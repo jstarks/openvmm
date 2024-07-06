@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg(any(target_os = "linux", target_os = "windows"))]
 
 mod disk_image;
 mod linux_direct_serial_agent;

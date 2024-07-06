@@ -5,6 +5,8 @@
 
 #![no_std]
 
+pub mod psci;
+
 use bitfield_struct::bitfield;
 use open_enum::open_enum;
 use zerocopy::AsBytes;

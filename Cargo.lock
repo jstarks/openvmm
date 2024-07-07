@@ -7257,7 +7257,7 @@ dependencies = [
 name = "virt_support_gic"
 version = "0.0.0"
 dependencies = [
- "bitfield-struct 0.7.0",
+ "bitfield-struct",
  "inspect",
  "open_enum",
  "parking_lot",

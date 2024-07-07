@@ -1,3 +1,5 @@
+// Copyright (C) Microsoft Corporation. All rights reserved.
+
 use core::ops::Range;
 use open_enum::open_enum;
 

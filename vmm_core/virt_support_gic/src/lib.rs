@@ -13,6 +13,7 @@ pub use gicr::Redistributor;
 mod gicd {
     use super::gicr::SharedState;
     use super::Redistributor;
+    use bitfield_struct::bitfield;
     use inspect::Inspect;
     use open_enum::open_enum;
     use parking_lot::Mutex;
@@ -49,6 +50,41 @@ mod gicd {
             IROUTER = 0x6000,       // 0x2000, skip first 0x100,
             PIDR2 = 0xffe8,
         }
+    }
+
+    #[bitfield(u32)]
+    pub struct GicdTyper {
+        #[bits(5)]
+        pub it_lines_number: u8,
+        #[bits(3)]
+        pub cpu_number: u8,
+        pub espi: bool,
+        pub nmi: bool,
+        pub security_extn: bool,
+        #[bits(5)]
+        pub num_lpis: u8,
+        pub mbis: bool,
+        pub lpis: bool,
+        pub dvis: bool,
+        #[bits(5)]
+        pub id_bits: u8,
+        pub a3v: bool,
+        pub no1n: bool,
+        pub rss: bool,
+        #[bits(5)]
+        pub espi_range: u8,
+    }
+
+    #[bitfield(u32)]
+    pub struct GicdTyper2 {
+        #[bits(5)]
+        pub vid: u8,
+        #[bits(2)]
+        _res5_6: u8,
+        pub vil: bool,
+        pub n_assgi_cap: bool,
+        #[bits(23)]
+        _res9_31: u32,
     }
 
     #[derive(Debug, Inspect)]
@@ -154,6 +190,12 @@ mod gicd {
                     // GICv3
                     3 << 4
                 }
+                Register::TYPER => GicdTyper::new()
+                    .with_it_lines_number(31)
+                    .with_id_bits(5)
+                    .into(),
+                Register::IIDR => 0,
+                Register::TYPER2 => GicdTyper2::new().into(),
                 address => {
                     tracing::warn!(?address, "unsupported 4-byte gicd register read");
                     0
@@ -195,6 +237,7 @@ mod gicd {
 }
 
 mod gicr {
+    use bitfield_struct::bitfield;
     use inspect::Inspect;
     use open_enum::open_enum;
     use std::sync::atomic::AtomicU32;
@@ -234,6 +277,25 @@ mod gicr {
             ICFGR1 = 0x0c04,
             IGRPMODR0 = 0x0d00,
         }
+    }
+
+    #[bitfield(u64)]
+    pub struct GicrTyper {
+        pub plpis: bool,
+        pub vlpis: bool,
+        pub dirty: bool,
+        pub direct_lpi: bool,
+        pub last: bool,
+        pub dpgs: bool,
+        pub mpam: bool,
+        pub rvpeid: bool,
+        pub processor_number: u16,
+        #[bits(2)]
+        pub common_lpi_aff: u8,
+        pub vsgi: bool,
+        #[bits(5)]
+        pub ppi_num: u8,
+        pub affinity_value: u32,
     }
 
     #[derive(Debug, Inspect)]
@@ -277,6 +339,10 @@ mod gicr {
                     };
                     data.copy_from_slice(&v.to_ne_bytes())
                 }
+                8 if rd => {
+                    let v = self.rd_read64(address as u16);
+                    data.copy_from_slice(&v.to_ne_bytes())
+                }
                 _ => {
                     data.fill(0);
                     tracing::warn!(?address, ?data, "unsupported n-byte gicr register read");
@@ -301,6 +367,10 @@ mod gicr {
                         self.sgi_write32(address as u16, data);
                     }
                 }
+                8 if rd => {
+                    let data = u64::from_ne_bytes(data.try_into().unwrap());
+                    self.rd_write64(address as u16, data);
+                }
                 address => {
                     tracing::warn!(?address, ?data, "unsupported n-byte gicr register write");
                 }
@@ -324,6 +394,24 @@ mod gicr {
             match RdRegister(address) {
                 address => {
                     tracing::warn!(?address, data, "unsupported 4-byte gicr rd register write");
+                }
+            }
+        }
+
+        fn rd_read64(&mut self, address: u16) -> u64 {
+            match RdRegister(address) {
+                RdRegister::TYPER => GicrTyper::new().with_last(true).into(),
+                address => {
+                    tracing::warn!(?address, "unsupported 8-byte gicr rd register read");
+                    0
+                }
+            }
+        }
+
+        fn rd_write64(&mut self, address: u16, data: u64) {
+            match RdRegister(address) {
+                address => {
+                    tracing::warn!(?address, data, "unsupported 8-byte gicr rd register write");
                 }
             }
         }

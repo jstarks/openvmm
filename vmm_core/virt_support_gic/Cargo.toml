@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 vm_topology.workspace = true
 
+bitfield-struct.workspace = true
 inspect.workspace = true
 open_enum.workspace = true
 

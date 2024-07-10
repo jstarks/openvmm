@@ -17,6 +17,7 @@ mod gicd {
     use inspect::Inspect;
     use open_enum::open_enum;
     use parking_lot::Mutex;
+    use std::ops::Range;
     use std::sync::Arc;
     use vm_topology::processor::VpIndex;
 
@@ -31,25 +32,38 @@ mod gicd {
             CLRSPI_NSR = 0x0048,
             SETSPI_SR = 0x0050,
             CLRSPI_SR = 0x0058,
-            IGROUPR = 0x0080,       // 0x80
-            ISENABLER = 0x0100,     // 0x80
-            ICENABLER = 0x0180,     // 0x80
-            ISPENDR = 0x0200,       // 0x80
-            ICPENDR = 0x0280,       // 0x80
-            ISACTIVER = 0x0300,     // 0x80
-            ICACTIVER = 0x0380,     // 0x80
-            IPRIORITYR = 0x0400,    // 0x400
-            ITARGETSR = 0x0800,     // 0x400
-            ICFGR = 0x0c00,         // 0x100
-            IGRPMODR = 0x0d00,      // 0x100
-            NSACR = 0x0e00,         // 0x100
+            IGROUPR0 = 0x0080,       // 0x80
+            ISENABLER0 = 0x0100,     // 0x80
+            ICENABLER0 = 0x0180,     // 0x80
+            ISPENDR0 = 0x0200,       // 0x80
+            ICPENDR0 = 0x0280,       // 0x80
+            ISACTIVER0 = 0x0300,     // 0x80
+            ICACTIVER0 = 0x0380,     // 0x80
+            IPRIORITYR0 = 0x0400,    // 0x400
+            ITARGETSR0 = 0x0800,     // 0x400
+            ICFGR0 = 0x0c00,         // 0x100
+            IGRPMODR0 = 0x0d00,      // 0x100
+            NSACR0 = 0x0e00,         // 0x100
             SGIR = 0x0f00,
-            CPENDSGIR = 0x0f10,     // 0x10
-            SPENDSGIR = 0x0f20,     // 0x10
-            INMIR = 0x0f80,         // 0x80
-            IROUTER = 0x6000,       // 0x2000, skip first 0x100,
+            CPENDSGIR0 = 0x0f10,     // 0x10
+            SPENDSGIR0 = 0x0f20,     // 0x10
+            INMIR0 = 0x0f80,         // 0x80
+            IROUTER0 = 0x6000,       // 0x2000, skip first 0x100,
             PIDR2 = 0xffe8,
         }
+    }
+
+    impl Register {
+        const IGROUPR: Range<u16> = Self::IGROUPR0.0..Self::IGROUPR0.0 + 0x80;
+        const ISENABLER: Range<u16> = Self::ISENABLER0.0..Self::ISENABLER0.0 + 0x80;
+        const ICENABLER: Range<u16> = Self::ICENABLER0.0..Self::ICENABLER0.0 + 0x80;
+        const ISPENDR: Range<u16> = Self::ISPENDR0.0..Self::ISPENDR0.0 + 0x80;
+        const ICPENDR: Range<u16> = Self::ICPENDR0.0..Self::ICPENDR0.0 + 0x80;
+        const ISACTIVER: Range<u16> = Self::ISACTIVER0.0..Self::ISACTIVER0.0 + 0x80;
+        const ICACTIVER: Range<u16> = Self::ICACTIVER0.0..Self::ICACTIVER0.0 + 0x80;
+        const ICFGR: Range<u16> = Self::ICFGR0.0..Self::ICFGR0.0 + 0x100;
+        const IPRIORITYR: Range<u16> = Self::IPRIORITYR0.0..Self::IPRIORITYR0.0 + 0x400;
+        const IROUTER: Range<u16> = Self::IROUTER0.0..Self::IROUTER0.0 + 0x2000;
     }
 
     #[bitfield(u32)]
@@ -87,19 +101,48 @@ mod gicd {
         _res9_31: u32,
     }
 
+    #[bitfield(u32)]
+    pub struct GicdCtlr {
+        pub enable_grp0: bool,
+        pub enable_grp1: bool,
+        #[bits(2)]
+        _res_2_3: u8,
+        pub are: bool,
+        _res_5: bool,
+        pub ds: bool,
+        pub e1nwf: bool,
+        pub n_assgi_req: bool,
+        #[bits(22)]
+        _res_9_30: u32,
+        pub rwp: bool,
+    }
+
     #[derive(Debug, Inspect)]
     pub struct Distributor {
-        #[inspect(skip)]
         state: Mutex<DistributorState>,
         max_spi_intid: u32,
         #[inspect(skip)]
         gicr: Arc<SharedState>,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Inspect)]
     struct DistributorState {
+        #[inspect(iter_by_index)]
         pending: Vec<u32>,
+        #[inspect(iter_by_index)]
         active: Vec<u32>,
+        #[inspect(iter_by_index)]
+        group: Vec<u32>,
+        #[inspect(iter_by_index)]
+        enable: Vec<u32>,
+        #[inspect(iter_by_index)]
+        cfg: Vec<u32>,
+        #[inspect(iter_by_index)]
+        priority: Vec<u32>,
+        #[inspect(iter_by_index)]
+        route: Vec<u64>,
+        enable_grp0: bool,
+        enable_grp1: bool,
     }
 
     impl Distributor {
@@ -109,6 +152,13 @@ mod gicd {
                 state: Mutex::new(DistributorState {
                     pending: vec![0; n],
                     active: vec![0; n],
+                    group: vec![0; n],
+                    enable: vec![0; n],
+                    cfg: vec![0; n * 2],
+                    priority: vec![0; n * 8],
+                    route: vec![0; n * 64],
+                    enable_grp0: false,
+                    enable_grp1: false,
                 }),
                 max_spi_intid: 32 + max_spis - 1,
                 gicr: Default::default(),
@@ -174,18 +224,81 @@ mod gicd {
             *v &= !(1 << (intid & 31));
         }
 
-        fn write32(&self, address: u16, value: u32) {
-            assert!(address & 3 == 0);
-            match Register(address) {
-                address => {
-                    tracing::warn!(?address, value, "unsupported 4-byte gicd register write");
+        fn write32(&self, address: Register, value: u32) -> bool {
+            assert!(address.0 & 3 == 0);
+            match address {
+                Register::CTLR => {
+                    let ctlr = GicdCtlr::from(value);
+                    let mut state = self.state.lock();
+                    let state = &mut *state;
+                    state.enable_grp0 = ctlr.enable_grp0();
+                    state.enable_grp1 = ctlr.enable_grp1();
                 }
+                r if Register::IGROUPR.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    if n != 0 {
+                        if let Some(group) = self.state.lock().group.get_mut(n as usize) {
+                            *group = value;
+                        }
+                    }
+                }
+                r if Register::ISENABLER.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    if n != 0 {
+                        if let Some(enable) = self.state.lock().enable.get_mut(n as usize) {
+                            *enable |= value;
+                        }
+                    }
+                }
+                r if Register::ICENABLER.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    if n != 0 {
+                        if let Some(enable) = self.state.lock().enable.get_mut(n as usize) {
+                            *enable &= !value;
+                        }
+                    }
+                }
+                r if Register::ICFGR.contains(&r.0) => {
+                    let n = (r.0 & 0xff) / 4;
+                    if n >= 2 {
+                        if let Some(cfg) = self.state.lock().cfg.get_mut(n as usize) {
+                            // The low bit of each bit pair is res0.
+                            *cfg = value & 0xaaaaaaaa;
+                        }
+                    }
+                }
+                r if Register::IPRIORITYR.contains(&r.0) => {
+                    let n = (r.0 & 0x3ff) / 4;
+                    if n >= 8 {
+                        if let Some(cfg) = self.state.lock().cfg.get_mut(n as usize) {
+                            *cfg = value;
+                        }
+                    }
+                }
+                r if Register::ISACTIVER.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    if n != 0 {
+                        if let Some(active) = self.state.lock().active.get_mut(n as usize) {
+                            *active |= value;
+                        }
+                    }
+                }
+                r if Register::ICACTIVER.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    if n != 0 {
+                        if let Some(active) = self.state.lock().active.get_mut(n as usize) {
+                            *active &= !value;
+                        }
+                    }
+                }
+                _ => return false,
             }
+            true
         }
 
-        fn read32(&self, address: u16) -> u32 {
-            assert!(address & 3 == 0);
-            match Register(address) {
+        fn read32(&self, address: Register) -> Option<u32> {
+            assert!(address.0 & 3 == 0);
+            let v = match address {
                 Register::PIDR2 => {
                     // GICv3
                     3 << 4
@@ -196,11 +309,91 @@ mod gicd {
                     .into(),
                 Register::IIDR => 0,
                 Register::TYPER2 => GicdTyper2::new().into(),
-                address => {
-                    tracing::warn!(?address, "unsupported 4-byte gicd register read");
-                    0
+                Register::CTLR => {
+                    let state = self.state.lock();
+                    GicdCtlr::new()
+                        .with_enable_grp0(state.enable_grp0)
+                        .with_enable_grp1(state.enable_grp1)
+                        .with_ds(true)
+                        .with_are(true)
+                        .into()
                 }
+                r if Register::IGROUPR.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    self.state
+                        .lock()
+                        .group
+                        .get(n as usize)
+                        .copied()
+                        .unwrap_or(0)
+                }
+                r if Register::ICENABLER.contains(&r.0) || Register::ISENABLER.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    self.state
+                        .lock()
+                        .enable
+                        .get(n as usize)
+                        .copied()
+                        .unwrap_or(0)
+                }
+                r if Register::ICFGR.contains(&r.0) => {
+                    let n = (r.0 & 0xff) / 4;
+                    self.state.lock().cfg.get(n as usize).copied().unwrap_or(0)
+                }
+                r if Register::IPRIORITYR.contains(&r.0) => {
+                    let n = (r.0 & 0x3ff) / 4;
+                    self.state
+                        .lock()
+                        .priority
+                        .get(n as usize)
+                        .copied()
+                        .unwrap_or(0)
+                }
+                r if Register::ICACTIVER.contains(&r.0) || Register::ISACTIVER.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    self.state
+                        .lock()
+                        .active
+                        .get(n as usize)
+                        .copied()
+                        .unwrap_or(0)
+                }
+                _ => return None,
+            };
+            Some(v)
+        }
+
+        fn write64(&self, address: Register, value: u64) -> bool {
+            assert!(address.0 & 7 == 0);
+            match address {
+                r if Register::IROUTER.contains(&r.0) => {
+                    let n = (r.0 & 0x1fff) / 8;
+                    if n >= 32 {
+                        if let Some(route) = self.state.lock().route.get_mut(n as usize) {
+                            *route = value;
+                        }
+                    }
+                }
+                _ => return false,
             }
+            true
+        }
+
+        fn read64(&self, address: Register) -> Option<u64> {
+            assert!(address.0 & 7 == 0);
+            let v = match address {
+                r if Register::IROUTER.contains(&r.0) => {
+                    let n = (r.0 & 0x1fff) / 8;
+                    self.state
+                        .lock()
+                        .route
+                        .get(n as usize)
+                        .copied()
+                        .unwrap_or(0)
+                }
+                _ => return None,
+            };
+            Some(v)
         }
 
         pub fn read(&self, address: u64, data: &mut [u8]) {
@@ -209,12 +402,29 @@ mod gicd {
                 tracing::warn!(address, ?data, "gicd read unaligned access");
                 return;
             }
-            match data.len() {
-                4 => data.copy_from_slice(&self.read32(address as u16).to_ne_bytes()),
-                _ => {
-                    data.fill(0);
-                    tracing::warn!(address, ?data, "unsupported n-byte gicd register read");
+            let address = Register(address as u16);
+            let handled = match data.len() {
+                4 => {
+                    if let Some(v) = self.read32(address) {
+                        data.copy_from_slice(&v.to_ne_bytes());
+                        true
+                    } else {
+                        false
+                    }
                 }
+                8 => {
+                    if let Some(v) = self.read64(address) {
+                        data.copy_from_slice(&v.to_ne_bytes());
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if !handled {
+                data.fill(0);
+                tracing::warn!(?address, ?data, "unsupported gicd register read");
             }
         }
 
@@ -223,14 +433,14 @@ mod gicd {
                 tracing::warn!(address, ?data, "gicd write unaligned access");
                 return;
             }
-
-            match data.len() {
-                4 => {
-                    self.write32(address as u16, u32::from_ne_bytes(data.try_into().unwrap()));
-                }
-                _ => {
-                    tracing::warn!(address, ?data, "unsupported n-byte gicd register write");
-                }
+            let address = Register(address as u16);
+            let handled = match data.len() {
+                4 => self.write32(address, u32::from_ne_bytes(data.try_into().unwrap())),
+                8 => self.write64(address, u64::from_ne_bytes(data.try_into().unwrap())),
+                _ => false,
+            };
+            if !handled {
+                tracelimit::warn_ratelimited!(?address, ?data, "unsupported gicd register write");
             }
         }
     }
@@ -298,6 +508,22 @@ mod gicr {
         pub affinity_value: u32,
     }
 
+    #[bitfield(u32)]
+    pub struct GicrCtlr {
+        pub enable_lpis: bool,
+        pub ces: bool,
+        pub ir: bool,
+        pub rwp: bool,
+        #[bits(20)]
+        _res_4_23: u32,
+        pub dpg0: bool,
+        pub dpg1ns: bool,
+        pub dpg1s: bool,
+        #[bits(4)]
+        _res_27_30: u32,
+        pub uwp: bool,
+    }
+
     #[derive(Debug, Inspect)]
     pub struct Redistributor {
         shared: Arc<SharedState>,
@@ -328,24 +554,51 @@ mod gicr {
                 return;
             }
 
-            let rd = address & 0x10000 == 0;
-
-            match data.len() {
-                4 => {
-                    let v = if rd {
-                        self.rd_read32(address as u16)
-                    } else {
-                        self.sgi_read32(address as u16)
-                    };
-                    data.copy_from_slice(&v.to_ne_bytes())
-                }
-                8 if rd => {
-                    let v = self.rd_read64(address as u16);
-                    data.copy_from_slice(&v.to_ne_bytes())
-                }
-                _ => {
+            if address & 0x10000 == 0 {
+                let address = RdRegister(address as u16);
+                let handled = match data.len() {
+                    4 => {
+                        if let Some(v) = self.rd_read32(address) {
+                            data.copy_from_slice(&v.to_ne_bytes());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    8 => {
+                        if let Some(v) = self.rd_read64(address) {
+                            data.copy_from_slice(&v.to_ne_bytes());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if !handled {
                     data.fill(0);
-                    tracing::warn!(?address, ?data, "unsupported n-byte gicr register read");
+                    tracelimit::warn_ratelimited!(?address, "unsupported gicr rd register read");
+                }
+            } else {
+                let address = SgiRegister(address as u16);
+                let handled = match data.len() {
+                    4 => {
+                        if let Some(v) = self.sgi_read32(address) {
+                            data.copy_from_slice(&v.to_ne_bytes());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if !handled {
+                    data.fill(0);
+                    tracelimit::warn_ratelimited!(
+                        ?address,
+                        ?data,
+                        "unsupported gicr sgi register read"
+                    );
                 }
             }
         }
@@ -356,81 +609,83 @@ mod gicr {
                 return;
             }
 
-            let rd = address & 0x10000 == 0;
-
-            match data.len() {
-                4 => {
-                    let data = u32::from_ne_bytes(data.try_into().unwrap());
-                    if rd {
-                        self.rd_write32(address as u16, data);
-                    } else {
-                        self.sgi_write32(address as u16, data);
+            if address & 0x10000 == 0 {
+                let address = RdRegister(address as u16);
+                let handled = match data.len() {
+                    4 => {
+                        let data = u32::from_ne_bytes(data.try_into().unwrap());
+                        self.rd_write32(address, data)
                     }
+                    8 => {
+                        let data = u64::from_ne_bytes(data.try_into().unwrap());
+                        self.rd_write64(address, data)
+                    }
+                    _ => false,
+                };
+                if !handled {
+                    tracelimit::warn_ratelimited!(
+                        ?address,
+                        ?data,
+                        "unsupported gicr rd register write"
+                    );
                 }
-                8 if rd => {
-                    let data = u64::from_ne_bytes(data.try_into().unwrap());
-                    self.rd_write64(address as u16, data);
-                }
-                address => {
-                    tracing::warn!(?address, ?data, "unsupported n-byte gicr register write");
+            } else {
+                let address = SgiRegister(address as u16);
+                let handled = match data.len() {
+                    4 => {
+                        let data = u32::from_ne_bytes(data.try_into().unwrap());
+                        self.sgi_write32(address, data)
+                    }
+                    _ => false,
+                };
+                if !handled {
+                    tracelimit::warn_ratelimited!(
+                        ?address,
+                        ?data,
+                        "unsupported gicr sgi register write"
+                    );
                 }
             }
         }
 
-        fn rd_read32(&mut self, address: u16) -> u32 {
-            match RdRegister(address) {
+        fn rd_read32(&mut self, address: RdRegister) -> Option<u32> {
+            let v = match address {
                 RdRegister::PIDR2 => {
                     // GICv3
                     3 << 4
                 }
-                address => {
-                    tracing::warn!(?address, "unsupported 4-byte gicr rd register read");
-                    0
-                }
-            }
+                RdRegister::CTLR => GicrCtlr::new().into(),
+                _ => return None,
+            };
+            Some(v)
         }
 
-        fn rd_write32(&mut self, address: u16, data: u32) {
-            match RdRegister(address) {
-                address => {
-                    tracing::warn!(?address, data, "unsupported 4-byte gicr rd register write");
-                }
+        fn rd_write32(&mut self, address: RdRegister, _data: u32) -> bool {
+            match address {
+                RdRegister::CTLR => {}
+                _ => return false,
             }
+            true
         }
 
-        fn rd_read64(&mut self, address: u16) -> u64 {
-            match RdRegister(address) {
+        fn rd_read64(&mut self, address: RdRegister) -> Option<u64> {
+            let v = match address {
                 RdRegister::TYPER => GicrTyper::new().with_last(true).into(),
-                address => {
-                    tracing::warn!(?address, "unsupported 8-byte gicr rd register read");
-                    0
-                }
-            }
+                _ => return None,
+            };
+            Some(v)
         }
 
-        fn rd_write64(&mut self, address: u16, data: u64) {
-            match RdRegister(address) {
-                address => {
-                    tracing::warn!(?address, data, "unsupported 8-byte gicr rd register write");
-                }
-            }
+        fn rd_write64(&mut self, address: RdRegister, data: u64) -> bool {
+            false
         }
 
-        fn sgi_read32(&mut self, address: u16) -> u32 {
-            match SgiRegister(address) {
-                address => {
-                    tracing::warn!(?address, "unsupported 4-byte gicr sgi register read");
-                    0
-                }
-            }
+        fn sgi_read32(&mut self, address: SgiRegister) -> Option<u32> {
+            None
         }
 
-        fn sgi_write32(&mut self, address: u16, data: u32) {
-            match SgiRegister(address) {
-                address => {
-                    tracing::warn!(?address, data, "unsupported 4-byte gicr sgi register write");
-                }
-            }
+        fn sgi_write32(&mut self, address: SgiRegister, data: u32) -> bool {
+            false
         }
 
         pub fn raise(&mut self, intid: u32) {

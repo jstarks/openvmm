@@ -12,6 +12,7 @@ vm_topology.workspace = true
 bitfield-struct.workspace = true
 inspect.workspace = true
 open_enum.workspace = true
+tracelimit.workspace = true
 
 parking_lot.workspace = true
 tracing.workspace = true

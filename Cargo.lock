@@ -7261,6 +7261,7 @@ dependencies = [
  "inspect",
  "open_enum",
  "parking_lot",
+ "tracelimit",
  "tracing",
  "vm_topology",
 ]

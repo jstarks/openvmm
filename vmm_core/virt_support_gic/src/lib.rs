@@ -174,7 +174,7 @@ mod gicd {
         }
 
         pub fn set_pending(&self, intid: u32, pending: bool) -> Option<u32> {
-            let v = &mut self.state.lock().pending[intid as usize / 32 - 1];
+            let v = &mut self.state.lock().pending[intid as usize / 32];
             let mask = 1 << (intid & 31);
             if (*v & mask != 0) != pending {
                 tracing::debug!(intid, pending, "set pending");
@@ -188,16 +188,23 @@ mod gicd {
             }
         }
 
-        pub fn irq_pending(&self) -> bool {
+        pub fn irq_pending(&self, gicr: &Redistributor) -> bool {
+            if gicr.irq_pending() {
+                return true;
+            }
             let state = self.state.lock();
             state
                 .pending
                 .iter()
                 .zip(&state.active)
-                .any(|(&p, &a)| p & !a != 0)
+                .zip(&state.enable)
+                .any(|((&p, &a), e)| p & !a & e != 0)
         }
 
-        pub fn ack(&self) -> u32 {
+        pub fn ack(&self, gicr: &mut Redistributor, group1: bool) -> u32 {
+            if let Some(intid) = gicr.ack(group1) {
+                return intid;
+            }
             let mut state = self.state.lock();
             let state = &mut *state;
             if let Some((i, (p, a))) = state
@@ -210,7 +217,7 @@ mod gicd {
                 let v = 31 - (*p & !*a).leading_zeros();
                 *p &= !(1 << v);
                 *a |= 1 << v;
-                let intid = (i as u32 + 1) * 32 + v;
+                let intid = i as u32 * 32 + v;
                 tracing::debug!(intid, "gicd ack");
                 intid
             } else {
@@ -218,9 +225,13 @@ mod gicd {
             }
         }
 
-        pub fn eoi(&self, intid: u32) {
+        pub fn eoi(&self, gicr: &mut Redistributor, group1: bool, intid: u32) {
+            if intid < 32 {
+                gicr.eoi(group1, intid);
+                return;
+            }
             tracing::debug!(intid, "gicd eoi");
-            let v = &mut self.state.lock().active[intid as usize / 32 - 1];
+            let v = &mut self.state.lock().active[intid as usize / 32];
             *v &= !(1 << (intid & 31));
         }
 
@@ -778,22 +789,19 @@ mod gicr {
             self.shared.pending.fetch_or(1 << intid, Ordering::Relaxed);
         }
 
-        pub fn irq_pending(&self) -> bool {
-            (self.shared.pending.load(Ordering::Relaxed) & !self.active) != 0
-        }
-
-        pub fn fiq_pending(&self) -> bool {
-            false
+        pub(crate) fn irq_pending(&self) -> bool {
+            (self.shared.pending.load(Ordering::Relaxed) & !self.active & self.enable & self.group)
+                != 0
         }
 
         pub fn is_pending_or_active(&self, intid: u32) -> bool {
             (self.shared.pending.load(Ordering::Relaxed) | self.active) & (1 << intid) != 0
         }
 
-        pub fn ack_group1(&mut self) -> u32 {
+        pub(crate) fn ack(&mut self, group1: bool) -> Option<u32> {
             let pending = self.shared.pending.load(Ordering::Relaxed);
             if pending == 0 {
-                1023
+                None
             } else {
                 let intid = 31 - (pending & !self.active).leading_zeros();
                 tracing::trace!(intid, "ack");
@@ -801,15 +809,14 @@ mod gicr {
                     .pending
                     .fetch_and(!(1 << intid), Ordering::Relaxed);
                 self.active |= 1 << intid;
-                intid
+                Some(intid)
             }
         }
 
-        pub fn eoi_group1(&mut self, intid: u32) {
-            if intid < 32 {
-                tracing::trace!(intid, "eoi");
-                self.active &= !(1 << intid);
-            }
+        pub(crate) fn eoi(&mut self, _group1: bool, intid: u32) {
+            assert!(intid < 32);
+            tracing::trace!(intid, "eoi");
+            self.active &= !(1 << intid);
         }
     }
 }

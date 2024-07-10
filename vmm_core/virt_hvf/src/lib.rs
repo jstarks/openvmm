@@ -747,7 +747,7 @@ impl<'p> virt::Processor for HvfProcessor<'p> {
                 continue;
             }
 
-            if self.gicr.irq_pending() || self.partition.gicd.irq_pending() {
+            if self.partition.gicd.irq_pending(&mut self.gicr) {
                 // SAFETY: no requirements.
                 unsafe {
                     abi::hv_vcpu_set_pending_interrupt(
@@ -899,12 +899,11 @@ impl<'p> virt::Processor for HvfProcessor<'p> {
                             let iss = IssSystem::from(exception.syndrome.iss());
                             if iss.direction() {
                                 let value = match iss.system_reg() {
+                                    SystemReg::ICC_IAR0_EL1 => {
+                                        self.partition.gicd.ack(&mut self.gicr, false).into()
+                                    }
                                     SystemReg::ICC_IAR1_EL1 => {
-                                        let mut intid = self.gicr.ack_group1();
-                                        if intid == 1023 {
-                                            intid = self.partition.gicd.ack();
-                                        }
-                                        intid.into()
+                                        self.partition.gicd.ack(&mut self.gicr, true).into()
                                     }
                                     reg => {
                                         tracing::warn!(
@@ -918,13 +917,11 @@ impl<'p> virt::Processor for HvfProcessor<'p> {
                             } else {
                                 let value = self.vcpu.gp(iss.rt()).expect("BUGBUG");
                                 match iss.system_reg() {
+                                    SystemReg::ICC_EOIR0_EL1 => {
+                                        self.partition.gicd.eoi(&mut self.gicr, false, value as u32)
+                                    }
                                     SystemReg::ICC_EOIR1_EL1 => {
-                                        let intid = value as u32;
-                                        if intid < 32 {
-                                            self.gicr.eoi_group1(intid);
-                                        } else {
-                                            self.partition.gicd.eoi(intid);
-                                        }
+                                        self.partition.gicd.eoi(&mut self.gicr, true, value as u32)
                                     }
                                     reg => {
                                         tracing::warn!(

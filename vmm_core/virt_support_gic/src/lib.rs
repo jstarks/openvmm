@@ -358,6 +358,15 @@ mod gicd {
                         .copied()
                         .unwrap_or(0)
                 }
+                r if Register::ICPENDR.contains(&r.0) || Register::ISPENDR.contains(&r.0) => {
+                    let n = (r.0 & 0x7f) / 4;
+                    self.state
+                        .lock()
+                        .pending
+                        .get(n as usize)
+                        .copied()
+                        .unwrap_or(0)
+                }
                 _ => return None,
             };
             Some(v)
@@ -450,6 +459,7 @@ mod gicr {
     use bitfield_struct::bitfield;
     use inspect::Inspect;
     use open_enum::open_enum;
+    use std::ops::Range;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -482,11 +492,15 @@ mod gicr {
             ICPENDR0 = 0x0280,
             ISACTIVER0 = 0x0300,
             ICACTIVER0 = 0x0380,
-            IPRIORITYR = 0x0400, // 0x20
+            IPRIORITYR0 = 0x0400, // 0x20
             ICFGR0 = 0x0c00,
             ICFGR1 = 0x0c04,
             IGRPMODR0 = 0x0d00,
         }
+    }
+
+    impl SgiRegister {
+        pub const IPRIORITYR: Range<u16> = Self::IPRIORITYR0.0..Self::IPRIORITYR0.0 + 0x20;
     }
 
     #[bitfield(u64)]
@@ -524,10 +538,28 @@ mod gicr {
         pub uwp: bool,
     }
 
+    #[bitfield(u32)]
+    pub struct GicrWaker {
+        /// Implementation defined.
+        pub bit_0: bool,
+        pub processor_sleep: bool,
+        pub children_asleep: bool,
+        #[bits(28)]
+        _res_3_30: u32,
+        /// Implementation defined.
+        pub bit_31: bool,
+    }
+
     #[derive(Debug, Inspect)]
     pub struct Redistributor {
         shared: Arc<SharedState>,
         active: u32,
+        group: u32,
+        enable: u32,
+        ppi_cfg: u32,
+        #[inspect(iter_by_index)]
+        priority: [u32; 8],
+        sleep: bool,
     }
 
     #[derive(Default, Debug, Inspect)]
@@ -544,7 +576,15 @@ mod gicr {
 
     impl Redistributor {
         pub(crate) fn new(shared: Arc<SharedState>) -> Self {
-            Self { shared, active: 0 }
+            Self {
+                shared,
+                active: 0,
+                group: 0,
+                enable: 0,
+                ppi_cfg: 0,
+                priority: [0; 8],
+                sleep: true,
+            }
         }
 
         pub fn read(&mut self, address: u64, data: &mut [u8]) {
@@ -655,16 +695,26 @@ mod gicr {
                     3 << 4
                 }
                 RdRegister::CTLR => GicrCtlr::new().into(),
+                RdRegister::WAKER => GicrWaker::new()
+                    .with_processor_sleep(self.sleep)
+                    .with_children_asleep(self.sleep)
+                    .into(),
                 _ => return None,
             };
+            tracing::debug!(?address, v, "gicr rd read32");
             Some(v)
         }
 
-        fn rd_write32(&mut self, address: RdRegister, _data: u32) -> bool {
+        fn rd_write32(&mut self, address: RdRegister, data: u32) -> bool {
             match address {
                 RdRegister::CTLR => {}
+                RdRegister::WAKER => {
+                    let v = GicrWaker::from(data);
+                    self.sleep = v.processor_sleep();
+                }
                 _ => return false,
             }
+            tracing::debug!(?address, data, "gicr rd write32");
             true
         }
 
@@ -676,16 +726,52 @@ mod gicr {
             Some(v)
         }
 
-        fn rd_write64(&mut self, address: RdRegister, data: u64) -> bool {
+        fn rd_write64(&mut self, _address: RdRegister, _data: u64) -> bool {
             false
         }
 
         fn sgi_read32(&mut self, address: SgiRegister) -> Option<u32> {
-            None
+            let v = match address {
+                SgiRegister::IGROUPR0 => self.group,
+                SgiRegister::ICACTIVER0 | SgiRegister::ISACTIVER0 => self.active,
+                SgiRegister::ICENABLER0 | SgiRegister::ISENABLER0 => self.enable,
+                SgiRegister::ICPENDR0 | SgiRegister::ISPENDR0 => {
+                    self.shared.pending.load(Ordering::Relaxed)
+                }
+                SgiRegister::ICFGR0 => {
+                    // SGIs are always edge triggered.
+                    0xaaaaaaaa
+                }
+                SgiRegister::ICFGR1 => self.ppi_cfg,
+                r if SgiRegister::IPRIORITYR.contains(&r.0) => {
+                    let n = (r.0 & 0x1f) / 4;
+                    self.priority[n as usize]
+                }
+                _ => return None,
+            };
+            tracing::debug!(?address, v, "gicr sgi read32");
+            Some(v)
         }
 
         fn sgi_write32(&mut self, address: SgiRegister, data: u32) -> bool {
-            false
+            match address {
+                SgiRegister::IGROUPR0 => self.group = data,
+                SgiRegister::ISACTIVER0 => self.active |= data,
+                SgiRegister::ICACTIVER0 => self.active &= !data,
+                SgiRegister::ISENABLER0 => self.enable |= data,
+                SgiRegister::ICENABLER0 => self.enable &= !data,
+                SgiRegister::ICFGR0 => {
+                    // Cannot change trigger mode for SGIs.
+                }
+                SgiRegister::ICFGR1 => self.ppi_cfg = data,
+                r if SgiRegister::IPRIORITYR.contains(&r.0) => {
+                    let n = (r.0 & 0x1f) / 4;
+                    self.priority[n as usize] = data;
+                }
+                _ => return false,
+            }
+            tracing::debug!(?address, data, "gicr sgi write32");
+            true
         }
 
         pub fn raise(&mut self, intid: u32) {

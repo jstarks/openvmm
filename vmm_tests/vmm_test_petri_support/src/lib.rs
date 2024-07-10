@@ -5,7 +5,6 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-#![cfg(any(target_os = "linux", target_os = "windows"))]
 
 use petri::ArtifactHandle;
 use petri::AsArtifactHandle;

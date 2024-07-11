@@ -17,6 +17,7 @@ mod gicd {
     use aarch64defs::gic::GicdRegister;
     use aarch64defs::gic::GicdTyper;
     use aarch64defs::gic::GicdTyper2;
+    use aarch64defs::gic::GicrSgi;
     use aarch64defs::MpidrEl1;
     use aarch64defs::SystemReg;
     use inspect::Inspect;
@@ -76,7 +77,7 @@ mod gicd {
             let mpidr = mpidr & u64::from(MpidrEl1::AFFINITY_MASK);
             let state = Arc::new(SharedState {
                 pending: 0.into(),
-                mpidr,
+                mpidr: mpidr.into(),
             });
             let gicr = Redistributor::new(self.gicr.len(), last, state.clone());
             self.gicr.push(state);
@@ -149,13 +150,44 @@ mod gicd {
             }
         }
 
-        pub fn write_sysreg(&self, gicr: &mut Redistributor, reg: SystemReg, value: u64) -> bool {
+        pub fn write_sysreg(
+            &self,
+            gicr: &mut Redistributor,
+            reg: SystemReg,
+            value: u64,
+            wake: impl FnMut(usize),
+        ) -> bool {
             match reg {
                 SystemReg::ICC_EOIR0_EL1 => self.eoi(gicr, false, value as u32),
                 SystemReg::ICC_EOIR1_EL1 => self.eoi(gicr, true, value as u32),
+                SystemReg::ICC_SGI0R_EL1 => self.sgi(gicr, false, value, wake),
+                SystemReg::ICC_SGI1R_EL1 => self.sgi(gicr, true, value, wake),
                 _ => return false,
             }
             true
+        }
+
+        fn sgi(
+            &self,
+            this: &mut Redistributor,
+            group1: bool,
+            value: u64,
+            mut wake: impl FnMut(usize),
+        ) {
+            let value = GicrSgi::from(value);
+            for (index, gicr) in self.gicr.iter().enumerate() {
+                if (value.irm() && !Arc::ptr_eq(&this.shared, gicr))
+                    || (!value.irm()
+                        && gicr.mpidr.aff3() == value.aff3()
+                        && gicr.mpidr.aff2() == value.aff2()
+                        && gicr.mpidr.aff1() == value.aff1()
+                        && (1 << gicr.mpidr.aff0()) & value.target_list() != 0)
+                {
+                    if gicr.raise(value.intid()) {
+                        wake(index);
+                    }
+                }
+            }
         }
 
         pub fn read_sysreg(&self, gicr: &mut Redistributor, reg: SystemReg) -> Option<u64> {
@@ -431,8 +463,9 @@ mod gicr {
 
     #[derive(Debug, Inspect)]
     pub struct Redistributor {
-        pub(crate) shared: Arc<SharedState>,
-        pub(crate) index: usize,
+        #[inspect(flatten)]
+        pub(super) shared: Arc<SharedState>,
+        pub(super) index: usize,
         active: u32,
         group: u32,
         enable: u32,
@@ -445,8 +478,9 @@ mod gicr {
 
     #[derive(Debug, Inspect)]
     pub(crate) struct SharedState {
-        pub(crate) pending: AtomicU32,
-        pub(crate) mpidr: u64,
+        pub(super) pending: AtomicU32,
+        #[inspect(with = "|&x| u64::from(x)")]
+        pub(super) mpidr: MpidrEl1,
     }
 
     impl SharedState {

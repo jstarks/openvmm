@@ -995,7 +995,12 @@ impl<'p> Processor for HvfProcessor<'p> {
                                 self.vcpu.set_gp(iss.rt(), value).expect("BUGBUG");
                             } else {
                                 let value = self.vcpu.gp(iss.rt()).expect("BUGBUG");
-                                if !self.partition.gicd.write_sysreg(&mut self.gicr, reg, value) {
+                                if !self.partition.gicd.write_sysreg(
+                                    &mut self.gicr,
+                                    reg,
+                                    value,
+                                    |index| self.partition.vps[index].wake(),
+                                ) {
                                     tracing::warn!(
                                         ?reg,
                                         value,

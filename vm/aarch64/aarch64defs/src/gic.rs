@@ -186,3 +186,21 @@ pub struct GicrWaker {
     /// Implementation defined.
     pub bit_31: bool,
 }
+
+#[bitfield(u64)]
+pub struct GicrSgi {
+    pub target_list: u16,
+    pub aff1: u8,
+    #[bits(4)]
+    pub intid: u32,
+    #[bits(4)]
+    _res_28_31: u16,
+    pub aff2: u8,
+    pub irm: bool,
+    #[bits(3)]
+    _res_41_43: u8,
+    #[bits(4)]
+    pub rs: u8,
+    pub aff3: u8,
+    _res_56_63: u8,
+}

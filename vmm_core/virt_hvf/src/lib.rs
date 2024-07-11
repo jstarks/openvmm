@@ -21,7 +21,6 @@ use aarch64defs::Cpsr64;
 use aarch64defs::ExceptionClass;
 use aarch64defs::IssDataAbort;
 use aarch64defs::IssSystem;
-use aarch64defs::SystemReg;
 use abi::HvfError;
 use anyhow::Context;
 use guestmem::GuestMemory;
@@ -897,39 +896,28 @@ impl<'p> virt::Processor for HvfProcessor<'p> {
                         }
                         ExceptionClass::SYSTEM => {
                             let iss = IssSystem::from(exception.syndrome.iss());
+                            let reg = iss.system_reg();
                             if iss.direction() {
-                                let value = match iss.system_reg() {
-                                    SystemReg::ICC_IAR0_EL1 => {
-                                        self.partition.gicd.ack(&mut self.gicr, false).into()
-                                    }
-                                    SystemReg::ICC_IAR1_EL1 => {
-                                        self.partition.gicd.ack(&mut self.gicr, true).into()
-                                    }
-                                    reg => {
+                                let value = self
+                                    .partition
+                                    .gicd
+                                    .read_sysreg(&mut self.gicr, reg)
+                                    .unwrap_or_else(|| {
                                         tracing::warn!(
                                             ?reg,
                                             "returning zero for unknown system register"
                                         );
                                         0
-                                    }
-                                };
+                                    });
                                 self.vcpu.set_gp(iss.rt(), value).expect("BUGBUG");
                             } else {
                                 let value = self.vcpu.gp(iss.rt()).expect("BUGBUG");
-                                match iss.system_reg() {
-                                    SystemReg::ICC_EOIR0_EL1 => {
-                                        self.partition.gicd.eoi(&mut self.gicr, false, value as u32)
-                                    }
-                                    SystemReg::ICC_EOIR1_EL1 => {
-                                        self.partition.gicd.eoi(&mut self.gicr, true, value as u32)
-                                    }
-                                    reg => {
-                                        tracing::warn!(
-                                            ?reg,
-                                            value,
-                                            "ignoring write to unknown system register"
-                                        );
-                                    }
+                                if !self.partition.gicd.write_sysreg(&mut self.gicr, reg, value) {
+                                    tracing::warn!(
+                                        ?reg,
+                                        value,
+                                        "ignoring write to unknown system register"
+                                    );
                                 }
                             }
                             advance(&mut self.vcpu);

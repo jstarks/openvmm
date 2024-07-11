@@ -5,6 +5,7 @@
 
 #![no_std]
 
+pub mod gic;
 pub mod psci;
 
 use bitfield_struct::bitfield;

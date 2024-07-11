@@ -13,109 +13,15 @@ pub use gicr::Redistributor;
 mod gicd {
     use super::gicr::SharedState;
     use super::Redistributor;
-    use bitfield_struct::bitfield;
+    use aarch64defs::gic::GicdCtlr;
+    use aarch64defs::gic::GicdRegister;
+    use aarch64defs::gic::GicdTyper;
+    use aarch64defs::gic::GicdTyper2;
+    use aarch64defs::SystemReg;
     use inspect::Inspect;
-    use open_enum::open_enum;
     use parking_lot::Mutex;
-    use std::ops::Range;
     use std::sync::Arc;
     use vm_topology::processor::VpIndex;
-
-    open_enum! {
-        enum Register: u16 {
-            CTLR = 0x0000,
-            TYPER = 0x0004,
-            IIDR = 0x0008,
-            TYPER2 = 0x000c,
-            STATUSR = 0x0010,
-            SETSPI_NSR = 0x0040,
-            CLRSPI_NSR = 0x0048,
-            SETSPI_SR = 0x0050,
-            CLRSPI_SR = 0x0058,
-            IGROUPR0 = 0x0080,       // 0x80
-            ISENABLER0 = 0x0100,     // 0x80
-            ICENABLER0 = 0x0180,     // 0x80
-            ISPENDR0 = 0x0200,       // 0x80
-            ICPENDR0 = 0x0280,       // 0x80
-            ISACTIVER0 = 0x0300,     // 0x80
-            ICACTIVER0 = 0x0380,     // 0x80
-            IPRIORITYR0 = 0x0400,    // 0x400
-            ITARGETSR0 = 0x0800,     // 0x400
-            ICFGR0 = 0x0c00,         // 0x100
-            IGRPMODR0 = 0x0d00,      // 0x100
-            NSACR0 = 0x0e00,         // 0x100
-            SGIR = 0x0f00,
-            CPENDSGIR0 = 0x0f10,     // 0x10
-            SPENDSGIR0 = 0x0f20,     // 0x10
-            INMIR0 = 0x0f80,         // 0x80
-            IROUTER0 = 0x6000,       // 0x2000, skip first 0x100,
-            PIDR2 = 0xffe8,
-        }
-    }
-
-    impl Register {
-        const IGROUPR: Range<u16> = Self::IGROUPR0.0..Self::IGROUPR0.0 + 0x80;
-        const ISENABLER: Range<u16> = Self::ISENABLER0.0..Self::ISENABLER0.0 + 0x80;
-        const ICENABLER: Range<u16> = Self::ICENABLER0.0..Self::ICENABLER0.0 + 0x80;
-        const ISPENDR: Range<u16> = Self::ISPENDR0.0..Self::ISPENDR0.0 + 0x80;
-        const ICPENDR: Range<u16> = Self::ICPENDR0.0..Self::ICPENDR0.0 + 0x80;
-        const ISACTIVER: Range<u16> = Self::ISACTIVER0.0..Self::ISACTIVER0.0 + 0x80;
-        const ICACTIVER: Range<u16> = Self::ICACTIVER0.0..Self::ICACTIVER0.0 + 0x80;
-        const ICFGR: Range<u16> = Self::ICFGR0.0..Self::ICFGR0.0 + 0x100;
-        const IPRIORITYR: Range<u16> = Self::IPRIORITYR0.0..Self::IPRIORITYR0.0 + 0x400;
-        const IROUTER: Range<u16> = Self::IROUTER0.0..Self::IROUTER0.0 + 0x2000;
-    }
-
-    #[bitfield(u32)]
-    pub struct GicdTyper {
-        #[bits(5)]
-        pub it_lines_number: u8,
-        #[bits(3)]
-        pub cpu_number: u8,
-        pub espi: bool,
-        pub nmi: bool,
-        pub security_extn: bool,
-        #[bits(5)]
-        pub num_lpis: u8,
-        pub mbis: bool,
-        pub lpis: bool,
-        pub dvis: bool,
-        #[bits(5)]
-        pub id_bits: u8,
-        pub a3v: bool,
-        pub no1n: bool,
-        pub rss: bool,
-        #[bits(5)]
-        pub espi_range: u8,
-    }
-
-    #[bitfield(u32)]
-    pub struct GicdTyper2 {
-        #[bits(5)]
-        pub vid: u8,
-        #[bits(2)]
-        _res5_6: u8,
-        pub vil: bool,
-        pub n_assgi_cap: bool,
-        #[bits(23)]
-        _res9_31: u32,
-    }
-
-    #[bitfield(u32)]
-    pub struct GicdCtlr {
-        pub enable_grp0: bool,
-        pub enable_grp1: bool,
-        #[bits(2)]
-        _res_2_3: u8,
-        pub are: bool,
-        _res_5: bool,
-        pub ds: bool,
-        pub e1nwf: bool,
-        pub n_assgi_req: bool,
-        #[bits(22)]
-        _res_9_30: u32,
-        pub rwp: bool,
-    }
 
     #[derive(Debug, Inspect)]
     pub struct Distributor {
@@ -225,7 +131,25 @@ mod gicd {
             }
         }
 
-        pub fn eoi(&self, gicr: &mut Redistributor, group1: bool, intid: u32) {
+        pub fn write_sysreg(&self, gicr: &mut Redistributor, reg: SystemReg, value: u64) -> bool {
+            match reg {
+                SystemReg::ICC_EOIR0_EL1 => self.eoi(gicr, false, value as u32),
+                SystemReg::ICC_EOIR1_EL1 => self.eoi(gicr, true, value as u32),
+                _ => return false,
+            }
+            true
+        }
+
+        pub fn read_sysreg(&self, gicr: &mut Redistributor, reg: SystemReg) -> Option<u64> {
+            let v = match reg {
+                SystemReg::ICC_IAR0_EL1 => self.ack(gicr, false).into(),
+                SystemReg::ICC_IAR1_EL1 => self.ack(gicr, true).into(),
+                _ => return None,
+            };
+            Some(v)
+        }
+
+        fn eoi(&self, gicr: &mut Redistributor, group1: bool, intid: u32) {
             if intid < 32 {
                 gicr.eoi(group1, intid);
                 return;
@@ -235,17 +159,17 @@ mod gicd {
             *v &= !(1 << (intid & 31));
         }
 
-        fn write32(&self, address: Register, value: u32) -> bool {
+        fn write32(&self, address: GicdRegister, value: u32) -> bool {
             assert!(address.0 & 3 == 0);
             match address {
-                Register::CTLR => {
+                GicdRegister::CTLR => {
                     let ctlr = GicdCtlr::from(value);
                     let mut state = self.state.lock();
                     let state = &mut *state;
                     state.enable_grp0 = ctlr.enable_grp0();
                     state.enable_grp1 = ctlr.enable_grp1();
                 }
-                r if Register::IGROUPR.contains(&r.0) => {
+                r if GicdRegister::IGROUPR.contains(&r.0) => {
                     let n = (r.0 & 0x7f) / 4;
                     if n != 0 {
                         if let Some(group) = self.state.lock().group.get_mut(n as usize) {
@@ -253,7 +177,7 @@ mod gicd {
                         }
                     }
                 }
-                r if Register::ISENABLER.contains(&r.0) => {
+                r if GicdRegister::ISENABLER.contains(&r.0) => {
                     let n = (r.0 & 0x7f) / 4;
                     if n != 0 {
                         if let Some(enable) = self.state.lock().enable.get_mut(n as usize) {
@@ -261,7 +185,7 @@ mod gicd {
                         }
                     }
                 }
-                r if Register::ICENABLER.contains(&r.0) => {
+                r if GicdRegister::ICENABLER.contains(&r.0) => {
                     let n = (r.0 & 0x7f) / 4;
                     if n != 0 {
                         if let Some(enable) = self.state.lock().enable.get_mut(n as usize) {
@@ -269,7 +193,7 @@ mod gicd {
                         }
                     }
                 }
-                r if Register::ICFGR.contains(&r.0) => {
+                r if GicdRegister::ICFGR.contains(&r.0) => {
                     let n = (r.0 & 0xff) / 4;
                     if n >= 2 {
                         if let Some(cfg) = self.state.lock().cfg.get_mut(n as usize) {
@@ -278,7 +202,7 @@ mod gicd {
                         }
                     }
                 }
-                r if Register::IPRIORITYR.contains(&r.0) => {
+                r if GicdRegister::IPRIORITYR.contains(&r.0) => {
                     let n = (r.0 & 0x3ff) / 4;
                     if n >= 8 {
                         if let Some(cfg) = self.state.lock().cfg.get_mut(n as usize) {
@@ -286,7 +210,7 @@ mod gicd {
                         }
                     }
                 }
-                r if Register::ISACTIVER.contains(&r.0) => {
+                r if GicdRegister::ISACTIVER.contains(&r.0) => {
                     let n = (r.0 & 0x7f) / 4;
                     if n != 0 {
                         if let Some(active) = self.state.lock().active.get_mut(n as usize) {
@@ -294,7 +218,7 @@ mod gicd {
                         }
                     }
                 }
-                r if Register::ICACTIVER.contains(&r.0) => {
+                r if GicdRegister::ICACTIVER.contains(&r.0) => {
                     let n = (r.0 & 0x7f) / 4;
                     if n != 0 {
                         if let Some(active) = self.state.lock().active.get_mut(n as usize) {
@@ -307,20 +231,20 @@ mod gicd {
             true
         }
 
-        fn read32(&self, address: Register) -> Option<u32> {
+        fn read32(&self, address: GicdRegister) -> Option<u32> {
             assert!(address.0 & 3 == 0);
             let v = match address {
-                Register::PIDR2 => {
+                GicdRegister::PIDR2 => {
                     // GICv3
                     3 << 4
                 }
-                Register::TYPER => GicdTyper::new()
+                GicdRegister::TYPER => GicdTyper::new()
                     .with_it_lines_number(31)
                     .with_id_bits(5)
                     .into(),
-                Register::IIDR => 0,
-                Register::TYPER2 => GicdTyper2::new().into(),
-                Register::CTLR => {
+                GicdRegister::IIDR => 0,
+                GicdRegister::TYPER2 => GicdTyper2::new().into(),
+                GicdRegister::CTLR => {
                     let state = self.state.lock();
                     GicdCtlr::new()
                         .with_enable_grp0(state.enable_grp0)
@@ -329,7 +253,7 @@ mod gicd {
                         .with_are(true)
                         .into()
                 }
-                r if Register::IGROUPR.contains(&r.0) => {
+                r if GicdRegister::IGROUPR.contains(&r.0) => {
                     let n = (r.0 & 0x7f) / 4;
                     self.state
                         .lock()
@@ -338,7 +262,9 @@ mod gicd {
                         .copied()
                         .unwrap_or(0)
                 }
-                r if Register::ICENABLER.contains(&r.0) || Register::ISENABLER.contains(&r.0) => {
+                r if GicdRegister::ICENABLER.contains(&r.0)
+                    || GicdRegister::ISENABLER.contains(&r.0) =>
+                {
                     let n = (r.0 & 0x7f) / 4;
                     self.state
                         .lock()
@@ -347,11 +273,11 @@ mod gicd {
                         .copied()
                         .unwrap_or(0)
                 }
-                r if Register::ICFGR.contains(&r.0) => {
+                r if GicdRegister::ICFGR.contains(&r.0) => {
                     let n = (r.0 & 0xff) / 4;
                     self.state.lock().cfg.get(n as usize).copied().unwrap_or(0)
                 }
-                r if Register::IPRIORITYR.contains(&r.0) => {
+                r if GicdRegister::IPRIORITYR.contains(&r.0) => {
                     let n = (r.0 & 0x3ff) / 4;
                     self.state
                         .lock()
@@ -360,7 +286,9 @@ mod gicd {
                         .copied()
                         .unwrap_or(0)
                 }
-                r if Register::ICACTIVER.contains(&r.0) || Register::ISACTIVER.contains(&r.0) => {
+                r if GicdRegister::ICACTIVER.contains(&r.0)
+                    || GicdRegister::ISACTIVER.contains(&r.0) =>
+                {
                     let n = (r.0 & 0x7f) / 4;
                     self.state
                         .lock()
@@ -369,7 +297,9 @@ mod gicd {
                         .copied()
                         .unwrap_or(0)
                 }
-                r if Register::ICPENDR.contains(&r.0) || Register::ISPENDR.contains(&r.0) => {
+                r if GicdRegister::ICPENDR.contains(&r.0)
+                    || GicdRegister::ISPENDR.contains(&r.0) =>
+                {
                     let n = (r.0 & 0x7f) / 4;
                     self.state
                         .lock()
@@ -383,10 +313,10 @@ mod gicd {
             Some(v)
         }
 
-        fn write64(&self, address: Register, value: u64) -> bool {
+        fn write64(&self, address: GicdRegister, value: u64) -> bool {
             assert!(address.0 & 7 == 0);
             match address {
-                r if Register::IROUTER.contains(&r.0) => {
+                r if GicdRegister::IROUTER.contains(&r.0) => {
                     let n = (r.0 & 0x1fff) / 8;
                     if n >= 32 {
                         if let Some(route) = self.state.lock().route.get_mut(n as usize) {
@@ -399,10 +329,10 @@ mod gicd {
             true
         }
 
-        fn read64(&self, address: Register) -> Option<u64> {
+        fn read64(&self, address: GicdRegister) -> Option<u64> {
             assert!(address.0 & 7 == 0);
             let v = match address {
-                r if Register::IROUTER.contains(&r.0) => {
+                r if GicdRegister::IROUTER.contains(&r.0) => {
                     let n = (r.0 & 0x1fff) / 8;
                     self.state
                         .lock()
@@ -422,7 +352,7 @@ mod gicd {
                 tracing::warn!(address, ?data, "gicd read unaligned access");
                 return;
             }
-            let address = Register(address as u16);
+            let address = GicdRegister(address as u16);
             let handled = match data.len() {
                 4 => {
                     if let Some(v) = self.read32(address) {
@@ -453,7 +383,7 @@ mod gicd {
                 tracing::warn!(address, ?data, "gicd write unaligned access");
                 return;
             }
-            let address = Register(address as u16);
+            let address = GicdRegister(address as u16);
             let handled = match data.len() {
                 4 => self.write32(address, u32::from_ne_bytes(data.try_into().unwrap())),
                 8 => self.write64(address, u64::from_ne_bytes(data.try_into().unwrap())),
@@ -467,99 +397,15 @@ mod gicd {
 }
 
 mod gicr {
-    use bitfield_struct::bitfield;
+    use aarch64defs::gic::GicrCtlr;
+    use aarch64defs::gic::GicrRdRegister;
+    use aarch64defs::gic::GicrSgiRegister;
+    use aarch64defs::gic::GicrTyper;
+    use aarch64defs::gic::GicrWaker;
     use inspect::Inspect;
-    use open_enum::open_enum;
-    use std::ops::Range;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
-
-    open_enum! {
-        enum RdRegister: u16 {
-            CTLR = 0x0000,
-            IIDR = 0x0004,
-            TYPER = 0x0008,     // 64 bit
-            STATUSR = 0x0010,
-            WAKER = 0x0014,
-            MPAMIDR = 0x0018,
-            PARTIDR = 0x001c,
-            SETLPIR = 0x0040,   // 64 bit
-            CLRLPIR = 0x0048,   // 64 bit
-            PROPBASER = 0x0070, // 64 bit
-            PENDBASER = 0x0078, // 64 bit
-            INVLPIR = 0x00A0,   // 64 bit
-            SYNCR = 0x00C0,     // 64 bit
-            PIDR2 = 0xffe8,
-        }
-    }
-
-    open_enum! {
-        enum SgiRegister: u16 {
-            IGROUPR0 = 0x0080,
-            ISENABLER0 = 0x0100,
-            ICENABLER0 = 0x0180,
-            ISPENDR0 = 0x0200,
-            ICPENDR0 = 0x0280,
-            ISACTIVER0 = 0x0300,
-            ICACTIVER0 = 0x0380,
-            IPRIORITYR0 = 0x0400, // 0x20
-            ICFGR0 = 0x0c00,
-            ICFGR1 = 0x0c04,
-            IGRPMODR0 = 0x0d00,
-        }
-    }
-
-    impl SgiRegister {
-        pub const IPRIORITYR: Range<u16> = Self::IPRIORITYR0.0..Self::IPRIORITYR0.0 + 0x20;
-    }
-
-    #[bitfield(u64)]
-    pub struct GicrTyper {
-        pub plpis: bool,
-        pub vlpis: bool,
-        pub dirty: bool,
-        pub direct_lpi: bool,
-        pub last: bool,
-        pub dpgs: bool,
-        pub mpam: bool,
-        pub rvpeid: bool,
-        pub processor_number: u16,
-        #[bits(2)]
-        pub common_lpi_aff: u8,
-        pub vsgi: bool,
-        #[bits(5)]
-        pub ppi_num: u8,
-        pub affinity_value: u32,
-    }
-
-    #[bitfield(u32)]
-    pub struct GicrCtlr {
-        pub enable_lpis: bool,
-        pub ces: bool,
-        pub ir: bool,
-        pub rwp: bool,
-        #[bits(20)]
-        _res_4_23: u32,
-        pub dpg0: bool,
-        pub dpg1ns: bool,
-        pub dpg1s: bool,
-        #[bits(4)]
-        _res_27_30: u32,
-        pub uwp: bool,
-    }
-
-    #[bitfield(u32)]
-    pub struct GicrWaker {
-        /// Implementation defined.
-        pub bit_0: bool,
-        pub processor_sleep: bool,
-        pub children_asleep: bool,
-        #[bits(28)]
-        _res_3_30: u32,
-        /// Implementation defined.
-        pub bit_31: bool,
-    }
 
     #[derive(Debug, Inspect)]
     pub struct Redistributor {
@@ -606,7 +452,7 @@ mod gicr {
             }
 
             if address & 0x10000 == 0 {
-                let address = RdRegister(address as u16);
+                let address = GicrRdRegister(address as u16);
                 let handled = match data.len() {
                     4 => {
                         if let Some(v) = self.rd_read32(address) {
@@ -631,7 +477,7 @@ mod gicr {
                     tracelimit::warn_ratelimited!(?address, "unsupported gicr rd register read");
                 }
             } else {
-                let address = SgiRegister(address as u16);
+                let address = GicrSgiRegister(address as u16);
                 let handled = match data.len() {
                     4 => {
                         if let Some(v) = self.sgi_read32(address) {
@@ -661,7 +507,7 @@ mod gicr {
             }
 
             if address & 0x10000 == 0 {
-                let address = RdRegister(address as u16);
+                let address = GicrRdRegister(address as u16);
                 let handled = match data.len() {
                     4 => {
                         let data = u32::from_ne_bytes(data.try_into().unwrap());
@@ -681,7 +527,7 @@ mod gicr {
                     );
                 }
             } else {
-                let address = SgiRegister(address as u16);
+                let address = GicrSgiRegister(address as u16);
                 let handled = match data.len() {
                     4 => {
                         let data = u32::from_ne_bytes(data.try_into().unwrap());
@@ -699,14 +545,14 @@ mod gicr {
             }
         }
 
-        fn rd_read32(&mut self, address: RdRegister) -> Option<u32> {
+        fn rd_read32(&mut self, address: GicrRdRegister) -> Option<u32> {
             let v = match address {
-                RdRegister::PIDR2 => {
+                GicrRdRegister::PIDR2 => {
                     // GICv3
                     3 << 4
                 }
-                RdRegister::CTLR => GicrCtlr::new().into(),
-                RdRegister::WAKER => GicrWaker::new()
+                GicrRdRegister::CTLR => GicrCtlr::new().into(),
+                GicrRdRegister::WAKER => GicrWaker::new()
                     .with_processor_sleep(self.sleep)
                     .with_children_asleep(self.sleep)
                     .into(),
@@ -716,10 +562,10 @@ mod gicr {
             Some(v)
         }
 
-        fn rd_write32(&mut self, address: RdRegister, data: u32) -> bool {
+        fn rd_write32(&mut self, address: GicrRdRegister, data: u32) -> bool {
             match address {
-                RdRegister::CTLR => {}
-                RdRegister::WAKER => {
+                GicrRdRegister::CTLR => {}
+                GicrRdRegister::WAKER => {
                     let v = GicrWaker::from(data);
                     self.sleep = v.processor_sleep();
                 }
@@ -729,32 +575,32 @@ mod gicr {
             true
         }
 
-        fn rd_read64(&mut self, address: RdRegister) -> Option<u64> {
+        fn rd_read64(&mut self, address: GicrRdRegister) -> Option<u64> {
             let v = match address {
-                RdRegister::TYPER => GicrTyper::new().with_last(true).into(),
+                GicrRdRegister::TYPER => GicrTyper::new().with_last(true).into(),
                 _ => return None,
             };
             Some(v)
         }
 
-        fn rd_write64(&mut self, _address: RdRegister, _data: u64) -> bool {
+        fn rd_write64(&mut self, _address: GicrRdRegister, _data: u64) -> bool {
             false
         }
 
-        fn sgi_read32(&mut self, address: SgiRegister) -> Option<u32> {
+        fn sgi_read32(&mut self, address: GicrSgiRegister) -> Option<u32> {
             let v = match address {
-                SgiRegister::IGROUPR0 => self.group,
-                SgiRegister::ICACTIVER0 | SgiRegister::ISACTIVER0 => self.active,
-                SgiRegister::ICENABLER0 | SgiRegister::ISENABLER0 => self.enable,
-                SgiRegister::ICPENDR0 | SgiRegister::ISPENDR0 => {
+                GicrSgiRegister::IGROUPR0 => self.group,
+                GicrSgiRegister::ICACTIVER0 | GicrSgiRegister::ISACTIVER0 => self.active,
+                GicrSgiRegister::ICENABLER0 | GicrSgiRegister::ISENABLER0 => self.enable,
+                GicrSgiRegister::ICPENDR0 | GicrSgiRegister::ISPENDR0 => {
                     self.shared.pending.load(Ordering::Relaxed)
                 }
-                SgiRegister::ICFGR0 => {
+                GicrSgiRegister::ICFGR0 => {
                     // SGIs are always edge triggered.
                     0xaaaaaaaa
                 }
-                SgiRegister::ICFGR1 => self.ppi_cfg,
-                r if SgiRegister::IPRIORITYR.contains(&r.0) => {
+                GicrSgiRegister::ICFGR1 => self.ppi_cfg,
+                r if GicrSgiRegister::IPRIORITYR.contains(&r.0) => {
                     let n = (r.0 & 0x1f) / 4;
                     self.priority[n as usize]
                 }
@@ -764,18 +610,18 @@ mod gicr {
             Some(v)
         }
 
-        fn sgi_write32(&mut self, address: SgiRegister, data: u32) -> bool {
+        fn sgi_write32(&mut self, address: GicrSgiRegister, data: u32) -> bool {
             match address {
-                SgiRegister::IGROUPR0 => self.group = data,
-                SgiRegister::ISACTIVER0 => self.active |= data,
-                SgiRegister::ICACTIVER0 => self.active &= !data,
-                SgiRegister::ISENABLER0 => self.enable |= data,
-                SgiRegister::ICENABLER0 => self.enable &= !data,
-                SgiRegister::ICFGR0 => {
+                GicrSgiRegister::IGROUPR0 => self.group = data,
+                GicrSgiRegister::ISACTIVER0 => self.active |= data,
+                GicrSgiRegister::ICACTIVER0 => self.active &= !data,
+                GicrSgiRegister::ISENABLER0 => self.enable |= data,
+                GicrSgiRegister::ICENABLER0 => self.enable &= !data,
+                GicrSgiRegister::ICFGR0 => {
                     // Cannot change trigger mode for SGIs.
                 }
-                SgiRegister::ICFGR1 => self.ppi_cfg = data,
-                r if SgiRegister::IPRIORITYR.contains(&r.0) => {
+                GicrSgiRegister::ICFGR1 => self.ppi_cfg = data,
+                r if GicrSgiRegister::IPRIORITYR.contains(&r.0) => {
                     let n = (r.0 & 0x1f) / 4;
                     self.priority[n as usize] = data;
                 }

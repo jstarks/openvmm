@@ -142,14 +142,8 @@ impl AcpiTopology for Aarch64Topology {
         for vp in topology.vps_arch() {
             let uid = vp.base.vp_index.index() + 1;
 
-            /// ACPI specifies that just the MPIDR affinity fields should be included.
-            const MPIDR_EL1_AFF_MASK: aarch64defs::MpidrEl1 = aarch64defs::MpidrEl1::new()
-                .with_aff0(0xff)
-                .with_aff1(0xff)
-                .with_aff2(0xff)
-                .with_aff3(0xff);
-
-            let mpidr = u64::from(vp.mpidr) & u64::from(MPIDR_EL1_AFF_MASK);
+            // ACPI specifies that just the MPIDR affinity fields should be included.
+            let mpidr = u64::from(vp.mpidr) & u64::from(aarch64defs::MpidrEl1::AFFINITY_MASK);
             let gicr = GICR_BASE + vp.base.vp_index.index() as u64 * GICR_SIZE;
             madt.extend_from_slice(acpi_spec::madt::MadtGicc::new(uid, mpidr, gicr).as_bytes());
         }

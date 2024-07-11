@@ -605,6 +605,14 @@ pub struct MpidrEl1 {
     pub res0_40_63: u32,
 }
 
+impl MpidrEl1 {
+    pub const AFFINITY_MASK: Self = Self::new()
+        .with_aff0(0xff)
+        .with_aff1(0xff)
+        .with_aff2(0xff)
+        .with_aff3(0xff);
+}
+
 open_enum! {
     /// aarch64 translation granule size for TTBR0_EL1
     pub enum TranslationGranule0: u64 {

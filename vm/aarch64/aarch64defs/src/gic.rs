@@ -153,7 +153,10 @@ pub struct GicrTyper {
     pub vsgi: bool,
     #[bits(5)]
     pub ppi_num: u8,
-    pub affinity_value: u32,
+    pub aff0: u8,
+    pub aff1: u8,
+    pub aff2: u8,
+    pub aff3: u8,
 }
 
 #[bitfield(u32)]

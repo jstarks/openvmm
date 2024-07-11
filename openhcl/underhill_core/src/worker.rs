@@ -1107,10 +1107,11 @@ fn new_aarch64_topology(
     TopologyBuilder::new_aarch64(gic)
         .vps_per_socket(cpus.len() as u32)
         .build_with_vp_info(cpus.iter().enumerate().map(|(vp_index, cpu)| {
-            let mpidr = (aarch64defs::MpidrEl1::from(cpu.reg)
-                & aarch64defs::MpidrEl1::AFFINITY_MASK)
-                .with_res1_31(true)
-                .with_u(cpus.len() == 1);
+            let mpidr = aarch64defs::MpidrEl1::from(
+                cpu.reg & u64::from(aarch64defs::MpidrEl1::AFFINITY_MASK),
+            )
+            .with_res1_31(true)
+            .with_u(cpus.len() == 1);
             vm_topology::processor::aarch64::Aarch64VpInfo {
                 base: VpInfo {
                     vp_index: VpIndex::new(vp_index as u32),

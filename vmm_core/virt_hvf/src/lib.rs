@@ -21,6 +21,7 @@ use aarch64defs::Cpsr64;
 use aarch64defs::ExceptionClass;
 use aarch64defs::IssDataAbort;
 use aarch64defs::IssSystem;
+use aarch64defs::MpidrEl1;
 use abi::HvfError;
 use anyhow::Context;
 use guestmem::GuestMemory;
@@ -44,18 +45,23 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::task::ready;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 use thiserror::Error;
 use virt::aarch64::vm::AccessVmState;
 use virt::aarch64::Aarch64PartitionCapabilities;
 use virt::io::CpuIo;
+use virt::state::StateElement;
+use virt::vp::AccessVpState;
 use virt::BindProcessor;
 use virt::NeedsYield;
+use virt::Processor;
 use virt::StopVp;
 use virt::VpHaltReason;
 use virt::VpIndex;
-use virt::VpInfo;
 use virt_support_gic as gic;
+use vm_topology::processor::aarch64::Aarch64VpInfo;
 use vmcore::interrupt::Interrupt;
 use vmcore::synic::GuestEventPort;
 use vmcore::vmtime::VmTimeAccess;
@@ -125,8 +131,8 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
         let gicrs = self
             .config
             .processor_topology
-            .vps()
-            .map(|_| gicd.add_redistributor())
+            .vps_arch()
+            .map(|vp_info| gicd.add_redistributor(vp_info.mpidr.into(), true))
             .collect::<Vec<_>>();
 
         let inner = Arc::new(HvfPartitionInner {
@@ -134,11 +140,14 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
             vps: self
                 .config
                 .processor_topology
-                .vps()
-                .map(|_| HvfVpInner {
+                .vps_arch()
+                .map(|vp_info| HvfVpInner {
                     needs_yield: NeedsYield::new(),
                     vcpu: (!0).into(),
                     message_queues: hv1_emulator::message_queues::MessageQueues::new(),
+                    waker: Default::default(),
+                    vp_info,
+                    cpu_on: Default::default(),
                 })
                 .collect(),
             gicd,
@@ -161,8 +170,8 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
         {
             vps.push(HvfProcessorBinder {
                 partition: inner.clone(),
+                vp_index: vp.vp_index,
                 state: Some(VpInitState {
-                    info: vp.base,
                     gicr,
                     hv1,
                     vmtime: self
@@ -241,7 +250,7 @@ impl virt::irqcon::ControlGic for HvfPartitionInner {
     fn set_spi_irq(&self, irq_id: u32, high: bool) {
         if let Some(vp) = self.gicd.set_pending(irq_id, high) {
             if let Some(vp) = self.vps.get(vp as usize) {
-                vp.cancel_run();
+                vp.wake();
             }
         }
     }
@@ -254,7 +263,7 @@ impl virt::Synic for HvfPartition {
                 .message_queues
                 .enqueue_message(sint, &HvMessage::new(HvMessageType(typ), 0, payload))
             {
-                vp.cancel_run();
+                vp.wake();
             }
         }
     }
@@ -292,7 +301,7 @@ impl GuestEventPort for HvfEventPort {
                         &mut |vector, _auto_eoi| {
                             if partition.gicd.raise_ppi(vp, vector) {
                                 tracing::debug!(vector, "ppi from event");
-                                partition.vps[vp.index() as usize].cancel_run();
+                                partition.vps[vp.index() as usize].wake();
                             }
                         },
                     );
@@ -420,9 +429,19 @@ impl HvfHv1State {
 struct HvfVpInner {
     #[inspect(skip)]
     needs_yield: NeedsYield,
+    vp_info: Aarch64VpInfo,
     #[inspect(skip)]
     vcpu: AtomicU64,
     message_queues: hv1_emulator::message_queues::MessageQueues,
+    #[inspect(skip)]
+    waker: RwLock<Option<Waker>>,
+    cpu_on: Mutex<Option<CpuOnState>>,
+}
+
+#[derive(Debug, Inspect)]
+struct CpuOnState {
+    pc: u64,
+    x0: u64,
 }
 
 impl HvfVpInner {
@@ -433,16 +452,22 @@ impl HvfVpInner {
             unsafe { abi::hv_vcpus_exit(&vcpu, 1) }.chk().unwrap();
         }
     }
+
+    fn wake(&self) {
+        if let Some(waker) = &*self.waker.read() {
+            waker.wake_by_ref();
+        }
+    }
 }
 
 pub struct HvfProcessorBinder {
     partition: Arc<HvfPartitionInner>,
+    vp_index: VpIndex,
     state: Option<VpInitState>,
 }
 
 #[derive(Inspect)]
 struct VpInitState {
-    info: VpInfo,
     gicr: gic::Redistributor,
     hv1: ProcessorSynic,
     vmtime: VmTimeAccess,
@@ -457,29 +482,40 @@ impl BindProcessor for HvfProcessorBinder {
     fn bind(&mut self) -> Result<Self::Processor<'_>, Self::Error> {
         let mut vcpu = HvfVcpu::new()?;
 
+        let state = self.state.take().unwrap();
+        let inner = &self.partition.vps[self.vp_index.index() as usize];
+
         // Initialize configuration registers.
         // Set 40 bit physical address width.
         vcpu.set_sys_reg(abi::HvSysReg::ID_AA64MMFR0_EL1, 2)?;
         // Enable GICv3 system registers.
         vcpu.set_sys_reg(abi::HvSysReg::ID_AA64PFR0_EL1, 1 << 24)?;
-
-        let state = self.state.take().unwrap();
-        let inner = &self.partition.vps[state.info.vp_index.index() as usize];
+        // Set the MPIDR.
+        vcpu.set_sys_reg(abi::HvSysReg::MPIDR_EL1, inner.vp_info.mpidr.into())?;
 
         // Store the vcpu index in the partition.
         inner.vcpu.store(vcpu.vcpu, Ordering::Relaxed);
 
-        let vp = HvfProcessor {
-            info: state.info,
+        let mut vp = HvfProcessor {
             partition: &self.partition,
             inner,
             vcpu,
             wfi: false,
+            on: inner.vp_info.base.vp_index.is_bsp(),
             gicr: state.gicr,
             hv1: state.hv1,
             vmtime: state.vmtime,
             gicr_range: state.gicr_range,
         };
+
+        // Set initial register state.
+        let mut state = vp.access_state(Vtl::Vtl0);
+        state
+            .set_registers(&StateElement::at_reset(
+                &self.partition.caps,
+                &inner.vp_info,
+            ))
+            .unwrap();
 
         Ok(vp)
     }
@@ -489,7 +525,6 @@ impl BindProcessor for HvfProcessorBinder {
 pub struct HvfProcessor<'a> {
     #[inspect(skip)]
     partition: &'a HvfPartitionInner,
-    info: VpInfo,
     #[inspect(flatten)]
     inner: &'a HvfVpInner,
     gicr: gic::Redistributor,
@@ -500,6 +535,7 @@ pub struct HvfProcessor<'a> {
     wfi: bool,
     #[inspect(debug)]
     gicr_range: Range<u64>,
+    on: bool,
 }
 
 #[derive(Debug, Inspect)]
@@ -675,7 +711,30 @@ impl HvfProcessor<'_> {
     fn psci64(&mut self, x0: u32) -> Result<(), VpHaltReason<Error>> {
         let r = match PsciCall64(x0) {
             PsciCall64::CPU_SUSPEND => PsciError::INVALID_PARAMETERS.0,
-            PsciCall64::CPU_ON => PsciError::INVALID_PARAMETERS.0,
+            PsciCall64::CPU_ON => {
+                let target_cpu = self.vcpu.gp(1).unwrap();
+                let entry_point = self.vcpu.gp(2).unwrap();
+                let context_id = self.vcpu.gp(3).unwrap();
+                if let Some(vp) = self.partition.vps.iter().find(|vp| {
+                    u64::from(vp.vp_info.mpidr) & u64::from(MpidrEl1::AFFINITY_MASK) == target_cpu
+                }) {
+                    let mut cpu_on = vp.cpu_on.lock();
+                    if cpu_on.is_some() {
+                        PsciError::ON_PENDING.0
+                    } else {
+                        // TODO check already on
+                        *cpu_on = Some(CpuOnState {
+                            pc: entry_point,
+                            x0: context_id,
+                        });
+                        drop(cpu_on);
+                        vp.wake();
+                        PsciError::SUCCESS.0
+                    }
+                } else {
+                    PsciError::INVALID_PARAMETERS.0
+                }
+            }
             PsciCall64::AFFINITY_INFO => PsciError::INVALID_PARAMETERS.0,
             call => {
                 tracelimit::warn_ratelimited!(?call, "ignoring unknown PSCI64 call");
@@ -687,7 +746,7 @@ impl HvfProcessor<'_> {
     }
 }
 
-impl<'p> virt::Processor for HvfProcessor<'p> {
+impl<'p> Processor for HvfProcessor<'p> {
     type Error = Error;
     type RunVpError = Error;
 
@@ -705,73 +764,97 @@ impl<'p> virt::Processor for HvfProcessor<'p> {
 
     async fn run_vp(
         &mut self,
-        mut stop: StopVp<'_>,
+        stop: StopVp<'_>,
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason<Error>> {
+        let vp_index = self.inner.vp_info.base.vp_index;
+        let mut last_waker = None;
         loop {
             self.inner.needs_yield.maybe_yield().await;
 
-            stop.check()?;
+            poll_fn(|cx| loop {
+                stop.check()?;
 
-            let vp_index = self.info.vp_index;
-
-            self.hv1
-                .request_sint_readiness(self.inner.message_queues.pending_sints());
-
-            let ref_time_now = self.vmtime.now().as_100ns();
-            let (ready_sints, next_ref_time) = self.hv1.scan(
-                ref_time_now,
-                &self.partition.guest_memory,
-                &mut |ppi, _auto_eoi| {
-                    tracing::debug!(ppi, "ppi from message");
-                    self.gicr.raise(ppi);
-                },
-            );
-
-            if let Some(next_ref_time) = next_ref_time {
-                // Convert from reference timer basis to vmtime basis via
-                // difference of programmed timer and current reference time.
-                const NUM_100NS_IN_SEC: u64 = 10 * 1000 * 1000;
-                let ref_diff = next_ref_time.saturating_sub(ref_time_now);
-                let ref_duration = Duration::new(
-                    ref_diff / NUM_100NS_IN_SEC,
-                    (ref_diff % NUM_100NS_IN_SEC) as u32 * 100,
-                );
-                let timeout = self.vmtime.now().wrapping_add(ref_duration);
-                self.vmtime.set_timeout_if_before(timeout);
-            }
-
-            if ready_sints != 0 {
-                self.deliver_sints(ready_sints);
-                continue;
-            }
-
-            if self.partition.gicd.irq_pending(&mut self.gicr) {
-                // SAFETY: no requirements.
-                unsafe {
-                    abi::hv_vcpu_set_pending_interrupt(
-                        self.vcpu.vcpu,
-                        abi::HvInterruptType::IRQ,
-                        true,
-                    )
+                if !last_waker
+                    .as_ref()
+                    .map_or(false, |waker| cx.waker().will_wake(waker))
+                {
+                    last_waker = Some(cx.waker().clone());
+                    self.inner.waker.write().clone_from(&last_waker);
                 }
-                .chk()
-                .map_err(|err| VpHaltReason::Hypervisor(err.into()))?;
-                self.wfi = false;
-            }
 
-            if self.wfi {
-                self.vmtime.set_timeout_if_before(
-                    self.vmtime.now().wrapping_add(Duration::from_millis(2)),
+                if let Some(cpu_on) = self.inner.cpu_on.lock().take() {
+                    if self.on {
+                        todo!("block this");
+                    } else {
+                        tracing::debug!(x0 = cpu_on.x0, pc = cpu_on.pc, "cpu on");
+                        self.vcpu.set_gp(0, cpu_on.x0).unwrap();
+                        self.vcpu.set_reg(abi::HvReg::PC, cpu_on.pc).unwrap();
+                        self.on = true;
+                    }
+                }
+
+                if !self.on {
+                    break Poll::Pending;
+                }
+
+                self.hv1
+                    .request_sint_readiness(self.inner.message_queues.pending_sints());
+
+                let ref_time_now = self.vmtime.now().as_100ns();
+                let (ready_sints, next_ref_time) = self.hv1.scan(
+                    ref_time_now,
+                    &self.partition.guest_memory,
+                    &mut |ppi, _auto_eoi| {
+                        tracing::debug!(ppi, "ppi from message");
+                        self.gicr.raise(ppi);
+                    },
                 );
-                let timeout = poll_fn(|cx| {
+
+                if let Some(next_ref_time) = next_ref_time {
+                    // Convert from reference timer basis to vmtime basis via
+                    // difference of programmed timer and current reference time.
+                    const NUM_100NS_IN_SEC: u64 = 10 * 1000 * 1000;
+                    let ref_diff = next_ref_time.saturating_sub(ref_time_now);
+                    let ref_duration = Duration::new(
+                        ref_diff / NUM_100NS_IN_SEC,
+                        (ref_diff % NUM_100NS_IN_SEC) as u32 * 100,
+                    );
+                    let timeout = self.vmtime.now().wrapping_add(ref_duration);
+                    self.vmtime.set_timeout_if_before(timeout);
+                }
+
+                if ready_sints != 0 {
+                    self.deliver_sints(ready_sints);
+                    continue;
+                }
+
+                if self.partition.gicd.irq_pending(&mut self.gicr) {
+                    // SAFETY: no requirements.
+                    unsafe {
+                        abi::hv_vcpu_set_pending_interrupt(
+                            self.vcpu.vcpu,
+                            abi::HvInterruptType::IRQ,
+                            true,
+                        )
+                    }
+                    .chk()
+                    .map_err(|err| VpHaltReason::Hypervisor(err.into()))?;
+                    self.wfi = false;
+                }
+
+                if self.wfi {
+                    self.vmtime.set_timeout_if_before(
+                        self.vmtime.now().wrapping_add(Duration::from_millis(2)),
+                    );
                     ready!(self.vmtime.poll_timeout(cx));
                     self.gicr.raise(PPI_VTIMER);
-                    ().into()
-                });
-                stop.until_stop(timeout).await?;
-                continue;
-            }
+                    continue;
+                }
+
+                break Poll::Ready(Result::<_, VpHaltReason<_>>::Ok(()));
+            })
+            .await?;
 
             if !self.gicr.is_pending_or_active(PPI_VTIMER) {
                 // SAFETY: no requirements.

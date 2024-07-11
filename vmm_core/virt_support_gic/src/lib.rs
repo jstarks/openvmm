@@ -17,6 +17,7 @@ mod gicd {
     use aarch64defs::gic::GicdRegister;
     use aarch64defs::gic::GicdTyper;
     use aarch64defs::gic::GicdTyper2;
+    use aarch64defs::MpidrEl1;
     use aarch64defs::SystemReg;
     use inspect::Inspect;
     use parking_lot::Mutex;
@@ -28,7 +29,7 @@ mod gicd {
         state: Mutex<DistributorState>,
         max_spi_intid: u32,
         #[inspect(skip)]
-        gicr: Arc<SharedState>,
+        gicr: Vec<Arc<SharedState>>,
     }
 
     #[derive(Debug, Inspect)]
@@ -71,12 +72,23 @@ mod gicd {
             }
         }
 
-        pub fn add_redistributor(&mut self) -> Redistributor {
-            Redistributor::new(self.gicr.clone())
+        pub fn add_redistributor(&mut self, mpidr: u64, last: bool) -> Redistributor {
+            let mpidr = mpidr & u64::from(MpidrEl1::AFFINITY_MASK);
+            let state = Arc::new(SharedState {
+                pending: 0.into(),
+                mpidr,
+            });
+            let gicr = Redistributor::new(self.gicr.len(), last, state.clone());
+            self.gicr.push(state);
+            gicr
         }
 
-        pub fn raise_ppi(&self, _vp: VpIndex, intid: u32) -> bool {
-            self.gicr.raise(intid)
+        pub fn raise_ppi(&self, vp: VpIndex, intid: u32) -> bool {
+            if let Some(gicr) = self.gicr.get(vp.index() as usize) {
+                gicr.raise(intid)
+            } else {
+                false
+            }
         }
 
         pub fn set_pending(&self, intid: u32, pending: bool) -> Option<u32> {
@@ -98,6 +110,9 @@ mod gicd {
             if gicr.irq_pending() {
                 return true;
             }
+            if gicr.index != 0 {
+                return false;
+            }
             let state = self.state.lock();
             state
                 .pending
@@ -110,6 +125,9 @@ mod gicd {
         pub fn ack(&self, gicr: &mut Redistributor, group1: bool) -> u32 {
             if let Some(intid) = gicr.ack(group1) {
                 return intid;
+            }
+            if gicr.index != 0 {
+                return 1023;
             }
             let mut state = self.state.lock();
             let state = &mut *state;
@@ -152,6 +170,9 @@ mod gicd {
         fn eoi(&self, gicr: &mut Redistributor, group1: bool, intid: u32) {
             if intid < 32 {
                 gicr.eoi(group1, intid);
+                return;
+            }
+            if gicr.index != 0 {
                 return;
             }
             tracing::debug!(intid, "gicd eoi");
@@ -402,6 +423,7 @@ mod gicr {
     use aarch64defs::gic::GicrSgiRegister;
     use aarch64defs::gic::GicrTyper;
     use aarch64defs::gic::GicrWaker;
+    use aarch64defs::MpidrEl1;
     use inspect::Inspect;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::Ordering;
@@ -409,7 +431,8 @@ mod gicr {
 
     #[derive(Debug, Inspect)]
     pub struct Redistributor {
-        shared: Arc<SharedState>,
+        pub(crate) shared: Arc<SharedState>,
+        pub(crate) index: usize,
         active: u32,
         group: u32,
         enable: u32,
@@ -417,11 +440,13 @@ mod gicr {
         #[inspect(iter_by_index)]
         priority: [u32; 8],
         sleep: bool,
+        last: bool,
     }
 
-    #[derive(Default, Debug, Inspect)]
-    pub struct SharedState {
-        pending: AtomicU32,
+    #[derive(Debug, Inspect)]
+    pub(crate) struct SharedState {
+        pub(crate) pending: AtomicU32,
+        pub(crate) mpidr: u64,
     }
 
     impl SharedState {
@@ -432,8 +457,9 @@ mod gicr {
     }
 
     impl Redistributor {
-        pub(crate) fn new(shared: Arc<SharedState>) -> Self {
+        pub(crate) fn new(index: usize, last: bool, shared: Arc<SharedState>) -> Self {
             Self {
+                index,
                 shared,
                 active: 0,
                 group: 0,
@@ -441,6 +467,7 @@ mod gicr {
                 ppi_cfg: 0,
                 priority: [0; 8],
                 sleep: true,
+                last,
             }
         }
 
@@ -576,8 +603,15 @@ mod gicr {
         }
 
         fn rd_read64(&mut self, address: GicrRdRegister) -> Option<u64> {
+            let mpidr = MpidrEl1::from(self.shared.mpidr);
             let v = match address {
-                GicrRdRegister::TYPER => GicrTyper::new().with_last(true).into(),
+                GicrRdRegister::TYPER => GicrTyper::new()
+                    .with_aff0(mpidr.aff0())
+                    .with_aff1(mpidr.aff1())
+                    .with_aff2(mpidr.aff2())
+                    .with_aff3(mpidr.aff3())
+                    .with_last(self.last)
+                    .into(),
                 _ => return None,
             };
             Some(v)

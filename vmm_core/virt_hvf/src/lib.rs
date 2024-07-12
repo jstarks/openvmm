@@ -12,11 +12,10 @@ mod hypercall;
 mod vp_state;
 
 use crate::hypercall::HvfHypercallHandler;
-use aarch64defs::psci::PsciCall32;
-use aarch64defs::psci::PsciCall64;
+use aarch64defs::psci::FastCall;
+use aarch64defs::psci::PsciCall;
 use aarch64defs::psci::PsciError;
-use aarch64defs::psci::PSCI32;
-use aarch64defs::psci::PSCI64;
+use aarch64defs::psci::PSCI;
 use aarch64defs::Cpsr64;
 use aarch64defs::ExceptionClass;
 use aarch64defs::IssDataAbort;
@@ -667,54 +666,34 @@ impl HvfProcessor<'_> {
             });
     }
 
-    fn psci32(&mut self, x0: u32) -> Result<(), VpHaltReason<Error>> {
-        let r = match PsciCall32(x0) {
-            PsciCall32::PSCI_VERSION => (1 << 16) | 0,
-            PsciCall32::PSCI_FEATURES => {
-                let feature_bits = match self.vcpu.gp(1).unwrap() as u32 {
-                    v if PSCI32.contains(&v) => match PsciCall32(v) {
-                        PsciCall32::CPU_SUSPEND => Some(0),
-                        PsciCall32::CPU_ON => Some(0),
-                        PsciCall32::CPU_OFF => Some(0),
-                        PsciCall32::AFFINITY_INFO => Some(0),
-                        PsciCall32::SYSTEM_OFF => Some(0),
-                        PsciCall32::SYSTEM_RESET => Some(0),
-                        PsciCall32::PSCI_FEATURES => Some(0),
-                        _ => None,
-                    },
-                    v if PSCI64.contains(&v) => match PsciCall64(v) {
-                        PsciCall64::CPU_SUSPEND => Some(0),
-                        PsciCall64::CPU_ON => Some(0),
-                        PsciCall64::AFFINITY_INFO => Some(0),
-                        _ => None,
-                    },
+    fn psci(&mut self, fc: FastCall) -> Result<(), VpHaltReason<Error>> {
+        let mask = if fc.smc64() {
+            u64::MAX
+        } else {
+            u32::MAX as u64
+        };
+        let r = match PsciCall(fc.with_smc64(false).with_hint(false)) {
+            PsciCall::PSCI_VERSION => (1 << 16) | 0,
+            PsciCall::PSCI_FEATURES => {
+                let feature_bits = match PsciCall(
+                    FastCall::from(self.vcpu.gp(1).unwrap() as u32).with_smc64(false),
+                ) {
+                    PsciCall::CPU_SUSPEND => Some(0),
+                    PsciCall::CPU_ON => Some(0),
+                    PsciCall::CPU_OFF => Some(0),
+                    PsciCall::AFFINITY_INFO => Some(0),
+                    PsciCall::SYSTEM_OFF => Some(0),
+                    PsciCall::SYSTEM_RESET => Some(0),
+                    PsciCall::PSCI_FEATURES => Some(0),
                     _ => None,
                 };
                 feature_bits.unwrap_or(PsciError::NOT_SUPPORTED.0)
             }
-            PsciCall32::CPU_SUSPEND => PsciError::INVALID_PARAMETERS.0,
-            PsciCall32::CPU_ON => PsciError::INVALID_PARAMETERS.0,
-            PsciCall32::CPU_OFF => PsciError::DENIED.0,
-            PsciCall32::AFFINITY_INFO => PsciError::INVALID_PARAMETERS.0,
-            PsciCall32::SYSTEM_RESET => return Err(VpHaltReason::Reset),
-            PsciCall32::SYSTEM_OFF => return Err(VpHaltReason::PowerOff),
-            PsciCall32::MIGRATE_INFO_TYPE => PsciError::NOT_SUPPORTED.0,
-            call => {
-                tracelimit::warn_ratelimited!(?call, "ignoring unknown PSCI32 call");
-                PsciError::NOT_SUPPORTED.0
-            }
-        };
-        self.vcpu.set_gp(0, r as u64).expect("BUGBUG");
-        Ok(())
-    }
-
-    fn psci64(&mut self, x0: u32) -> Result<(), VpHaltReason<Error>> {
-        let r = match PsciCall64(x0) {
-            PsciCall64::CPU_SUSPEND => PsciError::INVALID_PARAMETERS.0,
-            PsciCall64::CPU_ON => {
-                let target_cpu = self.vcpu.gp(1).unwrap();
-                let entry_point = self.vcpu.gp(2).unwrap();
-                let context_id = self.vcpu.gp(3).unwrap();
+            PsciCall::CPU_SUSPEND => PsciError::INVALID_PARAMETERS.0,
+            PsciCall::CPU_ON => {
+                let target_cpu = self.vcpu.gp(1).unwrap() & mask;
+                let entry_point = self.vcpu.gp(2).unwrap() & mask;
+                let context_id = self.vcpu.gp(3).unwrap() & mask;
                 if let Some(vp) = self.partition.vps.iter().find(|vp| {
                     u64::from(vp.vp_info.mpidr) & u64::from(MpidrEl1::AFFINITY_MASK) == target_cpu
                 }) {
@@ -735,9 +714,13 @@ impl HvfProcessor<'_> {
                     PsciError::INVALID_PARAMETERS.0
                 }
             }
-            PsciCall64::AFFINITY_INFO => PsciError::INVALID_PARAMETERS.0,
+            PsciCall::CPU_OFF => PsciError::DENIED.0,
+            PsciCall::AFFINITY_INFO => PsciError::INVALID_PARAMETERS.0,
+            PsciCall::SYSTEM_RESET => return Err(VpHaltReason::Reset),
+            PsciCall::SYSTEM_OFF => return Err(VpHaltReason::PowerOff),
+            PsciCall::MIGRATE_INFO_TYPE => PsciError::NOT_SUPPORTED.0,
             call => {
-                tracelimit::warn_ratelimited!(?call, "ignoring unknown PSCI64 call");
+                tracelimit::warn_ratelimited!(?call, "ignoring unknown PSCI32 call");
                 PsciError::NOT_SUPPORTED.0
             }
         };
@@ -1010,41 +993,47 @@ impl<'p> Processor for HvfProcessor<'p> {
                             }
                             advance(&mut self.vcpu);
                         }
-                        ExceptionClass::HVC => {
+                        ec @ (ExceptionClass::HVC | ExceptionClass::SMC) => {
+                            // HVC automatically advances pc.
+                            let mut advance_pc = ec == ExceptionClass::SMC;
                             match exception.syndrome.iss() as u16 {
                                 0 => {
-                                    let x0 = self.vcpu.gp(0).expect("BUGBUG");
+                                    let x0 = self.vcpu.gp(0).expect("BUGBUG") as u32;
+                                    let fc = FastCall::from(x0);
                                     let handled = 'handle: {
-                                        match x0 as u32 {
-                                            HV_ARM64_HVC_SMCCC_IDENTIFIER => {
-                                                self.hypercall(dev, true)
+                                        if fc.fast() {
+                                            match fc.service() {
+                                                PSCI => self.psci(fc)?,
+                                                _ => break 'handle false,
                                             }
-                                            x0 if PSCI32.contains(&x0) => self.psci32(x0)?,
-                                            x0 if PSCI64.contains(&x0) => self.psci64(x0)?,
-                                            _ => break 'handle false,
+                                        } else {
+                                            match x0 {
+                                                HV_ARM64_HVC_SMCCC_IDENTIFIER
+                                                    if ec == ExceptionClass::HVC =>
+                                                {
+                                                    self.hypercall(dev, true);
+                                                    advance_pc = false;
+                                                }
+                                                _ => break 'handle false,
+                                            }
                                         }
                                         true
                                     };
                                     if !handled {
-                                        tracing::warn!(x0, "ignoring SMCCC HVC");
+                                        tracing::warn!(x0, ?ec, "ignoring SMCCC HVC/SMC");
                                         // Set not supported error.
                                         self.vcpu.set_gp(0, !0).expect("BUGBUG");
                                     }
                                 }
                                 1 => self.hypercall(dev, false),
                                 immed => {
-                                    tracing::warn!(immed, "ignoring HVC");
+                                    tracing::warn!(immed, ?ec, "ignoring HVC/SMC");
                                     self.vcpu.set_gp(0, !0).expect("BUGBUG");
-                                    // HVC automatically advances pc.
                                 }
                             }
-                        }
-                        ExceptionClass::SMC => {
-                            let x0 = self.vcpu.gp(0).expect("BUGBUG");
-                            tracing::warn!(immed = exception.syndrome.iss(), x0, "ignoring SMC");
-                            // Set not supported error.
-                            self.vcpu.set_gp(0, !0).expect("BUGBUG");
-                            advance(&mut self.vcpu);
+                            if advance_pc {
+                                advance(&mut self.vcpu);
+                            }
                         }
                         ExceptionClass::WFI => {
                             self.wfi = true;

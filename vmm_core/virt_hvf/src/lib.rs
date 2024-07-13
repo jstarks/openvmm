@@ -236,12 +236,20 @@ impl virt::Aarch64Partition for HvfPartition {
 
 impl virt::Hv1 for HvfPartition {
     type Error = Error;
-    type Device = virt::UnimplementedDevice;
+    type Device = virt::aarch64::gic_software_device::GicSoftwareDevice;
 
     fn new_virtual_device(
         &self,
     ) -> Option<&dyn virt::DeviceBuilder<Device = Self::Device, Error = Self::Error>> {
-        None
+        Some(self)
+    }
+}
+
+impl virt::DeviceBuilder for HvfPartition {
+    fn build(&self, _vtl: Vtl, _device_id: u64) -> Result<Self::Device, Self::Error> {
+        Ok(virt::aarch64::gic_software_device::GicSoftwareDevice::new(
+            self.inner.clone(),
+        ))
     }
 }
 

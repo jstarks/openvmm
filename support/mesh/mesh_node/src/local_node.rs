@@ -56,7 +56,11 @@ pub struct Port {
 
 impl Debug for Port {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Debug::fmt(&self.inner.id, f)
+        if let Some(id) = self.inner.state.try_lock().and_then(|s| s.id) {
+            Debug::fmt(&id, f)
+        } else {
+            f.pad("Port")
+        }
     }
 }
 
@@ -74,33 +78,20 @@ impl Drop for Port {
 impl Port {
     /// Creates a new bidirectional channel, returning a pair of ports.
     pub fn new_pair() -> (Self, Self) {
-        let left_addr = Address {
-            node: NodeId::ZERO,
-            port: PortId::new(),
-        };
-        let right_addr = Address {
-            node: NodeId::ZERO,
-            port: PortId::new(),
-        };
-        let left = Self::new(
-            left_addr.port,
-            PortInnerState::new(PortActivity::Unreachable),
-        );
-        let right = Self::new(
-            right_addr.port,
-            PortInnerState::new(PortActivity::Peered(PortRef::LocalPort(left.inner.clone()))),
-        );
+        let left = Self::new(PortInnerState::new(PortActivity::Unreachable));
+        let right = Self::new(PortInnerState::new(PortActivity::Peered(
+            PortRef::LocalPort(left.inner.clone()),
+        )));
         left.inner.state.lock().activity =
             PortActivity::Peered(PortRef::LocalPort(right.inner.clone()));
-        tracing::trace!(left = ?left_addr.port, right = ?right_addr.port, "new port pair");
+        tracing::trace!("new port pair");
         (left, right)
     }
 
-    /// Creates a new port with `id` and initial state `state`.
-    fn new(id: PortId, state: PortInnerState) -> Self {
+    /// Creates a new port with initial state `state`.
+    fn new(state: PortInnerState) -> Self {
         Self {
             inner: Arc::new(PortInner {
-                id,
                 state: Mutex::new(state),
             }),
             close_on_drop: true,
@@ -133,12 +124,11 @@ impl Port {
     /// port, since only peered ports can be sent.
     fn repeer_if_done(&self, state: &mut PortInnerState) -> Option<Self> {
         if matches!(state.activity, PortActivity::Done) {
-            let new_id = PortId::new();
             let mut peer_state =
                 PortInnerState::new(PortActivity::Peered(PortRef::LocalPort(self.inner.clone())));
             // Continue this peer from the last sequence number.
             peer_state.next_local_seq = state.event_queue.next_peer_seq;
-            let peer_port = Self::new(new_id, peer_state);
+            let peer_port = Self::new(peer_state);
             state.set_activity(PortActivity::Peered(PortRef::LocalPort(
                 peer_port.inner.clone(),
             )));
@@ -151,16 +141,15 @@ impl Port {
     /// Prepares to send a port to another node. This consumes the `Port` and
     /// returns the port data to send.
     fn prepare_to_send(self, remote_node: &Arc<RemoteNode>) -> protocol::ResourceData {
-        let old_address = Address {
-            node: remote_node.local_node.id,
-            port: self.inner.id,
-        };
-
         let port_id = PortId::new();
         let target = PortRef::RemotePort(remote_node.clone(), port_id);
 
         // Ensure the port is associated with this mesh.
-        let mut state = PortInner::associate(&self.inner, &remote_node.local_node);
+        let (mut state, this_id) = PortInner::associate(&self.inner, None, &remote_node.local_node);
+        let old_address = Address {
+            node: remote_node.local_node.id,
+            port: this_id,
+        };
 
         // Save a local sequence number for the ChangePeer message.
         let next_local_seq = state.next_local_seq + Wrapping(1);
@@ -173,13 +162,13 @@ impl Port {
         // Prepare the port for proxying and get the peer address. Get the peer
         // port's address, associating the peer with the mesh if it is local.
         let mut port_to_associate = None;
-        let (peer_node, peer_port) =
+        let (peer_node, mut peer_port) =
             match std::mem::replace(&mut state.activity, PortActivity::Unreachable) {
                 PortActivity::Peered(peer) => {
                     let peer_addr = match &peer {
                         PortRef::LocalPort(peer_port) => {
                             port_to_associate = Some(peer_port.clone());
-                            (remote_node.local_node.id, Some(peer_port.id))
+                            (remote_node.local_node.id, None)
                         }
                         PortRef::RemotePort(peer_node, peer_port_id) => {
                             (peer_node.id, Some(*peer_port_id))
@@ -198,10 +187,8 @@ impl Port {
 
         drop(state);
         if let Some(port_to_associate) = &port_to_associate {
-            drop(PortInner::associate(
-                port_to_associate,
-                &remote_node.local_node,
-            ))
+            let (_, id) = PortInner::associate(port_to_associate, None, &remote_node.local_node);
+            peer_port = Some(id);
         }
 
         self.forget();
@@ -220,7 +207,11 @@ impl Port {
     /// Bridges two channels together so that the peer of `self` is connected
     /// directly to the peer of `other`.
     pub fn bridge(self, other: Self) {
-        tracing::trace!(left = ?self.inner.id, right = ?other.inner.id, "bridging ports");
+        tracing::trace!(
+            left = self.inner.debug_id(),
+            right = other.inner.debug_id(),
+            "bridging ports"
+        );
 
         let get_peer_info = |state: &PortInnerState| {
             match &state.activity {
@@ -240,7 +231,7 @@ impl Port {
                            target_info: Result<(PortRef, Seq), NodeError>,
                            pending_events: &mut PendingEvents| {
             let result = match target_info {
-                Ok((PortRef::LocalPort(ref target), _)) if target.id == inner.id => {
+                Ok((PortRef::LocalPort(ref target), _)) if Arc::as_ptr(target) == inner => {
                     // TODO: can this still happen in a loop?
                     Err(NodeError::local(PortError::CircularBridge))
                 }
@@ -592,7 +583,7 @@ impl RemoteNode {
 /// The interior state of a port.
 #[derive(Debug)]
 struct PortInner {
-    id: PortId,
+    //id: PortId,
     state: Mutex<PortInnerState>,
 }
 
@@ -753,6 +744,7 @@ impl<T: HandlePortEvent> HandlePortEventAndAny for T {
 struct PortInnerState {
     activity: PortActivity,
     local_node: Option<Weak<LocalNodeInner>>,
+    id: Option<PortId>,
 
     event_queue: EventQueue,
     handler: Box<dyn HandlePortEventAndAny>,
@@ -841,7 +833,13 @@ enum PortRef {
 impl Debug for PortRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PortRef::LocalPort(port) => f.debug_tuple("LocalPort").field(&port.id).finish(),
+            PortRef::LocalPort(port) => {
+                let mut r = f.debug_tuple("LocalPort");
+                if let Some(id) = port.state.try_lock().and_then(|s| s.id) {
+                    r.field(&id);
+                }
+                r.finish()
+            }
             PortRef::RemotePort(remote_node, port_id) => f
                 .debug_tuple("RemotePort")
                 .field(&remote_node.id)
@@ -877,6 +875,7 @@ impl PortInnerState {
     fn new(activity: PortActivity) -> Self {
         Self {
             local_node: None,
+            id: None,
             activity,
             next_local_seq: Wrapping(1),
             event_queue: EventQueue::new(),
@@ -1187,6 +1186,10 @@ impl PortInnerState {
 }
 
 impl PortInner {
+    fn debug_id(&self) -> Option<tracing::field::DebugValue<PortId>> {
+        Some(tracing::field::debug(self.state.try_lock()?.id?))
+    }
+
     /// Closes the port. After this, no messages may be sent or received.
     fn close(&self) {
         let peer_seq = {
@@ -1243,7 +1246,7 @@ impl PortInner {
         initial_seq: Seq,
         pending_events: &mut PendingEvents,
     ) {
-        tracing::trace!(port = ?self.id, initial_seq, "proxy starting");
+        tracing::trace!(port = self.debug_id(), initial_seq, "proxy starting");
         let mut state = self.state.lock();
 
         let mut err = None;
@@ -1269,7 +1272,7 @@ impl PortInner {
 
             drop(state);
             // Trace outside the lock to avoid deadlocks.
-            tracing::error!(port = ?self.id, "proxy from wrong state");
+            tracing::error!(port = self.debug_id(), "proxy from wrong state");
         }
     }
 
@@ -1278,21 +1281,24 @@ impl PortInner {
     /// Panics if the port is already associated with a different node.
     fn associate<'a>(
         inner: &'a Arc<Self>,
+        new_id: Option<PortId>,
         local_node: &Arc<LocalNodeInner>,
-    ) -> MutexGuard<'a, PortInnerState> {
+    ) -> (MutexGuard<'a, PortInnerState>, PortId) {
         let mut state = inner.state.lock();
+        let id = if let Some(id) = state.id {
+            assert!(new_id.is_none(), "id already set");
+            id
+        } else {
+            *state.id.insert(new_id.unwrap_or_else(PortId::new))
+        };
         match &state.local_node {
             Some(node) => assert_eq!(Arc::as_ptr(local_node), node.as_ptr()),
             None => {
-                local_node
-                    .state
-                    .lock()
-                    .ports
-                    .insert(inner.id, inner.clone());
+                local_node.state.lock().ports.insert(id, inner.clone());
                 state.local_node = Some(Arc::downgrade(local_node));
             }
         }
-        state
+        (state, id)
     }
 
     /// Disassociates the port with its local node.
@@ -1303,9 +1309,9 @@ impl PortInner {
             .as_ref()
             .and_then(Weak::upgrade)
         {
-            tracing::trace!(node = ?local_node.id, port = ?self.id, "disassociate port");
+            tracing::trace!(node = ?local_node.id, port = self.debug_id(), "disassociate port");
             let mut state = local_node.state.lock();
-            state.ports.remove(&self.id);
+            state.ports.remove(&port_state.id.unwrap());
             let shutdown = state.shutdown.take();
             drop(state);
             // Trace outside the lock to avoid deadlocks.
@@ -1532,8 +1538,9 @@ impl<'a> OutgoingEvent<'a> {
                 PortEvent::ChangePeer(port, seq_delta) => {
                     let (node_id, port_id) = match port {
                         PortRef::LocalPort(port) => {
-                            drop(PortInner::associate(&port, &self.remote_node.local_node));
-                            (self.remote_node.local_node.id, port.id)
+                            let (_, id) =
+                                PortInner::associate(&port, None, &self.remote_node.local_node);
+                            (self.remote_node.local_node.id, id)
                         }
                         PortRef::RemotePort(remote_node, port_id) => (remote_node.id, port_id),
                     };
@@ -1692,9 +1699,9 @@ impl LocalNode {
         let peer_node = self.get_remote(peer.node);
         let activity = PortActivity::Peered(PortRef::RemotePort(peer_node.clone(), peer.port));
 
-        let port = Port::new(id, PortInnerState::new(activity));
+        let port = Port::new(PortInnerState::new(activity));
         {
-            let mut state = PortInner::associate(&port.inner, &self.inner);
+            let (mut state, _) = PortInner::associate(&port.inner, Some(id), &self.inner);
             if let Err(err) = peer_node.node_status() {
                 state.set_activity(PortActivity::Failed(err));
                 port.inner.disassociate(&mut state);
@@ -1882,15 +1889,13 @@ impl LocalNode {
             }
         };
 
-        let port = Port::new(
-            PortId(data.id.into()),
-            PortInnerState {
-                next_local_seq: Wrapping(data.next_local_seq),
-                ..PortInnerState::new(activity)
-            },
-        );
+        let port = Port::new(PortInnerState {
+            next_local_seq: Wrapping(data.next_local_seq),
+            ..PortInnerState::new(activity)
+        });
         if let Some(peer) = peer {
-            let mut state = PortInner::associate(&port.inner, &self.inner);
+            let (mut state, _) =
+                PortInner::associate(&port.inner, Some(PortId(data.id.into())), &self.inner);
             let source = self.get_remote(old_address.node);
             if let Err(err) = peer.node_status().and_then(|()| source.node_status()) {
                 state.set_activity(PortActivity::Failed(err));
@@ -2019,7 +2024,7 @@ impl LocalNodeInner {
                 // Trace outside the lock to avoid deadlocks.
                 tracing::debug!(
                     local_id = ?self.id,
-                    port = ?port.id,
+                    port = ?port.debug_id(),
                     remote_id = ?remote_node.id,
                     error = &err as &dyn std::error::Error,
                     "port failed due to failed node"

@@ -56,7 +56,12 @@ pub struct Port {
 
 impl Debug for Port {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(id) = self.inner.state.try_lock().and_then(|s| s.id) {
+        if let Some(id) = self
+            .inner
+            .state
+            .try_lock()
+            .and_then(|s| Some(s.association.as_ref()?.id))
+        {
             Debug::fmt(&id, f)
         } else {
             f.pad("Port")
@@ -67,6 +72,7 @@ impl Debug for Port {
 impl Drop for Port {
     fn drop(&mut self) {
         if self.handler_set {
+            // TODO: why?
             self.inner.clear_queue(false);
         }
         if self.close_on_drop {
@@ -743,14 +749,19 @@ impl<T: HandlePortEvent> HandlePortEventAndAny for T {
 #[derive(Debug)]
 struct PortInnerState {
     activity: PortActivity,
-    local_node: Option<Weak<LocalNodeInner>>,
-    id: Option<PortId>,
+    association: Option<Association>,
 
     event_queue: EventQueue,
     handler: Box<dyn HandlePortEventAndAny>,
 
     next_local_seq: Seq,
     is_local_closed: bool,
+}
+
+#[derive(Debug)]
+struct Association {
+    local_node: Weak<LocalNodeInner>,
+    id: PortId,
 }
 
 /// A [`HandlePortEvent`] implementation that just queues the messages.
@@ -835,7 +846,11 @@ impl Debug for PortRef {
         match self {
             PortRef::LocalPort(port) => {
                 let mut r = f.debug_tuple("LocalPort");
-                if let Some(id) = port.state.try_lock().and_then(|s| s.id) {
+                if let Some(id) = port
+                    .state
+                    .try_lock()
+                    .and_then(|s| Some(s.association.as_ref()?.id))
+                {
                     r.field(&id);
                 }
                 r.finish()
@@ -858,13 +873,13 @@ impl PortRef {
     }
 
     /// Returns whether messages to this port can reference `port`.
-    fn is_compatible_node(&self, local_node: &Option<Weak<LocalNodeInner>>) -> bool {
-        match local_node {
+    fn is_compatible_node(&self, association: Option<&Association>) -> bool {
+        match association {
             None => true,
-            Some(local_node) => match self {
+            Some(association) => match self {
                 PortRef::LocalPort(_) => true,
                 PortRef::RemotePort(node, _) => {
-                    Weak::as_ptr(local_node) == Arc::as_ptr(&node.local_node)
+                    Weak::as_ptr(&association.local_node) == Arc::as_ptr(&node.local_node)
                 }
             },
         }
@@ -874,8 +889,7 @@ impl PortRef {
 impl PortInnerState {
     fn new(activity: PortActivity) -> Self {
         Self {
-            local_node: None,
-            id: None,
+            association: None,
             activity,
             next_local_seq: Wrapping(1),
             event_queue: EventQueue::new(),
@@ -1082,7 +1096,7 @@ impl PortInnerState {
                                 return Ok(PortEventResult::Done);
                             }
                             PortEvent::ChangePeer(new_peer, seq_delta) => {
-                                assert!(new_peer.is_compatible_node(&self.local_node));
+                                assert!(new_peer.is_compatible_node(self.association.as_ref()));
                                 new_peer.node_status()?;
                                 let old_peer = std::mem::replace(peer, new_peer);
                                 pending_events.push(
@@ -1122,7 +1136,7 @@ impl PortInnerState {
                             }
                             event => {
                                 if let PortEvent::ChangePeer(new_peer, _) = &event {
-                                    assert!(new_peer.is_compatible_node(&self.local_node));
+                                    assert!(new_peer.is_compatible_node(self.association.as_ref()));
                                     new_peer.node_status()?;
                                     self.set_activity(PortActivity::Proxying {
                                         peer: new_peer.clone(),
@@ -1187,7 +1201,9 @@ impl PortInnerState {
 
 impl PortInner {
     fn debug_id(&self) -> Option<tracing::field::DebugValue<PortId>> {
-        Some(tracing::field::debug(self.state.try_lock()?.id?))
+        Some(tracing::field::debug(
+            self.state.try_lock()?.association.as_ref()?.id,
+        ))
     }
 
     /// Closes the port. After this, no messages may be sent or received.
@@ -1285,33 +1301,34 @@ impl PortInner {
         local_node: &Arc<LocalNodeInner>,
     ) -> (MutexGuard<'a, PortInnerState>, PortId) {
         let mut state = inner.state.lock();
-        let id = if let Some(id) = state.id {
-            assert!(new_id.is_none(), "id already set");
-            id
-        } else {
-            *state.id.insert(new_id.unwrap_or_else(PortId::new))
-        };
-        match &state.local_node {
-            Some(node) => assert_eq!(Arc::as_ptr(local_node), node.as_ptr()),
-            None => {
-                local_node.state.lock().ports.insert(id, inner.clone());
-                state.local_node = Some(Arc::downgrade(local_node));
+        let id = match &state.association {
+            Some(association) => {
+                assert!(new_id.is_none(), "id already set");
+                assert_eq!(Arc::as_ptr(local_node), association.local_node.as_ptr());
+                association.id
             }
-        }
+            None => {
+                let id = new_id.unwrap_or_else(PortId::new);
+                local_node.state.lock().ports.insert(id, inner.clone());
+                state.association = Some(Association {
+                    id,
+                    local_node: Arc::downgrade(local_node),
+                });
+                id
+            }
+        };
         (state, id)
     }
 
     /// Disassociates the port with its local node.
     fn disassociate(&self, port_state: &mut PortInnerState) {
-        if let Some(local_node) = port_state
-            .local_node
-            .take()
-            .as_ref()
-            .and_then(Weak::upgrade)
-        {
-            tracing::trace!(node = ?local_node.id, port = self.debug_id(), "disassociate port");
+        let Some(association) = port_state.association.take() else {
+            return;
+        };
+        if let Some(local_node) = association.local_node.upgrade() {
+            tracing::trace!(node = ?local_node.id, port = ?association.id, "disassociate port");
             let mut state = local_node.state.lock();
-            state.ports.remove(&port_state.id.unwrap());
+            state.ports.remove(&association.id);
             let shutdown = state.shutdown.take();
             drop(state);
             // Trace outside the lock to avoid deadlocks.
@@ -1961,7 +1978,7 @@ impl LocalNodeInner {
         for (_, port) in ports {
             let mut state = port.state.lock();
             state.handler.fail(&mut control, err.clone());
-            state.local_node = None;
+            state.association = None;
             state.set_activity(PortActivity::Failed(err.clone()));
         }
         pending_events.process();

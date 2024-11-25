@@ -98,11 +98,13 @@ impl DiagServer {
         request_send: mesh::Sender<DiagRequest>,
     ) -> anyhow::Result<()> {
         let (diag_send, diag_recv) = mesh::channel();
+        let (diag2_send, diag2_recv) = mesh::channel();
         let (inspect_send, inspect_recv) = mesh::channel();
         // Disable all diag requests for CVMs. Inspect filtering will be handled
         // internally more granularly.
         if !underhill_confidentiality::confidential_filtering_enabled() {
             self.server.add_service(diag_send);
+            self.server.add_service(diag2_send);
         }
 
         self.server.add_service(inspect_send);
@@ -115,7 +117,13 @@ impl DiagServer {
             request_send,
             self.inner.clone(),
         ));
-        let process = diag_service.process_requests(driver, diag_recv, inspect_recv, profile_recv);
+        let process = diag_service.process_requests(
+            driver,
+            diag_recv,
+            diag2_recv,
+            inspect_recv,
+            profile_recv,
+        );
 
         let serve = self.server.run(driver, self.control_listener, cancel);
         let data_connections = self

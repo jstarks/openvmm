@@ -15,6 +15,7 @@ use diag_proto::FileRequest;
 use diag_proto::KmsgRequest;
 use diag_proto::NetworkPacketCaptureRequest;
 use diag_proto::NetworkPacketCaptureResponse;
+use diag_proto::OpenhclDiag;
 use diag_proto::StartRequest;
 use diag_proto::UnderhillDiag;
 use diag_proto::WaitRequest;
@@ -128,16 +129,19 @@ impl DiagServiceHandler {
         self: &Arc<Self>,
         driver: &(impl Driver + Spawn + Clone),
         diag_recv: mesh::Receiver<(CancelContext, UnderhillDiag)>,
+        diag2_recv: mesh::Receiver<(CancelContext, OpenhclDiag)>,
         inspect_recv: mesh::Receiver<(CancelContext, InspectService)>,
         profile_recv: mesh::Receiver<(CancelContext, AzureProfiler)>,
     ) -> anyhow::Result<()> {
         enum Event {
             Diag(UnderhillDiag),
+            Diag2(OpenhclDiag),
             Inspect(InspectService),
             Profile(AzureProfiler),
         }
         let mut s = (
             diag_recv.map(|(ctx, req)| (ctx, Event::Diag(req))),
+            diag2_recv.map(|(ctx, req)| (ctx, Event::Diag2(req))),
             inspect_recv.map(|(ctx, req)| (ctx, Event::Inspect(req))),
             profile_recv.map(|(ctx, req)| (ctx, Event::Profile(req))),
         )
@@ -151,6 +155,7 @@ impl DiagServiceHandler {
                     async move {
                         match req {
                             Event::Diag(req) => this.handle_diag_request(&driver, req, ctx).await,
+                            Event::Diag2(req) => this.handle_diag2_request(&driver, req, ctx).await,
                             Event::Inspect(req) => this.handle_inspect_request(req, ctx).await,
                             Event::Profile(req) => this.handle_profile_request(req, ctx).await,
                         }
@@ -241,6 +246,19 @@ impl DiagServiceHandler {
             UnderhillDiag::DumpSavedState((), response) => response.send(grpc_result(
                 ctx.until_cancelled(self.handle_dump_saved_state()).await,
             )),
+        }
+    }
+
+    async fn handle_diag2_request(
+        &self,
+        _driver: &(impl Driver + Spawn + Clone),
+        req: OpenhclDiag,
+        _ctx: CancelContext,
+    ) {
+        match req {
+            OpenhclDiag::Ping((), response) => {
+                response.send(Ok(()));
+            }
         }
     }
 

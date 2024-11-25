@@ -554,10 +554,12 @@ mod grpc {
 
 #[cfg(test)]
 mod tests {
+    use crate::client::ExistingConnection;
     use crate::Client;
     use crate::Server;
     use futures::executor::block_on;
     use pal_async::local::block_with_io;
+    use pal_async::socket::PolledSocket;
     use pal_async::DefaultPool;
     use test_with_tracing::test;
 
@@ -577,9 +579,13 @@ mod tests {
 
         let client_thread = std::thread::spawn(move || {
             DefaultPool::run_with(|driver| async move {
-                let client = Client::new(&driver, c);
+                let client = Client::new(
+                    &driver,
+                    ExistingConnection::new(PolledSocket::new(&driver, c).unwrap()),
+                );
                 let response = client
-                    .call(
+                    .call()
+                    .start(
                         items::Example::Method1,
                         items::Method1Request {
                             foo: "abc".to_string(),
@@ -587,7 +593,6 @@ mod tests {
                         },
                     )
                     .await
-                    .unwrap()
                     .unwrap();
 
                 assert_eq!(&response.foo, "abc123");

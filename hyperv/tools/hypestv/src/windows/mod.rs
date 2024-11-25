@@ -139,6 +139,7 @@ pub(crate) enum ParavisorCommand {
     /// Get or set the output mode for paravisor kmsg logs.
     Kmsg { mode: Option<LogMode> },
 
+    /// Inpsect paravisor state.
     #[clap(visible_alias = "x")]
     Inspect(InspectArgs),
 }

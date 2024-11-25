@@ -2975,6 +2975,7 @@ dependencies = [
  "futures-concurrency",
  "guid",
  "inspect",
+ "kmsg",
  "mesh",
  "pal_async",
  "parking_lot",

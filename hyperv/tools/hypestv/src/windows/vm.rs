@@ -87,9 +87,6 @@ impl Vm {
         path: &str,
     ) -> anyhow::Result<inspect::Node> {
         match target {
-            InspectTarget::Host => {
-                anyhow::bail!("host inspect not supported yet");
-            }
             InspectTarget::Paravisor => {
                 self.inner
                     .paravisor_diag

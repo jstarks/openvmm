@@ -167,7 +167,6 @@ pub(crate) enum Request {
 }
 
 pub(crate) enum InspectTarget {
-    Host,
     Paravisor,
 }
 

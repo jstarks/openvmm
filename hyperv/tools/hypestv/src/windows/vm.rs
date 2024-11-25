@@ -38,13 +38,13 @@ pub struct Vm {
 struct SerialTask {
     mode: SerialMode,
     task: Task<()>,
-    req: mesh::Sender<SerialRequest>,
+    req: mesh::Sender<IoRequest>,
 }
 
 struct KmsgTask {
     mode: LogMode,
     task: Task<()>,
-    req: mesh::Sender<SerialRequest>,
+    req: mesh::Sender<IoRequest>,
 }
 
 struct VmInner {
@@ -179,8 +179,8 @@ impl Vm {
                         }
                         None
                     }
-                    SerialMode::Log => Some(SerialTarget::Printer),
-                    SerialMode::Term => Some(SerialTarget::Console(
+                    SerialMode::Log => Some(IoTarget::Printer),
+                    SerialMode::Term => Some(IoTarget::Console(
                         console_relay::Console::new(self.inner.driver.clone(), None)
                             .context("failed to launch console")?,
                     )),
@@ -188,7 +188,7 @@ impl Vm {
                 if let Some(target) = target {
                     if let Some(task) = task {
                         task.mode = mode;
-                        task.req.send(SerialRequest::NewTarget(target));
+                        task.req.send(IoRequest::NewTarget(target));
                     } else {
                         let (req, recv) = mesh::channel();
                         let inner = self.inner.clone();
@@ -229,8 +229,8 @@ impl Vm {
                         }
                         None
                     }
-                    LogMode::Log => Some(SerialTarget::Printer),
-                    LogMode::Term => Some(SerialTarget::Console(
+                    LogMode::Log => Some(IoTarget::Printer),
+                    LogMode::Term => Some(IoTarget::Console(
                         console_relay::Console::new(self.inner.driver.clone(), None)
                             .context("failed to launch console")?,
                     )),
@@ -238,7 +238,7 @@ impl Vm {
                 if let Some(target) = target {
                     if let Some(task) = &mut self.pv_kmsg {
                         task.mode = mode;
-                        task.req.send(SerialRequest::NewTarget(target));
+                        task.req.send(IoRequest::NewTarget(target));
                     } else {
                         let (req, recv) = mesh::channel();
                         let inner = self.inner.clone();
@@ -300,11 +300,11 @@ impl Vm {
     }
 }
 
-enum SerialRequest {
-    NewTarget(SerialTarget),
+enum IoRequest {
+    NewTarget(IoTarget),
 }
 
-enum SerialTarget {
+enum IoTarget {
     Printer,
     Console(console_relay::Console),
 }
@@ -312,15 +312,15 @@ enum SerialTarget {
 impl VmInner {
     async fn handle_serial(
         &self,
-        mut req: mesh::Receiver<SerialRequest>,
-        mut target: SerialTarget,
+        mut req: mesh::Receiver<IoRequest>,
+        mut target: IoTarget,
         port: u32,
     ) -> anyhow::Result<()> {
         let mut current_serial = None;
 
         enum Event {
             TaskDone(anyhow::Result<()>),
-            Request(Option<SerialRequest>),
+            Request(Option<IoRequest>),
         }
 
         loop {
@@ -345,7 +345,7 @@ impl VmInner {
                 };
 
                 match &mut target {
-                    SerialTarget::Printer => {
+                    IoTarget::Printer => {
                         let mut line = String::new();
                         while let Ok(n) = serial.read_line(&mut line).await {
                             if n == 0 {
@@ -355,7 +355,7 @@ impl VmInner {
                             line.clear();
                         }
                     }
-                    SerialTarget::Console(console) => {
+                    IoTarget::Console(console) => {
                         console.relay(serial).await?;
                     }
                 }
@@ -371,7 +371,7 @@ impl VmInner {
             match event {
                 Event::TaskDone(r) => r?,
                 Event::Request(Some(y)) => match y {
-                    SerialRequest::NewTarget(new_target) => {
+                    IoRequest::NewTarget(new_target) => {
                         target = new_target;
                     }
                 },
@@ -391,14 +391,14 @@ impl VmInner {
 
     async fn handle_kmsg(
         &self,
-        mut req: mesh::Receiver<SerialRequest>,
-        mut target: SerialTarget,
+        mut req: mesh::Receiver<IoRequest>,
+        mut target: IoTarget,
     ) -> anyhow::Result<()> {
         let mut current = None;
 
         enum Event {
             TaskDone(anyhow::Result<()>),
-            Request(Option<SerialRequest>),
+            Request(Option<IoRequest>),
         }
 
         loop {
@@ -423,7 +423,7 @@ impl VmInner {
                         Ok(data) => {
                             let message = kmsg::KmsgParsedEntry::new(&data)?;
                             match &mut target {
-                                SerialTarget::Printer => {
+                                IoTarget::Printer => {
                                     writeln!(
                                         self.printer.out(),
                                         "[kmsg]: {}",
@@ -431,7 +431,7 @@ impl VmInner {
                                     )
                                     .ok();
                                 }
-                                SerialTarget::Console(console) => {
+                                IoTarget::Console(console) => {
                                     let line = format!("{}\r\n", message.display(true));
                                     console.write_all(line.as_bytes()).await?;
                                 }
@@ -455,7 +455,7 @@ impl VmInner {
             match event {
                 Event::TaskDone(r) => r?,
                 Event::Request(Some(y)) => match y {
-                    SerialRequest::NewTarget(new_target) => {
+                    IoRequest::NewTarget(new_target) => {
                         target = new_target;
                     }
                 },

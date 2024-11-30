@@ -1,0 +1,23 @@
+[package]
+name = "pci_remote"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+chipset_device.workspace = true
+pci_core.workspace = true
+pci_resources.workspace = true
+vm_resource.workspace = true
+
+inspect.workspace = true
+mesh.workspace = true
+
+anyhow.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracelimit.workspace = true
+unicycle.workspace = true
+
+[lints]
+workspace = true

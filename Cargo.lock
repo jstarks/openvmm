@@ -4831,6 +4831,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pci_remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chipset_device",
+ "futures",
+ "inspect",
+ "mesh",
+ "pci_core",
+ "pci_resources",
+ "tracelimit",
+ "tracing",
+ "unicycle",
+ "vm_resource",
+]
+
+[[package]]
 name = "pci_resources"
 version = "0.0.0"
 dependencies = [

@@ -2603,13 +2603,19 @@ async fn new_underhill_vm(
 
         let vmbus = VmbusServerHandle::new(&tp, state_units.add("vmbus"), vmbus)?;
         if let Some((relay_channel, hvsock_relay)) = relay_channels {
+            let relay_driver = tp.driver(0);
+            let (synic, msg_source) =
+                vmbus_client_hcl::new_synic_client_and_messsage_source(relay_driver)
+                    .context("failed to create synic client and message source")?;
+
             let vmbus_relay = vmbus_relay::HostVmbusTransport::new(
-                tp.driver(0).clone(),
+                relay_driver.clone(),
                 Arc::clone(vmbus.control()),
                 relay_channel,
                 hvsock_relay,
+                synic,
+                msg_source,
             )
-            .await
             .expect("failed to create host vmbus transport");
 
             host_vmbus_relay = Some(VmbusRelayHandle::new(

@@ -77,9 +77,23 @@ impl<T: VmbusMessageSource> super::ClientTask<T> {
             if let Some(offer_info) = self.restore_channel(saved_channel) {
                 let key = offer_key(&offer_info.offer);
                 tracing::info!(%key, state = %saved_channel.state, "channel restored");
+                let open = match saved_channel.state {
+                    ChannelState::Offered => None,
+                    ChannelState::Opened { local_event_flag } => {
+                        let local_event = if let Some(flag) = local_event_flag {
+                            Some(
+                                self.claim_local_event(flag)
+                                    .map_err(RestoreError::LocalEvent)?,
+                            )
+                        } else {
+                            None
+                        };
+                        Some(crate::OpenResult { local_event })
+                    }
+                };
                 restored_channels.push(RestoredChannel {
                     offer: offer_info,
-                    open: saved_channel.state == ChannelState::Opened,
+                    open,
                 });
             }
             if let Some(channel) = self.inner.channels.get_mut(&ChannelId(saved_channel.id)) {
@@ -195,24 +209,29 @@ pub enum ChannelState {
     #[mesh(1)]
     Offered,
     #[mesh(2)]
-    Opened,
+    Opened {
+        #[mesh(1)]
+        local_event_flag: Option<u16>,
+    },
 }
 
 impl ChannelState {
     fn save(state: &super::ChannelState) -> Self {
-        match state {
+        match *state {
             super::ChannelState::Offered => Self::Offered,
-            super::ChannelState::Opening(..) => {
+            super::ChannelState::Opening { .. } => {
                 unreachable!("Cannot save channel in opening state.")
             }
-            super::ChannelState::Opened => Self::Opened,
+            super::ChannelState::Opened { local_event_flag } => Self::Opened { local_event_flag },
         }
     }
 
     fn restore(self) -> super::ChannelState {
         match self {
             ChannelState::Offered => super::ChannelState::Offered,
-            ChannelState::Opened => super::ChannelState::Opened,
+            ChannelState::Opened { local_event_flag } => {
+                super::ChannelState::Opened { local_event_flag }
+            }
         }
     }
 }
@@ -221,7 +240,7 @@ impl std::fmt::Display for ChannelState {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChannelState::Offered => write!(fmt, "Offered"),
-            ChannelState::Opened => write!(fmt, "Opened"),
+            ChannelState::Opened { .. } => write!(fmt, "Opened"),
         }
     }
 }

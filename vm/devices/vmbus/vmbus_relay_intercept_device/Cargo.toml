@@ -16,11 +16,11 @@ vmbus_server.workspace = true
 vmcore.workspace = true
 
 guid.workspace = true
-hcl.workspace = true
 hvdef.workspace = true
 inspect.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
+pal_event.workspace = true
 safeatomic.workspace = true
 task_control.workspace = true
 user_driver.workspace = true
@@ -28,7 +28,7 @@ virt.workspace = true
 
 anyhow.workspace = true
 futures.workspace = true
-tracelimit.workspace = true
+parking_lot.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
 

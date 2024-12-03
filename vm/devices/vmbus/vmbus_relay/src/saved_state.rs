@@ -20,15 +20,43 @@ impl RelayTask {
         assert!(!self.running);
 
         let client_saved_state = self.vmbus_client.save().await;
-        let channels = futures::future::join_all(
+        let mut channels = futures::future::join_all(
             self.channels
                 .iter()
                 .map(|(id, channel)| self.save_channel_state(*id, channel)),
         )
         .await
-        .drain(..)
+        .into_iter()
         .flatten()
-        .collect();
+        .collect::<Vec<_>>();
+
+        // Update the local event flag state for each channel for compatibility
+        // with older versions.
+        let mut local_event_flags = client_saved_state
+            .channels
+            .iter()
+            .filter_map(|c| {
+                Some((
+                    c.id,
+                    match c.state {
+                        vmbus_client::saved_state::ChannelState::Offered => return None,
+                        vmbus_client::saved_state::ChannelState::Opened { local_event_flag } => {
+                            local_event_flag?
+                        }
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        local_event_flags.sort_by_key(|k| k.0);
+        for channel in &mut channels {
+            assert!(channel.event_flag.is_none());
+            if let Ok(i) =
+                local_event_flags.binary_search_by_key(&channel.channel_id, |&(id, _)| id)
+            {
+                channel.event_flag = Some(local_event_flags[i].1);
+            }
+        }
 
         SavedState {
             use_interrupt_relay: self.use_interrupt_relay.load(Ordering::SeqCst),
@@ -42,9 +70,32 @@ impl RelayTask {
         let SavedState {
             use_interrupt_relay,
             relay_state,
-            client_saved_state,
+            mut client_saved_state,
             mut channels,
         } = state;
+
+        // Update the local event flag state for each channel for compatibility
+        // with older versions.
+        channels.sort_by_key(|k| k.channel_id);
+        for channel in &mut client_saved_state.channels {
+            if let Ok(i) = channels.binary_search_by_key(&channel.id, |c| c.channel_id) {
+                match channel.state {
+                    vmbus_client::saved_state::ChannelState::Opened {
+                        local_event_flag: Some(flag),
+                    } => {
+                        if channels[i].event_flag.is_some() && channels[i].event_flag != Some(flag)
+                        {
+                            anyhow::bail!("local event flag mismatch");
+                        }
+                        channels[i].event_flag = Some(flag);
+                    }
+                    vmbus_client::saved_state::ChannelState::Opened {
+                        local_event_flag: None,
+                    }
+                    | vmbus_client::saved_state::ChannelState::Offered => {}
+                }
+            }
+        }
 
         self.use_interrupt_relay
             .store(use_interrupt_relay, Ordering::SeqCst);
@@ -56,7 +107,7 @@ impl RelayTask {
                 .binary_search_by_key(&offer.offer.offer.channel_id.0, |k| k.channel_id)
                 .ok()
                 .and_then(|i| {
-                    if offer.open || channels[i].intercepted {
+                    if offer.open.is_some() || channels[i].intercepted {
                         Some(&channels[i])
                     } else {
                         None
@@ -125,11 +176,7 @@ impl RelayChannelTask {
     pub(crate) fn handle_save(&self) -> Channel {
         Channel {
             channel_id: self.channel.channel_id.0,
-            event_flag: self
-                .channel
-                .interrupt_relay
-                .as_ref()
-                .map(|interrupt| interrupt.event.get_flag_index()),
+            event_flag: None,
             intercepted: false,
             intercepted_save_state: Vec::new(),
         }
@@ -182,6 +229,9 @@ impl RelayState {
 pub struct Channel {
     #[mesh(1)]
     pub channel_id: u32,
+    // Present for compatibility with old versions. This is ignored in this
+    // crate but is populated from `vmbus_client` saved state on save and copied
+    // over to `vmbus_client` saved state on restore.
     #[mesh(2)]
     pub event_flag: Option<u16>,
     #[mesh(3)]

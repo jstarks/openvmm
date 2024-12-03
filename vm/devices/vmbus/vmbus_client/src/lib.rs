@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-mod saved_state;
+pub mod saved_state;
 
 pub use self::saved_state::SavedState;
 use anyhow::Result;
@@ -19,6 +19,9 @@ use pal_async::task::Spawn;
 use pal_async::task::Task;
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::Arc;
 use thiserror::Error;
 use vmbus_async::async_dgram::AsyncRecv;
 use vmbus_async::async_dgram::AsyncRecvExt;
@@ -39,6 +42,7 @@ use vmbus_core::MonitorPageGpas;
 use vmbus_core::OutgoingMessage;
 use vmbus_core::TaggedStream;
 use vmbus_core::VersionInfo;
+use vmcore::interrupt::Interrupt;
 use zerocopy::AsBytes;
 
 const SINT: u8 = 2;
@@ -49,6 +53,12 @@ const SUPPORTED_FEATURE_FLAGS: FeatureFlags = FeatureFlags::all();
 /// The client interface to the synic.
 pub trait SynicClient: Send + Sync {
     fn post_message(&self, connection_id: u32, typ: u32, msg: &[u8]);
+    /// Maps an incoming event signal on SINT7 to `event`.
+    fn map_event(&self, event_flag: u16, event: &pal_event::Event) -> std::io::Result<()>;
+    /// Unmaps an event previously mapped with `map_event`.
+    fn unmap_event(&self, event_flag: u16);
+    /// Signals an event on the synic.
+    fn signal_event(&self, connection_id: u32) -> std::io::Result<()>;
 }
 
 /// A stream of vmbus messages that can be paused and resumed.
@@ -89,7 +99,7 @@ impl VmbusClient {
         let (client_request_send, client_request_recv) = mesh::channel();
 
         let inner = ClientTaskInner {
-            synic: Box::new(synic),
+            synic: Arc::new(synic),
             channels: HashMap::new(),
             gpadls: HashMap::new(),
             teardown_gpadls: HashMap::new(),
@@ -105,6 +115,7 @@ impl VmbusClient {
             client_request_recv,
             state: ClientState::Disconnected,
             modify_request: None,
+            local_events: Vec::new(),
         };
 
         let thread = spawner.spawn("vmbus client", async move { task.run().await });
@@ -202,12 +213,16 @@ impl Inspect for VmbusClient {
 #[derive(Debug)]
 pub struct OpenRequest {
     pub open_data: OpenData,
-    pub flags: OpenChannelFlags,
+    pub local_interrupt: bool,
+}
+
+pub struct OpenResult {
+    pub local_event: Option<pal_event::Event>,
 }
 
 /// Expresses an operation requested of the client.
 pub enum ChannelRequest {
-    Open(Rpc<OpenRequest, bool>),
+    Open(Rpc<OpenRequest, Option<OpenResult>>),
     Close,
     Gpadl(Rpc<GpadlRequest, bool>),
     TeardownGpadl(GpadlId),
@@ -245,17 +260,19 @@ pub enum RestoreError {
 
     #[error("duplicate gpadl id {0}")]
     DuplicateGpadlId(u32),
+
+    #[error("failed to claim local event")]
+    LocalEvent(#[source] std::io::Error),
 }
 
 /// Provides the offer details from the server in addition to both a channel
 /// to request client actions and a channel to receive server responses.
-#[derive(Debug, Inspect)]
+#[derive(Debug)]
 pub struct OfferInfo {
     pub offer: protocol::OfferChannel,
-    #[inspect(skip)]
     pub request_send: mesh::Sender<ChannelRequest>,
-    #[inspect(skip)]
     pub response_recv: mesh::Receiver<ChannelResponse>,
+    pub signal: Interrupt,
 }
 
 #[derive(Debug)]
@@ -295,12 +312,11 @@ enum TaskRequest {
 }
 
 /// Information about a restored channel.
-#[derive(Debug)]
 pub struct RestoredChannel {
     /// The channel offer.
     pub offer: OfferInfo,
     /// Whether the channel was open at save time.
-    pub open: bool,
+    pub open: Option<OpenResult>,
 }
 
 /// The overall state machine used to drive which actions the client can legally
@@ -376,17 +392,20 @@ enum ChannelState {
     /// The channel has been offered to the client.
     Offered,
     /// The channel has requested the server to be opened.
-    Opening(mesh::OneshotSender<bool>),
+    Opening {
+        local_event: Option<(u16, pal_event::Event)>,
+        respond: mesh::OneshotSender<Option<OpenResult>>,
+    },
     /// The channel has been successfully opened.
-    Opened,
+    Opened { local_event_flag: Option<u16> },
 }
 
 impl std::fmt::Display for ChannelState {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChannelState::Opening(..) => write!(fmt, "Opening"),
+            ChannelState::Opening { .. } => write!(fmt, "Opening"),
             ChannelState::Offered => write!(fmt, "Offered"),
-            ChannelState::Opened => write!(fmt, "Opened"),
+            ChannelState::Opened { .. } => write!(fmt, "Opened"),
         }
     }
 }
@@ -396,6 +415,7 @@ struct Channel {
     response_send: mesh::Sender<ChannelResponse>,
     state: ChannelState,
     modify_response_send: Option<mesh::OneshotSender<i32>>,
+    host_connection_id: Arc<AtomicU32>,
 }
 
 impl std::fmt::Debug for Channel {
@@ -469,6 +489,7 @@ struct ClientTask<T: VmbusMessageSource> {
     notify_send: mesh::Sender<ClientNotification>,
     task_recv: mesh::Receiver<TaskRequest>,
     client_request_recv: mesh::Receiver<ClientRequest>,
+    local_events: Vec<bool>,
 }
 
 impl<T: VmbusMessageSource> ClientTask<T> {
@@ -640,6 +661,7 @@ impl<T: VmbusMessageSource> ClientTask<T> {
         let (request_send, request_recv) = mesh::channel();
         let (response_send, response_recv) = mesh::channel();
 
+        let host_connection_id = Arc::new(AtomicU32::new(0));
         self.inner.channels.insert(
             offer.channel_id,
             Channel {
@@ -647,6 +669,7 @@ impl<T: VmbusMessageSource> ClientTask<T> {
                 offer,
                 state,
                 modify_response_send: None,
+                host_connection_id: host_connection_id.clone(),
             },
         );
 
@@ -654,10 +677,38 @@ impl<T: VmbusMessageSource> ClientTask<T> {
             .channel_requests
             .push(TaggedStream::new(offer.channel_id, request_recv));
 
+        let synic = Arc::downgrade(&self.inner.synic);
+        let signal = Interrupt::from_fn(move || {
+            if let Some(synic) = synic.upgrade() {
+                let connection_id = host_connection_id.load(SeqCst);
+                // If a channel is forcibly closed by the host (during a
+                // revoke), the host interrupt can be disabled before the guest
+                // is aware the channel is closed. In this case, relaying the
+                // interrupt can fail, which is not a problem. For example, this
+                // is the case for an hvsocket channel when the VM gets paused.
+                //
+                // In cases were the channel this happened on is open and
+                // appears stuck, this could indicate a problem.
+                if connection_id != 0 {
+                    if let Err(err) = synic.signal_event(connection_id) {
+                        tracelimit::info_ratelimited!(
+                            error = &err as &dyn std::error::Error,
+                            "interrupt relay failure, could be normal during channel close"
+                        );
+                    }
+                } else {
+                    // The channel close notification reached here but has not
+                    // yet made it to the guest. This is expected.
+                    tracing::debug!("interrupt relay request after close");
+                }
+            }
+        });
+
         Some(OfferInfo {
             offer,
             response_recv,
             request_send,
+            signal,
         })
     }
 
@@ -682,7 +733,7 @@ impl<T: VmbusMessageSource> ClientTask<T> {
     fn handle_rescind(&mut self, rescind: protocol::RescindChannelOffer) {
         tracing::info!(state = %self.state, channel_id = rescind.channel_id.0, "received rescind");
 
-        let channel = &self.inner.channels[&rescind.channel_id];
+        let channel = self.inner.channels.remove(&rescind.channel_id).unwrap();
 
         // Teardown all remaining gpadls for this channel. We don't care about GpadlTorndown
         // responses at this point.
@@ -714,9 +765,26 @@ impl<T: VmbusMessageSource> ClientTask<T> {
                 false
             });
 
-        self.inner.channels.remove(&rescind.channel_id);
+        // Free the local event flag if it was allocated.
+        match channel.state {
+            ChannelState::Opening {
+                local_event: Some((event_flag, _)),
+                ..
+            }
+            | ChannelState::Opened {
+                local_event_flag: Some(event_flag),
+            } => {
+                self.free_local_event(event_flag);
+            }
+            _ => {}
+        }
+
+        // Stop interrupts.
+        channel.host_connection_id.store(0, SeqCst);
 
         // Tell the host we're not referencing the client ID anymore.
+        //
+        // TODO: delay this until the relay is done.
         self.inner.send(&protocol::RelIdReleased {
             channel_id: rescind.channel_id,
         });
@@ -792,19 +860,36 @@ impl<T: VmbusMessageSource> ClientTask<T> {
 
         let channel_opened = result.status == protocol::STATUS_SUCCESS as u32;
         let new_state = if channel_opened {
-            ChannelState::Opened
+            ChannelState::Opened {
+                local_event_flag: None,
+            }
         } else {
             ChannelState::Offered
         };
 
         // Even if the old state is wrong, we still update to the state the host thinks we're in.
         let old_state = std::mem::replace(&mut channel.state, new_state);
-        let ChannelState::Opening(rpc) = old_state else {
+        let ChannelState::Opening {
+            local_event,
+            respond,
+        } = old_state
+        else {
             tracing::warn!(?old_state, channel_opened, "invalid state for open result");
             return;
         };
 
-        rpc.send(channel_opened);
+        if let Some((event_flag, _)) = local_event {
+            let ChannelState::Opened { local_event_flag } = &mut channel.state else {
+                unreachable!()
+            };
+            *local_event_flag = Some(event_flag);
+        }
+
+        let result = channel_opened.then_some(OpenResult {
+            local_event: local_event.map(|(_, event)| event),
+        });
+
+        respond.send(result);
     }
 
     fn handle_gpadl_torndown(&mut self, request: protocol::GpadlTorndown) {
@@ -960,7 +1045,11 @@ impl<T: VmbusMessageSource> ClientTask<T> {
         }
     }
 
-    fn handle_open_channel(&mut self, channel_id: ChannelId, rpc: Rpc<OpenRequest, bool>) {
+    fn handle_open_channel(
+        &mut self,
+        channel_id: ChannelId,
+        rpc: Rpc<OpenRequest, Option<OpenResult>>,
+    ) {
         let channel = self
             .inner
             .channels
@@ -969,7 +1058,7 @@ impl<T: VmbusMessageSource> ClientTask<T> {
 
         if !matches!(channel.state, ChannelState::Offered) {
             tracing::warn!(id = %channel_id.0, channel_state = %self.inner.channel_state(channel_id).unwrap(), "invalid channel state for OpenChannel");
-            rpc.complete(false);
+            rpc.complete(None);
             return;
         }
 
@@ -986,8 +1075,32 @@ impl<T: VmbusMessageSource> ClientTask<T> {
             user_data: open_data.user_data,
         };
 
+        let mut flags = OpenChannelFlags::new();
+        let (local_event, event_flag) = if request.local_interrupt {
+            let (event_flag, event) = match self.allocate_local_event() {
+                Ok(r) => r,
+                Err(err) => {
+                    tracing::error!(
+                        error = &err as &dyn std::error::Error,
+                        "failed to map event"
+                    );
+                    rpc.complete(None);
+                    return;
+                }
+            };
+            flags.set_redirect_interrupt(true);
+            (Some((event_flag, event)), event_flag)
+        } else {
+            (None, open_data.event_flag)
+        };
+
+        self.inner.channels[&channel_id]
+            .host_connection_id
+            .store(open_data.connection_id, SeqCst);
+
         if matches!(self.state, ClientState::Connected(version) if version.feature_flags.guest_specified_signal_parameters() || version.feature_flags.channel_interrupt_redirection())
         {
+            let flags = OpenChannelFlags::new().with_redirect_interrupt(request.local_interrupt);
             // N.B. The open_data will contain the server's event
             // flag/connection ID if the VTL0 guest doesn't use alternate
             // values (it normally won't), so we can communicate those to
@@ -995,10 +1108,11 @@ impl<T: VmbusMessageSource> ClientTask<T> {
             self.inner.send(&protocol::OpenChannel2 {
                 open_channel,
                 connection_id: open_data.connection_id,
-                event_flag: open_data.event_flag,
-                flags: request.flags.into(),
+                event_flag,
+                flags: flags.into(),
             });
         } else {
+            assert!(!flags.redirect_interrupt());
             assert_eq!(
                 open_data.event_flag, channel_id.0 as u16,
                 "Trying to use guest-specified event flag when the host doesn't support it."
@@ -1007,7 +1121,10 @@ impl<T: VmbusMessageSource> ClientTask<T> {
             self.inner.send(&open_channel);
         }
 
-        self.inner.channels.get_mut(&channel_id).unwrap().state = ChannelState::Opening(rpc.1);
+        self.inner.channels.get_mut(&channel_id).unwrap().state = ChannelState::Opening {
+            local_event,
+            respond: rpc.1,
+        };
     }
 
     fn handle_gpadl(&mut self, channel_id: ChannelId, rpc: Rpc<GpadlRequest, bool>) {
@@ -1098,10 +1215,17 @@ impl<T: VmbusMessageSource> ClientTask<T> {
     }
 
     fn handle_close_channel(&mut self, channel_id: ChannelId) {
-        if let ChannelState::Opened = self.inner.channel_state(channel_id).unwrap() {
+        if let ChannelState::Opened { local_event_flag } =
+            *self.inner.channel_state(channel_id).unwrap()
+        {
             tracing::info!(channel_id = channel_id.0, "closing channel on host");
             self.inner.send(&protocol::CloseChannel { channel_id });
-            self.inner.channels.get_mut(&channel_id).unwrap().state = ChannelState::Offered;
+            let channel = self.inner.channels.get_mut(&channel_id).unwrap();
+            channel.state = ChannelState::Offered;
+            channel.host_connection_id.store(0, SeqCst);
+            if let Some(event_flag) = local_event_flag {
+                self.free_local_event(event_flag);
+            }
         } else {
             tracing::warn!(id = %channel_id.0, channel_state = %self.inner.channel_state(channel_id).unwrap(), "invalid channel state for close channel");
         }
@@ -1167,7 +1291,7 @@ impl<T: VmbusMessageSource> ClientTask<T> {
 
     /// Makes sure a channel is closed if the channel request stream was dropped.
     fn handle_device_removal(&mut self, channel_id: ChannelId) {
-        if let Some(ChannelState::Opened) = self.inner.channel_state(channel_id) {
+        if let Some(ChannelState::Opened { .. }) = self.inner.channel_state(channel_id) {
             tracing::warn!(
                 channel_id = channel_id.0,
                 "Channel dropped without closing first"
@@ -1212,6 +1336,42 @@ impl<T: VmbusMessageSource> ClientTask<T> {
         tracing::debug!("messages drained");
         // Because the run loop awaits all async operations, there is no need for rundown.
         self.running = false;
+    }
+
+    fn allocate_local_event(&mut self) -> std::io::Result<(u16, pal_event::Event)> {
+        let flag = if let Some(i) = self.local_events.iter().position(|&used| !used) {
+            self.local_events[i] = true;
+            i as u16
+        } else {
+            self.local_events.push(true);
+            (self.local_events.len() - 1) as u16
+        };
+        self.set_local_event_inner(flag).map(|event| (flag, event))
+    }
+
+    fn claim_local_event(&mut self, flag: u16) -> std::io::Result<pal_event::Event> {
+        let flag_index = flag as usize;
+        if self.local_events.len() <= flag_index {
+            self.local_events.resize(flag_index + 1, false);
+        }
+        if self.local_events[flag_index] {
+            tracing::warn!(flag_index, "Specified flag is already in use; overwriting")
+        }
+        self.local_events[flag_index] = true;
+        self.set_local_event_inner(flag)
+    }
+
+    fn set_local_event_inner(&mut self, flag: u16) -> std::io::Result<pal_event::Event> {
+        let event = pal_event::Event::new();
+        self.inner.synic.map_event(flag, &event).inspect_err(|_| {
+            self.local_events[flag as usize] = false;
+        })?;
+        Ok(event)
+    }
+
+    fn free_local_event(&mut self, flag: u16) {
+        self.local_events[flag as usize] = false;
+        self.inner.synic.unmap_event(flag);
     }
 
     async fn run(&mut self) {
@@ -1312,7 +1472,7 @@ enum GpadlState {
 }
 
 struct ClientTaskInner {
-    synic: Box<dyn SynicClient>,
+    synic: Arc<dyn SynicClient>,
     channels: HashMap<ChannelId, Channel>,
     gpadls: HashMap<(ChannelId, GpadlId), GpadlState>,
     teardown_gpadls: HashMap<GpadlId, Option<ChannelId>>,
@@ -1470,6 +1630,18 @@ mod tests {
             self.messages
                 .lock()
                 .push(OutgoingMessage::from_message(msg));
+        }
+
+        fn map_event(&self, _event_flag: u16, _event: &pal_event::Event) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn unmap_event(&self, _event_flag: u16) {
+            unreachable!()
+        }
+
+        fn signal_event(&self, _connection_id: u32) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::Unsupported.into())
         }
     }
 
@@ -1787,7 +1959,7 @@ mod tests {
                     connection_id: 0,
                     user_data: UserDefinedData::new_zeroed(),
                 },
-                flags: OpenChannelFlags::new(),
+                local_interrupt: false,
             },
             send,
         )));
@@ -1818,8 +1990,7 @@ mod tests {
             },
         ));
 
-        let opened = recv.await.unwrap();
-        assert!(opened);
+        recv.await.unwrap().unwrap();
     }
 
     #[async_test]
@@ -1838,7 +2009,7 @@ mod tests {
                     connection_id: 0,
                     user_data: UserDefinedData::new_zeroed(),
                 },
-                flags: OpenChannelFlags::new(),
+                local_interrupt: false,
             },
             send,
         )));
@@ -1869,8 +2040,7 @@ mod tests {
             },
         ));
 
-        let opened = recv.await.unwrap();
-        assert!(!opened);
+        recv.await.unwrap().unwrap();
     }
 
     #[async_test]

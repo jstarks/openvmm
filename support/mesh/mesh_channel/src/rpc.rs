@@ -100,6 +100,10 @@ impl<I, R: 'static + Send> Rpc<I, Result<R, RemoteError>> {
         let r = f(self.0).await;
         self.1.send(r.map_err(RemoteError::new));
     }
+
+    pub fn fail<E: Into<Box<dyn std::error::Error + Send + Sync>>>(self, err: E) {
+        self.1.send(Err(RemoteError::new(err)));
+    }
 }
 
 /// A trait implemented by objects that can send RPC requests.

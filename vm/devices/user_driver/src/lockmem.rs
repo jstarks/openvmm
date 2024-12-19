@@ -5,11 +5,14 @@
 
 use crate::memory::MappedDmaTarget;
 use anyhow::Context;
+use safeatomic::AtomicSliceOps;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering::Relaxed;
 use zerocopy::AsBytes;
 
 const PAGE_SIZE: usize = 4096;
@@ -74,6 +77,40 @@ impl Mapping {
             }
             *pfn &= 0x3f_ffff_ffff_ffff;
         }
+
+        // Now validate the pages are correct.
+        let mem = fs_err::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/mem")
+            .context("failed to open /dev/mem")?;
+        let map =
+            sparse_mmap::SparseMapping::new(self.len).context("failed to create sparse mapping")?;
+        for (i, &pfn) in pfns.iter().enumerate() {
+            map.map_file(
+                i * PAGE_SIZE,
+                PAGE_SIZE,
+                mem.file(),
+                pfn * PAGE_SIZE as u64,
+                true,
+            )
+            .with_context(|| format!("failed to map page {pfn}"))?;
+        }
+        let a = unsafe { std::slice::from_raw_parts(self.addr as *const AtomicU8, self.len) };
+        let b = map.atomic_slice(0, self.len);
+        let mut n = 3u64;
+        for (i, (a, b)) in a.iter().zip(b).enumerate() {
+            let v = n as u8;
+            a.store(v, Relaxed);
+            assert_eq!(
+                b.load(Relaxed),
+                v,
+                "mismatch at byte {i} pfn {pfn:#x}",
+                pfn = pfns[i / PAGE_SIZE]
+            );
+            n = n.wrapping_mul(7);
+        }
+        a.atomic_fill(0);
         Ok(pfns)
     }
 }

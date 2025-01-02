@@ -143,7 +143,7 @@ impl AsyncRead for ReadPipe {
 impl HandlePortEvent for ReadPipeState {
     fn message(
         &mut self,
-        control: &mut PortControl<'_>,
+        control: &mut PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         if let Some(err) = &self.failed {
@@ -162,14 +162,14 @@ impl HandlePortEvent for ReadPipeState {
         Ok(())
     }
 
-    fn close(&mut self, control: &mut PortControl<'_>) {
+    fn close(&mut self, control: &mut PortControl<'_, '_>) {
         self.closed = true;
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
         }
     }
 
-    fn fail(&mut self, control: &mut PortControl<'_>, err: NodeError) {
+    fn fail(&mut self, control: &mut PortControl<'_, '_>, err: NodeError) {
         self.failed = Some(ReadError::NodeFailure(err));
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
@@ -266,7 +266,7 @@ impl AsyncWrite for WritePipe {
 impl HandlePortEvent for WritePipeState {
     fn message(
         &mut self,
-        control: &mut PortControl<'_>,
+        control: &mut PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         if let Some(err) = &self.failed {
@@ -289,14 +289,14 @@ impl HandlePortEvent for WritePipeState {
         Ok(())
     }
 
-    fn close(&mut self, control: &mut PortControl<'_>) {
+    fn close(&mut self, control: &mut PortControl<'_, '_>) {
         self.closed = true;
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
         }
     }
 
-    fn fail(&mut self, control: &mut PortControl<'_>, err: NodeError) {
+    fn fail(&mut self, control: &mut PortControl<'_, '_>, err: NodeError) {
         self.failed = Some(Arc::new(err.into()));
         if let Some(waker) = self.waker.take() {
             control.wake(waker);

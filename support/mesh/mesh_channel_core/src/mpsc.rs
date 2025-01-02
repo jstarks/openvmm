@@ -42,6 +42,7 @@ use mesh_node::local_node::PortField;
 use mesh_node::local_node::PortWithHandler;
 use mesh_node::message::MeshField;
 use mesh_node::message::Message;
+use mesh_node::message::OwnedMessage;
 use mesh_protobuf::DefaultEncoding;
 use mesh_protobuf::Protobuf;
 use parking_lot::Mutex;
@@ -141,7 +142,7 @@ impl MessagePtr {
 ///
 /// # Safety
 /// The caller must ensure that `message` is a valid owned `T`.
-unsafe fn encode_message<T: 'static + MeshField + Send>(message: MessagePtr) -> Message {
+unsafe fn encode_message<T: 'static + MeshField + Send>(message: MessagePtr) -> Message<'static> {
     // SAFETY: The caller guarantees `message` is a valid owned `T`.
     unsafe { Message::new(ChannelPayload::Message(message.read::<T>())) }
 }
@@ -767,7 +768,7 @@ struct RemoteQueueState {
     encode: EncodeFn,
 }
 
-type EncodeFn = unsafe fn(MessagePtr) -> Message;
+type EncodeFn = unsafe fn(MessagePtr) -> Message<'static>;
 
 #[derive(Protobuf)]
 #[mesh(bound = "T: MeshField", resource = "mesh_node::resource::Resource")]
@@ -778,7 +779,7 @@ enum ChannelPayload<T> {
 
 struct RemotePortHandler {
     queue: Arc<Queue>,
-    parse: unsafe fn(Message, *mut ()) -> Result<Option<Port>, ChannelError>,
+    parse: unsafe fn(Message<'_>, *mut ()) -> Result<Option<Port>, ChannelError>,
 }
 
 impl RemotePortHandler {
@@ -797,8 +798,8 @@ impl RemotePortHandler {
     ///
     /// # Safety
     /// The caller must ensure that `p` is valid for writing a `T`.
-    unsafe fn parse<T: 'static + MeshField + Send>(
-        message: Message,
+    unsafe fn parse<T: MeshField>(
+        message: Message<'_>,
         p: *mut (),
     ) -> Result<Option<Port>, ChannelError> {
         match message.parse::<ChannelPayload<T>>() {
@@ -816,7 +817,7 @@ impl RemotePortHandler {
 impl HandlePortEvent for RemotePortHandler {
     fn message(
         &mut self,
-        control: &mut mesh_node::local_node::PortControl<'_>,
+        control: &mut mesh_node::local_node::PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         let mut local = self.queue.local.lock();
@@ -845,7 +846,7 @@ impl HandlePortEvent for RemotePortHandler {
         Ok(())
     }
 
-    fn close(&mut self, control: &mut mesh_node::local_node::PortControl<'_>) {
+    fn close(&mut self, control: &mut mesh_node::local_node::PortControl<'_, '_>) {
         let waker = {
             let mut local = self.queue.local.lock();
             local.remove_closed = true;
@@ -858,13 +859,13 @@ impl HandlePortEvent for RemotePortHandler {
 
     fn fail(
         &mut self,
-        control: &mut mesh_node::local_node::PortControl<'_>,
+        control: &mut mesh_node::local_node::PortControl<'_, '_>,
         _err: mesh_node::local_node::NodeError,
     ) {
         self.close(control);
     }
 
-    fn drain(&mut self) -> Vec<Message> {
+    fn drain(&mut self) -> Vec<OwnedMessage> {
         Vec::new()
     }
 }

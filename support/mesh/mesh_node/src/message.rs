@@ -9,11 +9,13 @@
 use crate::resource::Resource;
 use crate::resource::SerializedMessage;
 use mesh_protobuf;
+use mesh_protobuf::encoding::BoxEncoding;
 use mesh_protobuf::encoding::SerializedMessageEncoder;
 use mesh_protobuf::inplace;
 use mesh_protobuf::protobuf::Encoder;
 use mesh_protobuf::protobuf::MessageSizer;
 use mesh_protobuf::protobuf::MessageWriter;
+use mesh_protobuf::DefaultEncoding;
 use mesh_protobuf::MessageEncode;
 use std::any::Any;
 use std::any::TypeId;
@@ -23,16 +25,16 @@ use std::mem::MaybeUninit;
 
 /// A message for sending over a channel.
 #[derive(Default)]
-pub struct Message(MessageInner);
+pub struct OwnedMessage(MessageInner);
 
 enum MessageInner {
     Unserialized(Box<dyn DynSerializeMessage>),
     Serialized(SerializedMessage),
 }
 
-impl Debug for Message {
+impl Debug for OwnedMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Message")
+        f.pad("OwnedMessage")
     }
 }
 
@@ -42,7 +44,7 @@ impl Default for MessageInner {
     }
 }
 
-impl Message {
+impl OwnedMessage {
     /// Serializes the message and returns it.
     pub fn serialize(self) -> SerializedMessage {
         match self.0 {
@@ -57,7 +59,7 @@ impl Message {
 /// This does not include scalar types such as `u32`, which are encoded as
 /// non-message types.
 pub trait MeshPayload:
-    mesh_protobuf::DefaultEncoding<Encoding = <Self as MeshPayload>::Encoding> + Sized
+    DefaultEncoding<Encoding = <Self as MeshPayload>::Encoding> + Send + 'static + Sized
 {
     type Encoding: MessageEncode<Self, Resource>
         + for<'a> mesh_protobuf::MessageDecode<'a, Self, Resource>
@@ -69,7 +71,7 @@ pub trait MeshPayload:
 
 impl<T> MeshPayload for T
 where
-    T: mesh_protobuf::DefaultEncoding,
+    T: DefaultEncoding + Any + Send + 'static,
     T::Encoding: MessageEncode<T, Resource>
         + for<'a> mesh_protobuf::MessageDecode<'a, T, Resource>
         + mesh_protobuf::FieldEncode<T, Resource>
@@ -83,7 +85,7 @@ where
 /// Trait for types that can be a field in a mesh message, including both scalar
 /// types and types that implement [`MeshPayload`].
 pub trait MeshField:
-    mesh_protobuf::DefaultEncoding<Encoding = <Self as MeshField>::Encoding> + Sized
+    DefaultEncoding<Encoding = <Self as MeshField>::Encoding> + Send + 'static + Sized
 {
     type Encoding: mesh_protobuf::FieldEncode<Self, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, Self, Resource>
@@ -93,7 +95,7 @@ pub trait MeshField:
 
 impl<T> MeshField for T
 where
-    T: mesh_protobuf::DefaultEncoding,
+    T: DefaultEncoding + Any + Send + 'static,
     T::Encoding: mesh_protobuf::FieldEncode<T, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, T, Resource>
         + Send
@@ -183,7 +185,7 @@ impl<T: 'static + MeshPayload + Send> SerializeMessage for T {
     }
 }
 
-impl Message {
+impl OwnedMessage {
     /// Creates a new message wrapping `data`, which will be lazily serialized
     /// when needed.
     #[inline]
@@ -222,7 +224,7 @@ impl Message {
     }
 }
 
-impl mesh_protobuf::DefaultEncoding for Message {
+impl DefaultEncoding for OwnedMessage {
     type Encoding = mesh_protobuf::encoding::MessageEncoding<MessageEncoder>;
 }
 
@@ -238,8 +240,8 @@ impl MessageEncode<Box<dyn DynSerializeMessage>, Resource> for MessageEncoder {
     }
 }
 
-impl MessageEncode<Message, Resource> for MessageEncoder {
-    fn write_message(item: Message, writer: MessageWriter<'_, '_, Resource>) {
+impl MessageEncode<OwnedMessage, Resource> for MessageEncoder {
+    fn write_message(item: OwnedMessage, writer: MessageWriter<'_, '_, Resource>) {
         match item.0 {
             MessageInner::Unserialized(message) => Self::write_message(message, writer),
             MessageInner::Serialized(message) => {
@@ -248,7 +250,7 @@ impl MessageEncode<Message, Resource> for MessageEncoder {
         }
     }
 
-    fn compute_message_size(item: &mut Message, sizer: MessageSizer<'_>) {
+    fn compute_message_size(item: &mut OwnedMessage, sizer: MessageSizer<'_>) {
         match &mut item.0 {
             MessageInner::Unserialized(message) => Self::compute_message_size(message, sizer),
             MessageInner::Serialized(message) => {
@@ -258,16 +260,116 @@ impl MessageEncode<Message, Resource> for MessageEncoder {
     }
 }
 
-impl mesh_protobuf::MessageDecode<'_, Message, Resource> for MessageEncoder {
+impl mesh_protobuf::MessageDecode<'_, OwnedMessage, Resource> for MessageEncoder {
     fn read_message(
-        item: &mut inplace::InplaceOption<'_, Message>,
+        item: &mut inplace::InplaceOption<'_, OwnedMessage>,
         reader: mesh_protobuf::protobuf::MessageReader<'_, '_, Resource>,
     ) -> mesh_protobuf::Result<()> {
-        let message = item.take().map(Message::serialize);
+        let message = item.take().map(OwnedMessage::serialize);
         inplace!(message);
         SerializedMessageEncoder::read_message(&mut message, reader)?;
-        item.set(Message::serialized(message.take().unwrap()));
+        item.set(OwnedMessage::serialized(message.take().unwrap()));
         Ok(())
+    }
+}
+
+enum LocalMessageInner<'a> {
+    Owned(OwnedMessage),
+    Local(Box<dyn 'a + DynEncodeMessage>),
+    View(&'a [u8], Vec<Resource>),
+}
+
+pub struct Message<'a>(LocalMessageInner<'a>);
+
+impl<'a> Message<'a> {
+    pub fn new<T: MeshPayload>(data: T) -> Self {
+        OwnedMessage::new(data).into()
+    }
+
+    pub fn new_local<T: 'a + DefaultEncoding<Encoding = E>, E>(data: T) -> Self
+    where
+        E: MessageEncode<T, Resource>,
+    {
+        Self(LocalMessageInner::Local(Box::new(data)))
+    }
+
+    pub fn serialized(v: &'a [u8], resources: Vec<Resource>) -> Self {
+        Self(LocalMessageInner::View(v, resources))
+    }
+
+    pub fn into_owned(self) -> OwnedMessage {
+        match self.0 {
+            LocalMessageInner::Owned(m) => m,
+            LocalMessageInner::Local(_) => {
+                OwnedMessage::serialized(SerializedMessage::from_message(self))
+            }
+            LocalMessageInner::View(v, vec) => OwnedMessage::serialized(SerializedMessage {
+                data: v.into(),
+                resources: vec,
+            }),
+        }
+    }
+
+    /// Parses the message into a value of type `T`.
+    ///
+    /// If the message was constructed with `new<T>`, then the round trip
+    /// serialization/deserialization is skipped.
+    pub fn parse<T: MeshPayload>(self) -> Result<T, mesh_protobuf::Error> {
+        match self.0 {
+            LocalMessageInner::Owned(m) => m.parse(),
+            LocalMessageInner::Local(m) => {}
+            LocalMessageInner::View(data, resources) => todo!(),
+        }
+    }
+}
+
+impl From<OwnedMessage> for Message<'_> {
+    fn from(m: OwnedMessage) -> Self {
+        Self(LocalMessageInner::Owned(m))
+    }
+}
+
+impl DefaultEncoding for Message<'_> {
+    type Encoding = MessageEncoder;
+}
+
+impl MessageEncode<Message<'_>, Resource> for MessageEncoder {
+    fn write_message(item: Message<'_>, mut writer: MessageWriter<'_, '_, Resource>) {
+        match item.0 {
+            LocalMessageInner::Owned(m) => Self::write_message(m, writer),
+            LocalMessageInner::Local(m) => m.write_message(writer),
+            LocalMessageInner::View(data, resources) => {
+                writer.raw_message(data, resources);
+            }
+        }
+    }
+
+    fn compute_message_size(item: &mut Message<'_>, mut sizer: MessageSizer<'_>) {
+        match &mut item.0 {
+            LocalMessageInner::Owned(m) => Self::compute_message_size(m, sizer),
+            LocalMessageInner::Local(m) => m.compute_message_size(sizer),
+            LocalMessageInner::View(data, resources) => {
+                sizer.raw_message(data.len(), resources.len() as u32);
+            }
+        }
+    }
+}
+
+trait DynEncodeMessage {
+    fn compute_message_size(&mut self, sizer: MessageSizer<'_>);
+    fn write_message(self: Box<Self>, writer: MessageWriter<'_, '_, Resource>);
+}
+
+impl<T: DefaultEncoding<Encoding = E>, E> DynEncodeMessage for T
+where
+    E: MessageEncode<T, Resource>,
+{
+    fn compute_message_size(&mut self, sizer: MessageSizer<'_>) {
+        E::compute_message_size(self, sizer);
+    }
+
+    fn write_message(self: Box<Self>, writer: MessageWriter<'_, '_, Resource>) {
+        BoxEncoding::<E>::write_message(self, writer);
     }
 }
 

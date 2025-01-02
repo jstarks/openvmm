@@ -101,14 +101,14 @@ impl<T: 'static + MeshField + Send> From<Port> for OneshotSender<T> {
 
 /// # Safety
 /// The caller must ensure that `value` is of type `T`.
-unsafe fn encode_message<T: 'static + MeshField + Send>(value: BoxedValue) -> Message {
+unsafe fn encode_message<T: MeshField>(value: BoxedValue) -> Message<'static> {
     // SAFETY: the caller ensures that `value` is of type `T`.
     let value = unsafe { value.cast::<T>() };
     Message::new((value,))
 }
 
 fn decode_message<T: 'static + MeshField + Send>(
-    message: Message,
+    message: Message<'_>,
 ) -> Result<BoxedValue, ChannelError> {
     let (value,) = message.parse::<(Box<T>,)>()?;
     Ok(BoxedValue::new(value))
@@ -466,7 +466,11 @@ struct SlotHandler {
 struct UnexpectedMessage;
 
 impl SlotHandler {
-    fn close_or_fail(&mut self, control: &mut mesh_node::local_node::PortControl<'_>, fail: bool) {
+    fn close_or_fail(
+        &mut self,
+        control: &mut mesh_node::local_node::PortControl<'_, '_>,
+        fail: bool,
+    ) {
         let mut state = self.slot.0.lock();
         match std::mem::replace(&mut *state, SlotState::Done) {
             SlotState::Waiting(waker) => {
@@ -488,7 +492,7 @@ impl SlotHandler {
 impl HandlePortEvent for SlotHandler {
     fn message(
         &mut self,
-        control: &mut mesh_node::local_node::PortControl<'_>,
+        control: &mut mesh_node::local_node::PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         let mut state = self.slot.0.lock();
@@ -517,13 +521,13 @@ impl HandlePortEvent for SlotHandler {
         Ok(())
     }
 
-    fn close(&mut self, control: &mut mesh_node::local_node::PortControl<'_>) {
+    fn close(&mut self, control: &mut mesh_node::local_node::PortControl<'_, '_>) {
         self.close_or_fail(control, false);
     }
 
     fn fail(
         &mut self,
-        control: &mut mesh_node::local_node::PortControl<'_>,
+        control: &mut mesh_node::local_node::PortControl<'_, '_>,
         _err: mesh_node::local_node::NodeError,
     ) {
         self.close_or_fail(control, true);

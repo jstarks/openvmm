@@ -300,7 +300,7 @@ struct MessageQueue {
 impl HandlePortEvent for MessageQueue {
     fn message(
         &mut self,
-        control: &mut PortControl<'_>,
+        control: &mut PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         self.messages.push_back(message);
@@ -310,14 +310,14 @@ impl HandlePortEvent for MessageQueue {
         Ok(())
     }
 
-    fn fail(&mut self, control: &mut PortControl<'_>, err: NodeError) {
+    fn fail(&mut self, control: &mut PortControl<'_, '_>, err: NodeError) {
         self.state = QueueState::Failed(err);
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
         }
     }
 
-    fn close(&mut self, control: &mut PortControl<'_>) {
+    fn close(&mut self, control: &mut PortControl<'_, '_>) {
         self.state = QueueState::Closed;
         if let Some(waker) = self.waker.take() {
             control.wake(waker);

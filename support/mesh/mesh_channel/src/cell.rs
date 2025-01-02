@@ -269,7 +269,7 @@ enum UpdateResponse {
 impl<T: 'static + MeshField + Send + Sync> HandlePortEvent for State<T> {
     fn message(
         &mut self,
-        control: &mut PortControl<'_>,
+        control: &mut PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         let UpdateMessage::<T> { id, value } = message.parse().map_err(HandleMessageError::new)?;
@@ -284,9 +284,9 @@ impl<T: 'static + MeshField + Send + Sync> HandlePortEvent for State<T> {
         Ok(())
     }
 
-    fn close(&mut self, _control: &mut PortControl<'_>) {}
+    fn close(&mut self, _control: &mut PortControl<'_, '_>) {}
 
-    fn fail(&mut self, _control: &mut PortControl<'_>, _err: NodeError) {}
+    fn fail(&mut self, _control: &mut PortControl<'_, '_>, _err: NodeError) {}
 
     fn drain(&mut self) -> Vec<Message> {
         Vec::new()

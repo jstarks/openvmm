@@ -123,7 +123,7 @@ impl<T: 'static + MeshField + Send> Stream for BoundedReceiver<T> {
 impl HandlePortEvent for ReceiverState {
     fn message(
         &mut self,
-        control: &mut PortControl<'_>,
+        control: &mut PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         if let Some(err) = &self.failed {
@@ -136,14 +136,14 @@ impl HandlePortEvent for ReceiverState {
         Ok(())
     }
 
-    fn close(&mut self, control: &mut PortControl<'_>) {
+    fn close(&mut self, control: &mut PortControl<'_, '_>) {
         self.closed = true;
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
         }
     }
 
-    fn fail(&mut self, control: &mut PortControl<'_>, err: NodeError) {
+    fn fail(&mut self, control: &mut PortControl<'_, '_>, err: NodeError) {
         self.failed = Some(err);
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
@@ -217,7 +217,7 @@ impl<T: 'static + MeshField + Send> BoundedSender<T> {
 impl HandlePortEvent for SenderState {
     fn message(
         &mut self,
-        control: &mut PortControl<'_>,
+        control: &mut PortControl<'_, '_>,
         message: Message,
     ) -> Result<(), HandleMessageError> {
         let message = message.parse::<QuotaMessage>().map_err(|err| {
@@ -231,14 +231,14 @@ impl HandlePortEvent for SenderState {
         Ok(())
     }
 
-    fn close(&mut self, control: &mut PortControl<'_>) {
+    fn close(&mut self, control: &mut PortControl<'_, '_>) {
         self.closed = true;
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
         }
     }
 
-    fn fail(&mut self, control: &mut PortControl<'_>, _err: NodeError) {
+    fn fail(&mut self, control: &mut PortControl<'_, '_>, _err: NodeError) {
         self.closed = true;
         if let Some(waker) = self.waker.take() {
             control.wake(waker);

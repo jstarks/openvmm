@@ -4,9 +4,9 @@
 //! Provides an `Option`-like type for constructing values in place.
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::sync::Arc;
 use core::mem::MaybeUninit;
-use std::rc::Rc;
 
 /// A type with methods like `Option` but that operates on a mutable reference
 /// to possibly-initialized data.

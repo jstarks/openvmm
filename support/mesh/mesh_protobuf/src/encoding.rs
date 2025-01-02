@@ -41,6 +41,7 @@ use crate::Error;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -57,7 +58,6 @@ use core::num::NonZeroU64;
 use core::num::NonZeroU8;
 use core::num::NonZeroUsize;
 use core::time::Duration;
-use std::rc::Rc;
 use thiserror::Error;
 
 /// An encoding derived by `mesh_derive` for `T`.
@@ -1752,6 +1752,10 @@ impl<T: DefaultEncoding> DefaultEncoding for Box<T> {
 }
 
 impl<T: DefaultEncoding + Clone> DefaultEncoding for Arc<T> {
+    type Encoding = RcEncoding<T::Encoding>;
+}
+
+impl<T: DefaultEncoding + Clone> DefaultEncoding for Rc<T> {
     type Encoding = RcEncoding<T::Encoding>;
 }
 

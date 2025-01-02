@@ -882,6 +882,7 @@ mod tests {
     use futures_core::FusedStream;
     use mesh_node::local_node::Port;
     use std::cell::Cell;
+    use std::rc::Rc;
     use test_with_tracing::test;
 
     // Ensure `Send` and `Sync` are implemented correctly.
@@ -969,6 +970,19 @@ mod tests {
             };
             tracing::info!(error = &err as &dyn std::error::Error, "expected error");
             assert!(receiver.is_terminated());
+        })
+    }
+
+    #[test]
+    fn test_no_send() {
+        block_on(async {
+            let (sender, receiver) = channel::<Rc<String>>();
+            let mut receiver = Receiver::<Rc<String>>::from(Port::from(receiver));
+            sender.send(Rc::new(String::from("test")));
+            assert_eq!(
+                receiver.next().await.as_ref().map(|v| v.as_str()),
+                Some("test")
+            );
         })
     }
 }

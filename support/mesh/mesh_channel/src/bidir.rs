@@ -21,6 +21,7 @@ use mesh_node::local_node::PortField;
 use mesh_node::local_node::PortWithHandler;
 use mesh_node::message::MeshPayload;
 use mesh_node::message::Message;
+use mesh_node::message::OwnedMessage;
 use mesh_node::resource::SerializedMessage;
 use std::any::TypeId;
 use std::collections::VecDeque;
@@ -143,7 +144,7 @@ impl GenericChannel {
 
     /// Consumes and returns the first message from the incoming message queue
     /// if there are any messages available.
-    fn try_recv(&self) -> Result<Message, TryRecvError> {
+    fn try_recv(&self) -> Result<OwnedMessage, TryRecvError> {
         self.port.with_handler(|queue| match &queue.state {
             QueueState::Open => queue.messages.pop_front().ok_or(TryRecvError::Empty),
             QueueState::Closed => queue.messages.pop_front().ok_or(TryRecvError::Closed),
@@ -152,7 +153,7 @@ impl GenericChannel {
     }
 
     /// Polls the message queue.
-    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<Message, RecvError>> {
+    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<OwnedMessage, RecvError>> {
         let mut old_waker = None;
         self.port.with_handler(|queue| match &queue.state {
             QueueState::Open => {
@@ -207,7 +208,7 @@ impl<T: 'static + Send, U: 'static + Send> Channel<T, U> {
         self.generic
             .try_recv()?
             .try_parse()
-            .or_else(|m| lazy_parse(m, &mut self.deserialize))
+            .or_else(|m| lazy_parse(m.serialize(), &mut self.deserialize))
             .map_err(|err| TryRecvError::Error(err.into()))
     }
 
@@ -216,7 +217,7 @@ impl<T: 'static + Send, U: 'static + Send> Channel<T, U> {
         let r = std::task::ready!(self.generic.poll_recv(cx)).and_then(|message| {
             message
                 .try_parse()
-                .or_else(|m| lazy_parse(m, &mut self.deserialize))
+                .or_else(|m| lazy_parse(m.serialize(), &mut self.deserialize))
                 .map_err(|err| RecvError::Error(err.into()))
         });
         if r.is_err() {
@@ -292,7 +293,7 @@ enum QueueState {
 
 #[derive(Debug, Default)]
 struct MessageQueue {
-    messages: VecDeque<Message>,
+    messages: VecDeque<OwnedMessage>,
     state: QueueState,
     waker: Option<Waker>,
 }
@@ -301,9 +302,9 @@ impl HandlePortEvent for MessageQueue {
     fn message(
         &mut self,
         control: &mut PortControl<'_, '_>,
-        message: Message,
+        message: Message<'_>,
     ) -> Result<(), HandleMessageError> {
-        self.messages.push_back(message);
+        self.messages.push_back(message.into_owned());
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
         }
@@ -324,7 +325,7 @@ impl HandlePortEvent for MessageQueue {
         }
     }
 
-    fn drain(&mut self) -> Vec<Message> {
+    fn drain(&mut self) -> Vec<OwnedMessage> {
         std::mem::take(&mut self.messages).into()
     }
 }

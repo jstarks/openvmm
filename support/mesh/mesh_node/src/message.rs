@@ -12,13 +12,16 @@ use mesh_protobuf;
 use mesh_protobuf::encoding::BoxEncoding;
 use mesh_protobuf::encoding::SerializedMessageEncoder;
 use mesh_protobuf::inplace;
-use mesh_protobuf::protobuf::Encoder;
+use mesh_protobuf::inplace_none;
+use mesh_protobuf::protobuf::decode_with;
 use mesh_protobuf::protobuf::MessageSizer;
 use mesh_protobuf::protobuf::MessageWriter;
 use mesh_protobuf::DefaultEncoding;
+use mesh_protobuf::MessageDecode;
 use mesh_protobuf::MessageEncode;
 use std::any::Any;
 use std::any::TypeId;
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Debug;
 use std::mem::MaybeUninit;
@@ -58,11 +61,9 @@ impl OwnedMessage {
 ///
 /// This does not include scalar types such as `u32`, which are encoded as
 /// non-message types.
-pub trait MeshPayload:
-    DefaultEncoding<Encoding = <Self as MeshPayload>::Encoding> + Send + 'static + Sized
-{
+pub trait MeshPayload: DefaultEncoding<Encoding = <Self as MeshPayload>::Encoding> + Sized {
     type Encoding: MessageEncode<Self, Resource>
-        + for<'a> mesh_protobuf::MessageDecode<'a, Self, Resource>
+        + for<'a> MessageDecode<'a, Self, Resource>
         + mesh_protobuf::FieldEncode<Self, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, Self, Resource>
         + Send
@@ -73,7 +74,7 @@ impl<T> MeshPayload for T
 where
     T: DefaultEncoding + Any + Send + 'static,
     T::Encoding: MessageEncode<T, Resource>
-        + for<'a> mesh_protobuf::MessageDecode<'a, T, Resource>
+        + for<'a> MessageDecode<'a, T, Resource>
         + mesh_protobuf::FieldEncode<T, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, T, Resource>
         + Send
@@ -84,9 +85,7 @@ where
 
 /// Trait for types that can be a field in a mesh message, including both scalar
 /// types and types that implement [`MeshPayload`].
-pub trait MeshField:
-    DefaultEncoding<Encoding = <Self as MeshField>::Encoding> + Send + 'static + Sized
-{
+pub trait MeshField: DefaultEncoding<Encoding = <Self as MeshField>::Encoding> + Sized {
     type Encoding: mesh_protobuf::FieldEncode<Self, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, Self, Resource>
         + Send
@@ -95,7 +94,7 @@ pub trait MeshField:
 
 impl<T> MeshField for T
 where
-    T: DefaultEncoding + Any + Send + 'static,
+    T: DefaultEncoding,
     T::Encoding: mesh_protobuf::FieldEncode<T, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, T, Resource>
         + Send
@@ -164,11 +163,6 @@ unsafe impl<T: SerializeMessage> DynSerializeMessage for T {
     }
 }
 
-fn serialize_dyn_message(message: Box<dyn DynSerializeMessage>) -> SerializedMessage {
-    let (data, resources) = Encoder::<_, MessageEncoder, _>::with_encoding(message).encode();
-    SerializedMessage { data, resources }
-}
-
 impl<T: 'static + MeshPayload + Send> SerializeMessage for T {
     type Concrete = Self;
 
@@ -202,11 +196,11 @@ impl OwnedMessage {
     ///
     /// If the message was constructed with `new<T>`, then the round trip
     /// serialization/deserialization is skipped.
-    pub fn parse<T: 'static + MeshPayload>(self) -> Result<T, mesh_protobuf::Error> {
-        self.try_parse().or_else(|m| m.into_message())
+    pub fn parse<T: 'static + MeshPayload + Send>(self) -> Result<T, mesh_protobuf::Error> {
+        self.try_parse().or_else(|m| m.serialize().into_message())
     }
 
-    pub fn try_parse<T: 'static>(self) -> Result<T, SerializedMessage> {
+    pub fn try_parse<T: 'static>(self) -> Result<T, Self> {
         match self.0 {
             MessageInner::Unserialized(m) => {
                 let mut message = MaybeUninit::<T>::uninit();
@@ -215,11 +209,11 @@ impl OwnedMessage {
                 unsafe {
                     match m.extract(TypeId::of::<T>(), message.as_mut_ptr().cast()) {
                         Ok(()) => Ok(message.assume_init()),
-                        Err(message) => Err(serialize_dyn_message(message)),
+                        Err(message) => Err(Self(MessageInner::Unserialized(message))),
                     }
                 }
             }
-            MessageInner::Serialized(m) => Err(m),
+            MessageInner::Serialized(_) => Err(self),
         }
     }
 }
@@ -260,7 +254,7 @@ impl MessageEncode<OwnedMessage, Resource> for MessageEncoder {
     }
 }
 
-impl mesh_protobuf::MessageDecode<'_, OwnedMessage, Resource> for MessageEncoder {
+impl MessageDecode<'_, OwnedMessage, Resource> for MessageEncoder {
     fn read_message(
         item: &mut inplace::InplaceOption<'_, OwnedMessage>,
         reader: mesh_protobuf::protobuf::MessageReader<'_, '_, Resource>,
@@ -282,7 +276,7 @@ enum LocalMessageInner<'a> {
 pub struct Message<'a>(LocalMessageInner<'a>);
 
 impl<'a> Message<'a> {
-    pub fn new<T: MeshPayload>(data: T) -> Self {
+    pub fn new<T: SerializeMessage>(data: T) -> Self {
         OwnedMessage::new(data).into()
     }
 
@@ -310,16 +304,51 @@ impl<'a> Message<'a> {
         }
     }
 
-    /// Parses the message into a value of type `T`.
-    ///
-    /// If the message was constructed with `new<T>`, then the round trip
-    /// serialization/deserialization is skipped.
-    pub fn parse<T: MeshPayload>(self) -> Result<T, mesh_protobuf::Error> {
+    pub fn serialize(self) -> (Cow<'a, [u8]>, Vec<Resource>) {
         match self.0 {
-            LocalMessageInner::Owned(m) => m.parse(),
-            LocalMessageInner::Local(m) => {}
-            LocalMessageInner::View(data, resources) => todo!(),
+            LocalMessageInner::Owned(OwnedMessage(MessageInner::Serialized(m))) => {
+                (Cow::Owned(m.data), m.resources)
+            }
+            LocalMessageInner::View(data, resources) => (Cow::Borrowed(data), resources),
+            m => {
+                let m = SerializedMessage::from_message(Self(m));
+                (Cow::Owned(m.data), m.resources)
+            }
         }
+    }
+
+    fn into_data_and_resources(self) -> (Cow<'a, [u8]>, Vec<Option<Resource>>) {
+        let (d, r) = self.serialize();
+        (d, r.into_iter().map(Some).collect::<Vec<_>>())
+    }
+
+    /// Parses the message into a value of type `T`.
+    pub fn parse<T: 'static>(mut self) -> Result<T, mesh_protobuf::Error>
+    where
+        T: DefaultEncoding,
+        T::Encoding: for<'b> MessageDecode<'b, T, Resource>,
+    {
+        if let LocalMessageInner::Owned(m) = self.0 {
+            match m.try_parse() {
+                Ok(m) => return Ok(m),
+                Err(m) => {
+                    self = Self(LocalMessageInner::Owned(m));
+                }
+            }
+        }
+        self.parse_local()
+    }
+
+    /// Parses the message into a value of type `T`.
+    pub fn parse_local<T>(self) -> Result<T, mesh_protobuf::Error>
+    where
+        T: DefaultEncoding,
+        T::Encoding: for<'b> MessageDecode<'b, T, Resource>,
+    {
+        let (data, mut resources) = self.into_data_and_resources();
+        inplace_none!(message: T);
+        decode_with::<T::Encoding, _, _>(&mut message, &data, &mut resources)?;
+        Ok(message.take().expect("should be constructed"))
     }
 }
 

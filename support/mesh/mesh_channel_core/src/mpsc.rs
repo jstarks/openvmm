@@ -144,7 +144,8 @@ impl MessagePtr {
 /// The caller must ensure that `message` is a valid owned `T`.
 unsafe fn encode_message<T: 'static + MeshField + Send>(message: MessagePtr) -> Message<'static> {
     // SAFETY: The caller guarantees `message` is a valid owned `T`.
-    unsafe { Message::new(ChannelPayload::Message(message.read::<T>())) }
+    let m = unsafe { Message::new_local(ChannelPayload::Message(message.read::<T>())) };
+    unsafe { std::mem::transmute::<Message<'_>, Message<'static>>(m) }
 }
 
 #[derive(Debug, Clone)]
@@ -286,7 +287,7 @@ impl Drop for SenderCore {
     }
 }
 
-impl<T: 'static + MeshField + Send> DefaultEncoding for Sender<T> {
+impl<T> DefaultEncoding for Sender<T> {
     type Encoding = PortField;
 }
 
@@ -802,7 +803,7 @@ impl RemotePortHandler {
         message: Message<'_>,
         p: *mut (),
     ) -> Result<Option<Port>, ChannelError> {
-        match message.parse::<ChannelPayload<T>>() {
+        match message.parse_local::<ChannelPayload<T>>() {
             Ok(ChannelPayload::Message(message)) => {
                 // SAFETY: The caller guarantees `p` is valid for writing a `T`.
                 unsafe { p.cast::<T>().write(message) };
@@ -818,7 +819,7 @@ impl HandlePortEvent for RemotePortHandler {
     fn message(
         &mut self,
         control: &mut mesh_node::local_node::PortControl<'_, '_>,
-        message: Message,
+        message: Message<'_>,
     ) -> Result<(), HandleMessageError> {
         let mut local = self.queue.local.lock();
         assert!(!local.receiver_gone);

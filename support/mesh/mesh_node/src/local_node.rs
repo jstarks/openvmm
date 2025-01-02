@@ -402,9 +402,9 @@ impl<T: HandlePortEvent> PortWithHandler<T> {
         f(state.handler.as_any().downcast_mut().unwrap())
     }
 
-    pub fn with_port_and_handler<R>(
+    pub fn with_port_and_handler<'a, R>(
         &self,
-        f: impl FnOnce(&mut PortControl<'_, '_>, &mut T) -> R,
+        f: impl FnOnce(&mut PortControl<'_, 'a>, &mut T) -> R,
     ) -> R {
         let mut pending_events = PendingEvents::new();
         let mut state = self.raw.inner.state.lock();
@@ -2288,7 +2288,9 @@ pub mod tests {
             Port::from(self).bridge(other.into())
         }
 
-        fn change_types<T2: MeshField, U2: MeshField>(self) -> Channel<T2, U2> {
+        fn change_types<T2: 'static + MeshField + Send, U2: 'static + MeshField + Send>(
+            self,
+        ) -> Channel<T2, U2> {
             let Self { port, _phantom: _ } = self;
             Channel {
                 port,

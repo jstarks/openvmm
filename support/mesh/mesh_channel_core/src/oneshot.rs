@@ -9,6 +9,7 @@ use mesh_node::local_node::PortField;
 use mesh_node::local_node::PortWithHandler;
 use mesh_node::message::MeshField;
 use mesh_node::message::Message;
+use mesh_node::message::OwnedMessage;
 use mesh_protobuf::DefaultEncoding;
 use parking_lot::Mutex;
 use std::fmt::Debug;
@@ -104,13 +105,12 @@ impl<T: 'static + MeshField + Send> From<Port> for OneshotSender<T> {
 unsafe fn encode_message<T: MeshField>(value: BoxedValue) -> Message<'static> {
     // SAFETY: the caller ensures that `value` is of type `T`.
     let value = unsafe { value.cast::<T>() };
-    Message::new((value,))
+    let m = Message::new_local((value,));
+    unsafe { std::mem::transmute::<Message<'_>, Message<'static>>(m) }
 }
 
-fn decode_message<T: 'static + MeshField + Send>(
-    message: Message<'_>,
-) -> Result<BoxedValue, ChannelError> {
-    let (value,) = message.parse::<(Box<T>,)>()?;
+fn decode_message<T: MeshField>(message: Message<'_>) -> Result<BoxedValue, ChannelError> {
+    let (value,) = message.parse_local::<(Box<T>,)>()?;
     Ok(BoxedValue::new(value))
 }
 
@@ -417,8 +417,8 @@ enum SlotState {
     ReceiverRemote(Port, EncodeFn),
 }
 
-type EncodeFn = unsafe fn(BoxedValue) -> Message;
-type DecodeFn = unsafe fn(Message) -> Result<BoxedValue, ChannelError>;
+type EncodeFn = unsafe fn(BoxedValue) -> Message<'static>;
+type DecodeFn = unsafe fn(Message<'_>) -> Result<BoxedValue, ChannelError>;
 
 #[derive(Debug)]
 struct BoxedValue(NonNull<()>);
@@ -493,7 +493,7 @@ impl HandlePortEvent for SlotHandler {
     fn message(
         &mut self,
         control: &mut mesh_node::local_node::PortControl<'_, '_>,
-        message: Message,
+        message: Message<'_>,
     ) -> Result<(), HandleMessageError> {
         let mut state = self.slot.0.lock();
         match std::mem::replace(&mut *state, SlotState::Done) {
@@ -533,7 +533,7 @@ impl HandlePortEvent for SlotHandler {
         self.close_or_fail(control, true);
     }
 
-    fn drain(&mut self) -> Vec<Message> {
+    fn drain(&mut self) -> Vec<OwnedMessage> {
         Vec::new()
     }
 }

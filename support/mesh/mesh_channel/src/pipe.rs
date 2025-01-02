@@ -14,6 +14,7 @@ use mesh_node::local_node::PortControl;
 use mesh_node::local_node::PortField;
 use mesh_node::local_node::PortWithHandler;
 use mesh_node::message::Message;
+use mesh_node::message::OwnedMessage;
 use mesh_node::resource::Resource;
 use mesh_protobuf::encoding::OptionField;
 use mesh_protobuf::Protobuf;
@@ -144,17 +145,17 @@ impl HandlePortEvent for ReadPipeState {
     fn message(
         &mut self,
         control: &mut PortControl<'_, '_>,
-        message: Message,
+        message: Message<'_>,
     ) -> Result<(), HandleMessageError> {
         if let Some(err) = &self.failed {
             return Err(HandleMessageError::new(err.clone()));
         }
-        let data = message.serialize().data;
+        let (data, _) = message.serialize();
         if data.len() + self.data.len() + self.consumed_bytes as usize > self.quota_bytes as usize {
             self.failed = Some(ReadError::OverQuota);
             return Err(HandleMessageError::new(ReadError::OverQuota));
         }
-        self.data.extend(&data);
+        self.data.extend(data.as_ref());
         self.consumed_messages += 1;
         if let Some(waker) = self.waker.take() {
             control.wake(waker);
@@ -176,9 +177,9 @@ impl HandlePortEvent for ReadPipeState {
         }
     }
 
-    fn drain(&mut self) -> Vec<Message> {
+    fn drain(&mut self) -> Vec<OwnedMessage> {
         let data = std::mem::take(&mut self.data).into();
-        vec![Message::serialized(mesh_protobuf::SerializedMessage {
+        vec![OwnedMessage::serialized(mesh_protobuf::SerializedMessage {
             data,
             resources: Vec::new(),
         })]
@@ -229,10 +230,7 @@ impl WritePipe {
                 let n = buf.len().min(state.remaining_bytes as usize);
                 state.remaining_bytes -= n as u32;
                 state.remaining_messages -= 1;
-                port.respond(Message::serialized(mesh_protobuf::SerializedMessage {
-                    data: buf[..n].to_vec(),
-                    resources: Vec::new(),
-                }));
+                port.respond(Message::serialized(&buf[..n], Vec::new()));
                 Ok(n).into()
             } else {
                 if let Some(cx) = cx {
@@ -267,7 +265,7 @@ impl HandlePortEvent for WritePipeState {
     fn message(
         &mut self,
         control: &mut PortControl<'_, '_>,
-        message: Message,
+        message: Message<'_>,
     ) -> Result<(), HandleMessageError> {
         if let Some(err) = &self.failed {
             return Err(HandleMessageError::new(err.clone()));
@@ -303,10 +301,10 @@ impl HandlePortEvent for WritePipeState {
         }
     }
 
-    fn drain(&mut self) -> Vec<Message> {
+    fn drain(&mut self) -> Vec<OwnedMessage> {
         // Send remaining quota as a message to avoid having to synchronize
         // during encoding.
-        vec![Message::new(QuotaMessage {
+        vec![OwnedMessage::new(QuotaMessage {
             bytes: self.remaining_bytes,
             messages: self.remaining_messages,
         })]

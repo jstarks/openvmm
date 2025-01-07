@@ -2,14 +2,15 @@ use futures_concurrency::future::TryJoin;
 use hyperlight_host::func::HostFunction1;
 use hyperlight_host::func::ParameterValue;
 use hyperlight_host::func::ReturnType;
+use hyperlight_host::func::ReturnValue;
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
 use hyperlight_host::MultiUseGuestCallContext;
 use hyperlight_host::MultiUseSandbox;
 use hyperlight_host::UninitializedSandbox;
 use mesh::local_node::LocalNode;
-use mesh::local_node::Port;
 use mesh::local_node::SendEvent;
+use mesh::message::MeshField;
 use mesh::Address;
 use mesh::NodeId;
 use mesh::PortId;
@@ -49,7 +50,7 @@ impl HyperlightMeshSandbox {
         })
     }
 
-    pub async fn run(mut self, port: impl Into<Port>) -> hyperlight_host::Result<()> {
+    pub async fn run(mut self, message: impl MeshField) -> anyhow::Result<()> {
         let guest_address = Address::new(NodeId::new(), PortId::new());
         let host_address = Address::new(NodeId::new(), PortId::new());
         let params = StartParams {
@@ -58,8 +59,8 @@ impl HyperlightMeshSandbox {
         };
         let node = LocalNode::with_id(host_address.node, Box::new(NullConnector));
         let remote = node.add_remote(guest_address.node);
-        node.add_port(host_address.port, guest_address)
-            .bridge(port.into());
+        let port = node.add_port(host_address.port, guest_address);
+        mesh::OneshotSender::from(port).send(message);
 
         self.context.call(
             "start",
@@ -81,13 +82,19 @@ impl HyperlightMeshSandbox {
 
         let host_send_task = async {
             while let Ok(v) = host_recv.recv().await {
-                self.context.call(
+                let r = self.context.call(
                     "send",
-                    ReturnType::Void,
+                    ReturnType::Int,
                     Some(vec![ParameterValue::VecBytes(v)]),
                 )?;
+                let ReturnValue::Int(r) = r else {
+                    anyhow::bail!("unexpected return value")
+                };
+                if r == 0 {
+                    break;
+                }
             }
-            Ok::<_, hyperlight_host::error::HyperlightError>(())
+            Ok(())
         };
 
         (guest_send_task, host_send_task).try_join().await?;

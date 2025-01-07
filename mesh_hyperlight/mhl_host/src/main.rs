@@ -1,6 +1,6 @@
 mod infra;
 
-use futures_concurrency::future::Race;
+use futures_concurrency::future::TryJoin;
 use hyperlight_host::sandbox::uninitialized::UninitializedSandbox;
 use hyperlight_host::GuestBinary;
 
@@ -15,18 +15,18 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let sandbox = infra::HyperlightMeshSandbox::new(usandbox)?;
-    let (send, recv) = mesh::oneshot();
 
     let (logger_send, mut logger_recv) = mesh::channel();
     let (req_send, req_recv) = mesh::channel();
-    send.send(mhl_common::InitialMessage {
-        logger: logger_send,
-        dictionary: [('h', 'H'), ('w', 'W')].into_iter().collect(),
-        requests: req_recv,
-    });
 
     let sandbox_task = async {
-        sandbox.run(recv).await?;
+        sandbox
+            .run(mhl_common::InitialMessage {
+                logger: logger_send,
+                requests: req_recv,
+                dictionary: [('h', 'H'), ('w', 'W')].into_iter().collect(),
+            })
+            .await?;
         anyhow::Ok(())
     };
 
@@ -39,14 +39,24 @@ fn main() -> anyhow::Result<()> {
 
     let work_task = async {
         let (response_send, response_recv) = mesh::oneshot();
-        req_send.send(mhl_common::Request {
-            request: "hello world".to_owned(),
+        req_send.send(mhl_common::Request::Ping {
             response: response_send,
         });
-        println!("got response: {}", response_recv.await?);
+        response_recv.await?;
+        println!("ping successful");
+
+        for s in ["hello world", "which way"] {
+            let (response_send, response_recv) = mesh::oneshot();
+            req_send.send(mhl_common::Request::TranslateString {
+                request: s.to_owned(),
+                response: response_send,
+            });
+            let response = response_recv.await?;
+            println!("got response: {response}");
+        }
         Ok(())
     };
 
-    futures::executor::block_on((sandbox_task, log_task, work_task).race())?;
+    futures::executor::block_on((sandbox_task, log_task, work_task).try_join())?;
     Ok(())
 }

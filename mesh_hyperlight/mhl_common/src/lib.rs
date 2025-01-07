@@ -22,7 +22,12 @@ pub struct InitialMessage {
 
 #[derive(Protobuf)]
 #[mesh(resource = "Resource")]
-pub struct Request {
-    pub request: String,
-    pub response: OneshotSender<String>,
+pub enum Request {
+    TranslateString {
+        request: String,
+        response: OneshotSender<String>,
+    },
+    Ping {
+        response: OneshotSender<()>,
+    },
 }

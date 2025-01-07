@@ -8,6 +8,12 @@
 //! types on top that `mesh_channel` provides.
 
 #![warn(missing_docs)]
+#![warn(clippy::std_instead_of_core)]
+#![warn(clippy::std_instead_of_alloc)]
+
+extern crate alloc;
+
+pub use alloc::rc;
 
 mod deque;
 mod error;

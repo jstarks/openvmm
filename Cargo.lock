@@ -3785,7 +3785,6 @@ dependencies = [
  "open_enum",
  "pal",
  "pal_async",
- "parking_lot",
  "test_with_tracing",
  "thiserror 2.0.0",
  "tracing",

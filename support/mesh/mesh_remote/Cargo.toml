@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 mesh_channel.workspace = true
-mesh_node.workspace = true
+mesh_node = { workspace = true, features = ["std"] }
 mesh_protobuf.workspace = true
 open_enum.workspace = true
 pal.workspace = true

@@ -12,11 +12,11 @@ use thiserror::Error;
 
 #[derive(Debug)]
 pub enum OsResource {
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "std"))]
     Fd(std::os::unix::io::OwnedFd),
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "std"))]
     Handle(std::os::windows::io::OwnedHandle),
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "std"))]
     Socket(std::os::windows::io::OwnedSocket),
 }
 
@@ -55,14 +55,14 @@ impl TryFrom<Resource> for Port {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 impl From<std::os::unix::io::OwnedFd> for Resource {
     fn from(fd: std::os::unix::io::OwnedFd) -> Self {
         Self::Os(OsResource::Fd(fd))
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 impl TryFrom<Resource> for std::os::unix::io::OwnedFd {
     type Error = ResourceError;
 
@@ -74,14 +74,14 @@ impl TryFrom<Resource> for std::os::unix::io::OwnedFd {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 impl From<std::os::windows::io::OwnedHandle> for Resource {
     fn from(port: std::os::windows::io::OwnedHandle) -> Self {
         Self::Os(OsResource::Handle(port))
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 impl TryFrom<Resource> for std::os::windows::io::OwnedHandle {
     type Error = ResourceError;
 
@@ -93,14 +93,14 @@ impl TryFrom<Resource> for std::os::windows::io::OwnedHandle {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 impl From<std::os::windows::io::OwnedSocket> for Resource {
     fn from(port: std::os::windows::io::OwnedSocket) -> Self {
         Self::Os(OsResource::Socket(port))
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 impl TryFrom<Resource> for std::os::windows::io::OwnedSocket {
     type Error = ResourceError;
 

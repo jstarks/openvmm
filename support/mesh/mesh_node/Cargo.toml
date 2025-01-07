@@ -7,8 +7,8 @@ edition = "2021"
 rust-version.workspace = true
 
 [features]
-default = ["std"]
-std = []
+#default = ["std"]
+std = ["xrc/std"]
 
 [dependencies]
 mesh_derive.workspace = true
@@ -16,11 +16,11 @@ mesh_protobuf.workspace = true
 open_enum.workspace = true
 xrc.workspace = true
 
-futures-channel.workspace = true
-getrandom.workspace = true
-parking_lot.workspace = true
+futures-channel = { workspace = true, features = ["alloc"] }
+getrandom = { workspace = true, features = ["custom"] }
+#parking_lot.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1", default-features = false }
 zerocopy.workspace = true
 
 [target.'cfg(windows)'.dependencies]

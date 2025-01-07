@@ -7,10 +7,12 @@ extern crate std;
 #[cfg(feature = "std")]
 pub mod arc {
     pub use parking_lot::Mutex;
+    pub use parking_lot::MutexGuard;
     pub use parking_lot::RawMutex;
     pub use parking_lot::RawRwLock;
     pub use parking_lot::RwLock;
     pub use std::sync::Arc;
+    pub use std::sync::Weak;
 }
 
 pub mod rc {
@@ -18,8 +20,10 @@ pub mod rc {
     #![expect(unsafe_code)]
 
     pub use alloc::rc::Rc as Arc;
+    pub use alloc::rc::Weak;
     pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
     pub type RwLock<T> = lock_api::RwLock<RawRwLock, T>;
+    pub type MutexGuard<'a, T> = lock_api::MutexGuard<'a, RawMutex, T>;
 
     use core::cell::Cell;
 

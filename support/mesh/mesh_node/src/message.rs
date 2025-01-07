@@ -8,6 +8,15 @@
 
 use crate::resource::Resource;
 use crate::resource::SerializedMessage;
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::fmt;
+use alloc::vec::Vec;
+use core::any::Any;
+use core::any::TypeId;
+use core::fmt::Debug;
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use mesh_protobuf;
 use mesh_protobuf::encoding::SerializedMessageEncoder;
 use mesh_protobuf::inplace;
@@ -18,13 +27,6 @@ use mesh_protobuf::protobuf::MessageWriter;
 use mesh_protobuf::DefaultEncoding;
 use mesh_protobuf::MessageDecode;
 use mesh_protobuf::MessageEncode;
-use std::any::Any;
-use std::any::TypeId;
-use std::borrow::Cow;
-use std::fmt;
-use std::fmt::Debug;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 
 /// A message on a port.
 ///
@@ -473,7 +475,7 @@ impl StackMessage<'_> {
 
     fn write_message(self, writer: MessageWriter<'_, '_, Resource>) {
         let Self(ptr, vtable, _) = self;
-        std::mem::forget(self);
+        core::mem::forget(self);
         // SAFETY: The value is owned and the vtable type matches.
         unsafe { (vtable.write_message)(ptr, writer) }
     }

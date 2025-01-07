@@ -8,34 +8,42 @@ use crate::common::NodeId;
 use crate::common::PortId;
 use crate::message::Message;
 use crate::message::OwnedMessage;
+use crate::rc::Arc;
+use crate::rc::Mutex;
+use crate::rc::MutexGuard;
+use crate::rc::RwLock;
+use crate::rc::Weak;
 use crate::resource::OsResource;
 use crate::resource::Resource;
+use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::collections::btree_map as hash_map;
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeMap as HashMap;
+use alloc::collections::BinaryHeap;
+use alloc::collections::VecDeque;
+use alloc::fmt;
+use alloc::vec::Vec;
+use core::any::Any;
+use core::cmp::Reverse;
+use core::fmt::Debug;
+use core::fmt::Display;
+use core::marker::PhantomData;
+use core::num::Wrapping;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicIsize;
+use core::sync::atomic::Ordering;
+use core::task::Waker;
 use futures_channel::oneshot;
 use mesh_protobuf::buffer::write_with;
 use mesh_protobuf::buffer::Buf;
 use mesh_protobuf::buffer::Buffer;
 use mesh_protobuf::protobuf::Encoder;
 use mesh_protobuf::DefaultEncoding;
-use parking_lot::Mutex;
-use parking_lot::MutexGuard;
-use parking_lot::RwLock;
-use std::any::Any;
-use std::cmp::Reverse;
+#[cfg(feature = "std")]
 use std::collections::hash_map;
-use std::collections::BinaryHeap;
+#[cfg(feature = "std")]
 use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::fmt;
-use std::fmt::Debug;
-use std::fmt::Display;
-use std::marker::PhantomData;
-use std::num::Wrapping;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicIsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Weak;
-use std::task::Waker;
 use thiserror::Error;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
@@ -163,7 +171,7 @@ impl Port {
         // port's address, associating the peer with the mesh if it is local.
         let mut port_to_associate = None;
         let (peer_node, peer_port) =
-            match std::mem::replace(&mut state.activity, PortActivity::Unreachable) {
+            match core::mem::replace(&mut state.activity, PortActivity::Unreachable) {
                 PortActivity::Peered(peer) => {
                     let peer_addr = match &peer {
                         PortRef::LocalPort(peer_port) => {
@@ -234,7 +242,7 @@ impl Port {
                     Err(NodeError::local(PortError::CircularBridge))
                 }
                 Ok((target, initial_seq)) => {
-                    match std::mem::replace(&mut state.activity, PortActivity::Unreachable) {
+                    match core::mem::replace(&mut state.activity, PortActivity::Unreachable) {
                         PortActivity::Peered(peer) => {
                             state.start_proxy(peer, target, initial_seq, pending_events);
                             Ok(())
@@ -373,8 +381,8 @@ mod unsafe_code {
     use super::Port;
     use super::PortInner;
     use super::PortWithHandler;
-    use std::mem::ManuallyDrop;
-    use std::sync::Arc;
+    use crate::rc::Arc;
+    use core::mem::ManuallyDrop;
 
     impl Port {
         pub(super) fn into_inner(self) -> Arc<PortInner> {
@@ -458,7 +466,7 @@ struct MissingPort;
 impl<T: From<Port>, R> mesh_protobuf::FieldDecode<'_, T, R> for PortField
 where
     Port: TryFrom<R>,
-    <Port as TryFrom<R>>::Error: 'static + std::error::Error + Send + Sync,
+    <Port as TryFrom<R>>::Error: 'static + core::error::Error + Send + Sync,
 {
     fn read_field(
         item: &mut mesh_protobuf::inplace::InplaceOption<'_, T>,
@@ -525,13 +533,13 @@ impl<T> PartialEq for SeqValue<T> {
 impl<T> Eq for SeqValue<T> {}
 
 impl<T> PartialOrd for SeqValue<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl<T> Ord for SeqValue<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.0.cmp(&other.0)
     }
 }
@@ -600,7 +608,7 @@ impl RemoteNode {
             let mut state = self.state.write();
             match &mut *state {
                 RemoteNodeState::Queuing(v) => {
-                    let v = std::mem::take(v.get_mut());
+                    let v = core::mem::take(v.get_mut());
                     *state = RemoteNodeState::Active(conn);
                     v
                 }
@@ -616,7 +624,7 @@ impl RemoteNode {
 
     fn check_failed(&self) {
         if self.failed.load(Ordering::SeqCst) {
-            let _old = std::mem::replace(&mut *self.state.write(), RemoteNodeState::Failed);
+            let _old = core::mem::replace(&mut *self.state.write(), RemoteNodeState::Failed);
         }
     }
 
@@ -628,7 +636,7 @@ impl RemoteNode {
         // is held elsewhere--those callers will double check the failed bit
         // once they unlock the lock.
         if let Some(mut state) = self.state.try_write() {
-            let _old = std::mem::replace(&mut *state, RemoteNodeState::Failed);
+            let _old = core::mem::replace(&mut *state, RemoteNodeState::Failed);
         }
     }
 
@@ -707,7 +715,7 @@ impl<'a, 'm> PortControl<'a, 'm> {
 ///
 /// Such an implementation can be associated with a port by calling
 /// [`Port::set_handler`].
-pub trait HandlePortEvent: 'static + Send {
+pub trait HandlePortEvent: 'static + Base {
     /// Handles a new message for the port.
     ///
     /// If an error is returned, the port will be failed (and the caller will
@@ -731,13 +739,23 @@ pub trait HandlePortEvent: 'static + Send {
     fn drain(&mut self) -> Vec<OwnedMessage>;
 }
 
+#[cfg(feature = "std")]
+pub trait Base: Send {}
+#[cfg(feature = "std")]
+impl<T: Send> Base for T {}
+
+#[cfg(not(feature = "std"))]
+pub trait Base {}
+#[cfg(not(feature = "std"))]
+impl<T> Base for T {}
+
 /// Error returned by [`HandlePortEvent::message`] when the message is invalid
 /// or the port should otherwise be failed.
-pub struct HandleMessageError(Box<dyn std::error::Error + Send + Sync>);
+pub struct HandleMessageError(Box<dyn core::error::Error + Send + Sync>);
 
 impl HandleMessageError {
     /// Creates a new error.
-    pub fn new<E: Into<Box<dyn std::error::Error + Send + Sync>>>(err: E) -> Self {
+    pub fn new<E: Into<Box<dyn core::error::Error + Send + Sync>>>(err: E) -> Self {
         Self(err.into())
     }
 }
@@ -745,18 +763,18 @@ impl HandleMessageError {
 /// An error that occurred communicating with another node.
 #[derive(Clone, Debug, Error)]
 #[error(transparent)]
-pub struct NodeError(Arc<NodeErrorInner>);
+pub struct NodeError(::alloc::sync::Arc<NodeErrorInner>);
 
 impl NodeError {
-    fn new(node: &NodeId, source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self(Arc::new(NodeErrorInner {
+    fn new(node: &NodeId, source: impl Into<Box<dyn core::error::Error + Send + Sync>>) -> Self {
+        Self(::alloc::sync::Arc::new(NodeErrorInner {
             node_id: Some(*node),
             source: source.into(),
         }))
     }
 
-    fn local(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self(Arc::new(NodeErrorInner {
+    fn local(source: impl Into<Box<dyn core::error::Error + Send + Sync>>) -> Self {
+        Self(::alloc::sync::Arc::new(NodeErrorInner {
             node_id: None,
             source: source.into(),
         }))
@@ -782,7 +800,7 @@ impl NodeError {
 #[derive(Debug, Error)]
 struct NodeErrorInner {
     node_id: Option<NodeId>,
-    source: Box<dyn std::error::Error + Send + Sync>,
+    source: Box<dyn core::error::Error + Send + Sync>,
 }
 
 impl Display for NodeErrorInner {
@@ -843,11 +861,13 @@ struct PortInnerState {
     local_node: Option<Weak<LocalNodeInner>>,
 
     event_queue: EventQueue,
-    handler: Box<dyn HandlePortEventAndAny>,
+    handler: BoxedHandler,
 
     next_local_seq: Seq,
     is_local_closed: bool,
 }
+
+type BoxedHandler = Box<dyn HandlePortEventAndAny>;
 
 /// A [`HandlePortEvent`] implementation that just queues the messages.
 ///
@@ -872,7 +892,7 @@ impl HandlePortEvent for QueuingHandler {
     fn fail(&mut self, _control: &mut PortControl<'_, '_>, _err: NodeError) {}
 
     fn drain(&mut self) -> Vec<OwnedMessage> {
-        std::mem::take(&mut self.messages)
+        core::mem::take(&mut self.messages)
     }
 }
 
@@ -990,7 +1010,7 @@ impl PortInnerState {
 
     /// Fails a port, notifying any nodes that might be interested.
     fn fail(&mut self, pending_events: &mut PendingEvents<'_>, err: NodeError) {
-        match std::mem::replace(&mut self.activity, PortActivity::Failed(err.clone())) {
+        match core::mem::replace(&mut self.activity, PortActivity::Failed(err.clone())) {
             PortActivity::Peered(peer) => {
                 pending_events.push(peer, Wrapping(0), NonMessageEvent::FailPort(err));
             }
@@ -1129,7 +1149,7 @@ enum PortError {
     #[error("invalid state for proxy")]
     InvalidStateForProxy,
     #[error("failed to parse message")]
-    BadMessage(#[source] Box<dyn std::error::Error + Send + Sync>),
+    BadMessage(#[source] Box<dyn core::error::Error + Send + Sync>),
 }
 
 /// The result of a port event operation.
@@ -1195,7 +1215,7 @@ impl PortInnerState {
                                 NonMessageEvent::ChangePeer(new_peer, seq_delta) => {
                                     assert!(new_peer.is_compatible_node(&self.local_node));
                                     new_peer.node_status()?;
-                                    let old_peer = std::mem::replace(peer, new_peer);
+                                    let old_peer = core::mem::replace(peer, new_peer);
                                     pending_events.push(
                                         old_peer,
                                         self.next_local_seq,
@@ -1361,7 +1381,7 @@ impl PortInner {
         let mut state = self.state.lock();
 
         let mut err = None;
-        match std::mem::replace(&mut state.activity, PortActivity::Unreachable) {
+        match core::mem::replace(&mut state.activity, PortActivity::Unreachable) {
             PortActivity::Sending { peer, target } => {
                 state.start_proxy(peer, target, initial_seq, pending_events);
             }
@@ -1442,7 +1462,7 @@ impl PortInner {
         //      addresses will be the same but the order of the arguments may
         //      differ.
         let (lm, rm);
-        if std::ptr::from_ref(left) < std::ptr::from_ref(right) {
+        if core::ptr::from_ref(left) < core::ptr::from_ref(right) {
             lm = left.state.lock();
             rm = right.state.lock();
         } else {
@@ -1452,7 +1472,7 @@ impl PortInner {
         (lm, rm)
     }
 
-    fn set_handler(&self, mut handler: Box<dyn HandlePortEventAndAny>) {
+    fn set_handler(&self, mut handler: BoxedHandler) {
         let mut pending_events = PendingEvents::new();
         {
             let mut state = self.state.lock();
@@ -1490,14 +1510,14 @@ impl PortInner {
         pending_events.process();
     }
 
-    fn clear_queue(&self, drain: bool) -> Box<dyn HandlePortEventAndAny> {
+    fn clear_queue(&self, drain: bool) -> BoxedHandler {
         let mut state = self.state.lock();
         let messages = if drain {
             state.handler.drain()
         } else {
             Vec::new()
         };
-        std::mem::replace(&mut state.handler, Box::new(QueuingHandler { messages }))
+        core::mem::replace(&mut state.handler, Box::new(QueuingHandler { messages }))
     }
 }
 
@@ -1542,7 +1562,7 @@ impl RemoteNodeHandle {
         self.fail(RemoteNodeDisconnected)
     }
 
-    pub fn fail(&self, err: impl Into<Box<dyn std::error::Error + Send + Sync>>) {
+    pub fn fail(&self, err: impl Into<Box<dyn core::error::Error + Send + Sync>>) {
         if let Some(remote_node) = self.remote_node.upgrade() {
             remote_node
                 .local_node
@@ -2043,7 +2063,7 @@ impl LocalNode {
                 tracing::warn!(
                     node = ?self.inner.id,
                     port = ?PortId(data.id.into()),
-                    error = &err as &dyn std::error::Error,
+                    error = ?&err, // TODO
                     old_address = ?old_address,
                     "received failed port",
                 );
@@ -2116,7 +2136,7 @@ impl LocalNode {
 impl LocalNodeInner {
     /// Fails all the remote nodes.
     fn fail_all_nodes(&self, err: NodeError) {
-        let nodes = std::mem::take(&mut self.state.lock().nodes);
+        let nodes = core::mem::take(&mut self.state.lock().nodes);
         for (_, node) in nodes {
             node.fail(err.clone());
         }
@@ -2124,7 +2144,7 @@ impl LocalNodeInner {
 
     /// Fails all the ports.
     fn fail_all_ports(&self, err: NodeError) {
-        let ports = std::mem::take(&mut self.state.lock().ports);
+        let ports = core::mem::take(&mut self.state.lock().ports);
         let mut pending_events = PendingEvents::new();
         let mut control = PortControl::unpeered(&mut pending_events);
         for (_, port) in ports {
@@ -2195,7 +2215,7 @@ impl LocalNodeInner {
                     local_id = ?self.id,
                     port = ?port.id,
                     remote_id = ?remote_node.id,
-                    error = &err as &dyn std::error::Error,
+                    error = ?&err, // TODO
                     "port failed due to failed node"
                 );
             }
@@ -2212,12 +2232,14 @@ pub mod tests {
     use super::*;
     use crate::message::MeshField;
     use crate::resource::SerializedMessage;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::future::poll_fn;
+    use core::marker::PhantomData;
+    use core::task::Context;
+    use core::task::Poll;
     use pal_async::async_test;
     use pal_async::task::Spawn;
-    use std::future::poll_fn;
-    use std::marker::PhantomData;
-    use std::task::Context;
-    use std::task::Poll;
     use test_with_tracing::test;
 
     #[derive(Debug)]

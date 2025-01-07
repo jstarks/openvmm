@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use alloc::fmt;
+use core::fmt::Debug;
+use core::fmt::Display;
+use core::str::FromStr;
 use mesh_derive::Protobuf;
-use std::fmt;
-use std::fmt::Debug;
-use std::fmt::Display;
-use std::str::FromStr;
 
 /// A unique ID.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Protobuf)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Protobuf)]
 pub struct Uuid(pub [u8; 16]);
 
 impl Uuid {
@@ -49,7 +49,7 @@ impl FromStr for Uuid {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "std"))]
 mod debug {
     //! In debug builds, conditionally return linear node and port IDs instead
     //! of random ones, based on the contents of an environment variable. This
@@ -57,9 +57,9 @@ mod debug {
     //! production use, but it simplifies mesh debugging.
 
     use super::Uuid;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
+    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::AtomicU64;
+    use core::sync::atomic::Ordering;
     use std::sync::Once;
 
     static CHECK_ONCE: Once = Once::new();
@@ -92,14 +92,14 @@ mod debug {
 }
 
 /// A node ID.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Protobuf)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Protobuf)]
 pub struct NodeId(pub Uuid);
 
 impl NodeId {
     pub const ZERO: Self = Self(Uuid([0; 16]));
 
     pub fn new() -> Self {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "std"))]
         {
             static SOURCE: debug::DebugUuidSource = debug::DebugUuidSource::new();
             if let Some(id) = SOURCE.next() {
@@ -117,12 +117,12 @@ impl Debug for NodeId {
 }
 
 /// A port ID.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Protobuf)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Protobuf)]
 pub struct PortId(pub Uuid);
 
 impl PortId {
     pub fn new() -> Self {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "std"))]
         {
             static SOURCE: debug::DebugUuidSource = debug::DebugUuidSource::new();
             if let Some(id) = SOURCE.next() {

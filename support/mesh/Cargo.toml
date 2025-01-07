@@ -14,7 +14,7 @@ socket2 = ["mesh_protobuf/socket2"]
 [dependencies]
 mesh_channel.workspace = true
 mesh_derive.workspace = true
-mesh_node.workspace = true
+mesh_node = { workspace = true, features = ["std"] }
 mesh_protobuf.workspace = true
 
 [lints]

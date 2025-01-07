@@ -4,11 +4,9 @@ use futures_concurrency::future::Race;
 use hyperlight_host::sandbox::uninitialized::UninitializedSandbox;
 use hyperlight_host::GuestBinary;
 
-// This example can be run with `cargo run --package hyperlight_host --example chrome-tracing --release`
 fn main() -> anyhow::Result<()> {
     let guest_path = "target/x86_64-unknown-none/debug/mhl_guest";
 
-    // Create a new sandbox.
     let usandbox = UninitializedSandbox::new(
         GuestBinary::FilePath(guest_path.to_owned()),
         None,

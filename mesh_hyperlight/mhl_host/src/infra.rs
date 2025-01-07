@@ -13,8 +13,8 @@ use mesh::local_node::SendEvent;
 use mesh::Address;
 use mesh::NodeId;
 use mesh::PortId;
-use mhl_common::NullConnector;
-use mhl_common::StartParams;
+use mhl_common::infra::NullConnector;
+use mhl_common::infra::StartParams;
 use std::sync::Arc;
 use std::sync::Mutex;
 

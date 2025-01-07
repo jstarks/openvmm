@@ -19,7 +19,6 @@ use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result_from_voi
 use hyperlight_guest as _;
 use hyperlight_guest::error::HyperlightGuestError;
 use hyperlight_guest::host_function_call::call_host_function;
-use hyperlight_guest::logging::log_message;
 use mesh_channel_core::OneshotReceiver;
 use mesh_node::common::NodeId;
 use mesh_node::local_node::LocalNode;

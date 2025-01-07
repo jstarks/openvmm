@@ -142,6 +142,7 @@ unix_socket = { path = "support/unix_socket" }
 vmsocket = { path = "support/vmsocket" }
 win_import_lib = { path = "support/win_import_lib" }
 win_prng_support = { path = "support/win_prng_support" }
+xrc = { path = "support/xrc" }
 zerocopy_helpers = { path = "support/zerocopy_helpers" }
 
 azure_profiler_proto = { path = "openhcl/azure_profiler_proto" }
@@ -447,6 +448,7 @@ landlock = "0.3.1"
 libc = "0.2"
 libfuzzer-sys = "0.4"
 linkme = "0.3.9"
+lock_api = "0.4"
 log = "0.4"
 macaddr = "1.0"
 mbrman = "0.5"

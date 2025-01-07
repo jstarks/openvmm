@@ -6,10 +6,16 @@ name = "mesh_node"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+default = ["std"]
+std = []
+
 [dependencies]
 mesh_derive.workspace = true
 mesh_protobuf.workspace = true
 open_enum.workspace = true
+xrc.workspace = true
+
 futures-channel.workspace = true
 getrandom.workspace = true
 parking_lot.workspace = true

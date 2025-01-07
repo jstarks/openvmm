@@ -3789,6 +3789,7 @@ dependencies = [
  "test_with_tracing",
  "thiserror 2.0.0",
  "tracing",
+ "xrc",
  "zerocopy",
 ]
 
@@ -9051,6 +9052,14 @@ dependencies = [
  "tracing",
  "x86defs",
  "zerocopy",
+]
+
+[[package]]
+name = "xrc"
+version = "0.1.0"
+dependencies = [
+ "lock_api",
+ "parking_lot",
 ]
 
 [[package]]

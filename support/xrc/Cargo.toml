@@ -1,0 +1,15 @@
+[package]
+name = "xrc"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[features]
+std = ["dep:parking_lot"]
+
+[dependencies]
+lock_api.workspace = true
+parking_lot = { workspace = true, optional = true }
+
+[lints]
+workspace = true

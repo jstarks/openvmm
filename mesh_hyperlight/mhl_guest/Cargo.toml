@@ -1,0 +1,21 @@
+[package]
+name = "mhl_guest"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+hyperlight-guest = { path = "../../../hyperlight/src/hyperlight_guest" }
+hyperlight-common = { path = "../../../hyperlight/src/hyperlight_common", default-features = false }
+
+mhl_common = { path = "../mhl_common" }
+
+mesh_node.workspace = true
+mesh_channel_core.workspace = true
+mesh_protobuf.workspace = true
+
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+getrandom = { workspace = true, features = ["custom"] }
+
+[lints]
+workspace = true

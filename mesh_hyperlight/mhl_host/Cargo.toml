@@ -1,0 +1,23 @@
+[package]
+name = "mhl_host"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+hyperlight-host = { path = "../../../hyperlight/src/hyperlight_host" }
+hyperlight-common = { path = "../../../hyperlight/src/hyperlight_common", default-features = true }
+
+mhl_common = { path = "../mhl_common" }
+
+mesh.workspace = true
+mesh_node.workspace = true
+mesh_protobuf.workspace = true
+
+anyhow.workspace = true
+futures.workspace = true
+futures-concurrency.workspace = true
+getrandom.workspace = true
+
+[lints]
+workspace = true

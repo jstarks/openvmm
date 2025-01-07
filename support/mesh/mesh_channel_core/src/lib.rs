@@ -10,10 +10,9 @@
 #![warn(missing_docs)]
 #![warn(clippy::std_instead_of_core)]
 #![warn(clippy::std_instead_of_alloc)]
+#![no_std]
 
 extern crate alloc;
-
-pub use alloc::rc;
 
 mod deque;
 mod error;
@@ -23,3 +22,8 @@ mod oneshot;
 pub use error::*;
 pub use mpsc::*;
 pub use oneshot::*;
+
+#[cfg(feature = "std")]
+use xrc::arc as rc;
+#[cfg(not(feature = "std"))]
+use xrc::rc;

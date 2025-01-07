@@ -12,6 +12,7 @@ pub mod arc {
     pub use parking_lot::RawRwLock;
     pub use parking_lot::RwLock;
     pub use std::sync::Arc;
+    pub use std::sync::OnceLock;
     pub use std::sync::Weak;
 }
 
@@ -21,6 +22,7 @@ pub mod rc {
 
     pub use alloc::rc::Rc as Arc;
     pub use alloc::rc::Weak;
+    pub use core::cell::OnceCell as OnceLock;
     pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
     pub type RwLock<T> = lock_api::RwLock<RawRwLock, T>;
     pub type MutexGuard<'a, T> = lock_api::MutexGuard<'a, RawMutex, T>;

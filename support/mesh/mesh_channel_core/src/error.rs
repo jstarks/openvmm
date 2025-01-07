@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use alloc::boxed::Box;
 use thiserror::Error;
 
 /// An error representing a failure of a channel.

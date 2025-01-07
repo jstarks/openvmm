@@ -27,11 +27,19 @@ use crate::deque::ErasedVecDeque;
 use crate::error::ChannelError;
 use crate::error::RecvError;
 use crate::error::TryRecvError;
+use crate::rc::Arc;
+use crate::rc::Mutex;
+use crate::rc::MutexGuard;
+use crate::rc::OnceLock;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::marker::PhantomPinned;
 use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
+use core::task::ready;
 use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
@@ -45,12 +53,6 @@ use mesh_node::message::Message;
 use mesh_node::message::OwnedMessage;
 use mesh_protobuf::DefaultEncoding;
 use mesh_protobuf::Protobuf;
-use parking_lot::Mutex;
-use parking_lot::MutexGuard;
-use std::marker::PhantomPinned;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::task::ready;
 
 /// Creates a new channel for sending messages of type `T`, returning the sender
 /// and receiver ends.
@@ -359,9 +361,9 @@ impl Drop for ReceiverQueue {
     fn drop(&mut self) {
         let mut local = self.0.local.lock();
         local.receiver_gone = true;
-        let _waker = std::mem::take(&mut local.waker);
+        let _waker = core::mem::take(&mut local.waker);
         local.messages.clear_and_shrink();
-        let _ports = std::mem::take(&mut local.ports);
+        let _ports = core::mem::take(&mut local.ports);
     }
 }
 
@@ -444,7 +446,7 @@ pub struct Recv<'a, T>(&'a mut Receiver<T>, PhantomPinned);
 impl<T> Future for Recv<'_, T> {
     type Output = Result<T, RecvError>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: there are no actual pinning invariants.
         let this = unsafe { self.get_unchecked_mut() };
         this.0.poll_recv(cx)
@@ -496,7 +498,7 @@ impl ReceiverCore {
                     }
                 } else if !local.ports.is_empty() {
                     let new_handler = local.new_handler;
-                    let ports = std::mem::take(&mut local.ports);
+                    let ports = core::mem::take(&mut local.ports);
                     drop(local);
                     this.ports.0.extend(ports.into_iter().map(|port| {
                         // SAFETY: `new_handler` has been set to a function whose
@@ -617,7 +619,7 @@ impl ReceiverCore {
 
 fn trace_channel_error(err: &ChannelError) {
     tracing::error!(
-        error = err as &dyn std::error::Error,
+        error = ?err, // TODO
         "channel closed due to error"
     );
 }
@@ -625,8 +627,11 @@ fn trace_channel_error(err: &ChannelError) {
 impl<T> futures_core::Stream for Receiver<T> {
     type Item = T;
 
-    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(match std::task::ready!(self.get_mut().poll_recv(cx)) {
+    fn poll_next(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Poll::Ready(match core::task::ready!(self.get_mut().poll_recv(cx)) {
             Ok(t) => Some(t),
             Err(RecvError::Closed) => None,
             Err(RecvError::Error(err)) => {

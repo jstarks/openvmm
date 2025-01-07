@@ -6,11 +6,11 @@
 // UNSAFETY: Needed to erase types to avoid monomorphization overhead.
 #![expect(unsafe_code)]
 
+use core::alloc::Layout;
 use core::fmt;
-use std::alloc::Layout;
-use std::marker::PhantomData;
-use std::ptr::drop_in_place;
-use std::ptr::NonNull;
+use core::marker::PhantomData;
+use core::ptr::drop_in_place;
+use core::ptr::NonNull;
 
 /// A type-erased vector-based queue.
 ///
@@ -77,7 +77,7 @@ impl ElementVtable {
                 assert!(size_of::<T>() >= align_of::<T>());
                 size_of::<T>()
             },
-            drop: if std::mem::needs_drop::<T>() {
+            drop: if core::mem::needs_drop::<T>() {
                 Some(drop_fn::<T>)
             } else {
                 None
@@ -192,7 +192,7 @@ impl ErasedVecDeque {
         // SAFETY: the caller ensures that `value` is a valid owned pointer to the
         // element type.
         unsafe {
-            std::ptr::copy_nonoverlapping(value.cast(), dst.as_ptr().cast::<u8>(), len);
+            core::ptr::copy_nonoverlapping(value.cast(), dst.as_ptr().cast::<u8>(), len);
         }
         // SAFETY: the value has been written.
         unsafe { dst.commit() };
@@ -236,7 +236,7 @@ impl ErasedVecDeque {
             // SAFETY: `buf` contains a valid unaliased allocation with the
             // given size and alignment.
             unsafe {
-                std::alloc::dealloc(
+                alloc::alloc::dealloc(
                     self.buf.as_ptr(),
                     Layout::from_size_align_unchecked(self.cap, self.vtable.layout.align()),
                 );
@@ -260,7 +260,7 @@ impl ErasedVecDeque {
             // SAFETY: `new_cap` is non-zero and at least as big as `align`,
             // which is a power of 2.
             let buf =
-                unsafe { std::alloc::alloc(Layout::from_size_align_unchecked(new_cap, align)) };
+                unsafe { alloc::alloc::alloc(Layout::from_size_align_unchecked(new_cap, align)) };
             (new_cap, buf)
         } else {
             // Double the capacity (geometric growth) to ensure amortized O(1)
@@ -269,7 +269,7 @@ impl ErasedVecDeque {
             // SAFETY: `buf` is a valid allocation with the given layout, and
             // `new_cap` is non-zero.
             let buf = unsafe {
-                std::alloc::realloc(
+                alloc::alloc::realloc(
                     self.buf.as_ptr(),
                     Layout::from_size_align_unchecked(self.cap, align),
                     new_cap,
@@ -280,7 +280,7 @@ impl ErasedVecDeque {
         let Some(buf) = NonNull::new(buf) else {
             // SAFETY: these layout parameters were validated above.
             let layout = unsafe { Layout::from_size_align_unchecked(new_cap, align) };
-            std::alloc::handle_alloc_error(layout);
+            alloc::alloc::handle_alloc_error(layout);
         };
         // Move the trailing elements to the end of the new buffer.
         if self.len > 0 && self.head + self.len > self.cap {
@@ -288,7 +288,7 @@ impl ErasedVecDeque {
             let new_head = new_cap - n;
             // SAFETY: `buf` is valid for reads and writes at the given offsets.
             unsafe {
-                std::ptr::copy(buf.as_ptr().add(self.head), buf.as_ptr().add(new_head), n);
+                core::ptr::copy(buf.as_ptr().add(self.head), buf.as_ptr().add(new_head), n);
             }
             self.head = new_head;
         }
@@ -307,7 +307,7 @@ impl Drop for ErasedVecDeque {
 mod tests {
     use super::ElementVtable;
     use super::ErasedVecDeque;
-    use std::mem::MaybeUninit;
+    use core::mem::MaybeUninit;
 
     #[test]
     fn test_erased_vecdeque() {

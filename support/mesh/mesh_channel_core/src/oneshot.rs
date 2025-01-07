@@ -17,8 +17,21 @@
 // UNSAFETY: needed to avoid monomorphization.
 #![allow(unsafe_code)]
 
+use crate::rc::Mutex;
 use crate::ChannelError;
 use crate::RecvError;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::fmt::Debug;
+use core::future::Future;
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
+use core::ptr::NonNull;
+use core::task::ready;
+use core::task::Context;
+use core::task::Poll;
+use core::task::Waker;
 use mesh_node::local_node::HandleMessageError;
 use mesh_node::local_node::HandlePortEvent;
 use mesh_node::local_node::Port;
@@ -28,17 +41,6 @@ use mesh_node::message::MeshField;
 use mesh_node::message::Message;
 use mesh_node::message::OwnedMessage;
 use mesh_protobuf::DefaultEncoding;
-use parking_lot::Mutex;
-use std::fmt::Debug;
-use std::future::Future;
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::task::ready;
-use std::task::Context;
-use std::task::Poll;
-use std::task::Waker;
 use thiserror::Error;
 
 /// Creates a unidirection channel for sending a single value of type `T`.
@@ -90,7 +92,7 @@ pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
 pub struct OneshotSender<T>(OneshotSenderCore, PhantomData<Arc<Mutex<T>>>);
 
 impl<T> Debug for OneshotSender<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         Debug::fmt(&self.0, f)
     }
 }
@@ -154,7 +156,7 @@ impl OneshotSenderCore {
 
     fn close(&self) {
         let mut state = self.0 .0.lock();
-        match std::mem::replace(&mut *state, SlotState::Done) {
+        match core::mem::replace(&mut *state, SlotState::Done) {
             SlotState::Waiting(waker) => {
                 drop(state);
                 if let Some(waker) = waker {
@@ -178,7 +180,7 @@ impl OneshotSenderCore {
         fn send(this: OneshotSenderCore, value: BoxedValue) -> Option<BoxedValue> {
             let slot = this.into_slot();
             let mut state = slot.0.lock();
-            match std::mem::replace(&mut *state, SlotState::Done) {
+            match core::mem::replace(&mut *state, SlotState::Done) {
                 SlotState::ReceiverRemote(port, send) => {
                     // SAFETY: `send` has been set to operate on values of type
                     // `T`, and `value` is of type `T`.
@@ -209,7 +211,7 @@ impl OneshotSenderCore {
         fn into_port(this: OneshotSenderCore, decode: DecodeFn) -> Port {
             let slot = this.into_slot();
             let mut state = slot.0.lock();
-            match std::mem::replace(&mut *state, SlotState::Done) {
+            match core::mem::replace(&mut *state, SlotState::Done) {
                 SlotState::Waiting(waker) => {
                     let (send, recv) = Port::new_pair();
                     *state = SlotState::SenderRemote(recv, decode);
@@ -249,7 +251,7 @@ pub struct OneshotReceiver<T>(
 );
 
 impl<T> Debug for OneshotReceiver<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         Debug::fmt(&self.0, f)
     }
 }
@@ -282,7 +284,7 @@ impl<T> Drop for OneshotReceiver<T> {
 impl<T> Future for OneshotReceiver<T> {
     type Output = Result<T, RecvError>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().poll_recv(cx)
     }
 }
@@ -334,7 +336,7 @@ impl OneshotReceiverCore {
             // extra storage in `OneshotReceiverCore` to remember this, which is
             // probably undesirable.
             let v = if let SlotState::Sent(value) =
-                std::mem::replace(&mut *slot.0.lock(), SlotState::Done)
+                core::mem::replace(&mut *slot.0.lock(), SlotState::Done)
             {
                 Some(value)
             } else {
@@ -357,7 +359,7 @@ impl OneshotReceiverCore {
         ) -> Poll<Result<BoxedValue, RecvError>> {
             let v = loop {
                 let mut state = this.slot.0.lock();
-                break match std::mem::replace(&mut *state, SlotState::Done) {
+                break match core::mem::replace(&mut *state, SlotState::Done) {
                     SlotState::SenderRemote(port, decode) => {
                         *state = SlotState::Waiting(None);
                         drop(state);
@@ -409,7 +411,7 @@ impl OneshotReceiverCore {
             let OneshotReceiverCore { slot, port } = this;
             let existing = port.map(|port| port.remove_handler().0);
             let mut state = slot.0.lock();
-            match std::mem::replace(&mut *state, SlotState::Done) {
+            match core::mem::replace(&mut *state, SlotState::Done) {
                 SlotState::SenderRemote(port, _) => {
                     assert!(existing.is_none());
                     port
@@ -506,7 +508,7 @@ impl SlotHandler {
         fail: bool,
     ) {
         let mut state = self.slot.0.lock();
-        match std::mem::replace(&mut *state, SlotState::Done) {
+        match core::mem::replace(&mut *state, SlotState::Done) {
             SlotState::Waiting(waker) => {
                 if let Some(waker) = waker {
                     control.wake(waker);
@@ -530,7 +532,7 @@ impl HandlePortEvent for SlotHandler {
         message: Message<'_>,
     ) -> Result<(), HandleMessageError> {
         let mut state = self.slot.0.lock();
-        match std::mem::replace(&mut *state, SlotState::Done) {
+        match core::mem::replace(&mut *state, SlotState::Done) {
             SlotState::Waiting(waker) => {
                 // SAFETY: the users of the slot will ensure it is not
                 // sent/shared across threads unless the underlying type is

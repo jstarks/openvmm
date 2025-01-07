@@ -7,16 +7,16 @@ edition = "2021"
 rust-version.workspace = true
 
 [features]
-std = ["mesh_node/std"]
+std = ["mesh_node/std", "xrc/std"]
 
 [dependencies]
 mesh_protobuf.workspace = true
 mesh_node.workspace = true
+xrc.workspace = true
 
 futures-core.workspace = true
-parking_lot.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
+tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 static_assertions.workspace = true

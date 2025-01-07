@@ -6,6 +6,7 @@ extern crate alloc;
 
 mod infra;
 
+use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;
 use mhl_common::InitialMessage;
@@ -33,4 +34,5 @@ async fn start(message: InitialMessage) {
             mhl_common::Request::Ping { response } => response.send(()),
         }
     }
+    logger.send("done".to_owned());
 }

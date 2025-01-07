@@ -94,6 +94,9 @@ impl HyperlightMeshSandbox {
                     break;
                 }
             }
+            remote.disconnect();
+            drop(self.context);
+            drop(remote);
             Ok(())
         };
 

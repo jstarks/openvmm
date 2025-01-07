@@ -19,16 +19,11 @@ fn main() -> anyhow::Result<()> {
     let (logger_send, mut logger_recv) = mesh::channel();
     let (req_send, req_recv) = mesh::channel();
 
-    let sandbox_task = async {
-        sandbox
-            .run(mhl_common::InitialMessage {
-                logger: logger_send,
-                requests: req_recv,
-                dictionary: [('h', 'H'), ('w', 'W')].into_iter().collect(),
-            })
-            .await?;
-        anyhow::Ok(())
-    };
+    let sandbox_task = sandbox.run(mhl_common::InitialMessage {
+        logger: logger_send,
+        requests: req_recv,
+        dictionary: [('h', 'H'), ('w', 'W')].into_iter().collect(),
+    });
 
     let log_task = async {
         while let Ok(msg) = logger_recv.recv().await {
@@ -45,7 +40,7 @@ fn main() -> anyhow::Result<()> {
         response_recv.await?;
         println!("ping successful");
 
-        for s in ["hello world", "which way"] {
+        for s in ["hello world", "what's up"] {
             let (response_send, response_recv) = mesh::oneshot();
             req_send.send(mhl_common::Request::TranslateString {
                 request: s.to_owned(),
@@ -54,6 +49,7 @@ fn main() -> anyhow::Result<()> {
             let response = response_recv.await?;
             println!("got response: {response}");
         }
+        drop(req_send);
         Ok(())
     };
 

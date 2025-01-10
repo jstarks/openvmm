@@ -157,7 +157,7 @@ impl<T: RangeKey> IoRanges<T> {
                     (
                         inner.fallback_device.clone().unwrap_or_else(|| {
                             UNKNOWN_DEVICE
-                        .get_or_init(|| {
+                          .get_or_init(|| {
                             Arc::new(CloseableMutex::new(missing_dev::MissingDev::from_manifest(
                                 missing_dev::MissingDevManifest::new(),
                                 &mut chipset_device::mmio::ExternallyManagedMmioIntercepts,

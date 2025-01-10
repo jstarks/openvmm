@@ -736,7 +736,5 @@ fn fix_srat(raw_srat: &mut [u8]) {
         buf = &mut buf[len as usize..];
     }
 
-    // Update the checksum.
-    let checksum = raw_srat.iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
-    raw_srat[9] = 0u8.wrapping_sub(checksum);
+    // The checksum should not change.
 }

@@ -25,6 +25,8 @@ use vm_topology::memory::MemoryRangeWithNode;
 use vm_topology::processor::ProcessorTopology;
 use vmm_core::acpi_builder::AcpiTablesBuilder;
 use zerocopy::AsBytes;
+use zerocopy::FromBytes;
+use zerocopy::Ref;
 
 pub mod vtl0_config;
 pub mod vtl2_config;
@@ -423,8 +425,9 @@ pub fn write_uefi_config(
         acpi_irq: crate::worker::SYSTEM_IRQ_ACPI,
     };
 
+    let mut srat_buf;
     let (mut madt, mut srat);
-    if !isolated {
+    if !isolated && !platform_config.acpi_tables.is_empty() {
         // The host has ACPI table specializations. Use the host-provided SRAT
         // and MADT as well.
         //
@@ -432,7 +435,15 @@ pub fn write_uefi_config(
         // least validate that no such modifications are present.
         tracing::info!("using host-provided srat and madt");
         madt = igvm_parameters.madt();
-        srat = igvm_parameters.srat();
+
+        // The SRAT may have some endian-flipped fields.
+        if let Some(igvm_srat) = igvm_parameters.srat() {
+            srat_buf = igvm_srat.to_vec();
+            fix_srat(&mut srat_buf);
+            srat = Some(&srat_buf);
+        } else {
+            srat = None;
+        }
     } else {
         tracing::info!("using generated srat and madt");
         madt = None;
@@ -703,4 +714,29 @@ fn determine_memory_protection_mode(general: &General, isolated: bool) -> config
             }
         }
     }
+}
+
+fn fix_srat(raw_srat: &mut [u8]) {
+    let (acpi_header, buf) = Ref::<_, acpi_spec::Header>::new_from_prefix(&mut *raw_srat).unwrap();
+
+    if acpi_header.signature != *b"SRAT" {
+        panic!("not an srat");
+    }
+
+    let mut buf = &mut buf[12..];
+
+    while !buf.is_empty() {
+        if buf[0] == 5 && buf[3] == 1 {
+            // Swap the BDF.
+            let (a, b) = (buf[10], buf[11]);
+            buf[10] = b;
+            buf[11] = a;
+        }
+        let len = buf[1];
+        buf = &mut buf[len as usize..];
+    }
+
+    // Update the checksum.
+    let checksum = raw_srat.iter().fold(0u8, |acc, &x| acc.wrapping_add(x));
+    raw_srat[9] = 0u8.wrapping_sub(checksum);
 }

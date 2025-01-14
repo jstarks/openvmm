@@ -7,6 +7,7 @@ use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
 use hyperlight_host::MultiUseGuestCallContext;
 use hyperlight_host::MultiUseSandbox;
+use hyperlight_host::SingleUseSandbox;
 use hyperlight_host::UninitializedSandbox;
 use mesh::local_node::LocalNode;
 use mesh::local_node::SendEvent;
@@ -14,6 +15,14 @@ use mesh::message::MeshField;
 use mesh::Address;
 use mesh::NodeId;
 use mesh::PortId;
+use mesh_protobuf::decode;
+use mesh_protobuf::encode;
+use mesh_protobuf::DefaultEncoding;
+use mesh_protobuf::FieldDecode;
+use mesh_protobuf::FieldEncode;
+use mesh_protobuf::MessageDecode;
+use mesh_protobuf::MessageEncode;
+use mesh_protobuf::NoResources;
 use mhl_common::infra::NullConnector;
 use mhl_common::infra::StartParams;
 use std::sync::Arc;
@@ -65,9 +74,7 @@ impl HyperlightMeshSandbox {
         self.context.call(
             "start",
             ReturnType::Void,
-            Some(vec![ParameterValue::VecBytes(mesh_protobuf::encode(
-                params,
-            ))]),
+            Some(vec![ParameterValue::VecBytes(encode(params))]),
         )?;
 
         let (host_send, mut host_recv) = mesh::channel();
@@ -113,4 +120,89 @@ impl SendEvent for Connection {
         event.write_to(&mut v, &mut Vec::new());
         self.0.send(v);
     }
+}
+
+pub fn register_host_function<F: Fn(T) -> R, T, R>(
+    sandbox: &mut UninitializedSandbox,
+    name: &str,
+    f: F,
+) -> Result<(), hyperlight_host::error::HyperlightError>
+where
+    F: 'static + Send + Sync,
+    T: DefaultEncoding,
+    T::Encoding: for<'a> MessageDecode<'a, T, NoResources>,
+    R: DefaultEncoding,
+    R::Encoding: FieldEncode<R, NoResources>,
+{
+    let f = Arc::new(Mutex::new(move |args: Vec<u8>| {
+        let args = decode(&args)
+            .map_err(|err| hyperlight_host::error::HyperlightError::AnyhowError(err.into()))?;
+        let r = f(args);
+        Ok(encode((r,)))
+    }));
+    f.register(sandbox, name)
+}
+
+pub trait CallGuest {
+    fn call(
+        self,
+        name: &str,
+        return_type: ReturnType,
+        parameters: Option<Vec<ParameterValue>>,
+    ) -> Result<ReturnValue, hyperlight_host::error::HyperlightError>;
+}
+
+impl CallGuest for &mut MultiUseGuestCallContext {
+    fn call(
+        self,
+        name: &str,
+        return_type: ReturnType,
+        parameters: Option<Vec<ParameterValue>>,
+    ) -> Result<ReturnValue, hyperlight_host::error::HyperlightError> {
+        self.call(name, return_type, parameters)
+    }
+}
+
+impl CallGuest for &mut MultiUseSandbox {
+    fn call(
+        self,
+        name: &str,
+        return_type: ReturnType,
+        parameters: Option<Vec<ParameterValue>>,
+    ) -> Result<ReturnValue, hyperlight_host::error::HyperlightError> {
+        self.call_guest_function_by_name(name, return_type, parameters)
+    }
+}
+
+impl CallGuest for SingleUseSandbox {
+    fn call(
+        self,
+        name: &str,
+        return_type: ReturnType,
+        parameters: Option<Vec<ParameterValue>>,
+    ) -> Result<ReturnValue, hyperlight_host::error::HyperlightError> {
+        self.call_guest_function_by_name(name, return_type, parameters)
+    }
+}
+
+pub fn call_guest_function<C: CallGuest, T, R>(
+    context: C,
+    name: &str,
+    params: T,
+) -> Result<R, hyperlight_host::error::HyperlightError>
+where
+    T: DefaultEncoding,
+    T::Encoding: MessageEncode<T, NoResources>,
+    R: DefaultEncoding,
+    R::Encoding: for<'a> FieldDecode<'a, R, NoResources>,
+{
+    let result = context.call(
+        name,
+        ReturnType::VecBytes,
+        Some(vec![ParameterValue::VecBytes(encode(params))]),
+    )?;
+    let v: Vec<u8> = result.try_into()?;
+    let (r,) = decode(&v)
+        .map_err(|err| hyperlight_host::error::HyperlightError::AnyhowError(err.into()))?;
+    Ok(r)
 }

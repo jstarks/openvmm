@@ -1,8 +1,7 @@
-mod infra;
-
 use futures_concurrency::future::TryJoin;
 use hyperlight_host::sandbox::uninitialized::UninitializedSandbox;
 use hyperlight_host::GuestBinary;
+use mhl_host_infra::HyperlightMeshSandbox;
 
 fn main() -> anyhow::Result<()> {
     let guest_path = "target/x86_64-unknown-none/debug/mhl_guest";
@@ -14,7 +13,7 @@ fn main() -> anyhow::Result<()> {
         None,
     )?;
 
-    let sandbox = infra::HyperlightMeshSandbox::new(usandbox)?;
+    let sandbox = HyperlightMeshSandbox::new(usandbox)?;
 
     let (logger_send, mut logger_recv) = mesh::channel();
     let (req_send, req_recv) = mesh::channel();

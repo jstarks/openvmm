@@ -4,12 +4,13 @@
 
 extern crate alloc;
 
-mod infra;
-
 use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;
 use mhl_common::InitialMessage;
+use mhl_guest_infra::mesh_hyperlight;
+
+mesh_hyperlight!(start);
 
 async fn start(message: InitialMessage) {
     let InitialMessage {

@@ -4222,10 +4222,74 @@ dependencies = [
  "mesh_node",
  "mesh_protobuf",
  "mhl_common",
+ "mhl_guest_infra",
+]
+
+[[package]]
+name = "mhl_guest_basic"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "getrandom",
+ "hyperlight-common",
+ "hyperlight-guest",
+ "mesh_channel_core",
+ "mesh_node",
+ "mesh_protobuf",
+ "mhl_common",
+ "mhl_guest_infra",
+]
+
+[[package]]
+name = "mhl_guest_infra"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "getrandom",
+ "hyperlight-common",
+ "hyperlight-guest",
+ "mesh_channel_core",
+ "mesh_node",
+ "mesh_protobuf",
+ "mhl_common",
 ]
 
 [[package]]
 name = "mhl_host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "futures-concurrency",
+ "getrandom",
+ "hyperlight-common",
+ "hyperlight-host",
+ "mesh",
+ "mesh_node",
+ "mesh_protobuf",
+ "mhl_common",
+ "mhl_host_infra",
+]
+
+[[package]]
+name = "mhl_host_basic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "futures-concurrency",
+ "getrandom",
+ "hyperlight-common",
+ "hyperlight-host",
+ "mesh",
+ "mesh_node",
+ "mesh_protobuf",
+ "mhl_common",
+ "mhl_host_infra",
+]
+
+[[package]]
+name = "mhl_host_infra"
 version = "0.1.0"
 dependencies = [
  "anyhow",

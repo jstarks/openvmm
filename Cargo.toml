@@ -40,7 +40,11 @@ members = [
   "vm/loader/igvmfilegen",
   "vm/vmgs/vmgs_lib",
   "vm/vmgs/vmgstool",
-  "hyperv/tools/hypestv", "mesh_hyperlight/mhl_guest", "mesh_hyperlight/mhl_host", "mesh_hyperlight/mhl_common",
+  "hyperv/tools/hypestv",
+  "mesh_hyperlight/mhl_guest",
+  "mesh_hyperlight/mhl_host",
+  "mesh_hyperlight/mhl_guest_basic",
+  "mesh_hyperlight/mhl_host_basic",
 ]
 exclude = [
   "xsync",

@@ -1,7 +1,12 @@
+#![no_std]
+#![allow(unsafe_code)]
+
+extern crate alloc;
+
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::vec;
-use alloc::vec::Vec;
+pub use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
@@ -10,21 +15,32 @@ use core::task::Context;
 use futures::task::noop_waker_ref;
 use futures::FutureExt;
 use getrandom::register_custom_getrandom;
-use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
+pub use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
+use hyperlight_common::flatbuffer_wrappers::function_types::ParameterType;
 use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
 use hyperlight_common::flatbuffer_wrappers::function_types::ReturnType;
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result_from_int;
+pub use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result_from_vec;
 use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result_from_void;
 use hyperlight_guest as _;
-use hyperlight_guest::error::HyperlightGuestError;
-use hyperlight_guest::host_function_call::call_host_function;
+pub use hyperlight_guest::error::HyperlightGuestError;
+use hyperlight_guest::guest_function_definition::GuestFunctionDefinition;
+use hyperlight_guest::guest_function_register::register_function;
+pub use hyperlight_guest::host_function_call::call_host_function;
+use hyperlight_guest::host_function_call::get_host_value_return_as_vecbytes;
 use mesh_channel_core::OneshotReceiver;
 use mesh_node::common::NodeId;
 use mesh_node::local_node::LocalNode;
 use mesh_node::local_node::RemoteNodeHandle;
 use mesh_node::local_node::SendEvent;
+use mesh_node::message::MeshField;
+pub use mesh_protobuf;
 use mesh_protobuf::decode;
+use mesh_protobuf::DefaultEncoding;
+use mesh_protobuf::MessageDecode;
+use mesh_protobuf::MessageEncode;
+use mesh_protobuf::NoResources;
 use mhl_common::infra::NullConnector;
 use mhl_common::infra::StartParams;
 
@@ -37,13 +53,29 @@ struct State {
 
 static mut STATE: RefCell<Option<State>> = RefCell::new(None);
 
-#[unsafe(no_mangle)]
-pub extern "C" fn hyperlight_main() {}
+#[macro_export]
+macro_rules! mesh_hyperlight {
+    ($start:expr) => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn hyperlight_main() {}
 
-#[unsafe(no_mangle)]
-pub fn guest_dispatch_function(
+        #[unsafe(no_mangle)]
+        pub fn guest_dispatch_function(
+            function_call: $crate::FunctionCall,
+        ) -> Result<$crate::Vec<u8>, $crate::HyperlightGuestError> {
+            $crate::guest_dispatch_function($start, function_call)
+        }
+    };
+}
+
+pub fn guest_dispatch_function<T, Fut>(
+    start: impl 'static + FnOnce(T) -> Fut,
     function_call: FunctionCall,
-) -> Result<Vec<u8>, HyperlightGuestError> {
+) -> Result<Vec<u8>, HyperlightGuestError>
+where
+    T: MeshField,
+    Fut: 'static + Future<Output = ()>,
+{
     let mut state = unsafe { &*addr_of!(STATE) }.borrow_mut();
     let state = &mut *state;
 
@@ -74,7 +106,7 @@ pub fn guest_dispatch_function(
             remote.connect(Connection);
             let future = async move {
                 let message = OneshotReceiver::from(port).await.unwrap();
-                crate::start(message).await
+                start(message).await
             };
             *state = Some(State {
                 node,
@@ -139,4 +171,67 @@ fn host_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     )
     .unwrap();
     Ok(())
+}
+
+pub fn call_protobuf_host_function<T, R>(name: &str, value: T) -> R
+where
+    T: DefaultEncoding,
+    T::Encoding: MessageEncode<T, NoResources>,
+    R: DefaultEncoding,
+    R::Encoding: for<'a> MessageDecode<'a, R, NoResources>,
+{
+    call_host_function(
+        name,
+        Some(vec![ParameterValue::VecBytes(mesh_protobuf::encode(value))]),
+        ReturnType::VecBytes,
+    )
+    .unwrap();
+    let result = get_host_value_return_as_vecbytes().unwrap();
+    decode(&result).unwrap()
+}
+
+pub fn register_protobuf_guest_function(
+    name: &str,
+    f: fn(&FunctionCall) -> Result<Vec<u8>, HyperlightGuestError>,
+) {
+    register_function(GuestFunctionDefinition {
+        function_name: name.to_owned(),
+        parameter_types: vec![ParameterType::VecBytes],
+        return_type: ReturnType::VecBytes,
+        function_pointer: f as usize as i64,
+    })
+}
+
+#[macro_export]
+macro_rules! guest_func {
+    ($name:ident) => {
+        $crate::register_protobuf_guest_function(stringify!($name), |func| {
+            let input: Vec<u8> = func
+                .parameters
+                .clone()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let value = $crate::mesh_protobuf::decode(&input).unwrap();
+            let result = $name(value);
+            let result = $crate::mesh_protobuf::encode((result,));
+            Ok($crate::get_flatbuffer_result_from_vec(&result))
+        });
+    };
+}
+
+#[macro_export]
+macro_rules! host_func {
+    ($vis:vis fn $name:ident($($arg:ident: $arg_ty:ty),* $(,)?) -> $ret:ty;) => {
+        $vis fn $name($($arg: $arg_ty,)*) -> $ret {
+            let (r,) = $crate::call_protobuf_host_function(
+                stringify!($name),
+                ($($arg,)*),
+            );
+            r
+        }
+    }
 }

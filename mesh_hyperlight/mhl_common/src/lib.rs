@@ -31,3 +31,10 @@ pub enum Request {
         response: OneshotSender<()>,
     },
 }
+
+#[derive(Protobuf)]
+pub struct Add {
+    pub a: i32,
+    pub b: i32,
+    pub log_annotation: String,
+}

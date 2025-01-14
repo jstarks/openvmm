@@ -1,5 +1,5 @@
 [package]
-name = "mhl_host"
+name = "mhl_host_infra"
 version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
@@ -9,7 +9,6 @@ hyperlight-host = { path = "../../../hyperlight/src/hyperlight_host" }
 hyperlight-common = { path = "../../../hyperlight/src/hyperlight_common", default-features = true }
 
 mhl_common = { path = "../mhl_common" }
-mhl_host_infra = { path = "../mhl_host_infra" }
 
 mesh.workspace = true
 mesh_node.workspace = true

@@ -22,7 +22,6 @@ use crate::PetriVm;
 use crate::PetriVmConfig;
 use async_trait::async_trait;
 use framebuffer::FramebufferAccess;
-use fs_err::File;
 use get_resources::ged::FirmwareEvent;
 use guid::Guid;
 use hvlite_defs::config::Config;
@@ -65,9 +64,6 @@ pub struct PetriVmConfigOpenVmm {
 
     // Runtime resources
     resources: PetriVmResourcesOpenVmm,
-
-    // Logging
-    hvlite_log_file: File,
 
     // Resources that are only used during startup.
     ged: Option<get_resources::ged::GuestEmulationDeviceHandle>,

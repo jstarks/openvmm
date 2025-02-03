@@ -29,6 +29,7 @@ macro_rules! multitest {
         };
     };
 }
+use anyhow::Context as _;
 pub(crate) use multitest;
 
 /// A single test.
@@ -70,16 +71,27 @@ impl Test {
             .require(petri_artifacts_common::artifacts::TEST_LOG_DIRECTORY)
     }
 
+    fn run(
+        &self,
+        resolve: fn(&str, TestArtifactRequirements) -> anyhow::Result<TestArtifacts>,
+    ) -> anyhow::Result<()> {
+        let name = self.name();
+        let artifacts =
+            resolve(&name, self.requirements()).context("failed to resolve artifacts")?;
+        petri::try_init_tracing(
+            artifacts.get(petri_artifacts_common::artifacts::TEST_LOG_DIRECTORY),
+        )
+        .context("failed to initialize tracing")?;
+        self.test.run(&name, &artifacts)
+    }
+
     /// Returns a libtest-mimic trial to run the test.
     pub fn trial(
         self,
         resolve: fn(&str, TestArtifactRequirements) -> anyhow::Result<TestArtifacts>,
     ) -> libtest_mimic::Trial {
         libtest_mimic::Trial::test(self.name(), move || {
-            let name = self.name();
-            let artifacts = resolve(&name, self.requirements())
-                .map_err(|err| format!("failed to resolve artifacts: {:#}", err))?;
-            self.test.run(&name, &artifacts)
+            self.run(resolve).map_err(|err| format!("{err:#}").into())
         })
     }
 }
@@ -97,7 +109,7 @@ pub(crate) trait RunTest: Send {
     fn requirements(&self) -> TestArtifactRequirements;
     /// Runs the test, which has been assigned `name`, with the given
     /// `artifacts`.
-    fn run(&self, name: &str, artifacts: &TestArtifacts) -> Result<(), libtest_mimic::Failed>;
+    fn run(&self, name: &str, artifacts: &TestArtifacts) -> anyhow::Result<()>;
 }
 
 /// A test defined by a fixed set of requirements and a run function.
@@ -136,8 +148,7 @@ where
         self.requirements.clone()
     }
 
-    fn run(&self, name: &str, artifacts: &TestArtifacts) -> Result<(), libtest_mimic::Failed> {
-        (self.run)(name, artifacts).map_err(|err| format!("{:#}", err.into()))?;
-        Ok(())
+    fn run(&self, name: &str, artifacts: &TestArtifacts) -> anyhow::Result<()> {
+        (self.run)(name, artifacts).map_err(Into::into)
     }
 }

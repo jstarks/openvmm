@@ -13,7 +13,6 @@ use anyhow::Context;
 use diag_client::DiagClient;
 use disk_backend_resources::FileDiskHandle;
 use framebuffer::FramebufferAccess;
-use fs_err::File;
 use guid::Guid;
 use hvlite_defs::config::DeviceVtl;
 use image::ColorType;
@@ -50,8 +49,6 @@ impl PetriVmConfigOpenVmm {
 
             resources,
 
-            hvlite_log_file,
-
             ged,
             vtl2_settings,
             framebuffer_access,
@@ -74,7 +71,7 @@ impl PetriVmConfigOpenVmm {
 
         let mesh = Mesh::new("petri_mesh".to_string())?;
 
-        let host = Self::hvlite_host(&mesh, &resources.artifacts, hvlite_log_file)
+        let host = Self::hvlite_host(&mesh, &resources.artifacts)
             .await
             .context("failed to create host process")?;
         let (worker, halt_notif) = Worker::launch(&host, config)
@@ -353,11 +350,7 @@ impl PetriVmConfigOpenVmm {
         Ok(tasks)
     }
 
-    async fn hvlite_host(
-        mesh: &Mesh,
-        resolver: &TestArtifacts,
-        mut log_file: File,
-    ) -> anyhow::Result<WorkerHost> {
+    async fn hvlite_host(mesh: &Mesh, resolver: &TestArtifacts) -> anyhow::Result<WorkerHost> {
         // Copy the child's stderr to this process's, since internally this is
         // wrapped by the test harness.
         let (stderr_read, stderr_write) = pal::pipe_pair()?;
@@ -366,14 +359,7 @@ impl PetriVmConfigOpenVmm {
             for line in read.lines() {
                 match line {
                     Ok(line) => {
-                        tracing::info!(target: crate::tracing::OPENVMM_TARGET, "{}", line);
-                        // add a newline otherwise the file is unreadable
-                        if let Err(err) = log_file.write_all(format!("{line}\n").as_bytes()) {
-                            tracing::error!(
-                                error = &err as &dyn std::error::Error,
-                                "error writing hvlite stderr to file"
-                            );
-                        }
+                        tracing::info!(target: "openvmm.log", "{}", line);
                     }
                     Err(err) => {
                         tracing::warn!(

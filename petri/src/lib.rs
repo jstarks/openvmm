@@ -23,6 +23,7 @@ pub use petri_artifacts_core::ResolveTestArtifact;
 pub use petri_artifacts_core::TestArtifactRequirements;
 pub use petri_artifacts_core::TestArtifacts;
 pub use pipette_client as pipette;
+pub use tracing::try_init_tracing;
 pub use vm::*;
 
 /// 1 kibibyte's worth of bytes.

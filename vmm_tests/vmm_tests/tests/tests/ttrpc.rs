@@ -33,9 +33,6 @@ async fn test_ttrpc_interface(
     driver: DefaultDriver,
     artifacts: &petri::TestArtifacts,
 ) -> anyhow::Result<()> {
-    // This test doesn't use a Petri VM, so it needs to initialize tracing itself.
-    test_with_tracing::init();
-
     let mut socket_path = std::env::temp_dir();
     socket_path.push(Guid::new_random().to_string());
 
@@ -60,7 +57,7 @@ async fn test_ttrpc_interface(
     std::thread::spawn(move || {
         let stderr = BufReader::new(stderr);
         for line in stderr.lines() {
-            tracing::info!(target: "stderr_log", "{}", line.unwrap());
+            tracing::info!(target: "stderr.log", "{}", line.unwrap());
         }
     });
 
@@ -119,8 +116,12 @@ async fn test_ttrpc_interface(
             let read = BufReader::new(com1);
             for line in read.lines() {
                 match line {
-                    Ok(line) => tracing::info!(target: "linux_console", "{}", line),
-                    Err(e) => tracing::error!(target: "linux_console", "{}", e),
+                    Ok(line) => {
+                        tracing::info!(target: "linux_console.log",  "{}", line)
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "linux_console.log",  "{}", e)
+                    }
                 }
             }
         });

@@ -518,11 +518,11 @@ impl AtapiDrive {
         // Any buffer size errors at this point are fatal.
         match io_type {
             IoPortData::Read(ref mut data) => {
-                current_buffer[..length as usize].atomic_read(&mut data[..length as usize]);
+                current_buffer[..length as usize].copy_to_slice(&mut data[..length as usize]);
                 tracing::trace!(?data, "data payload");
             }
             IoPortData::Write(data) => {
-                current_buffer[..length as usize].atomic_write(&data[..length as usize]);
+                current_buffer[..length as usize].copy_from_slice(&data[..length as usize]);
                 tracing::trace!(?current_buffer, ?data, "data_port_io");
             }
         }
@@ -693,7 +693,8 @@ impl AtapiDrive {
             ..FromZeros::new_zeroed()
         };
 
-        self.command_buffer.buffer[..protocol::IDENTIFY_DEVICE_BYTES].atomic_write_obj(&features);
+        self.command_buffer.buffer[..protocol::IDENTIFY_DEVICE_BYTES]
+            .copy_from_slice(features.as_bytes());
         self.state.buffer = Some(BufferState::new(
             protocol::IDENTIFY_DEVICE_BYTES as u32,
             None,
@@ -724,7 +725,7 @@ impl AtapiDrive {
 
         let mut cdb = [0_u8; size_of::<scsi::Cdb16>()];
         // Copy from CommandPacket into the CDB.
-        buffer_ptr.atomic_read(&mut cdb[..len]);
+        buffer_ptr.copy_to_slice(&mut cdb[..len]);
         tracing::debug!(path = ?self.disk_path, ?buffer_ptr, ?cdb, "Handle ATAPI packet command");
 
         self.state.buffer = None;
@@ -957,6 +958,7 @@ pub(crate) mod save_restore {
 
             let command_buffer = if let Some(buffer_state) = &self.state.buffer {
                 self.command_buffer.buffer[buffer_state.range()]
+                    .as_slice()
                     .iter()
                     .map(|val| val.load(Ordering::Relaxed))
                     .collect()
@@ -1037,7 +1039,7 @@ pub(crate) mod save_restore {
                     None
                 } else {
                     self.command_buffer.buffer[..command_buffer.len()]
-                        .atomic_write(command_buffer.as_bytes());
+                        .copy_from_slice(command_buffer.as_bytes());
 
                     Some(BufferState {
                         current_byte: 0,

@@ -1778,14 +1778,14 @@ impl FloppyDiskController {
             return false;
         }
 
-        let Some(cylinder) = buffer_ptr.first() else {
+        let Some(cylinder) = buffer_ptr.as_slice().first() else {
             tracelimit::error_ratelimited!("failed to get(0)");
             return false;
         };
 
         let cylinder = cylinder.load(Ordering::Relaxed) as u64;
 
-        let Some(head) = buffer_ptr.get(1) else {
+        let Some(head) = buffer_ptr.as_slice().get(1) else {
             tracelimit::error_ratelimited!("failed to get(1)");
             return false;
         };

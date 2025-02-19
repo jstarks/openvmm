@@ -11,6 +11,8 @@ use guestmem::GuestMemory;
 use guestmem::GuestMemoryError;
 use inspect::Inspect;
 use parking_lot::Mutex;
+use safeatomic::shared::Shared;
+use safeatomic::shared::SharedMut;
 use std::sync::atomic::AtomicU8;
 use user_driver::memory::MemoryBlock;
 use user_driver::memory::PAGE_SIZE;
@@ -128,7 +130,7 @@ impl ScopedPages<'_> {
         self.pages[index].physical_address
     }
 
-    pub fn page_as_slice(&self, index: usize) -> &[AtomicU8] {
+    pub fn page_as_slice(&self, index: usize) -> &SharedMut<[u8]> {
         &self.alloc.mem.as_slice()[self.pages[index].page_index * PAGE_SIZE..][..PAGE_SIZE]
     }
 

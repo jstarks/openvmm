@@ -2066,6 +2066,7 @@ dependencies = [
  "arbitrary",
  "guestmem",
  "libfuzzer-sys",
+ "safeatomic",
  "smallvec",
  "sparse_mmap",
  "xtask_fuzz",
@@ -2568,6 +2569,7 @@ version = "0.0.0"
 dependencies = [
  "inspect",
  "pal_event",
+ "safeatomic",
  "sparse_mmap",
  "thiserror 2.0.0",
  "zerocopy 0.8.14",

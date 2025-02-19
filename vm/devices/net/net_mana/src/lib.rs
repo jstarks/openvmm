@@ -46,6 +46,7 @@ use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
 use pal_async::task::Spawn;
+use safeatomic::shared::SharedMut;
 use safeatomic::AtomicSliceOps;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicU8;
@@ -835,7 +836,7 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                             let mut data = vec![0; len];
                             self.rx_bounce_buffer.as_mut().unwrap().as_slice()
                                 [rx.bounce_offset as usize..][..len]
-                                .atomic_read(&mut data);
+                                .copy_to_slice(&mut data);
                             self.pool.write_data(rx.id, &data);
                         }
                         self.stats.rx_packets += 1;
@@ -1188,7 +1189,7 @@ impl<'a> ContiguousBuffer<'a> {
         }
     }
 
-    pub fn as_slice(&mut self) -> &[AtomicU8] {
+    pub fn as_slice(&mut self) -> &SharedMut<[u8]> {
         &self.parent.as_slice()[self.offset as usize..(self.offset + self.len) as usize]
     }
 
@@ -1263,7 +1264,7 @@ impl ContiguousBufferManager {
         self.tail = self.tail.wrapping_add(len_with_padding);
     }
 
-    pub fn as_slice(&self) -> &[AtomicU8] {
+    pub fn as_slice(&self) -> &SharedMut<[u8]> {
         self.mem.as_slice()
     }
 }

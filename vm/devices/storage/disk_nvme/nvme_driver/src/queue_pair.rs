@@ -28,6 +28,7 @@ use mesh::Cancel;
 use mesh::CancelContext;
 use pal_async::driver::SpawnDriver;
 use pal_async::task::Task;
+use safeatomic::shared::SharedMut;
 use safeatomic::AtomicSliceOps;
 use slab::Slab;
 use std::future::poll_fn;
@@ -484,8 +485,8 @@ impl Issuer {
 
                 let prp_addr = prp.physical_address(0);
                 let page = prp.page_as_slice(0);
-                for (iova, dest) in iovas.zip(page.chunks_exact(8)) {
-                    dest.atomic_write_obj(&iova.to_le_bytes());
+                for (iova, dest) in iovas.zip(page.as_slice().chunks_exact(8)) {
+                    SharedMut::from_slice(dest).copy_from_slice(&iova.to_le_bytes());
                 }
                 prp_pages = Some(prp);
                 [a + offset, prp_addr]

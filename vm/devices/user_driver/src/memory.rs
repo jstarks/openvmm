@@ -3,6 +3,8 @@
 
 //! Traits and types for sharing host memory with the device.
 
+use safeatomic::shared::Shared;
+use safeatomic::shared::SharedMut;
 use safeatomic::AtomicSliceOps;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
@@ -10,6 +12,7 @@ use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
+use zerocopy::Unalign;
 
 /// The 4KB page size used by user-mode devices.
 pub const PAGE_SIZE: usize = 4096;
@@ -146,29 +149,34 @@ impl MemoryBlock {
     }
 
     /// Gets the buffer as an atomic slice.
-    pub fn as_slice(&self) -> &[AtomicU8] {
+    pub fn as_slice(&self) -> &SharedMut<[u8]> {
         // SAFETY: the underlying memory is valid for the lifetime of `mem`.
-        unsafe { std::slice::from_raw_parts(self.base.cast(), self.len) }
+        unsafe { SharedMut::from_raw_parts(self.base.cast_mut().cast(), self.len) }
     }
 
     /// Reads from the buffer into `data`.
     pub fn read_at(&self, offset: usize, data: &mut [u8]) {
-        self.as_slice()[offset..][..data.len()].atomic_read(data);
+        self.as_slice()[offset..][..data.len()].copy_to_slice(data);
     }
 
     /// Reads an object from the buffer at `offset`.
     pub fn read_obj<T: FromBytes + Immutable + KnownLayout>(&self, offset: usize) -> T {
-        self.as_slice()[offset..][..size_of::<T>()].atomic_read_obj()
+        self.as_slice()[offset..][..size_of::<T>()]
+            .try_cast::<Unalign<T>>()
+            .unwrap()
+            .read()
+            .into_inner()
     }
 
     /// Writes into the buffer from `data`.
     pub fn write_at(&self, offset: usize, data: &[u8]) {
-        self.as_slice()[offset..][..data.len()].atomic_write(data);
+        self.as_slice()[offset..][..data.len()].copy_from_slice(data);
     }
 
     /// Writes an object into the buffer at `offset`.
     pub fn write_obj<T: IntoBytes + Immutable + KnownLayout>(&self, offset: usize, data: &T) {
-        self.as_slice()[offset..][..size_of::<T>()].atomic_write_obj(data);
+        // TODO: use `write`.
+        self.as_slice()[offset..][..size_of::<T>()].copy_from_slice(data.as_bytes());
     }
 
     /// Returns the offset of the beginning of the buffer in the first page

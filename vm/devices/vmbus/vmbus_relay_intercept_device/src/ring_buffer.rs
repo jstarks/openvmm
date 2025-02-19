@@ -51,7 +51,7 @@ impl RingMem for MemoryBlockRingBuffer {
     }
 
     fn control(&self) -> &[AtomicU32; CONTROL_WORD_COUNT] {
-        self.0.as_slice().as_atomic_slice().unwrap()[..CONTROL_WORD_COUNT]
+        self.0.as_slice().try_cast().unwrap()[..CONTROL_WORD_COUNT]
             .try_into()
             .unwrap()
     }

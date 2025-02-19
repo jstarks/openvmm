@@ -11,6 +11,8 @@ use guestmem::BitmapInfo;
 use guestmem::GuestMemory;
 use guestmem::GuestMemoryAccess;
 use guestmem::LockedRange;
+use safeatomic::shared::Shared;
+use safeatomic::shared::SharedMut;
 use smallvec::SmallVec;
 use sparse_mmap::SparseMapping;
 use std::ptr::NonNull;
@@ -241,16 +243,16 @@ fn do_fuzz(input: FuzzCase) {
             }
             GuestMemAction::ReadAtomic { gpa, len } => {
                 let len = len % MAX_SIZE;
-                let data: Vec<AtomicU8> = std::iter::repeat_with(|| AtomicU8::new(0))
+                let data: Vec<_> = std::iter::repeat_with(|| SharedMut::new(0u8))
                     .take(len)
                     .collect();
-                _ = gm.read_to_atomic(gpa, &data);
+                _ = gm.read_to_atomic(gpa, SharedMut::from_slice(&data));
             }
             GuestMemAction::Write { gpa, data } => _ = gm.write_at(gpa, &data),
             GuestMemAction::WritePlain { gpa, data } => _ = gm.write_plain(gpa, &data),
             GuestMemAction::WriteAtomic { gpa, data } => {
-                let data_atomic: Vec<AtomicU8> = data.iter().map(|v| AtomicU8::new(*v)).collect();
-                _ = gm.write_from_atomic(gpa, &data_atomic);
+                let data_atomic: Vec<_> = data.iter().map(|v| Shared::new(*v)).collect();
+                _ = gm.write_from_atomic(gpa, Shared::from_slice(&data_atomic));
             }
             GuestMemAction::Fill { gpa, val, len } => _ = gm.fill_at(gpa, val, len),
             GuestMemAction::CompareExchange { gpa, current, new } => {
@@ -295,18 +297,17 @@ fn do_fuzz(input: FuzzCase) {
             GuestMemAction::ReadRangeAtomic { offset, len, gpns } => {
                 let len = len % MAX_SIZE;
                 if let Some(range) = PagedRange::new(offset, len, &gpns) {
-                    let data: Vec<AtomicU8> = std::iter::repeat_with(|| AtomicU8::new(0))
+                    let data: Vec<_> = std::iter::repeat_with(|| SharedMut::new(0))
                         .take(len)
                         .collect();
-                    _ = gm.read_range_to_atomic(&range, &data);
+                    _ = gm.read_range_to_atomic(&range, SharedMut::from_slice(&data));
                 }
             }
             GuestMemAction::WriteRangeAtomic { offset, gpns, data } => {
                 let len = data.len();
                 if let Some(range) = PagedRange::new(offset, len, &gpns) {
-                    let data_atomic: Vec<AtomicU8> =
-                        data.iter().map(|v| AtomicU8::new(*v)).collect();
-                    _ = gm.write_range_from_atomic(&range, &data_atomic);
+                    let data_atomic: Vec<_> = data.iter().map(|v| Shared::new(*v)).collect();
+                    _ = gm.write_range_from_atomic(&range, Shared::from_slice(&data_atomic));
                 }
             }
             GuestMemAction::LockRange { offset, len, gpns } => {

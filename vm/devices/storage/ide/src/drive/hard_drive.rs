@@ -20,7 +20,6 @@ use guestmem::AlignedHeapMemory;
 use guestmem::GuestMemory;
 use ide_resources::IdePath;
 use inspect::Inspect;
-use safeatomic::AtomicSliceOps;
 use scsi_buffers::RequestBuffers;
 use std::future::Future;
 use std::pin::Pin;
@@ -1087,7 +1086,10 @@ impl HardDrive {
             ..FromZeros::new_zeroed()
         };
 
-        self.command_buffer.buffer[..protocol::IDENTIFY_DEVICE_BYTES].atomic_write_obj(&features);
+        self.command_buffer.buffer[..protocol::IDENTIFY_DEVICE_BYTES]
+            .try_cast()
+            .unwrap()
+            .write(features);
 
         self.state.buffer = Some(BufferState::new(
             protocol::IDENTIFY_DEVICE_BYTES as u32,
@@ -1133,11 +1135,11 @@ impl HardDrive {
         // Any buffer size errors at this point are fatal.
         match io_type {
             IoPortData::Read(ref mut data) => {
-                current_buffer[..length as usize].atomic_read(&mut data[..length as usize]);
+                current_buffer[..length as usize].copy_to_slice(&mut data[..length as usize]);
                 tracing::trace!(?data, "data payload");
             }
             IoPortData::Write(data) => {
-                current_buffer[..length as usize].atomic_write(&data[..length as usize]);
+                current_buffer[..length as usize].copy_from_slice(&data[..length as usize]);
             }
         }
 
@@ -1518,6 +1520,7 @@ pub(crate) mod save_restore {
 
             let command_buffer = if let Some(buffer_state) = &self.state.buffer {
                 self.command_buffer.buffer[buffer_state.range()]
+                    .as_slice()
                     .iter()
                     .map(|val| val.load(Ordering::Relaxed))
                     .collect()
@@ -1658,7 +1661,7 @@ pub(crate) mod save_restore {
                     None
                 } else {
                     self.command_buffer.buffer[..command_buffer.len()]
-                        .atomic_write(command_buffer.as_bytes());
+                        .copy_from_slice(command_buffer.as_bytes());
 
                     Some(BufferState {
                         current_byte: 0,

@@ -174,3 +174,5 @@ impl AtomicSliceOps for [AtomicU8] {
         }
     }
 }
+
+pub mod shared;

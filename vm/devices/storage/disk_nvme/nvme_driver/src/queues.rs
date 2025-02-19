@@ -140,7 +140,7 @@ impl CompletionQueue {
         let completion_mem = self.mem.as_slice()
             [self.head as usize * size_of::<spec::Completion>()..]
             [..size_of::<spec::Completion>() * 2]
-            .as_atomic_slice::<AtomicU64>()
+            .try_cast_slice::<u64>()
             .unwrap();
 
         // Check the phase bit, using an acquire read to ensure the rest of the

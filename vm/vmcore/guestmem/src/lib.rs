@@ -11,6 +11,8 @@ pub mod ranges;
 use self::ranges::PagedRange;
 use inspect::Inspect;
 use pal_event::Event;
+use safeatomic::shared::Shared;
+use safeatomic::shared::SharedMut;
 use sparse_mmap::AsMappableRef;
 use std::fmt::Debug;
 use std::io;
@@ -237,39 +239,36 @@ impl AlignedHeapMemory {
 }
 
 impl Deref for AlignedHeapMemory {
-    type Target = [AtomicU8];
+    type Target = SharedMut<[u8]>;
 
     fn deref(&self) -> &Self::Target {
         // SAFETY: the buffer has the correct size and validity.
-        unsafe { std::slice::from_raw_parts(self.pages.as_ptr().cast(), self.len()) }
+        unsafe { SharedMut::from_raw_parts(self.pages.as_ptr().cast_mut().cast(), self.len()) }
     }
 }
 
 impl DerefMut for AlignedHeapMemory {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: the buffer is unaliased and valid.
-        unsafe { std::slice::from_raw_parts_mut(self.pages.as_mut_ptr().cast(), self.len()) }
+        unsafe { SharedMut::from_raw_parts_mut(self.pages.as_mut_ptr().cast(), self.len()) }
     }
 }
 
-impl AsRef<[AtomicU8]> for AlignedHeapMemory {
-    fn as_ref(&self) -> &[AtomicU8] {
+impl AsRef<SharedMut<[u8]>> for AlignedHeapMemory {
+    fn as_ref(&self) -> &SharedMut<[u8]> {
         self
     }
 }
 
-impl AsMut<[AtomicU8]> for AlignedHeapMemory {
-    fn as_mut(&mut self) -> &mut [AtomicU8] {
+impl AsMut<SharedMut<[u8]>> for AlignedHeapMemory {
+    fn as_mut(&mut self) -> &mut SharedMut<[u8]> {
         self
     }
 }
 
 impl AsMut<[u8]> for AlignedHeapMemory {
     fn as_mut(&mut self) -> &mut [u8] {
-        // FUTURE: use AtomicU8::get_mut_slice once stabilized.
-        // SAFETY: the buffer is unaliased, so it is fine to cast away the atomicness of the
-        // slice.
-        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr().cast(), self.len()) }
+        self.as_mut_slice()
     }
 }
 
@@ -1126,7 +1125,7 @@ impl GuestMemory {
 
     /// If this memory was created via [`GuestMemory::allocate`], returns a slice to
     /// the allocated buffer.
-    pub fn inner_buf(&self) -> Option<&[AtomicU8]> {
+    pub fn inner_buf(&self) -> Option<&SharedMut<[u8]>> {
         if !self.inner.allocated {
             return None;
         }
@@ -1347,7 +1346,7 @@ impl GuestMemory {
     }
 
     /// Writes `src` into guest memory at address `gpa`.
-    pub fn write_from_atomic(&self, gpa: u64, src: &[AtomicU8]) -> Result<(), GuestMemoryError> {
+    pub fn write_from_atomic(&self, gpa: u64, src: &Shared<[u8]>) -> Result<(), GuestMemoryError> {
         self.with_op(
             Some((gpa, src.len() as u64)),
             GuestMemoryOperation::Write,
@@ -1429,7 +1428,7 @@ impl GuestMemory {
     }
 
     /// Reads from guest memory address `gpa` into `dest`.
-    pub fn read_to_atomic(&self, gpa: u64, dest: &[AtomicU8]) -> Result<(), GuestMemoryError> {
+    pub fn read_to_atomic(&self, gpa: u64, dest: &SharedMut<[u8]>) -> Result<(), GuestMemoryError> {
         self.with_op(
             Some((gpa, dest.len() as u64)),
             GuestMemoryOperation::Read,
@@ -1782,7 +1781,7 @@ impl GuestMemory {
     pub fn write_range_from_atomic(
         &self,
         range: &PagedRange<'_>,
-        data: &[AtomicU8],
+        data: &Shared<[u8]>,
     ) -> Result<(), GuestMemoryError> {
         assert!(data.len() == range.len());
         self.op_range(GuestMemoryOperation::Write, range, move |addr, r| {
@@ -1795,13 +1794,13 @@ impl GuestMemory {
     pub fn read_range_to_atomic(
         &self,
         range: &PagedRange<'_>,
-        data: &[AtomicU8],
+        data: &SharedMut<[u8]>,
     ) -> Result<(), GuestMemoryError> {
         assert!(data.len() == range.len());
         self.op_range(GuestMemoryOperation::Read, range, move |addr, r| {
             let dest = &data[r];
             // SAFETY: `dest` is a valid buffer for writes.
-            unsafe { self.read_ptr(addr, dest.as_ptr().cast_mut().cast(), dest.len()) }
+            unsafe { self.read_ptr(addr, dest.as_ptr().cast(), dest.len()) }
         })
     }
 

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 guestmem.workspace = true
+safeatomic.workspace = true
 sparse_mmap.workspace = true
 xtask_fuzz.workspace = true
 

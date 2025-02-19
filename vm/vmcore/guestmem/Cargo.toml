@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 inspect.workspace = true
 pal_event.workspace = true
+safeatomic.workspace = true
 sparse_mmap.workspace = true
 
 thiserror.workspace = true

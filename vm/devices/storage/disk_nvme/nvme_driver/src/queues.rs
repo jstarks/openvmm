@@ -8,8 +8,6 @@ use crate::driver::save_restore::CompletionQueueSavedState;
 use crate::driver::save_restore::SubmissionQueueSavedState;
 use crate::registers::DeviceRegisters;
 use inspect::Inspect;
-use safeatomic::AtomicSliceOps;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Relaxed;
 use user_driver::memory::MemoryBlock;

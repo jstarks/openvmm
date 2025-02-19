@@ -12,6 +12,7 @@ cc.workspace = true
 [dependencies]
 pal.workspace = true
 
+safeatomic.workspace = true
 thiserror.workspace = true
 zerocopy.workspace = true
 

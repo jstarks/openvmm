@@ -38,7 +38,7 @@ use guid::Guid;
 use pal_async::driver::Driver;
 use pal_async::wait::PolledWait;
 use parking_lot::Mutex;
-use safeatomic::AtomicSliceOps;
+use safeatomic::shared::SharedMut;
 use sparse_mmap::SparseMapping;
 use std::fs::File;
 use std::io::Write;
@@ -71,10 +71,10 @@ const OUT_RING_SIZE: usize = 0x10000;
 const IN_RING_SIZE: usize = 0x10000;
 
 impl RingMem for MappedRingMem {
-    fn control(&self) -> &[std::sync::atomic::AtomicU32; vmbus_ring::CONTROL_WORD_COUNT] {
+    fn control(&self) -> &SharedMut<[u32; vmbus_ring::CONTROL_WORD_COUNT]> {
         self.mapping
             .atomic_slice(self.offset, CONTROL_SIZE)
-            .as_atomic_slice()
+            .try_cast_slice()
             .unwrap()[..vmbus_ring::CONTROL_WORD_COUNT]
             .try_into()
             .unwrap()

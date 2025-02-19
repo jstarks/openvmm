@@ -15,7 +15,7 @@ use guestmem::LockedRange;
 use guestmem::LockedRangeImpl;
 use guestmem::MemoryRead;
 use guestmem::MemoryWrite;
-use safeatomic::AsAtomicBytes;
+use safeatomic::shared::SharedMut;
 use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -32,7 +32,7 @@ use zerocopy::KnownLayout;
 #[repr(C)]
 pub struct AtomicIoVec {
     /// The address of the buffer.
-    pub address: *const AtomicU8,
+    pub address: *mut u8,
     /// The length of the buffer in bytes.
     pub len: usize,
 }
@@ -40,16 +40,16 @@ pub struct AtomicIoVec {
 impl Default for AtomicIoVec {
     fn default() -> Self {
         Self {
-            address: std::ptr::null(),
+            address: std::ptr::null_mut(),
             len: 0,
         }
     }
 }
 
-impl From<&'_ [AtomicU8]> for AtomicIoVec {
-    fn from(p: &'_ [AtomicU8]) -> Self {
+impl From<&'_ SharedMut<[u8]>> for AtomicIoVec {
+    fn from(p: &'_ SharedMut<[u8]>) -> Self {
         Self {
-            address: p.as_ptr(),
+            address: p.as_ptr().cast(),
             len: p.len(),
         }
     }
@@ -61,9 +61,9 @@ impl AtomicIoVec {
     /// # Safety
     /// The caller must ensure this iovec points to [valid](std::ptr#Safety)
     /// data.
-    pub unsafe fn as_slice_unchecked(&self) -> &[AtomicU8] {
+    pub unsafe fn as_slice_unchecked(&self) -> &SharedMut<[u8]> {
         // SAFETY: guaranteed by caller.
-        unsafe { std::slice::from_raw_parts(self.address, self.len) }
+        unsafe { SharedMut::from_raw_parts(self.address.cast(), self.len) }
     }
 }
 
@@ -73,7 +73,7 @@ unsafe impl Send for AtomicIoVec {}
 // SAFETY: see above comment
 unsafe impl Sync for AtomicIoVec {}
 
-/// Wrapper around an &[AtomicU8] guaranteed to be ABI compatible with the
+/// Wrapper around an &SharedMut<[u8]> guaranteed to be ABI compatible with the
 /// `iovec` type on Linux.
 #[derive(Debug, Copy, Clone, Default)]
 #[repr(transparent)]
@@ -84,10 +84,10 @@ pub struct IoBuffer<'a> {
 
 impl<'a> IoBuffer<'a> {
     /// Wraps `buffer` and returns it.
-    pub fn new(buffer: &'a [AtomicU8]) -> Self {
+    pub fn new(buffer: &'a SharedMut<[u8]>) -> Self {
         Self {
             io_vec: AtomicIoVec {
-                address: buffer.as_ptr(),
+                address: buffer.as_ptr().cast(),
                 len: buffer.len(),
             },
             phantom: PhantomData,
@@ -113,7 +113,7 @@ impl<'a> IoBuffer<'a> {
     }
 
     /// Returns a pointer to the beginning of the buffer.
-    pub fn as_ptr(&self) -> *const AtomicU8 {
+    pub fn as_ptr(&self) -> *mut u8 {
         self.io_vec.address
     }
 
@@ -124,7 +124,7 @@ impl<'a> IoBuffer<'a> {
 }
 
 impl Deref for IoBuffer<'_> {
-    type Target = [AtomicU8];
+    type Target = SharedMut<[u8]>;
 
     fn deref(&self) -> &Self::Target {
         // SAFETY: the buffer is guaranteed to be valid for the lifetime of
@@ -143,15 +143,17 @@ const ZERO_PAGE: Page = Page([0; PAGE_SIZE]);
 
 /// A page-aligned buffer used to double-buffer IO data.
 pub struct BounceBuffer {
-    pages: Vec<Page>,
+    pages: Vec<SharedMut<Page>>,
     io_vec: AtomicIoVec,
 }
 
 impl BounceBuffer {
     /// Allocates a new bounce buffer of `size` bytes.
     pub fn new(size: usize) -> Self {
-        let mut pages = vec![ZERO_PAGE; size.div_ceil(PAGE_SIZE)];
-        let io_vec = pages.as_mut_bytes()[..size].as_atomic_bytes().into();
+        let pages = (0..size.div_ceil(PAGE_SIZE))
+            .map(|_| SharedMut::new(ZERO_PAGE))
+            .collect::<Vec<_>>();
+        let io_vec = SharedMut::from_slice(&pages).as_bytes().into();
         BounceBuffer { pages, io_vec }
     }
 
@@ -200,11 +202,11 @@ impl LockedIoVecs {
 }
 
 impl LockedRange for LockedIoVecs {
-    fn push_sub_range(&mut self, sub_range: &[AtomicU8]) {
+    fn push_sub_range(&mut self, sub_range: &SharedMut<[u8]>) {
         self.0.push(sub_range.into());
     }
 
-    fn pop_sub_range(&mut self) -> Option<(*const AtomicU8, usize)> {
+    fn pop_sub_range(&mut self) -> Option<(*mut u8, usize)> {
         self.0.pop().map(|buffer| (buffer.address, buffer.len))
     }
 }

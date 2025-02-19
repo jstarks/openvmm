@@ -29,7 +29,6 @@ use mesh::CancelContext;
 use pal_async::driver::SpawnDriver;
 use pal_async::task::Task;
 use safeatomic::shared::SharedMut;
-use safeatomic::AtomicSliceOps;
 use slab::Slab;
 use std::future::poll_fn;
 use std::num::Wrapping;

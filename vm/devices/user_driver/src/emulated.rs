@@ -25,7 +25,6 @@ use pci_core::chipset_device_ext::PciChipsetDeviceExt;
 use pci_core::msi::MsiControl;
 use pci_core::msi::MsiInterruptSet;
 use pci_core::msi::MsiInterruptTarget;
-use safeatomic::AtomicSliceOps;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;

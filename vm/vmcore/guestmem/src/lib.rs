@@ -1346,7 +1346,12 @@ impl GuestMemory {
     }
 
     /// Writes `src` into guest memory at address `gpa`.
-    pub fn write_from_atomic(&self, gpa: u64, src: &Shared<[u8]>) -> Result<(), GuestMemoryError> {
+    pub fn write_from_atomic(
+        &self,
+        gpa: u64,
+        src: impl AsRef<Shared<[u8]>>,
+    ) -> Result<(), GuestMemoryError> {
+        let src = src.as_ref();
         self.with_op(
             Some((gpa, src.len() as u64)),
             GuestMemoryOperation::Write,
@@ -1691,7 +1696,7 @@ impl GuestMemory {
     /// space is known to be reserved.
     ///
     /// Panics if the requested buffer is out of range.
-    fn dangerous_access_pre_locked_memory(&self, gpa: u64, len: usize) -> &[AtomicU8] {
+    fn dangerous_access_pre_locked_memory(&self, gpa: u64, len: usize) -> &SharedMut<[u8]> {
         let addr = self
             .mapping_range(AccessType::Write, gpa, len)
             .unwrap()
@@ -1700,7 +1705,7 @@ impl GuestMemory {
         // possible some of the pages aren't mapped and will cause AVs at
         // runtime when accessed, but, as discussed above, at a language level
         // this cannot cause any safety issues.
-        unsafe { std::slice::from_raw_parts(addr.cast(), len) }
+        unsafe { SharedMut::from_raw_parts(addr.cast(), len) }
     }
 
     fn op_range<F: FnMut(u64, Range<usize>) -> Result<(), GuestMemoryBackingError>>(
@@ -1781,8 +1786,9 @@ impl GuestMemory {
     pub fn write_range_from_atomic(
         &self,
         range: &PagedRange<'_>,
-        data: &Shared<[u8]>,
+        data: impl AsRef<Shared<[u8]>>,
     ) -> Result<(), GuestMemoryError> {
+        let data = data.as_ref();
         assert!(data.len() == range.len());
         self.op_range(GuestMemoryOperation::Write, range, move |addr, r| {
             let src = &data[r];
@@ -1904,7 +1910,7 @@ unsafe impl Send for PagePtr {}
 // SAFETY: see above comment
 unsafe impl Sync for PagePtr {}
 
-pub type Page = [AtomicU8; PAGE_SIZE];
+pub type Page = SharedMut<[u8; PAGE_SIZE]>;
 
 impl LockedPages {
     #[inline]
@@ -1928,10 +1934,10 @@ impl<'a> AsRef<[&'a Page]> for &'a LockedPages {
 /// intermediate pages.
 pub trait LockedRange {
     /// Adds a sub-range to this range.
-    fn push_sub_range(&mut self, sub_range: &[AtomicU8]);
+    fn push_sub_range(&mut self, sub_range: &SharedMut<[u8]>);
 
     /// Removes and returns the last sub range.
-    fn pop_sub_range(&mut self) -> Option<(*const AtomicU8, usize)>;
+    fn pop_sub_range(&mut self) -> Option<(*mut u8, usize)>;
 }
 
 pub struct LockedRangeImpl<T: LockedRange> {

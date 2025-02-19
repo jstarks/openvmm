@@ -3,7 +3,7 @@
 
 use guestmem::LockedPages;
 use parking_lot::RwLock;
-use safeatomic::AtomicSliceOps;
+use safeatomic::shared::SharedMut;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -81,30 +81,30 @@ impl ChannelBitmap {
     }
 
     /// Gets the host-to-guest half of the interrupt page.
-    fn get_send_page(&self) -> &[AtomicU64] {
+    fn get_send_page(&self) -> &SharedMut<[u64]> {
         self.interrupt_page.pages()[0][..INTERRUPT_PAGE_SIZE]
-            .as_atomic_slice()
+            .try_cast_slice()
             .unwrap()
     }
 
     /// Gets the guest-to-host half of the interrupt page.
-    fn get_recv_page(&self) -> &[AtomicU64] {
+    fn get_recv_page(&self) -> &SharedMut<[u64]> {
         self.interrupt_page.pages()[0][INTERRUPT_PAGE_SIZE..]
-            .as_atomic_slice()
+            .try_cast_slice()
             .unwrap()
     }
 }
 
 /// Helper class for atomically operating on a large bitmap.
 struct AtomicBitmap<'a> {
-    bits: &'a [AtomicU64],
+    bits: &'a SharedMut<[u64]>,
 }
 
 const BITS_PER_WORD: usize = size_of::<AtomicU64>() * 8;
 
 impl<'a> AtomicBitmap<'a> {
     /// Creates a new bitmap using the specified slice as storage.
-    pub fn new(bits: &'a [AtomicU64]) -> Self {
+    pub fn new(bits: &'a SharedMut<[u64]>) -> Self {
         Self { bits }
     }
 
@@ -116,7 +116,7 @@ impl<'a> AtomicBitmap<'a> {
 
     /// Calls the provided callback for all bits currently set, clearing them in the process.
     pub fn scan_and_clear(&self, mut callback: impl FnMut(usize)) {
-        for (word_index, word) in self.bits.iter().enumerate() {
+        for (word_index, word) in self.bits.as_slice().iter().enumerate() {
             // Retrieve and clear the current word atomically.
             let mut value = word.swap(0, Ordering::SeqCst);
 
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_atomic_bitmap() {
-        let bits: [AtomicU64; 128] = [0; 128].map(AtomicU64::new);
+        let bits = SharedMut::new([0; 128]);
         let bitmap = AtomicBitmap::new(&bits);
         let mut expected_bits = [0u64; 128];
 
@@ -157,7 +157,7 @@ mod tests {
         compare_bits(&bits, &expected_bits);
     }
 
-    fn compare_bits(bits: &[AtomicU64; 128], expected_bits: &[u64; 128]) {
+    fn compare_bits(bits: &SharedMut<[u64; 128]>, expected_bits: &[u64; 128]) {
         bits.iter().zip(expected_bits).for_each(|(left, right)| {
             assert_eq!(left.load(Ordering::Acquire), *right);
         })

@@ -20,8 +20,8 @@ pub use sys::Mappable;
 pub use sys::MappableRef;
 pub use sys::SparseMapping;
 
+use safeatomic::shared::SharedMut;
 use std::mem::MaybeUninit;
-use std::sync::atomic::AtomicU8;
 use thiserror::Error;
 #[cfg(unix)]
 use unix as sys;
@@ -581,10 +581,10 @@ impl SparseMapping {
     /// In the latter case, actually accessing the data may cause a fault, which
     /// will likely lead to a process crash, so care must nonetheless be taken
     /// when using this method.
-    pub fn atomic_slice(&self, start: usize, len: usize) -> &[AtomicU8] {
+    pub fn atomic_slice(&self, start: usize, len: usize) -> &SharedMut<[u8]> {
         assert!(self.len() >= start && self.len() - start >= len);
         // SAFETY: slice is within the mapped range
-        unsafe { std::slice::from_raw_parts((self.as_ptr() as *const AtomicU8).add(start), len) }
+        unsafe { SharedMut::from_raw_parts((self.as_ptr()).byte_add(start).cast(), len) }
     }
 }
 

@@ -27,11 +27,8 @@ use guestmem::MemoryRead;
 use guestmem::MemoryWrite;
 use inspect::Inspect;
 use protocol::*;
-use safeatomic::AtomicSliceOps;
+use safeatomic::shared::SharedMut;
 use std::fmt::Debug;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use thiserror::Error;
@@ -73,8 +70,8 @@ mod protocol {
 
     use crate::CONTROL_WORD_COUNT;
     use inspect::Inspect;
+    use safeatomic::shared::SharedMut;
     use std::fmt::Debug;
-    use std::sync::atomic::AtomicU32;
     use std::sync::atomic::Ordering;
     use zerocopy::FromBytes;
     use zerocopy::Immutable;
@@ -96,22 +93,22 @@ mod protocol {
     }
 
     /// A control page accessor.
-    pub struct Control<'a>(pub &'a [AtomicU32; CONTROL_WORD_COUNT]);
+    pub struct Control<'a>(pub &'a [SharedMut<u32>; CONTROL_WORD_COUNT]);
 
     impl Control<'_> {
-        pub fn inp(&self) -> &AtomicU32 {
+        pub fn inp(&self) -> &SharedMut<u32> {
             &self.0[0]
         }
-        pub fn outp(&self) -> &AtomicU32 {
+        pub fn outp(&self) -> &SharedMut<u32> {
             &self.0[1]
         }
-        pub fn interrupt_mask(&self) -> &AtomicU32 {
+        pub fn interrupt_mask(&self) -> &SharedMut<u32> {
             &self.0[2]
         }
-        pub fn pending_send_size(&self) -> &AtomicU32 {
+        pub fn pending_send_size(&self) -> &SharedMut<u32> {
             &self.0[3]
         }
-        pub fn feature_bits(&self) -> &AtomicU32 {
+        pub fn feature_bits(&self) -> &SharedMut<u32> {
             &self.0[16]
         }
     }
@@ -425,7 +422,7 @@ pub const CONTROL_WORD_COUNT: usize = 32;
 /// A trait for memory backing a ring buffer.
 pub trait RingMem: Send {
     /// Returns the control page.
-    fn control(&self) -> &[AtomicU32; CONTROL_WORD_COUNT];
+    fn control(&self) -> &SharedMut<[u32; CONTROL_WORD_COUNT]>;
 
     /// Reads from the data portion of the ring, wrapping (once) at the end of
     /// the ring. Precondition: `addr + data.len() <= self.len() * 2`.
@@ -461,7 +458,7 @@ pub trait RingMem: Send {
 
 /// Implementation of `RingMem` for references. Useful for tests.
 impl<T: RingMem + Sync> RingMem for &'_ T {
-    fn control(&self) -> &[AtomicU32; CONTROL_WORD_COUNT] {
+    fn control(&self) -> &SharedMut<[u32; CONTROL_WORD_COUNT]> {
         (*self).control()
     }
     fn read_at(&self, addr: usize, data: &mut [u8]) {
@@ -490,8 +487,8 @@ pub struct FlatRingMem {
 }
 
 struct FlatRingInner {
-    control: [AtomicU32; CONTROL_WORD_COUNT],
-    data: Vec<AtomicU8>,
+    control: SharedMut<[u32; CONTROL_WORD_COUNT]>,
+    data: Vec<SharedMut<u8>>,
 }
 
 impl FlatRingMem {
@@ -501,10 +498,14 @@ impl FlatRingMem {
         data.resize_with(len, Default::default);
         Self {
             inner: Arc::new(FlatRingInner {
-                control: [0; CONTROL_WORD_COUNT].map(Into::into),
+                control: SharedMut::new([0; CONTROL_WORD_COUNT]),
                 data,
             }),
         }
+    }
+
+    fn data(&self) -> &SharedMut<[u8]> {
+        SharedMut::from_slice(&self.inner.data)
     }
 }
 
@@ -520,12 +521,12 @@ impl RingMem for FlatRingMem {
             addr -= self.len();
         }
         if addr + data.len() <= self.len() {
-            self.inner.data[addr..addr + data.len()].atomic_read(data);
+            self.data()[addr..addr + data.len()].copy_to_slice(data);
         } else {
             let data_len = data.len();
             let (first, last) = data.split_at_mut(self.len() - addr);
-            self.inner.data[addr..].atomic_read(first);
-            self.inner.data[..data_len - (self.len() - addr)].atomic_read(last);
+            self.data()[addr..].copy_to_slice(first);
+            self.data()[..data_len - (self.len() - addr)].copy_to_slice(last);
         }
     }
 
@@ -534,15 +535,15 @@ impl RingMem for FlatRingMem {
             addr -= self.len();
         }
         if addr + data.len() <= self.len() {
-            self.inner.data[addr..addr + data.len()].atomic_write(data);
+            self.data()[addr..addr + data.len()].copy_from_slice(data);
         } else {
             let (first, last) = data.split_at(self.len() - addr);
-            self.inner.data[addr..].atomic_write(first);
-            self.inner.data[..data.len() - (self.len() - addr)].atomic_write(last);
+            self.data()[addr..].copy_from_slice(first);
+            self.data()[..data.len() - (self.len() - addr)].copy_from_slice(last);
         }
     }
 
-    fn control(&self) -> &[AtomicU32; CONTROL_WORD_COUNT] {
+    fn control(&self) -> &SharedMut<[u32; CONTROL_WORD_COUNT]> {
         &self.inner.control
     }
 
@@ -554,7 +555,7 @@ impl RingMem for FlatRingMem {
 /// A trait for ring buffer memory divided into discontiguous pages.
 pub trait PagedMemory: Send {
     /// Returns the control page.
-    fn control(&self) -> &[AtomicU8; PAGE_SIZE];
+    fn control(&self) -> &SharedMut<[u8; PAGE_SIZE]>;
     /// Returns the number of data pages.
     fn data_page_count(&self) -> usize;
     /// Returns a data page.
@@ -563,7 +564,7 @@ pub trait PagedMemory: Send {
     /// representing the ring logically mapped twice consecutively. The
     /// implementation should return the same page for `n` and `n +
     /// data_page_count`.
-    fn data(&self, page: usize) -> &[AtomicU8; PAGE_SIZE];
+    fn data(&self, page: usize) -> &SharedMut<[u8; PAGE_SIZE]>;
 }
 
 /// An implementation of [`RingMem`] on top of discontiguous pages.
@@ -589,7 +590,7 @@ impl<T: PagedMemory> RingMem for PagedRingMem<T> {
             let offset_end = PAGE_SIZE.min(offset + data.len());
             let len = offset_end - offset;
             let (this, next) = data.split_at_mut(len);
-            self.0.data(page)[offset..offset_end].atomic_read(this);
+            self.0.data(page)[offset..offset_end].copy_to_slice(this);
             addr += len;
             data = next;
         }
@@ -602,7 +603,7 @@ impl<T: PagedMemory> RingMem for PagedRingMem<T> {
             let offset_end = PAGE_SIZE.min(offset + data.len());
             let len = offset_end - offset;
             let (this, next) = data.split_at(len);
-            self.0.data(page)[offset..offset_end].atomic_write(this);
+            self.0.data(page)[offset..offset_end].copy_from_slice(this);
             addr += len;
             data = next;
         }
@@ -618,7 +619,7 @@ impl<T: PagedMemory> RingMem for PagedRingMem<T> {
             let offset = addr % PAGE_SIZE;
             b.copy_from_slice(
                 &self.0.data(page)[offset..offset + 8]
-                    .as_atomic::<AtomicU64>()
+                    .try_cast::<u64>()
                     .unwrap()
                     .load(Ordering::Relaxed)
                     .to_ne_bytes(),
@@ -635,15 +636,15 @@ impl<T: PagedMemory> RingMem for PagedRingMem<T> {
             let page = addr / PAGE_SIZE;
             let offset = addr % PAGE_SIZE;
             self.0.data(page)[offset..offset + 8]
-                .as_atomic::<AtomicU64>()
+                .try_cast::<u64>()
                 .unwrap()
                 .store(u64::from_ne_bytes(b.try_into().unwrap()), Ordering::Relaxed);
         }
     }
 
     #[inline]
-    fn control(&self) -> &[AtomicU32; CONTROL_WORD_COUNT] {
-        self.0.control().as_atomic_slice().unwrap()[..CONTROL_WORD_COUNT]
+    fn control(&self) -> &SharedMut<[u32; CONTROL_WORD_COUNT]> {
+        self.0.control().try_cast_slice::<u32>().unwrap()[..CONTROL_WORD_COUNT]
             .try_into()
             .unwrap()
     }
@@ -1201,7 +1202,7 @@ impl<M: RingMem> InnerRing<M> {
     }
 
     fn control(&self) -> Control<'_> {
-        Control(self.mem.control())
+        Control(self.mem.control().as_array_ref())
     }
 
     fn len(&self) -> u32 {

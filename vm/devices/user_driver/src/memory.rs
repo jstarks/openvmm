@@ -3,10 +3,7 @@
 
 //! Traits and types for sharing host memory with the device.
 
-use safeatomic::shared::Shared;
 use safeatomic::shared::SharedMut;
-use safeatomic::AtomicSliceOps;
-use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;

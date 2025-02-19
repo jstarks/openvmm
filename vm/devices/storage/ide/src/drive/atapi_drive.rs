@@ -16,7 +16,6 @@ use guestmem::AlignedHeapMemory;
 use guestmem::GuestMemory;
 use ide_resources::IdePath;
 use inspect::Inspect;
-use safeatomic::AtomicSliceOps;
 use scsi::AdditionalSenseCode;
 use scsi::SenseKey;
 use scsi_buffers::RequestBuffers;

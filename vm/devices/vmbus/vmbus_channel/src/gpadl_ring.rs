@@ -18,9 +18,8 @@ use guestmem::LockedPages;
 use pal_async::driver::Driver;
 use ring::IncomingRing;
 use ring::OutgoingRing;
+use safeatomic::shared::SharedMut;
 use std::fmt::Debug;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::AtomicU8;
 use vmbus_ring as ring;
 use vmcore::interrupt::Interrupt;
 use vmcore::notify::PolledNotify;
@@ -103,12 +102,12 @@ impl GpadlPagedMemory {
 }
 
 impl ring::PagedMemory for GpadlPagedMemory {
-    fn control(&self) -> &[AtomicU8; ring::PAGE_SIZE] {
+    fn control(&self) -> &SharedMut<[u8; ring::PAGE_SIZE]> {
         self.pages.pages()[0]
     }
 
     #[inline]
-    fn data(&self, page: usize) -> &[AtomicU8; ring::PAGE_SIZE] {
+    fn data(&self, page: usize) -> &SharedMut<[u8; ring::PAGE_SIZE]> {
         self.pages.pages()[page + 1]
     }
 
@@ -166,7 +165,7 @@ impl ring::RingMem for GpadlRingMem {
     }
 
     #[inline]
-    fn control(&self) -> &[AtomicU32; vmbus_ring::CONTROL_WORD_COUNT] {
+    fn control(&self) -> &SharedMut<[u32; vmbus_ring::CONTROL_WORD_COUNT]> {
         self.ring.control()
     }
 }

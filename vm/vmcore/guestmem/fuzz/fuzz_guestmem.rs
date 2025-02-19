@@ -16,7 +16,6 @@ use safeatomic::shared::SharedMut;
 use smallvec::SmallVec;
 use sparse_mmap::SparseMapping;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicU8;
 use xtask_fuzz::fuzz_target;
 
 /// An implementation of a GuestMemoryAccess trait that expects all of
@@ -91,15 +90,15 @@ fn create_random_mapping(
 #[repr(C)]
 struct AtomicIoVec {
     /// The address of the buffer.
-    pub address: *const AtomicU8,
+    pub address: *mut u8,
     /// The length of the buffer in bytes.
     pub len: usize,
 }
 
-impl From<&'_ [AtomicU8]> for AtomicIoVec {
-    fn from(p: &'_ [AtomicU8]) -> Self {
+impl From<&'_ SharedMut<[u8]>> for AtomicIoVec {
+    fn from(p: &'_ SharedMut<[u8]>) -> Self {
         Self {
-            address: p.as_ptr(),
+            address: p.as_ptr().cast(),
             len: p.len(),
         }
     }
@@ -114,11 +113,11 @@ impl LockedIoVecs {
 }
 
 impl LockedRange for LockedIoVecs {
-    fn push_sub_range(&mut self, sub_range: &[AtomicU8]) {
+    fn push_sub_range(&mut self, sub_range: &SharedMut<[u8]>) {
         self.0.push(sub_range.into());
     }
 
-    fn pop_sub_range(&mut self) -> Option<(*const AtomicU8, usize)> {
+    fn pop_sub_range(&mut self) -> Option<(*mut u8, usize)> {
         self.0.pop().map(|buffer| (buffer.address, buffer.len))
     }
 }

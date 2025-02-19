@@ -16,7 +16,6 @@ use net_backend::RxBufferSegment;
 use net_backend::RxChecksumState;
 use net_backend::RxId;
 use net_backend::RxMetadata;
-use safeatomic::AtomicSliceOps;
 use std::ops::Range;
 use std::sync::Arc;
 use vmbus_channel::gpadl::GpadlView;
@@ -86,7 +85,7 @@ impl GuestBuffers {
             let len = (PAGE_SIZE - offset % PAGE_SIZE).min(buf.len());
             let (this, next) = buf.split_at(len);
             self.locked_pages.pages()[offset / PAGE_SIZE][offset % PAGE_SIZE..][..len]
-                .atomic_write(this);
+                .copy_from_slice(this);
             buf = next;
             offset += len;
         }

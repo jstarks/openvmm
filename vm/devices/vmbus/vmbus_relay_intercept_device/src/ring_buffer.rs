@@ -5,8 +5,7 @@
 //! allocated memory that has been locked to physical pages and whose pfns are
 //! known.
 
-use safeatomic::AtomicSliceOps;
-use std::sync::atomic::AtomicU32;
+use safeatomic::shared::SharedMut;
 use user_driver::memory::MemoryBlock;
 use vmbus_ring::RingMem;
 use vmbus_ring::CONTROL_WORD_COUNT;
@@ -50,8 +49,8 @@ impl RingMem for MemoryBlockRingBuffer {
         }
     }
 
-    fn control(&self) -> &[AtomicU32; CONTROL_WORD_COUNT] {
-        self.0.as_slice().try_cast().unwrap()[..CONTROL_WORD_COUNT]
+    fn control(&self) -> &SharedMut<[u32; CONTROL_WORD_COUNT]> {
+        self.0.as_slice().try_cast_slice().unwrap()[..CONTROL_WORD_COUNT]
             .try_into()
             .unwrap()
     }

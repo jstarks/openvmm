@@ -115,6 +115,7 @@ type IncompleteGpadlMap = HashMap<GpadlId, OfferId>;
 type GpadlMap = HashMap<(GpadlId, OfferId), Gpadl>;
 
 /// A message that could not be sent immediately.
+#[derive(Clone)]
 pub struct PendingMessage {
     pub message: OutgoingMessage,
     pub target: MessageTarget,
@@ -1393,14 +1394,19 @@ impl Server {
         ))
     }
 
-    pub fn pending_message(&self) -> Option<&PendingMessage> {
-        self.pending_messages.front()
+    pub fn has_pending_message(&self) -> bool {
+        !self.pending_messages.is_empty()
     }
 
-    pub fn remove_pending_message(&mut self) {
-        self.pending_messages
-            .pop_front()
-            .expect("message queue should not be empty");
+    pub fn flush_pending_messages<E>(
+        &mut self,
+        mut f: impl FnMut(&PendingMessage) -> Result<(), E>,
+    ) -> Result<(), E> {
+        while let Some(message) = self.pending_messages.front() {
+            f(&message)?;
+            self.pending_messages.pop_front();
+        }
+        Ok(())
     }
 }
 
@@ -5120,7 +5126,7 @@ mod tests {
 
         // No messages were received.
         assert!(env.notifier.messages.is_empty());
-        assert!(env.server.pending_message().is_some());
+        assert!(env.server.has_pending_message());
         env.notifier.pend_messages = false;
 
         let state = env.server.save();
@@ -5138,8 +5144,22 @@ mod tests {
         env.c().restore_channel(offer_id3, false).unwrap();
         env.c().post_restore().unwrap();
 
+        let mut next_msg = || {
+            let mut msg = None;
+            env.server
+                .flush_pending_messages(|m| {
+                    if msg.is_some() {
+                        return Err(());
+                    }
+                    msg = Some(m.clone());
+                    Ok(())
+                })
+                .ok();
+            msg
+        };
+
         // The messages should be pending again.
-        let msg = env.server.pending_message().unwrap();
+        let msg = next_msg().unwrap();
         assert_eq!(
             protocol::MessageHeader::read_from_prefix(msg.message.data())
                 .unwrap()
@@ -5149,8 +5169,7 @@ mod tests {
         );
         assert_eq!(msg.target, MessageTarget::Default);
 
-        env.server.remove_pending_message();
-        let msg = env.server.pending_message().unwrap();
+        let msg = next_msg().unwrap();
         assert_eq!(
             protocol::MessageHeader::read_from_prefix(msg.message.data())
                 .unwrap()
@@ -5160,8 +5179,7 @@ mod tests {
         );
         assert_eq!(msg.target, MessageTarget::ReservedChannel(offer_id2));
 
-        env.server.remove_pending_message();
-        let msg = env.server.pending_message().unwrap();
+        let msg = next_msg().unwrap();
         assert_eq!(
             protocol::MessageHeader::read_from_prefix(msg.message.data())
                 .unwrap()
@@ -5174,8 +5192,7 @@ mod tests {
             MessageTarget::Custom(ConnectionTarget { vp: 2, sint: 1 })
         );
 
-        env.server.remove_pending_message();
-        assert!(env.server.pending_message().is_none());
+        assert!(next_msg().is_none());
     }
 
     #[test]

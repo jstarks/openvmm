@@ -1019,7 +1019,7 @@ impl ServerTask {
             // guest.
             let mut message_recv = OptionFuture::from(
                 (self.running
-                    && self.server.pending_message().is_none()
+                    && !self.server.has_pending_message()
                     && self.inner.hvsock_requests < MAX_CONCURRENT_HVSOCK_REQUESTS)
                     .then(|| self.message_recv.select_next_some()),
             );
@@ -1042,25 +1042,30 @@ impl ServerTask {
             let redirect_vtl = self.inner.redirect_vtl;
             let message_port = self.inner.message_port.as_mut();
             let mut send_pending_message = OptionFuture::from(
-                self.running
-                    .then(|| {
-                        self.server.pending_message().map(|msg| {
+                (self.running && self.server.has_pending_message()).then(|| {
+                    poll_fn(|cx| {
+                        let r = self.server.flush_pending_messages(|msg| {
                             tracing::trace!(msg = ?msg.message, "sending queued message");
-                            poll_fn(move |cx| {
-                                ServerTaskInner::poll_send_message(
-                                    cx,
-                                    message_port,
-                                    channels,
-                                    synic,
-                                    redirect_vtl,
-                                    &msg.message,
-                                    msg.target,
-                                )
-                            })
-                            .fuse()
-                        })
+                            match ServerTaskInner::poll_send_message(
+                                cx,
+                                message_port,
+                                channels,
+                                synic,
+                                redirect_vtl,
+                                &msg.message,
+                                msg.target,
+                            ) {
+                                Poll::Ready(()) => Ok(()),
+                                Poll::Pending => Err(()),
+                            }
+                        });
+                        match r {
+                            Ok(()) => Poll::Ready(()),
+                            Err(()) => Poll::Pending,
+                        }
                     })
-                    .flatten(),
+                    .fuse()
+                }),
             );
 
             futures::select! { // merge semantics
@@ -1111,7 +1116,6 @@ impl ServerTask {
                 }
                 r = send_pending_message => {
                     r.unwrap();
-                    self.server.remove_pending_message();
                 }
                 complete => break,
             }

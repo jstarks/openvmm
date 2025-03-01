@@ -163,10 +163,8 @@ impl SenderCore {
     unsafe fn send<T>(&self, message: T) {
         fn send(queue: &Queue, message: MessagePtr) -> bool {
             match queue.access() {
-                QueueAccess::Local(mut local) => {
-                    if local.receiver_gone {
-                        return false;
-                    }
+                None => return false,
+                Some(QueueAccess::Local(mut local)) => {
                     // SAFETY: The caller guarantees `message` is a valid owned `T`,
                     // and that the queue will not be sent/shared across threads
                     // unless `T` is `Send`/`Sync`.
@@ -176,7 +174,7 @@ impl SenderCore {
                         waker.wake();
                     }
                 }
-                QueueAccess::Remote(remote) => {
+                Some(QueueAccess::Remote(remote)) => {
                     // SAFETY: The caller guarantees `message` is a valid owned `T`.
                     unsafe { (remote.send)(&remote.port, message) };
                 }
@@ -194,8 +192,9 @@ impl SenderCore {
 
     fn is_closed(&self) -> bool {
         match self.0.access() {
-            QueueAccess::Local(local) => local.receiver_gone,
-            QueueAccess::Remote(remote) => remote.port.is_closed().unwrap_or(true),
+            None => true,
+            Some(QueueAccess::Local(_)) => false,
+            Some(QueueAccess::Remote(remote)) => remote.port.is_closed().unwrap_or(true),
         }
     }
 
@@ -249,17 +248,16 @@ impl SenderCore {
                     // There is a receiver or at least one other sender.
                     let (send, recv) = Port::new_pair();
                     match queue.access() {
-                        QueueAccess::Local(mut local) => {
-                            if !local.receiver_gone {
-                                local.new_handler = new_handler;
-                                local.ports.push(recv);
-                                if let Some(waker) = local.waker.take() {
-                                    drop(local);
-                                    waker.wake();
-                                }
+                        None => {}
+                        Some(QueueAccess::Local(mut local)) => {
+                            local.new_handler = new_handler;
+                            local.ports.push(recv);
+                            if let Some(waker) = local.waker.take() {
+                                drop(local);
+                                waker.wake();
                             }
                         }
-                        QueueAccess::Remote(remote) => {
+                        Some(QueueAccess::Remote(remote)) => {
                             remote.port.send_protobuf(ChannelPayload::<()>::Port(recv));
                         }
                     }
@@ -768,11 +766,11 @@ enum QueueAccess<'a> {
 }
 
 impl Queue {
-    fn access(&self) -> QueueAccess<'_> {
+    fn access(&self) -> Option<QueueAccess<'_>> {
         loop {
             // Check if the queue is remote first to avoid taking the lock.
             if let Some(remote) = self.remote.get() {
-                break QueueAccess::Remote(remote);
+                break Some(QueueAccess::Remote(remote));
             } else {
                 let local = self.local.lock();
                 if local.remote {
@@ -780,7 +778,10 @@ impl Queue {
                     // taking the lock.
                     continue;
                 }
-                break QueueAccess::Local(local);
+                if local.receiver_gone {
+                    break None;
+                };
+                break Some(QueueAccess::Local(local));
             }
         }
     }

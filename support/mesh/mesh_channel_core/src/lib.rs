@@ -13,6 +13,7 @@ mod deque;
 mod error;
 mod mpsc;
 mod oneshot;
+mod waker_list;
 
 pub use error::*;
 pub use mpsc::*;

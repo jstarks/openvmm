@@ -27,6 +27,7 @@ use crate::deque::ErasedVecDeque;
 use crate::error::ChannelError;
 use crate::error::RecvError;
 use crate::error::TryRecvError;
+use crate::waker_list::AsyncDone;
 use core::fmt::Debug;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -51,7 +52,9 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomPinned;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::task::ready;
+use thiserror::Error;
 
 /// Creates a new channel for sending messages of type `T`, returning the sender
 /// and receiver ends.
@@ -123,6 +126,11 @@ impl<T> Sender<T> {
     pub fn is_closed(&self) -> bool {
         self.0.is_closed()
     }
+
+    /// Returns when the receiving side of the channel is closed or has failed.
+    pub async fn closed(&self) {
+        self.0 .0.receiver_done.wait_done().await
+    }
 }
 
 struct MessagePtr(*mut ());
@@ -176,7 +184,7 @@ impl SenderCore {
                 }
                 Some(QueueAccess::Remote(remote)) => {
                     // SAFETY: The caller guarantees `message` is a valid owned `T`.
-                    unsafe { (remote.send)(&remote.port, message) };
+                    unsafe { (remote.send)(remote.port.port(), message) };
                 }
             }
             true
@@ -191,11 +199,7 @@ impl SenderCore {
     }
 
     fn is_closed(&self) -> bool {
-        match self.0.access() {
-            None => true,
-            Some(QueueAccess::Local(_)) => false,
-            Some(QueueAccess::Remote(remote)) => remote.port.is_closed().unwrap_or(true),
-        }
+        self.0.receiver_done.is_done()
     }
 
     fn into_queue(self) -> Arc<Queue> {
@@ -207,12 +211,16 @@ impl SenderCore {
     /// Creates a new queue with element type `T` for sending to `port`.
     fn from_port<T: MeshField>(port: Port) -> Self {
         fn from_port(port: Port, vtable: &'static ElementVtable, send: SendFn) -> SenderCore {
-            SenderCore(ManuallyDrop::new(Arc::new(Queue {
+            SenderCore(ManuallyDrop::new(Arc::new_cyclic(|weak| Queue {
                 local: Mutex::new(LocalQueue {
                     remote: true,
                     ..LocalQueue::new(vtable)
                 }),
-                remote: OnceLock::from(RemoteQueueState { port, send }),
+                remote: OnceLock::from(RemoteQueueState {
+                    port: port.set_handler(CloseHandler(weak.clone())),
+                    send,
+                }),
+                receiver_done: AsyncDone::new(),
                 receiver: SyncUnsafeCell::new(ReceiverState {
                     ports: PortHandlerList::default(),
                     terminated: false,
@@ -237,7 +245,7 @@ impl SenderCore {
                 Ok(mut queue) => {
                     if let Some(remote) = queue.remote.into_inner() {
                         // This is the unique owner of the port.
-                        remote.port
+                        remote.port.remove_handler().0
                     } else {
                         assert!(queue.local.get_mut().receiver_gone);
                         let (send, _recv) = Port::new_pair();
@@ -258,7 +266,10 @@ impl SenderCore {
                             }
                         }
                         Some(QueueAccess::Remote(remote)) => {
-                            remote.port.send_protobuf(ChannelPayload::<()>::Port(recv));
+                            remote
+                                .port
+                                .port()
+                                .send_protobuf(ChannelPayload::<()>::Port(recv));
                         }
                     }
                     send
@@ -452,6 +463,7 @@ impl Drop for ReceiverQueue {
         // Drop any handled ports to propagate the close signal and to eliminate
         // circular references.
         self.state_mut().ports = Default::default();
+        self.0.receiver_done.mark_done();
         let mut local = self.0.local.lock();
         local.receiver_gone = true;
         let _waker = std::mem::take(&mut local.waker);
@@ -483,6 +495,7 @@ impl ReceiverCore {
             queue: ReceiverQueue(Arc::new(Queue {
                 local: Mutex::new(LocalQueue::new(vtable)),
                 remote: OnceLock::new(),
+                receiver_done: AsyncDone::new(),
                 receiver: SyncUnsafeCell::new(ReceiverState {
                     ports: PortHandlerList::default(),
                     terminated: true,
@@ -609,7 +622,10 @@ impl ReceiverCore {
             this.queue
                 .0
                 .remote
-                .set(RemoteQueueState { port: sender, send })
+                .set(RemoteQueueState {
+                    port: sender.set_handler(CloseHandler(Arc::downgrade(&this.queue.0))),
+                    send,
+                })
                 .ok()
                 .unwrap();
 
@@ -632,6 +648,7 @@ impl ReceiverCore {
                     ..LocalQueue::new(vtable)
                 }),
                 remote: OnceLock::new(),
+                receiver_done: AsyncDone::new(),
                 receiver: SyncUnsafeCell::new(ReceiverState {
                     ports: PortHandlerList::default(),
                     terminated: false,
@@ -737,6 +754,7 @@ impl<T: MeshField> Receiver<T> {
 struct Queue {
     remote: OnceLock<RemoteQueueState>,
     local: Mutex<LocalQueue>,
+    receiver_done: AsyncDone,
     receiver: SyncUnsafeCell<ReceiverState>,
 }
 
@@ -820,7 +838,7 @@ fn missing_handler(_: Arc<Queue>) -> RemotePortHandler {
 
 #[derive(Debug)]
 struct RemoteQueueState {
-    port: Port,
+    port: PortWithHandler<CloseHandler>,
     send: SendFn,
 }
 
@@ -928,6 +946,40 @@ impl HandlePortEvent for RemotePortHandler {
     }
 }
 
+struct CloseHandler(Weak<Queue>);
+
+#[derive(Debug, Error)]
+#[error("unexpected message to sender port")]
+struct UnexpectedMessage;
+
+impl HandlePortEvent for CloseHandler {
+    fn message<'a>(
+        &mut self,
+        _control: &mut mesh_node::local_node::PortControl<'_, 'a>,
+        _message: Message<'a>,
+    ) -> Result<(), HandleMessageError> {
+        Err(HandleMessageError::new(UnexpectedMessage))
+    }
+
+    fn close(&mut self, _control: &mut mesh_node::local_node::PortControl<'_, '_>) {
+        if let Some(queue) = self.0.upgrade() {
+            queue.receiver_done.mark_done();
+        }
+    }
+
+    fn fail(
+        &mut self,
+        control: &mut mesh_node::local_node::PortControl<'_, '_>,
+        _err: mesh_node::local_node::NodeError,
+    ) {
+        self.close(control);
+    }
+
+    fn drain(&mut self) -> Vec<OwnedMessage> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::channel;
@@ -935,6 +987,8 @@ mod tests {
     use super::Sender;
     use crate::RecvError;
     use futures::executor::block_on;
+    use futures::future::join;
+    use futures::FutureExt;
     use futures::StreamExt;
     use futures_core::FusedStream;
     use mesh_node::local_node::Port;
@@ -1044,6 +1098,29 @@ mod tests {
                 receiver.next().await.as_ref().map(|v| v.0.as_str()),
                 Some("test")
             );
+        })
+    }
+
+    #[test]
+    fn test_closed() {
+        block_on(async {
+            let (sender, receiver) = channel::<()>();
+            assert!(sender.closed().now_or_never().is_none());
+            assert!(!sender.is_closed());
+            join(sender.closed(), async { drop(receiver) }).await;
+            assert!(sender.is_closed());
+        })
+    }
+
+    #[test]
+    fn test_closed_remove() {
+        block_on(async {
+            let (sender, receiver) = channel::<()>();
+            let sender = Sender::<()>::from(Port::from(sender));
+            assert!(sender.closed().now_or_never().is_none());
+            assert!(!sender.is_closed());
+            join(sender.closed(), async { drop(receiver) }).await;
+            assert!(sender.is_closed());
         })
     }
 }

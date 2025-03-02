@@ -402,6 +402,11 @@ impl<T: HandlePortEvent> PortWithHandler<T> {
         self.raw.send(message)
     }
 
+    /// Returns a reference to the port.
+    pub fn port(&self) -> &Port {
+        &self.raw
+    }
+
     pub fn is_closed(&self) -> Result<bool, NodeError> {
         self.raw.is_closed()
     }

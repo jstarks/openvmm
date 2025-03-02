@@ -14,7 +14,8 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
-struct AsyncDone {
+#[derive(Debug)]
+pub struct AsyncDone {
     done: AtomicBool,
     lock: Mutex<()>,
     list: WakerNode,
@@ -27,6 +28,10 @@ impl AsyncDone {
             lock: Mutex::new(()),
             list: WakerNode::new(),
         }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Acquire)
     }
 
     pub fn mark_done(&self) {
@@ -66,10 +71,14 @@ impl AsyncDone {
     }
 }
 
+#[derive(Debug)]
 struct WakerNode {
     next: UnsafeCell<*const WakerEntry>,
     prev: UnsafeCell<*const WakerEntry>,
 }
+
+unsafe impl Send for WakerNode {}
+unsafe impl Sync for WakerNode {}
 
 impl WakerNode {
     const fn new() -> Self {
@@ -88,7 +97,7 @@ struct WakerEntry {
     done: AtomicBool,
 }
 
-struct WaitDone<'a> {
+pub struct WaitDone<'a> {
     done: &'a AsyncDone,
     entry: WakerEntry,
     maybe_on_list: bool,

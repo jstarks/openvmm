@@ -343,6 +343,30 @@ impl<T, R> EncoderEntry<T, R> {
     /// Returns an encoder entry that contains a vtable with methods for
     /// encoding the field.
     pub(crate) const fn custom<E: FieldEncode<T, R>>() -> Self {
+        fn write_field_dyn<T, R, E: FieldEncode<T, R>>(
+            field: *mut u8,
+            writer: FieldWriter<'_, '_, R>,
+        ) {
+            // SAFETY: caller guarantees that `field` points to a `T`, and this function
+            // takes ownership of it.
+            let field = unsafe { field.cast::<T>().read() };
+            E::write_field(field, writer);
+        }
+
+        fn compute_size_field_dyn<T, R, E: FieldEncode<T, R>>(
+            field: *mut u8,
+            sizer: FieldSizer<'_>,
+        ) {
+            // SAFETY: caller guarantees that `field` points to a `T`.
+            let field = unsafe { &mut *field.cast::<T>() };
+            E::compute_field_size(field, sizer);
+        }
+
+        fn drop_field_dyn<T>(field: *mut u8) {
+            // SAFETY: caller guarantees that `field` points to a `T`.
+            unsafe { field.cast::<T>().drop_in_place() }
+        }
+
         Self(
             ErasedEncoderEntry(
                 core::ptr::from_ref(
@@ -350,6 +374,11 @@ impl<T, R> EncoderEntry<T, R> {
                         &StaticEncoderVtable {
                             write_fn: write_field_dyn::<T, R, E>,
                             compute_size_fn: compute_size_field_dyn::<T, R, E>,
+                            drop_fn: if core::mem::needs_drop::<T>() {
+                                Some(drop_field_dyn::<T>)
+                            } else {
+                                None
+                            },
                         }
                     },
                 )
@@ -364,15 +393,17 @@ impl<T, R> EncoderEntry<T, R> {
     where
         T: StructEncodeMetadata<R>,
     {
+        assert!(T::NUMBERS.len() <= u16::MAX as usize);
         Self(
             ErasedEncoderEntry(
                 core::ptr::from_ref(
                     const {
                         &EncoderTable {
-                            count: T::NUMBERS.len(),
+                            count: T::NUMBERS.len() as u16,
                             numbers: T::NUMBERS.as_ptr(),
                             encoders: T::ENCODERS.as_ptr(),
                             offsets: T::OFFSETS.as_ptr(),
+                            needs_drop: core::mem::needs_drop::<T>(),
                         }
                     },
                 )
@@ -441,7 +472,7 @@ impl ErasedEncoderEntry {
                 Ok(vtable) => (vtable.write_fn)(field, writer),
                 Err(table) => {
                     write_message_by_ptr(
-                        table.count,
+                        table.count.into(),
                         table.numbers,
                         table.encoders,
                         table.offsets,
@@ -466,7 +497,7 @@ impl ErasedEncoderEntry {
                 Ok(vtable) => (vtable.compute_size_fn)(field, sizer),
                 Err(table) => {
                     compute_size_message_by_ptr::<R>(
-                        table.count,
+                        table.count.into(),
                         table.numbers,
                         table.encoders,
                         table.offsets,
@@ -477,10 +508,39 @@ impl ErasedEncoderEntry {
             }
         }
     }
+
+    /// Drops a field using the encoder.
+    ///
+    /// # Safety
+    /// The caller must ensure that `field` points to a valid object of type `T`.
+    pub unsafe fn drop_field(&self, field: *mut u8) {
+        // SAFETY: caller guarantees that `field` points to a valid object of
+        // type `T`.
+        unsafe {
+            match self.decode::<()>() {
+                Ok(vtable) => {
+                    if let Some(drop_fn) = vtable.drop_fn {
+                        drop_fn(field);
+                    }
+                }
+                Err(table) => {
+                    if table.needs_drop {
+                        for i in 0..table.count as usize {
+                            let offset = *table.offsets.add(i);
+                            let ptr = field.add(offset);
+                            let encoder = *table.encoders.add(i);
+                            encoder.drop_field(ptr);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct EncoderTable {
-    count: usize,
+    count: u16,
+    needs_drop: bool,
     numbers: *const u32,
     encoders: *const ErasedEncoderEntry,
     offsets: *const usize,
@@ -490,23 +550,5 @@ struct EncoderTable {
 struct StaticEncoderVtable<R> {
     write_fn: unsafe fn(*mut u8, FieldWriter<'_, '_, R>),
     compute_size_fn: unsafe fn(*mut u8, FieldSizer<'_>),
-}
-
-unsafe fn write_field_dyn<T, R, E: FieldEncode<T, R>>(
-    field: *mut u8,
-    writer: FieldWriter<'_, '_, R>,
-) {
-    // SAFETY: caller guarantees that `field` points to a `T`, and this function
-    // takes ownership of it.
-    let field = unsafe { field.cast::<T>().read() };
-    E::write_field(field, writer);
-}
-
-unsafe fn compute_size_field_dyn<T, R, E: FieldEncode<T, R>>(
-    field: *mut u8,
-    sizer: FieldSizer<'_>,
-) {
-    // SAFETY: caller guarantees that `field` points to a `T`.
-    let field = unsafe { &mut *field.cast::<T>() };
-    E::compute_field_size(field, sizer);
+    drop_fn: Option<unsafe fn(*mut u8)>,
 }

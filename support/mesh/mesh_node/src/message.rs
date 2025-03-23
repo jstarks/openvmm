@@ -10,6 +10,7 @@ use crate::resource::Resource;
 use crate::resource::SerializedMessage;
 use mesh_protobuf;
 use mesh_protobuf::DefaultEncoding;
+use mesh_protobuf::FieldEncode;
 use mesh_protobuf::MessageDecode;
 use mesh_protobuf::MessageEncode;
 use mesh_protobuf::encoding::SerializedMessageEncoder;
@@ -18,6 +19,7 @@ use mesh_protobuf::inplace_none;
 use mesh_protobuf::protobuf::MessageSizer;
 use mesh_protobuf::protobuf::MessageWriter;
 use mesh_protobuf::protobuf::decode_with;
+use mesh_protobuf::table::encode::ErasedEncoderEntry;
 use std::any::Any;
 use std::any::TypeId;
 use std::borrow::Cow;
@@ -70,7 +72,7 @@ impl OwnedMessage {
 pub trait MeshPayload: DefaultEncoding<Encoding = <Self as MeshPayload>::Encoding> + Sized {
     type Encoding: MessageEncode<Self, Resource>
         + for<'a> MessageDecode<'a, Self, Resource>
-        + mesh_protobuf::FieldEncode<Self, Resource>
+        + FieldEncode<Self, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, Self, Resource>
         + Send
         + Sync;
@@ -81,7 +83,7 @@ where
     T: DefaultEncoding + Any + Send + 'static,
     T::Encoding: MessageEncode<T, Resource>
         + for<'a> MessageDecode<'a, T, Resource>
-        + mesh_protobuf::FieldEncode<T, Resource>
+        + FieldEncode<T, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, T, Resource>
         + Send
         + Sync,
@@ -92,7 +94,7 @@ where
 /// Trait for types that can be a field in a mesh message, including both scalar
 /// types and types that implement [`MeshPayload`].
 pub trait MeshField: DefaultEncoding<Encoding = <Self as MeshField>::Encoding> + Sized {
-    type Encoding: mesh_protobuf::FieldEncode<Self, Resource>
+    type Encoding: FieldEncode<Self, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, Self, Resource>
         + Send
         + Sync;
@@ -101,7 +103,7 @@ pub trait MeshField: DefaultEncoding<Encoding = <Self as MeshField>::Encoding> +
 impl<T> MeshField for T
 where
     T: DefaultEncoding,
-    T::Encoding: mesh_protobuf::FieldEncode<T, Resource>
+    T::Encoding: FieldEncode<T, Resource>
         + for<'a> mesh_protobuf::FieldDecode<'a, T, Resource>
         + Send
         + Sync,
@@ -300,7 +302,7 @@ impl Debug for Message<'_> {
 
 enum MessageInner<'a> {
     Owned(OwnedMessage),
-    Stack(StackMessage<'a>),
+    StackOneofVariant(StackOneofVariantMessage<'a>),
     View(&'a [u8], Vec<Resource>),
 }
 
@@ -311,25 +313,48 @@ impl<'a> Message<'a> {
         OwnedMessage::new(message).into()
     }
 
-    /// Returns a new instance that logically owns the contents of `message`,
-    /// while keeping the storage for `message` in place.
+    /// Returns a new message that encodes as a oneof variant with the given
+    /// field number. The given encoder is used to encode the field.
     ///
-    /// Note that `message` need not be `Send`.
-    ///
-    /// This should be used via the [`stack_message!`] macro.
+    /// # Safety
+    /// The caller must ensure that `ptr` remains valid for the lifetime of the
+    /// message and that the encoder matches the type of the message. The
+    /// message takes ownership of the value pointed to by `ptr` (but not the
+    /// underlying storage), so the caller must ensure that the value is never
+    /// used again.
+    pub unsafe fn new_erased_oneof_variant_message(
+        field_number: u32,
+        ptr: *mut (),
+        encoder: ErasedEncoderEntry,
+    ) -> Self {
+        Message(MessageInner::StackOneofVariant(StackOneofVariantMessage {
+            ptr,
+            field_number,
+            encoder,
+            _phantom: PhantomData,
+        }))
+    }
+
+    /// Helper for [`stack_oneof_variant_message!`].
     ///
     /// # Safety
     /// The caller must ensure that `message` is initialized. It will be dropped
     /// in place when the message is dropped, so it must not be used again.
-    pub(crate) unsafe fn new_stack<T: 'a + DefaultEncoding>(message: &'a mut MaybeUninit<T>) -> Self
+    #[doc(hidden)]
+    pub unsafe fn new_stack_oneof_variant<T: 'a + DefaultEncoding>(
+        field_number: u32,
+        message: &'a mut MaybeUninit<T>,
+    ) -> Self
     where
-        T::Encoding: MessageEncode<T, Resource>,
+        T::Encoding: FieldEncode<T, Resource>,
     {
-        Message(MessageInner::Stack(StackMessage(
-            message.as_mut_ptr().cast(),
-            DynMessageVtable::stack::<T, T::Encoding>(),
-            PhantomData,
-        )))
+        unsafe {
+            Self::new_erased_oneof_variant_message(
+                field_number,
+                message.as_mut_ptr().cast(),
+                T::Encoding::ENTRY.erase(),
+            )
+        }
     }
 
     /// Returns an instance for a serialized message with `data` and
@@ -346,7 +371,7 @@ impl<'a> Message<'a> {
     pub fn into_owned(self) -> OwnedMessage {
         let m = match self.0 {
             MessageInner::Owned(m) => return m,
-            MessageInner::Stack(_) => SerializedMessage::from_message(self),
+            MessageInner::StackOneofVariant(_) => SerializedMessage::from_message(self),
             MessageInner::View(v, vec) => SerializedMessage {
                 data: v.into(),
                 resources: vec,
@@ -423,7 +448,7 @@ impl MessageEncode<Message<'_>, Resource> for MessageEncoder {
     fn write_message(item: Message<'_>, mut writer: MessageWriter<'_, '_, Resource>) {
         match item.0 {
             MessageInner::Owned(m) => Self::write_message(m, writer),
-            MessageInner::Stack(m) => m.write_message(writer),
+            MessageInner::StackOneofVariant(m) => m.write_message(writer),
             MessageInner::View(data, resources) => {
                 writer.raw_message(data, resources);
             }
@@ -433,7 +458,7 @@ impl MessageEncode<Message<'_>, Resource> for MessageEncoder {
     fn compute_message_size(item: &mut Message<'_>, mut sizer: MessageSizer<'_>) {
         match &mut item.0 {
             MessageInner::Owned(m) => Self::compute_message_size(m, sizer),
-            MessageInner::Stack(m) => m.compute_message_size(sizer),
+            MessageInner::StackOneofVariant(m) => m.compute_message_size(sizer),
             MessageInner::View(data, resources) => {
                 sizer.raw_message(data.len(), resources.len() as u32);
             }
@@ -441,93 +466,61 @@ impl MessageEncode<Message<'_>, Resource> for MessageEncoder {
     }
 }
 
-/// Returns a [`Message`] that takes ownership of a value but leaves the value
-/// in place on the stack.
-macro_rules! stack_message {
-    ($v:expr) => {
+/// Returns a [`Message`] representing a oneof variant with the given field
+/// number and field value.
+///
+/// This takes ownership of a value but leaves the value in place on the stack,
+/// eliminating the need for a heap allocation.
+#[macro_export]
+macro_rules! stack_oneof_variant_message {
+    ($field_number:expr, $v:expr) => {
         (|v| {
             // UNSAFETY: required to call unsafe function.
             #[expect(unsafe_code)]
-            // SAFETY: The value is initialized and never used again.
-            unsafe {
-                $crate::message::Message::new_stack(v)
+            {
+                // SAFETY: The value is initialized and never used again.
+                unsafe { $crate::message::Message::new_stack_oneof_variant($field_number, v) }
             }
         })(&mut ::core::mem::MaybeUninit::new($v))
     };
 }
-pub(crate) use stack_message;
 
 /// A message whose storage is on the stack.
-struct StackMessage<'a>(*mut (), &'static DynMessageVtable, PhantomData<&'a mut ()>);
+struct StackOneofVariantMessage<'a> {
+    ptr: *mut (),
+    field_number: u32,
+    encoder: ErasedEncoderEntry,
+    _phantom: PhantomData<&'a mut ()>,
+}
 
-impl Drop for StackMessage<'_> {
+impl Drop for StackOneofVariantMessage<'_> {
     fn drop(&mut self) {
         // SAFETY: The value is owned.
-        unsafe { (self.1.drop)(self.0) }
+        unsafe { self.encoder.drop_field(self.ptr.cast()) }
     }
 }
 
-impl StackMessage<'_> {
-    fn compute_message_size(&mut self, sizer: MessageSizer<'_>) {
-        // SAFETY: The value is owned and the vtable type matches.
-        unsafe { (self.1.compute_message_size)(self.0, sizer) }
+impl StackOneofVariantMessage<'_> {
+    fn compute_message_size(&mut self, mut sizer: MessageSizer<'_>) {
+        // SAFETY: The value is owned and the encoder type matches.
+        unsafe {
+            self.encoder.compute_size_field::<Resource>(
+                self.ptr.cast(),
+                sizer.field(self.field_number).sequence().field(),
+            );
+        }
     }
 
-    fn write_message(self, writer: MessageWriter<'_, '_, Resource>) {
-        let Self(ptr, vtable, _) = self;
+    fn write_message(self, mut writer: MessageWriter<'_, '_, Resource>) {
+        let Self {
+            ptr,
+            field_number,
+            encoder,
+            ..
+        } = self;
         std::mem::forget(self);
-        // SAFETY: The value is owned and the vtable type matches.
-        unsafe { (vtable.write_message)(ptr, writer) }
-    }
-}
-
-struct DynMessageVtable {
-    compute_message_size: unsafe fn(*mut (), MessageSizer<'_>),
-    write_message: unsafe fn(*mut (), MessageWriter<'_, '_, Resource>),
-    drop: unsafe fn(*mut ()),
-}
-
-impl DynMessageVtable {
-    const fn stack<T, E: MessageEncode<T, Resource>>() -> &'static Self {
-        /// # Safety
-        ///
-        /// The caller must ensure that `ptr` points to a valid owned `T`.
-        unsafe fn compute_message_size<T, E: MessageEncode<T, Resource>>(
-            ptr: *mut (),
-            sizer: MessageSizer<'_>,
-        ) {
-            // SAFETY: The value is owned and the vtable type matches.
-            let v = unsafe { &mut *ptr.cast::<T>() };
-            E::compute_message_size(v, sizer);
-        }
-
-        /// # Safety
-        ///
-        /// The caller must ensure that `ptr` points to a valid owned `T`.
-        unsafe fn write_message<T, E: MessageEncode<T, Resource>>(
-            ptr: *mut (),
-            writer: MessageWriter<'_, '_, Resource>,
-        ) {
-            // SAFETY: The value is owned and the vtable type matches.
-            let v = unsafe { ptr.cast::<T>().read() };
-            E::write_message(v, writer);
-        }
-
-        /// # Safety
-        ///
-        /// The caller must ensure that `ptr` points to a valid owned `T`.
-        unsafe fn drop<T>(ptr: *mut ()) {
-            // SAFETY: The value is owned and the vtable type matches.
-            unsafe { ptr.cast::<T>().drop_in_place() };
-        }
-
-        const {
-            &Self {
-                compute_message_size: compute_message_size::<T, E>,
-                write_message: write_message::<T, E>,
-                drop: drop::<T>,
-            }
-        }
+        // SAFETY: The value is owned and the encoder type matches.
+        unsafe { encoder.write_field(ptr.cast(), writer.field(field_number).sequence().field()) }
     }
 }
 

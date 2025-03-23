@@ -28,12 +28,16 @@ use mesh_node::local_node::PortWithHandler;
 use mesh_node::message::MeshField;
 use mesh_node::message::Message;
 use mesh_node::message::OwnedMessage;
+use mesh_node::resource::Resource;
 use mesh_protobuf::DefaultEncoding;
+use mesh_protobuf::FieldEncode;
+use mesh_protobuf::table::encode::ErasedEncoderEntry;
 use parking_lot::Mutex;
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::task::Context;
@@ -126,14 +130,6 @@ impl<T: MeshField> From<Port> for OneshotSender<T> {
     }
 }
 
-/// # Safety
-/// The caller must ensure that `value` is of type `T`.
-unsafe fn send_message<T: MeshField>(port: Port, value: BoxedValue) {
-    // SAFETY: the caller ensures that `value` is of type `T`.
-    let value = unsafe { value.cast::<T>() };
-    port.send_protobuf_and_close((value,));
-}
-
 fn decode_message<T: MeshField>(message: Message<'_>) -> Result<BoxedValue, ChannelError> {
     let (value,) = message.parse_non_static::<(Box<T>,)>()?;
     Ok(BoxedValue::new(value))
@@ -196,15 +192,18 @@ impl OneshotSenderCore {
     /// # Safety
     /// The caller must ensure that the slot is of type `T`.
     unsafe fn send<T>(self, value: T) {
-        fn send(this: OneshotSenderCore, value: BoxedValue) -> Option<BoxedValue> {
+        fn send(this: OneshotSenderCore, value: BoxedValue) -> Option<(BoxedValue, bool)> {
             let slot = this.into_slot();
             let mut state = slot.state.lock();
             match std::mem::replace(&mut *state, SlotState::Done) {
-                SlotState::ReceiverRemote(port, send) => {
-                    // SAFETY: `send` has been set to operate on values of type
+                SlotState::ReceiverRemote(port, encoder) => {
+                    // SAFETY: `encoder` has been set to operate on values of type
                     // `T`, and `value` is of type `T`.
-                    unsafe { send(port, value) };
-                    None
+                    let m = unsafe {
+                        Message::new_erased_oneof_variant_message(1, value.0.as_ptr(), encoder)
+                    };
+                    port.send_and_close(m);
+                    Some((value, false))
                 }
                 SlotState::Waiting(waker) => {
                     *state = SlotState::Sent(value);
@@ -214,13 +213,17 @@ impl OneshotSenderCore {
                     }
                     None
                 }
-                SlotState::Done => Some(value),
+                SlotState::Done => Some((value, true)),
                 SlotState::Sent { .. } | SlotState::SenderRemote { .. } => unreachable!(),
             }
         }
-        if let Some(value) = send(self, BoxedValue::new(Box::new(value))) {
-            // SAFETY: the value is of type `T`, and it has not been dropped.
-            unsafe { value.drop::<T>() };
+        if let Some((value, has_value)) = send(self, BoxedValue::new(Box::new(value))) {
+            // SAFETY: the value is of type `T`.
+            let mut value = unsafe { value.cast::<MaybeUninit<T>>() };
+            if has_value {
+                // SAFETY: the value is initialized.
+                unsafe { value.assume_init_drop() };
+            }
         }
     }
 
@@ -248,15 +251,18 @@ impl OneshotSenderCore {
         into_port(self, decode_message::<T>)
     }
 
-    fn from_port<T: MeshField>(port: Port) -> Self {
-        fn from_port(port: Port, send: SendFn) -> OneshotSenderCore {
+    fn from_port<T: DefaultEncoding>(port: Port) -> Self
+    where
+        T::Encoding: FieldEncode<T, Resource>,
+    {
+        fn from_port(port: Port, encoder: ErasedEncoderEntry) -> OneshotSenderCore {
             let slot = Arc::new(Slot {
-                state: Mutex::new(SlotState::ReceiverRemote(port, send)),
+                state: Mutex::new(SlotState::ReceiverRemote(port, encoder)),
                 receiver: Default::default(),
             });
             OneshotSenderCore(slot)
         }
-        from_port(port, send_message::<T>)
+        from_port(port, T::Encoding::ENTRY.erase())
     }
 }
 
@@ -441,36 +447,57 @@ impl OneshotReceiverCore {
     /// # Safety
     /// The caller must ensure that `encode` is a valid function to encode
     /// values of type `T`, the type of this slot.
-    unsafe fn into_port<T: MeshField>(self) -> Port {
-        fn into_port(this: OneshotReceiverCore, send: SendFn) -> Port {
+    unsafe fn into_port<T: DefaultEncoding>(self) -> Port
+    where
+        T::Encoding: FieldEncode<T, Resource>,
+    {
+        fn into_port(
+            this: OneshotReceiverCore,
+            encoder: ErasedEncoderEntry,
+        ) -> (Port, Option<BoxedValue>) {
             let (slot, ReceiverState { port }) = this.split();
             let existing = port.map(|port| port.remove_handler().0);
             let mut state = slot.state.lock();
             match std::mem::replace(&mut *state, SlotState::Done) {
                 SlotState::SenderRemote(port, _) => {
                     assert!(existing.is_none());
-                    port
+                    (port, None)
                 }
-                SlotState::Waiting(_) => existing.unwrap_or_else(|| {
-                    let (sender, recv) = Port::new_pair();
-                    *state = SlotState::ReceiverRemote(recv, send);
-                    sender
-                }),
+                SlotState::Waiting(_) => (
+                    existing.unwrap_or_else(|| {
+                        let (sender, recv) = Port::new_pair();
+                        *state = SlotState::ReceiverRemote(recv, encoder);
+                        sender
+                    }),
+                    None,
+                ),
                 SlotState::Sent(value) => {
                     let (sender, recv) = Port::new_pair();
-                    // SAFETY: `send` has been set to operate on values of type
-                    // `T`, the type of this slot.
-                    unsafe { send(sender, value) };
-                    // The state of the existing port, if one is present, is
-                    // lost. This should never really matter since the sender
-                    // should already be closed.
-                    recv
+                    // SAFETY: `encoder` has been set to operate on values of type
+                    // `T`, and `value` is of type `T`.
+                    let m = unsafe {
+                        Message::new_erased_oneof_variant_message(1, value.0.as_ptr(), encoder)
+                    };
+                    if let Some(existing) = existing {
+                        sender.send(m);
+                        existing.bridge(sender);
+                    } else {
+                        sender.send_and_close(m);
+                    }
+                    (recv, Some(value))
                 }
-                SlotState::Done => existing.unwrap_or_else(|| Port::new_pair().0),
+                SlotState::Done => (existing.unwrap_or_else(|| Port::new_pair().0), None),
                 SlotState::ReceiverRemote { .. } => unreachable!(),
             }
         }
-        into_port(self, send_message::<T>)
+        let (port, value) = into_port(self, T::Encoding::ENTRY.erase());
+        if let Some(value) = value {
+            // SAFETY: the value is of type `MaybeUninit<T>`. It's no longer
+            // initialized since the inner value was consumed by the `Message`
+            // constructed above.
+            unsafe { value.drop::<MaybeUninit<T>>() };
+        }
+        port
     }
 
     fn from_port<T: MeshField>(port: Port) -> Self {
@@ -491,13 +518,14 @@ enum SlotState {
     Waiting(Option<Waker>),
     Sent(BoxedValue),
     SenderRemote(Port, DecodeFn),
-    ReceiverRemote(Port, SendFn),
+    ReceiverRemote(Port, ErasedEncoderEntry),
 }
 
-type SendFn = unsafe fn(Port, BoxedValue);
 type DecodeFn = unsafe fn(Message<'_>) -> Result<BoxedValue, ChannelError>;
 
+/// Has the same representation as Box<T> for any T.
 #[derive(Debug)]
+#[repr(transparent)]
 struct BoxedValue(NonNull<()>);
 
 // SAFETY: `BoxedValue` is `Send` and `Sync` even though the underlying element

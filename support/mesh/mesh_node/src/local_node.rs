@@ -295,37 +295,6 @@ impl Port {
         self.into_inner().close(Some(message));
     }
 
-    /// Send a protobuf-encodable message to the peer.
-    ///
-    /// Prefer [`Port::send`] if you already have a [`Message`],
-    /// [`OwnedMessage`], or serialized message, or if the recipient is known to
-    /// take advantage of the [`OwnedMessage::try_unwrap`] optimization.
-    ///
-    /// Otherwise, this method is more efficient since it can avoid an extra
-    /// allocation to construct a [`Message`].
-    pub fn send_protobuf<T: DefaultEncoding>(&self, value: T)
-    where
-        T::Encoding: mesh_protobuf::MessageEncode<T, Resource>,
-    {
-        self.send(crate::message::stack_message!(value));
-    }
-
-    /// Send a protobuf-encodable message to the peer and close the port in one
-    /// operation.
-    ///
-    /// Prefer [`Port::send_and_close`] if you already have a [`Message`],
-    /// [`OwnedMessage`], or serialized message, or if the recipient is known to
-    /// take advantage of the [`OwnedMessage::try_unwrap`] optimization.
-    ///
-    /// Otherwise, this method is more efficient since it can avoid an extra
-    /// allocation to construct a [`Message`].
-    pub fn send_protobuf_and_close<T: DefaultEncoding>(self, value: T)
-    where
-        T::Encoding: mesh_protobuf::MessageEncode<T, Resource>,
-    {
-        self.send_and_close(crate::message::stack_message!(value));
-    }
-
     pub fn is_closed(&self) -> Result<bool, NodeError> {
         match &self.inner.state.lock().activity {
             PortActivity::Done => Ok(true),

@@ -430,15 +430,17 @@ impl<'a, T, R> DecoderEntry<'a, T, R> {
     where
         T: StructDecodeMetadata<'a, R>,
     {
+        assert!(T::NUMBERS.len() <= u16::MAX as usize);
         Self(
             ErasedDecoderEntry(
                 core::ptr::from_ref(
                     const {
                         &DecoderTable {
-                            count: T::NUMBERS.len(),
+                            count: T::NUMBERS.len() as u16,
                             numbers: T::NUMBERS.as_ptr(),
                             decoders: T::DECODERS.as_ptr(),
                             offsets: T::OFFSETS.as_ptr(),
+                            needs_drop: core::mem::needs_drop::<T>(),
                         }
                     },
                 )
@@ -510,7 +512,7 @@ impl ErasedDecoderEntry {
             match self.decode::<R>() {
                 Ok(vtable) => (vtable.read_fn)(ptr, init, reader),
                 Err(table) => read_message_by_ptr(
-                    table.count,
+                    table.count.into(),
                     table.numbers,
                     table.decoders,
                     table.offsets,
@@ -532,9 +534,13 @@ impl ErasedDecoderEntry {
         unsafe {
             match self.decode::<()>() {
                 Ok(vtable) => (vtable.default_fn)(ptr, init),
-                Err(table) => {
-                    default_fields_by_ptr(table.count, table.decoders, table.offsets, ptr, init)
-                }
+                Err(table) => default_fields_by_ptr(
+                    table.count.into(),
+                    table.decoders,
+                    table.offsets,
+                    ptr,
+                    init,
+                ),
             }
         }
     }
@@ -554,10 +560,12 @@ impl ErasedDecoderEntry {
                     }
                 }
                 Err(table) => {
-                    for i in 0..table.count {
-                        let offset = *table.offsets.add(i);
-                        let decoder = &*table.decoders.add(i);
-                        decoder.drop_field(ptr.add(offset));
+                    if table.needs_drop {
+                        for i in 0..table.count as usize {
+                            let offset = *table.offsets.add(i);
+                            let decoder = &*table.decoders.add(i);
+                            decoder.drop_field(ptr.add(offset));
+                        }
                     }
                 }
             }
@@ -566,7 +574,8 @@ impl ErasedDecoderEntry {
 }
 
 struct DecoderTable {
-    count: usize,
+    count: u16,
+    needs_drop: bool,
     numbers: *const u32,
     decoders: *const ErasedDecoderEntry,
     offsets: *const usize,

@@ -43,6 +43,7 @@ mod entry {
         "isr_common:",
         "push rbp",
         "mov rbp, rsp",
+        "and rsp, 0xfffffffffffffff0", // align to 16 bytes
         "push rax",
         "push rcx",
         "push rdx",
@@ -52,20 +53,23 @@ mod entry {
         "push r9",
         "push r10",
         "push r11",
+        "push 0", // stay aligned
         "mov rdi, rbp",
-        "and rsp, 0xfffffffffffffff0", // align to 16 bytes
         "call {isr_handler}",
         "test al, al", // check if there's an error code on the stack
-        "mov rax, [rbp - 8]",
-        "mov rcx, [rbp - 16]",
-        "mov rdx, [rbp - 24]",
-        "mov rsi, [rbp - 32]",
-        "mov rdi, [rbp - 40]",
-        "mov r8, [rbp - 48]",
-        "mov r9, [rbp - 56]",
-        "mov r10, [rbp - 64]",
-        "mov r11, [rbp - 72]",
-        "lea rsp, [rbp + 16]", // pop the stack frame (including rbp and vector)
+        "pop r11",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rsp, rbp",
+        "pop rbp",
+        "lea rsp, [rsp + 8]", // pop the vector
         "jz 2f",
         "add rsp, 8", // pop the error code
         "2:",

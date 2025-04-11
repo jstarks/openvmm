@@ -66,6 +66,18 @@ impl ApicMode {
                 .unwrap();
             }
         }
+
+        // Enable software APIC.
+        self.write(
+            s,
+            x86defs::apic::ApicRegister::SVR,
+            u32::from(
+                x86defs::apic::Svr::new()
+                    .with_enable(true)
+                    .with_vector(0xff),
+            )
+            .into(),
+        );
     }
 
     fn read(&self, s: &mut Scope<'_, '_>, reg: x86defs::apic::ApicRegister) -> u32 {
@@ -106,18 +118,6 @@ fn self_ipi_xapic_moved(t: TestContext<'_>) {
 
 fn self_ipi(t: TestContext<'_>, apic: ApicMode) {
     apic.init(t.scope);
-
-    // Enable software APIC.
-    apic.write(
-        t.scope,
-        x86defs::apic::ApicRegister::SVR,
-        u32::from(
-            x86defs::apic::Svr::new()
-                .with_enable(true)
-                .with_vector(0xff),
-        )
-        .into(),
-    );
 
     let got_interrupt = AtomicBool::new(false);
     let isr = |_: &mut IsrContext<'_>| {
@@ -163,5 +163,72 @@ fn self_ipi(t: TestContext<'_>, apic: ApicMode) {
         // Verify ISR.
         let isr = apic.read(s, x86defs::apic::ApicRegister::ISR4);
         assert_eq!(isr, 0);
+    });
+}
+
+#[tmk_test]
+fn apic_timer(t: TestContext<'_>) {
+    let apic = ApicMode::X2Apic;
+    apic.init(t.scope);
+
+    // Set up the APIC timer using definitions from x86defs::apic.
+    apic.write(
+        t.scope,
+        x86defs::apic::ApicRegister::TIMER_DCR,
+        x86defs::apic::Dcr::new().with_value_low(0b11).into(), // Divide by 1
+    );
+    apic.write(
+        t.scope,
+        x86defs::apic::ApicRegister::TIMER_ICR,
+        100_000, // Initial count value
+    );
+
+    // Enable the timer interrupt.
+    let timer_vector = 0x40;
+    apic.write(
+        t.scope,
+        x86defs::apic::ApicRegister::LVT_TIMER,
+        x86defs::apic::Lvt::new()
+            .with_vector(timer_vector)
+            .with_timer_mode(x86defs::apic::TimerMode::PERIODIC.0)
+            .into(),
+    );
+
+    let timer_fired = AtomicBool::new(false);
+    let timer_isr = |_: &mut IsrContext<'_>| {
+        log!("fired");
+        timer_fired.store(true, Relaxed);
+    };
+
+    t.scope.subscope(|s| {
+        s.set_isr(timer_vector, &timer_isr);
+        s.enable_interrupts();
+
+        // Wait for the timer interrupt to fire.
+        for _ in 0..1_000_000 {
+            if timer_fired.load(Relaxed) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        assert!(
+            timer_fired.load(Relaxed),
+            "APIC timer interrupt did not fire"
+        );
+
+        // Verify the current count is decreasing.
+        let current_count = apic.read(s, x86defs::apic::ApicRegister::TIMER_CCR);
+        assert!(current_count < 100_000, "APIC timer count did not decrease");
+
+        // Disable the timer.
+        apic.write(
+            s,
+            x86defs::apic::ApicRegister::LVT_TIMER,
+            x86defs::apic::Lvt::new()
+                .with_vector(timer_vector)
+                .with_masked(true)
+                .into(),
+        );
     });
 }

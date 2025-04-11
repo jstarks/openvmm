@@ -794,13 +794,14 @@ impl<T: ApicClient> LocalApicAccess<'_, T> {
                 // The APIC may be disabled by this, so we need IRR/ISR local to
                 // be reset.
                 self.ensure_state_local();
-                match self.apic.set_apic_base_inner(value) {
-                    Ok(()) => self.client.set_apic_base(self.apic.apic_base),
-                    Err(err) => tracelimit::warn_ratelimited!(
+                self.apic.set_apic_base_inner(value).map_err(|err| {
+                    tracelimit::warn_ratelimited!(
                         error = &err as &dyn std::error::Error,
                         "invalid apic base write"
-                    ),
-                }
+                    );
+                    MsrError::InvalidAccess
+                })?;
+                self.client.set_apic_base(self.apic.apic_base);
             }
             X2APIC_MSR_BASE..=X2APIC_MSR_END if self.apic.x2apic_enabled() => {
                 let register = ApicRegister((msr - X2APIC_MSR_BASE) as u8);
@@ -1386,9 +1387,21 @@ impl LocalApic {
     fn set_apic_base_inner(&mut self, apic_base: u64) -> Result<(), InvalidApicBase> {
         let current = ApicBase::from(self.apic_base);
 
-        // Only allow changing the enable and x2apic enable bits.
-        let new = ApicBase::from(apic_base);
-        let new = current.with_enable(new.enable()).with_x2apic(new.x2apic());
+        let requested = ApicBase::from(apic_base);
+        let allowed = ApicBase::new()
+            .with_enable(true)
+            .with_x2apic(true)
+            .with_base_page(0xffffff)
+            .with_bsp(true);
+        if u64::from(requested) & !u64::from(allowed) != 0 {
+            // Invalid bits set.
+            return Err(InvalidApicBase::InvalidX2Apic);
+        }
+
+        // Only propagate changes to the enable and x2apic enable bits.
+        let new = current
+            .with_enable(requested.enable())
+            .with_x2apic(requested.x2apic());
 
         tracing::debug!(
             ?current,

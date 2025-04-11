@@ -219,6 +219,7 @@ fn apic_timer(t: TestContext<'_>) {
 
         // Verify the current count is decreasing.
         let current_count = apic.read(s, x86defs::apic::ApicRegister::TIMER_CCR);
+        log!("current count: {}", current_count);
         assert!(current_count < 100_000, "APIC timer count did not decrease");
 
         // Disable the timer.

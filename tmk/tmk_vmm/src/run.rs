@@ -127,7 +127,7 @@ impl CommonState {
                     tracing::info!(target: "test", name = test.name, "test passed");
                 }
                 TestResult::Failed => {
-                    tracing::info!(target: "test", name = test.name, reason = "explicit failure", "test failed");
+                    tracing::error!(target: "test", name = test.name, reason = "explicit failure", "test failed");
                     success = false;
                 }
                 TestResult::Faulted {
@@ -135,7 +135,7 @@ impl CommonState {
                     reason,
                     regs,
                 } => {
-                    tracing::info!(
+                    tracing::error!(
                         target: "test",
                         name = test.name,
                         vp_index = vp_index.index(),

@@ -62,7 +62,7 @@ async fn boot_with_tpm(config: PetriVmConfigOpenVmm) -> anyhow::Result<()> {
             // and verify that the AK cert preserves across boot.
             // TODO: Replace the script with tpm2-tools
             const TEST_FILE: &str = "tpm.py";
-            const TEST_CONTENT: &str = include_str!("../../test_data/tpm.py");
+            const TEST_CONTENT: &str = include_str!("../test_data/tpm.py");
 
             agent.write_file(TEST_FILE, TEST_CONTENT.as_bytes()).await?;
             assert_eq!(agent.read_file(TEST_FILE).await?, TEST_CONTENT.as_bytes());

@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![expect(missing_docs)]
-
 //! A collection of end-to-end VMM tests.
 //!
 //! Tests should contain both the name of the firmware and the guest they are
@@ -28,13 +26,3 @@ mod x86_64;
 // Tests that will only ever compile and run when targeting x86-64.
 #[cfg(guest_arch = "x86_64")]
 mod x86_64_exclusive;
-
-pub fn main() {
-    petri::test_main(|name, requirements| {
-        requirements.resolve(
-            petri_artifact_resolver_openvmm_known_paths::OpenvmmKnownPathsTestArtifactResolver::new(
-                name,
-            ),
-        )
-    })
-}

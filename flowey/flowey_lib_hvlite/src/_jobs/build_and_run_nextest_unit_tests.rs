@@ -63,8 +63,6 @@ impl SimpleFlowNode for Node {
             },
         });
 
-        let mut side_effects = Vec::new();
-
         let junit_xml = results.map(ctx, |r| r.junit_xml);
         let reported_results = ctx.reqv(|v| flowey_lib_common::publish_test_results::Request {
             junit_xml,
@@ -74,15 +72,11 @@ impl SimpleFlowNode for Node {
             done: v,
         });
 
-        side_effects.push(reported_results);
-
-        ctx.emit_rust_step("report test results to overall pipeline status", |ctx| {
-            side_effects.claim(ctx);
-            done.claim(ctx);
-
-            let results = results.clone().claim(ctx);
-            move |rt| {
-                let results = rt.read(results);
+        ctx.run_into(
+            [done.discard_result()],
+            "report test results to overall pipeline status",
+            (results, reported_results),
+            move |_rt, (results, _reported_results)| {
                 if results.all_tests_passed {
                     log::info!("all tests passed!");
                 } else {
@@ -94,8 +88,8 @@ impl SimpleFlowNode for Node {
                 }
 
                 Ok(())
-            }
-        });
+            },
+        );
 
         Ok(())
     }

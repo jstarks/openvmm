@@ -41,7 +41,7 @@ impl SimpleFlowNode for Node {
             profile,
             hypestv,
         } = request;
-        let output = ctx.reqv(|v| crate::run_cargo_build::Request {
+        ctx.reqv(|v| crate::run_cargo_build::Request {
             crate_name: "hypestv".into(),
             out_name: "hypestv".into(),
             crate_type: flowey_lib_common::run_cargo_build::CargoCrateType::Bin,
@@ -52,21 +52,12 @@ impl SimpleFlowNode for Node {
             extra_env: None,
             pre_build_deps: Vec::new(),
             output: v,
-        });
-
-        ctx.emit_minor_rust_step("report built hypestv", |ctx| {
-            let hypestv = hypestv.claim(ctx);
-            let output = output.claim(ctx);
-            move |rt| {
-                let output = match rt.read(output) {
-                    crate::run_cargo_build::CargoBuildOutput::WindowsBin { exe, pdb } => {
-                        HypestvOutput { exe, pdb }
-                    }
-                    _ => unreachable!(),
-                };
-
-                rt.write(hypestv, &output);
+        })
+        .write_into(ctx, hypestv, |output| match output {
+            crate::run_cargo_build::CargoBuildOutput::WindowsBin { exe, pdb } => {
+                HypestvOutput { exe, pdb }
             }
+            _ => unreachable!(),
         });
 
         Ok(())

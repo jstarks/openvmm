@@ -79,12 +79,12 @@ impl FlowNode for Node {
 
             let openvmm_repo_path = ctx.reqv(crate::git_checkout_openvmm_repo::req::GetRepoDir);
 
-            ctx.emit_rust_step("build guest_test_uefi.img", |ctx| {
-                let openvmm_repo_path = openvmm_repo_path.claim(ctx);
-                let output = output.claim(ctx);
-                let outvars = outvars.claim(ctx);
-                move |rt| {
-                    let (efi, pdb) = match rt.read(output) {
+            ctx.run_into(
+                outvars,
+                "build guest_test_uefi.img",
+                (openvmm_repo_path, output),
+                move |_rt, (openvmm_repo_path, output)| {
+                    let (efi, pdb) = match output {
                         crate::run_cargo_build::CargoBuildOutput::UefiBin { efi, pdb } => {
                             (efi, pdb)
                         }
@@ -98,26 +98,20 @@ impl FlowNode for Node {
                         CommonArch::X86_64 => "bootx64",
                         CommonArch::Aarch64 => "bootaa64",
                     };
-                    sh.change_dir(rt.read(openvmm_repo_path));
+                    sh.change_dir(openvmm_repo_path);
                     xshell::cmd!(
                         sh,
                         "cargo xtask guest-test uefi --output {img_path} --{arch_arg} {efi}"
                     )
                     .run()?;
 
-                    let output = GuestTestUefiOutput {
+                    Ok(GuestTestUefiOutput {
                         efi,
                         pdb,
                         img: img_path.absolute()?,
-                    };
-
-                    for var in outvars {
-                        rt.write(var, &output);
-                    }
-
-                    Ok(())
-                }
-            });
+                    })
+                },
+            );
         }
 
         Ok(())

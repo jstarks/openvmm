@@ -30,18 +30,18 @@ impl SimpleFlowNode for Node {
 
         let xtask = ctx.reqv(|v| crate::build_xtask::Request { target, xtask: v });
 
-        ctx.emit_rust_step("run xtask fmt", |ctx| {
-            done.claim(ctx);
-            let xtask = xtask.claim(ctx);
-            let openvmm_repo_path = openvmm_repo_path.claim(ctx);
-            |rt| {
-                let xtask = match rt.read(xtask) {
+        ctx.run_into(
+            [done.discard_result()],
+            "run xtask fmt",
+            (xtask, openvmm_repo_path),
+            move |_rt, (xtask, openvmm_repo_path)| {
+                let xtask: PathBuf = match xtask {
                     crate::build_xtask::XtaskOutput::LinuxBin { bin, .. } => bin,
                     crate::build_xtask::XtaskOutput::WindowsBin { exe, .. } => exe,
                 };
 
                 let sh = xshell::Shell::new()?;
-                sh.change_dir(rt.read(openvmm_repo_path));
+                sh.change_dir(openvmm_repo_path);
                 xshell::cmd!(sh, "{xtask} fmt --no-parallel")
                     // CI runs with trace logging, but that results in a lot of
                     // spam when running the xtask flowey check
@@ -49,8 +49,8 @@ impl SimpleFlowNode for Node {
                     .run()?;
 
                 Ok(())
-            }
-        });
+            },
+        );
 
         Ok(())
     }

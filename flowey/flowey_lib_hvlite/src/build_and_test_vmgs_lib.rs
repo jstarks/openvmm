@@ -78,15 +78,12 @@ impl SimpleFlowNode for Node {
             output: v,
         });
 
-        let built_vmgs_lib = ctx.emit_minor_rust_stepv("check built vmgs_lib", |ctx| {
-            let output = output.claim(ctx);
-            move |rt| match rt.read(output) {
-                CargoBuildOutput::LinuxDynamicLib { so } => VmgsLibOutput::LinuxDynamicLib { so },
-                CargoBuildOutput::WindowsDynamicLib { dll, dll_lib, pdb } => {
-                    VmgsLibOutput::WindowsDynamicLib { dll, dll_lib, pdb }
-                }
-                _ => unreachable!(),
+        let built_vmgs_lib = output.map(ctx, |output| match output {
+            CargoBuildOutput::LinuxDynamicLib { so } => VmgsLibOutput::LinuxDynamicLib { so },
+            CargoBuildOutput::WindowsDynamicLib { dll, dll_lib, pdb } => {
+                VmgsLibOutput::WindowsDynamicLib { dll, dll_lib, pdb }
             }
+            _ => unreachable!(),
         });
 
         // given how simple the test is for vmgs_lib, it's fine to just
@@ -111,7 +108,7 @@ impl SimpleFlowNode for Node {
             let openvmm_repo_path = ctx.reqv(crate::git_checkout_openvmm_repo::req::GetRepoDir);
 
             if matches!(ctx.platform(), FlowPlatform::Linux(_)) {
-                ctx.emit_rust_step("test vmgs_lib", |ctx| {
+                ctx.emit_rust_stepv("test vmgs_lib", |ctx| {
                     clang_installed.claim(ctx);
 
                     let built_vmgs_lib = built_vmgs_lib.clone().claim(ctx);
@@ -149,7 +146,7 @@ impl SimpleFlowNode for Node {
                 // works, but it's undoubtedly suboptimal, and someone who
                 // actually _understands_ how clang is set up in this
                 // context could do a wildly better job here.
-                ctx.emit_rust_step("test vmgs_lib", |ctx| {
+                ctx.emit_rust_stepv("test vmgs_lib", |ctx| {
                     clang_installed.claim(ctx);
 
                     let built_vmgs_lib = built_vmgs_lib.clone().claim(ctx);
@@ -205,18 +202,12 @@ impl SimpleFlowNode for Node {
                 anyhow::bail!("unsupported platform")
             }
         } else {
-            ReadVar::from_static(()).into_side_effect()
+            ReadVar::from_static(())
         };
 
-        ctx.emit_minor_rust_step("report built vmgs_lib", |ctx| {
-            did_test.claim(ctx);
-            let built_vmgs_lib = built_vmgs_lib.claim(ctx);
-            let vmgs_lib = vmgs_lib.claim(ctx);
-            move |rt| {
-                let built_vmgs_lib = rt.read(built_vmgs_lib);
-                rt.write(vmgs_lib, &built_vmgs_lib);
-            }
-        });
+        built_vmgs_lib
+            .depending_on(ctx, &did_test)
+            .write_into(ctx, vmgs_lib, |v| v);
 
         Ok(())
     }

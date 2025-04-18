@@ -405,18 +405,16 @@ impl SimpleFlowNode for Node {
         // build sidecar
         let sidecar_bin = if with_sidecar {
             let sidecar_bin = if let Some(path) = custom_sidecar {
-                ctx.emit_rust_stepv("set custom_sidecar", |_ctx| {
-                    |_rt| {
-                        let fake_dbg_path = std::env::current_dir()?
-                            .join("fake_sidecar.dbg")
-                            .absolute()?;
-                        fs_err::write(&fake_dbg_path, "")?;
+                ctx.run("set custom_sidecar", (), |_rt, ()| {
+                    let fake_dbg_path = std::env::current_dir()?
+                        .join("fake_sidecar.dbg")
+                        .absolute()?;
+                    fs_err::write(&fake_dbg_path, "")?;
 
-                        Ok(crate::build_sidecar::SidecarOutput {
-                            bin: path,
-                            dbg: fake_dbg_path,
-                        })
-                    }
+                    Ok(crate::build_sidecar::SidecarOutput {
+                        bin: path,
+                        dbg: fake_dbg_path,
+                    })
                 })
             } else {
                 ctx.reqv(|v| crate::build_sidecar::Request {

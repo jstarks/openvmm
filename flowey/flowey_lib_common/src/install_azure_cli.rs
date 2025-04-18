@@ -69,9 +69,8 @@ impl FlowNode for Node {
                     .ok_or(anyhow::anyhow!("Missing essential request: AutoInstall"))?;
 
                 if auto_install {
-                    ctx.emit_rust_step("installing azure-cli", |ctx| {
-                        let get_az_cli = get_az_cli.claim(ctx);
-                        move |rt| {
+                    ctx.run_into(get_az_cli, "installing azure-cli", (), {
+                        move |rt, ()| {
                             log::warn!("automatic azure-cli installation is not supported yet!");
                             log::warn!(
                                 "follow the guide, and manually ensure you have azure-cli installed"
@@ -80,19 +79,12 @@ impl FlowNode for Node {
                             log::warn!("press <enter> to continue");
                             let _ = std::io::stdin().read_line(&mut String::new());
 
-                            let path = check_az_install(rt)?;
-                            rt.write_all(get_az_cli, &path);
-                            Ok(())
+                            check_az_install(rt)
                         }
                     })
                 } else {
-                    ctx.emit_rust_step("detecting azure-cli install", |ctx| {
-                        let get_az_cli = get_az_cli.claim(ctx);
-                        move |rt| {
-                            let path = check_az_install(rt)?;
-                            rt.write_all(get_az_cli, &path);
-                            Ok(())
-                        }
+                    ctx.run_into(get_az_cli, "detecting azure-cli install", (), {
+                        move |rt, ()| check_az_install(rt)
                     })
                 }
             }
@@ -103,13 +95,8 @@ impl FlowNode for Node {
 
                 // FUTURE: don't assume that all ADO workers come with azure-cli
                 // pre-installed.
-                ctx.emit_rust_step("detecting azure-cli install", |ctx| {
-                    let get_az_cli = get_az_cli.claim(ctx);
-                    move |rt| {
-                        let path = check_az_install(rt)?;
-                        rt.write_all(get_az_cli, &path);
-                        Ok(())
-                    }
+                ctx.run_into(get_az_cli, "detecting azure-cli install", (), {
+                    move |rt, ()| check_az_install(rt)
                 })
             }
             FlowBackend::Github => {
@@ -117,13 +104,11 @@ impl FlowNode for Node {
                     anyhow::bail!("AutoInstall must be `true` when running on Github Actions")
                 }
 
-                ctx.emit_rust_step("installing azure-cli", |ctx| {
-                    let get_az_cli = get_az_cli.claim(ctx);
-                    move |rt| {
+                ctx.run_into(get_az_cli, "installing azure-cli", (), {
+                    move |rt, ()| {
                         let sh = xshell::Shell::new()?;
                         if let Ok(path) = check_az_install(rt) {
-                            rt.write_all(get_az_cli, &path);
-                            return Ok(());
+                            return Ok(path);
                         }
                         match rt.platform() {
                             FlowPlatform::Windows => {
@@ -136,7 +121,7 @@ impl FlowNode for Node {
                                 )
                                 .run()?;
                                 xshell::cmd!(sh, "tar -xf az.zip").run()?;
-                                rt.write_all(get_az_cli, &az_dir.join("bin\\az.cmd"));
+                                Ok(az_dir.join("bin\\az.cmd"))
                             }
                             FlowPlatform::Linux(_) => {
                                 xshell::cmd!(
@@ -146,13 +131,10 @@ impl FlowNode for Node {
                                 .run()?;
                                 xshell::cmd!(sh, "chmod +x ./InstallAzureCLIDeb.sh").run()?;
                                 xshell::cmd!(sh, "sudo ./InstallAzureCLIDeb.sh").run()?;
-                                let path = check_az_install(rt)?;
-                                rt.write_all(get_az_cli, &path);
+                                check_az_install(rt)
                             }
                             platform => anyhow::bail!("unsupported platform {platform}"),
-                        };
-
-                        Ok(())
+                        }
                     }
                 })
             }

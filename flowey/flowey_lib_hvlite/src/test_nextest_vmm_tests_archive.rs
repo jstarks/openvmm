@@ -54,15 +54,14 @@ impl SimpleFlowNode for Node {
         if !matches!(ctx.backend(), FlowBackend::Local)
             && matches!(ctx.platform(), FlowPlatform::Linux(_))
         {
-            pre_run_deps.push({
-                ctx.emit_rust_step("ensure /dev/kvm is accessible", |_| {
-                    |_| {
-                        let sh = xshell::Shell::new()?;
-                        xshell::cmd!(sh, "sudo chmod a+rw /dev/kvm").run()?;
-                        Ok(())
-                    }
+            pre_run_deps.push(
+                ctx.run("ensure /dev/kvm is accessible", (), |_, ()| {
+                    let sh = xshell::Shell::new()?;
+                    xshell::cmd!(sh, "sudo chmod a+rw /dev/kvm").run()?;
+                    Ok(())
                 })
-            });
+                .into_side_effect(),
+            );
         }
 
         let nextest_archive = nextest_archive_file.map(ctx, |x| x.archive_file);

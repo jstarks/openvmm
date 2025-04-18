@@ -256,6 +256,16 @@ impl<T: Serialize + DeserializeOwned> WriteVar<T, VarNotClaimed> {
     }
 }
 
+impl WriteVar<SideEffect> {
+    pub fn discard_result<T: Serialize + DeserializeOwned>(self) -> WriteVar<T> {
+        WriteVar {
+            backing_var: self.backing_var,
+            is_secret: self.is_secret,
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<T: Serialize + DeserializeOwned, C> WriteVar<T, C> {
     /// Return whether the WriteVar is a secret.
     pub fn is_secret(&self) -> bool {
@@ -277,6 +287,13 @@ pub trait ClaimVar {
     fn claim(self, ctx: &mut StepCtx<'_>) -> Self::Claimed;
 }
 
+pub trait ReadVarValue {
+    /// The read value of Self.
+    type Read;
+    /// Read the variable's value.
+    fn read(self, rt: &mut RustRuntimeServices<'_>) -> Self::Read;
+}
+
 impl<T: Serialize + DeserializeOwned> ClaimVar for ReadVar<T> {
     type Claimed = ClaimedReadVar<T>;
 
@@ -285,6 +302,28 @@ impl<T: Serialize + DeserializeOwned> ClaimVar for ReadVar<T> {
             ctx.backend.borrow_mut().on_claimed_runtime_var(var, true);
         }
         self.into_claimed()
+    }
+}
+
+impl<T: Serialize + DeserializeOwned> ReadVarValue for ClaimedReadVar<T> {
+    type Read = T;
+    fn read(self, rt: &mut RustRuntimeServices<'_>) -> Self::Read {
+        rt.read(self)
+    }
+}
+
+impl<T: ClaimVar + Clone> ClaimVar for &T {
+    type Claimed = T::Claimed;
+
+    fn claim(self, ctx: &mut StepCtx<'_>) -> T::Claimed {
+        self.clone().claim(ctx)
+    }
+}
+
+impl<T: ReadVarValue + Clone> ReadVarValue for &T {
+    type Read = T::Read;
+    fn read(self, rt: &mut RustRuntimeServices<'_>) -> Self::Read {
+        self.clone().read(rt)
     }
 }
 
@@ -307,6 +346,13 @@ impl<T: ClaimVar> ClaimVar for Vec<T> {
     }
 }
 
+impl<T: ReadVarValue> ReadVarValue for Vec<T> {
+    type Read = Vec<T::Read>;
+    fn read(self, rt: &mut RustRuntimeServices<'_>) -> Self::Read {
+        self.into_iter().map(|v| v.read(rt)).collect()
+    }
+}
+
 impl<T: ClaimVar> ClaimVar for Option<T> {
     type Claimed = Option<T::Claimed>;
 
@@ -315,11 +361,41 @@ impl<T: ClaimVar> ClaimVar for Option<T> {
     }
 }
 
+impl<T: ReadVarValue> ReadVarValue for Option<T> {
+    type Read = Option<T::Read>;
+    fn read(self, rt: &mut RustRuntimeServices<'_>) -> Self::Read {
+        self.map(|x| x.read(rt))
+    }
+}
+
 impl<U: Ord, T: ClaimVar> ClaimVar for BTreeMap<U, T> {
     type Claimed = BTreeMap<U, T::Claimed>;
 
     fn claim(self, ctx: &mut StepCtx<'_>) -> BTreeMap<U, T::Claimed> {
         self.into_iter().map(|(k, v)| (k, v.claim(ctx))).collect()
+    }
+}
+
+impl<U: Ord, T: ReadVarValue> ReadVarValue for BTreeMap<U, T> {
+    type Read = BTreeMap<U, T::Read>;
+    fn read(self, rt: &mut RustRuntimeServices<'_>) -> Self::Read {
+        self.into_iter().map(|(k, v)| (k, v.read(rt))).collect()
+    }
+}
+
+impl ClaimVar for () {
+    type Claimed = ();
+
+    fn claim(self, _ctx: &mut StepCtx<'_>) -> Self::Claimed {
+        ()
+    }
+}
+
+impl ReadVarValue for () {
+    type Read = ();
+
+    fn read(self, _rt: &mut RustRuntimeServices<'_>) -> Self::Read {
+        ()
     }
 }
 
@@ -335,6 +411,19 @@ macro_rules! impl_tuple_claim {
             fn claim(self, ctx: &mut $crate::node::StepCtx<'_>) -> Self::Claimed {
                 let ($($T,)*) = self;
                 ($($T.claim(ctx),)*)
+            }
+        }
+
+        impl<$($T,)*> $crate::node::ReadVarValue for ($($T,)*)
+        where
+            $($T: $crate::node::ReadVarValue,)*
+        {
+            type Read = ($($T::Read,)*);
+
+            #[expect(non_snake_case)]
+            fn read(self, rt: &mut $crate::node::RustRuntimeServices<'_>) -> Self::Read {
+                let ($($T,)*) = self;
+                ($($T.read(rt),)*)
             }
         }
     };
@@ -586,16 +675,16 @@ impl<T: Serialize + DeserializeOwned> ReadVar<T> {
     /// not naturally the case, e.g., when you are providing a path as part of a
     /// request, as opposed to the path being returned to you.
     #[must_use]
-    pub fn depending_on<U>(&self, ctx: &mut NodeCtx<'_>, other: &ReadVar<U>) -> Self
+    pub fn depending_on<U>(&self, ctx: &mut NodeCtx<'_>, other: U) -> Self
     where
         T: 'static,
-        U: Serialize + DeserializeOwned + 'static,
+        U: ClaimVar,
     {
         // This could probably be handled without an additional Rust step with some
         // additional work in the backend, but this is simple enough for now.
         ctx.emit_minor_rust_stepv("🌼 Add dependency", |ctx| {
             let this = self.clone().claim(ctx);
-            other.clone().claim(ctx);
+            other.claim(ctx);
             move |rt| rt.read(this)
         })
     }
@@ -891,6 +980,23 @@ impl StepCtx<'_> {
     pub fn platform(&self) -> FlowPlatform {
         self.backend.borrow_mut().platform()
     }
+
+    pub fn run_with<T, R, V, F>(
+        &mut self,
+        input: T,
+        code: F,
+    ) -> impl FnOnce(&mut RustRuntimeServices<'_>) -> R + use<T, R, V, F>
+    where
+        T: ClaimVar,
+        T::Claimed: ReadVarValue<Read = V>,
+        F: FnOnce(&mut RustRuntimeServices<'_>, V) -> R,
+    {
+        let input = input.claim(self);
+        move |rt| {
+            let input = input.read(rt);
+            code(rt, input)
+        }
+    }
 }
 
 const NO_ADO_INLINE_SCRIPT: Option<
@@ -913,7 +1019,29 @@ impl<'ctx> NodeCtx<'ctx> {
         F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
         G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<()> + 'static,
     {
-        self.emit_rust_step_inner(label.as_ref(), false, code)
+        self.emit_rust_stepv_inner("auto_se", label.as_ref(), false, code)
+            .into_side_effect()
+    }
+
+    pub fn emit_rust_step_into<F, G, R>(
+        &mut self,
+        v: impl IntoIterator<Item = WriteVar<R>>,
+        label: impl AsRef<str>,
+        code: F,
+    ) where
+        F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
+        G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<R> + 'static,
+        R: Serialize + DeserializeOwned + 'static,
+    {
+        self.emit_rust_step(label.as_ref(), |ctx| {
+            let v = v.into_iter().map(|v| v.claim(ctx)).collect::<Vec<_>>();
+            let f = code(ctx);
+            move |rt| {
+                let r = f(rt)?;
+                rt.write_all(v, &r);
+                Ok(())
+            }
+        });
     }
 
     /// Emit a Rust-based step that cannot fail.
@@ -973,7 +1101,56 @@ impl<'ctx> NodeCtx<'ctx> {
         F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
         G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<T> + 'static,
     {
-        self.emit_rust_stepv_inner(label.as_ref(), false, code)
+        self.emit_rust_stepv_inner("", label.as_ref(), false, code)
+    }
+
+    pub fn run<V, C, F, O>(&mut self, label: impl AsRef<str>, input: V, code: F) -> ReadVar<O>
+    where
+        O: Serialize + DeserializeOwned + 'static,
+        V: ClaimVar + 'static,
+        V::Claimed: ReadVarValue<Read = C>,
+        F: FnOnce(&mut RustRuntimeServices<'_>, C) -> anyhow::Result<O> + 'static,
+    {
+        let (read, write) = self.new_var();
+        self.run_into([write], label, input, code);
+        read
+    }
+
+    pub fn run_into<V, C, F, O>(
+        &mut self,
+        output: impl IntoIterator<Item = WriteVar<O>>,
+        label: impl AsRef<str>,
+        input: V,
+        code: F,
+    ) where
+        O: Serialize + DeserializeOwned + 'static,
+        V: ClaimVar,
+        V::Claimed: ReadVarValue<Read = C> + 'static,
+        F: FnOnce(&mut RustRuntimeServices<'_>, C) -> anyhow::Result<O> + 'static,
+    {
+        self.emit_rust_step_into(output, label, |ctx| {
+            let input = input.claim(ctx);
+            move |rt| {
+                let input = input.read(rt);
+                code(rt, input)
+            }
+        });
+    }
+
+    pub fn run_minor<V, C, F, O>(&mut self, label: impl AsRef<str>, input: V, code: F) -> ReadVar<O>
+    where
+        O: Serialize + DeserializeOwned + 'static,
+        V: ClaimVar<Claimed = ClaimedReadVar<C>>,
+        C: Serialize + DeserializeOwned + 'static,
+        F: FnOnce(C) -> O + 'static,
+    {
+        self.emit_minor_rust_stepv(label, |ctx| {
+            let input = input.claim(ctx);
+            move |rt| {
+                let input = rt.read(input);
+                code(input)
+            }
+        })
     }
 
     /// Emit a Rust-based step, creating a new `ReadVar<T>` from the step's
@@ -1009,7 +1186,7 @@ impl<'ctx> NodeCtx<'ctx> {
         F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
         G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> T + 'static,
     {
-        self.emit_rust_stepv_inner(label.as_ref(), true, |ctx| {
+        self.emit_rust_stepv_inner("", label.as_ref(), true, |ctx| {
             let f = code(ctx);
             |rt| Ok(f(rt))
         })
@@ -1039,9 +1216,9 @@ impl<'ctx> NodeCtx<'ctx> {
         read
     }
 
-    #[must_use]
     fn emit_rust_stepv_inner<T, F, G>(
         &mut self,
+        var_prefix: &'static str,
         label: impl AsRef<str>,
         can_merge: bool,
         code: F,
@@ -1051,7 +1228,7 @@ impl<'ctx> NodeCtx<'ctx> {
         F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
         G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<T> + 'static,
     {
-        let (read, write) = self.new_var();
+        let (read, write) = self.new_maybe_secret_var(false, var_prefix);
 
         let ctx = &mut StepCtx {
             backend: self.backend.clone(),

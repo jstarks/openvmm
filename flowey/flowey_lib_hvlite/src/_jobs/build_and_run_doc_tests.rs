@@ -39,25 +39,39 @@ impl SimpleFlowNode for Node {
         let rust_installed = ctx.reqv(crate::install_openvmm_rust_build_essential::Request);
         let openvmm_repo_path = ctx.reqv(crate::git_checkout_openvmm_repo::req::GetRepoDir);
 
-        ctx.emit_rust_step(format!("run doctests for {target}"), |ctx| {
-            done.claim(ctx);
-            rust_installed.claim(ctx);
-            let openvmm_repo_path = openvmm_repo_path.claim(ctx);
-            move |rt| {
-                let sh = xshell::Shell::new()?;
+        ctx.emit_rust_step_into(
+            [done.discard_result()],
+            format!("run doctests for {target}"),
+            |ctx| {
+                ctx.run_with(
+                    (rust_installed, openvmm_repo_path),
+                    move |_rt, (_rust_installed, openvmm_repo_path)| {
+                        let sh = xshell::Shell::new()?;
 
-                let target = target.to_string();
-                let profile = match profile {
-                    CommonProfile::Release => "release",
-                    CommonProfile::Debug => "dev",
-                };
+                        let target = target.to_string();
+                        let profile = match profile {
+                            CommonProfile::Release => "release",
+                            CommonProfile::Debug => "dev",
+                        };
 
-                sh.change_dir(rt.read(openvmm_repo_path));
-                xshell::cmd!(sh, "cargo test --locked --doc --workspace --no-fail-fast --target {target} --profile {profile}").run()?;
+                        sh.change_dir(openvmm_repo_path);
+                        xshell::cmd!(
+                            sh,
+                            "cargo test
+                            --locked
+                            --doc
+                            --workspace
+                            --no-fail-fast
+                            --target {target}
+                            --profile {profile}"
+                        )
+                        .run()?;
 
-                Ok(())
-            }
-        });
+                        Ok(())
+                    },
+                )
+            },
+        );
 
         Ok(())
     }

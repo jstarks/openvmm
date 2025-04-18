@@ -34,9 +34,11 @@ impl SimpleFlowNode for Node {
             done,
         } = request;
 
-        ctx.emit_rust_step("Check if any jobs failed", |ctx| {
-            done.claim(ctx);
-            |_rt| {
+        ctx.run_into(
+            [done.discard_result()],
+            "Check if any jobs failed",
+            (),
+            |_rt, ()| {
                 let did_fail = std::env::var(did_fail_env_var)?
                     .to_lowercase()
                     .parse::<bool>()?;
@@ -44,8 +46,8 @@ impl SimpleFlowNode for Node {
                     anyhow::bail!("Detected failures in one or more previous jobs!")
                 }
                 Ok(())
-            }
-        });
+            },
+        );
 
         Ok(())
     }

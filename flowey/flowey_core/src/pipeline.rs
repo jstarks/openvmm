@@ -8,6 +8,7 @@ mod artifact;
 pub use artifact::Artifact;
 
 use self::internal::*;
+use crate::config::NodeConfig;
 use crate::node::FlowArch;
 use crate::node::FlowNodeBase;
 use crate::node::FlowPlatform;
@@ -592,6 +593,7 @@ impl Pipeline {
             platform,
             arch,
             cond_param_idx: None,
+            config: Default::default(),
             ado_pool: None,
             ado_variables: BTreeMap::new(),
             gh_override_if: None,
@@ -1018,6 +1020,21 @@ impl PipelineJobCtx<'_> {
     }
 }
 
+pub struct ConfigCtx<'a> {
+    pipeline: &'a mut Pipeline,
+    job_idx: usize,
+}
+
+impl ConfigCtx<'_> {
+    pub fn set<T: NodeConfig>(&mut self, value: T) {
+        self.pipeline.jobs[self.job_idx].config.set(value)
+    }
+
+    pub fn get_mut<T: NodeConfig + Default>(&mut self) -> &mut T {
+        self.pipeline.jobs[self.job_idx].config.get_mut()
+    }
+}
+
 #[must_use]
 pub struct PipelineJob<'a> {
     pipeline: &'a mut Pipeline,
@@ -1224,6 +1241,14 @@ impl PipelineJob<'_> {
         self
     }
 
+    pub fn configure(self, f: impl FnOnce(&mut ConfigCtx<'_>)) -> Self {
+        f(&mut ConfigCtx {
+            pipeline: self.pipeline,
+            job_idx: self.job_idx,
+        });
+        self
+    }
+
     /// Finish describing the pipeline job.
     pub fn finish(self) -> PipelineJobHandle {
         PipelineJobHandle {
@@ -1278,6 +1303,7 @@ fn new_parameter_name(name: impl AsRef<str>, kind: ParameterKind) -> String {
 /// pipeline author, these are not types you need to care about!
 pub mod internal {
     use super::*;
+    use crate::config::ConfigBuilder;
     use std::collections::BTreeMap;
 
     pub fn consistent_artifact_runtime_var_name(artifact: impl AsRef<str>, is_use: bool) -> String {
@@ -1309,6 +1335,7 @@ pub mod internal {
         pub platform: FlowPlatform,
         pub arch: FlowArch,
         pub cond_param_idx: Option<usize>,
+        pub config: ConfigBuilder,
         // backend specific
         pub ado_pool: Option<AdoPool>,
         pub ado_variables: BTreeMap<String, String>,
@@ -1338,6 +1365,8 @@ pub mod internal {
         pub parameter: Parameter,
         pub used_by_jobs: BTreeSet<usize>,
     }
+
+    pub struct ConfigMeta {}
 
     /// Mirror of [`Pipeline`], except with all field marked as `pub`.
     pub struct PipelineFinalized {

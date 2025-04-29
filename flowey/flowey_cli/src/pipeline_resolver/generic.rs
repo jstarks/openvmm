@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use anyhow::Context;
+use flowey_core::config::ConfigMap;
 use flowey_core::node::FlowArch;
 use flowey_core::node::FlowPlatform;
 use flowey_core::node::NodeHandle;
@@ -65,6 +66,7 @@ pub struct ResolvedPipelineJob {
     pub label: String,
     pub platform: FlowPlatform,
     pub arch: FlowArch,
+    pub config: ConfigMap,
     pub ado_pool: Option<AdoPool>,
     pub ado_variables: BTreeMap<String, String>,
     pub gh_override_if: Option<String>,
@@ -168,6 +170,7 @@ pub fn resolve_pipeline(pipeline: Pipeline) -> anyhow::Result<ResolvedPipeline> 
             platform,
             arch,
             cond_param_idx,
+            config,
             ado_pool,
             ado_variables,
             gh_override_if,
@@ -227,6 +230,7 @@ pub fn resolve_pipeline(pipeline: Pipeline) -> anyhow::Result<ResolvedPipeline> 
             gh_permissions,
             platform,
             arch,
+            config: config.build(),
             cond_param_idx,
             external_read_vars,
             parameters_used,

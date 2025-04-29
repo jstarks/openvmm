@@ -9,6 +9,7 @@ use crate::flow_resolver::stage1_dag::OutputGraphEntry;
 use crate::flow_resolver::stage1_dag::StepId;
 use crate::pipeline_resolver::generic::ResolvedPipeline;
 use crate::pipeline_resolver::generic::ResolvedPipelineJob;
+use flowey_core::config::ConfigMap;
 use flowey_core::node::FlowArch;
 use flowey_core::node::FlowBackend;
 use flowey_core::node::FlowPlatform;
@@ -40,6 +41,7 @@ fn viz_pipeline_generic(
         seed_nodes: BTreeMap<NodeHandle, (bool, Vec<Box<[u8]>>)>,
         resolved_patches: flowey_core::patch::ResolvedPatches,
         external_read_vars: BTreeSet<String>,
+        config: &ConfigMap,
         backend: FlowBackend,
         platform: FlowPlatform,
         arch: FlowArch,
@@ -73,6 +75,7 @@ fn viz_pipeline_generic(
             ref label,
             platform,
             arch,
+            ref config,
             cond_param_idx: _,
             ref ado_pool,
             ado_variables: _,
@@ -124,6 +127,7 @@ fn viz_pipeline_generic(
                 .collect(),
             patches.clone(),
             external_read_vars.clone(),
+            config,
             backend,
             platform,
             arch,
@@ -141,6 +145,7 @@ pub fn viz_flow_toposort(
     seed_nodes: BTreeMap<NodeHandle, (bool, Vec<Box<[u8]>>)>,
     resolved_patches: flowey_core::patch::ResolvedPatches,
     external_read_vars: BTreeSet<String>,
+    config: &ConfigMap,
     backend: FlowBackend,
     platform: FlowPlatform,
     arch: FlowArch,
@@ -156,6 +161,7 @@ pub fn viz_flow_toposort(
             seed_nodes,
             external_read_vars,
             with_persist_dir.then_some("<dummy>".into()),
+            config,
         )?;
 
     let output_order = petgraph::algo::toposort(&output_graph, None)
@@ -255,6 +261,7 @@ pub fn viz_pipeline_dot(pipeline: ResolvedPipeline, _backend: FlowBackend) -> an
                 label,
                 platform: _,
                 arch: _,
+                config: _,
                 cond_param_idx: _,
                 ado_pool,
                 ado_variables: _,
@@ -321,6 +328,7 @@ pub fn viz_flow_dot(
     seed_nodes: BTreeMap<NodeHandle, (bool, Vec<Box<[u8]>>)>,
     resolved_patches: flowey_core::patch::ResolvedPatches,
     external_read_vars: BTreeSet<String>,
+    config: &ConfigMap,
     backend: FlowBackend,
     platform: FlowPlatform,
     arch: FlowArch,
@@ -335,6 +343,7 @@ pub fn viz_flow_dot(
         seed_nodes,
         external_read_vars,
         with_persist_dir.then_some("<dummy>".into()),
+        config,
     )?;
 
     #[derive(Clone)]

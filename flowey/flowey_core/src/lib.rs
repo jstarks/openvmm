@@ -9,6 +9,7 @@
 
 #![expect(missing_docs)]
 
+pub mod config;
 pub mod node;
 pub mod patch;
 pub mod pipeline;

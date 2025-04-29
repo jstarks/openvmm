@@ -18,6 +18,7 @@ use crate::pipeline_resolver::common_yaml::job_flowey_bootstrap_source;
 use crate::pipeline_resolver::generic::ResolvedPipeline;
 use crate::pipeline_resolver::generic::ResolvedPipelineJob;
 use anyhow::Context;
+use flowey_core::config::ConfigMap;
 use flowey_core::node::FlowArch;
 use flowey_core::node::FlowBackend;
 use flowey_core::node::FlowPlatform;
@@ -74,7 +75,7 @@ pub fn github_yaml(
     let mut pipeline_static_db = FloweyPipelineStaticDb {
         flow_backend: crate::cli::FlowBackendCli::Github,
         var_db_backend_kind: crate::cli::exec_snippet::VarDbBackendKind::Json,
-        job_reqs: BTreeMap::new(),
+        jobs: BTreeMap::new(),
     };
 
     let mut github_jobs = BTreeMap::new();
@@ -86,6 +87,7 @@ pub fn github_yaml(
             ref label,
             platform,
             arch,
+            ref config,
             ref external_read_vars,
             ado_pool: _,
             ref gh_override_if,
@@ -108,6 +110,7 @@ pub fn github_yaml(
                 .collect(),
             patches.clone(),
             external_read_vars.clone(),
+            config,
             platform,
             arch,
             job_idx.index(),
@@ -117,7 +120,13 @@ pub fn github_yaml(
         .context(format!("in job '{label}'"))?;
 
         {
-            let existing = pipeline_static_db.job_reqs.insert(job_idx.index(), req_db);
+            let existing = pipeline_static_db.jobs.insert(
+                job_idx.index(),
+                crate::cli::exec_snippet::JobDbEntry {
+                    config: config.clone(),
+                    reqs: req_db,
+                },
+            );
             assert!(existing.is_none())
         }
 
@@ -697,6 +706,7 @@ fn resolve_flow_as_github_yaml_steps(
     seed_nodes: BTreeMap<NodeHandle, (bool, Vec<Box<[u8]>>)>,
     resolved_patches: flowey_core::patch::ResolvedPatches,
     external_read_vars: BTreeSet<String>,
+    config: &ConfigMap,
     platform: FlowPlatform,
     arch: FlowArch,
     job_idx: usize,
@@ -718,6 +728,7 @@ fn resolve_flow_as_github_yaml_steps(
             external_read_vars,
             // TODO: support GitHub agents with persistent storage
             None,
+            config,
         )?;
 
     if err_unreachable_nodes.is_some() {

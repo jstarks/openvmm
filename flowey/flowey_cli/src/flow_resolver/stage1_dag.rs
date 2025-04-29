@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use anyhow::Context;
+use flowey_core::config::ConfigMap;
 use flowey_core::node::FlowArch;
 use flowey_core::node::FlowBackend;
 use flowey_core::node::FlowPlatform;
@@ -51,6 +52,7 @@ pub(crate) fn stage1_dag(
     seed_nodes: BTreeMap<NodeHandle, (bool, Vec<Box<[u8]>>)>,
     external_read_vars: BTreeSet<String>,
     persistent_dir_path_var: Option<String>,
+    config: &ConfigMap,
 ) -> Result<
     (
         petgraph::Graph<(StepId, Option<OutputGraphEntry>), DepKind>,
@@ -235,7 +237,7 @@ pub(crate) fn stage1_dag(
                 &patch_node,
                 &mut yaml_var_ordinal,
             );
-            let mut ctx = flowey_core::node::new_node_ctx(&mut ctx_backend);
+            let mut ctx = flowey_core::node::new_node_ctx(&mut ctx_backend, config);
 
             node.imports(&mut dep_registration);
             if let Err(e) = node.emit(requests.clone(), &mut ctx) {

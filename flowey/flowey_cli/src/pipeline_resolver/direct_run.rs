@@ -90,6 +90,7 @@ fn direct_run_do_work(
             ref label,
             platform,
             arch,
+            ref config,
             cond_param_idx,
             ado_pool: _,
             ado_variables: _,
@@ -174,6 +175,7 @@ fn direct_run_do_work(
                         .collect(),
                     external_read_vars.clone(),
                     Some(VAR_DB_SEEDVAR_FLOWEY_PERSISTENT_STORAGE_DIR.into()),
+                    config,
                 )?;
 
             if err_unreachable_nodes.is_some() {

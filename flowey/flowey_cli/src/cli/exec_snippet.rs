@@ -3,6 +3,7 @@
 
 use crate::cli::FlowBackendCli;
 use anyhow::Context;
+use flowey_core::config::ConfigMap;
 use flowey_core::node::FlowArch;
 use flowey_core::node::FlowBackend;
 use flowey_core::node::FlowPlatform;
@@ -72,7 +73,7 @@ impl ExecSnippet {
         let FloweyPipelineStaticDb {
             flow_backend,
             var_db_backend_kind: _,
-            job_reqs,
+            jobs,
         } = {
             let current_exe = std::env::current_exe()
                 .context("failed to get path to current flowey executable")?;
@@ -87,9 +88,10 @@ impl ExecSnippet {
         {
             let snippet_idx = snippet_idx.parse::<usize>().unwrap();
 
-            let raw_json_reqs: Vec<Box<[u8]>> = job_reqs
-                .get(&job_idx)
-                .context("invalid job_idx")?
+            let job = jobs.get(&job_idx).context("invalid job_idx")?;
+
+            let raw_json_reqs: Vec<Box<[u8]>> = job
+                .reqs
                 .get(&node_modpath)
                 .context("pipeline db did not include data for specified node")?
                 .iter()
@@ -145,7 +147,7 @@ impl ExecSnippet {
                 &mut rust_runtime_services,
             );
 
-            let mut ctx = flowey_core::node::new_node_ctx(&mut ctx_backend);
+            let mut ctx = flowey_core::node::new_node_ctx(&mut ctx_backend, &job.config);
             node.emit(raw_json_reqs.clone(), &mut ctx)?;
 
             match ctx_backend.into_result() {
@@ -336,11 +338,16 @@ pub(crate) enum VarDbBackendKind {
 pub(crate) struct FloweyPipelineStaticDb {
     pub flow_backend: FlowBackendCli,
     pub var_db_backend_kind: VarDbBackendKind,
-    pub job_reqs: BTreeMap<usize, BTreeMap<String, Vec<SerializedRequest>>>,
+    pub jobs: BTreeMap<usize, JobDbEntry>,
 }
 
-// encode requests as JSON stored in a JSON string (to make human inspection
-// easier).
+#[derive(Serialize, Deserialize)]
+pub(crate) struct JobDbEntry {
+    pub config: ConfigMap,
+    pub reqs: BTreeMap<String, Vec<SerializedRequest>>,
+}
+
+// encode requests with their JSON structure decoded (to make human inspection easier).
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct SerializedRequest(#[serde(with = "serialized_request")] pub Box<[u8]>);
@@ -348,23 +355,19 @@ pub(crate) struct SerializedRequest(#[serde(with = "serialized_request")] pub Bo
 pub(crate) mod serialized_request {
     use serde::Deserialize;
     use serde::Deserializer;
+    use serde::Serialize;
     use serde::Serializer;
 
     #[expect(clippy::borrowed_box, reason = "required by serde")]
     pub fn serialize<S: Serializer>(v: &Box<[u8]>, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_str(
-            &serde_json::to_string(&serde_json::from_slice::<serde_json::Value>(v).unwrap())
-                .unwrap(),
-        )
+        serde_json::from_slice::<serde_json::Value>(v)
+            .unwrap()
+            .serialize(ser)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Box<[u8]>, D::Error> {
-        let s: String = Deserialize::deserialize(d)?;
-        Ok(
-            serde_json::to_vec(&serde_json::from_str::<serde_json::Value>(&s).unwrap())
-                .unwrap()
-                .into(),
-        )
+        let v: serde_json::Value = Deserialize::deserialize(d)?;
+        Ok(serde_json::to_vec(&v).unwrap().into())
     }
 }
 

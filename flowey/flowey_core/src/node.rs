@@ -15,6 +15,8 @@ use self::steps::rust::RustRuntimeServices;
 use self::user_facing::ClaimedGhParam;
 use self::user_facing::GhPermission;
 use self::user_facing::GhPermissionValue;
+use crate::config::ConfigMap;
+use crate::config::NodeConfig;
 use crate::node::github_context::GhContextVarReader;
 use github_context::state::Root;
 use serde::Deserialize;
@@ -901,9 +903,10 @@ pub trait NodeCtxBackend {
     fn persistent_dir_path_var(&mut self) -> Option<String>;
 }
 
-pub fn new_node_ctx(backend: &mut dyn NodeCtxBackend) -> NodeCtx<'_> {
+pub fn new_node_ctx<'a>(backend: &'a mut dyn NodeCtxBackend, config: &'a ConfigMap) -> NodeCtx<'a> {
     NodeCtx {
         backend: Rc::new(RefCell::new(backend)),
+        config,
     }
 }
 
@@ -1030,9 +1033,14 @@ const NO_ADO_INLINE_SCRIPT: Option<
 /// Context object for a `FlowNode`.
 pub struct NodeCtx<'a> {
     backend: Rc<RefCell<&'a mut dyn NodeCtxBackend>>,
+    config: &'a ConfigMap,
 }
 
 impl<'ctx> NodeCtx<'ctx> {
+    pub fn config<T: NodeConfig>(&self) -> Rc<T> {
+        self.config.get()
+    }
+
     /// Emit a Rust-based step.
     ///
     /// As a convenience feature, this function returns a special _optional_
@@ -1354,6 +1362,7 @@ impl<'ctx> NodeCtx<'ctx> {
         GhContextVarReader {
             ctx: NodeCtx {
                 backend: self.backend.clone(),
+                config: self.config,
             },
             _state: std::marker::PhantomData,
         }

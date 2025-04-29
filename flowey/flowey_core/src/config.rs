@@ -48,7 +48,7 @@ impl ConfigBuilder {
         self.0.insert(T::config_name(), Box::new(value)).map(|v| {
             *(v as Box<dyn Any>)
                 .downcast()
-                .expect("duplicate config names")
+                .unwrap_or_else(|_| panic!("duplicate config names involving {}", T::config_name()))
         })
     }
 
@@ -138,5 +138,48 @@ impl<'de> Deserialize<'de> for ConfigMap {
                 .map(|(k, v)| (k, ConfigEntry::Json(v)))
                 .collect(),
         ))))
+    }
+}
+
+#[macro_export]
+macro_rules! flowey_config {
+    () => {};
+    (
+        $(#[$a:meta])*
+        $vis:vis struct $config:ident {
+            $($tt:tt)*
+        }
+        $($rest:tt)*
+    ) => {
+        $crate::flowey_config!{ @impl $config;
+            $(#[$a])*
+            $vis struct $config {
+                $($tt)*
+            }
+        }
+        $crate::flowey_config!($($rest)*);
+    };
+    (
+        $(#[$a:meta])*
+        $vis:vis struct $config:ident($($tt:tt)*);
+        $($rest:tt)*
+    ) => {
+        $crate::flowey_config!{ @impl $config;
+            $(#[$a])*
+            $vis struct $config($($tt)*);
+        }
+        $crate::flowey_config!($($rest)*);
+    };
+    (@impl $config:ident; $item:item) => {
+        #[derive($crate::reexports::Serialize, $crate::reexports::Deserialize)]
+        $item
+
+        impl $crate::config::NodeConfig for $config {
+            fn config_name() -> &'static str {
+                concat!(module_path!(), "::", stringify!($config))
+            }
+
+            fn do_not_manually_impl_this_trait__use_the_flowey_config_macro_instead() {}
+        }
     }
 }

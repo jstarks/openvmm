@@ -30,8 +30,6 @@ flowey_request! {
             /// e.g: requiring that a nuget credentials manager has been installed
             pre_install_side_effects: Vec<ReadVar<SideEffect>>,
         },
-        /// Whether to pass `-NonInteractive` to `nuget install`
-        LocalOnlyInteractive(bool),
     }
 }
 
@@ -53,15 +51,10 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut interactive = None;
         let mut install = Vec::new();
 
         for request in requests {
             match request {
-                Request::LocalOnlyInteractive(v) => {
-                    same_across_all_reqs("LocalOnlyInteractive", &mut interactive, v)?
-                }
-
                 Request::Install {
                     packages,
                     nuget_config_file,
@@ -77,14 +70,9 @@ impl FlowNode for Node {
         }
 
         let interactive = if matches!(ctx.backend(), FlowBackend::Ado | FlowBackend::Github) {
-            if interactive.is_some() {
-                anyhow::bail!("can only use `LocalOnlyInteractive` when using the Local backend");
-            }
             false
         } else if matches!(ctx.backend(), FlowBackend::Local) {
-            interactive.ok_or(anyhow::anyhow!(
-                "Missing essential request: LocalOnlyInteractive",
-            ))?
+            ctx.config_or_default::<crate::_config::Interactive>().0
         } else {
             anyhow::bail!("unsupported backend")
         };

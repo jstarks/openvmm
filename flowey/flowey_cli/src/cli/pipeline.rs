@@ -3,7 +3,7 @@
 
 use anyhow::Context;
 use flowey_core::node::FlowBackend;
-use flowey_core::pipeline::IntoPipeline;
+use flowey_core::pipeline::BuildPipeline;
 use flowey_core::pipeline::PipelineBackendHint;
 use std::path::Path;
 use std::path::PathBuf;
@@ -179,7 +179,7 @@ impl std::str::FromStr for IncludeJobs {
     }
 }
 
-impl<P: clap::Subcommand + IntoPipeline> Pipeline<P> {
+impl<P: clap::Subcommand + BuildPipeline> Pipeline<P> {
     pub fn run(self, flowey_crate: &str, repo_root: &Path) -> anyhow::Result<()> {
         let Self {
             project_pipeline,
@@ -328,12 +328,13 @@ impl<P: clap::Subcommand + IntoPipeline> Pipeline<P> {
     }
 }
 
-fn resolve_pipeline<P: IntoPipeline>(
+fn resolve_pipeline<P: BuildPipeline>(
     pipelines: P,
     backend_hint: PipelineBackendHint,
 ) -> Result<crate::pipeline_resolver::generic::ResolvedPipeline, anyhow::Error> {
-    let pipeline = pipelines
-        .into_pipeline(backend_hint)
+    let mut pipeline = flowey_core::pipeline::Pipeline::new(backend_hint);
+    pipelines
+        .build_pipeline(&mut pipeline)
         .context("error defining pipeline")?;
 
     let resolved_pipeline = crate::pipeline_resolver::generic::resolve_pipeline(pipeline)

@@ -47,8 +47,8 @@ pub struct CheckinGatesCli {
     vmm_tests_disk_cache_dir: Option<PathBuf>,
 }
 
-impl IntoPipeline for CheckinGatesCli {
-    fn into_pipeline(self, backend_hint: PipelineBackendHint) -> anyhow::Result<Pipeline> {
+impl BuildPipeline for CheckinGatesCli {
+    fn build_pipeline(self, pipeline: &mut Pipeline) -> anyhow::Result<()> {
         let Self {
             config,
             local_run_args,
@@ -59,8 +59,6 @@ impl IntoPipeline for CheckinGatesCli {
             PipelineConfig::Ci => true,
             PipelineConfig::Pr => false,
         };
-
-        let mut pipeline = Pipeline::new();
 
         // configure pr/ci branch triggers and add gh pipeline name
         {
@@ -85,7 +83,9 @@ impl IntoPipeline for CheckinGatesCli {
             }
         }
 
-        let openvmm_repo_source = {
+        let backend_hint = pipeline.backend_hint();
+
+        let openvmm_repo_source: RepoSource = {
             if matches!(backend_hint, PipelineBackendHint::Local) {
                 RepoSource::ExistingClone(ReadVar::from_static(crate::repo_root()))
             } else if matches!(backend_hint, PipelineBackendHint::Github) {
@@ -104,14 +104,12 @@ impl IntoPipeline for CheckinGatesCli {
         }
 
         let cfg_common_params = crate::pipelines_shared::cfg_common_params::get_cfg_common_params(
-            &mut pipeline,
-            backend_hint,
+            pipeline,
             local_run_args,
         )?;
 
         pipeline.inject_all_jobs_with(move |job| {
-            job.dep_on(&cfg_common_params)
-                .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request {})
+            job.configure(&cfg_common_params)
                 .dep_on(
                     |_| flowey_lib_hvlite::_jobs::cfg_hvlite_reposource::Params {
                         hvlite_repo_source: openvmm_repo_source.clone(),
@@ -1124,7 +1122,7 @@ impl IntoPipeline for CheckinGatesCli {
             }
         }
 
-        Ok(pipeline)
+        Ok(())
     }
 }
 

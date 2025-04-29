@@ -6,10 +6,13 @@
 use crate::cache::CacheHit;
 use flowey::node::prelude::*;
 
+flowey_config! {
+    /// Version of `azcopy` to install (e.g: "v10")
+    pub struct Version(pub String);
+}
+
 flowey_request! {
     pub enum Request {
-        /// Version of `azcopy` to install (e.g: "v10")
-        Version(String),
         /// Get a path to `azcopy`
         GetAzCopy(WriteVar<PathBuf>),
     }
@@ -26,18 +29,16 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
+        let version = ctx.config::<Version>().0.clone();
         let mut get_azcopy = Vec::new();
 
         for req in requests {
             match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::GetAzCopy(v) => get_azcopy.push(v),
             }
         }
 
-        let version_with_date =
-            version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
+        let version_with_date = version;
         let version_without_date = version_with_date.split_once('-').unwrap().0.to_owned();
         let get_azcopy = get_azcopy;
 

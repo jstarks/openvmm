@@ -12,39 +12,38 @@ use flowey_lib_hvlite::run_cargo_build::common::CommonArch;
 pub struct LocalRunArgs {
     /// Emit verbose output when possible
     #[clap(long)]
-    verbose: bool,
+    pub verbose: bool,
 
     /// Run builds with --locked
     #[clap(long)]
-    locked: bool,
+    pub locked: bool,
 
     /// Automatically install all required dependencies
     #[clap(long)]
-    auto_install_deps: bool,
+    pub auto_install_deps: bool,
 
     /// Don't prompt user when running certain interactive commands.
     #[clap(long)]
-    non_interactive: bool,
+    pub non_interactive: bool,
 
     /// (WSL2 only) Force the use of `mono` to download nuget packages.
     #[clap(long)]
-    force_nuget_mono: bool,
+    pub force_nuget_mono: bool,
 
     /// Claim that nuget is using an external auth mechanism.
     ///
     /// This will skip the check to make sure Azure Credential Provider is
     /// installed.
     #[clap(long)]
-    external_nuget_auth: bool,
+    pub external_nuget_auth: bool,
 }
 
-pub type FulfillCommonRequestsParamsResolver =
-    Box<dyn for<'a> Fn(&mut PipelineJobCtx<'a>) -> flowey_lib_hvlite::_jobs::cfg_common::Params>;
+pub type FulfillCommonRequestsParamsResolver = Box<dyn for<'a> Fn(&mut ConfigCtx<'a>)>;
 
 fn get_params_local(
     local_run_args: Option<LocalRunArgs>,
 ) -> anyhow::Result<FulfillCommonRequestsParamsResolver> {
-    Ok(Box::new(move |_ctx| {
+    Ok(Box::new(move |ctx| {
         let LocalRunArgs {
             verbose,
             locked,
@@ -54,18 +53,30 @@ fn get_params_local(
             external_nuget_auth,
         } = local_run_args.clone().unwrap_or_default();
 
-        flowey_lib_hvlite::_jobs::cfg_common::Params {
-            local_only: Some(flowey_lib_hvlite::_jobs::cfg_common::LocalOnlyParams {
-                interactive: !non_interactive,
-                auto_install: auto_install_deps,
-                force_nuget_mono,
+        ctx.set_once(flowey_lib_common::_config::Interactive(!non_interactive));
+        ctx.set_once(flowey_lib_common::_config::AutoInstall(auto_install_deps));
+        ctx.set_once(flowey_lib_common::_config::Verbose(ReadVar::from_static(
+            verbose,
+        )));
+        ctx.set_once(flowey_lib_common::_config::PackagesLocked(locked));
+
+        ctx.set_once(flowey_lib_common::install_rust::IgnoreVersion(true));
+
+        ctx.set_once(
+            flowey_lib_common::install_nuget_azure_credential_provider::LocalOnlySkipAuthCheck(
                 external_nuget_auth,
-                ignore_rust_version: true,
-            }),
-            verbose: ReadVar::from_static(verbose),
-            locked,
-            deny_warnings: false,
-        }
+            ),
+        );
+        ctx.set_once(
+            flowey_lib_common::download_nuget_exe::LocalOnlyForceWsl2MonoNugetExe(force_nuget_mono),
+        );
+        ctx.set_once(flowey_lib_common::git_checkout::LocalOnlyRequireExistingClones(true));
+
+        ctx.set_once(
+            flowey_lib_hvlite::init_openvmm_cargo_config_deny_warnings::DenyWarnings(false),
+        );
+
+        flowey_lib_hvlite::_jobs::cfg_versions::configure_versions(ctx);
     }))
 }
 
@@ -79,22 +90,27 @@ fn get_params_cloud(
         Some(false),
     );
 
-    Ok(Box::new(move |ctx: &mut PipelineJobCtx<'_>| {
-        flowey_lib_hvlite::_jobs::cfg_common::Params {
-            local_only: None,
-            verbose: ctx.use_parameter(param_verbose.clone()),
-            locked: true,
-            deny_warnings: true,
-        }
+    Ok(Box::new(move |ctx| {
+        ctx.set_once(flowey_lib_common::_config::Interactive(false));
+        ctx.set_once(flowey_lib_common::_config::AutoInstall(true));
+        let verbose = ctx.use_parameter(param_verbose.clone());
+        ctx.set_once(flowey_lib_common::_config::Verbose(verbose));
+        ctx.set_once(flowey_lib_common::_config::PackagesLocked(true));
+        ctx.set_once(flowey_lib_common::install_rust::IgnoreVersion(false));
+
+        ctx.set_once(
+            flowey_lib_hvlite::init_openvmm_cargo_config_deny_warnings::DenyWarnings(true),
+        );
+
+        flowey_lib_hvlite::_jobs::cfg_versions::configure_versions(ctx);
     }))
 }
 
 pub fn get_cfg_common_params(
     pipeline: &mut Pipeline,
-    backend_hint: PipelineBackendHint,
     local_run_args: Option<LocalRunArgs>,
 ) -> anyhow::Result<FulfillCommonRequestsParamsResolver> {
-    match backend_hint {
+    match pipeline.backend_hint() {
         PipelineBackendHint::Local => get_params_local(local_run_args),
         PipelineBackendHint::Ado | PipelineBackendHint::Github => {
             if local_run_args.is_some() {

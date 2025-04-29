@@ -6,6 +6,12 @@
 use flowey::node::prelude::*;
 use std::collections::BTreeMap;
 
+flowey_config! {
+    /// When running locally: whether or not all repos should be cloned
+    /// locally ahead of time, vs. re-cloning them.
+    pub struct LocalOnlyRequireExistingClones(pub bool);
+}
+
 /// Describes the source of a particular repo.
 #[derive(Serialize, Deserialize)]
 pub enum RepoSource<C = VarNotClaimed> {
@@ -126,9 +132,6 @@ flowey_request! {
             depth: Option<usize>,
             pre_run_deps: Vec<ReadVar<SideEffect>>,
         },
-        /// When running locally: whether or not all repos should be cloned
-        /// locally ahead of time, vs. re-cloning them.
-        LocalOnlyRequireExistingClones(bool),
     }
 }
 
@@ -158,8 +161,8 @@ pub mod process_reqs {
     }
 
     impl ResolvedRequestsAdo {
-        pub fn from_reqs(requests: Vec<Request>) -> anyhow::Result<Self> {
-            let ResolvedRequests::Ado(v) = process_reqs(requests, false)? else {
+        pub fn from_reqs(ctx: &mut NodeCtx<'_>, requests: Vec<Request>) -> anyhow::Result<Self> {
+            let ResolvedRequests::Ado(v) = process_reqs(ctx, requests, false)? else {
                 panic!()
             };
             Ok(v)
@@ -173,8 +176,8 @@ pub mod process_reqs {
     }
 
     impl ResolvedRequestsLocal {
-        pub fn from_reqs(requests: Vec<Request>) -> anyhow::Result<Self> {
-            let ResolvedRequests::Local(v) = process_reqs(requests, true)? else {
+        pub fn from_reqs(ctx: &mut NodeCtx<'_>, requests: Vec<Request>) -> anyhow::Result<Self> {
+            let ResolvedRequests::Local(v) = process_reqs(ctx, requests, true)? else {
                 panic!()
             };
             Ok(v)
@@ -186,10 +189,13 @@ pub mod process_reqs {
         Local(ResolvedRequestsLocal),
     }
 
-    fn process_reqs(requests: Vec<Request>, is_local: bool) -> anyhow::Result<ResolvedRequests> {
+    fn process_reqs(
+        ctx: &mut NodeCtx<'_>,
+        requests: Vec<Request>,
+        is_local: bool,
+    ) -> anyhow::Result<ResolvedRequests> {
         let mut checkout_repo = Vec::new();
         let mut register_repo = Vec::new();
-        let mut require_local_clones = None;
 
         for req in requests {
             match req {
@@ -215,19 +221,6 @@ pub mod process_reqs {
                     depth,
                     pre_run_deps,
                 }),
-                Request::LocalOnlyRequireExistingClones(v) => same_across_all_reqs(
-                    "LocalOnlyRequireExistingClones",
-                    &mut require_local_clones,
-                    v,
-                )?,
-            }
-        }
-
-        if !is_local {
-            if require_local_clones.is_some() {
-                anyhow::bail!(
-                    "can only set `LocalOnlyRequireExistingClones` when using the Local backend"
-                )
             }
         }
 
@@ -235,9 +228,7 @@ pub mod process_reqs {
             ResolvedRequests::Local(ResolvedRequestsLocal {
                 checkout_repo,
                 register_repo,
-                require_local_clones: require_local_clones.ok_or(anyhow::anyhow!(
-                    "Missing required request: LocalOnlyRequireExistingClones",
-                ))?,
+                require_local_clones: ctx.config::<LocalOnlyRequireExistingClones>().0,
             })
         } else {
             ResolvedRequests::Ado(ResolvedRequestsAdo {
@@ -269,7 +260,7 @@ impl Node {
         let process_reqs::ResolvedRequestsAdo {
             checkout_repo,
             register_repo,
-        } = process_reqs::ResolvedRequestsAdo::from_reqs(requests)?;
+        } = process_reqs::ResolvedRequestsAdo::from_reqs(ctx, requests)?;
 
         if checkout_repo.is_empty() {
             return Ok(());
@@ -439,7 +430,7 @@ impl Node {
         let process_reqs::ResolvedRequestsAdo {
             checkout_repo,
             register_repo,
-        } = process_reqs::ResolvedRequestsAdo::from_reqs(requests)?;
+        } = process_reqs::ResolvedRequestsAdo::from_reqs(ctx, requests)?;
 
         if checkout_repo.is_empty() {
             return Ok(());
@@ -582,7 +573,7 @@ impl Node {
             checkout_repo,
             register_repo,
             require_local_clones,
-        } = process_reqs::ResolvedRequestsLocal::from_reqs(requests)?;
+        } = process_reqs::ResolvedRequestsLocal::from_reqs(ctx, requests)?;
 
         if checkout_repo.is_empty() {
             return Ok(());

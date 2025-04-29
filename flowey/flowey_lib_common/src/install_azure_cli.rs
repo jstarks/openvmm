@@ -5,14 +5,13 @@
 
 use flowey::node::prelude::*;
 
+flowey_config! {
+    /// Which version of azure-cli to install (e.g: 2.57.0)
+    pub struct Version(pub String);
+}
+
 flowey_request! {
     pub enum Request {
-        /// Automatically install all required azure-cli tools and components.
-        ///
-        /// This must be set to true/false when running locally.
-        AutoInstall(bool),
-        /// Which version of azure-cli to install (e.g: 2.57.0)
-        Version(String),
         /// Get a path to `az`
         GetAzureCli(WriteVar<PathBuf>),
     }
@@ -26,16 +25,12 @@ impl FlowNode for Node {
     fn imports(_ctx: &mut ImportCtx<'_>) {}
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut auto_install = None;
-        let mut version = None;
+        let auto_install = ctx.config::<crate::_config::AutoInstall>().0;
+        let version = ctx.config::<Version>().0.clone();
         let mut get_az_cli = Vec::new();
 
         for req in requests {
             match req {
-                Request::AutoInstall(v) => {
-                    same_across_all_reqs("AutoInstall", &mut auto_install, v)?
-                }
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::GetAzureCli(v) => get_az_cli.push(v),
             }
         }
@@ -46,8 +41,6 @@ impl FlowNode for Node {
             return Ok(());
         }
 
-        let auto_install = auto_install;
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
         let get_az_cli = get_az_cli;
 
         // -- end of req processing -- //
@@ -65,9 +58,6 @@ impl FlowNode for Node {
 
         match ctx.backend() {
             FlowBackend::Local => {
-                let auto_install = auto_install
-                    .ok_or(anyhow::anyhow!("Missing essential request: AutoInstall"))?;
-
                 if auto_install {
                     ctx.emit_rust_step("installing azure-cli", |ctx| {
                         let get_az_cli = get_az_cli.claim(ctx);
@@ -97,7 +87,7 @@ impl FlowNode for Node {
                 }
             }
             FlowBackend::Ado => {
-                if !auto_install.unwrap_or(true) {
+                if !auto_install {
                     anyhow::bail!("AutoInstall must be `true` when running on ADO")
                 }
 
@@ -113,7 +103,7 @@ impl FlowNode for Node {
                 })
             }
             FlowBackend::Github => {
-                if !auto_install.unwrap_or(true) {
+                if !auto_install {
                     anyhow::bail!("AutoInstall must be `true` when running on Github Actions")
                 }
 

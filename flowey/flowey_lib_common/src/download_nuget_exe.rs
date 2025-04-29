@@ -13,16 +13,19 @@ pub enum NugetInstallPlatform {
     MacOs,
 }
 
+flowey_config! {
+    /// When running using WSL2, use `mono` to run the `nuget.exe` inside
+    /// WSL2 directly, instead of running `nuget.exe` via WSL2 interop.
+    ///
+    /// This is sometimes required to work around windows defender bugs when
+    /// restoring.
+    pub struct LocalOnlyForceWsl2MonoNugetExe(pub bool);
+}
+
 flowey_request! {
     pub enum Request {
         NugetBin(WriteVar<PathBuf>),
         NugetInstallPlatform(WriteVar<NugetInstallPlatform>),
-        /// When running using WSL2, use `mono` to run the `nuget.exe` inside
-        /// WSL2 directly, instead of running `nuget.exe` via WSL2 interop.
-        ///
-        /// This is sometimes required to work around windows defender bugs when
-        /// restoring.
-        LocalOnlyForceWsl2MonoNugetExe(bool),
     }
 }
 
@@ -39,15 +42,9 @@ impl FlowNode for Node {
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let mut broadcast_nuget_tool_kind = Vec::new();
         let mut broadcast_nuget_config_platform = Vec::new();
-        let mut force_mono_nuget_exe_wsl2 = None;
 
         for req in requests {
             match req {
-                Request::LocalOnlyForceWsl2MonoNugetExe(v) => same_across_all_reqs(
-                    "LocalOnlyForceWsl2MonoNugetExe",
-                    &mut force_mono_nuget_exe_wsl2,
-                    v,
-                )?,
                 Request::NugetBin(outvar) => broadcast_nuget_tool_kind.push(outvar),
                 Request::NugetInstallPlatform(outvar) => {
                     broadcast_nuget_config_platform.push(outvar)
@@ -59,15 +56,8 @@ impl FlowNode for Node {
         let broadcast_nuget_config_platform = broadcast_nuget_config_platform;
 
         let force_mono_nuget_exe_wsl2 = if matches!(ctx.backend(), FlowBackend::Local) {
-            force_mono_nuget_exe_wsl2.ok_or(anyhow::anyhow!(
-                "Missing essential request: LocalOnlyForceWsl2MonoNugetExe"
-            ))?
+            ctx.config::<LocalOnlyForceWsl2MonoNugetExe>().0
         } else {
-            if force_mono_nuget_exe_wsl2.is_some() {
-                anyhow::bail!(
-                    "can only use `LocalOnlyForceWsl2MonoNugetExe` when using the Local backend"
-                );
-            }
             false
         };
 

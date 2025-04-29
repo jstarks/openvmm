@@ -9,10 +9,13 @@
 use crate::cache::CacheHit;
 use flowey::node::prelude::*;
 
+flowey_config! {
+    /// Version of `gh` to download (e.g: 2.52.0)
+    pub struct Version(pub String);
+}
+
 flowey_request! {
     pub enum Request {
-        /// Version of `gh` to download (e.g: 2.52.0)
-        Version(String),
         /// Get a path to downloaded `gh`
         Get(WriteVar<PathBuf>),
     }
@@ -29,17 +32,15 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
+        let version = ctx.config::<Version>().0.clone();
         let mut install_reqs = Vec::new();
 
         for req in requests {
             match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::Get(v) => install_reqs.push(v),
             }
         }
 
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
         let install_reqs = install_reqs;
 
         // -- end of req processing -- //

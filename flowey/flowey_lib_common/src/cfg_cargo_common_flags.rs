@@ -16,10 +16,17 @@ pub struct Flags {
     pub verbose: bool,
 }
 
+flowey_config! {
+    pub struct Locked(pub bool);
+
+    /// Write verbose output.
+    #[derive(Default)]
+    pub struct Verbose(pub ReadVar<bool>);
+}
+
 flowey_request! {
     pub enum Request {
         SetLocked(bool),
-        SetVerbose(ReadVar<bool>),
         GetFlags(WriteVar<Flags>),
     }
 }
@@ -35,23 +42,18 @@ impl FlowNode for Node {
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let mut set_locked = None;
-        let mut set_verbose = None;
         let mut get_flags = Vec::new();
 
         for req in requests {
             match req {
                 Request::SetLocked(v) => same_across_all_reqs("SetLocked", &mut set_locked, v)?,
-                Request::SetVerbose(v) => {
-                    same_across_all_reqs_backing_var("SetVerbose", &mut set_verbose, v)?
-                }
                 Request::GetFlags(v) => get_flags.push(v),
             }
         }
 
         let set_locked =
             set_locked.ok_or(anyhow::anyhow!("Missing essential request: SetLocked"))?;
-        let set_verbose =
-            set_verbose.ok_or(anyhow::anyhow!("Missing essential request: SetVerbose"))?;
+        let set_verbose = ctx.config_or_default::<crate::_config::Verbose>().0.clone();
         let get_flags = get_flags;
 
         // -- end of req processing -- //

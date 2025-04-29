@@ -59,11 +59,13 @@ pub mod user_facing {
     pub use super::steps::github::GhPermission;
     pub use super::steps::github::GhPermissionValue;
     pub use super::steps::rust::RustRuntimeServices;
+    pub use crate::flowey_config;
     pub use crate::flowey_request;
     pub use crate::new_flow_node;
     pub use crate::new_simple_flow_node;
     pub use crate::node::FlowPlatformLinuxDistro;
     pub use crate::pipeline::Artifact;
+    pub use crate::pipeline::ConfigCtx; // Arguably this should be in pipelines only.
 
     /// Helper method to streamline request validation in cases where a value is
     /// expected to be identical across all incoming requests.
@@ -534,6 +536,12 @@ impl<T: Serialize + DeserializeOwned> Clone for ReadVarBacking<T> {
                 Self::Inline(serde_json::from_value(serde_json::to_value(v).unwrap()).unwrap())
             }
         }
+    }
+}
+
+impl<T: 'static + Default + Serialize + DeserializeOwned> Default for ReadVar<T> {
+    fn default() -> Self {
+        Self::from_static(Default::default())
     }
 }
 
@@ -1037,8 +1045,20 @@ pub struct NodeCtx<'a> {
 }
 
 impl<'ctx> NodeCtx<'ctx> {
-    pub fn config<T: NodeConfig>(&self) -> Rc<T> {
+    pub fn config_or_default<T: NodeConfig + Default>(&self) -> Rc<T> {
         self.config.get()
+    }
+
+    #[track_caller]
+    pub fn config<T: NodeConfig>(&self) -> Rc<T> {
+        let Some(v) = self.try_config() else {
+            panic!("required configuration {} not set", T::config_name());
+        };
+        v
+    }
+
+    pub fn try_config<T: NodeConfig>(&self) -> Option<Rc<T>> {
+        self.config.try_get()
     }
 
     /// Emit a Rust-based step.
@@ -2913,4 +2933,47 @@ macro_rules! flowey_request {
             fn do_not_manually_impl_this_trait__use_the_flowey_request_macro_instead(&mut self) {}
         }
     };
+}
+
+#[macro_export]
+macro_rules! flowey_config {
+    () => {};
+    (
+        $(#[$a:meta])*
+        $vis:vis struct $config:ident {
+            $($tt:tt)*
+        }
+        $($rest:tt)*
+    ) => {
+        $crate::flowey_config!{ @impl $config;
+            $(#[$a])*
+            $vis struct $config {
+                $($tt)*
+            }
+        }
+        $crate::flowey_config!($($rest)*);
+    };
+    (
+        $(#[$a:meta])*
+        $vis:vis struct $config:ident($($tt:tt)*);
+        $($rest:tt)*
+    ) => {
+        $crate::flowey_config!{ @impl $config;
+            $(#[$a])*
+            $vis struct $config($($tt)*);
+        }
+        $crate::flowey_config!($($rest)*);
+    };
+    (@impl $config:ident; $item:item) => {
+        #[derive($crate::reexports::Serialize, $crate::reexports::Deserialize)]
+        $item
+
+        impl $crate::config::NodeConfig for $config {
+            fn config_name() -> &'static str {
+                concat!(module_path!(), "::", stringify!($name))
+            }
+
+            fn do_not_manually_impl_this_trait__use_the_flowey_config_macro_instead() {}
+        }
+    }
 }

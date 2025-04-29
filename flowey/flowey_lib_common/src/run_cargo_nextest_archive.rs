@@ -2,8 +2,6 @@
 // Licensed under the MIT License.
 
 //! Build and archive cargo-nextest tests (for cross-job execution).
-//!
-//! Respects common cargo flags specified by the `cfg_cargo_common_flags` node.
 
 use crate::run_cargo_nextest_run::build_params::NextestBuildParams;
 use flowey::node::prelude::*;
@@ -31,13 +29,13 @@ impl FlowNode for Node {
     type Request = Request;
 
     fn imports(ctx: &mut ImportCtx<'_>) {
-        ctx.import::<crate::cfg_cargo_common_flags::Node>();
         ctx.import::<crate::download_cargo_nextest::Node>();
         ctx.import::<crate::install_rust::Node>();
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let cargo_flags = ctx.reqv(crate::cfg_cargo_common_flags::Request::GetFlags);
+        let verbose = ctx.config::<crate::_config::Verbose>().0.clone();
+        let locked = ctx.config::<crate::_config::PackagesLocked>().0;
 
         let nextest_installed = ctx.reqv(crate::download_cargo_nextest::Request::InstallWithCargo);
 
@@ -69,14 +67,14 @@ impl FlowNode for Node {
                 |ctx| {
                     pre_run_deps.claim(ctx);
                     nextest_installed.clone().claim(ctx);
-                    let cargo_flags = cargo_flags.clone().claim(ctx);
+                    let verbose = verbose.clone().claim(ctx);
                     let rust_toolchain = rust_toolchain.clone().claim(ctx);
                     let working_dir = working_dir.claim(ctx);
                     let archive_file = archive_file.claim(ctx);
                     let packages = packages.claim(ctx);
                     let extra_env = extra_env.claim(ctx);
                     move |rt| {
-                        let cargo_flags = rt.read(cargo_flags);
+                        let verbose = rt.read(verbose);
                         let working_dir = rt.read(working_dir);
                         let rust_toolchain = rt.read(rust_toolchain);
                         let packages = rt.read(packages);
@@ -85,7 +83,8 @@ impl FlowNode for Node {
                         let rust_toolchain = rust_toolchain.map(|s| format!("+{s}"));
                         let (build_args, build_env) =
                             crate::run_cargo_nextest_run::cargo_nextest_build_args_and_env(
-                                cargo_flags,
+                                locked,
+                                verbose,
                                 profile,
                                 target,
                                 packages,

@@ -38,13 +38,13 @@ impl FlowNode for Node {
     type Request = Request;
 
     fn imports(ctx: &mut ImportCtx<'_>) {
-        ctx.import::<crate::cfg_cargo_common_flags::Node>();
         ctx.import::<crate::install_rust::Node>();
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let rust_toolchain = ctx.reqv(crate::install_rust::Request::GetRustupToolchain);
-        let flags = ctx.reqv(crate::cfg_cargo_common_flags::Request::GetFlags);
+        let locked = ctx.config::<crate::_config::PackagesLocked>().0;
+        let verbose = ctx.config::<crate::_config::Verbose>().0.clone();
 
         for Request {
             in_folder,
@@ -68,16 +68,14 @@ impl FlowNode for Node {
                 pre_build_deps.claim(ctx);
                 done.claim(ctx);
                 let rust_toolchain = rust_toolchain.clone().claim(ctx);
-                let flags = flags.clone().claim(ctx);
+                let verbose = verbose.clone().claim(ctx);
                 let in_folder = in_folder.claim(ctx);
                 let exclude = exclude.claim(ctx);
                 move |rt| {
                     let rust_toolchain = rt.read(rust_toolchain);
-                    let flags = rt.read(flags);
+                    let verbose = rt.read(verbose);
                     let in_folder = rt.read(in_folder);
                     let exclude = rt.read(exclude);
-
-                    let crate::cfg_cargo_common_flags::Flags { locked, verbose } = flags;
 
                     let target = target.to_string();
                     let features = features.map(|x| x.join(","));

@@ -5,8 +5,8 @@
 //! version configuration requests required by various dependencies in OpenVMM
 //! pipelines.
 
-use crate::download_openhcl_kernel_package::OpenhclKernelPackageKind;
 use flowey::node::prelude::*;
+use flowey::pipeline::prelude::PipelineBackendHint;
 
 // FUTURE: instead of hard-coding these values in-code, we might want to make
 // our own nuget-esque `packages.config` file, that we can read at runtime to
@@ -34,56 +34,40 @@ pub const OPENHCL_KERNEL_STABLE_VERSION: &str = "6.12.9.2";
 pub const OPENVMM_DEPS: &str = "0.1.0-20250403.3";
 pub const PROTOC: &str = "27.1";
 
-flowey_request! {
-    pub struct Request {}
-}
+pub fn configure_versions(ctx: &mut ConfigCtx<'_>) {
+    ctx.set_once(flowey_lib_common::download_protoc::Version(PROTOC.into()));
 
-new_flow_node!(struct Node);
+    ctx.set_once(crate::download_openhcl_kernel_package::Versions {
+        dev: OPENHCL_KERNEL_DEV_VERSION.into(),
+        main: OPENHCL_KERNEL_STABLE_VERSION.into(),
+        cvm: OPENHCL_KERNEL_STABLE_VERSION.into(),
+        cvm_dev: OPENHCL_KERNEL_DEV_VERSION.into(),
+    });
 
-impl FlowNode for Node {
-    type Request = Request;
+    ctx.set_once(crate::download_lxutil::Version(LXUTIL.into()));
+    ctx.set_once(crate::download_openvmm_deps::Version(OPENVMM_DEPS.into()));
+    ctx.set_once(crate::download_uefi_mu_msvm::Version(MU_MSVM.into()));
+    ctx.set_once(flowey_lib_common::download_azcopy::Version(AZCOPY.into()));
+    ctx.set_once(flowey_lib_common::download_cargo_fuzz::Version(FUZZ.into()));
+    ctx.set_once(flowey_lib_common::download_cargo_nextest::Version(
+        NEXTEST.into(),
+    ));
+    ctx.set_once(flowey_lib_common::download_gh_cli::Version(GH_CLI.into()));
+    ctx.set_once(flowey_lib_common::download_mdbook::Version(MDBOOK.into()));
+    ctx.set_once(flowey_lib_common::download_mdbook_admonish::Version(
+        MDBOOK_ADMONISH.into(),
+    ));
+    ctx.set_once(flowey_lib_common::download_mdbook_mermaid::Version(
+        MDBOOK_MERMAID.into(),
+    ));
+    ctx.set_once(flowey_lib_common::install_azure_cli::Version(
+        AZURE_CLI.into(),
+    ));
+    ctx.set_once(flowey_lib_common::install_nodejs::Version(NODEJS.into()));
 
-    fn imports(ctx: &mut ImportCtx<'_>) {
-        ctx.import::<crate::download_lxutil::Node>();
-        ctx.import::<crate::download_openhcl_kernel_package::Node>();
-        ctx.import::<crate::download_openhcl_kernel_package::Node>();
-        ctx.import::<crate::download_openvmm_deps::Node>();
-        ctx.import::<crate::download_uefi_mu_msvm::Node>();
-        ctx.import::<flowey_lib_common::download_azcopy::Node>();
-        ctx.import::<flowey_lib_common::download_cargo_fuzz::Node>();
-        ctx.import::<flowey_lib_common::download_cargo_nextest::Node>();
-        ctx.import::<flowey_lib_common::download_gh_cli::Node>();
-        ctx.import::<flowey_lib_common::download_mdbook_admonish::Node>();
-        ctx.import::<flowey_lib_common::download_mdbook_mermaid::Node>();
-        ctx.import::<flowey_lib_common::download_mdbook::Node>();
-        ctx.import::<flowey_lib_common::download_protoc::Node>();
-        ctx.import::<flowey_lib_common::install_azure_cli::Node>();
-        ctx.import::<flowey_lib_common::install_nodejs::Node>();
-        ctx.import::<flowey_lib_common::install_rust::Node>();
-    }
-
-    #[rustfmt::skip]
-    fn emit(_requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        ctx.req(crate::download_lxutil::Request::Version(LXUTIL.into()));
-        ctx.req(crate::download_openhcl_kernel_package::Request::Version(OpenhclKernelPackageKind::Dev, OPENHCL_KERNEL_DEV_VERSION.into()));
-        ctx.req(crate::download_openhcl_kernel_package::Request::Version(OpenhclKernelPackageKind::Main, OPENHCL_KERNEL_STABLE_VERSION.into()));
-        ctx.req(crate::download_openhcl_kernel_package::Request::Version(OpenhclKernelPackageKind::Cvm, OPENHCL_KERNEL_STABLE_VERSION.into()));
-        ctx.req(crate::download_openhcl_kernel_package::Request::Version(OpenhclKernelPackageKind::CvmDev, OPENHCL_KERNEL_DEV_VERSION.into()));
-        ctx.req(crate::download_openvmm_deps::Request::Version(OPENVMM_DEPS.into()));
-        ctx.req(crate::download_uefi_mu_msvm::Request::Version(MU_MSVM.into()));
-        ctx.req(flowey_lib_common::download_azcopy::Request::Version(AZCOPY.into()));
-        ctx.req(flowey_lib_common::download_cargo_fuzz::Request::Version(FUZZ.into()));
-        ctx.req(flowey_lib_common::download_cargo_nextest::Request::Version(NEXTEST.into()));
-        ctx.req(flowey_lib_common::download_gh_cli::Request::Version(GH_CLI.into()));
-        ctx.req(flowey_lib_common::download_mdbook::Request::Version(MDBOOK.into()));
-        ctx.req(flowey_lib_common::download_mdbook_admonish::Request::Version(MDBOOK_ADMONISH.into()));
-        ctx.req(flowey_lib_common::download_mdbook_mermaid::Request::Version(MDBOOK_MERMAID.into()));
-        ctx.req(flowey_lib_common::download_protoc::Request::Version(PROTOC.into()));
-        ctx.req(flowey_lib_common::install_azure_cli::Request::Version(AZURE_CLI.into()));
-        ctx.req(flowey_lib_common::install_nodejs::Request::Version(NODEJS.into()));
-        if !matches!(ctx.backend(), FlowBackend::Ado) {
-            ctx.req(flowey_lib_common::install_rust::Request::Version(RUSTUP_TOOLCHAIN.into()));
-        }
-        Ok(())
+    if !matches!(ctx.backend_hint(), PipelineBackendHint::Ado) {
+        ctx.set_once(flowey_lib_common::install_rust::Version(
+            RUSTUP_TOOLCHAIN.into(),
+        ));
     }
 }

@@ -39,13 +39,14 @@ pub mod user_facing {
     pub use super::AdoResourcesRepositoryRef;
     pub use super::AdoResourcesRepositoryType;
     pub use super::AdoScheduleTriggers;
+    pub use super::BuildPipeline;
+    pub use super::ConfigCtx;
     pub use super::GhCiTriggers;
     pub use super::GhPrTriggers;
     pub use super::GhRunner;
     pub use super::GhRunnerOsLabel;
     pub use super::GhScheduleTriggers;
     pub use super::HostExt;
-    pub use super::IntoPipeline;
     pub use super::ParameterKind;
     pub use super::Pipeline;
     pub use super::PipelineBackendHint;
@@ -356,12 +357,12 @@ impl<T> Clone for UseTypedArtifact<T> {
     }
 }
 
-#[derive(Default)]
 pub struct Pipeline {
     jobs: Vec<PipelineJobMetadata>,
     artifacts: Vec<ArtifactMeta>,
     parameters: Vec<ParameterMeta>,
     extra_deps: BTreeSet<(usize, usize)>,
+    backend_hint: PipelineBackendHint,
     // builder internal
     artifact_names: BTreeSet<String>,
     dummy_done_idx: usize,
@@ -386,8 +387,37 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new() -> Pipeline {
-        Pipeline::default()
+    pub fn new(backend_hint: PipelineBackendHint) -> Pipeline {
+        Self {
+            jobs: Default::default(),
+            artifacts: Default::default(),
+            parameters: Default::default(),
+            extra_deps: Default::default(),
+            backend_hint,
+            artifact_names: Default::default(),
+            dummy_done_idx: Default::default(),
+            artifact_map_idx: Default::default(),
+            global_patchfns: Default::default(),
+            inject_all_jobs_with: Default::default(),
+            ado_name: Default::default(),
+            ado_job_id_overrides: Default::default(),
+            ado_schedule_triggers: Default::default(),
+            ado_ci_triggers: Default::default(),
+            ado_pr_triggers: Default::default(),
+            ado_resources_repository: Default::default(),
+            ado_bootstrap_template: Default::default(),
+            ado_variables: Default::default(),
+            ado_post_process_yaml_cb: Default::default(),
+            gh_name: Default::default(),
+            gh_schedule_triggers: Default::default(),
+            gh_ci_triggers: Default::default(),
+            gh_pr_triggers: Default::default(),
+            gh_bootstrap_template: Default::default(),
+        }
+    }
+
+    pub fn backend_hint(&self) -> PipelineBackendHint {
+        self.backend_hint
     }
 
     /// Inject all pipeline jobs with some common logic. (e.g: to resolve common
@@ -1026,12 +1056,30 @@ pub struct ConfigCtx<'a> {
 }
 
 impl ConfigCtx<'_> {
-    pub fn set<T: NodeConfig>(&mut self, value: T) {
-        self.pipeline.jobs[self.job_idx].config.set(value)
+    pub fn set_once<T: NodeConfig>(&mut self, value: T) {
+        let old_value = self.pipeline.jobs[self.job_idx].config.replace(value);
+        if old_value.is_some() {
+            panic!("job config {} already set", T::config_name());
+        }
     }
 
     pub fn get_mut<T: NodeConfig + Default>(&mut self) -> &mut T {
         self.pipeline.jobs[self.job_idx].config.get_mut()
+    }
+
+    pub fn backend_hint(&self) -> PipelineBackendHint {
+        self.pipeline.backend_hint
+    }
+
+    pub fn use_parameter<T>(&mut self, param: UseParameter<T>) -> ReadVar<T>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        PipelineJobCtx {
+            pipeline: self.pipeline,
+            job_idx: self.job_idx,
+        }
+        .use_parameter(param)
     }
 }
 
@@ -1288,8 +1336,8 @@ pub enum PipelineBackendHint {
     Github,
 }
 
-pub trait IntoPipeline {
-    fn into_pipeline(self, backend_hint: PipelineBackendHint) -> anyhow::Result<Pipeline>;
+pub trait BuildPipeline {
+    fn build_pipeline(self, pipeline: &mut Pipeline) -> anyhow::Result<()>;
 }
 
 fn new_parameter_name(name: impl AsRef<str>, kind: ParameterKind) -> String {
@@ -1423,6 +1471,7 @@ pub mod internal {
                 gh_pr_triggers,
                 gh_bootstrap_template,
                 // not relevant to consumer code
+                backend_hint: _,
                 dummy_done_idx: _,
                 artifact_map_idx: _,
                 artifact_names: _,

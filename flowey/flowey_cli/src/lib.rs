@@ -3,7 +3,7 @@
 
 #![expect(missing_docs)]
 
-use flowey_core::pipeline::IntoPipeline;
+use flowey_core::pipeline::BuildPipeline;
 use std::path::Path;
 
 mod cli;
@@ -12,7 +12,7 @@ mod pipeline_resolver;
 mod var_db;
 
 /// Entrypoint into generic flowey infrastructure.
-pub fn flowey_main<ProjectPipelines: clap::Subcommand + IntoPipeline>(
+pub fn flowey_main<ProjectPipelines: clap::Subcommand + BuildPipeline>(
     flowey_crate: &str,
     repo_root: &Path,
 ) -> ! {

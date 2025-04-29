@@ -6,6 +6,11 @@
 use flowey::node::prelude::*;
 use std::collections::BTreeMap;
 
+flowey_config! {
+    /// Specify version of the github release to pull from
+    pub struct Version(pub String);
+}
+
 #[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpenvmmDepsArch {
     X86_64,
@@ -14,8 +19,6 @@ pub enum OpenvmmDepsArch {
 
 flowey_request! {
     pub enum Request {
-        /// Specify version of the github release to pull from
-        Version(String),
         GetLinuxTestKernel(OpenvmmDepsArch, WriteVar<PathBuf>),
         GetLinuxTestInitrd(OpenvmmDepsArch, WriteVar<PathBuf>),
         GetOpenhclCpioDbgrd(OpenvmmDepsArch, WriteVar<PathBuf>),
@@ -35,7 +38,7 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
+        let version = ctx.config::<Version>().0.clone();
         let mut linux_test_kernel: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut linux_test_initrd: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut openhcl_cpio_dbgrd: BTreeMap<_, Vec<_>> = BTreeMap::new();
@@ -44,8 +47,6 @@ impl FlowNode for Node {
 
         for req in requests {
             match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
-
                 Request::GetLinuxTestKernel(arch, var) => {
                     linux_test_kernel.entry(arch).or_default().push(var)
                 }
@@ -63,8 +64,6 @@ impl FlowNode for Node {
                 }
             }
         }
-
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
 
         // -- end of req processing -- //
 

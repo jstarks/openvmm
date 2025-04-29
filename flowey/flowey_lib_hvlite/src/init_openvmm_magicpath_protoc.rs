@@ -21,7 +21,7 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let protoc_pkg = ctx.reqv(flowey_lib_common::download_protoc::Request::Get);
+        let protoc_pkg = ctx.reqv(flowey_lib_common::download_protoc::Request);
         let openvmm_magicpath = ctx.reqv(crate::cfg_openvmm_magicpath::Request);
 
         ctx.emit_rust_step("symlink protoc", move |ctx| {

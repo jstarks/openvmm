@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 /// A trait for types that can be used as node configuration.
-pub trait NodeConfig: Any + Serialize + DeserializeOwned + Default {
+pub trait NodeConfig: Any + Serialize + DeserializeOwned {
     #[doc(hidden)]
     fn config_name() -> &'static str;
 
@@ -44,8 +44,12 @@ impl<T: NodeConfig> DynConfig for T {
 pub struct ConfigBuilder(BTreeMap<&'static str, Box<dyn DynConfig>>);
 
 impl ConfigBuilder {
-    pub(crate) fn set<T: NodeConfig>(&mut self, value: T) {
-        self.0.insert(T::config_name(), Box::new(value));
+    pub(crate) fn replace<T: NodeConfig>(&mut self, value: T) -> Option<T> {
+        self.0.insert(T::config_name(), Box::new(value)).map(|v| {
+            *(v as Box<dyn Any>)
+                .downcast()
+                .expect("duplicate config names")
+        })
     }
 
     pub(crate) fn get_mut<T: NodeConfig + Default>(&mut self) -> &mut T {
@@ -73,22 +77,33 @@ impl ConfigBuilder {
 #[derive(Debug, Clone, Default)]
 pub struct ConfigMap(Rc<RefCell<BTreeMap<String, ConfigEntry>>>);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ConfigEntry {
     Json(serde_json::Value),
     Value(Rc<dyn DynConfig>),
 }
 
 impl ConfigMap {
-    pub(crate) fn get<T: NodeConfig>(&self) -> Rc<T> {
+    pub(crate) fn get<T: NodeConfig + Default>(&self) -> Rc<T> {
         let mut config = self.0.borrow_mut();
-        let entry = config
+        config
             .entry(T::config_name().into())
-            .or_insert_with(|| ConfigEntry::Value(Rc::new(T::default())));
-        match entry {
+            .or_insert_with(|| ConfigEntry::Value(Rc::new(T::default())))
+            .value()
+    }
+
+    pub(crate) fn try_get<T: NodeConfig>(&self) -> Option<Rc<T>> {
+        let mut config = self.0.borrow_mut();
+        Some(config.get_mut(T::config_name())?.value())
+    }
+}
+
+impl ConfigEntry {
+    fn value<T: NodeConfig>(&mut self) -> Rc<T> {
+        match self {
             ConfigEntry::Json(items) => {
                 let v = Rc::new(T::deserialize(&*items).unwrap());
-                *entry = ConfigEntry::Value(v.clone());
+                *self = ConfigEntry::Value(v.clone());
                 v
             }
             ConfigEntry::Value(any) => Rc::downcast(any.clone()).ok().unwrap(),

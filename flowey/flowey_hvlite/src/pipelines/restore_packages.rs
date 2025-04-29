@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::pipelines_shared::cfg_common_params::CommonArchCli;
+use crate::pipelines_shared::cfg_common_params::LocalRunArgs;
 use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 
@@ -14,37 +15,37 @@ pub struct RestorePackagesCli {
     arch: Vec<CommonArchCli>,
 }
 
-impl IntoPipeline for RestorePackagesCli {
-    fn into_pipeline(self, backend_hint: PipelineBackendHint) -> anyhow::Result<Pipeline> {
+impl BuildPipeline for RestorePackagesCli {
+    fn build_pipeline(self, pipeline: &mut Pipeline) -> anyhow::Result<()> {
         let openvmm_repo = flowey_lib_common::git_checkout::RepoSource::ExistingClone(
             ReadVar::from_static(crate::repo_root()),
         );
 
-        let mut pipeline = Pipeline::new();
+        let cfg_common_params = crate::pipelines_shared::cfg_common_params::get_cfg_common_params(
+            pipeline,
+            Some(LocalRunArgs {
+                verbose: true,
+                locked: false,
+                auto_install_deps: true,
+                non_interactive: false,
+                force_nuget_mono: false,
+                external_nuget_auth: false,
+            }),
+        )?;
+
+        let backend_hint = pipeline.backend_hint();
         let mut job = pipeline
             .new_job(
                 FlowPlatform::host(backend_hint),
                 FlowArch::host(backend_hint),
                 "restore packages",
             )
-            .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request {})
+            .configure(cfg_common_params)
             .dep_on(
                 |_| flowey_lib_hvlite::_jobs::cfg_hvlite_reposource::Params {
                     hvlite_repo_source: openvmm_repo,
                 },
-            )
-            .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_common::Params {
-                local_only: Some(flowey_lib_hvlite::_jobs::cfg_common::LocalOnlyParams {
-                    interactive: true,
-                    auto_install: true,
-                    force_nuget_mono: false,
-                    external_nuget_auth: false,
-                    ignore_rust_version: true,
-                }),
-                verbose: ReadVar::from_static(true),
-                locked: false,
-                deny_warnings: false,
-            });
+            );
 
         let arches = {
             if self.arch.is_empty() {
@@ -63,6 +64,6 @@ impl IntoPipeline for RestorePackagesCli {
             );
         }
         job.finish();
-        Ok(pipeline)
+        Ok(())
     }
 }

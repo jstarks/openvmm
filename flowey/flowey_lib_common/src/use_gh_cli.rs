@@ -10,10 +10,13 @@
 use flowey::node::prelude::*;
 use std::io::Write;
 
+flowey_config! {
+    /// Prompt user to log-in interactively.
+    pub struct LocalOnlyInteractive(pub bool);
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum GhCliAuth<C = VarNotClaimed> {
-    /// Prompt user to log-in interactively.
-    LocalOnlyInteractive,
     /// Set the value of the `GITHUB_TOKEN` environment variable to the
     /// specified runtime String when invoking the `gh` CLI.
     AuthToken(ReadVar<String, C>),
@@ -24,7 +27,6 @@ impl ClaimVar for GhCliAuth {
 
     fn claim(self, ctx: &mut StepCtx<'_>) -> Self::Claimed {
         match self {
-            GhCliAuth::LocalOnlyInteractive => GhCliAuth::LocalOnlyInteractive,
             GhCliAuth::AuthToken(v) => GhCliAuth::AuthToken(v.claim(ctx)),
         }
     }
@@ -50,13 +52,14 @@ impl FlowNode for Node {
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let mut get_reqs = Vec::new();
-        let mut with_auth_interactive = false;
+        let with_auth_interactive = ctx
+            .try_config::<LocalOnlyInteractive>()
+            .map_or(false, |v| v.0);
         let mut with_auth_token = None;
 
         for req in requests {
             match req {
                 Request::WithAuth(v) => match v {
-                    GhCliAuth::LocalOnlyInteractive => with_auth_interactive = true,
                     GhCliAuth::AuthToken(v) => {
                         same_across_all_reqs_backing_var("WithAuth", &mut with_auth_token, v)?
                     }
@@ -67,8 +70,8 @@ impl FlowNode for Node {
 
         let get_reqs = get_reqs;
         let auth = match (with_auth_interactive, with_auth_token) {
-            (true, None) => GhCliAuth::LocalOnlyInteractive,
-            (false, Some(v)) => GhCliAuth::AuthToken(v),
+            (true, None) => None,
+            (false, Some(v)) => Some(GhCliAuth::AuthToken(v)),
             (true, Some(_)) => {
                 anyhow::bail!("`WithAuth` must be consistent across requests")
             }
@@ -78,14 +81,14 @@ impl FlowNode for Node {
         // -- end of req processing -- //
 
         if get_reqs.is_empty() {
-            if let GhCliAuth::AuthToken(tok) = auth {
+            if let Some(GhCliAuth::AuthToken(tok)) = auth {
                 tok.claim_unused(ctx);
             }
             return Ok(());
         }
 
         if !matches!(ctx.backend(), FlowBackend::Local) {
-            if matches!(auth, GhCliAuth::LocalOnlyInteractive) {
+            if auth.is_none() {
                 anyhow::bail!("cannot use interactive auth on a non-local backend")
             }
         }
@@ -101,8 +104,8 @@ impl FlowNode for Node {
 
                 let gh_bin_path = rt.read(gh_bin_path).display().to_string();
                 let gh_token = match auth {
-                    GhCliAuth::LocalOnlyInteractive => String::new(),
-                    GhCliAuth::AuthToken(tok) => rt.read(tok),
+                    None => String::new(),
+                    Some(GhCliAuth::AuthToken(tok)) => rt.read(tok),
                 };
                 // only set GITHUB_TOKEN if there is a value to set it to, otherwise
                 // let the user's environment take precedence over authenticating interactively

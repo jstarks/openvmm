@@ -11,9 +11,6 @@ flowey_request! {
     pub enum Request {
         /// Ensure that Git was installed and is available on $PATH
         EnsureInstalled(WriteVar<SideEffect>),
-
-        /// Automatically install Git
-        LocalOnlyAutoInstall(bool),
     }
 }
 
@@ -26,22 +23,16 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
+        let auto_install = ctx.config::<crate::_config::AutoInstall>().0;
         let mut ensure_installed = Vec::new();
-        let mut auto_install = None;
 
         for req in requests {
             match req {
                 Request::EnsureInstalled(v) => ensure_installed.push(v),
-                Request::LocalOnlyAutoInstall(v) => {
-                    same_across_all_reqs("LocalOnlyAutoInstall", &mut auto_install, v)?
-                }
             }
         }
 
         let ensure_installed = ensure_installed;
-        let auto_install = auto_install.ok_or(anyhow::anyhow!(
-            "Missing essential request: LocalOnlyAutoInstall",
-        ))?;
 
         // -- end of req processing -- //
 

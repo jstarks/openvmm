@@ -128,7 +128,6 @@ enum RunKindDeps<C = VarNotClaimed> {
         params: build_params::NextestBuildParams<C>,
         nextest_installed: ReadVar<SideEffect, C>,
         rust_toolchain: ReadVar<Option<String>, C>,
-        cargo_flags: ReadVar<crate::cfg_cargo_common_flags::Flags, C>,
     },
     RunFromArchive {
         archive_file: ReadVar<PathBuf, C>,
@@ -142,12 +141,14 @@ impl FlowNode for Node {
     type Request = Request;
 
     fn imports(ctx: &mut ImportCtx<'_>) {
-        ctx.import::<crate::cfg_cargo_common_flags::Node>();
         ctx.import::<crate::download_cargo_nextest::Node>();
         ctx.import::<crate::install_rust::Node>();
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
+        let verbose = ctx.config::<crate::_config::Verbose>().0.clone();
+        let locked = ctx.config::<crate::_config::PackagesLocked>().0;
+
         let mut run = Vec::new();
         let mut fail_fast = None;
         let mut terminate_job_on_fail = None;
@@ -183,8 +184,6 @@ impl FlowNode for Node {
         {
             let run_kind_deps = match run_kind {
                 NextestRunKind::BuildAndRun(params) => {
-                    let cargo_flags = ctx.reqv(crate::cfg_cargo_common_flags::Request::GetFlags);
-
                     let nextest_installed =
                         ctx.reqv(crate::download_cargo_nextest::Request::InstallWithCargo);
 
@@ -198,7 +197,6 @@ impl FlowNode for Node {
                         params,
                         nextest_installed,
                         rust_toolchain,
-                        cargo_flags,
                     }
                 }
                 NextestRunKind::RunFromArchive(archive_file) => {
@@ -228,6 +226,7 @@ impl FlowNode for Node {
                 let extra_env = extra_env.claim(ctx);
                 let all_tests_passed_var = all_tests_passed_write.claim(ctx);
                 let junit_xml_write = junit_xml_write.claim(ctx);
+                let verbose = verbose.clone().claim(ctx);
                 move |rt| {
                     let working_dir = rt.read(working_dir);
                     let config_file = rt.read(config_file);
@@ -281,10 +280,10 @@ impl FlowNode for Node {
                                 },
                             nextest_installed: _, // side-effect
                             rust_toolchain,
-                            cargo_flags,
                         } => {
                             let (mut build_args, build_env) = cargo_nextest_build_args_and_env(
-                                rt.read(cargo_flags),
+                                locked,
+                                rt.read(verbose),
                                 profile,
                                 target,
                                 rt.read(packages),
@@ -569,7 +568,8 @@ impl FlowNode for Node {
 
 // shared with `cargo_nextest_archive`
 pub(crate) fn cargo_nextest_build_args_and_env(
-    cargo_flags: crate::cfg_cargo_common_flags::Flags,
+    locked: bool,
+    verbose: bool,
     cargo_profile: CargoBuildProfile,
     target: target_lexicon::Triple,
     packages: build_params::TestPackages,
@@ -578,8 +578,8 @@ pub(crate) fn cargo_nextest_build_args_and_env(
     no_default_features: bool,
     mut extra_env: BTreeMap<String, String>,
 ) -> (Vec<String>, BTreeMap<String, String>) {
-    let locked = cargo_flags.locked.then_some("--locked");
-    let verbose = cargo_flags.verbose.then_some("--verbose");
+    let locked = locked.then_some("--locked");
+    let verbose = verbose.then_some("--verbose");
     let cargo_profile = match &cargo_profile {
         CargoBuildProfile::Debug => "dev",
         CargoBuildProfile::Release => "release",
@@ -694,12 +694,10 @@ impl RunKindDeps {
                 params,
                 nextest_installed,
                 rust_toolchain,
-                cargo_flags,
             } => RunKindDeps::BuildAndRun {
                 params: params.claim(ctx),
                 nextest_installed: nextest_installed.claim(ctx),
                 rust_toolchain: rust_toolchain.claim(ctx),
-                cargo_flags: cargo_flags.claim(ctx),
             },
             RunKindDeps::RunFromArchive {
                 archive_file,

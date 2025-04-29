@@ -12,12 +12,13 @@ pub struct ProtocPackage {
 }
 
 flowey_request! {
-    pub enum Request {
-        /// What version to download (e.g: 27.1)
-        Version(String),
-        /// Return paths to items in the protoc package
-        Get(WriteVar<ProtocPackage>),
-    }
+    /// Return paths to items in the protoc package
+    pub struct Request(pub WriteVar<ProtocPackage>);
+}
+
+flowey_config! {
+    /// The version of `protoc` to download (e.g: 27.1)
+    pub struct Version(pub String);
 }
 
 new_flow_node!(struct Node);
@@ -32,17 +33,9 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
-        let mut get_reqs = Vec::new();
-
-        for req in requests {
-            match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
-                Request::Get(v) => get_reqs.push(v),
-            }
-        }
-
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
+        let version = ctx.try_config::<Version>().context("missing Version")?;
+        let version = &version.0;
+        let get_reqs = requests.into_iter().map(|v| v.0).collect::<Vec<_>>();
 
         // -- end of req processing -- //
 

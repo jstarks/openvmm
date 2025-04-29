@@ -4,6 +4,7 @@
 //! See [`CustomVmfirmwareigvmDllCli`]
 
 use crate::pipelines_shared::cfg_common_params::CommonArchCli;
+use crate::pipelines_shared::cfg_common_params::LocalRunArgs;
 use anyhow::Context;
 use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
@@ -32,8 +33,9 @@ pub struct CustomVmfirmwareigvmDllCli {
     pub arch: Option<CommonArchCli>,
 }
 
-impl IntoPipeline for CustomVmfirmwareigvmDllCli {
-    fn into_pipeline(self, backend_hint: PipelineBackendHint) -> anyhow::Result<Pipeline> {
+impl BuildPipeline for CustomVmfirmwareigvmDllCli {
+    fn build_pipeline(self, pipeline: &mut Pipeline) -> anyhow::Result<()> {
+        let backend_hint = pipeline.backend_hint();
         if !matches!(backend_hint, PipelineBackendHint::Local) {
             anyhow::bail!("build-igvm is for local use only")
         }
@@ -58,9 +60,19 @@ impl IntoPipeline for CustomVmfirmwareigvmDllCli {
             ReadVar::from_static(crate::repo_root()),
         );
 
-        let mut pipeline = Pipeline::new();
-
         let (pub_out_dir, _) = pipeline.new_artifact("custom-vmfirmwareigvm-dll");
+
+        let cfg_common_params = crate::pipelines_shared::cfg_common_params::get_cfg_common_params(
+            pipeline,
+            Some(LocalRunArgs {
+                verbose: false,
+                locked: false,
+                auto_install_deps: false,
+                non_interactive: false,
+                force_nuget_mono: false,
+                external_nuget_auth: false,
+            }),
+        )?;
 
         pipeline
             .new_job(
@@ -68,24 +80,12 @@ impl IntoPipeline for CustomVmfirmwareigvmDllCli {
                 FlowArch::host(backend_hint),
                 "custom-vmfirmwareigvm-dll",
             )
-            .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request {})
+            .configure(cfg_common_params)
             .dep_on(
                 |_| flowey_lib_hvlite::_jobs::cfg_hvlite_reposource::Params {
                     hvlite_repo_source: openvmm_repo,
                 },
             )
-            .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_common::Params {
-                local_only: Some(flowey_lib_hvlite::_jobs::cfg_common::LocalOnlyParams {
-                    interactive: true,
-                    auto_install: false,
-                    force_nuget_mono: false, // no oss nuget packages
-                    external_nuget_auth: false,
-                    ignore_rust_version: true,
-                }),
-                verbose: ReadVar::from_static(false),
-                locked: false,
-                deny_warnings: false,
-            })
             .dep_on(
                 |ctx| flowey_lib_hvlite::_jobs::local_custom_vmfirmwareigvm_dll::Params {
                     arch: arch.into(),
@@ -96,6 +96,6 @@ impl IntoPipeline for CustomVmfirmwareigvmDllCli {
             )
             .finish();
 
-        Ok(pipeline)
+        Ok(())
     }
 }

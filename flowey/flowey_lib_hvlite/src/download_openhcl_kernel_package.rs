@@ -6,6 +6,15 @@
 use flowey::node::prelude::*;
 use std::collections::BTreeMap;
 
+flowey_config! {
+    pub struct Versions {
+        pub main: String,
+        pub cvm: String,
+        pub dev: String,
+        pub cvm_dev: String,
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpenhclKernelPackageKind {
     Main,
@@ -22,8 +31,6 @@ pub enum OpenhclKernelPackageArch {
 
 flowey_request! {
     pub enum Request {
-        /// Specify version string to use for each package kind
-        Version(OpenhclKernelPackageKind, String),
         /// Download the specified kernel package
         GetPackage {
             kind: OpenhclKernelPackageKind,
@@ -44,7 +51,7 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut versions: BTreeMap<OpenhclKernelPackageKind, String> = BTreeMap::new();
+        let versions = ctx.config::<Versions>();
         let mut reqs: BTreeMap<
             (OpenhclKernelPackageKind, OpenhclKernelPackageArch),
             Vec<WriteVar<PathBuf>>,
@@ -52,21 +59,20 @@ impl FlowNode for Node {
 
         for req in requests {
             match req {
-                Request::Version(arch, v) => {
-                    let mut old = versions.insert(arch, v.clone());
-                    same_across_all_reqs("SetVersion", &mut old, v)?
-                }
                 Request::GetPackage { kind, arch, pkg } => {
                     reqs.entry((kind, arch)).or_default().push(pkg)
                 }
             }
         }
 
-        for req_kind in reqs.keys().map(|(k, _)| k) {
-            if !versions.contains_key(req_kind) {
-                anyhow::bail!("missing SetVersion for {:?}", req_kind)
-            }
-        }
+        let versions = [
+            (OpenhclKernelPackageKind::Main, versions.main.clone()),
+            (OpenhclKernelPackageKind::Cvm, versions.cvm.clone()),
+            (OpenhclKernelPackageKind::Dev, versions.dev.clone()),
+            (OpenhclKernelPackageKind::CvmDev, versions.cvm_dev.clone()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
 
         // -- end of req processing -- //
 

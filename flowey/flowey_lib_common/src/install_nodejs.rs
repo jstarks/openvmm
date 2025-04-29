@@ -5,14 +5,13 @@
 
 use flowey::node::prelude::*;
 
+flowey_config! {
+    /// Which version of nodejs to install (e.g: `6.0.0`)
+    pub struct Version(pub String);
+}
+
 flowey_request! {
     pub enum Request {
-        /// Automatically install all required nodejs tools and components.
-        ///
-        /// This must be set to true/false when running locally.
-        AutoInstall(bool),
-        /// Which version of nodejs to install (e.g: `6.0.0`)
-        Version(String),
         /// Ensure node is installed
         EnsureInstalled(WriteVar<SideEffect>),
     }
@@ -28,16 +27,12 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut auto_install = None;
-        let mut version = None;
+        let auto_install = ctx.config::<crate::_config::AutoInstall>().0;
+        let version = ctx.config::<Version>().0.clone();
         let mut done = Vec::new();
 
         for req in requests {
             match req {
-                Request::AutoInstall(v) => {
-                    same_across_all_reqs("AutoInstall", &mut auto_install, v)?
-                }
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::EnsureInstalled(v) => done.push(v),
             }
         }
@@ -48,17 +43,12 @@ impl FlowNode for Node {
             return Ok(());
         }
 
-        let auto_install = auto_install;
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: NodeVersion"))?;
         let done = done;
 
         // -- end of req processing -- //
 
         let is_installed = match ctx.backend() {
             FlowBackend::Local => {
-                let auto_install = auto_install
-                    .ok_or(anyhow::anyhow!("Missing essential request: AutoInstall"))?;
-
                 let check_nodejs_install = {
                     move |_: &mut RustRuntimeServices<'_>| {
                         if which::which("node").is_err() {
@@ -105,7 +95,7 @@ impl FlowNode for Node {
                 }
             }
             FlowBackend::Ado => {
-                if !auto_install.unwrap_or(true) {
+                if !auto_install {
                     anyhow::bail!("AutoInstall must be `true` when running on ADO")
                 }
 
@@ -128,7 +118,7 @@ impl FlowNode for Node {
                 did_install
             }
             FlowBackend::Github => {
-                if !auto_install.unwrap_or(true) {
+                if !auto_install {
                     anyhow::bail!("AutoInstall must be `true` when running on Github")
                 }
 

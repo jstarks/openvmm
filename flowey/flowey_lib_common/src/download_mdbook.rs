@@ -5,10 +5,13 @@
 
 use flowey::node::prelude::*;
 
+flowey_config! {
+    /// Version of `mdbook` to install
+    pub struct Version(pub String);
+}
+
 flowey_request! {
     pub enum Request {
-        /// Version of `mdbook` to install
-        Version(String),
         /// Get a path to `mdbook`
         GetMdbook(WriteVar<PathBuf>),
     }
@@ -25,17 +28,15 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
+        let version = ctx.config::<Version>().0.clone();
         let mut get_mdbook = Vec::new();
 
         for req in requests {
             match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::GetMdbook(v) => get_mdbook.push(v),
             }
         }
 
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
         let get_mdbook = get_mdbook;
 
         // -- end of req processing -- //

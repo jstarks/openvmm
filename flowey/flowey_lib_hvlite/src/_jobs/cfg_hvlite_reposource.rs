@@ -25,17 +25,6 @@ impl SimpleFlowNode for Node {
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let Params { hvlite_repo_source } = request;
 
-        if matches!(ctx.backend(), FlowBackend::Local) {
-            ctx.req(
-                flowey_lib_common::git_checkout::Request::LocalOnlyRequireExistingClones(
-                    !matches!(
-                        hvlite_repo_source,
-                        flowey_lib_common::git_checkout::RepoSource::LocalOnlyNewClone { .. }
-                    ),
-                ),
-            );
-        }
-
         ctx.req(flowey_lib_common::git_checkout::Request::RegisterRepo {
             repo_id: "openvmm".into(),
             repo_src: hvlite_repo_source,

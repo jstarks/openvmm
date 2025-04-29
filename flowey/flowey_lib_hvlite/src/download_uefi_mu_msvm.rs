@@ -6,6 +6,11 @@
 use flowey::node::prelude::*;
 use std::collections::BTreeMap;
 
+flowey_config! {
+    /// Specify version of mu_msvm to use
+    pub struct Version(pub String);
+}
+
 #[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MuMsvmArch {
     X86_64,
@@ -14,8 +19,6 @@ pub enum MuMsvmArch {
 
 flowey_request! {
     pub enum Request {
-        /// Specify version of mu_msvm to use
-        Version(String),
         /// Download the mu_msvm package for the given arch
         GetMsvmFd {
             arch: MuMsvmArch,
@@ -35,17 +38,14 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
+        let version = ctx.config::<Version>().0.clone();
         let mut reqs: BTreeMap<MuMsvmArch, Vec<WriteVar<PathBuf>>> = BTreeMap::new();
 
         for req in requests {
             match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::GetMsvmFd { arch, msvm_fd } => reqs.entry(arch).or_default().push(msvm_fd),
             }
         }
-
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
 
         // -- end of req processing -- //
 

@@ -35,8 +35,8 @@ pub enum OpenvmmPipelinesCi {
     CheckinGates(checkin_gates::CheckinGatesCli),
 }
 
-impl IntoPipeline for OpenvmmPipelines {
-    fn into_pipeline(self, pipeline_hint: PipelineBackendHint) -> anyhow::Result<Pipeline> {
+impl BuildPipeline for OpenvmmPipelines {
+    fn build_pipeline(self, pipeline: &mut Pipeline) -> anyhow::Result<()> {
         match self {
             OpenvmmPipelines::Regen { args } => {
                 std::process::Command::new("cargo")
@@ -55,13 +55,13 @@ impl IntoPipeline for OpenvmmPipelines {
                 std::process::exit(0)
             }
 
-            OpenvmmPipelines::BuildIgvm(cmd) => cmd.into_pipeline(pipeline_hint),
-            OpenvmmPipelines::CustomVmfirmwareigvmDll(cmd) => cmd.into_pipeline(pipeline_hint),
+            OpenvmmPipelines::BuildIgvm(cmd) => cmd.build_pipeline(pipeline),
+            OpenvmmPipelines::CustomVmfirmwareigvmDll(cmd) => cmd.build_pipeline(pipeline),
 
             OpenvmmPipelines::Ci(cmd) => match cmd {
-                OpenvmmPipelinesCi::CheckinGates(cmd) => cmd.into_pipeline(pipeline_hint),
+                OpenvmmPipelinesCi::CheckinGates(cmd) => cmd.build_pipeline(pipeline),
             },
-            OpenvmmPipelines::RestorePackages(cmd) => cmd.into_pipeline(pipeline_hint),
+            OpenvmmPipelines::RestorePackages(cmd) => cmd.build_pipeline(pipeline),
         }
     }
 }

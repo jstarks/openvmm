@@ -10,25 +10,21 @@ use std::io::Write;
 
 new_flow_node!(struct Node);
 
+flowey_config! {
+    /// Ignore the Version requirement, and build using whatever version of
+    /// the Rust toolchain the user has installed locally.
+    pub struct IgnoreVersion(pub bool);
+
+    /// Install a specific Rust toolchain version.
+    // FUTURE: support installing / using multiple versions of the Rust
+    // toolchain at the same time, e.g: for stable and nightly, or to
+    // support regression tests between a pinned rust version and current
+    // stable.
+    pub struct Version(pub String);
+}
+
 flowey_request! {
     pub enum Request {
-        /// Automatically install all required Rust tools and components.
-        ///
-        /// If false - will check for pre-existing Rust installation, and fail
-        /// if it doesn't meet the current job's requirements.
-        AutoInstall(bool),
-
-        /// Ignore the Version requirement, and build using whatever version of
-        /// the Rust toolchain the user has installed locally.
-        IgnoreVersion(bool),
-
-        /// Install a specific Rust toolchain version.
-        // FUTURE: support installing / using multiple versions of the Rust
-        // toolchain at the same time, e.g: for stable and nightly, or to
-        // support regression tests between a pinned rust version and current
-        // stable.
-        Version(String),
-
         /// Specify an additional target-triple to install the toolchain for.
         ///
         /// By default, only the native target will be installed.
@@ -63,9 +59,6 @@ impl FlowNode for Node {
         }
 
         let mut ensure_installed = Vec::new();
-        let mut rust_toolchain = None;
-        let mut auto_install = None;
-        let mut ignore_version = None;
         let mut additional_target_triples = BTreeSet::new();
         let mut additional_components = BTreeSet::new();
         let mut get_rust_toolchain = Vec::new();
@@ -74,13 +67,6 @@ impl FlowNode for Node {
         for req in requests {
             match req {
                 Request::EnsureInstalled(v) => ensure_installed.push(v),
-                Request::AutoInstall(v) => {
-                    same_across_all_reqs("AutoInstall", &mut auto_install, v)?
-                }
-                Request::IgnoreVersion(v) => {
-                    same_across_all_reqs("IgnoreVersion", &mut ignore_version, v)?
-                }
-                Request::Version(v) => same_across_all_reqs("Version", &mut rust_toolchain, v)?,
                 Request::InstallTargetTriple(s) => {
                     additional_target_triples.insert(s.to_string());
                 }
@@ -93,18 +79,21 @@ impl FlowNode for Node {
         }
 
         let ensure_installed = ensure_installed;
-        let auto_install =
-            auto_install.ok_or(anyhow::anyhow!("Missing essential request: AutoInstall",))?;
+        let auto_install = ctx.config_or_default::<crate::_config::AutoInstall>().0;
         if !auto_install && matches!(ctx.backend(), FlowBackend::Github) {
             anyhow::bail!("`AutoInstall` must be true when using the Github backend");
         }
-        let ignore_version =
-            ignore_version.ok_or(anyhow::anyhow!("Missing essential request: IgnoreVersion",))?;
+        let ignore_version = ctx
+            .try_config::<IgnoreVersion>()
+            .ok_or(anyhow::anyhow!("Missing essential request: IgnoreVersion",))?
+            .0;
         if ignore_version && matches!(ctx.backend(), FlowBackend::Github) {
             anyhow::bail!("`IgnoreVersion` must be false when using the Github backend");
         }
-        let rust_toolchain =
-            rust_toolchain.ok_or(anyhow::anyhow!("Missing essential request: RustToolchain"))?;
+        let rust_toolchain = ctx
+            .try_config::<Version>()
+            .ok_or(anyhow::anyhow!("Missing essential request: RustToolchain"))?;
+        let rust_toolchain = rust_toolchain.0.clone();
         let additional_target_triples = additional_target_triples;
         let additional_components = additional_components;
         let get_rust_toolchain = get_rust_toolchain;
@@ -338,7 +327,7 @@ impl FlowNode for Node {
 
                 move |rt| {
                     let rust_toolchain = match rust_toolchain {
-                        Some(toolchain) => Some(toolchain),
+                        Some(toolchain) => Some(toolchain.clone()),
                         None => {
                             let sh = xshell::Shell::new()?;
                             if let Ok(rustup) = which::which("rustup") {

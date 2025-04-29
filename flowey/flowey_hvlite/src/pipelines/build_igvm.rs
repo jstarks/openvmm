@@ -3,6 +3,7 @@
 
 //! See [`BuildIgvmCli`]
 
+use crate::pipelines_shared::cfg_common_params::LocalRunArgs;
 use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 use flowey_lib_hvlite::build_openhcl_igvm_from_recipe::OpenhclIgvmRecipe;
@@ -215,9 +216,9 @@ pub fn bail_if_running_in_ci() -> anyhow::Result<()> {
     Ok(())
 }
 
-impl IntoPipeline for BuildIgvmCli {
-    fn into_pipeline(self, backend_hint: PipelineBackendHint) -> anyhow::Result<Pipeline> {
-        if !matches!(backend_hint, PipelineBackendHint::Local) {
+impl BuildPipeline for BuildIgvmCli {
+    fn build_pipeline(self, pipeline: &mut Pipeline) -> anyhow::Result<()> {
+        if !matches!(pipeline.backend_hint(), PipelineBackendHint::Local) {
             anyhow::bail!("build-igvm is for local use only")
         }
 
@@ -264,34 +265,32 @@ impl IntoPipeline for BuildIgvmCli {
             );
         }
 
-        let mut pipeline = Pipeline::new();
-
         let (pub_out_dir, _) = pipeline.new_artifact("build-igvm");
+
+        let cfg_common_params = crate::pipelines_shared::cfg_common_params::get_cfg_common_params(
+            pipeline,
+            Some(LocalRunArgs {
+                verbose,
+                locked,
+                auto_install_deps: install_missing_deps,
+                non_interactive: false,
+                force_nuget_mono: false,
+                external_nuget_auth: false,
+            }),
+        )?;
 
         pipeline
             .new_job(
-                FlowPlatform::host(backend_hint),
-                FlowArch::host(backend_hint),
+                FlowPlatform::host(pipeline.backend_hint()),
+                FlowArch::host(pipeline.backend_hint()),
                 "build-igvm",
             )
-            .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request {})
+            .configure(cfg_common_params)
             .dep_on(
                 |_| flowey_lib_hvlite::_jobs::cfg_hvlite_reposource::Params {
                     hvlite_repo_source: openvmm_repo,
                 },
             )
-            .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_common::Params {
-                local_only: Some(flowey_lib_hvlite::_jobs::cfg_common::LocalOnlyParams {
-                    interactive: true,
-                    auto_install: install_missing_deps,
-                    force_nuget_mono: false, // no oss nuget packages
-                    external_nuget_auth: false,
-                    ignore_rust_version: true,
-                }),
-                verbose: ReadVar::from_static(verbose),
-                locked,
-                deny_warnings: false,
-            })
             .dep_on(|ctx| flowey_lib_hvlite::_jobs::local_build_igvm::Params {
                 artifact_dir: ctx.publish_artifact(pub_out_dir),
                 done: ctx.new_done_handle(),
@@ -341,6 +340,6 @@ impl IntoPipeline for BuildIgvmCli {
             })
             .finish();
 
-        Ok(pipeline)
+        Ok(())
     }
 }

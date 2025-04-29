@@ -6,10 +6,13 @@
 use crate::cache::CacheHit;
 use flowey::node::prelude::*;
 
+flowey_config! {
+    /// Version of `cargo fuzz` to install (e.g: "0.12.0")
+    pub struct Version(pub String);
+}
+
 flowey_request! {
     pub enum Request {
-        /// Version of `cargo fuzz` to install (e.g: "0.12.0")
-        Version(String),
         /// Install `cargo-fuzz` as a `cargo` extension (invoked via `cargo fuzz`).
         InstallWithCargo(WriteVar<SideEffect>),
     }
@@ -27,17 +30,15 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
+        let version = ctx.config::<Version>().0.clone();
         let mut install_with_cargo = Vec::new();
 
         for req in requests {
             match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::InstallWithCargo(v) => install_with_cargo.push(v),
             }
         }
 
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
         let install_with_cargo = install_with_cargo;
 
         // -- end of req processing -- //

@@ -5,9 +5,12 @@
 
 use flowey::node::prelude::*;
 
+flowey_config! {
+    pub struct DenyWarnings(pub bool);
+}
+
 flowey_request! {
     pub enum Request {
-        DenyWarnings(bool),
         Done(WriteVar<SideEffect>),
     }
 }
@@ -23,19 +26,13 @@ impl FlowNode for Node {
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let mut done = Vec::new();
-        let mut deny_warnings = None;
+        let deny_warnings = ctx.config::<DenyWarnings>().0;
 
         for req in requests {
             match req {
                 Request::Done(v) => done.push(v),
-                Request::DenyWarnings(v) => {
-                    same_across_all_reqs("DenyWarnings", &mut deny_warnings, v)?
-                }
             }
         }
-
-        let deny_warnings =
-            deny_warnings.ok_or(anyhow::anyhow!("Missing essential request: DenyWarnings"))?;
 
         // -- end of req processing -- //
 

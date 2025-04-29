@@ -9,6 +9,11 @@
 use flowey::node::prelude::*;
 use std::collections::BTreeMap;
 
+flowey_config! {
+    /// Specify the version of lxutil to use
+    pub struct Version(pub String);
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct LxutilPackage {
     pub lxutil_dll: PathBuf,
@@ -25,8 +30,6 @@ pub enum LxutilArch {
 
 flowey_request! {
     pub enum Request {
-        /// Specify version of lxutil to use
-        Version(String),
         /// Download the lxutil package for the given arch
         GetPackage {
             arch: LxutilArch,
@@ -46,17 +49,14 @@ impl FlowNode for Node {
     }
 
     fn emit(requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
-        let mut version = None;
+        let version = ctx.config::<Version>().0.clone();
         let mut reqs: BTreeMap<LxutilArch, Vec<WriteVar<LxutilPackage>>> = BTreeMap::new();
 
         for req in requests {
             match req {
-                Request::Version(v) => same_across_all_reqs("Version", &mut version, v)?,
                 Request::GetPackage { arch, pkg } => reqs.entry(arch).or_default().push(pkg),
             }
         }
-
-        let version = version.ok_or(anyhow::anyhow!("Missing essential request: Version"))?;
 
         // -- end of req processing -- //
 

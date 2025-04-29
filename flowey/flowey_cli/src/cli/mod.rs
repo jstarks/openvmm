@@ -7,7 +7,7 @@ use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
 use flowey_core::node::FlowBackend;
-use flowey_core::pipeline::IntoPipeline;
+use flowey_core::pipeline::BuildPipeline;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path;
@@ -39,7 +39,7 @@ enum Commands<P: Subcommand> {
     Debug(debug::DebugCommands),
 }
 
-pub fn cli_main<P: Subcommand + IntoPipeline>(
+pub fn cli_main<P: Subcommand + BuildPipeline>(
     flowey_crate: &str,
     repo_root: &Path,
 ) -> anyhow::Result<()> {

@@ -7,6 +7,7 @@ use crate::TpmError;
 use crate::TpmErrorKind;
 use vmcore::non_volatile_store::NonVolatileStore;
 use zerocopy::FromBytes;
+use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 const LEGACY_SIZE: usize = 16384;
@@ -16,6 +17,10 @@ fn is_good_blob(blob: &[u8]) -> bool {
     check_blob(blob).is_some()
 }
 
+/// Check if the TPM blob's persistent data structures all fit inside it.
+///
+/// This can return false if the blob was incorrectly truncated (by a previous
+/// bug that reported a 32KB blob size for a 16KB blob).
 fn check_blob(blob: &[u8]) -> Option<()> {
     const NV_USER_DYNAMIC: usize = 3508; // from the TPM reference implementation
     let mut dynamic = blob.get(NV_USER_DYNAMIC..)?;
@@ -30,7 +35,7 @@ fn check_blob(blob: &[u8]) -> Option<()> {
 }
 
 #[repr(C)]
-#[derive(IntoBytes, FromBytes)]
+#[derive(IntoBytes, FromBytes, Immutable)]
 struct OriginalSize {
     size: u32,
 }
@@ -50,8 +55,15 @@ pub async fn recover_blob(
     blob.resize(FULL_SIZE, 0);
     if is_good_blob(&blob) {
         tracing::warn!("recovered undersized TPM NVRAM");
+        // Save the original size for diagnostics and future use.
         original_nvram_size_store
-            .persist(16384u32.to_le_bytes().to_vec())
+            .persist(
+                OriginalSize {
+                    size: blob.len() as u32,
+                }
+                .as_bytes()
+                .to_vec(),
+            )
             .await
             .map_err(TpmErrorKind::FailedToWriteOriginalSize)?;
     } else {

@@ -14,6 +14,7 @@
 
 pub mod ak_cert;
 pub mod logger;
+mod recover;
 pub mod resolver;
 mod tpm20proto;
 mod tpm_helper;
@@ -186,6 +187,7 @@ impl ControlArea {
 struct TpmRuntime {
     ppi_store: Box<dyn NonVolatileStore>,
     nvram_store: Box<dyn NonVolatileStore>,
+    original_nvram_size_store: Option<Box<dyn NonVolatileStore>>,
     mem: GuestMemory,
 }
 
@@ -299,6 +301,8 @@ pub enum TpmErrorKind {
     ClearPlatformHierarchy(#[source] TpmHelperError),
     #[error("failed to set pcr banks")]
     SetPcrBanks(#[source] TpmHelperError),
+    #[error("failed to write original NVRAM size during TPM recovery")]
+    FailedToWriteOriginalSize(#[source] NonVolatileStoreError),
 }
 
 struct TpmPlatformCallbacks {
@@ -332,6 +336,7 @@ impl Tpm {
         mem: GuestMemory,
         ppi_store: Box<dyn NonVolatileStore>,
         nvram_store: Box<dyn NonVolatileStore>,
+        original_nvram_size_store: Option<Box<dyn NonVolatileStore>>,
         monotonic_timer: MonotonicTimer,
         refresh_tpm_seeds: bool,
         is_restoring: bool,
@@ -396,6 +401,7 @@ impl Tpm {
                 mem,
                 ppi_store,
                 nvram_store,
+                original_nvram_size_store,
             },
             ak_cert_type,
             logger,
@@ -450,7 +456,10 @@ impl Tpm {
                 .await
                 .map_err(TpmErrorKind::ReadNvramState)?;
 
-            if let Some(blob) = existing_nvmem_blob {
+            if let Some(mut blob) = existing_nvmem_blob {
+                if let Some(original_nvram_size_store) = &mut self.rt.original_nvram_size_store {
+                    recover::recover_blob(&mut blob, original_nvram_size_store.as_mut()).await?;
+                }
                 if let Err(e) = self.tpm_engine_helper.tpm_engine.reset(Some(&blob)) {
                     if let ms_tpm_20_ref::Error::NvMem(NvError::MismatchedBlobSize) = e {
                         self.logger

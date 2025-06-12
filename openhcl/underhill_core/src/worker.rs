@@ -2429,15 +2429,20 @@ async fn new_underhill_vm(
 
     if dps.general.tpm_enabled {
         let no_persistent_secrets = dps.general.suppress_attestation.unwrap_or(false);
-        let (ppi_store, nvram_store) = if no_persistent_secrets {
+        let (ppi_store, nvram_store, original_nvram_size_store) = if no_persistent_secrets {
             (
                 EphemeralNonVolatileStoreHandle.into_resource(),
                 EphemeralNonVolatileStoreHandle.into_resource(),
+                None,
             )
         } else {
             (
                 VmgsFileHandle::new(vmgs::FileId::TPM_PPI, true).into_resource(),
                 VmgsFileHandle::new(vmgs::FileId::TPM_NVRAM, true).into_resource(),
+                Some(
+                    VmgsFileHandle::new(vmgs::FileId::TPM_NVRAM_ORIGINAL_SIZE, true)
+                        .into_resource(),
+                ),
             )
         };
 
@@ -2470,6 +2475,7 @@ async fn new_underhill_vm(
             resource: TpmDeviceHandle {
                 ppi_store,
                 nvram_store,
+                original_nvram_size_store,
                 refresh_tpm_seeds: platform_attestation_data
                     .host_attestation_settings
                     .refresh_tpm_seeds,

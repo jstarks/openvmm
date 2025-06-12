@@ -46,6 +46,7 @@ open_enum! {
         GUEST_WATCHDOG = 10,
         HW_KEY_PROTECTOR = 11,
         GUEST_SECRET_KEY = 13,
+        TPM_NVRAM_ORIGINAL_SIZE = 14,
 
         EXTENDED_FILE_TABLE = 63,
     }

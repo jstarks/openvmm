@@ -64,6 +64,17 @@ impl AsyncResolveResource<ChipsetDeviceHandleKind, TpmDeviceHandle> for TpmDevic
             .await
             .map_err(ResolveTpmError::ResolveNvramStore)?;
 
+        let original_nvram_size_store = if let Some(r) = resource.original_nvram_size_store {
+            Some(
+                resolver
+                    .resolve(r, ())
+                    .await
+                    .map_err(ResolveTpmError::ResolveNvramStore)?,
+            )
+        } else {
+            None
+        };
+
         let ak_cert_type = match resource.ak_cert_type {
             TpmAkCertTypeResource::HwAttested(request_ak_cert) => TpmAkCertType::HwAttested(
                 resolver
@@ -111,6 +122,7 @@ impl AsyncResolveResource<ChipsetDeviceHandleKind, TpmDeviceHandle> for TpmDevic
             input.encrypted_guest_memory.clone(),
             ppi_store.0,
             nvram_store.0,
+            original_nvram_size_store.map(|s| s.0),
             monotonic_timer,
             resource.refresh_tpm_seeds,
             input.is_restoring,

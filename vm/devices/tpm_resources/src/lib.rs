@@ -21,6 +21,8 @@ pub struct TpmDeviceHandle {
     pub ppi_store: Resource<NonVolatileStoreKind>,
     /// Non-volatile store for TPM NVRAM data
     pub nvram_store: Resource<NonVolatileStoreKind>,
+    /// Non-volatile store for the original size of the TPM NVRAM data
+    pub original_nvram_size_store: Option<Resource<NonVolatileStoreKind>>,
     /// Whether to refresh TPM seeds on init
     pub refresh_tpm_seeds: bool,
     /// Type of AK cert

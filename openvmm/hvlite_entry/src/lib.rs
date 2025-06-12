@@ -938,6 +938,7 @@ fn vm_config_from_command_line(
             resource: TpmDeviceHandle {
                 ppi_store,
                 nvram_store,
+                original_nvram_size_store: None,
                 refresh_tpm_seeds: false,
                 ak_cert_type: tpm_resources::TpmAkCertTypeResource::None,
                 register_layout,

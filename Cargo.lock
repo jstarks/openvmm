@@ -7950,6 +7950,7 @@ dependencies = [
  "vmsocket",
  "vnc_worker_defs",
  "vpci",
+ "vpci_client",
  "watchdog_core",
  "watchdog_vmgs_format",
  "x86defs",
@@ -9484,6 +9485,36 @@ dependencies = [
  "vmbus_channel",
  "vmbus_ring",
  "vmcore",
+ "vpci_protocol",
+ "zerocopy 0.8.25",
+]
+
+[[package]]
+name = "vpci_client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chipset_device",
+ "closeable_mutex",
+ "futures",
+ "futures-concurrency",
+ "guestmem",
+ "guid",
+ "inspect",
+ "mesh",
+ "pal_async",
+ "parking_lot",
+ "pci_core",
+ "slab",
+ "task_control",
+ "test_with_tracing",
+ "tracelimit",
+ "tracing",
+ "vmbus_async",
+ "vmbus_channel",
+ "vmbus_ring",
+ "vmcore",
+ "vpci",
  "vpci_protocol",
  "zerocopy 0.8.25",
 ]

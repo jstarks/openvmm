@@ -1,6 +1,8 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 [package]
 name = "vpci_client"
-version = "0.1.0"
 rust-version.workspace = true
 edition.workspace = true
 
@@ -16,14 +18,12 @@ inspect.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
 guestmem.workspace = true
-tracelimit.workspace = true
 
 anyhow.workspace = true
 futures.workspace = true
 futures-concurrency.workspace = true
 parking_lot.workspace = true
 slab.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
 
@@ -33,8 +33,6 @@ closeable_mutex.workspace = true
 test_with_tracing.workspace = true
 vpci.workspace = true
 guid.workspace = true
-async-trait.workspace = true
-vmbus_core.workspace = true
 mesh.workspace = true
 task_control.workspace = true
 

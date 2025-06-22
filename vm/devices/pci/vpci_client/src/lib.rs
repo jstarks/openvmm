@@ -360,7 +360,7 @@ impl MapVpciInterrupt for VpciDevice {
                 },
             )
             .await
-            .map_err(|err| RegisterInterruptError::new(err))?;
+            .map_err(RegisterInterruptError::new)?;
 
         tracing::debug!(
             address = resource.address,
@@ -570,14 +570,8 @@ impl<M: RingMem> VpciClientWorker<M> {
                                                 prog_if: device.pnp_id.prog_if.into(),
                                                 sub_class: device.pnp_id.sub_class.into(),
                                                 base_class: device.pnp_id.base_class.into(),
-                                                type0_sub_vendor_id: device
-                                                    .pnp_id
-                                                    .sub_vendor_id
-                                                    .into(),
-                                                type0_sub_system_id: device
-                                                    .pnp_id
-                                                    .sub_system_id
-                                                    .into(),
+                                                type0_sub_vendor_id: device.pnp_id.sub_vendor_id,
+                                                type0_sub_system_id: device.pnp_id.sub_system_id,
                                             };
                                             let vpci_device = VpciDeviceDescription {
                                                 hw_ids,
@@ -716,7 +710,7 @@ impl<M: RingMem> VpciClientWorker<M> {
                     Tx::AssignedResources(reply),
                     protocol::DeviceTranslate {
                         message_type: protocol::MessageType::ASSIGNED_RESOURCES,
-                        slot: slot.into(),
+                        slot,
                         ..FromZeros::new_zeroed()
                     },
                     &[0; size_of::<vpci_protocol::MsiResource3>()],
@@ -730,7 +724,7 @@ impl<M: RingMem> VpciClientWorker<M> {
                     Tx::QueryResourceRequirements(reply),
                     protocol::QueryResourceRequirements {
                         message_type: protocol::MessageType::CURRENT_RESOURCE_REQUIREMENTS,
-                        slot: slot.into(),
+                        slot,
                     },
                     &[],
                 )

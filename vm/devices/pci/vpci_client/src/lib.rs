@@ -2,6 +2,10 @@
 // Licensed under the MIT License.
 
 //! Client driver for VPCI (Virtual PCI) buses and devices.
+//!
+//! This implementation uses the configuration space-based interface for
+//! resource and power management, like Linux does, as opposed to the
+//! message-based interface, like Windows does.
 
 mod tests;
 

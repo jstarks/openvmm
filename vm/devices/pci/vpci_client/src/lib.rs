@@ -145,6 +145,9 @@ pub struct VpciDeviceDescription {
     config_space: Arc<Mutex<ConfigSpaceAccessor>>,
     #[inspect(hex, with = "|&x| u32::from(x)")]
     slot: SlotNumber,
+    numa_node: u16,
+    #[inspect(hex)]
+    serial_num: u32,
     #[inspect(skip)]
     req: mesh::Sender<WorkerRequest>,
 }
@@ -210,6 +213,16 @@ impl VpciDeviceDescription {
     /// Returns the hardware IDs of the device.
     pub fn hw_ids(&self) -> &HardwareIds {
         &self.hw_ids
+    }
+
+    /// Returns the NUMA node of the device.
+    pub fn numa_node(&self) -> u16 {
+        self.numa_node
+    }
+
+    /// Returns the serial number of the device.
+    pub fn serial_num(&self) -> u32 {
+        self.serial_num
     }
 
     /// Initializes the device, returning a VPCI device instance that can be
@@ -432,6 +445,16 @@ struct VpciClientWorker<M: RingMem> {
     send_devices: mesh::Sender<VpciDeviceDescription>,
     #[inspect(skip)]
     init_devices: Option<Vec<VpciDeviceDescription>>,
+    #[inspect(iter_by_index)]
+    slots: Vec<Option<SlotState>>,
+}
+
+#[derive(Inspect)]
+struct SlotState {
+    hw_ids: HardwareIds,
+    serial_num: u32,
+    removed: bool,
+    ejected: bool,
 }
 
 #[derive(Inspect)]
@@ -511,6 +534,7 @@ impl VpciClient {
                 current_slot: (!0).into(),
             })),
             init_devices: Some(Vec::new()),
+            slots: Vec::new(),
         };
 
         let task = driver.spawn("vpci-client", async move {
@@ -601,8 +625,31 @@ impl<M: RingMem> VpciClientWorker<M> {
                                         )
                                         .ok()
                                         .context("failed to read bus relation devices")?;
+
+                                        for slot in self.slots.iter_mut().flatten() {
+                                            slot.removed = true;
+                                        }
+
                                         for device in devices {
                                             let device = device.get();
+                                            let slot_index = u32::from(device.slot) as usize;
+                                            if slot_index >= u8::MAX as usize {
+                                                anyhow::bail!("invalid slot index {slot_index}");
+                                            }
+                                            if let Some(Some(slot)) = self.slots.get_mut(slot_index)
+                                            {
+                                                if slot.hw_ids.device_id == device.pnp_id.device_id
+                                                    && slot.hw_ids.vendor_id
+                                                        == device.pnp_id.vendor_id
+                                                    && slot.serial_num == device.serial_num
+                                                {
+                                                    slot.removed = false;
+                                                    continue;
+                                                }
+                                                todo!("surprise remove");
+                                                self.slots[slot_index] = None;
+                                            }
+
                                             let hw_ids = HardwareIds {
                                                 vendor_id: device.pnp_id.vendor_id,
                                                 device_id: device.pnp_id.device_id,
@@ -613,10 +660,22 @@ impl<M: RingMem> VpciClientWorker<M> {
                                                 type0_sub_vendor_id: device.pnp_id.sub_vendor_id,
                                                 type0_sub_system_id: device.pnp_id.sub_system_id,
                                             };
+
+                                            if slot_index >= self.slots.len() {
+                                                self.slots.resize_with(slot_index + 1, || None);
+                                            }
+                                            self.slots[slot_index] = Some(SlotState {
+                                                hw_ids,
+                                                serial_num: device.serial_num,
+                                                removed: false,
+                                                ejected: false,
+                                            });
                                             let vpci_device = VpciDeviceDescription {
                                                 hw_ids,
                                                 config_space: self.config_space.clone(),
                                                 slot: device.slot,
+                                                numa_node: device.numa_node,
+                                                serial_num: device.serial_num,
                                                 req: self.req.sender(),
                                             };
                                             if let Some(init_devices) = &mut self.init_devices {
@@ -625,6 +684,30 @@ impl<M: RingMem> VpciClientWorker<M> {
                                                 self.send_devices.send(vpci_device);
                                             }
                                         }
+
+                                        for slot_slot in self.slots.iter_mut() {
+                                            let Some(slot) = slot_slot else { continue };
+                                            if !slot.removed {
+                                                continue;
+                                            }
+                                            todo!("surprise remove");
+                                            *slot_slot = None;
+                                        }
+                                    }
+                                    protocol::MessageType::EJECT => {
+                                        let (eject, _) =
+                                            protocol::PdoMessage::read_from_prefix(buf)
+                                                .ok()
+                                                .context("failed to read eject packet")?;
+                                        let slot_index = u32::from(eject.slot) as usize;
+                                        let Some(Some(slot)) = self.slots.get_mut(slot_index)
+                                        else {
+                                            anyhow::bail!(
+                                                "eject packet for unknown slot {slot_index}"
+                                            );
+                                        };
+                                        slot.ejected = true;
+                                        todo!("handle eject");
                                     }
                                     p => {
                                         anyhow::bail!("unexpected packet type: {:?}", p);

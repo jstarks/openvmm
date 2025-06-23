@@ -430,12 +430,16 @@ struct VpciClientWorker<M: RingMem> {
     protocol_version: protocol::ProtocolVersion,
     #[inspect(skip)]
     send_devices: mesh::Sender<VpciDeviceDescription>,
+    #[inspect(skip)]
+    init_devices: Option<Vec<VpciDeviceDescription>>,
 }
 
 #[derive(Inspect)]
 #[inspect(external_tag)]
 enum Tx {
-    FdoD0Entry(#[inspect(skip)] mesh::OneshotSender<protocol::Status>),
+    FdoD0Entry(
+        #[inspect(skip)] mesh::OneshotSender<Result<Vec<VpciDeviceDescription>, protocol::Status>>,
+    ),
     CreateInterrupt(#[inspect(skip)] FailableRpc<(), protocol::MsiResourceRemapped>),
     DeleteInterrupt(#[inspect(skip)] FailableRpc<(), ()>),
     QueryResourceRequirements(
@@ -493,19 +497,20 @@ impl VpciClient {
             .await
             .context("failed to send FDO D0 entry")?;
 
-        let (send, recv) = mesh::channel();
+        let (req_send, req_recv) = mesh::channel();
         let mut worker = VpciClientWorker {
             conn,
             tx,
             protocol_version: version,
             send_devices: devices,
-            req: recv,
+            req: req_recv,
             config_space: Arc::new(Mutex::new(ConfigSpaceAccessor {
                 mem: mmio,
                 base_gpa: gpa,
                 // Let's not assume the config space access starts at slot 0.
                 current_slot: (!0).into(),
             })),
+            init_devices: Some(Vec::new()),
         };
 
         let task = driver.spawn("vpci-client", async move {
@@ -517,18 +522,24 @@ impl VpciClient {
             }
         });
 
-        let status = fdo_entry_recv
+        let r = fdo_entry_recv
             .await
             .context("no response to FDO D0 entry")?;
 
-        if status != protocol::Status::SUCCESS {
-            task.cancel().await;
-            anyhow::bail!("failed to enter D0 state: {:#x?}", status);
-        }
+        let init_devices = match r {
+            Ok(v) => v,
+            Err(status) => {
+                task.cancel().await;
+                anyhow::bail!("failed to enter D0 state: {:#x?}", status);
+            }
+        };
 
         tracing::debug!(gpa, "fdo d0 entry successful");
 
-        Ok(Self { task, req: send })
+        Ok(Self {
+            task,
+            req: req_send,
+        })
     }
 
     /// Shuts down the VPCI bus client.
@@ -606,7 +617,11 @@ impl<M: RingMem> VpciClientWorker<M> {
                                                 slot: device.slot,
                                                 req: self.req.sender(),
                                             };
-                                            self.send_devices.send(vpci_device);
+                                            if let Some(init_devices) = &mut self.init_devices {
+                                                init_devices.push(vpci_device);
+                                            } else {
+                                                self.send_devices.send(vpci_device);
+                                            }
                                         }
                                     }
                                     p => {
@@ -633,7 +648,12 @@ impl<M: RingMem> VpciClientWorker<M> {
                                             ?status,
                                             "fdo d0 entry reply received"
                                         );
-                                        send.send(status);
+                                        let r = if status == protocol::Status::SUCCESS {
+                                            Ok(self.init_devices.take().unwrap())
+                                        } else {
+                                            Err(status)
+                                        };
+                                        send.send(r);
                                     }
                                     Tx::CreateInterrupt(rpc) => {
                                         tracing::trace!(

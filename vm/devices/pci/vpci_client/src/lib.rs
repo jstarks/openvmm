@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![expect(missing_docs)] // temp
+//! Client driver for VPCI (Virtual PCI) buses and devices.
 
 mod tests;
 
@@ -38,6 +38,7 @@ use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 use zerocopy::Unalign;
 
+/// A VPCI client instance, for a single VPCI bus.
 pub struct VpciClient {
     req: mesh::Sender<WorkerRequest>,
     task: Task<()>,
@@ -122,12 +123,17 @@ async fn negotiate<M: RingMem>(
     anyhow::bail!("no supported VPCI protocol version found");
 }
 
+/// Trait used to access configuration space of a VPCI bus.
 pub trait MemoryAccess: Send {
+    /// Returns the base GPA of the allocated MMIO space.
     fn gpa(&mut self) -> u64;
+    /// Reads a 32-bit value from the given address.
     fn read(&mut self, addr: u64) -> u32;
+    /// Writes a 32-bit value to the given address.
     fn write(&mut self, addr: u64, value: u32);
 }
 
+/// A device description, which represents a VPCI device available on a bus.
 #[derive(Inspect)]
 pub struct VpciDeviceDescription {
     hw_ids: HardwareIds,
@@ -139,6 +145,7 @@ pub struct VpciDeviceDescription {
     req: mesh::Sender<WorkerRequest>,
 }
 
+/// An initialized VPCI device.
 #[derive(Inspect)]
 pub struct VpciDevice {
     #[inspect(flatten)]
@@ -147,6 +154,7 @@ pub struct VpciDevice {
     #[inspect(hex, iter_by_index)]
     bar_masks: [u32; 6],
     #[inspect(hex, iter_by_index)]
+    /// RAO == Read As One
     bar_rao: [u32; 6],
 }
 
@@ -195,17 +203,20 @@ impl ConfigSpaceAccessor {
 }
 
 impl VpciDeviceDescription {
+    /// Returns the hardware IDs of the device.
     pub fn hw_ids(&self) -> &HardwareIds {
         &self.hw_ids
     }
 
+    /// Initializes the device, returning a VPCI device instance that can be
+    /// used to interact with it.
     pub async fn init(self) -> anyhow::Result<VpciDevice> {
         let requirements = self
             .req
             .call_failable(WorkerRequest::QueryResourceRequirements, self.slot)
             .await?;
 
-        tracing::info!(
+        tracing::debug!(
             bars = format_args!("{:#x?}", requirements.bars),
             "queried requirements"
         );
@@ -245,6 +256,9 @@ impl VpciDeviceDescription {
 }
 
 impl VpciDevice {
+    /// Reads device configuration space.
+    ///
+    /// Some values will be handled without communicating with the host.
     pub fn read_cfg(&self, offset: u16) -> u32 {
         // For static values, return values from the device's description.
         let value = match HeaderType00(offset) {
@@ -287,6 +301,7 @@ impl VpciDevice {
         value
     }
 
+    /// Writes device configuration space.
     pub fn write_cfg(&self, offset: u16, value: u32) {
         tracing::trace!(?offset, value, "config space write");
         let mut shadows = self.shadows.lock();
@@ -426,6 +441,12 @@ enum Tx {
 }
 
 impl VpciClient {
+    /// Instantiates a new VPCI client, connecting to the VPCI bus avilable via
+    /// `channel`.
+    ///
+    /// `mmio` is used to access the two pages of MMIO space used for
+    /// configuration space. `devices` will receive devices as they are added to
+    /// the bus.
     pub async fn connect<M: 'static + RingMem + Sync>(
         driver: impl Spawn,
         channel: RawAsyncChannel<M>,
@@ -506,11 +527,13 @@ impl VpciClient {
         Ok(Self { task, req: send })
     }
 
+    /// Shuts down the VPCI bus client.
     pub async fn shutdown(self) {
         drop(self.req);
         self.task.await;
     }
 
+    /// Detaches the task from the client, allowing it to run independently.
     pub fn detach(self) {
         self.task.detach();
     }

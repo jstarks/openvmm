@@ -450,17 +450,17 @@ enum Tx {
 
 impl VpciClient {
     /// Instantiates a new VPCI client, connecting to the VPCI bus avilable via
-    /// `channel`.
+    /// `channel`. Returns the initial set of devices available on the bus.
     ///
     /// `mmio` is used to access the two pages of MMIO space used for
-    /// configuration space. `devices` will receive devices as they are added to
-    /// the bus.
+    /// configuration space. `devices` will receive dynamically added devices as
+    /// they are added to the bus.
     pub async fn connect<M: 'static + RingMem + Sync>(
         driver: impl Spawn,
         channel: RawAsyncChannel<M>,
         mut mmio: Box<dyn MemoryAccess>,
         devices: mesh::Sender<VpciDeviceDescription>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, Vec<VpciDeviceDescription>)> {
         let mut conn = VpciConnection {
             queue: Queue::new(channel)?,
             buf: vec![0; protocol::MAXIMUM_PACKET_SIZE],
@@ -536,10 +536,12 @@ impl VpciClient {
 
         tracing::debug!(gpa, "fdo d0 entry successful");
 
-        Ok(Self {
-            task,
+        let this = Self {
             req: req_send,
-        })
+            task,
+        };
+
+        Ok((this, init_devices))
     }
 
     /// Shuts down the VPCI bus client.

@@ -60,6 +60,7 @@ enum WorkerRequest {
     UnmapInterrupt(FailableRpc<protocol::DeleteInterrupt, ()>),
     QueryResourceRequirements(FailableRpc<SlotNumber, protocol::QueryResourceRequirementsReply>),
     Init(FailableRpc<SlotNumber, ()>),
+    Done(SlotNumber),
 }
 
 #[derive(Inspect)]
@@ -521,7 +522,7 @@ impl VpciClient {
             .context("failed to send FDO D0 entry")?;
 
         let (req_send, req_recv) = mesh::channel();
-        let mut worker = VpciClientWorker {
+        let worker = VpciClientWorker {
             conn,
             tx,
             protocol_version: version,
@@ -537,15 +538,7 @@ impl VpciClient {
             slots: Vec::new(),
         };
 
-        let task = driver.spawn("vpci-client", async move {
-            if let Err(err) = worker.run().await {
-                tracing::error!(
-                    error = err.as_ref() as &dyn std::error::Error,
-                    "vpci client worker failed"
-                );
-            }
-        });
-
+        let task = driver.spawn("vpci-client", worker.run());
         let r = fdo_entry_recv
             .await
             .context("no response to FDO D0 entry")?;
@@ -581,7 +574,17 @@ impl VpciClient {
 }
 
 impl<M: RingMem> VpciClientWorker<M> {
-    async fn run(&mut self) -> anyhow::Result<()> {
+    async fn run(mut self) {
+        if let Err(err) = self.run_inner().await {
+            tracing::error!(
+                error = err.as_ref() as &dyn std::error::Error,
+                "vpci client worker failed"
+            );
+        }
+        todo!("clean tear down (anything to do here?)");
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             let req = {
                 enum Event<T, U> {
@@ -817,7 +820,7 @@ impl<M: RingMem> VpciClientWorker<M> {
                 self.handle_req(req).await?;
             }
         }
-        todo!("cleanly tear down");
+        Ok(())
     }
 
     async fn handle_req(&mut self, req: WorkerRequest) -> anyhow::Result<()> {
@@ -862,6 +865,25 @@ impl<M: RingMem> VpciClientWorker<M> {
                 )
                 .await
                 .context("failed to send query resource requirements request")?;
+            }
+            WorkerRequest::Done(slot_num) => {
+                let slot = self.slots[u32::from(slot_num) as usize].take().unwrap();
+                if slot.ejected && !slot.removed {
+                    self.conn
+                        .queue
+                        .split()
+                        .1
+                        .write(OutgoingPacket {
+                            transaction_id: 0, // No reply expected.
+                            packet_type: vmbus_ring::OutgoingPacketType::InBandNoCompletion,
+                            payload: &[protocol::PdoMessage {
+                                message_type: protocol::MessageType::EJECT_COMPLETE,
+                                slot: slot_num,
+                            }
+                            .as_bytes()],
+                        })
+                        .await?;
+                }
             }
         }
         Ok(())

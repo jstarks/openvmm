@@ -68,8 +68,9 @@ enum WorkerRequest {
     Done(DeviceId),
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, Inspect)]
 struct DeviceId {
+    #[inspect(hex, with = "|&x| u32::from(x)")]
     slot: SlotNumber,
     seq: u64,
 }
@@ -77,8 +78,6 @@ struct DeviceId {
 #[derive(Inspect)]
 struct VpciConnection<M: RingMem> {
     queue: Queue<M>,
-    #[inspect(skip)]
-    buf: Vec<u8>,
 }
 
 impl<M: RingMem> VpciConnection<M> {
@@ -135,24 +134,25 @@ impl<M: RingMem> VpciConnection<M> {
 
         anyhow::bail!("no supported VPCI protocol version found");
     }
+}
 
-    async fn send_eject_complete(&mut self, slot: SlotNumber) -> anyhow::Result<()> {
-        self.queue
-            .split()
-            .1
-            .write(OutgoingPacket {
-                transaction_id: 0,
-                packet_type: vmbus_ring::OutgoingPacketType::InBandNoCompletion,
-                payload: &[protocol::PdoMessage {
-                    message_type: protocol::MessageType::EJECT_COMPLETE,
-                    slot,
-                }
-                .as_bytes()],
-            })
-            .await?;
+async fn send_eject_complete<M: RingMem>(
+    write: &mut vmbus_async::queue::WriteHalf<'_, M>,
+    slot: SlotNumber,
+) -> anyhow::Result<()> {
+    write
+        .write(OutgoingPacket {
+            transaction_id: 0,
+            packet_type: vmbus_ring::OutgoingPacketType::InBandNoCompletion,
+            payload: &[protocol::PdoMessage {
+                message_type: protocol::MessageType::EJECT_COMPLETE,
+                slot,
+            }
+            .as_bytes()],
+        })
+        .await?;
 
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Trait used to access configuration space of a VPCI bus.
@@ -171,9 +171,7 @@ pub struct VpciDeviceDescription {
     hw_ids: HardwareIds,
     #[inspect(skip)]
     config_space: Arc<Mutex<ConfigSpaceAccessor>>,
-    #[inspect(hex, with = "|&x| u32::from(x)")]
-    slot: SlotNumber,
-    seq: u64,
+    id: DeviceId,
     numa_node: u16,
     #[inspect(hex)]
     serial_num: u32,
@@ -201,6 +199,8 @@ struct ConfigSpaceAccessor {
     base_gpa: u64,
     #[inspect(hex, with = "|&x| u32::from(x)")]
     current_slot: SlotNumber,
+    #[inspect(iter_by_index)]
+    slot_seq: Vec<u64>,
 }
 
 #[derive(Inspect)]
@@ -211,26 +211,44 @@ struct ConfigSpaceShadows {
 }
 
 impl ConfigSpaceAccessor {
-    fn set_slot(&mut self, slot: SlotNumber) {
-        if slot != self.current_slot {
-            self.mem
-                .write(self.base_gpa + protocol::MMIO_PAGE_SLOT_NUMBER, slot.into());
-            self.current_slot = slot;
+    #[must_use]
+    fn set_slot(&mut self, id: DeviceId) -> bool {
+        if self
+            .slot_seq
+            .get(u32::from(id.slot) as usize)
+            .is_none_or(|s| s != &id.seq)
+        {
+            // TODO warn
+            return false;
         }
+        if id.slot != self.current_slot {
+            self.mem.write(
+                self.base_gpa + protocol::MMIO_PAGE_SLOT_NUMBER,
+                id.slot.into(),
+            );
+            self.current_slot = id.slot;
+        }
+        true
     }
 
-    fn read(&mut self, slot: SlotNumber, offset: u16) -> u32 {
-        self.set_slot(slot);
+    fn read(&mut self, id: DeviceId, offset: u16) -> u32 {
+        if !self.set_slot(id) {
+            tracelimit::warn_ratelimited!(?id, "device is gone, ignoring cfg read");
+            return !0;
+        }
         let value = self
             .mem
             .read(self.base_gpa + protocol::MMIO_PAGE_CONFIG_SPACE + offset as u64);
-        tracing::trace!(?slot, offset, value, "host config space read");
+        tracing::trace!(?id, offset, value, "host config space read");
         value
     }
 
-    fn write(&mut self, slot: SlotNumber, offset: u16, value: u32) {
-        self.set_slot(slot);
-        tracing::trace!(?slot, offset, value, "host config space write");
+    fn write(&mut self, id: DeviceId, offset: u16, value: u32) {
+        if !self.set_slot(id) {
+            tracelimit::warn_ratelimited!(?id, "device is gone, ignoring cfg write");
+            return;
+        }
+        tracing::trace!(?id, offset, value, "host config space write");
         self.mem.write(
             self.base_gpa + protocol::MMIO_PAGE_CONFIG_SPACE + offset as u64,
             value,
@@ -240,18 +258,11 @@ impl ConfigSpaceAccessor {
 
 impl Drop for VpciDeviceDescription {
     fn drop(&mut self) {
-        self.req.send(WorkerRequest::Done(self.id()));
+        self.req.send(WorkerRequest::Done(self.id));
     }
 }
 
 impl VpciDeviceDescription {
-    fn id(&self) -> DeviceId {
-        DeviceId {
-            slot: self.slot,
-            seq: self.seq,
-        }
-    }
-
     /// Returns the hardware IDs of the device.
     pub fn hw_ids(&self) -> &HardwareIds {
         &self.hw_ids
@@ -272,7 +283,7 @@ impl VpciDeviceDescription {
     pub async fn init(self) -> anyhow::Result<VpciDevice> {
         let requirements = self
             .req
-            .call_failable(WorkerRequest::QueryResourceRequirements, self.id())
+            .call_failable(WorkerRequest::QueryResourceRequirements, self.id)
             .await?;
 
         tracing::debug!(
@@ -280,9 +291,7 @@ impl VpciDeviceDescription {
             "queried requirements"
         );
 
-        self.req
-            .call_failable(WorkerRequest::Init, self.id())
-            .await?;
+        self.req.call_failable(WorkerRequest::Init, self.id).await?;
 
         let mut high64 = false;
         let mut bar_rao = [0; 6];
@@ -323,7 +332,7 @@ impl VpciDevice {
         let value = match HeaderType00(offset) {
             HeaderType00::STATUS_COMMAND => {
                 let shadows = self.shadows.lock();
-                let status_command = self.desc.config_space.lock().read(self.desc.slot, offset);
+                let status_command = self.desc.config_space.lock().read(self.desc.id, offset);
                 // Preserve the MMIO enabled bit in the command register, since
                 // Hyper-V does not always emulate it correctly for reads.
                 let mask = u32::from(u16::from(Command::new().with_mmio_enabled(true)));
@@ -354,7 +363,7 @@ impl VpciDevice {
                 let i = (offset - HeaderType00::BAR0.0) as usize / 4;
                 shadows.bars[i] | self.bar_rao[i]
             }
-            _ => self.desc.config_space.lock().read(self.desc.slot, offset),
+            _ => self.desc.config_space.lock().read(self.desc.id, offset),
         };
         tracing::trace!(?offset, value, "config space read");
         value
@@ -373,7 +382,7 @@ impl VpciDevice {
                     // Flush the BAR shadow to the device.
                     for (i, &bar) in shadows.bars.iter().enumerate() {
                         let bar_offset = HeaderType00::BAR0.0 + (i as u16 * 4);
-                        accessor.write(self.desc.slot, bar_offset, bar);
+                        accessor.write(self.desc.id, bar_offset, bar);
                     }
                 }
                 shadows.command = new_command;
@@ -393,7 +402,7 @@ impl VpciDevice {
             }
             _ => {}
         }
-        accessor.write(self.desc.slot, offset, value);
+        accessor.write(self.desc.id, offset, value);
     }
 }
 
@@ -425,7 +434,7 @@ impl MapVpciInterrupt for VpciDevice {
         let resource = self
             .desc
             .req
-            .call_failable(WorkerRequest::MapInterrupt, (self.desc.id(), interrupt))
+            .call_failable(WorkerRequest::MapInterrupt, (self.desc.id, interrupt))
             .await
             .map_err(RegisterInterruptError::new)?;
 
@@ -451,7 +460,7 @@ impl MapVpciInterrupt for VpciDevice {
         };
         self.desc
             .req
-            .call_failable(WorkerRequest::UnmapInterrupt, (self.desc.id(), interrupt))
+            .call_failable(WorkerRequest::UnmapInterrupt, (self.desc.id, interrupt))
             .await
             .unwrap_or_else(|err| {
                 tracing::error!(
@@ -465,6 +474,12 @@ impl MapVpciInterrupt for VpciDevice {
 #[derive(InspectMut)]
 struct VpciClientWorker<M: RingMem> {
     conn: VpciConnection<M>,
+    #[inspect(flatten)]
+    state: WorkerState,
+}
+
+#[derive(Inspect)]
+struct WorkerState {
     #[inspect(iter_by_key)]
     tx: slab::Slab<Tx>,
     #[inspect(skip)]
@@ -479,6 +494,8 @@ struct VpciClientWorker<M: RingMem> {
     #[inspect(iter_by_index)]
     slots: Vec<Option<SlotState>>,
     next_seq: u64,
+    #[inspect(skip)]
+    buf: Vec<u8>,
 }
 
 #[derive(Inspect)]
@@ -487,7 +504,8 @@ struct SlotState {
     serial_num: u32,
     done: bool,
     removed: bool,
-    ejected: bool,
+    #[inspect(rename = "ejected", with = "|x| x.is_none()")]
+    eject: Option<mesh::OneshotSender<()>>,
     seq: u64,
 }
 
@@ -520,7 +538,6 @@ impl VpciClient {
     ) -> anyhow::Result<(Self, Vec<VpciDeviceDescription>)> {
         let mut conn = VpciConnection {
             queue: Queue::new(channel)?,
-            buf: vec![0; protocol::MAXIMUM_PACKET_SIZE],
         };
 
         let version = conn
@@ -558,19 +575,23 @@ impl VpciClient {
         let (req_send, req_recv) = mesh::channel();
         let worker = VpciClientWorker {
             conn,
-            tx,
-            protocol_version: version,
-            send_devices: devices,
-            req: req_recv,
-            config_space: Arc::new(Mutex::new(ConfigSpaceAccessor {
-                mem: mmio,
-                base_gpa: gpa,
-                // Let's not assume the config space access starts at slot 0.
-                current_slot: (!0).into(),
-            })),
-            init_devices: Some(Vec::new()),
-            slots: Vec::new(),
-            next_seq: 0,
+            state: WorkerState {
+                tx,
+                req: req_recv,
+                protocol_version: version,
+                send_devices: devices,
+                config_space: Arc::new(Mutex::new(ConfigSpaceAccessor {
+                    mem: mmio,
+                    base_gpa: gpa,
+                    // Let's not assume the config space access starts at slot 0.
+                    current_slot: (!0).into(),
+                    slot_seq: Vec::new(),
+                })),
+                init_devices: Some(Vec::new()),
+                slots: Vec::new(),
+                next_seq: 1,
+                buf: vec![0; protocol::MAXIMUM_PACKET_SIZE],
+            },
         };
 
         let task = driver.spawn("vpci-client", worker.run());
@@ -616,20 +637,19 @@ impl<M: RingMem> VpciClientWorker<M> {
                 "vpci client worker failed"
             );
         }
-        todo!("clean tear down (anything to do here?)");
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
-            let req = {
+            let (mut read, mut write) = self.conn.queue.split();
+            let deferred = {
                 enum Event<T, U> {
                     Packet(T),
                     Request(U),
                 }
 
-                let mut read = self.conn.queue.split().0;
                 let read_packet = read.read().map(Event::Packet);
-                let req = self.req.next().map(Event::Request);
+                let req = self.state.req.next().map(Event::Request);
 
                 let event = (read_packet, req).race().await;
                 match event {
@@ -637,232 +657,27 @@ impl<M: RingMem> VpciClientWorker<M> {
                         let p = p.context("failed to read packet")?;
                         match &*p {
                             IncomingPacket::Data(p) => {
-                                let mut reader = p.reader();
-                                let len = reader.len();
-                                let buf =
-                                    self.conn.buf.get_mut(..len).context("packet too large")?;
-                                reader.read(buf)?;
-                                let (packet_type, _) = protocol::MessageType::read_from_prefix(buf)
-                                    .ok()
-                                    .context("packet too small")?;
-
-                                tracing::debug!(?packet_type, "received packet");
-
-                                match packet_type {
-                                    protocol::MessageType::BUS_RELATIONS2 => {
-                                        let (bus_relations, devices) =
-                                            protocol::QueryBusRelations2::read_from_prefix(buf)
-                                                .ok()
-                                                .context("failed to read bus relations")?;
-
-                                        let (devices, _) = <[Unalign<
-                                            protocol::DeviceDescription2,
-                                        >]>::ref_from_prefix_with_elems(
-                                            devices,
-                                            bus_relations.device_count as usize,
-                                        )
-                                        .ok()
-                                        .context("failed to read bus relation devices")?;
-
-                                        for slot in self.slots.iter_mut().flatten() {
-                                            slot.removed = true;
-                                        }
-
-                                        for device in devices {
-                                            let device = device.get();
-                                            let slot_index = u32::from(device.slot) as usize;
-                                            if slot_index >= u8::MAX as usize {
-                                                anyhow::bail!("invalid slot index {slot_index}");
-                                            }
-                                            if let Some(Some(slot)) = self.slots.get_mut(slot_index)
-                                            {
-                                                if slot.hw_ids.device_id == device.pnp_id.device_id
-                                                    && slot.hw_ids.vendor_id
-                                                        == device.pnp_id.vendor_id
-                                                    && slot.serial_num == device.serial_num
-                                                {
-                                                    slot.removed = false;
-                                                    continue;
-                                                }
-                                                todo!("surprise remove");
-                                                self.slots[slot_index] = None;
-                                            }
-
-                                            let hw_ids = HardwareIds {
-                                                vendor_id: device.pnp_id.vendor_id,
-                                                device_id: device.pnp_id.device_id,
-                                                revision_id: device.pnp_id.revision_id,
-                                                prog_if: device.pnp_id.prog_if.into(),
-                                                sub_class: device.pnp_id.sub_class.into(),
-                                                base_class: device.pnp_id.base_class.into(),
-                                                type0_sub_vendor_id: device.pnp_id.sub_vendor_id,
-                                                type0_sub_system_id: device.pnp_id.sub_system_id,
-                                            };
-
-                                            if slot_index >= self.slots.len() {
-                                                self.slots.resize_with(slot_index + 1, || None);
-                                            }
-                                            let seq = self.next_seq;
-                                            self.next_seq += 1;
-                                            self.slots[slot_index] = Some(SlotState {
-                                                hw_ids,
-                                                serial_num: device.serial_num,
-                                                removed: false,
-                                                ejected: false,
-                                                done: false,
-                                                seq,
-                                            });
-                                            let vpci_device = VpciDeviceDescription {
-                                                hw_ids,
-                                                config_space: self.config_space.clone(),
-                                                slot: device.slot,
-                                                numa_node: device.numa_node,
-                                                serial_num: device.serial_num,
-                                                req: self.req.sender(),
-                                                seq,
-                                            };
-                                            if let Some(init_devices) = &mut self.init_devices {
-                                                init_devices.push(vpci_device);
-                                            } else {
-                                                self.send_devices.send(vpci_device);
-                                            }
-                                        }
-
-                                        for slot_slot in self.slots.iter_mut() {
-                                            let Some(slot) = slot_slot else { continue };
-                                            if !slot.removed {
-                                                continue;
-                                            }
-                                            todo!("surprise remove");
-                                            *slot_slot = None;
-                                        }
-                                    }
-                                    protocol::MessageType::EJECT => {
-                                        let (eject, _) =
-                                            protocol::PdoMessage::read_from_prefix(buf)
-                                                .ok()
-                                                .context("failed to read eject packet")?;
-                                        let slot_index = u32::from(eject.slot) as usize;
-                                        let Some(Some(slot)) = self.slots.get_mut(slot_index)
-                                        else {
-                                            anyhow::bail!(
-                                                "eject packet for unknown slot {slot_index}"
-                                            );
-                                        };
-                                        slot.ejected = true;
-                                        todo!("handle eject");
-                                    }
-                                    p => {
-                                        anyhow::bail!("unexpected packet type: {:?}", p);
-                                    }
-                                }
+                                self.state.handle_packet(&mut write, p).await?;
                             }
                             IncomingPacket::Completion(p) => {
-                                let tx_id = p.transaction_id();
-                                let entry = self
-                                    .tx
-                                    .try_remove(tx_id_to_index(tx_id))
-                                    .context("failed to find tx entry")?;
-
-                                let status = p
-                                    .reader()
-                                    .read_plain::<protocol::Status>()
-                                    .context("failed to read tx reply")?;
-
-                                match entry {
-                                    Tx::FdoD0Entry(send) => {
-                                        tracing::trace!(
-                                            tx_id,
-                                            ?status,
-                                            "fdo d0 entry reply received"
-                                        );
-                                        let r = if status == protocol::Status::SUCCESS {
-                                            Ok(self.init_devices.take().unwrap())
-                                        } else {
-                                            Err(status)
-                                        };
-                                        send.send(r);
-                                    }
-                                    Tx::CreateInterrupt(rpc) => {
-                                        tracing::trace!(
-                                            tx_id,
-                                            ?status,
-                                            "create interrupt reply received"
-                                        );
-
-                                        if status == protocol::Status::SUCCESS {
-                                            let reply = p
-                                                .reader()
-                                                .read_plain::<protocol::CreateInterruptReply>()
-                                                .context("failed to read create interrupt reply")?;
-                                            rpc.complete(Ok(reply.interrupt));
-                                        } else {
-                                            rpc.fail(anyhow::anyhow!(
-                                                "failed to create interrupt: {status:#x?}",
-                                            ));
-                                        }
-                                    }
-                                    Tx::DeleteInterrupt(rpc) => {
-                                        tracing::trace!(tx_id, "delete interrupt reply received");
-
-                                        if status == protocol::Status::SUCCESS {
-                                            rpc.complete(Ok(()));
-                                        } else {
-                                            rpc.fail(anyhow::anyhow!(
-                                                "failed to delete interrupt: {status:#x?}",
-                                            ));
-                                        }
-                                    }
-                                    Tx::AssignedResources(rpc) => {
-                                        tracing::trace!(
-                                            tx_id,
-                                            ?status,
-                                            "assigned resources reply received"
-                                        );
-
-                                        if status == protocol::Status::SUCCESS {
-                                            rpc.complete(Ok(()));
-                                        } else {
-                                            rpc.fail(anyhow::anyhow!(
-                                                "failed to initialize device: {status:#x?}",
-                                            ));
-                                        }
-                                    }
-                                    Tx::QueryResourceRequirements(rpc) => {
-                                        tracing::trace!(
-                                            tx_id,
-                                            ?status,
-                                            "query resource requirements reply received"
-                                        );
-
-                                        if status == protocol::Status::SUCCESS {
-                                            let reply = p
-                                                .reader()
-                                                .read_plain::<protocol::QueryResourceRequirementsReply>()
-                                                .context("failed to read query resource requirements reply")?;
-                                            rpc.complete(Ok(reply));
-                                        } else {
-                                            rpc.fail(anyhow::anyhow!(
-                                                "failed to query resource requirements: {status:#x?}",
-                                            ));
-                                        }
-                                    }
-                                }
+                                self.state.handle_completion(p)?;
                             }
                         }
                         None
                     }
-                    Event::Request(Some(req)) => Some(req),
+                    Event::Request(Some(req)) => self.state.handle_req(&mut write, req).await?,
                     Event::Request(None) => break,
                 }
             };
-            if let Some(req) = req {
-                self.handle_req(req).await?;
+            if let Some(deferred) = deferred {
+                deferred.inspect(&mut *self);
             }
         }
         Ok(())
     }
+}
 
+impl WorkerState {
     fn check_slot(&self, id: DeviceId) -> Option<usize> {
         let slot_index = u32::from(id.slot) as usize;
         let slot = self.slots.get(slot_index)?.as_ref()?;
@@ -872,16 +687,220 @@ impl<M: RingMem> VpciClientWorker<M> {
         Some(slot_index)
     }
 
-    async fn handle_req(&mut self, req: WorkerRequest) -> anyhow::Result<()> {
+    async fn handle_packet<M: RingMem>(
+        &mut self,
+        write: &mut vmbus_async::queue::WriteHalf<'_, M>,
+        p: &vmbus_async::queue::DataPacket<'_, M>,
+    ) -> anyhow::Result<()> {
+        let mut reader = p.reader();
+        let len = reader.len();
+        let buf = self.buf.get_mut(..len).context("packet too large")?;
+        reader.read(buf)?;
+
+        let (packet_type, _) = protocol::MessageType::read_from_prefix(buf)
+            .ok()
+            .context("packet too small")?;
+
+        tracing::debug!(?packet_type, "received packet");
+
+        match packet_type {
+            protocol::MessageType::BUS_RELATIONS2 => {
+                let (bus_relations, devices) = protocol::QueryBusRelations2::read_from_prefix(buf)
+                    .ok()
+                    .context("failed to read bus relations")?;
+
+                let (devices, _) =
+                    <[Unalign<protocol::DeviceDescription2>]>::ref_from_prefix_with_elems(
+                        devices,
+                        bus_relations.device_count as usize,
+                    )
+                    .ok()
+                    .context("failed to read bus relation devices")?;
+
+                for slot in self.slots.iter_mut().flatten() {
+                    slot.removed = true;
+                }
+
+                for device in devices {
+                    let device = device.get();
+                    let slot_index = u32::from(device.slot) as usize;
+                    if slot_index >= u8::MAX as usize {
+                        anyhow::bail!("invalid slot index {slot_index}");
+                    }
+                    if let Some(Some(slot)) = self.slots.get_mut(slot_index) {
+                        if slot.hw_ids.device_id == device.pnp_id.device_id
+                            && slot.hw_ids.vendor_id == device.pnp_id.vendor_id
+                            && slot.serial_num == device.serial_num
+                        {
+                            slot.removed = false;
+                            continue;
+                        }
+                        self.slots[slot_index] = None;
+                    }
+
+                    let hw_ids = HardwareIds {
+                        vendor_id: device.pnp_id.vendor_id,
+                        device_id: device.pnp_id.device_id,
+                        revision_id: device.pnp_id.revision_id,
+                        prog_if: device.pnp_id.prog_if.into(),
+                        sub_class: device.pnp_id.sub_class.into(),
+                        base_class: device.pnp_id.base_class.into(),
+                        type0_sub_vendor_id: device.pnp_id.sub_vendor_id,
+                        type0_sub_system_id: device.pnp_id.sub_system_id,
+                    };
+
+                    if slot_index >= self.slots.len() {
+                        self.slots.resize_with(slot_index + 1, || None);
+                    }
+                    let seq = self.next_seq;
+                    self.next_seq += 1;
+                    let (eject_send, eject_recv) = mesh::oneshot();
+                    self.slots[slot_index] = Some(SlotState {
+                        hw_ids,
+                        serial_num: device.serial_num,
+                        removed: false,
+                        eject: Some(eject_send),
+                        done: false,
+                        seq,
+                    });
+                    let vpci_device = VpciDeviceDescription {
+                        hw_ids,
+                        config_space: self.config_space.clone(),
+                        id: DeviceId {
+                            slot: device.slot,
+                            seq,
+                        },
+                        numa_node: device.numa_node,
+                        serial_num: device.serial_num,
+                        req: self.req.sender(),
+                    };
+                    if let Some(init_devices) = &mut self.init_devices {
+                        init_devices.push(vpci_device);
+                    } else {
+                        self.send_devices.send(vpci_device);
+                    }
+                }
+
+                for slot_slot in self.slots.iter_mut() {
+                    let Some(slot) = slot_slot else { continue };
+                    if !slot.removed {
+                        continue;
+                    }
+                    *slot_slot = None;
+                }
+            }
+            protocol::MessageType::EJECT => {
+                let (eject, _) = protocol::PdoMessage::read_from_prefix(buf)
+                    .ok()
+                    .context("failed to read eject packet")?;
+                let slot_index = u32::from(eject.slot) as usize;
+                let Some(Some(slot)) = self.slots.get_mut(slot_index) else {
+                    anyhow::bail!("eject packet for unknown slot {slot_index}");
+                };
+                if let Some(eject_send) = slot.eject.take() {
+                    if slot.done {
+                        send_eject_complete(write, eject.slot).await?;
+                    } else {
+                        eject_send.send(());
+                    }
+                } else {
+                    tracing::warn!("eject packet for device that is already ejected");
+                }
+            }
+            p => {
+                anyhow::bail!("unexpected packet type: {:?}", p);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_completion<M: RingMem>(
+        &mut self,
+        p: &vmbus_async::queue::CompletionPacket<'_, M>,
+    ) -> Result<(), anyhow::Error> {
+        let tx_id = p.transaction_id();
+        let entry = self
+            .tx
+            .try_remove(tx_id_to_index(tx_id))
+            .context("failed to find tx entry")?;
+        let status = p
+            .reader()
+            .read_plain::<protocol::Status>()
+            .context("failed to read tx reply")?;
+        Ok(match entry {
+            Tx::FdoD0Entry(send) => {
+                tracing::trace!(tx_id, ?status, "fdo d0 entry reply received");
+                let r = if status == protocol::Status::SUCCESS {
+                    Ok(self.init_devices.take().unwrap())
+                } else {
+                    Err(status)
+                };
+                send.send(r);
+            }
+            Tx::CreateInterrupt(rpc) => {
+                tracing::trace!(tx_id, ?status, "create interrupt reply received");
+
+                if status == protocol::Status::SUCCESS {
+                    let reply = p
+                        .reader()
+                        .read_plain::<protocol::CreateInterruptReply>()
+                        .context("failed to read create interrupt reply")?;
+                    rpc.complete(Ok(reply.interrupt));
+                } else {
+                    rpc.fail(anyhow::anyhow!("failed to create interrupt: {status:#x?}",));
+                }
+            }
+            Tx::DeleteInterrupt(rpc) => {
+                tracing::trace!(tx_id, "delete interrupt reply received");
+
+                if status == protocol::Status::SUCCESS {
+                    rpc.complete(Ok(()));
+                } else {
+                    rpc.fail(anyhow::anyhow!("failed to delete interrupt: {status:#x?}",));
+                }
+            }
+            Tx::AssignedResources(rpc) => {
+                tracing::trace!(tx_id, ?status, "assigned resources reply received");
+
+                if status == protocol::Status::SUCCESS {
+                    rpc.complete(Ok(()));
+                } else {
+                    rpc.fail(anyhow::anyhow!("failed to initialize device: {status:#x?}",));
+                }
+            }
+            Tx::QueryResourceRequirements(rpc) => {
+                tracing::trace!(tx_id, ?status, "query resource requirements reply received");
+
+                if status == protocol::Status::SUCCESS {
+                    let reply = p
+                        .reader()
+                        .read_plain::<protocol::QueryResourceRequirementsReply>()
+                        .context("failed to read query resource requirements reply")?;
+                    rpc.complete(Ok(reply));
+                } else {
+                    rpc.fail(anyhow::anyhow!(
+                        "failed to query resource requirements: {status:#x?}",
+                    ));
+                }
+            }
+        })
+    }
+
+    async fn handle_req<M: RingMem>(
+        &mut self,
+        write: &mut vmbus_async::queue::WriteHalf<'_, M>,
+        req: WorkerRequest,
+    ) -> anyhow::Result<Option<inspect::Deferred>> {
         match req {
-            WorkerRequest::Inspect(deferred) => deferred.inspect(&mut *self),
+            WorkerRequest::Inspect(deferred) => return Ok(Some(deferred)),
             WorkerRequest::MapInterrupt(rpc) => {
                 let ((id, interrupt), reply) = rpc.split();
                 if self.check_slot(id).is_none() {
                     reply.fail(anyhow::anyhow!("device is gone"));
-                    return Ok(());
+                    return Ok(None);
                 }
                 self.send_tx(
+                    write,
                     Tx::CreateInterrupt(reply),
                     vpci_protocol::CreateInterrupt2 {
                         message_type: protocol::MessageType::CREATE_INTERRUPT2,
@@ -897,9 +916,10 @@ impl<M: RingMem> VpciClientWorker<M> {
                 let ((id, interrupt), reply) = rpc.split();
                 if self.check_slot(id).is_none() {
                     reply.fail(anyhow::anyhow!("device is gone"));
-                    return Ok(());
+                    return Ok(None);
                 }
                 self.send_tx(
+                    write,
                     Tx::DeleteInterrupt(reply),
                     vpci_protocol::DeleteInterrupt {
                         message_type: protocol::MessageType::DELETE_INTERRUPT,
@@ -915,10 +935,11 @@ impl<M: RingMem> VpciClientWorker<M> {
                 let (id, reply) = rpc.split();
                 if self.check_slot(id).is_none() {
                     reply.fail(anyhow::anyhow!("device is gone"));
-                    return Ok(());
+                    return Ok(None);
                 }
                 // Send space for one resource to satisfy the Hyper-V implementation.
                 self.send_tx(
+                    write,
                     Tx::AssignedResources(reply),
                     protocol::DeviceTranslate {
                         message_type: protocol::MessageType::ASSIGNED_RESOURCES,
@@ -934,9 +955,10 @@ impl<M: RingMem> VpciClientWorker<M> {
                 let (id, reply) = rpc.split();
                 if self.check_slot(id).is_none() {
                     reply.fail(anyhow::anyhow!("device is gone"));
-                    return Ok(());
+                    return Ok(None);
                 }
                 self.send_tx(
+                    write,
                     Tx::QueryResourceRequirements(reply),
                     protocol::QueryResourceRequirements {
                         message_type: protocol::MessageType::CURRENT_RESOURCE_REQUIREMENTS,
@@ -949,20 +971,21 @@ impl<M: RingMem> VpciClientWorker<M> {
             }
             WorkerRequest::Done(id) => {
                 let Some(i) = self.check_slot(id) else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 let slot = self.slots[i].as_mut().unwrap();
                 slot.done = true;
-                if slot.ejected {
-                    self.conn.send_eject_complete(id.slot).await?;
+                if slot.eject.is_none() {
+                    send_eject_complete(write, id.slot).await?;
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
-    async fn send_tx<S: IntoBytes + Immutable>(
+    async fn send_tx<S: IntoBytes + Immutable, M: RingMem>(
         &mut self,
+        write: &mut vmbus_async::queue::WriteHalf<'_, M>,
         tx: Tx,
         msg: S,
         extra: &[u8],
@@ -974,11 +997,7 @@ impl<M: RingMem> VpciClientWorker<M> {
             message = std::any::type_name_of_val(&msg),
             "sending transaction"
         );
-
-        self.conn
-            .queue
-            .split()
-            .1
+        write
             .write(OutgoingPacket {
                 transaction_id: tx_id,
                 packet_type: vmbus_ring::OutgoingPacketType::InBandWithCompletion,

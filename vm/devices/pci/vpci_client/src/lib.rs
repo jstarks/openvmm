@@ -24,7 +24,11 @@ use parking_lot::Mutex;
 use pci_core::spec::cfg_space::Command;
 use pci_core::spec::cfg_space::HeaderType00;
 use pci_core::spec::hwid::HardwareIds;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
+use std::task::ready;
 use vmbus_async::queue::IncomingPacket;
 use vmbus_async::queue::OutgoingPacket;
 use vmbus_async::queue::Queue;
@@ -177,13 +181,21 @@ pub struct VpciDeviceDescription {
     serial_num: u32,
     #[inspect(skip)]
     req: mesh::Sender<WorkerRequest>,
+    #[inspect(skip)]
+    eject: mesh::OneshotReceiver<()>,
 }
 
 /// An initialized VPCI device.
 #[derive(Inspect)]
 pub struct VpciDevice {
+    hw_ids: HardwareIds,
+    #[inspect(skip)]
+    config_space: Arc<Mutex<ConfigSpaceAccessor>>,
+    numa_node: u16,
+    #[inspect(hex)]
+    serial_num: u32,
     #[inspect(flatten)]
-    desc: VpciDeviceDescription,
+    dev: InUseDevice,
     shadows: Mutex<ConfigSpaceShadows>,
     #[inspect(hex, iter_by_index)]
     bar_masks: [u32; 6],
@@ -256,7 +268,14 @@ impl ConfigSpaceAccessor {
     }
 }
 
-impl Drop for VpciDeviceDescription {
+#[derive(Inspect)]
+struct InUseDevice {
+    #[inspect(skip)]
+    req: mesh::Sender<WorkerRequest>,
+    id: DeviceId,
+}
+
+impl Drop for InUseDevice {
     fn drop(&mut self) {
         self.req.send(WorkerRequest::Done(self.id));
     }
@@ -279,8 +298,9 @@ impl VpciDeviceDescription {
     }
 
     /// Initializes the device, returning a VPCI device instance that can be
-    /// used to interact with it.
-    pub async fn init(self) -> anyhow::Result<VpciDevice> {
+    /// used to interact with it. Also returns an object to use to get notified
+    /// when the device is ejected or surprise removed.
+    pub async fn init(self) -> anyhow::Result<(VpciDevice, VpciDeviceRemoved)> {
         let requirements = self
             .req
             .call_failable(WorkerRequest::QueryResourceRequirements, self.id)
@@ -291,7 +311,21 @@ impl VpciDeviceDescription {
             "queried requirements"
         );
 
-        self.req.call_failable(WorkerRequest::Init, self.id).await?;
+        let Self {
+            hw_ids,
+            config_space,
+            id,
+            numa_node,
+            serial_num,
+            req,
+            eject,
+        } = self;
+
+        // After this, the device is considered initialized and the caller is
+        // responsible notifying the worker when the device is no longer in use.
+        let dev = InUseDevice { req, id };
+
+        dev.req.call_failable(WorkerRequest::Init, self.id).await?;
 
         let mut high64 = false;
         let mut bar_rao = [0; 6];
@@ -310,16 +344,40 @@ impl VpciDeviceDescription {
         }
 
         let device = VpciDevice {
-            desc: self,
             shadows: Mutex::new(ConfigSpaceShadows {
                 command: Command::new(),
                 bars: [0; 6],
             }),
             bar_masks: requirements.bars,
             bar_rao,
+            hw_ids,
+            config_space,
+            numa_node,
+            serial_num,
+            dev,
         };
 
-        Ok(device)
+        Ok((device, VpciDeviceRemoved(eject)))
+    }
+}
+
+pub struct VpciDeviceRemoved(mesh::OneshotReceiver<()>);
+
+pub enum RemovalKind {
+    /// The device was ejected by the host.
+    Eject,
+    /// The device was removed by the host.
+    SurpriseRemove,
+}
+
+impl Future for VpciDeviceRemoved {
+    type Output = RemovalKind;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match ready!(self.get_mut().0.poll_unpin(cx)) {
+            Ok(()) => Poll::Ready(RemovalKind::Eject),
+            Err(_) => Poll::Ready(RemovalKind::SurpriseRemove),
+        }
     }
 }
 
@@ -332,24 +390,24 @@ impl VpciDevice {
         let value = match HeaderType00(offset) {
             HeaderType00::STATUS_COMMAND => {
                 let shadows = self.shadows.lock();
-                let status_command = self.desc.config_space.lock().read(self.desc.id, offset);
+                let status_command = self.config_space.lock().read(self.dev.id, offset);
                 // Preserve the MMIO enabled bit in the command register, since
                 // Hyper-V does not always emulate it correctly for reads.
                 let mask = u32::from(u16::from(Command::new().with_mmio_enabled(true)));
                 (status_command & !mask) | (u32::from(u16::from(shadows.command)) & mask)
             }
             HeaderType00::DEVICE_VENDOR => {
-                (self.desc.hw_ids.vendor_id as u32) | ((self.desc.hw_ids.device_id as u32) << 16)
+                (self.hw_ids.vendor_id as u32) | ((self.hw_ids.device_id as u32) << 16)
             }
             HeaderType00::CLASS_REVISION => {
-                (self.desc.hw_ids.revision_id as u32)
-                    | ((self.desc.hw_ids.prog_if.0 as u32) << 8)
-                    | ((self.desc.hw_ids.sub_class.0 as u32) << 16)
-                    | ((self.desc.hw_ids.base_class.0 as u32) << 24)
+                (self.hw_ids.revision_id as u32)
+                    | ((self.hw_ids.prog_if.0 as u32) << 8)
+                    | ((self.hw_ids.sub_class.0 as u32) << 16)
+                    | ((self.hw_ids.base_class.0 as u32) << 24)
             }
             HeaderType00::SUBSYSTEM_ID => {
-                (self.desc.hw_ids.type0_sub_vendor_id as u32)
-                    | ((self.desc.hw_ids.type0_sub_system_id as u32) << 16)
+                (self.hw_ids.type0_sub_vendor_id as u32)
+                    | ((self.hw_ids.type0_sub_system_id as u32) << 16)
             }
             HeaderType00::BAR0
             | HeaderType00::BAR1
@@ -363,7 +421,7 @@ impl VpciDevice {
                 let i = (offset - HeaderType00::BAR0.0) as usize / 4;
                 shadows.bars[i] | self.bar_rao[i]
             }
-            _ => self.desc.config_space.lock().read(self.desc.id, offset),
+            _ => self.config_space.lock().read(self.dev.id, offset),
         };
         tracing::trace!(?offset, value, "config space read");
         value
@@ -374,7 +432,7 @@ impl VpciDevice {
         tracing::trace!(?offset, value, "config space write");
         let mut shadows = self.shadows.lock();
         let shadows = &mut *shadows;
-        let mut accessor = self.desc.config_space.lock();
+        let mut accessor = self.config_space.lock();
         match HeaderType00(offset) {
             HeaderType00::STATUS_COMMAND => {
                 let new_command = Command::from(value as u16);
@@ -382,7 +440,7 @@ impl VpciDevice {
                     // Flush the BAR shadow to the device.
                     for (i, &bar) in shadows.bars.iter().enumerate() {
                         let bar_offset = HeaderType00::BAR0.0 + (i as u16 * 4);
-                        accessor.write(self.desc.id, bar_offset, bar);
+                        accessor.write(self.dev.id, bar_offset, bar);
                     }
                 }
                 shadows.command = new_command;
@@ -402,7 +460,7 @@ impl VpciDevice {
             }
             _ => {}
         }
-        accessor.write(self.desc.id, offset, value);
+        accessor.write(self.dev.id, offset, value);
     }
 }
 
@@ -432,9 +490,9 @@ impl MapVpciInterrupt for VpciDevice {
             interrupt.processor_count += 1;
         }
         let resource = self
-            .desc
+            .dev
             .req
-            .call_failable(WorkerRequest::MapInterrupt, (self.desc.id, interrupt))
+            .call_failable(WorkerRequest::MapInterrupt, (self.dev.id, interrupt))
             .await
             .map_err(RegisterInterruptError::new)?;
 
@@ -458,9 +516,9 @@ impl MapVpciInterrupt for VpciDevice {
             data_payload: data,
             address,
         };
-        self.desc
+        self.dev
             .req
-            .call_failable(WorkerRequest::UnmapInterrupt, (self.desc.id, interrupt))
+            .call_failable(WorkerRequest::UnmapInterrupt, (self.dev.id, interrupt))
             .await
             .unwrap_or_else(|err| {
                 tracing::error!(
@@ -502,7 +560,7 @@ struct WorkerState {
 struct SlotState {
     hw_ids: HardwareIds,
     serial_num: u32,
-    done: bool,
+    in_use: bool,
     removed: bool,
     #[inspect(rename = "ejected", with = "|x| x.is_none()")]
     eject: Option<mesh::OneshotSender<()>>,
@@ -678,13 +736,14 @@ impl<M: RingMem> VpciClientWorker<M> {
 }
 
 impl WorkerState {
-    fn check_slot(&self, id: DeviceId) -> Option<usize> {
+    fn slot_mut(&mut self, id: DeviceId) -> Option<&mut SlotState> {
         let slot_index = u32::from(id.slot) as usize;
-        let slot = self.slots.get(slot_index)?.as_ref()?;
-        if slot.seq != id.seq || slot.removed {
+        let slot = self.slots.get_mut(slot_index)?.as_mut()?;
+        if slot.seq != id.seq {
             return None;
         }
-        Some(slot_index)
+        assert!(!slot.removed);
+        Some(slot)
     }
 
     async fn handle_packet<M: RingMem>(
@@ -760,7 +819,7 @@ impl WorkerState {
                         serial_num: device.serial_num,
                         removed: false,
                         eject: Some(eject_send),
-                        done: false,
+                        in_use: false,
                         seq,
                     });
                     let vpci_device = VpciDeviceDescription {
@@ -773,6 +832,7 @@ impl WorkerState {
                         numa_node: device.numa_node,
                         serial_num: device.serial_num,
                         req: self.req.sender(),
+                        eject: eject_recv,
                     };
                     if let Some(init_devices) = &mut self.init_devices {
                         init_devices.push(vpci_device);
@@ -798,10 +858,10 @@ impl WorkerState {
                     anyhow::bail!("eject packet for unknown slot {slot_index}");
                 };
                 if let Some(eject_send) = slot.eject.take() {
-                    if slot.done {
-                        send_eject_complete(write, eject.slot).await?;
-                    } else {
+                    if slot.in_use {
                         eject_send.send(());
+                    } else {
+                        send_eject_complete(write, eject.slot).await?;
                     }
                 } else {
                     tracing::warn!("eject packet for device that is already ejected");
@@ -895,7 +955,7 @@ impl WorkerState {
             WorkerRequest::Inspect(deferred) => return Ok(Some(deferred)),
             WorkerRequest::MapInterrupt(rpc) => {
                 let ((id, interrupt), reply) = rpc.split();
-                if self.check_slot(id).is_none() {
+                if self.slot_mut(id).is_none() {
                     reply.fail(anyhow::anyhow!("device is gone"));
                     return Ok(None);
                 }
@@ -914,7 +974,7 @@ impl WorkerState {
             }
             WorkerRequest::UnmapInterrupt(rpc) => {
                 let ((id, interrupt), reply) = rpc.split();
-                if self.check_slot(id).is_none() {
+                if self.slot_mut(id).is_none() {
                     reply.fail(anyhow::anyhow!("device is gone"));
                     return Ok(None);
                 }
@@ -933,10 +993,11 @@ impl WorkerState {
             }
             WorkerRequest::Init(rpc) => {
                 let (id, reply) = rpc.split();
-                if self.check_slot(id).is_none() {
+                let Some(slot) = self.slot_mut(id) else {
                     reply.fail(anyhow::anyhow!("device is gone"));
                     return Ok(None);
-                }
+                };
+                slot.in_use = true;
                 // Send space for one resource to satisfy the Hyper-V implementation.
                 self.send_tx(
                     write,
@@ -953,7 +1014,7 @@ impl WorkerState {
             }
             WorkerRequest::QueryResourceRequirements(rpc) => {
                 let (id, reply) = rpc.split();
-                if self.check_slot(id).is_none() {
+                if self.slot_mut(id).is_none() {
                     reply.fail(anyhow::anyhow!("device is gone"));
                     return Ok(None);
                 }
@@ -970,11 +1031,10 @@ impl WorkerState {
                 .context("failed to send query resource requirements request")?;
             }
             WorkerRequest::Done(id) => {
-                let Some(i) = self.check_slot(id) else {
+                let Some(slot) = self.slot_mut(id) else {
                     return Ok(None);
                 };
-                let slot = self.slots[i].as_mut().unwrap();
-                slot.done = true;
+                slot.in_use = false;
                 if slot.eject.is_none() {
                     send_eject_complete(write, id.slot).await?;
                 }

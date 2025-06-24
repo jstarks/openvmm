@@ -56,11 +56,22 @@ impl Inspect for VpciClient {
 
 enum WorkerRequest {
     Inspect(inspect::Deferred),
-    MapInterrupt(FailableRpc<protocol::CreateInterrupt2, protocol::MsiResourceRemapped>),
-    UnmapInterrupt(FailableRpc<protocol::DeleteInterrupt, ()>),
-    QueryResourceRequirements(FailableRpc<SlotNumber, protocol::QueryResourceRequirementsReply>),
-    Init(FailableRpc<SlotNumber, ()>),
-    Done(SlotNumber),
+    MapInterrupt(
+        FailableRpc<
+            (DeviceId, vpci_protocol::MsiResourceDescriptor2),
+            protocol::MsiResourceRemapped,
+        >,
+    ),
+    UnmapInterrupt(FailableRpc<(DeviceId, vpci_protocol::MsiResourceRemapped), ()>),
+    QueryResourceRequirements(FailableRpc<DeviceId, protocol::QueryResourceRequirementsReply>),
+    Init(FailableRpc<DeviceId, ()>),
+    Done(DeviceId),
+}
+
+#[derive(Copy, Clone)]
+struct DeviceId {
+    slot: SlotNumber,
+    seq: u64,
 }
 
 #[derive(Inspect)]
@@ -98,34 +109,50 @@ impl<M: RingMem> VpciConnection<M> {
         let reply = p.reader().read_plain()?;
         Ok(reply)
     }
-}
 
-async fn negotiate<M: RingMem>(
-    conn: &mut VpciConnection<M>,
-) -> anyhow::Result<protocol::ProtocolVersion> {
-    // Try to negotiate versions in order from newest to oldest
-    let versions = &[protocol::ProtocolVersion::VB];
+    async fn negotiate(self: &mut Self) -> anyhow::Result<protocol::ProtocolVersion> {
+        // Try to negotiate versions in order from newest to oldest
+        let versions = &[protocol::ProtocolVersion::VB];
 
-    for &version in versions {
-        tracing::debug!(?version, "trying protocol version");
+        for &version in versions {
+            tracing::debug!(?version, "trying protocol version");
 
-        // Create the protocol version query message
-        let query = protocol::QueryProtocolVersion {
-            message_type: protocol::MessageType::QUERY_PROTOCOL_VERSION,
-            protocol_version: version,
-        };
+            // Create the protocol version query message
+            let query = protocol::QueryProtocolVersion {
+                message_type: protocol::MessageType::QUERY_PROTOCOL_VERSION,
+                protocol_version: version,
+            };
 
-        let reply = conn
-            .transact::<_, protocol::QueryProtocolVersionReply>(query)
-            .await
-            .context("failed to send protocol version query")?;
-        if reply.status == protocol::Status::SUCCESS {
-            tracing::debug!(?version, "negotiated protocol version");
-            return Ok(version);
+            let reply = self
+                .transact::<_, protocol::QueryProtocolVersionReply>(query)
+                .await
+                .context("failed to send protocol version query")?;
+            if reply.status == protocol::Status::SUCCESS {
+                tracing::debug!(?version, "negotiated protocol version");
+                return Ok(version);
+            }
         }
+
+        anyhow::bail!("no supported VPCI protocol version found");
     }
 
-    anyhow::bail!("no supported VPCI protocol version found");
+    async fn send_eject_complete(&mut self, slot: SlotNumber) -> anyhow::Result<()> {
+        self.queue
+            .split()
+            .1
+            .write(OutgoingPacket {
+                transaction_id: 0,
+                packet_type: vmbus_ring::OutgoingPacketType::InBandNoCompletion,
+                payload: &[protocol::PdoMessage {
+                    message_type: protocol::MessageType::EJECT_COMPLETE,
+                    slot,
+                }
+                .as_bytes()],
+            })
+            .await?;
+
+        Ok(())
+    }
 }
 
 /// Trait used to access configuration space of a VPCI bus.
@@ -146,6 +173,7 @@ pub struct VpciDeviceDescription {
     config_space: Arc<Mutex<ConfigSpaceAccessor>>,
     #[inspect(hex, with = "|&x| u32::from(x)")]
     slot: SlotNumber,
+    seq: u64,
     numa_node: u16,
     #[inspect(hex)]
     serial_num: u32,
@@ -210,7 +238,20 @@ impl ConfigSpaceAccessor {
     }
 }
 
+impl Drop for VpciDeviceDescription {
+    fn drop(&mut self) {
+        self.req.send(WorkerRequest::Done(self.id()));
+    }
+}
+
 impl VpciDeviceDescription {
+    fn id(&self) -> DeviceId {
+        DeviceId {
+            slot: self.slot,
+            seq: self.seq,
+        }
+    }
+
     /// Returns the hardware IDs of the device.
     pub fn hw_ids(&self) -> &HardwareIds {
         &self.hw_ids
@@ -231,7 +272,7 @@ impl VpciDeviceDescription {
     pub async fn init(self) -> anyhow::Result<VpciDevice> {
         let requirements = self
             .req
-            .call_failable(WorkerRequest::QueryResourceRequirements, self.slot)
+            .call_failable(WorkerRequest::QueryResourceRequirements, self.id())
             .await?;
 
         tracing::debug!(
@@ -240,7 +281,7 @@ impl VpciDeviceDescription {
         );
 
         self.req
-            .call_failable(WorkerRequest::Init, self.slot)
+            .call_failable(WorkerRequest::Init, self.id())
             .await?;
 
         let mut high64 = false;
@@ -384,14 +425,7 @@ impl MapVpciInterrupt for VpciDevice {
         let resource = self
             .desc
             .req
-            .call_failable(
-                WorkerRequest::MapInterrupt,
-                protocol::CreateInterrupt2 {
-                    message_type: protocol::MessageType::CREATE_INTERRUPT2,
-                    slot: self.desc.slot,
-                    interrupt,
-                },
-            )
+            .call_failable(WorkerRequest::MapInterrupt, (self.desc.id(), interrupt))
             .await
             .map_err(RegisterInterruptError::new)?;
 
@@ -409,19 +443,15 @@ impl MapVpciInterrupt for VpciDevice {
 
     async fn unregister_interrupt(&self, address: u64, data: u32) {
         tracing::debug!(address, data, "unregistering interrupt");
-        let resource = protocol::DeleteInterrupt {
-            message_type: protocol::MessageType::DELETE_INTERRUPT,
-            slot: self.desc.slot,
-            interrupt: protocol::MsiResourceRemapped {
-                reserved: 0,
-                message_count: 0, // The host does not look at this value, so don't bother to remember it.
-                data_payload: data,
-                address,
-            },
+        let interrupt = protocol::MsiResourceRemapped {
+            reserved: 0,
+            message_count: 0, // The host does not look at this value, so don't bother to remember it.
+            data_payload: data,
+            address,
         };
         self.desc
             .req
-            .call_failable(WorkerRequest::UnmapInterrupt, resource)
+            .call_failable(WorkerRequest::UnmapInterrupt, (self.desc.id(), interrupt))
             .await
             .unwrap_or_else(|err| {
                 tracing::error!(
@@ -448,14 +478,17 @@ struct VpciClientWorker<M: RingMem> {
     init_devices: Option<Vec<VpciDeviceDescription>>,
     #[inspect(iter_by_index)]
     slots: Vec<Option<SlotState>>,
+    next_seq: u64,
 }
 
 #[derive(Inspect)]
 struct SlotState {
     hw_ids: HardwareIds,
     serial_num: u32,
+    done: bool,
     removed: bool,
     ejected: bool,
+    seq: u64,
 }
 
 #[derive(Inspect)]
@@ -490,7 +523,8 @@ impl VpciClient {
             buf: vec![0; protocol::MAXIMUM_PACKET_SIZE],
         };
 
-        let version = negotiate(&mut conn)
+        let version = conn
+            .negotiate()
             .await
             .context("failed to negotiate protocol version")?;
 
@@ -536,6 +570,7 @@ impl VpciClient {
             })),
             init_devices: Some(Vec::new()),
             slots: Vec::new(),
+            next_seq: 0,
         };
 
         let task = driver.spawn("vpci-client", worker.run());
@@ -667,11 +702,15 @@ impl<M: RingMem> VpciClientWorker<M> {
                                             if slot_index >= self.slots.len() {
                                                 self.slots.resize_with(slot_index + 1, || None);
                                             }
+                                            let seq = self.next_seq;
+                                            self.next_seq += 1;
                                             self.slots[slot_index] = Some(SlotState {
                                                 hw_ids,
                                                 serial_num: device.serial_num,
                                                 removed: false,
                                                 ejected: false,
+                                                done: false,
+                                                seq,
                                             });
                                             let vpci_device = VpciDeviceDescription {
                                                 hw_ids,
@@ -680,6 +719,7 @@ impl<M: RingMem> VpciClientWorker<M> {
                                                 numa_node: device.numa_node,
                                                 serial_num: device.serial_num,
                                                 req: self.req.sender(),
+                                                seq,
                                             };
                                             if let Some(init_devices) = &mut self.init_devices {
                                                 init_devices.push(vpci_device);
@@ -823,29 +863,66 @@ impl<M: RingMem> VpciClientWorker<M> {
         Ok(())
     }
 
+    fn check_slot(&self, id: DeviceId) -> Option<usize> {
+        let slot_index = u32::from(id.slot) as usize;
+        let slot = self.slots.get(slot_index)?.as_ref()?;
+        if slot.seq != id.seq || slot.removed {
+            return None;
+        }
+        Some(slot_index)
+    }
+
     async fn handle_req(&mut self, req: WorkerRequest) -> anyhow::Result<()> {
         match req {
             WorkerRequest::Inspect(deferred) => deferred.inspect(&mut *self),
             WorkerRequest::MapInterrupt(rpc) => {
-                let (req, reply) = rpc.split();
-                self.send_tx(Tx::CreateInterrupt(reply), req, &[])
-                    .await
-                    .context("failed to send create interrupt message")?;
+                let ((id, interrupt), reply) = rpc.split();
+                if self.check_slot(id).is_none() {
+                    reply.fail(anyhow::anyhow!("device is gone"));
+                    return Ok(());
+                }
+                self.send_tx(
+                    Tx::CreateInterrupt(reply),
+                    vpci_protocol::CreateInterrupt2 {
+                        message_type: protocol::MessageType::CREATE_INTERRUPT2,
+                        slot: id.slot,
+                        interrupt,
+                    },
+                    &[],
+                )
+                .await
+                .context("failed to send create interrupt message")?;
             }
             WorkerRequest::UnmapInterrupt(rpc) => {
-                let (req, reply) = rpc.split();
-                self.send_tx(Tx::DeleteInterrupt(reply), req, &[])
-                    .await
-                    .context("failed to send delete interrupt message")?;
+                let ((id, interrupt), reply) = rpc.split();
+                if self.check_slot(id).is_none() {
+                    reply.fail(anyhow::anyhow!("device is gone"));
+                    return Ok(());
+                }
+                self.send_tx(
+                    Tx::DeleteInterrupt(reply),
+                    vpci_protocol::DeleteInterrupt {
+                        message_type: protocol::MessageType::DELETE_INTERRUPT,
+                        slot: id.slot,
+                        interrupt,
+                    },
+                    &[],
+                )
+                .await
+                .context("failed to send delete interrupt message")?;
             }
             WorkerRequest::Init(rpc) => {
-                let (slot, reply) = rpc.split();
+                let (id, reply) = rpc.split();
+                if self.check_slot(id).is_none() {
+                    reply.fail(anyhow::anyhow!("device is gone"));
+                    return Ok(());
+                }
                 // Send space for one resource to satisfy the Hyper-V implementation.
                 self.send_tx(
                     Tx::AssignedResources(reply),
                     protocol::DeviceTranslate {
                         message_type: protocol::MessageType::ASSIGNED_RESOURCES,
-                        slot,
+                        slot: id.slot,
                         ..FromZeros::new_zeroed()
                     },
                     &[0; size_of::<vpci_protocol::MsiResource3>()],
@@ -854,36 +931,30 @@ impl<M: RingMem> VpciClientWorker<M> {
                 .context("failed to send assigned resources request")?;
             }
             WorkerRequest::QueryResourceRequirements(rpc) => {
-                let (slot, reply) = rpc.split();
+                let (id, reply) = rpc.split();
+                if self.check_slot(id).is_none() {
+                    reply.fail(anyhow::anyhow!("device is gone"));
+                    return Ok(());
+                }
                 self.send_tx(
                     Tx::QueryResourceRequirements(reply),
                     protocol::QueryResourceRequirements {
                         message_type: protocol::MessageType::CURRENT_RESOURCE_REQUIREMENTS,
-                        slot,
+                        slot: id.slot,
                     },
                     &[],
                 )
                 .await
                 .context("failed to send query resource requirements request")?;
             }
-            WorkerRequest::Done(slot_num) => {
-                // BUGBUG don't take
-                let slot = self.slots[u32::from(slot_num) as usize].take().unwrap();
-                if slot.ejected && !slot.removed {
-                    self.conn
-                        .queue
-                        .split()
-                        .1
-                        .write(OutgoingPacket {
-                            transaction_id: 0, // No reply expected.
-                            packet_type: vmbus_ring::OutgoingPacketType::InBandNoCompletion,
-                            payload: &[protocol::PdoMessage {
-                                message_type: protocol::MessageType::EJECT_COMPLETE,
-                                slot: slot_num,
-                            }
-                            .as_bytes()],
-                        })
-                        .await?;
+            WorkerRequest::Done(id) => {
+                let Some(i) = self.check_slot(id) else {
+                    return Ok(());
+                };
+                let slot = self.slots[i].as_mut().unwrap();
+                slot.done = true;
+                if slot.ejected {
+                    self.conn.send_eject_complete(id.slot).await?;
                 }
             }
         }

@@ -867,6 +867,7 @@ impl<M: RingMem> VpciClientWorker<M> {
                 .context("failed to send query resource requirements request")?;
             }
             WorkerRequest::Done(slot_num) => {
+                // BUGBUG don't take
                 let slot = self.slots[u32::from(slot_num) as usize].take().unwrap();
                 if slot.ejected && !slot.removed {
                     self.conn

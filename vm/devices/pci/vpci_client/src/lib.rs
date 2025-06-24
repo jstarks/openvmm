@@ -361,12 +361,14 @@ impl VpciDeviceDescription {
     }
 }
 
+/// Future that resolves when the device is ejected or removed.
 pub struct VpciDeviceRemoved(mesh::OneshotReceiver<()>);
 
+/// The kind of device removal.
 pub enum RemovalKind {
-    /// The device was ejected by the host.
+    /// The host requested that the device be ejected.
     Eject,
-    /// The device was removed by the host.
+    /// The host surprise removed the device.
     SurpriseRemove,
 }
 

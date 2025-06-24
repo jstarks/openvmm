@@ -8,7 +8,6 @@ use chipset_device::io::IoResult;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
 use chipset_device::pci::PciConfigSpace;
 use closeable_mutex::CloseableMutex;
-use futures::StreamExt;
 use guestmem::GuestMemory;
 use guid::Guid;
 use pal_async::DefaultDriver;
@@ -92,14 +91,12 @@ async fn test_negotiate_version(driver: DefaultDriver) {
         .await
     });
 
-    let (devices_send, mut devices_recv) = mesh::channel();
-
-    let _client =
-        super::VpciClient::connect(&driver, guest, Box::new(BusWrapper(bus)), devices_send)
+    let (_client, devices) =
+        super::VpciClient::connect(&driver, guest, Box::new(BusWrapper(bus)), mesh::channel().0)
             .await
             .unwrap();
 
-    let device = devices_recv.next().await.unwrap().init().await.unwrap();
+    let (device, _removed) = devices.into_iter().next().unwrap().init().await.unwrap();
     let MsiAddressData { address, data } = device
         .register_interrupt(
             1,

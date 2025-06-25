@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Unit tests.
+
 #![cfg(test)]
 
 use chipset_device::ChipsetDevice;

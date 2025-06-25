@@ -362,6 +362,8 @@ impl VpciDeviceDescription {
 }
 
 /// Future that resolves when the device is ejected or removed.
+///
+/// TODO: we need to know about eject and _then_ surprise removal.
 pub struct VpciDeviceRemoved(mesh::OneshotReceiver<()>);
 
 /// The kind of device removal.

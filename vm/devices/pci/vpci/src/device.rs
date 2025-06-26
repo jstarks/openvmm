@@ -583,19 +583,21 @@ impl ReadyState {
     async fn send_child_device(
         &mut self,
         conn: &mut Connection<impl RingMem>,
-        dev: &mut VpciChannel,
+        chan: &mut VpciChannel,
     ) -> Result<(), WorkerError> {
         // Enumerate the device within the guest
-        let hardware_ids = &dev.hardware_ids;
-        let pnp_id = protocol::PnpId {
-            vendor_id: hardware_ids.vendor_id,
-            device_id: hardware_ids.device_id,
-            revision_id: hardware_ids.revision_id,
-            prog_if: hardware_ids.prog_if.into(),
-            sub_class: hardware_ids.sub_class.into(),
-            base_class: hardware_ids.base_class.into(),
-            sub_vendor_id: hardware_ids.type0_sub_vendor_id,
-            sub_system_id: hardware_ids.type0_sub_system_id,
+        let pnp_id = |dev: &SingleDevice| {
+            let hardware_ids = &dev.desc.hardware_ids;
+            protocol::PnpId {
+                vendor_id: hardware_ids.vendor_id,
+                device_id: hardware_ids.device_id,
+                revision_id: hardware_ids.revision_id,
+                prog_if: hardware_ids.prog_if.into(),
+                sub_class: hardware_ids.sub_class.into(),
+                base_class: hardware_ids.base_class.into(),
+                sub_vendor_id: hardware_ids.type0_sub_vendor_id,
+                sub_system_id: hardware_ids.type0_sub_system_id,
+            }
         };
         if self.vpci_version < protocol::ProtocolVersion::VB {
             let relations = protocol::QueryBusRelations {
@@ -603,29 +605,45 @@ impl ReadyState {
                 device_count: 1,
                 device: [],
             };
-            let device = protocol::DeviceDescription {
-                pnp_id,
-                slot: SlotNumber::new(),
-                serial_num: dev.serial_num,
-            };
-
-            conn.send_packet(&relations, &device).await?;
+            let devices = chan
+                .current_devices
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, dev)| {
+                    let dev = dev.as_ref()?;
+                    Some(protocol::DeviceDescription {
+                        pnp_id: pnp_id(dev),
+                        slot: (slot as u32).into(),
+                        serial_num: dev.desc.serial_num,
+                    })
+                })
+                .collect::<Vec<_>>();
+            conn.send_packet(&relations, devices.as_slice()).await?;
         } else {
             let relations = protocol::QueryBusRelations2 {
                 message_type: protocol::MessageType::BUS_RELATIONS2,
                 device_count: 1,
                 device: [],
             };
-            let device = protocol::DeviceDescription2 {
-                pnp_id,
-                slot: SlotNumber::new(),
-                serial_num: dev.serial_num,
-                flags: 0,
-                numa_node: 0,
-                rsvd: 0,
-            };
+            let devices = chan
+                .current_devices
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, dev)| {
+                    let dev = dev.as_ref()?;
+                    Some(protocol::DeviceDescription2 {
+                        pnp_id: pnp_id(dev),
+                        slot: (slot as u32).into(),
+                        serial_num: dev.desc.serial_num,
+                        flags: protocol::DeviceFlags::new()
+                            .with_numa_affinity_specified(dev.desc.numa_node.is_some()),
+                        numa_node: dev.desc.numa_node.unwrap_or(0),
+                        rsvd: 0,
+                    })
+                })
+                .collect::<Vec<_>>();
 
-            conn.send_packet(&relations, &device).await?;
+            conn.send_packet(&relations, devices.as_slice()).await?;
         }
 
         Ok(())
@@ -684,7 +702,7 @@ impl ReadyState {
     async fn handle_packet(
         &mut self,
         packet: PacketData,
-        dev: &mut VpciChannel,
+        chan: &mut VpciChannel,
         conn: &mut Connection<impl RingMem>,
         transaction_id: Option<u64>,
     ) -> Result<(), WorkerError> {
@@ -693,15 +711,15 @@ impl ReadyState {
                 return Err(WorkerError::UnexpectedPacketOrder);
             }
             PacketData::FdoD0Entry { mmio_start } => {
-                tracing::trace!(?mmio_start, ?dev.instance_id, "FDO D0 entry");
-                dev.config_space.map(mmio_start);
+                tracing::trace!(?mmio_start, ?chan.instance_id, "FDO D0 entry");
+                chan.config_space.map(mmio_start);
                 self.send_device = true;
                 // Send the completion after the device has been sent.
                 self.send_completion = transaction_id;
             }
             PacketData::FdoD0Exit => {
-                tracing::trace!(?dev.instance_id, "FDO D0 exit");
-                dev.config_space.unmap();
+                tracing::trace!(?chan.instance_id, "FDO D0 exit");
+                chan.config_space.unmap();
                 conn.send_completion(transaction_id, &protocol::Status::SUCCESS, &[])?;
             }
             PacketData::QueryRelations => {
@@ -712,10 +730,11 @@ impl ReadyState {
                 conn.send_completion(transaction_id, &(), &[])?;
             }
             PacketData::DeviceRequest { slot, request } => {
-                if u32::from(slot) != 0 {
-                    // FUTURE: support a bus with multiple devices.
-                    return Err(PacketError::InvalidSlot(slot).into());
-                }
+                let dev = chan
+                    .current_devices
+                    .get_mut(u32::from(slot) as usize)
+                    .and_then(|d| d.as_mut())
+                    .ok_or(PacketError::InvalidSlot(slot))?;
                 match request {
                     DeviceRequest::AssignedResources {
                         resources,
@@ -757,7 +776,6 @@ impl ReadyState {
                     }
                     DeviceRequest::CreateInterrupt { interrupt } => {
                         let mut resource = FromZeros::new_zeroed();
-                        // TODO: pass failures back the guest, don't fail the channel.
                         dev.map_interrupts(&[interrupt], &mut |r| resource = r)
                             .await?;
                         conn.send_completion(
@@ -781,7 +799,7 @@ impl ReadyState {
                     DeviceRequest::QueryResources => {
                         let reply = protocol::QueryResourceRequirementsReply {
                             status: protocol::Status::SUCCESS,
-                            bars: dev.bar_masks,
+                            bars: dev.desc.bar_masks,
                         };
                         conn.send_completion(transaction_id, &reply, &[])?;
                     }
@@ -828,7 +846,7 @@ enum InvalidBars {
     TooLarge { index: usize, len: u64, mask: u64 },
 }
 
-impl VpciChannel {
+impl SingleDevice {
     fn bars(&mut self) -> [MmioResource; 6] {
         if !self.bars_set {
             // Don't return the default BAR state, which would look like
@@ -836,7 +854,7 @@ impl VpciChannel {
             return [MmioResource::default(); 6];
         }
         let bars = {
-            let mut device = self.device.lock();
+            let mut device = self.desc.device.lock();
             let mut buf = 0;
             [0, 1, 2, 3, 4, 5].map(|i| {
                 device
@@ -849,7 +867,7 @@ impl VpciChannel {
             })
         };
         let mut resources = [MmioResource::default(); 6];
-        for bar in BarMappings::parse(&bars, &self.bar_masks).iter() {
+        for bar in BarMappings::parse(&bars, &self.desc.bar_masks).iter() {
             resources[bar.index as usize] = MmioResource {
                 address: bar.base_address,
                 len: bar.len,
@@ -870,10 +888,10 @@ impl VpciChannel {
             if high64 {
                 return Err(InvalidBars::ResourceHigh64 { index: i });
             }
-            let mut mask = self.bar_masks[i] as u64;
+            let mut mask = self.desc.bar_masks[i] as u64;
             if cfg_space::BarEncodingBits::from_bits(mask as u32).type_64_bit() {
                 high64 = true;
-                mask |= (self.bar_masks[i + 1] as u64) << 32;
+                mask |= (self.desc.bar_masks[i + 1] as u64) << 32;
             }
             if resource.address & !(mask & !0xf) != 0 {
                 return Err(InvalidBars::Unaligned {
@@ -897,7 +915,7 @@ impl VpciChannel {
         }
         tracing::debug!(?bars, "setting bars");
         {
-            let mut device = self.device.lock();
+            let mut device = self.desc.device.lock();
             for (i, bar) in bars.into_iter().enumerate() {
                 {
                     device
@@ -913,7 +931,7 @@ impl VpciChannel {
     }
 
     fn set_power(&mut self, on: bool) {
-        let mut device = self.device.lock();
+        let mut device = self.desc.device.lock();
         let mut command = {
             let mut value = 0;
             device
@@ -964,6 +982,7 @@ impl VpciChannel {
             };
 
             let address_data = self
+                .desc
                 .msi_mapper
                 .register_interrupt(interrupt.vector_count.into(), &params)
                 .await
@@ -991,7 +1010,8 @@ impl VpciChannel {
             .position(|x| x == &interrupt)
             .ok_or(PacketError::UnknownInterrupt(interrupt))?;
 
-        self.msi_mapper
+        self.desc
+            .msi_mapper
             .unregister_interrupt(interrupt.address, interrupt.data)
             .await;
         self.interrupts.swap_remove(i);
@@ -1006,7 +1026,10 @@ impl VpciChannel {
 
         // Unmap all interrupts.
         for MsiAddressData { address, data } in self.interrupts.drain(..) {
-            self.msi_mapper.unregister_interrupt(address, data).await;
+            self.desc
+                .msi_mapper
+                .unregister_interrupt(address, data)
+                .await;
         }
 
         // Clear the BARs.
@@ -1020,23 +1043,34 @@ impl VpciChannel {
 pub struct VpciChannel {
     // Runtime services.
     #[inspect(skip)]
-    msi_mapper: VpciInterruptMapper,
-    #[inspect(skip)]
     config_space: VpciConfigSpace,
 
     // Static configuration.
     #[inspect(skip)]
     instance_id: Guid,
-    serial_num: u32,
-    hardware_ids: HardwareIds,
-    #[inspect(hex, iter_by_index)]
-    bar_masks: [u32; 6],
 
-    // The underlying device.
+    // The underlying devices that the guest is aware of.
     #[inspect(skip)]
-    device: Arc<CloseableMutex<dyn ChipsetDevice>>,
+    current_devices: Vec<Option<SingleDevice>>,
+}
 
-    // State.
+#[derive(Inspect)]
+pub(crate) struct DeviceDescription {
+    #[inspect(skip)]
+    pub device: Arc<CloseableMutex<dyn ChipsetDevice>>,
+    #[inspect(skip)]
+    pub msi_mapper: VpciInterruptMapper,
+    pub serial_num: u32,
+    pub hardware_ids: HardwareIds,
+    #[inspect(hex, iter_by_index)]
+    pub bar_masks: [u32; 6],
+    pub numa_node: Option<u16>,
+}
+
+#[derive(Inspect)]
+struct SingleDevice {
+    #[inspect(flatten)]
+    desc: DeviceDescription,
     bars_set: bool,
     #[inspect(iter_by_index)]
     interrupts: Vec<MsiAddressData>,
@@ -1129,7 +1163,7 @@ impl VpciChannel {
             serial_num: instance_id.data1, // Use FIOV precedent of serial number from first block of GUID
             hardware_ids,
             bar_masks,
-            device: device.clone(),
+            current_devices: Vec::new(),
             bars_set: false,
             interrupts: Vec::new(),
         })
@@ -1169,8 +1203,9 @@ impl<M: 'static + Send + Sync + RingMem> SimpleVmbusDevice<M> for VpciChannel {
     }
 
     async fn close(&mut self) {
-        self.release_all().await;
-
+        for dev in self.current_devices.iter_mut().flatten() {
+            dev.release_all().await;
+        }
         // Unmap the claimed config space. This can also occur if the device sends a D0 exit via the vpci protocol.
         self.config_space.unmap();
     }
@@ -1437,7 +1472,7 @@ mod tests {
             assert_eq!(device.pnp_id.sub_vendor_id, self.config.type0_sub_vendor_id);
             assert_eq!(device.pnp_id.sub_system_id, self.config.type0_sub_system_id);
             assert_eq!(device.slot, SlotNumber::new());
-            assert_eq!(device.flags, 0,);
+            assert_eq!(device.flags, vpci_protocol::DeviceFlags::new(),);
             assert_eq!(device.numa_node, 0);
             assert_eq!(device.rsvd, 0);
         }

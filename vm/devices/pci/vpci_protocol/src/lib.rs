@@ -253,22 +253,11 @@ pub struct DeviceDescription2 {
     /// Device serial number
     pub serial_num: u32,
     /// Device-specific flags
-    pub flags: DeviceFlags,
-    /// NUMA node the device is associated with. Ignored unless
-    /// [`DeviceFlags::numa_affinity_specified`] is set.
+    pub flags: u32,
+    /// NUMA node the device is associated with
     pub numa_node: u16,
     /// Reserved field
     pub rsvd: u16,
-}
-
-/// Flags in [`DeviceDescription2`].
-#[bitfield(u32)]
-#[derive(IntoBytes, Immutable, KnownLayout, FromBytes, PartialEq, Eq)]
-pub struct DeviceFlags {
-    /// Indicates [`DeviceDescription2::numa_node`] is valid.
-    pub numa_affinity_specified: bool,
-    #[bits(31)]
-    _rsvd: u32,
 }
 
 /// Message for querying bus relations (version 2).

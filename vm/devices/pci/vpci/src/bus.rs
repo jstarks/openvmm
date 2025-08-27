@@ -3,7 +3,6 @@
 
 //! VPCI bus implementation.
 
-use crate::device::DeviceDescription;
 use crate::device::NotPciDevice;
 use crate::device::VpciChannel;
 use crate::device::VpciConfigSpace;
@@ -20,7 +19,6 @@ use device_emulators::write_as_u32_chunks;
 use guid::Guid;
 use hvdef::HV_PAGE_SIZE;
 use inspect::InspectMut;
-use pci_core::chipset_device_ext::PciChipsetDeviceExt;
 use std::sync::Arc;
 use thiserror::Error;
 use vmbus_channel::simple::SimpleDeviceHandle;
@@ -95,47 +93,6 @@ impl VpciBusDevice {
 
         Ok((this, channel))
     }
-
-    pub fn access(&self) -> VpciBusAccess {
-        todo!()
-    }
-}
-
-pub struct VpciBusAccess {}
-
-impl VpciBusAccess {
-    pub fn add_device(
-        &self,
-        slot: SlotNumber,
-        device: Arc<CloseableMutex<dyn ChipsetDevice>>,
-        msi_mapper: VpciInterruptMapper,
-        serial_num: u32,
-        numa_node: Option<u16>,
-    ) -> Result<(), NotPciDevice> {
-        let hardware_ids;
-        let bar_masks;
-        {
-            let mut device = device.lock();
-            let pci = device.supports_pci().ok_or(NotPciDevice)?;
-            hardware_ids = pci.probe_hardware_ids();
-            bar_masks = pci.probe_bar_masks();
-        }
-
-        let desc = DeviceDescription {
-            device,
-            msi_mapper,
-            serial_num,
-            hardware_ids,
-            bar_masks,
-            numa_node,
-        };
-
-        Ok(())
-    }
-
-    pub async fn eject_device(&self, slot: SlotNumber) {}
-
-    pub async fn remove_device(&self, slot: SlotNumber) {}
 }
 
 impl VpciBus {
@@ -163,10 +120,6 @@ impl VpciBus {
             bus_device: bus,
             channel,
         })
-    }
-
-    pub fn access(&self) -> VpciBusAccess {
-        self.bus_device.access()
     }
 }
 

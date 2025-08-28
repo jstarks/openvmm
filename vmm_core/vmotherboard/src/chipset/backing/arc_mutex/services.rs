@@ -6,10 +6,12 @@
 use self::device_range::DeviceRangeMapper;
 use super::device::ArcMutexChipsetServicesFinalize;
 use super::state_unit::ArcMutexChipsetDeviceUnit;
+use crate::chipset::io_ranges::IoRanges;
 use crate::BusIdPci;
 use crate::ChipsetBuilder;
 use crate::VmmChipsetDevice;
 use crate::chipset::line_sets::LineSetTargetDevice;
+use chipset_device::mmio::RegisterMmioIntercept;
 use chipset_device::ChipsetDevice;
 use chipset_device_resources::LineSetId;
 use closeable_mutex::CloseableMutex;
@@ -203,6 +205,14 @@ impl<'a, 'b> ArcMutexChipsetServices<'a, 'b> {
         target_start: u32,
     ) {
         self.line_set_targets.push((id, source_range, target_start));
+    }
+}
+
+pub(crate) fn register_mmio(dev_name: Arc<str>, dev: Weak<CloseableMutex<dyn ChipsetDevice>>, ranges: IoRanges<u64>) -> impl RegisterMmioIntercept {
+    DeviceRangeMapper {
+        dev,
+        dev_name,
+        ranges,
     }
 }
 

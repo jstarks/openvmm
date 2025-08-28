@@ -2,12 +2,11 @@ use anyhow::Context as _;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;
 use chipset_device::pci::PciConfigSpace;
-use futures::StreamExt;
 use hcl::ioctl::MshvHvcall;
 use inspect::InspectMut;
 use std::sync::Arc;
 use user_driver::DmaClient;
-use vmbus_client::local_use::Input;
+use vmbus_client::driver::OpenParams;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
@@ -128,28 +127,27 @@ pub async fn relay_vpci_bus(
         Box::new(DirectMmio(mapping)) as _
     };
 
-    let channel = vmbus_client::local_use::open_channel(
+    let channel = vmbus_client::driver::open_channel(
         driver_source.simple(),
         offer_info,
-        Input {
+        OpenParams {
             ring_pages: 20,
             ring_offset_in_pages: 10,
         },
         dma_client,
     )
     .await?;
-    let (devices, mut devices_recv) = mesh::channel();
-    let vpci_client =
+    let (devices, _devices_recv) = mesh::channel();
+    let (vpci_client, devices) =
         vpci_client::VpciClient::connect(driver_source.simple(), channel, mmio, devices).await?;
     // TODO: hang onto this guy, wire him up to the inspect graph at least.
     vpci_client.detach();
-    let vpci_device = devices_recv.next().await.context("no device")?;
-    let vpci_device = Arc::new(
-        vpci_device
-            .init()
-            .await
-            .context("failed to initialize vpci device")?,
-    );
+    let vpci_device = devices.into_iter().next().context("no device")?;
+    let (vpci_device, _removed) = vpci_device
+        .init()
+        .await
+        .context("failed to initialize vpci device")?;
+    let vpci_device = Arc::new(vpci_device);
 
     let device_name = format!("assigned_device:vpci-{instance_id}");
     let device = chipset_builder

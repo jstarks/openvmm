@@ -2834,13 +2834,13 @@ async fn new_underhill_vm(
 
             let mut filter = vmbus_client::filter::ClientFilterBuilder::new();
 
-            let mut vpci_filter = vmbus_client::filter::filter_client("vpci")
+            let mut vpci_filter = vmbus_client::filter::FilterDefinition::new("vpci")
                 .by_interface(guid::guid!("44C4F61D-4444-4400-9D52-802E27EDE19F"));
 
-            filter.add_client(&mut vpci_filter);
+            filter.add(&mut vpci_filter);
 
-            let mut relay_filter = vmbus_client::filter::filter_client("relay").rest();
-            filter.add_client(&mut relay_filter);
+            let mut relay_filter = vmbus_client::filter::FilterDefinition::new("relay").rest();
+            filter.add(&mut relay_filter);
             vmbus_filter = Some(filter.build(tp, connection));
 
             let connection = relay_filter.take();

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! MMIO access types for Linux environments.
 
 use crate::CreateMemoryAccess;

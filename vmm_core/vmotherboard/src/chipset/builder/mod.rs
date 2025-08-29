@@ -65,11 +65,13 @@ impl ChipsetDevices {
     ) -> anyhow::Result<(DynamicDeviceUnit, Arc<CloseableMutex<T>>)> {
         let name = name.into();
         let arc_builder = Arc::<CloseableMutex<T>>::new_cyclic_builder();
-        let device = f(&mut super::backing::arc_mutex::services::register_mmio(
-            name.clone(),
-            arc_builder.weak(),
-            self.mmio_ranges.clone(),
-        ))
+        let device = f(
+            &mut super::backing::arc_mutex::services::register_mmio_for_device(
+                name.clone(),
+                arc_builder.weak(),
+                self.mmio_ranges.clone(),
+            ),
+        )
         .await?;
         let device = arc_builder.build(CloseableMutex::new(device));
         let device_unit = ArcMutexChipsetDeviceUnit::new(device.clone(), false);

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 //! Virtual PCI relay
 //!
 //! This module provides a virtual PCI relay for the OpenHCL paravisor. It

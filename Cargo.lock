@@ -7951,7 +7951,6 @@ dependencies = [
  "vmsocket",
  "vnc_worker_defs",
  "vpci",
- "vpci_client",
  "vpci_relay",
  "watchdog_core",
  "watchdog_vmgs_format",
@@ -9533,46 +9532,30 @@ dependencies = [
 
 [[package]]
 name = "vpci_relay"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "chipset_device",
- "closeable_mutex",
  "fs-err",
  "futures",
- "futures-concurrency",
- "guestmem",
- "guid",
  "hcl",
  "hvdef",
  "inspect",
  "memory_range",
  "mesh",
- "pal_async",
- "parking_lot",
  "pci_core",
  "slab",
  "sparse_mmap",
  "state_unit",
- "task_control",
- "test_with_tracing",
- "thiserror 2.0.16",
  "tracelimit",
  "tracing",
  "user_driver",
- "vmbus_async",
- "vmbus_channel",
  "vmbus_client",
- "vmbus_core",
- "vmbus_ring",
  "vmbus_server",
  "vmcore",
  "vmotherboard",
  "vpci",
  "vpci_client",
- "vpci_protocol",
- "zerocopy 0.8.25",
 ]
 
 [[package]]

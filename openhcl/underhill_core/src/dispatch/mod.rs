@@ -17,6 +17,7 @@ use crate::servicing;
 use crate::servicing::NvmeSavedState;
 use crate::servicing::ServicingState;
 use crate::vmbus_relay_unit::VmbusRelayHandle;
+use crate::vpci_relay;
 use crate::worker::FirmwareType;
 use crate::worker::NetworkSettingsError;
 use anyhow::Context;
@@ -137,7 +138,7 @@ pub(crate) struct LoadedVm {
     pub firmware_type: FirmwareType,
     pub isolation: IsolationType,
     // contain task handles which must be kept live
-    pub _chipset_devices: ChipsetDevices,
+    pub chipset_devices: ChipsetDevices,
     // keep the unit task alive
     pub _vmtime: SpawnedUnit<VmTimeKeeper>,
     pub _halt_task: Task<()>,
@@ -148,6 +149,7 @@ pub(crate) struct LoadedVm {
     pub device_interfaces: Option<DeviceInterfaces>,
     pub vmbus_client: Option<vmbus_client::VmbusClient>,
     pub vmbus_filter: Option<vmbus_client::filter::ClientFilter>,
+    pub vpci_relay: Option<vpci_relay::VpciRelay>,
     /// Memory map with IGVM types for each range.
     pub vtl0_memory_map: Vec<(MemoryRangeWithNode, MemoryMapEntryType)>,
 
@@ -259,6 +261,7 @@ impl LoadedVm {
                 ServicingRequest(GuestSaveRequest),
                 ShutdownRequest(Rpc<ShutdownParams, ShutdownResult>),
                 ShutdownResponse(<PendingRpc<ShutdownResult> as Future>::Output),
+                VpciRelayReady,
             }
 
             let event: Event<T> = futures::select! { // merge semantics
@@ -267,6 +270,13 @@ impl LoadedVm {
                 message = vm_rpc.select_next_some() => Event::UhVmRpc(message),
                 message = self.crash_notification_recv.select_next_some() => Event::VtlCrash(message),
                 message = save_request_recv.select_next_some() => Event::ServicingRequest(message),
+                _ = async {
+                    if let Some(vpci_relay) = &mut self.vpci_relay {
+                        vpci_relay.wait_ready().await
+                    } else {
+                        std::future::pending().await
+                    }
+                }.fuse() => Event::VpciRelayReady,
                 message = async {
                     if self.shutdown_relay.is_none() {
                         std::future::pending::<()>().await;
@@ -333,6 +343,7 @@ impl LoadedVm {
                         resp.field("dma_manager", &self.dma_manager);
                         resp.field("vmbus_client", &self.vmbus_client);
                         resp.field("vmbus_filter", &self.vmbus_filter);
+                        resp.field("vpci_relay", &self.vpci_relay);
                     }),
                 },
                 Event::Vtl2ConfigNicRpc(message) => {
@@ -453,6 +464,21 @@ impl LoadedVm {
                     send_result.complete(response);
                 }
                 Event::VtlCrash(vtl_crash) => self.notify_of_vtl_crash(vtl_crash),
+                Event::VpciRelayReady => {
+                    if let Err(err) = self
+                        .vpci_relay
+                        .as_mut()
+                        .unwrap()
+                        .process(&self.chipset_devices, &mut self.state_units)
+                        .await
+                    {
+                        tracing::error!(
+                            CVM_ALLOWED,
+                            error = err.as_ref() as &dyn std::error::Error,
+                            "failed to process VPCI relay"
+                        );
+                    }
+                }
             }
         };
 

@@ -1797,7 +1797,7 @@ async fn new_underhill_vm(
 
     let (crash_notification_send, crash_notification_recv) = mesh::channel();
 
-    let state_units = StateUnits::new();
+    let mut state_units = StateUnits::new();
 
     // Process VM time timers on VP 0, since that's where most of the
     // vmtime-driven device interrupts will be triggered.
@@ -2741,6 +2741,7 @@ async fn new_underhill_vm(
     let mut vmbus_client = None;
     let mut host_vmbus_relay = None;
     let mut vmbus_filter = None;
+    let mut vpci_relay = None;
 
     // VMBus
     if with_vmbus {
@@ -2845,26 +2846,17 @@ async fn new_underhill_vm(
 
             let connection = relay_filter.take();
 
-            for offer in vpci_filter.take().offers {
-                let instance_id = offer.offer.instance_id;
-                crate::vpci_relay::relay_vpci_bus(
-                    &mut chipset_builder,
-                    &driver_source,
-                    offer,
-                    dma_manager
-                        .new_client(DmaClientParameters {
-                            device_name: format!("vpci-{instance_id}"),
-                            lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
-                            allocation_visibility: AllocationVisibility::Private,
-                            persistent_allocations: false,
-                        })?
-                        .as_ref(),
-                    vmbus.control(),
-                )
-                .await?;
-            }
-
-            //crate::vpci_relay::foo(vpci_filter.take());
+            vpci_relay = Some(crate::vpci_relay::VpciRelay::new(
+                driver_source.clone(),
+                vpci_filter.take(),
+                vmbus.control().clone(),
+                dma_manager.new_client(DmaClientParameters {
+                    device_name: format!("vpci-relay"),
+                    lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
+                    allocation_visibility: AllocationVisibility::Private,
+                    persistent_allocations: false,
+                })?,
+            ));
 
             let mut intercept_list = Vec::new();
             if intercept_shutdown_ic {
@@ -3096,6 +3088,14 @@ async fn new_underhill_vm(
     let (chipset, devices) = chipset_builder.build()?;
     let chipset = vmm_core::vmotherboard_adapter::ChipsetPlusSynic::new(synic.clone(), chipset);
 
+    if let Some(vpci_relay) = &mut vpci_relay {
+        // Relay the initial set of VPCI devices.
+        vpci_relay
+            .process(&devices, &mut state_units)
+            .await
+            .context("failed to relay initial vpci channels")?;
+    }
+
     let control_send = Arc::new(Mutex::new(Some(control_send)));
     let (halt_notify_send, halt_notify_recv) = mesh::channel();
     let halt_task = tp.spawn(
@@ -3162,7 +3162,7 @@ async fn new_underhill_vm(
         memory: gm,
         firmware_type,
         isolation,
-        _chipset_devices: devices,
+        chipset_devices: devices,
         _vmtime: vmtime,
         _halt_task: halt_task,
         state_units,
@@ -3179,6 +3179,7 @@ async fn new_underhill_vm(
         device_interfaces: Some(controllers.device_interfaces),
         vmbus_client,
         vmbus_filter,
+        vpci_relay,
         vtl0_memory_map,
 
         vmbus_server,

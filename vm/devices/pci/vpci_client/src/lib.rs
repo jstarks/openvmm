@@ -479,7 +479,11 @@ impl MapVpciInterrupt for VpciDevice {
                 .vector
                 .try_into()
                 .expect("need to support resource 3 for ARM64"),
-            delivery_mode: 0, // TODO
+            delivery_mode: if params.multicast {
+                protocol::DeliveryMode::LOWEST_PRIORITY
+            } else {
+                protocol::DeliveryMode::FIXED
+            },
             vector_count: vector_count.try_into().expect("BUGBUG: fail to caller"),
             processor_count: 0,
             processor_array: [0; 32],

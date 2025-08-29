@@ -61,25 +61,32 @@ impl ChipsetDevices {
         driver_source: &VmTaskDriverSource,
         units: &StateUnits,
         name: impl Into<Arc<str>>,
-        f: impl AsyncFnOnce(&dyn RegisterMmioIntercept) -> anyhow::Result<T>,
-    ) -> anyhow::Result<DynamicDevice> {
+        f: impl AsyncFnOnce(&mut dyn RegisterMmioIntercept) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(DynamicDeviceUnit, Arc<CloseableMutex<T>>)> {
         let name = name.into();
         let arc_builder = Arc::<CloseableMutex<T>>::new_cyclic_builder();
-        let device = f(&super::backing::arc_mutex::services::register_mmio(name.clone(), arc_builder.weak(), self.mmio_ranges.clone())).await?;
+        let device = f(&mut super::backing::arc_mutex::services::register_mmio(
+            name.clone(),
+            arc_builder.weak(),
+            self.mmio_ranges.clone(),
+        ))
+        .await?;
         let device = arc_builder.build(CloseableMutex::new(device));
-        let device = ArcMutexChipsetDeviceUnit::new(device, false);
+        let device_unit = ArcMutexChipsetDeviceUnit::new(device.clone(), false);
         let builder = units.add(name).dependency_of(self.chipset_unit());
         let unit = builder
-            .spawn(driver_source.simple(), |recv| device.run(recv))
+            .spawn(driver_source.simple(), |recv| device_unit.run(recv))
             .context("name in use")?;
 
-        Ok(DynamicDevice(unit))
+        Ok((DynamicDeviceUnit(unit), device))
     }
 }
 
-pub struct DynamicDevice(SpawnedUnit<ArcMutexChipsetDeviceUnit>);
+/// A unit handle for a dynamically managed device.
+pub struct DynamicDeviceUnit(SpawnedUnit<ArcMutexChipsetDeviceUnit>);
 
-impl DynamicDevice {
+impl DynamicDeviceUnit {
+    /// Removes and drops the dynamically managed device.
     pub async fn remove(self) {
         self.0.remove().await;
     }
@@ -279,7 +286,7 @@ impl<'a> ChipsetBuilder<'a> {
             _chipset_task: chipset_task,
             _arc_mutex_device_units: self.arc_mutex_device_units,
             _line_set_units: self.line_sets.units,
-            mmio_ranges
+            mmio_ranges,
         };
 
         Ok((vm_chipset, devices))

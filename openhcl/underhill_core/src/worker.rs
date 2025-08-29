@@ -109,6 +109,7 @@ use pal_async::DefaultPool;
 use pal_async::local::LocalDriver;
 use pal_async::task::Spawn;
 use parking_lot::Mutex;
+use pci_core::spec::hwid::HardwareIds;
 use scsi_core::ResolveScsiDeviceHandleParams;
 use scsidisk::atapi_scsi::AtapiScsiDisk;
 use socket2::Socket;
@@ -297,6 +298,8 @@ pub struct UnderhillEnvCfg {
     pub guest_state_encryption_policy: Option<GuestStateEncryptionPolicyCli>,
     /// Attempt to renew the AK cert
     pub attempt_ak_cert_callback: Option<bool>,
+    /// Enable the VPCI relay
+    pub enable_vpci_relay: Option<bool>,
 }
 
 /// Bundle of config + runtime objects for hooking into the underhill remote
@@ -1349,9 +1352,12 @@ async fn new_underhill_vm(
         })
         .collect::<Vec<_>>();
 
+    let enable_vpci_relay = env_cfg.enable_vpci_relay.unwrap_or(hardware_isolated);
+
     let mut vtl0_mmio;
-    let (vtl0_mmio, vpci_relay_mmio) = if true {
-        let required_len = 64 * 0x2000;
+    let (vtl0_mmio, vpci_relay_mmio) = if enable_vpci_relay {
+        // Carve out enough VTL0 MMIO space for 64 devices.
+        let required_len = 64 * vpci_relay::VPCI_RELAY_MMIO_PER_DEVICE;
         vtl0_mmio = boot_info.vtl0_mmio.to_vec();
         if vtl0_mmio.last().is_none_or(|r| r.len() < required_len) {
             anyhow::bail!("too little VTL0 MMIO space to take for the VPCI relay");
@@ -1427,6 +1433,10 @@ async fn new_underhill_vm(
         // start the relay--the guest will not be able to use relayed channels
         // since it will not be able to put their ring buffers in shared memory.
         with_vmbus_relay = !hide_isolation;
+    }
+
+    if enable_vpci_relay && !with_vmbus_relay && !hide_isolation {
+        anyhow::bail!("cannot run the VPCI relay without the VMBus relay");
     }
 
     // also construct the VMGS nice and early, as much like the GET, it also
@@ -2853,7 +2863,9 @@ async fn new_underhill_vm(
             let mut vpci_filter = vmbus_client::filter::FilterDefinition::new("vpci")
                 .by_interface(guid::guid!("44C4F61D-4444-4400-9D52-802E27EDE19F"));
 
-            filter.add(&mut vpci_filter);
+            if enable_vpci_relay {
+                filter.add(&mut vpci_filter);
+            }
 
             let mut relay_filter = vmbus_client::filter::FilterDefinition::new("relay").rest();
             filter.add(&mut relay_filter);
@@ -2861,33 +2873,66 @@ async fn new_underhill_vm(
 
             let connection = relay_filter.take();
 
-            vpci_relay = Some(vpci_relay::VpciRelay::new(
-                driver_source.clone(),
-                vpci_filter.take(),
-                vmbus.control().clone(),
-                dma_manager.new_client(DmaClientParameters {
-                    device_name: format!("vpci-relay"),
-                    lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
-                    allocation_visibility: if hardware_isolated {
-                        AllocationVisibility::Shared
+            if enable_vpci_relay {
+                let mut relay = vpci_relay::VpciRelay::new(
+                    driver_source.clone(),
+                    vpci_filter.take(),
+                    vmbus.control().clone(),
+                    dma_manager.new_client(DmaClientParameters {
+                        device_name: format!("vpci-relay"),
+                        lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
+                        allocation_visibility: if hardware_isolated {
+                            AllocationVisibility::Shared
+                        } else {
+                            AllocationVisibility::Private
+                        },
+                        persistent_allocations: false,
+                    })?,
+                    vpci_relay_mmio,
+                    if use_mmio_hypercalls {
+                        Box::new(
+                            vpci_relay::linux_mmio::HypercallMmio::new()
+                                .context("failed to create hypercall mmio accessor")?,
+                        )
                     } else {
-                        AllocationVisibility::Private
+                        Box::new(
+                            vpci_relay::linux_mmio::DirectMmio::new()
+                                .context("failed to create direct mmio accessor")?,
+                        )
                     },
-                    persistent_allocations: false,
-                })?,
-                vpci_relay_mmio,
-                if use_mmio_hypercalls {
-                    Box::new(
-                        vpci_relay::linux_mmio::HypercallMmio::new()
-                            .context("failed to create hypercall mmio accessor")?,
-                    )
-                } else {
-                    Box::new(
-                        vpci_relay::linux_mmio::DirectMmio::new()
-                            .context("failed to create direct mmio accessor")?,
-                    )
-                },
-            ));
+                );
+
+                use pci_core::spec::hwid::*;
+
+                // Allow NVMe devices.
+                if false {
+                    relay.add_allowed_device(HardwareIds {
+                        vendor_id: !0,
+                        device_id: !0,
+                        revision_id: !0,
+                        prog_if:
+                            ProgrammingInterface::MASS_STORAGE_CONTROLLER_NON_VOLATILE_MEMORY_NVME,
+                        sub_class: Subclass::MASS_STORAGE_CONTROLLER_NON_VOLATILE_MEMORY,
+                        base_class: ClassCode::MASS_STORAGE_CONTROLLER,
+                        type0_sub_vendor_id: !0,
+                        type0_sub_system_id: !0,
+                    });
+                }
+
+                // Allow MANA devices.
+                relay.add_allowed_device(HardwareIds {
+                    vendor_id: 0x1414,
+                    device_id: 0x00ba,
+                    revision_id: !0,
+                    prog_if: ProgrammingInterface::NETWORK_CONTROLLER_ETHERNET_GDMA,
+                    sub_class: Subclass::NETWORK_CONTROLLER_ETHERNET,
+                    base_class: ClassCode::NETWORK_CONTROLLER,
+                    type0_sub_vendor_id: !0,
+                    type0_sub_system_id: !0,
+                });
+
+                vpci_relay = Some(relay);
+            }
 
             let mut intercept_list = Vec::new();
             if intercept_shutdown_ic {
@@ -2917,7 +2962,7 @@ async fn new_underhill_vm(
             )?);
 
             vmbus_client = Some(client);
-        };
+        }
 
         vmbus_server = Some(vmbus);
     }

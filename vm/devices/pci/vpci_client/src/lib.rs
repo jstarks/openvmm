@@ -211,6 +211,7 @@ pub struct VpciDevice {
 struct ConfigSpaceAccessor {
     #[inspect(skip)]
     mem: Box<dyn MemoryAccess>,
+    #[inspect(hex)]
     base_gpa: u64,
     #[inspect(hex, with = "|&x| u32::from(x)")]
     current_slot: SlotNumber,
@@ -226,6 +227,21 @@ struct ConfigSpaceShadows {
 }
 
 impl ConfigSpaceAccessor {
+    fn enable_slot(&mut self, id: DeviceId) {
+        let i = u32::from(id.slot) as usize;
+        if i >= self.slot_seq.len() {
+            self.slot_seq.resize(i + 1, 0);
+        }
+        self.slot_seq[i] = id.seq;
+    }
+
+    fn disable_slot(&mut self, slot: SlotNumber) {
+        let i = u32::from(slot) as usize;
+        if let Some(s) = self.slot_seq.get_mut(i) {
+            *s = 0;
+        }
+    }
+
     #[must_use]
     fn set_slot(&mut self, id: DeviceId) -> bool {
         if self
@@ -233,7 +249,6 @@ impl ConfigSpaceAccessor {
             .get(u32::from(id.slot) as usize)
             .is_none_or(|s| s != &id.seq)
         {
-            // TODO warn
             return false;
         }
         if id.slot != self.current_slot {
@@ -852,11 +867,14 @@ impl WorkerState {
                     }
                 }
 
-                for slot_slot in self.slots.iter_mut() {
+                for (slot_index, slot_slot) in self.slots.iter_mut().enumerate() {
                     let Some(slot) = slot_slot else { continue };
                     if !slot.removed {
                         continue;
                     }
+                    self.config_space
+                        .lock()
+                        .disable_slot((slot_index as u32).into());
                     *slot_slot = None;
                 }
             }
@@ -1009,6 +1027,7 @@ impl WorkerState {
                     return Ok(None);
                 };
                 slot.in_use = true;
+                self.config_space.lock().enable_slot(id);
                 // Send space for one resource to satisfy the Hyper-V implementation.
                 self.send_tx(
                     write,

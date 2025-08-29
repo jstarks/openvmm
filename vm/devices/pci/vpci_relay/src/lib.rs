@@ -1,7 +1,8 @@
 //! Virtual PCI relay
 //!
-//! This module provides a virtual PCI relay for the OpenHCL paravisor. It consumes
-//! VPCI buses from the host and relays them to the guest, filtering them as needed.
+//! This module provides a virtual PCI relay for the OpenHCL paravisor. It
+//! consumes VPCI buses from the host and relays them to the guest, filtering
+//! them as needed.
 
 #[cfg(target_os = "linux")]
 pub mod linux_mmio;
@@ -15,12 +16,14 @@ use futures::StreamExt as _;
 use inspect::Inspect;
 use inspect::InspectMut;
 use memory_range::MemoryRange;
+use pci_core::spec::hwid::HardwareIds;
 use state_unit::StateUnits;
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::task::Poll;
 use user_driver::DmaClient;
 use vmbus_client::driver::OpenParams;
+use vmbus_server::Guid;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
@@ -41,6 +44,9 @@ pub trait CreateMemoryAccess: 'static + Send + Sync {
     fn create_memory_access(&self, gpa: u64) -> anyhow::Result<Box<dyn MemoryAccess>>;
 }
 
+/// The size of the MMIO region required for each VPCI device.
+pub const VPCI_RELAY_MMIO_PER_DEVICE: u64 = vpci_client::MMIO_SIZE;
+
 /// Virtual PCI relay.
 #[derive(Inspect)]
 pub struct VpciRelay {
@@ -58,10 +64,13 @@ pub struct VpciRelay {
     mmio_range: MemoryRange,
     #[inspect(skip)]
     mmio_access: Box<dyn CreateMemoryAccess>,
+    #[inspect(iter_by_index)]
+    allowed_devices: Vec<HardwareIds>,
 }
 
 #[derive(Inspect)]
 struct RelayedDevice {
+    bus_instance_id: Guid,
     bus_client: VpciClient,
     #[inspect(skip)]
     removed: VpciDeviceRemoved,
@@ -78,6 +87,27 @@ impl RelayedDevice {
         self.device_unit.remove().await;
         self.bus_client.shutdown().await;
     }
+}
+
+fn allows(a: &HardwareIds, b: &HardwareIds) -> bool {
+    let HardwareIds {
+        vendor_id,
+        device_id,
+        revision_id,
+        prog_if,
+        sub_class,
+        base_class,
+        type0_sub_vendor_id,
+        type0_sub_system_id,
+    } = *a;
+    (vendor_id == !0 || vendor_id == b.vendor_id)
+        && (device_id == !0 || device_id == b.device_id)
+        && (revision_id == !0 || revision_id == b.revision_id)
+        && (prog_if.0 == !0 || prog_if == b.prog_if)
+        && (sub_class.0 == !0 || sub_class == b.sub_class)
+        && (base_class.0 == !0 || base_class == b.base_class)
+        && (type0_sub_vendor_id == !0 || type0_sub_vendor_id == b.type0_sub_vendor_id)
+        && (type0_sub_system_id == !0 || type0_sub_system_id == b.type0_sub_system_id)
 }
 
 impl VpciRelay {
@@ -99,7 +129,16 @@ impl VpciRelay {
             devices: slab::Slab::new(),
             mmio_range,
             mmio_access,
+            allowed_devices: Vec::new(),
         }
+    }
+
+    /// Adds an allowed device to the list. If one of the hardware ID is `!0`
+    /// then it is treated as a wildcard.
+    ///
+    /// Note that if no devices are on the list, then all devices are allowed.
+    pub fn add_allowed_device(&mut self, hw_ids: HardwareIds) {
+        self.allowed_devices.push(hw_ids);
     }
 
     /// Wait for the relay to be ready. This might never return. This call is cancellable.
@@ -174,10 +213,29 @@ impl VpciRelay {
             self.dma_client.as_ref(),
         )
         .await?;
+
+        // FUTURE: handle more than one device. Note, though, that Hyper-V
+        // doesn't really do this in practice.
         let (devices, _devices_recv) = mesh::channel();
         let (vpci_client, devices) =
             VpciClient::connect(self.driver_source.simple(), channel, mmio, devices).await?;
-        let vpci_device = devices.into_iter().next().context("no device")?;
+
+        let Some(vpci_device) = devices.into_iter().next() else {
+            tracing::info!(%instance_id, "no device on VPCI bus");
+            return Ok(());
+        };
+
+        let hw_ids = vpci_device.hw_ids();
+
+        if !self.allowed_devices.is_empty()
+            && !self.allowed_devices.iter().any(|d| allows(d, hw_ids))
+        {
+            tracing::warn!(%instance_id, vendor_id = hw_ids.vendor_id, device_id = hw_ids.device_id, "device not allowed on VPCI bus");
+            return Ok(());
+        }
+
+        tracing::info!(%instance_id, vendor_id = hw_ids.vendor_id, device_id = hw_ids.device_id, "vpci relay device arrived");
+
         let (vpci_device, removed) = vpci_device
             .init()
             .await
@@ -218,6 +276,7 @@ impl VpciRelay {
         };
 
         entry.insert(RelayedDevice {
+            bus_instance_id: instance_id,
             bus_client: vpci_client,
             removed,
             bus_unit,

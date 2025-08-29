@@ -111,5 +111,7 @@ async fn test_negotiate_version(driver: DefaultDriver) {
         .await
         .unwrap();
 
+    assert_eq!(device.read_cfg(256), 0);
+
     device.unregister_interrupt(address, data).await;
 }

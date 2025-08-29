@@ -2905,19 +2905,16 @@ async fn new_underhill_vm(
                 use pci_core::spec::hwid::*;
 
                 // Allow NVMe devices.
-                if false {
-                    relay.add_allowed_device(HardwareIds {
-                        vendor_id: !0,
-                        device_id: !0,
-                        revision_id: !0,
-                        prog_if:
-                            ProgrammingInterface::MASS_STORAGE_CONTROLLER_NON_VOLATILE_MEMORY_NVME,
-                        sub_class: Subclass::MASS_STORAGE_CONTROLLER_NON_VOLATILE_MEMORY,
-                        base_class: ClassCode::MASS_STORAGE_CONTROLLER,
-                        type0_sub_vendor_id: !0,
-                        type0_sub_system_id: !0,
-                    });
-                }
+                relay.add_allowed_device(HardwareIds {
+                    vendor_id: !0,
+                    device_id: !0,
+                    revision_id: !0,
+                    prog_if: ProgrammingInterface::MASS_STORAGE_CONTROLLER_NON_VOLATILE_MEMORY_NVME,
+                    sub_class: Subclass::MASS_STORAGE_CONTROLLER_NON_VOLATILE_MEMORY,
+                    base_class: ClassCode::MASS_STORAGE_CONTROLLER,
+                    type0_sub_vendor_id: !0,
+                    type0_sub_system_id: !0,
+                });
 
                 // Allow MANA devices.
                 relay.add_allowed_device(HardwareIds {

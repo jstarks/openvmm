@@ -17,7 +17,6 @@ use crate::servicing;
 use crate::servicing::NvmeSavedState;
 use crate::servicing::ServicingState;
 use crate::vmbus_relay_unit::VmbusRelayHandle;
-use crate::vpci_relay;
 use crate::worker::FirmwareType;
 use crate::worker::NetworkSettingsError;
 use anyhow::Context;

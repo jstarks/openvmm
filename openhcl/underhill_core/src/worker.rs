@@ -1349,12 +1349,27 @@ async fn new_underhill_vm(
         })
         .collect::<Vec<_>>();
 
+    let mut vtl0_mmio;
+    let (vtl0_mmio, vpci_relay_mmio) = if true {
+        let required_len = 64 * 0x2000;
+        vtl0_mmio = boot_info.vtl0_mmio.to_vec();
+        if vtl0_mmio.last().is_none_or(|r| r.len() < required_len) {
+            anyhow::bail!("too little VTL0 MMIO space to take for the VPCI relay");
+        }
+        let r = vtl0_mmio.last().unwrap();
+        let (rest, vpci) = r.split_at_offset(r.len() - required_len);
+        *vtl0_mmio.last_mut().unwrap() = rest;
+        (&vtl0_mmio, vpci)
+    } else {
+        (&boot_info.vtl0_mmio, MemoryRange::EMPTY)
+    };
+
     let BuiltVtl0MemoryLayout {
         vtl0_memory_map,
         vtl0_memory_layout: mem_layout,
         shared_pool,
         complete_memory_layout,
-    } = build_vtl0_memory_layout(vtl0_memory_map, &boot_info.vtl0_mmio, shared_pool_size)?;
+    } = build_vtl0_memory_layout(vtl0_memory_map, vtl0_mmio, shared_pool_size)?;
 
     let hide_isolation = isolation.is_isolated() && env_cfg.hide_isolation;
 
@@ -2846,16 +2861,32 @@ async fn new_underhill_vm(
 
             let connection = relay_filter.take();
 
-            vpci_relay = Some(crate::vpci_relay::VpciRelay::new(
+            vpci_relay = Some(vpci_relay::VpciRelay::new(
                 driver_source.clone(),
                 vpci_filter.take(),
                 vmbus.control().clone(),
                 dma_manager.new_client(DmaClientParameters {
                     device_name: format!("vpci-relay"),
                     lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
-                    allocation_visibility: AllocationVisibility::Private,
+                    allocation_visibility: if hardware_isolated {
+                        AllocationVisibility::Shared
+                    } else {
+                        AllocationVisibility::Private
+                    },
                     persistent_allocations: false,
                 })?,
+                vpci_relay_mmio,
+                if use_mmio_hypercalls {
+                    Box::new(
+                        vpci_relay::linux_mmio::HypercallMmio::new()
+                            .context("failed to create hypercall mmio accessor")?,
+                    )
+                } else {
+                    Box::new(
+                        vpci_relay::linux_mmio::DirectMmio::new()
+                            .context("failed to create direct mmio accessor")?,
+                    )
+                },
             ));
 
             let mut intercept_list = Vec::new();

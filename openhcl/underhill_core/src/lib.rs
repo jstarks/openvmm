@@ -25,7 +25,6 @@ mod vmbus_relay_unit;
 mod vmgs_logger;
 mod vp;
 mod vpci;
-mod vpci_relay;
 mod worker;
 mod wrapped_partition;
 

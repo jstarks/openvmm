@@ -7,8 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["vpci"]
-
 # Enable profiler support
 profiler = ["dep:profiler_worker", "diag_server/profiler"]
 
@@ -111,6 +109,7 @@ vmbus_serial_guest.workspace = true
 vmbus_server.workspace = true
 vpci.workspace = true
 vpci_client.workspace = true
+vpci_relay.workspace = true
 watchdog_core.workspace = true
 watchdog_vmgs_format.workspace = true
 scsi_buffers.workspace = true

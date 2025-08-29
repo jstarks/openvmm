@@ -169,6 +169,9 @@ pub trait MemoryAccess: Send {
     fn write(&mut self, addr: u64, value: u32);
 }
 
+/// The amount of MMIO space required by the VPCI bus.
+pub const MMIO_SIZE: u64 = 0x2000;
+
 /// A device description, which represents a VPCI device available on a bus.
 #[derive(Inspect)]
 pub struct VpciDeviceDescription {

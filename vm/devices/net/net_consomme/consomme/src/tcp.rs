@@ -43,6 +43,7 @@ use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::net::Ipv4Addr;
 use std::net::Shutdown;
+use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::pin::Pin;
 use std::task::Context;
@@ -95,6 +96,40 @@ impl Tcp {
             listeners: HashMap::new(),
         }
     }
+}
+
+pub trait TcpIo {
+    type Socket;
+    type Accept;
+    fn listen(&mut self, addr: SocketAddr) -> io::Result<Self::Accept>;
+    fn connect(&mut self, addr: SocketAddr) -> io::Result<Self::Socket>;
+    fn poll_accept(
+        &mut self,
+        cx: &mut Context<'_>,
+        socket: &mut Self::Accept,
+    ) -> Poll<io::Result<(Self::Socket, SocketAddr)>>;
+    fn poll_connect(
+        &mut self,
+        cx: &mut Context<'_>,
+        socket: &mut Self::Socket,
+    ) -> Poll<io::Result<()>>;
+    fn poll_close(
+        &mut self,
+        cx: &mut Context<'_>,
+        socket: &mut Self::Socket,
+    ) -> Poll<io::Result<()>>;
+    fn poll_read_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        socket: &mut Self::Socket,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>>;
+    fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        socket: &mut Self::Socket,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>>;
 }
 
 #[derive(Inspect)]

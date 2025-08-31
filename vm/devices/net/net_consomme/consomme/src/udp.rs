@@ -30,6 +30,7 @@ use smoltcp::wire::UdpPacket;
 use smoltcp::wire::UdpRepr;
 use std::collections::HashMap;
 use std::collections::hash_map;
+use std::io;
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -56,6 +57,23 @@ impl InspectMut for Udp {
             resp.field_mut(&format!("{}:{}", addr.ip, addr.port), conn);
         }
     }
+}
+
+pub trait UdpIo {
+    type Socket;
+    fn bind(&mut self, addr: std::net::SocketAddr) -> io::Result<Self::Socket>;
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        socket: &mut Self::Socket,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, std::net::SocketAddr)>>;
+    fn send_to(
+        &mut self,
+        addr: std::net::SocketAddr,
+        socket: &mut Self::Socket,
+        buf: &[u8],
+    ) -> io::Result<()>;
 }
 
 #[derive(InspectMut)]

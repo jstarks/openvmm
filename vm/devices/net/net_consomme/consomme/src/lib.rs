@@ -19,9 +19,15 @@ mod dhcp;
 #[cfg_attr(unix, path = "dns_unix.rs")]
 #[cfg_attr(windows, path = "dns_windows.rs")]
 mod dns;
+mod socket;
 mod tcp;
 mod udp;
 mod windows;
+
+pub use socket::OsSocket;
+pub use socket::OsSockets;
+pub use tcp::TcpIo;
+pub use udp::UdpIo;
 
 use inspect::InspectMut;
 use mesh::rpc::Rpc;

@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+use crate::Network;
 use crate::TcpIo;
 use crate::UdpIo;
 use futures::AsyncRead as _;
@@ -54,6 +55,19 @@ impl<T: Driver> OsSockets<T> {
         let socket = PolledSocket::new(&self.driver, socket)?;
         s.driver_seq = self.driver_seq;
         Ok(s.socket.insert(socket))
+    }
+}
+
+impl<T: Driver> Network for OsSockets<T> {
+    type Tcp = Self;
+    type Udp = Self;
+
+    fn tcp(&mut self) -> &mut Self::Tcp {
+        self
+    }
+
+    fn udp(&mut self) -> &mut Self::Udp {
+        self
     }
 }
 

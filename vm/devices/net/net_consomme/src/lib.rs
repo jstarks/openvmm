@@ -11,6 +11,7 @@ use consomme::ChecksumState;
 use consomme::Consomme;
 use consomme::ConsommeControl;
 use consomme::ConsommeState;
+use consomme::OsSockets;
 use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
@@ -33,20 +34,20 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
-pub struct ConsommeEndpoint {
-    consomme: Arc<Mutex<Option<Consomme>>>,
+pub struct ConsommeEndpoint<N: consomme::Network> {
+    consomme: Arc<Mutex<Option<Consomme<N>>>>,
 }
 
-impl ConsommeEndpoint {
-    pub fn new() -> Result<Self, consomme::Error> {
+impl<N: consomme::Network> ConsommeEndpoint<N> {
+    pub fn new(network: N) -> Result<Self, consomme::Error> {
         Ok(Self {
-            consomme: Arc::new(Mutex::new(Some(Consomme::new()?))),
+            consomme: Arc::new(Mutex::new(Some(Consomme::new(network)?))),
         })
     }
 
-    pub fn new_with_state(state: ConsommeState) -> Self {
+    pub fn new_with_state(network: N, state: ConsommeState) -> Self {
         Self {
-            consomme: Arc::new(Mutex::new(Some(Consomme::new_with_state(state)))),
+            consomme: Arc::new(Mutex::new(Some(Consomme::new_with_state(network, state)))),
         }
     }
 
@@ -83,9 +84,11 @@ impl net_backend::Endpoint for ConsommeEndpoint {
     ) -> anyhow::Result<()> {
         assert_eq!(config.len(), 1);
         let config = config.into_iter().next().unwrap();
-        let mut queue = Box::new(ConsommeQueue {
+        let mut consomme = self.consomme.lock().take().unwrap();
+        consomme.network_mut().update_driver(config.driver);
+        let queue = Box::new(ConsommeQueue {
             slot: self.consomme.clone(),
-            consomme: self.consomme.lock().take(),
+            consomme: Some(consomme),
             state: QueueState {
                 pool: config.pool,
                 rx_avail: config.initial_rx.iter().copied().collect(),
@@ -94,9 +97,7 @@ impl net_backend::Endpoint for ConsommeEndpoint {
                 tx_ready: VecDeque::new(),
             },
             stats: Default::default(),
-            driver: config.driver,
         });
-        queue.with_consomme(|c| c.refresh_driver());
         queues.push(queue);
         Ok(())
     }
@@ -120,11 +121,11 @@ impl net_backend::Endpoint for ConsommeEndpoint {
 }
 
 pub struct ConsommeQueue {
-    slot: Arc<Mutex<Option<Consomme>>>,
-    consomme: Option<Consomme>,
+    slot: Arc<Mutex<Option<Consomme<N>>>>,
+    consomme: Option<Consomme<N>>,
     state: QueueState,
     stats: Stats,
-    driver: Box<dyn Driver>,
+    //driver: Box<dyn Driver>,
 }
 
 impl InspectMut for ConsommeQueue {
@@ -148,12 +149,11 @@ impl Drop for ConsommeQueue {
 impl ConsommeQueue {
     fn with_consomme<F, R>(&mut self, f: F) -> R
     where
-        F: FnOnce(&mut consomme::Access<'_, Client<'_>>) -> R,
+        F: FnOnce(&mut consomme::Access<'_, Client<'_>, N>) -> R,
     {
         f(&mut self.consomme.as_mut().unwrap().access(&mut Client {
             state: &mut self.state,
             stats: &mut self.stats,
-            driver: &self.driver,
         }))
     }
 }
@@ -265,14 +265,9 @@ struct Stats {
 struct Client<'a> {
     state: &'a mut QueueState,
     stats: &'a mut Stats,
-    driver: &'a dyn Driver,
 }
 
 impl consomme::Client for Client<'_> {
-    fn driver(&self) -> &dyn Driver {
-        self.driver
-    }
-
     fn recv(&mut self, data: &[u8], checksum: &ChecksumState) {
         let Some(rx_id) = self.state.rx_avail.pop_front() else {
             // This should be rare, only affecting unbuffered protocols. TCP and

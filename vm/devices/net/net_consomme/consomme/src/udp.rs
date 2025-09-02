@@ -3,12 +3,13 @@
 
 use super::Access;
 use super::Client;
-use super::ConsommeState;
 use super::DropReason;
 use super::SocketAddress;
 use super::dhcp::DHCP_SERVER;
 use crate::ChecksumState;
+use crate::Common;
 use crate::Ipv4Addresses;
+use crate::Network;
 use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
@@ -42,6 +43,30 @@ impl<T: UdpIo> Udp<T> {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
+        }
+    }
+
+    fn get_or_insert(
+        &mut self,
+        common: &mut Common<impl Network<Udp = T>>,
+        guest_addr: SocketAddress,
+        host_addr: Option<Ipv4Addr>,
+        guest_mac: Option<EthernetAddress>,
+    ) -> Result<&mut UdpConnection<T>, DropReason> {
+        let entry = self.connections.entry(guest_addr);
+        match entry {
+            hash_map::Entry::Occupied(conn) => Ok(conn.into_mut()),
+            hash_map::Entry::Vacant(e) => {
+                let addr = (host_addr.unwrap_or(Ipv4Addr::UNSPECIFIED), 0).into();
+                let socket = common.network.udp().bind(addr).map_err(DropReason::Io)?;
+                let conn = UdpConnection {
+                    socket: Some(socket),
+                    guest_mac: guest_mac.unwrap_or(common.params.client_mac),
+                    stats: Default::default(),
+                    recycle: false,
+                };
+                Ok(e.insert(conn))
+            }
         }
     }
 }
@@ -96,14 +121,14 @@ impl<T: UdpIo> UdpConnection<T> {
         &mut self,
         cx: &mut Context<'_>,
         dst_addr: &SocketAddress,
-        state: &mut ConsommeState,
-        client: &mut impl Client<Udp = T>,
+        common: &mut Common<impl Network<Udp = T>>,
+        client: &mut impl Client,
     ) -> bool {
         if self.recycle {
             return false;
         }
 
-        let mut eth = EthernetFrame::new_unchecked(&mut state.buffer);
+        let mut eth = EthernetFrame::new_unchecked(&mut common.buffer);
         loop {
             // Receive UDP packets while there are receive buffers available. This
             // means we won't drop UDP packets at this level--instead, we only drop
@@ -113,7 +138,7 @@ impl<T: UdpIo> UdpConnection<T> {
             if client.rx_mtu() == 0 {
                 break true;
             }
-            match client.udp().poll_recv(
+            match common.network.udp().poll_recv(
                 cx,
                 self.socket.as_mut().unwrap(),
                 &mut eth.payload_mut()[IPV4_HEADER_LEN + UDP_HEADER_LEN..],
@@ -125,7 +150,7 @@ impl<T: UdpIo> UdpConnection<T> {
                         unreachable!()
                     };
                     eth.set_ethertype(EthernetProtocol::Ipv4);
-                    eth.set_src_addr(state.gateway_mac);
+                    eth.set_src_addr(common.params.gateway_mac);
                     eth.set_dst_addr(self.guest_mac);
                     let mut ipv4 = Ipv4Packet::new_unchecked(eth.payload_mut());
                     Ipv4Repr {
@@ -155,10 +180,10 @@ impl<T: UdpIo> UdpConnection<T> {
     }
 }
 
-impl<T: Client> Access<'_, T> {
+impl<T: Client, N: Network> Access<'_, T, N> {
     pub(crate) fn poll_udp(&mut self, cx: &mut Context<'_>) {
         self.inner.udp.connections.retain(|dst_addr, conn| {
-            conn.poll_conn(cx, dst_addr, &mut self.inner.state, self.client)
+            conn.poll_conn(cx, dst_addr, &mut self.inner.common, self.client)
         });
     }
 
@@ -177,7 +202,9 @@ impl<T: Client> Access<'_, T> {
             &checksum.caps(),
         )?;
 
-        if addresses.dst_addr == self.inner.state.gateway_ip || addresses.dst_addr.is_broadcast() {
+        if addresses.dst_addr == self.inner.common.params.gateway_ip
+            || addresses.dst_addr.is_broadcast()
+        {
             if self.handle_gateway_udp(&udp_packet)? {
                 return Ok(());
             }
@@ -188,8 +215,13 @@ impl<T: Client> Access<'_, T> {
             port: udp.src_port,
         };
 
-        let conn = self.get_or_insert(guest_addr, None, Some(frame.src_addr))?;
-        match self.client.udp().send_to(
+        let conn = self.inner.udp.get_or_insert(
+            &mut self.inner.common,
+            guest_addr,
+            None,
+            Some(frame.src_addr),
+        )?;
+        match self.inner.common.network.udp().send_to(
             conn.socket.as_mut().unwrap(),
             (Ipv4Addr::from(addresses.dst_addr), udp.dst_port).into(),
             udp_packet.payload(),
@@ -205,29 +237,6 @@ impl<T: Client> Access<'_, T> {
             Err(err) => {
                 conn.stats.tx_errors.increment();
                 Err(DropReason::Io(err))
-            }
-        }
-    }
-
-    fn get_or_insert(
-        &mut self,
-        guest_addr: SocketAddress,
-        host_addr: Option<Ipv4Addr>,
-        guest_mac: Option<EthernetAddress>,
-    ) -> Result<&mut UdpConnection<T::Udp>, DropReason> {
-        let entry = self.inner.udp.connections.entry(guest_addr);
-        match entry {
-            hash_map::Entry::Occupied(conn) => Ok(conn.into_mut()),
-            hash_map::Entry::Vacant(e) => {
-                let addr = (host_addr.unwrap_or(Ipv4Addr::UNSPECIFIED), 0).into();
-                let socket = self.client.udp().bind(addr).map_err(DropReason::Io)?;
-                let conn = UdpConnection {
-                    socket: Some(socket),
-                    guest_mac: guest_mac.unwrap_or(self.inner.state.client_mac),
-                    stats: Default::default(),
-                    recycle: false,
-                };
-                Ok(e.insert(conn))
             }
         }
     }
@@ -252,7 +261,10 @@ impl<T: Client> Access<'_, T> {
             ip: ip_addr.unwrap_or(Ipv4Addr::UNSPECIFIED).into(),
             port,
         };
-        let _ = self.get_or_insert(guest_addr, ip_addr, None)?;
+        let _ = self
+            .inner
+            .udp
+            .get_or_insert(&mut self.inner.common, guest_addr, ip_addr, None)?;
         Ok(())
     }
 

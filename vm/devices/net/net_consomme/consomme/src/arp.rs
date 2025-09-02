@@ -6,6 +6,7 @@ use super::Client;
 use super::DropReason;
 use crate::ChecksumState;
 use crate::MIN_MTU;
+use crate::Network;
 use smoltcp::wire::ArpOperation;
 use smoltcp::wire::ArpPacket;
 use smoltcp::wire::ArpRepr;
@@ -13,7 +14,7 @@ use smoltcp::wire::EthernetFrame;
 use smoltcp::wire::EthernetProtocol;
 use smoltcp::wire::EthernetRepr;
 
-impl<T: Client> Access<'_, T> {
+impl<T: Client, N: Network> Access<'_, T, N> {
     pub(crate) fn handle_arp(
         &mut self,
         frame: &EthernetRepr,
@@ -27,15 +28,15 @@ impl<T: Client> Access<'_, T> {
                 source_protocol_addr,
                 target_hardware_addr: _,
                 target_protocol_addr,
-            } if target_protocol_addr == self.inner.state.gateway_ip => {
+            } if target_protocol_addr == self.inner.common.params.gateway_ip => {
                 let e_repr = EthernetRepr {
-                    src_addr: self.inner.state.gateway_mac,
+                    src_addr: self.inner.common.params.gateway_mac,
                     dst_addr: frame.src_addr,
                     ethertype: EthernetProtocol::Arp,
                 };
                 let arp_repr = ArpRepr::EthernetIpv4 {
                     operation: ArpOperation::Reply,
-                    source_hardware_addr: self.inner.state.gateway_mac,
+                    source_hardware_addr: self.inner.common.params.gateway_mac,
                     source_protocol_addr: target_protocol_addr,
                     target_hardware_addr: source_hardware_addr,
                     target_protocol_addr: source_protocol_addr,

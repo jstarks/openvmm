@@ -10,7 +10,9 @@ use super::DropReason;
 use super::FourTuple;
 use super::SocketAddress;
 use crate::ChecksumState;
+use crate::Common;
 use crate::Ipv4Addresses;
+use crate::Network;
 use inspect::Inspect;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::ETHERNET_HEADER_LEN;
@@ -221,13 +223,13 @@ impl TcpState {
     }
 }
 
-impl<T: Client> Access<'_, T> {
+impl<T: Client, N: Network> Access<'_, T, N> {
     pub(crate) fn poll_tcp(&mut self, cx: &mut Context<'_>) {
         // Check for any new incoming connections
         self.inner
             .tcp
             .listeners
-            .retain(|port, listener| match listener.poll_listener(cx, self.client) {
+            .retain(|port, listener| match listener.poll_listener(cx, &mut self.inner.common.network) {
                 Ok(result) => {
                     if let Some((socket, mut other_addr)) = result {
                         // Check for loopback requests and replace the dest port.
@@ -246,7 +248,7 @@ impl<T: Client> Access<'_, T> {
                         }
 
                         let ft = FourTuple { dst: other_addr, src: SocketAddress {
-                            ip: self.inner.state.client_ip,
+                            ip: self.inner.common.params.client_ip,
                             port: *port,
                         } };
 
@@ -255,7 +257,7 @@ impl<T: Client> Access<'_, T> {
                                 let mut sender = Sender {
                                     ft: &ft,
                                     client: self.client,
-                                    state: &mut self.inner.state,
+                                    common: &mut self.inner.common,
                                 };
 
                                 let conn = match TcpConnection::new_from_accept(
@@ -288,8 +290,8 @@ impl<T: Client> Access<'_, T> {
                 cx,
                 &mut Sender {
                     ft,
-                    state: &mut self.inner.state,
                     client: self.client,
+                    common: &mut self.inner.common,
                 },
             )
         })
@@ -325,7 +327,7 @@ impl<T: Client> Access<'_, T> {
         let mut sender = Sender {
             ft: &ft,
             client: self.client,
-            state: &mut self.inner.state,
+            common: &mut self.inner.common,
         };
 
         match self.inner.tcp.connections.entry(ft) {
@@ -375,7 +377,7 @@ impl<T: Client> Access<'_, T> {
                 let mut sender = Sender {
                     ft: &ft,
                     client: self.client,
-                    state: &mut self.inner.state,
+                    common: &mut self.inner.common,
                 };
 
                 let listener = TcpListener::new(&mut sender)?;
@@ -396,19 +398,19 @@ impl<T: Client> Access<'_, T> {
     }
 }
 
-struct Sender<'a, T> {
+struct Sender<'a, T, N> {
     ft: &'a FourTuple,
     client: &'a mut T,
-    state: &'a mut ConsommeState,
+    common: &'a mut Common<N>,
 }
 
-impl<T: Client> Sender<'_, T> {
+impl<T: Client, N: Network> Sender<'_, T, N> {
     fn send_packet(&mut self, tcp: &TcpRepr<'_>, payload: Option<ring::View<'_>>) {
-        let buffer = &mut self.state.buffer;
+        let buffer = &mut self.common.buffer;
         let mut eth_packet = EthernetFrame::new_unchecked(&mut buffer[..]);
         eth_packet.set_ethertype(EthernetProtocol::Ipv4);
-        eth_packet.set_dst_addr(self.state.client_mac);
-        eth_packet.set_src_addr(self.state.gateway_mac);
+        eth_packet.set_dst_addr(self.common.params.client_mac);
+        eth_packet.set_src_addr(self.common.params.gateway_mac);
         let mut ipv4_packet = Ipv4Packet::new_unchecked(eth_packet.payload_mut());
         let ipv4 = Ipv4Repr {
             src_addr: self.ft.dst.ip,
@@ -501,14 +503,15 @@ impl<T: TcpIo> Default for TcpConnection<T> {
 
 impl<T: TcpIo> TcpConnection<T> {
     fn new(
-        sender: &mut Sender<'_, impl Client<Tcp = T>>,
+        sender: &mut Sender<'_, impl Client, impl Network<Tcp = T>>,
         tcp: &TcpRepr<'_>,
     ) -> Result<Self, DropReason> {
         let mut this = Self::default();
         this.initialize_from_first_client_packet(tcp)?;
 
         let socket = sender
-            .client
+            .common
+            .network
             .tcp()
             .connect(SocketAddrV4::from(sender.ft.dst).into())
             .map_err(|err| {
@@ -537,7 +540,7 @@ impl<T: TcpIo> TcpConnection<T> {
     }
 
     fn new_from_accept(
-        sender: &mut Sender<'_, impl Client>,
+        sender: &mut Sender<'_, impl Client, impl Network<Tcp = T>>,
         socket: T::Socket,
     ) -> Result<Self, DropReason> {
         let mut this = Self {
@@ -586,11 +589,12 @@ impl<T: TcpIo> TcpConnection<T> {
     fn poll_conn(
         &mut self,
         cx: &mut Context<'_>,
-        sender: &mut Sender<'_, impl Client<Tcp = T>>,
+        sender: &mut Sender<'_, impl Client, impl Network<Tcp = T>>,
     ) -> bool {
         if self.state == TcpState::Connecting {
             match sender
-                .client
+                .common
+                .network
                 .tcp()
                 .poll_connect(cx, self.socket.as_mut().unwrap())
             {
@@ -651,7 +655,8 @@ impl<T: TcpIo> TcpConnection<T> {
         if self.socket.is_some() {
             if self.state.tx_fin() {
                 match sender
-                    .client
+                    .common
+                    .network
                     .tcp()
                     .poll_close(cx, self.socket.as_mut().unwrap())
                 {
@@ -676,7 +681,7 @@ impl<T: TcpIo> TcpConnection<T> {
                 while !self.tx_buffer.is_full() {
                     let (a, b) = self.tx_buffer.unwritten_slices_mut();
                     let mut bufs = [IoSliceMut::new(a), IoSliceMut::new(b)];
-                    match sender.client.tcp().poll_read_vectored(
+                    match sender.common.network.tcp().poll_read_vectored(
                         cx,
                         self.socket.as_mut().unwrap(),
                         &mut bufs,
@@ -713,7 +718,7 @@ impl<T: TcpIo> TcpConnection<T> {
             while !self.rx_buffer.is_empty() {
                 let (a, b) = self.rx_buffer.as_slices();
                 let bufs = [IoSlice::new(a), IoSlice::new(b)];
-                match sender.client.tcp().poll_write_vectored(
+                match sender.common.network.tcp().poll_write_vectored(
                     cx,
                     self.socket.as_mut().unwrap(),
                     &bufs,
@@ -739,7 +744,8 @@ impl<T: TcpIo> TcpConnection<T> {
             }
             if self.rx_buffer.is_empty() && self.state.rx_fin() && !self.is_shutdown {
                 if let Err(err) = sender
-                    .client
+                    .common
+                    .network
                     .tcp()
                     .shutdown_writes(self.socket.as_mut().unwrap())
                 {
@@ -760,7 +766,7 @@ impl<T: TcpIo> TcpConnection<T> {
         ((self.rx_window_cap - self.rx_buffer.len()) >> self.rx_window_scale) as u16
     }
 
-    fn send_next(&mut self, sender: &mut Sender<'_, impl Client>) {
+    fn send_next(&mut self, sender: &mut Sender<'_, impl Client, impl Network>) {
         match self.state {
             TcpState::Connecting => {}
             TcpState::SynReceived => self.send_syn(sender, Some(self.rx_seq)),
@@ -768,7 +774,11 @@ impl<T: TcpIo> TcpConnection<T> {
         }
     }
 
-    fn send_syn(&mut self, sender: &mut Sender<'_, impl Client>, ack_number: Option<TcpSeqNumber>) {
+    fn send_syn(
+        &mut self,
+        sender: &mut Sender<'_, impl Client, impl Network>,
+        ack_number: Option<TcpSeqNumber>,
+    ) {
         if self.tx_send != self.tx_acked || sender.client.rx_mtu() == 0 {
             return;
         }
@@ -798,7 +808,7 @@ impl<T: TcpIo> TcpConnection<T> {
         self.tx_send += 1;
     }
 
-    fn send_data(&mut self, sender: &mut Sender<'_, impl Client>) {
+    fn send_data(&mut self, sender: &mut Sender<'_, impl Client, impl Network>) {
         // These computations assume syn has already been sent and acked.
         let tx_payload_end = self.tx_acked + self.tx_buffer.len();
         let tx_end = tx_payload_end + self.tx_fin_buffered as usize;
@@ -836,7 +846,7 @@ impl<T: TcpIo> TcpConnection<T> {
             // 4. The client MTU.
             let tx_segment_end = {
                 let header_len = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + tcp.header_len();
-                let mtu = rx_mtu.min(sender.state.buffer.len());
+                let mtu = rx_mtu.min(sender.common.buffer.len());
                 seq_min([
                     tx_payload_end,
                     tx_window_end,
@@ -905,7 +915,7 @@ impl<T: TcpIo> TcpConnection<T> {
     /// unacceptable packet (duplicate, out of order, etc.). These acks
     /// shouldn't be combined with data so that they are interpreted correctly
     /// by the peer.
-    fn ack(&self, sender: &mut Sender<'_, impl Client>) {
+    fn ack(&self, sender: &mut Sender<'_, impl Client, impl Network>) {
         let tcp = TcpRepr {
             src_port: sender.ft.dst.port,
             dst_port: sender.ft.src.port,
@@ -927,7 +937,7 @@ impl<T: TcpIo> TcpConnection<T> {
 
     fn handle_listen_syn(
         &mut self,
-        sender: &mut Sender<'_, impl Client>,
+        sender: &mut Sender<'_, impl Client, impl Network>,
         tcp: &TcpRepr<'_>,
     ) -> Result<bool, DropReason> {
         if tcp.control != TcpControl::Syn || tcp.segment_len() != 1 {
@@ -956,7 +966,7 @@ impl<T: TcpIo> TcpConnection<T> {
 
     fn handle_packet(
         &mut self,
-        sender: &mut Sender<'_, impl Client>,
+        sender: &mut Sender<'_, impl Client, impl Network>,
         tcp: &TcpRepr<'_>,
     ) -> Result<bool, DropReason> {
         if self.state == TcpState::Connecting {
@@ -1134,9 +1144,12 @@ impl<T: TcpIo> TcpConnection<T> {
 }
 
 impl<T: TcpIo> TcpListener<T> {
-    pub fn new(sender: &mut Sender<'_, impl Client<Tcp = T>>) -> Result<Self, DropReason> {
+    pub fn new(
+        sender: &mut Sender<'_, impl Client, impl Network<Tcp = T>>,
+    ) -> Result<Self, DropReason> {
         let socket = sender
-            .client
+            .common
+            .network
             .tcp()
             .listen(SocketAddrV4::from(sender.ft.src).into())
             .map_err(|err| {
@@ -1154,9 +1167,9 @@ impl<T: TcpIo> TcpListener<T> {
     fn poll_listener(
         &mut self,
         cx: &mut Context<'_>,
-        client: &mut impl Client<Tcp = T>,
+        network: &mut impl Network<Tcp = T>,
     ) -> Result<Option<(T::Socket, SocketAddress)>, DropReason> {
-        match client.tcp().poll_accept(cx, &mut self.socket) {
+        match network.tcp().poll_accept(cx, &mut self.socket) {
             Poll::Ready(r) => match r {
                 Ok((socket, address)) => match address {
                     SocketAddr::V4(src_address) => Ok(Some((

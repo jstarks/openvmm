@@ -133,14 +133,21 @@ impl ConsommeControl {
 }
 
 /// A consomme instance.
-pub struct Consomme<C: Client> {
-    state: ConsommeState,
+pub struct Consomme<N: Network> {
+    common: Common<N>,
     recv: Option<mesh::Receiver<ConsommeMessage>>,
-    tcp: tcp::Tcp<C::Tcp>,
-    udp: udp::Udp<C::Udp>,
+    tcp: tcp::Tcp<N::Tcp>,
+    udp: udp::Udp<N::Udp>,
 }
 
-impl<C: Client> InspectMut for Consomme<C> {
+struct Common<N> {
+    params: ConsommeState,
+    /// Buffer for packet processing
+    buffer: Box<[u8]>,
+    network: N,
+}
+
+impl<N: Network> InspectMut for Consomme<N> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
             .field("tcp", &self.tcp)
@@ -162,8 +169,6 @@ pub struct ConsommeState {
     pub client_mac: EthernetAddress,
     /// Current list of DNS resolvers.
     pub nameservers: Vec<Ipv4Address>,
-    /// Buffer for packet processing
-    buffer: Box<[u8]>,
 }
 
 /// An error indicating that the CIDR is invalid.
@@ -185,7 +190,6 @@ impl ConsommeState {
             client_mac: EthernetAddress([0x0, 0x0, 0x0, 0x0, 0x1, 0x0]),
             net_mask: Ipv4Address::new(255, 255, 255, 0),
             nameservers,
-            buffer: Box::new([0; 65535]),
         })
     }
 
@@ -206,19 +210,21 @@ impl ConsommeState {
 }
 
 /// An accessor for consomme.
-pub struct Access<'a, T: Client> {
-    inner: &'a mut Consomme<T>,
+pub struct Access<'a, T: Client, N: Network> {
+    inner: &'a mut Consomme<N>,
     client: &'a mut T,
 }
 
-/// A consomme client.
-pub trait Client {
+pub trait Network {
     type Tcp: TcpIo;
     type Udp: UdpIo;
 
     fn tcp(&mut self) -> &mut Self::Tcp;
     fn udp(&mut self) -> &mut Self::Udp;
+}
 
+/// A consomme client.
+pub trait Client {
     /// Transmits a packet to the client.
     ///
     /// If `checksum.ipv4`, `checksum.tcp`, or `checksum.udp` are set, then the
@@ -379,17 +385,21 @@ struct Ipv4Addresses {
     dst_addr: Ipv4Address,
 }
 
-impl<C: Client> Consomme<C> {
+impl<N: Network> Consomme<N> {
     /// Creates a new consomme instance.
-    pub fn new() -> Result<Self, Error> {
+    pub fn new(network: N) -> Result<Self, Error> {
         let state = ConsommeState::new()?;
-        Ok(Self::new_with_state(state))
+        Ok(Self::new_with_state(network, state))
     }
 
     /// Creates a new consomme instance with specified state.
-    pub fn new_with_state(state: ConsommeState) -> Self {
+    pub fn new_with_state(network: N, state: ConsommeState) -> Self {
         Self {
-            state,
+            common: Common {
+                params: state,
+                buffer: Box::new([0; 65535]),
+                network,
+            },
             recv: None,
             tcp: tcp::Tcp::new(),
             udp: udp::Udp::new(),
@@ -397,10 +407,14 @@ impl<C: Client> Consomme<C> {
     }
 
     /// Creates a new consomme instance with dynamic state.
-    pub fn new_dynamic(state: ConsommeState) -> (Self, ConsommeControl) {
+    pub fn new_dynamic(network: N, state: ConsommeState) -> (Self, ConsommeControl) {
         let (send, recv) = mesh::channel();
         let this = Self {
-            state,
+            common: Common {
+                params: state,
+                buffer: Box::new([0; 65535]),
+                network,
+            },
             recv: Some(recv),
             tcp: tcp::Tcp::new(),
             udp: udp::Udp::new(),
@@ -409,8 +423,18 @@ impl<C: Client> Consomme<C> {
         (this, control)
     }
 
+    /// Returns the network backend object.
+    pub fn network(&self) -> &N {
+        &self.common.network
+    }
+
+    /// Returns the network backend object.
+    pub fn network_mut(&mut self) -> &mut N {
+        &mut self.common.network
+    }
+
     /// Pairs the client with this instance to operate on the consomme instance.
-    pub fn access<'a>(&'a mut self, client: &'a mut C) -> Access<'a, C> {
+    pub fn access<'a, T: Client>(&'a mut self, client: &'a mut T) -> Access<'a, T, N> {
         Access {
             inner: self,
             client,
@@ -418,7 +442,7 @@ impl<C: Client> Consomme<C> {
     }
 }
 
-impl<T: Client> Access<'_, T> {
+impl<T: Client, N: Network> Access<'_, T, N> {
     fn process_message(&mut self, message: ConsommeMessage) {
         match message {
             ConsommeMessage::BindPort(rpc) => {
@@ -436,7 +460,7 @@ impl<T: Client> Access<'_, T> {
                 });
             }
             ConsommeMessage::UpdateState(rpc) => {
-                rpc.handle_sync(|f| f(&mut self.inner.state));
+                rpc.handle_sync(|f| f(&mut self.inner.common.params));
             }
         }
     }

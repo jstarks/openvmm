@@ -34,6 +34,16 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
+pub trait UpdateDriver {
+    fn update_driver(&mut self, driver: Box<dyn Driver>);
+}
+
+impl UpdateDriver for consomme::OsSockets<Box<dyn Driver>> {
+    fn update_driver(&mut self, driver: Box<dyn Driver>) {
+        self.update_driver(driver);
+    }
+}
+
 pub struct ConsommeEndpoint<N: consomme::Network> {
     consomme: Arc<Mutex<Option<Consomme<N>>>>,
 }
@@ -51,8 +61,8 @@ impl<N: consomme::Network> ConsommeEndpoint<N> {
         }
     }
 
-    pub fn new_dynamic(state: ConsommeState) -> (Self, ConsommeControl) {
-        let (consomme, control) = Consomme::new_dynamic(state);
+    pub fn new_dynamic(network: N, state: ConsommeState) -> (Self, ConsommeControl) {
+        let (consomme, control) = Consomme::new_dynamic(network, state);
         (
             Self {
                 consomme: Arc::new(Mutex::new(Some(consomme))),
@@ -62,7 +72,7 @@ impl<N: consomme::Network> ConsommeEndpoint<N> {
     }
 }
 
-impl InspectMut for ConsommeEndpoint {
+impl<N: consomme::Network> InspectMut for ConsommeEndpoint<N> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         if let Some(consomme) = &mut *self.consomme.lock() {
             consomme.inspect_mut(req);
@@ -71,7 +81,13 @@ impl InspectMut for ConsommeEndpoint {
 }
 
 #[async_trait]
-impl net_backend::Endpoint for ConsommeEndpoint {
+impl<N> net_backend::Endpoint for ConsommeEndpoint<N>
+where
+    N: 'static + consomme::Network + UpdateDriver + Send,
+    <<N as consomme::Network>::Tcp as consomme::TcpIo>::Listener: Send,
+    <<N as consomme::Network>::Tcp as consomme::TcpIo>::Socket: Send,
+    <<N as consomme::Network>::Udp as consomme::UdpIo>::Socket: Send,
+{
     fn endpoint_type(&self) -> &'static str {
         "consomme"
     }
@@ -120,7 +136,7 @@ impl net_backend::Endpoint for ConsommeEndpoint {
     }
 }
 
-pub struct ConsommeQueue {
+pub struct ConsommeQueue<N: consomme::Network> {
     slot: Arc<Mutex<Option<Consomme<N>>>>,
     consomme: Option<Consomme<N>>,
     state: QueueState,
@@ -128,7 +144,7 @@ pub struct ConsommeQueue {
     //driver: Box<dyn Driver>,
 }
 
-impl InspectMut for ConsommeQueue {
+impl<N: consomme::Network> InspectMut for ConsommeQueue<N> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
             .merge(self.consomme.as_mut().unwrap())
@@ -140,13 +156,13 @@ impl InspectMut for ConsommeQueue {
     }
 }
 
-impl Drop for ConsommeQueue {
+impl<N: consomme::Network> Drop for ConsommeQueue<N> {
     fn drop(&mut self) {
         *self.slot.lock() = self.consomme.take();
     }
 }
 
-impl ConsommeQueue {
+impl<N: consomme::Network> ConsommeQueue<N> {
     fn with_consomme<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut consomme::Access<'_, Client<'_>, N>) -> R,
@@ -158,7 +174,13 @@ impl ConsommeQueue {
     }
 }
 
-impl net_backend::Queue for ConsommeQueue {
+impl<N> net_backend::Queue for ConsommeQueue<N>
+where
+    N: consomme::Network + UpdateDriver + Send,
+    <<N as consomme::Network>::Tcp as consomme::TcpIo>::Listener: Send,
+    <<N as consomme::Network>::Tcp as consomme::TcpIo>::Socket: Send,
+    <<N as consomme::Network>::Udp as consomme::UdpIo>::Socket: Send,
+{
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         while let Some(head) = self.state.tx_avail.front() {
             let TxSegmentType::Head(meta) = &head.ty else {

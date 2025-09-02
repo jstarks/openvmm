@@ -24,21 +24,32 @@ use std::task::Poll;
 use std::task::ready;
 
 pub struct OsSockets<T> {
-    driver: T,
+    driver: Option<T>,
     driver_seq: u64,
 }
 
 impl<T: Driver> OsSockets<T> {
     pub fn new(driver: T) -> Self {
         Self {
-            driver,
+            driver: Some(driver),
+            driver_seq: 0,
+        }
+    }
+
+    pub fn without_driver() -> Self {
+        Self {
+            driver: None,
             driver_seq: 0,
         }
     }
 
     pub fn update_driver(&mut self, driver: T) {
-        self.driver = driver;
+        self.driver = Some(driver);
         self.driver_seq += 1;
+    }
+
+    fn polled_socket<S: AsSockRef>(&self, s: S) -> io::Result<PolledSocket<S>> {
+        PolledSocket::new(self.driver.as_ref().ok_or(io::ErrorKind::Other)?, s)
     }
 
     fn socket<'a, S: AsSockRef>(
@@ -52,7 +63,7 @@ impl<T: Driver> OsSockets<T> {
             return Ok(s.socket.as_mut().unwrap());
         }
         let socket = s.socket.take().unwrap().into_inner();
-        let socket = PolledSocket::new(&self.driver, socket)?;
+        let socket = self.polled_socket(socket)?;
         s.driver_seq = self.driver_seq;
         Ok(s.socket.insert(socket))
     }
@@ -78,7 +89,7 @@ impl<T: Driver> TcpIo for OsSockets<T> {
     fn listen(&mut self, addr: SocketAddr) -> io::Result<Self::Listener> {
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
 
-        let socket = PolledSocket::new(&self.driver, socket)?;
+        let socket = self.polled_socket(socket)?;
         socket.get().bind(&addr.into())?;
         socket.listen(10)?;
         Ok(OsSocket {
@@ -100,7 +111,7 @@ impl<T: Driver> TcpIo for OsSockets<T> {
             }
         }
 
-        let socket = PolledSocket::new(&self.driver, socket)?;
+        let socket = self.polled_socket(socket)?;
         let Err(err) = socket.get().connect(&addr.into()) else {
             unreachable!("unexpected non-blocking synchronous connect success")
         };
@@ -122,7 +133,7 @@ impl<T: Driver> TcpIo for OsSockets<T> {
         let (socket, addr) =
             ready!(socket.poll_accept(cx)).map_err(|_| take_socket_error(socket))?;
         let addr = addr.as_socket().ok_or(io::ErrorKind::Unsupported)?;
-        let socket = PolledSocket::new(&self.driver, socket)?;
+        let socket = self.polled_socket(socket)?;
         let socket = OsSocket {
             socket: Some(socket),
             driver_seq: self.driver_seq,
@@ -204,7 +215,7 @@ impl<T: Driver> UdpIo for OsSockets<T> {
 
     fn bind(&mut self, addr: SocketAddr) -> io::Result<Self::Socket> {
         let socket = UdpSocket::bind(addr)?;
-        let socket = PolledSocket::new(&self.driver, socket)?;
+        let socket = self.polled_socket(socket)?;
         Ok(OsSocket {
             socket: Some(socket),
             driver_seq: self.driver_seq,

@@ -5,7 +5,6 @@ mod ring;
 
 use super::Access;
 use super::Client;
-use super::ConsommeState;
 use super::DropReason;
 use super::FourTuple;
 use super::SocketAddress;

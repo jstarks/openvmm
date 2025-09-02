@@ -11,12 +11,7 @@ use super::FourTuple;
 use super::SocketAddress;
 use crate::ChecksumState;
 use crate::Ipv4Addresses;
-use futures::AsyncRead;
-use futures::AsyncWrite;
 use inspect::Inspect;
-use pal_async::interest::PollEvents;
-use pal_async::socket::PollReady;
-use pal_async::socket::PolledSocket;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::ETHERNET_HEADER_LEN;
 use smoltcp::wire::EthernetFrame;
@@ -29,11 +24,6 @@ use smoltcp::wire::TcpControl;
 use smoltcp::wire::TcpPacket;
 use smoltcp::wire::TcpRepr;
 use smoltcp::wire::TcpSeqNumber;
-use socket2::Domain;
-use socket2::Protocol;
-use socket2::SockAddr;
-use socket2::Socket;
-use socket2::Type;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::hash_map;
@@ -42,17 +32,15 @@ use std::io::ErrorKind;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::net::Ipv4Addr;
-use std::net::Shutdown;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
-use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 use thiserror::Error;
 
-pub(crate) struct Tcp {
-    connections: HashMap<FourTuple, TcpConnection>,
-    listeners: HashMap<u16, TcpListener>,
+pub(crate) struct Tcp<T: TcpIo> {
+    connections: HashMap<FourTuple, TcpConnection<T>>,
+    listeners: HashMap<u16, TcpListener<T>>,
 }
 
 #[derive(Debug, Error)]
@@ -71,7 +59,7 @@ pub enum TcpError {
     InvalidWindowScale,
 }
 
-impl Inspect for Tcp {
+impl<T: TcpIo> Inspect for Tcp<T> {
     fn inspect(&self, req: inspect::Request<'_>) {
         let mut resp = req.respond();
         for (addr, conn) in &self.connections {
@@ -89,7 +77,7 @@ impl Inspect for Tcp {
     }
 }
 
-impl Tcp {
+impl<T: TcpIo> Tcp<T> {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
@@ -100,13 +88,13 @@ impl Tcp {
 
 pub trait TcpIo {
     type Socket;
-    type Accept;
-    fn listen(&mut self, addr: SocketAddr) -> io::Result<Self::Accept>;
+    type Listener;
+    fn listen(&mut self, addr: SocketAddr) -> io::Result<Self::Listener>;
     fn connect(&mut self, addr: SocketAddr) -> io::Result<Self::Socket>;
     fn poll_accept(
         &mut self,
         cx: &mut Context<'_>,
-        socket: &mut Self::Accept,
+        socket: &mut Self::Listener,
     ) -> Poll<io::Result<(Self::Socket, SocketAddr)>>;
     fn poll_connect(
         &mut self,
@@ -130,6 +118,7 @@ pub trait TcpIo {
         socket: &mut Self::Socket,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>>;
+    fn shutdown_writes(&mut self, socket: &mut Self::Socket) -> io::Result<()>;
 }
 
 #[derive(Inspect)]
@@ -140,9 +129,9 @@ enum LoopbackPortInfo {
 }
 
 #[derive(Inspect)]
-struct TcpConnection {
+struct TcpConnection<T: TcpIo> {
     #[inspect(skip)]
-    socket: Option<PolledSocket<Socket>>,
+    socket: Option<T::Socket>,
     loopback_port: LoopbackPortInfo,
     state: TcpState,
 
@@ -180,9 +169,9 @@ fn inspect_seq(seq: &TcpSeqNumber) -> inspect::AsHex<u32> {
 }
 
 #[derive(Inspect)]
-struct TcpListener {
+struct TcpListener<T: TcpIo> {
     #[inspect(skip)]
-    socket: PolledSocket<Socket>,
+    socket: T::Listener,
 }
 
 #[derive(Debug, PartialEq, Eq, Inspect)]
@@ -238,7 +227,7 @@ impl<T: Client> Access<'_, T> {
         self.inner
             .tcp
             .listeners
-            .retain(|port, listener| match listener.poll_listener(cx) {
+            .retain(|port, listener| match listener.poll_listener(cx, self.client) {
                 Ok(result) => {
                     if let Some((socket, mut other_addr)) = result {
                         // Check for loopback requests and replace the dest port.
@@ -303,28 +292,6 @@ impl<T: Client> Access<'_, T> {
                     client: self.client,
                 },
             )
-        })
-    }
-
-    pub(crate) fn refresh_tcp_driver(&mut self) {
-        self.inner.tcp.connections.retain(|_, conn| {
-            let Some(socket) = conn.socket.take() else {
-                return true;
-            };
-            let socket = socket.into_inner();
-            match PolledSocket::new(self.client.driver(), socket) {
-                Ok(socket) => {
-                    conn.socket = Some(socket);
-                    true
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = &err as &dyn std::error::Error,
-                        "failed to update driver for tcp connection"
-                    );
-                    false
-                }
-            }
         })
     }
 
@@ -489,7 +456,7 @@ impl<T: Client> Sender<'_, T> {
     }
 }
 
-impl Default for TcpConnection {
+impl<T: TcpIo> Default for TcpConnection<T> {
     fn default() -> Self {
         let mut rx_tx_seq = [0; 8];
         getrandom::fill(&mut rx_tx_seq[..]).expect("prng failure");
@@ -532,40 +499,28 @@ impl Default for TcpConnection {
     }
 }
 
-impl TcpConnection {
-    fn new(sender: &mut Sender<'_, impl Client>, tcp: &TcpRepr<'_>) -> Result<Self, DropReason> {
+impl<T: TcpIo> TcpConnection<T> {
+    fn new(
+        sender: &mut Sender<'_, impl Client<Tcp = T>>,
+        tcp: &TcpRepr<'_>,
+    ) -> Result<Self, DropReason> {
         let mut this = Self::default();
         this.initialize_from_first_client_packet(tcp)?;
 
-        let socket =
-            Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).map_err(DropReason::Io)?;
-
-        // On Windows the default behavior for non-existent loopback sockets is
-        // to wait and try again. This is different than the Linux behavior of
-        // immediately failing. Default to the Linux behavior.
-        #[cfg(windows)]
-        if sender.ft.dst.ip.is_loopback() {
-            if let Err(err) = crate::windows::disable_connection_retries(&socket) {
-                tracing::trace!(err, "Failed to disable loopback retries");
-            }
-        }
-
-        let socket = PolledSocket::new(sender.client.driver(), socket).map_err(DropReason::Io)?;
-        match socket
-            .get()
-            .connect(&SockAddr::from(SocketAddrV4::from(sender.ft.dst)))
-        {
-            Ok(_) => unreachable!(),
-            Err(err) if is_connect_incomplete_error(&err) => (),
-            Err(err) => {
+        let socket = sender
+            .client
+            .tcp()
+            .connect(SocketAddrV4::from(sender.ft.dst).into())
+            .map_err(|err| {
                 tracing::warn!(
                     error = &err as &dyn std::error::Error,
                     "socket connect error"
                 );
                 sender.rst(TcpSeqNumber(0), Some(tcp.seq_number + tcp.segment_len()));
-                return Err(DropReason::Io(err));
-            }
-        }
+                DropReason::Io(err)
+            })?;
+
+        /*
         if let Ok(addr) = socket.get().local_addr() {
             if let Some(addr) = addr.as_socket_ipv4() {
                 if addr.ip().is_loopback() {
@@ -576,18 +531,17 @@ impl TcpConnection {
                 }
             }
         }
+        */
         this.socket = Some(socket);
         Ok(this)
     }
 
     fn new_from_accept(
         sender: &mut Sender<'_, impl Client>,
-        socket: Socket,
+        socket: T::Socket,
     ) -> Result<Self, DropReason> {
         let mut this = Self {
-            socket: Some(
-                PolledSocket::new(sender.client.driver(), socket).map_err(DropReason::Io)?,
-            ),
+            socket: Some(socket),
             state: TcpState::SynSent,
             ..Default::default()
         };
@@ -629,61 +583,63 @@ impl TcpConnection {
         Ok(())
     }
 
-    fn poll_conn(&mut self, cx: &mut Context<'_>, sender: &mut Sender<'_, impl Client>) -> bool {
+    fn poll_conn(
+        &mut self,
+        cx: &mut Context<'_>,
+        sender: &mut Sender<'_, impl Client<Tcp = T>>,
+    ) -> bool {
         if self.state == TcpState::Connecting {
-            match self
-                .socket
-                .as_mut()
-                .unwrap()
-                .poll_ready(cx, PollEvents::OUT)
+            match sender
+                .client
+                .tcp()
+                .poll_connect(cx, self.socket.as_mut().unwrap())
             {
-                Poll::Ready(r) => {
-                    if r.has_err() {
-                        let err = take_socket_error(self.socket.as_mut().unwrap());
-                        let reset = match err.kind() {
-                            ErrorKind::TimedOut => {
-                                // Avoid resetting so that the guest doesn't
-                                // think there is a responding TCP stack at this
-                                // address. The guest will time out on its own.
-                                tracing::debug!(
-                                    error = &err as &dyn std::error::Error,
-                                    "connect timed out"
-                                );
-                                false
-                            }
-                            ErrorKind::ConnectionRefused => {
-                                // Presumably the remote TCP stack send a RST.
-                                // Send a reset but don't log anything.
-                                tracing::debug!(
-                                    error = &err as &dyn std::error::Error,
-                                    "connection refused"
-                                );
-                                true
-                            }
-                            _ => {
-                                // Something unexpected happened. Log and reset.
-                                //
-                                // FUTURE: Handle more cases, especially
-                                // ENETUNREACH and similar, once we figure out
-                                // the right behavior for these. They might
-                                // require sending ICMP packets.
-                                tracing::warn!(
-                                    error = &err as &dyn std::error::Error,
-                                    "unhandled connect failure"
-                                );
-                                true
-                            }
-                        };
-                        if reset {
-                            sender.rst(self.tx_send, Some(self.rx_seq));
-                        }
-                        return false;
-                    }
-
+                Poll::Ready(Ok(())) => {
                     tracing::debug!("connection established");
                     self.state = TcpState::SynReceived;
                     self.rx_window_cap = self.rx_buffer.capacity();
                 }
+                Poll::Ready(Err(err)) => {
+                    let reset = match err.kind() {
+                        ErrorKind::TimedOut => {
+                            // Avoid resetting so that the guest doesn't
+                            // think there is a responding TCP stack at this
+                            // address. The guest will time out on its own.
+                            tracing::debug!(
+                                error = &err as &dyn std::error::Error,
+                                "connect timed out"
+                            );
+                            false
+                        }
+                        ErrorKind::ConnectionRefused => {
+                            // Presumably the remote TCP stack send a RST.
+                            // Send a reset but don't log anything.
+                            tracing::debug!(
+                                error = &err as &dyn std::error::Error,
+                                "connection refused"
+                            );
+                            true
+                        }
+                        _ => {
+                            // Something unexpected happened. Log and reset.
+                            //
+                            // FUTURE: Handle more cases, especially
+                            // ENETUNREACH and similar, once we figure out
+                            // the right behavior for these. They might
+                            // require sending ICMP packets.
+                            tracing::warn!(
+                                error = &err as &dyn std::error::Error,
+                                "unhandled connect failure"
+                            );
+                            true
+                        }
+                    };
+                    if reset {
+                        sender.rst(self.tx_send, Some(self.rx_seq));
+                    }
+                    return false;
+                }
+
                 Poll::Pending => return true,
             }
         } else if self.state == TcpState::SynSent {
@@ -694,14 +650,16 @@ impl TcpConnection {
         // Handle the tx path.
         if self.socket.is_some() {
             if self.state.tx_fin() {
-                if let Poll::Ready(events) = self
-                    .socket
-                    .as_mut()
-                    .unwrap()
-                    .poll_ready(cx, PollEvents::EMPTY)
+                match sender
+                    .client
+                    .tcp()
+                    .poll_close(cx, self.socket.as_mut().unwrap())
                 {
-                    if events.has_err() {
-                        let err = take_socket_error(self.socket.as_ref().unwrap());
+                    Poll::Ready(Ok(())) => {
+                        // Both ends are closed. Close the actual socket.
+                        self.socket = None;
+                    }
+                    Poll::Ready(Err(err)) => {
                         match err.kind() {
                             ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {}
                             _ => tracing::warn!(
@@ -712,17 +670,17 @@ impl TcpConnection {
                         sender.rst(self.tx_send, Some(self.rx_seq));
                         return false;
                     }
-
-                    // Both ends are closed. Close the actual socket.
-                    self.socket = None;
+                    Poll::Pending => {}
                 }
             } else {
                 while !self.tx_buffer.is_full() {
                     let (a, b) = self.tx_buffer.unwritten_slices_mut();
                     let mut bufs = [IoSliceMut::new(a), IoSliceMut::new(b)];
-                    match Pin::new(&mut *self.socket.as_mut().unwrap())
-                        .poll_read_vectored(cx, &mut bufs)
-                    {
+                    match sender.client.tcp().poll_read_vectored(
+                        cx,
+                        self.socket.as_mut().unwrap(),
+                        &mut bufs,
+                    ) {
                         Poll::Ready(Ok(n)) => {
                             if n == 0 {
                                 self.close();
@@ -755,7 +713,11 @@ impl TcpConnection {
             while !self.rx_buffer.is_empty() {
                 let (a, b) = self.rx_buffer.as_slices();
                 let bufs = [IoSlice::new(a), IoSlice::new(b)];
-                match Pin::new(&mut *self.socket.as_mut().unwrap()).poll_write_vectored(cx, &bufs) {
+                match sender.client.tcp().poll_write_vectored(
+                    cx,
+                    self.socket.as_mut().unwrap(),
+                    &bufs,
+                ) {
                     Poll::Ready(Ok(n)) => {
                         self.rx_buffer.drain(..n);
                     }
@@ -776,12 +738,10 @@ impl TcpConnection {
                 }
             }
             if self.rx_buffer.is_empty() && self.state.rx_fin() && !self.is_shutdown {
-                if let Err(err) = self
-                    .socket
-                    .as_ref()
-                    .unwrap()
-                    .get()
-                    .shutdown(Shutdown::Write)
+                if let Err(err) = sender
+                    .client
+                    .tcp()
+                    .shutdown_writes(self.socket.as_mut().unwrap())
                 {
                     tracing::warn!(error = &err as &dyn std::error::Error, "shutdown error");
                     sender.rst(self.tx_send, Some(self.rx_seq));
@@ -1173,57 +1133,45 @@ impl TcpConnection {
     }
 }
 
-impl TcpListener {
-    pub fn new(sender: &mut Sender<'_, impl Client>) -> Result<Self, DropReason> {
-        let socket =
-            Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).map_err(DropReason::Io)?;
+impl<T: TcpIo> TcpListener<T> {
+    pub fn new(sender: &mut Sender<'_, impl Client<Tcp = T>>) -> Result<Self, DropReason> {
+        let socket = sender
+            .client
+            .tcp()
+            .listen(SocketAddrV4::from(sender.ft.src).into())
+            .map_err(|err| {
+                tracing::warn!(
+                    address = ?sender.ft.src,
+                    error = &err as &dyn std::error::Error,
+                    "socket bind error"
+                );
+                DropReason::Io(err)
+            })?;
 
-        let socket = PolledSocket::new(sender.client.driver(), socket).map_err(DropReason::Io)?;
-        if let Err(err) = socket.get().bind(&sender.ft.src.into()) {
-            tracing::warn!(
-                address = ?sender.ft.src,
-                error = &err as &dyn std::error::Error,
-                "socket bind error"
-            );
-            return Err(DropReason::Io(err));
-        }
-        if let Err(err) = socket.listen(10) {
-            tracing::warn!(
-                error = &err as &dyn std::error::Error,
-                "socket listen error"
-            );
-            return Err(DropReason::Io(err));
-        }
         Ok(Self { socket })
     }
 
     fn poll_listener(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Result<Option<(Socket, SocketAddress)>, DropReason> {
-        match self.socket.poll_accept(cx) {
+        client: &mut impl Client<Tcp = T>,
+    ) -> Result<Option<(T::Socket, SocketAddress)>, DropReason> {
+        match client.tcp().poll_accept(cx, &mut self.socket) {
             Poll::Ready(r) => match r {
-                Ok((socket, address)) => match address.as_socket() {
-                    Some(addr) => match address.as_socket_ipv4() {
-                        Some(src_address) => Ok(Some((
-                            socket,
-                            SocketAddress {
-                                ip: (*src_address.ip()).into(),
-                                port: addr.port(),
-                            },
-                        ))),
-                        None => {
-                            tracing::warn!(?address, "Not an IPv4 address from accept");
-                            Ok(None)
-                        }
-                    },
-                    None => {
-                        tracing::warn!(?address, "Unknown address from accept");
+                Ok((socket, address)) => match address {
+                    SocketAddr::V4(src_address) => Ok(Some((
+                        socket,
+                        SocketAddress {
+                            ip: (*src_address.ip()).into(),
+                            port: src_address.port(),
+                        },
+                    ))),
+                    SocketAddr::V6(_) => {
+                        tracing::warn!(?address, "Not an IPv4 address from accept");
                         Ok(None)
                     }
                 },
-                Err(_) => {
-                    let err = take_socket_error(&self.socket);
+                Err(err) => {
                     tracing::warn!(error = &err as &dyn std::error::Error, "listen failure");
                     Err(DropReason::Io(err))
                 }
@@ -1231,26 +1179,6 @@ impl TcpListener {
             Poll::Pending => Ok(None),
         }
     }
-}
-
-fn take_socket_error(socket: &PolledSocket<Socket>) -> io::Error {
-    match socket.get().take_error() {
-        Ok(Some(err)) => err,
-        Ok(_) => io::Error::other("missing error"),
-        Err(err) => err,
-    }
-}
-
-fn is_connect_incomplete_error(err: &io::Error) -> bool {
-    if err.kind() == ErrorKind::WouldBlock {
-        return true;
-    }
-    // This handles the remaining cases on Linux.
-    #[cfg(unix)]
-    if err.raw_os_error() == Some(libc::EINPROGRESS) {
-        return true;
-    }
-    false
 }
 
 /// Finds the smallest sequence number in a set. To get a coherent result, all

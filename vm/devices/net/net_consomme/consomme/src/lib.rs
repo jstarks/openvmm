@@ -33,7 +33,6 @@ use inspect::InspectMut;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcError;
 use mesh::rpc::RpcSend;
-use pal_async::driver::Driver;
 use smoltcp::phy::Checksum;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::DhcpMessageType;
@@ -134,14 +133,14 @@ impl ConsommeControl {
 }
 
 /// A consomme instance.
-pub struct Consomme {
+pub struct Consomme<C: Client> {
     state: ConsommeState,
     recv: Option<mesh::Receiver<ConsommeMessage>>,
-    tcp: tcp::Tcp,
-    udp: udp::Udp,
+    tcp: tcp::Tcp<C::Tcp>,
+    udp: udp::Udp<C::Udp>,
 }
 
-impl InspectMut for Consomme {
+impl<C: Client> InspectMut for Consomme<C> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
             .field("tcp", &self.tcp)
@@ -207,18 +206,18 @@ impl ConsommeState {
 }
 
 /// An accessor for consomme.
-pub struct Access<'a, T> {
-    inner: &'a mut Consomme,
+pub struct Access<'a, T: Client> {
+    inner: &'a mut Consomme<T>,
     client: &'a mut T,
 }
 
 /// A consomme client.
 pub trait Client {
-    /// Gets the driver to use for handling new connections.
-    ///
-    /// TODO: generalize connection creation to allow pluggable model (not just
-    /// OS sockets) and remove this.
-    fn driver(&self) -> &dyn Driver;
+    type Tcp: TcpIo;
+    type Udp: UdpIo;
+
+    fn tcp(&mut self) -> &mut Self::Tcp;
+    fn udp(&mut self) -> &mut Self::Udp;
 
     /// Transmits a packet to the client.
     ///
@@ -380,7 +379,7 @@ struct Ipv4Addresses {
     dst_addr: Ipv4Address,
 }
 
-impl Consomme {
+impl<C: Client> Consomme<C> {
     /// Creates a new consomme instance.
     pub fn new() -> Result<Self, Error> {
         let state = ConsommeState::new()?;
@@ -411,7 +410,7 @@ impl Consomme {
     }
 
     /// Pairs the client with this instance to operate on the consomme instance.
-    pub fn access<'a, T: Client>(&'a mut self, client: &'a mut T) -> Access<'a, T> {
+    pub fn access<'a>(&'a mut self, client: &'a mut C) -> Access<'a, C> {
         Access {
             inner: self,
             client,
@@ -465,14 +464,6 @@ impl<T: Client> Access<'_, T> {
         self.poll_udp(cx);
         self.poll_tcp(cx);
         self.poll_message(cx);
-    }
-
-    /// Update all sockets to use the new client's IO driver. This must be
-    /// called if the previous driver is no longer usable or if the client
-    /// otherwise wants existing connections to be polled on a new IO driver.
-    pub fn refresh_driver(&mut self) {
-        self.refresh_tcp_driver();
-        self.refresh_udp_driver();
     }
 
     /// Sends an Ethernet frame to the network.

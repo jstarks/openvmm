@@ -15,6 +15,7 @@ use socket2::Protocol;
 use socket2::Socket;
 use socket2::Type;
 use std::io;
+use std::net::Shutdown;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::pin::Pin;
@@ -58,9 +59,9 @@ impl<T: Driver> OsSockets<T> {
 
 impl<T: Driver> TcpIo for OsSockets<T> {
     type Socket = OsSocket<Socket>;
-    type Accept = OsSocket<Socket>;
+    type Listener = OsSocket<Socket>;
 
-    fn listen(&mut self, addr: SocketAddr) -> io::Result<Self::Accept> {
+    fn listen(&mut self, addr: SocketAddr) -> io::Result<Self::Listener> {
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
 
         let socket = PolledSocket::new(&self.driver, socket)?;
@@ -101,7 +102,7 @@ impl<T: Driver> TcpIo for OsSockets<T> {
     fn poll_accept(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &mut Self::Accept,
+        socket: &mut Self::Listener,
     ) -> Poll<io::Result<(Self::Socket, SocketAddr)>> {
         let socket = self.socket(socket)?;
         let (socket, addr) =
@@ -158,6 +159,10 @@ impl<T: Driver> TcpIo for OsSockets<T> {
     ) -> Poll<io::Result<usize>> {
         Pin::new(self.socket(socket)?).poll_write_vectored(cx, bufs)
     }
+
+    fn shutdown_writes(&mut self, socket: &mut Self::Socket) -> io::Result<()> {
+        self.socket(socket)?.get().shutdown(Shutdown::Write)
+    }
 }
 
 fn is_connect_incomplete_error(err: &io::Error) -> bool {
@@ -206,8 +211,8 @@ impl<T: Driver> UdpIo for OsSockets<T> {
 
     fn send_to(
         &mut self,
-        addr: SocketAddr,
         socket: &mut Self::Socket,
+        addr: SocketAddr,
         buf: &[u8],
     ) -> io::Result<()> {
         let socket = self.socket(socket)?;

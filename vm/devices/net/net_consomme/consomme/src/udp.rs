@@ -12,9 +12,6 @@ use crate::Ipv4Addresses;
 use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
-use pal_async::interest::InterestSlot;
-use pal_async::interest::PollEvents;
-use pal_async::socket::PolledSocket;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::ETHERNET_HEADER_LEN;
 use smoltcp::wire::EthernetAddress;
@@ -34,15 +31,14 @@ use std::io;
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
-use std::net::UdpSocket;
 use std::task::Context;
 use std::task::Poll;
 
-pub(crate) struct Udp {
-    connections: HashMap<SocketAddress, UdpConnection>,
+pub(crate) struct Udp<T: UdpIo> {
+    connections: HashMap<SocketAddress, UdpConnection<T>>,
 }
 
-impl Udp {
+impl<T: UdpIo> Udp<T> {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
@@ -50,7 +46,7 @@ impl Udp {
     }
 }
 
-impl InspectMut for Udp {
+impl<T: UdpIo> InspectMut for Udp<T> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         let mut resp = req.respond();
         for (addr, conn) in &mut self.connections {
@@ -70,16 +66,16 @@ pub trait UdpIo {
     ) -> Poll<io::Result<(usize, std::net::SocketAddr)>>;
     fn send_to(
         &mut self,
-        addr: std::net::SocketAddr,
         socket: &mut Self::Socket,
+        addr: std::net::SocketAddr,
         buf: &[u8],
     ) -> io::Result<()>;
 }
 
 #[derive(InspectMut)]
-struct UdpConnection {
+struct UdpConnection<T: UdpIo> {
     #[inspect(skip)]
-    socket: Option<PolledSocket<UdpSocket>>,
+    socket: Option<T::Socket>,
     #[inspect(display)]
     guest_mac: EthernetAddress,
     stats: Stats,
@@ -95,13 +91,13 @@ struct Stats {
     rx_packets: Counter,
 }
 
-impl UdpConnection {
+impl<T: UdpIo> UdpConnection<T> {
     fn poll_conn(
         &mut self,
         cx: &mut Context<'_>,
         dst_addr: &SocketAddress,
         state: &mut ConsommeState,
-        client: &mut impl Client,
+        client: &mut impl Client<Udp = T>,
     ) -> bool {
         if self.recycle {
             return false;
@@ -117,15 +113,10 @@ impl UdpConnection {
             if client.rx_mtu() == 0 {
                 break true;
             }
-            match self.socket.as_mut().unwrap().poll_io(
+            match client.udp().poll_recv(
                 cx,
-                InterestSlot::Read,
-                PollEvents::IN,
-                |socket| {
-                    socket
-                        .get()
-                        .recv_from(&mut eth.payload_mut()[IPV4_HEADER_LEN + UDP_HEADER_LEN..])
-                },
+                self.socket.as_mut().unwrap(),
+                &mut eth.payload_mut()[IPV4_HEADER_LEN + UDP_HEADER_LEN..],
             ) {
                 Poll::Ready(Ok((n, src_addr))) => {
                     let src_ip = if let IpAddr::V4(ip) = src_addr.ip() {
@@ -171,25 +162,6 @@ impl<T: Client> Access<'_, T> {
         });
     }
 
-    pub(crate) fn refresh_udp_driver(&mut self) {
-        self.inner.udp.connections.retain(|_, conn| {
-            let socket = conn.socket.take().unwrap().into_inner();
-            match PolledSocket::new(self.client.driver(), socket) {
-                Ok(socket) => {
-                    conn.socket = Some(socket);
-                    true
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = &err as &dyn std::error::Error,
-                        "failed to update driver for udp connection"
-                    );
-                    false
-                }
-            }
-        });
-    }
-
     pub(crate) fn handle_udp(
         &mut self,
         frame: &EthernetRepr,
@@ -217,9 +189,10 @@ impl<T: Client> Access<'_, T> {
         };
 
         let conn = self.get_or_insert(guest_addr, None, Some(frame.src_addr))?;
-        match conn.socket.as_mut().unwrap().get().send_to(
+        match self.client.udp().send_to(
+            conn.socket.as_mut().unwrap(),
+            (Ipv4Addr::from(addresses.dst_addr), udp.dst_port).into(),
             udp_packet.payload(),
-            (Ipv4Addr::from(addresses.dst_addr), udp.dst_port),
         ) {
             Ok(_) => {
                 conn.stats.tx_packets.increment();
@@ -241,15 +214,13 @@ impl<T: Client> Access<'_, T> {
         guest_addr: SocketAddress,
         host_addr: Option<Ipv4Addr>,
         guest_mac: Option<EthernetAddress>,
-    ) -> Result<&mut UdpConnection, DropReason> {
+    ) -> Result<&mut UdpConnection<T::Udp>, DropReason> {
         let entry = self.inner.udp.connections.entry(guest_addr);
         match entry {
             hash_map::Entry::Occupied(conn) => Ok(conn.into_mut()),
             hash_map::Entry::Vacant(e) => {
-                let socket = UdpSocket::bind((host_addr.unwrap_or(Ipv4Addr::UNSPECIFIED), 0))
-                    .map_err(DropReason::Io)?;
-                let socket =
-                    PolledSocket::new(self.client.driver(), socket).map_err(DropReason::Io)?;
+                let addr = (host_addr.unwrap_or(Ipv4Addr::UNSPECIFIED), 0).into();
+                let socket = self.client.udp().bind(addr).map_err(DropReason::Io)?;
                 let conn = UdpConnection {
                     socket: Some(socket),
                     guest_mac: guest_mac.unwrap_or(self.inner.state.client_mac),

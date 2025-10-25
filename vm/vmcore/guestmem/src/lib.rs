@@ -1852,9 +1852,18 @@ impl GuestMemory {
         &self,
         gpa: u64,
     ) -> Result<T, GuestMemoryError> {
-        // Note that this is const, so the match below will compile out.
+        self.with_op(
+            Some((gpa, size_of::<T>() as u64)),
+            GuestMemoryOperation::Read,
+            || self.read_plain_inner(gpa),
+        )
+    }
+
+    fn read_plain_inner<T: FromBytes + Immutable + KnownLayout>(
+        &self,
+        gpa: u64,
+    ) -> Result<T, GuestMemoryBackingError> {
         let len = size_of::<T>();
-        self.with_op(Some((gpa, len as u64)), GuestMemoryOperation::Read, || {
             self.run_on_mapping(
                 AccessType::Read,
                 gpa,
@@ -1890,7 +1899,6 @@ impl GuestMemory {
                     Ok(unsafe { obj.assume_init() })
                 },
             )
-        })
     }
 
     fn probe_page_for_lock(
@@ -1906,10 +1914,9 @@ impl GuestMemory {
         if with_kernel_access {
             self.inner.imp.expose_va(gpa, 1)?;
         }
-        let mut b = [0];
         // FUTURE: check the correct bitmap for the access type, which needs to
         // be passed in.
-        self.read_at_inner(gpa, &mut b)?;
+        self.read_plain_inner::<u8>(gpa)?;
         // SAFETY: the read_at call includes a check that ensures that
         // `gpa` is in the VA range.
         let page = unsafe { ptr.as_ptr().add(offset as usize) };
@@ -1940,10 +1947,8 @@ impl GuestMemory {
     pub fn probe_gpns(&self, gpns: &[u64]) -> Result<(), GuestMemoryError> {
         self.with_op(None, GuestMemoryOperation::Probe, || {
             for &gpn in gpns {
-                let mut b = [0];
-                self.read_at_inner(
+                self.read_plain_inner::<u8>(
                     gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?,
-                    &mut b,
                 )?;
             }
             Ok(())

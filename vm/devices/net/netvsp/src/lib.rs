@@ -397,6 +397,7 @@ struct NetChannel<T: RingMem> {
 /// Buffers used during packet processing.
 struct ProcessingData {
     tx_segments: Vec<TxSegment>,
+    tx_segments_sent: usize,
     tx_done: Box<[TxId]>,
     rx_ready: Box<[RxId]>,
     rx_done: Vec<RxId>,
@@ -408,6 +409,7 @@ impl ProcessingData {
     fn new() -> Self {
         Self {
             tx_segments: Vec::new(),
+            tx_segments_sent: 0,
             tx_done: vec![TxId(0); 8192].into(),
             rx_ready: vec![RxId(0); RX_BATCH_SIZE].into(),
             rx_done: Vec::with_capacity(RX_BATCH_SIZE),
@@ -5008,7 +5010,7 @@ impl<T: 'static + RingMem> NetChannel<T> {
                         }
 
                         // Check the incoming ring for tx, but only if there are enough
-                        // free tx packets.
+                        // free tx packets and no pending tx segments.
                         let (mut recv, mut send) = self.queue.split();
                         if state.free_tx_packets.len() >= self.adapter.free_tx_packet_threshold
                             && data.tx_segments.is_empty()
@@ -5254,10 +5256,16 @@ impl<T: 'static + RingMem> NetChannel<T> {
         data: &mut ProcessingData,
         queue_state: &mut QueueState,
     ) -> Result<bool, WorkerError> {
+        if !data.tx_segments.is_empty() {
+            // There are still segments pending transmission. Skip polling the
+            // ring until they are sent to increase backpressure and minimize
+            // unnecessary wakeups.
+            return Ok(false);
+        }
         let mut total_packets = 0;
         let mut did_some_work = false;
         loop {
-            if state.free_tx_packets.is_empty() || !data.tx_segments.is_empty() {
+            if state.free_tx_packets.is_empty() {
                 break;
             }
             let packet = if let Some(packet) = self.try_next_packet(
@@ -5273,7 +5281,6 @@ impl<T: 'static + RingMem> NetChannel<T> {
             did_some_work = true;
             match packet.data {
                 PacketData::RndisPacket(_) => {
-                    assert!(data.tx_segments.is_empty());
                     let id = state.free_tx_packets.pop().unwrap();
                     let result: Result<usize, WorkerError> =
                         self.handle_rndis(buffers, id, state, &packet, &mut data.tx_segments);
@@ -5288,15 +5295,9 @@ impl<T: 'static + RingMem> NetChannel<T> {
                             continue;
                         }
                     };
-                    total_packets += num_packets as u64;
-                    state.pending_tx_packets[id.0 as usize].pending_packet_count += num_packets;
-
                     if num_packets != 0 {
-                        if self.transmit_segments(state, data, queue_state, id, num_packets)?
-                            < num_packets
-                        {
-                            state.stats.tx_stalled.increment();
-                        }
+                        state.pending_tx_packets[id.0 as usize].pending_packet_count += num_packets;
+                        total_packets += num_packets as u64;
                     } else {
                         self.complete_tx_packet(state, id, protocol::Status::SUCCESS)?;
                     }
@@ -5389,60 +5390,67 @@ impl<T: 'static + RingMem> NetChannel<T> {
                 }
             }
         }
+        if total_packets > 0 && !self.transmit_segments(state, data, queue_state)? {
+            state.stats.tx_stalled.increment();
+        }
         state.stats.tx_packets_per_wake.add_sample(total_packets);
         Ok(did_some_work)
     }
 
+    // Transmit any pending segments. Returns Ok(true) if work was done--if any
+    // segments were transmitted.
     fn transmit_pending_segments(
         &mut self,
         state: &mut ActiveState,
         data: &mut ProcessingData,
         queue_state: &mut QueueState,
     ) -> Result<bool, WorkerError> {
-        if data.tx_segments.is_empty() {
+        let count = data.tx_segments.len();
+        if count == 0 {
             return Ok(false);
         }
-        let net_backend::TxSegmentType::Head(metadata) = &data.tx_segments[0].ty else {
-            unreachable!()
-        };
-        let id = metadata.id;
-        let num_packets = state.pending_tx_packets[id.0 as usize].pending_packet_count;
-        let packets_sent = self.transmit_segments(state, data, queue_state, id, num_packets)?;
-        Ok(num_packets == packets_sent)
+        self.transmit_segments(state, data, queue_state)?;
+        Ok(data.tx_segments.len() < count)
     }
 
+    /// Returns true if all pending segments were transmitted.
     fn transmit_segments(
         &mut self,
         state: &mut ActiveState,
         data: &mut ProcessingData,
         queue_state: &mut QueueState,
-        id: TxId,
-        num_packets: usize,
-    ) -> Result<usize, WorkerError> {
+    ) -> Result<bool, WorkerError> {
+        let segments = &data.tx_segments[data.tx_segments_sent..];
         let (sync, segments_sent) = queue_state
             .queue
-            .tx_avail(&data.tx_segments)
+            .tx_avail(segments)
             .map_err(WorkerError::Endpoint)?;
 
-        assert!(segments_sent <= data.tx_segments.len());
-
-        let packets_sent = if segments_sent == data.tx_segments.len() {
-            num_packets
-        } else {
-            net_backend::packet_count(&data.tx_segments[..segments_sent])
-        };
-
-        data.tx_segments.drain(..segments_sent);
+        let mut segments = &segments[..segments_sent];
+        data.tx_segments_sent += segments_sent;
 
         if sync {
-            state.pending_tx_packets[id.0 as usize].pending_packet_count -= packets_sent;
+            // Complete the packets now.
+            while let Some(head) = segments.first() {
+                let net_backend::TxSegmentType::Head(metadata) = &head.ty else {
+                    unreachable!()
+                };
+                let id = metadata.id;
+                let pending_tx_packet = &mut state.pending_tx_packets[id.0 as usize];
+                pending_tx_packet.pending_packet_count -= 1;
+                if pending_tx_packet.pending_packet_count == 0 {
+                    self.complete_tx_packet(state, id, protocol::Status::SUCCESS)?;
+                }
+                segments = &segments[metadata.segment_count as usize..];
+            }
         }
 
-        if state.pending_tx_packets[id.0 as usize].pending_packet_count == 0 {
-            self.complete_tx_packet(state, id, protocol::Status::SUCCESS)?;
+        let all_sent = data.tx_segments_sent == data.tx_segments.len();
+        if all_sent {
+            data.tx_segments.clear();
+            data.tx_segments_sent = 0;
         }
-
-        Ok(packets_sent)
+        Ok(all_sent)
     }
 
     fn handle_rndis(

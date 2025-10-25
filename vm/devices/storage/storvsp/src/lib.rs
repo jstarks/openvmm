@@ -16,7 +16,6 @@ mod test_helpers;
 pub mod resolver;
 mod save_restore;
 
-use crate::ring::gparange::GpnList;
 use crate::ring::gparange::MultiPagedRangeBuf;
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -308,16 +307,12 @@ enum PacketError {
 
 #[derive(Debug, Default, Clone)]
 struct Range {
-    buf: MultiPagedRangeBuf<GpnList>,
     len: usize,
     is_write: bool,
 }
 
 impl Range {
-    fn new(
-        buf: MultiPagedRangeBuf<GpnList>,
-        request: &storvsp_protocol::ScsiRequest,
-    ) -> Option<Self> {
+    fn new(buf: &MultiPagedRangeBuf, request: &storvsp_protocol::ScsiRequest) -> Option<Self> {
         let len = request.data_transfer_length as usize;
         let is_write = request.data_in != 0;
         // Ensure there is exactly one range and it's large enough, or there are
@@ -325,11 +320,15 @@ impl Range {
         if buf.range_count() > 1 || (len > 0 && buf.first()?.len() < len) {
             return None;
         }
-        Some(Self { buf, len, is_write })
+        Some(Self { len, is_write })
     }
 
-    fn buffer<'a>(&'a self, guest_memory: &'a GuestMemory) -> RequestBuffers<'a> {
-        let mut range = self.buf.first().unwrap_or_else(PagedRange::empty);
+    fn buffer<'a>(
+        &'a self,
+        buf: &'a MultiPagedRangeBuf,
+        guest_memory: &'a GuestMemory,
+    ) -> RequestBuffers<'a> {
+        let mut range = buf.first().unwrap_or_else(PagedRange::empty);
         range.truncate(self.len);
         RequestBuffers::new(guest_memory, range, self.is_write)
     }
@@ -391,6 +390,7 @@ fn parse_packet<T: RingMem>(
             let mut full_request = pool.pop().unwrap_or_else(|| {
                 Arc::new(ScsiRequestAndRange {
                     external_data: Range::default(),
+                    external_data_buf: MultiPagedRangeBuf::new(),
                     request: storvsp_protocol::ScsiRequest::new_zeroed(),
                     request_size,
                 })
@@ -401,10 +401,14 @@ fn parse_packet<T: RingMem>(
                 let request_buf = &mut full_request.request.as_mut_bytes()[..request_size];
                 reader.read(request_buf).map_err(PacketError::Access)?;
 
-                let buf = packet.read_external_ranges().map_err(PacketError::Range)?;
+                full_request.external_data_buf.clear();
+                packet
+                    .read_external_ranges(&mut full_request.external_data_buf)
+                    .map_err(PacketError::Range)?;
 
-                full_request.external_data = Range::new(buf, &full_request.request)
-                    .ok_or(PacketError::InvalidDataTransferLength)?;
+                full_request.external_data =
+                    Range::new(&full_request.external_data_buf, &full_request.request)
+                        .ok_or(PacketError::InvalidDataTransferLength)?;
             }
 
             PacketData::ExecuteScsi(full_request)
@@ -525,13 +529,12 @@ struct ScsiCommandQueue {
 }
 
 impl ScsiCommandQueue {
-    async fn execute_scsi(
-        &self,
-        external_data: &Range,
-        request: &storvsp_protocol::ScsiRequest,
-    ) -> ScsiResult {
+    async fn execute_scsi(&self, full_request: &ScsiRequestAndRange) -> ScsiResult {
+        let request = &full_request.request;
         let op = ScsiOp(request.payload[0]);
-        let external_data = external_data.buffer(&self.mem);
+        let external_data = full_request
+            .external_data
+            .buffer(&full_request.external_data_buf, &self.mem);
 
         tracing::trace!(
             path_id = request.path_id,
@@ -1356,9 +1359,7 @@ impl WorkerInner {
             .pop()
             .unwrap_or_else(|| OversizedBox::new(()));
         let future = OversizedBox::refill(future, async move {
-            scsi_queue
-                .execute_scsi(&full_request.external_data, &full_request.request)
-                .await
+            scsi_queue.execute_scsi(full_request.as_ref()).await
         });
         let request = ScsiRequest::new(request_id, oversized_box::coerce!(future));
         self.scsi_requests.push(request);
@@ -1390,6 +1391,7 @@ struct ScsiRequestState {
 #[derive(Debug)]
 struct ScsiRequestAndRange {
     external_data: Range,
+    external_data_buf: MultiPagedRangeBuf,
     request: storvsp_protocol::ScsiRequest,
     request_size: usize,
 }

@@ -18,7 +18,6 @@ use vmbus_core::protocol::FeatureFlags;
 use vmbus_core::protocol::GpadlId;
 use vmbus_core::protocol::Version;
 use vmbus_ring::gparange;
-use vmbus_ring::gparange::MultiPagedRangeBuf;
 use vmcore::monitor::MonitorId;
 
 impl super::Server {
@@ -1050,10 +1049,9 @@ impl Gpadl {
     }
 
     fn restore(self, channel: &super::Channel) -> Result<super::Gpadl, RestoreError> {
-        let mut buf = self.buf;
         if self.state != GpadlState::InProgress {
             // Validate the range.
-            buf = MultiPagedRangeBuf::new(self.count.into(), buf)?.into_buffer();
+            gparange::validate_gpa_ranges(self.count.into(), &self.buf)?;
         }
         let (state, allow_revoked) = match self.state {
             GpadlState::InProgress => (super::GpadlState::InProgress, true),
@@ -1074,7 +1072,7 @@ impl Gpadl {
 
         Ok(super::Gpadl {
             count: self.count,
-            buf,
+            buf: self.buf,
             state,
         })
     }

@@ -11,7 +11,6 @@
 pub mod alloc;
 mod trycopy_x64;
 mod trycopy_windows_arm64;
-mod trycopy_windows_x64;
 pub mod unix;
 pub mod windows;
 

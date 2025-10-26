@@ -1,5 +1,4 @@
 // xtask-fmt allow-target-arch sys-crate
-#![cfg(target_arch = "x86_64")]
 
 use crate::AccessFailure;
 

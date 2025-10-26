@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#if !defined(_WIN32)
+#define _GNU_SOURCE
+#endif
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,6 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/ucontext.h>
 #endif
 
 struct access_failure {
@@ -163,7 +168,9 @@ TRY_WORD(64, _InterlockedCompareExchange64)
 __thread struct access_failure * volatile signal_access_failure;
 __thread sigjmp_buf signal_jmp_buf;
 
-static void handle_signal(int sig, siginfo_t *info, __attribute__((unused)) void *ucontext)
+#include <stdio.h>
+
+static void handle_signal(int sig, siginfo_t *info, void *ucontext)
 {
     // Only handle the signal if we're in the middle of a memmove, with the
     // jump point set on this thread.
@@ -177,6 +184,35 @@ static void handle_signal(int sig, siginfo_t *info, __attribute__((unused)) void
     }
     else
     {
+        extern struct recover __start__try_copy;
+        extern struct recover __stop__try_copy;
+
+        struct recover {
+            size_t start;
+            size_t end;
+        };
+
+        ucontext_t *ctx = (ucontext_t *)ucontext;
+        size_t ip = ctx->uc_mcontext.gregs[REG_RIP];
+        struct recover *r;
+        for (r = &__start__try_copy; r < &__stop__try_copy; r++) {
+            size_t start = r->start + (size_t)&r->start;
+            size_t end = r->end + (size_t)&r->end;
+            if (ip >= start && ip < end) {
+                // Write the recovery info into rdx.
+                struct access_failure *failure = (struct access_failure *)ctx->uc_mcontext.gregs[REG_RDX];
+                *failure = (struct access_failure) { .address = info->si_addr, .signal = sig, .si_code = info->si_code };
+
+                // Write a failure code into rcx.
+                ctx->uc_mcontext.gregs[REG_RCX] = (greg_t)-1;
+
+                // Adjust the instruction pointer to the recovery address.
+                ctx->uc_mcontext.gregs[REG_RIP] = (greg_t)end;
+
+                return;
+            }
+        }
+
         // Restore the default handler and continue to crash the process.
         struct sigaction act = { .sa_handler = SIG_DFL };
         sigemptyset(&act.sa_mask);

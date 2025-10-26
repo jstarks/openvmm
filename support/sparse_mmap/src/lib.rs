@@ -22,6 +22,8 @@ pub use sys::SparseMapping;
 pub use sys::alloc_shared_memory;
 pub use sys::new_mappable_from_file;
 
+#[cfg(target_arch = "x86_64")]
+use trycopy_x64::*;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU8;
 use thiserror::Error;
@@ -40,28 +42,16 @@ fn cold_path() {}
 
 /// Must be called before using try_copy on Unix platforms.
 pub fn initialize_try_copy() {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_arch = "x86_64"))]
     {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| unsafe {
-            let err = install_signal_handlers();
-            if err != 0 {
-                panic!(
-                    "could not install signal handlers: {}",
-                    std::io::Error::from_raw_os_error(err)
-                )
-            }
+            install_signal_handlers();
         });
     }
 }
 
-unsafe extern "C" {
-    #[cfg(unix)]
-    fn install_signal_handlers() -> i32;
-
-}
-
-#[cfg(windows)]
+#[cfg(target_arch = "aarch64")]
 unsafe extern "C" {
     fn try_memmove(
         dest: *mut u8,
@@ -104,8 +94,6 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-#[cfg(unix)]
-use trycopy_x64::*;
 
 #[repr(C)]
 struct AccessFailure {

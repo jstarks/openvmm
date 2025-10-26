@@ -7,7 +7,7 @@
 //! compiler.
 
 // xtask-fmt allow-target-arch sys-crate
-#![cfg(all(windows, target_arch = "x86_64"))]
+#![cfg(all(false, windows, target_arch = "x86_64"))]
 
 use crate::AccessFailure;
 use crate::sys::EXCEPTION_CONTINUE_SEARCH;

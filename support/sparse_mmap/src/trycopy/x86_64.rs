@@ -23,17 +23,21 @@ pub(super) fn extract(ctx: &Context) -> (usize, usize) {
     }
 }
 
-pub(super) fn inject(ctx: &mut Context, ip: usize, result: isize) {
+pub(super) fn inject(ctx: &mut Context, ip: usize, result: Option<isize>) {
     #[cfg(target_os = "linux")]
     {
         let mctx = &mut ctx.uc_mcontext;
         mctx.gregs[libc::REG_RIP as usize] = ip as _;
-        mctx.gregs[libc::REG_RCX as usize] = result as _;
+        if let Some(result) = result {
+            mctx.gregs[libc::REG_RCX as usize] = result as _;
+        }
     }
     #[cfg(target_os = "windows")]
     {
         ctx.Rip = ip as _;
-        ctx.Rcx = result as _;
+        if let Some(result) = result {
+            ctx.Rcx = result as _;
+        }
     }
 }
 
@@ -46,7 +50,7 @@ macro_rules! asm_recover {
                 $($asm,)*
                 "2001:",
                 $($postasm,)*
-                super::recover_descriptor!("2000b", "2001b"),
+                super::recover_descriptor!("2000b", "2001b", "2001b", 1),
                 in("rdx") $failure,
                 lateout("rcx") recover_result,
                 $($rest)*

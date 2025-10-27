@@ -22,23 +22,29 @@ pub(super) fn extract(ctx: &Context) -> (usize, usize) {
     }
 }
 
-pub(super) fn inject(ctx: &mut Context, ip: usize, result: isize) {
+pub(super) fn inject(ctx: &mut Context, ip: usize, result: Option<isize>) {
     #[cfg(target_os = "linux")]
     {
         let mctx = &mut ctx.uc_mcontext;
         mctx.pc = ip as _;
-        mctx.regs[0] = result as _;
+        if let Some(result) = result {
+            mctx.regs[0] = result as _;
+        }
     }
     #[cfg(target_os = "macos")]
     {
         let mctx = unsafe { &mut *ctx.uc_mcontext };
         mctx.__ss.__pc = ip as _;
-        mctx.__ss.__x[0] = result as _;
+        if let Some(result) = result {
+            mctx.__ss.__x[0] = result as _;
+        }
     }
     #[cfg(windows)]
     {
         ctx.Pc = ip as _;
-        unsafe { ctx.Anonymous.X[0] = result as _ };
+        if let Some(result) = result {
+            unsafe { ctx.Anonymous.X[0] = result as _ };
+        }
     }
 }
 
@@ -51,7 +57,7 @@ macro_rules! asm_recover {
                 $($asm,)*
                 "2001:",
                 $($postasm,)*
-                super::recover_descriptor!("2000b", "2001b"),
+                super::recover_descriptor!("2000b", "2001b", "2001b", 1),
                 in("x3") $failure,
                 lateout("x0") recover_result,
                 $($rest)*
@@ -62,32 +68,70 @@ macro_rules! asm_recover {
 }
 
 unsafe fn try_copy_forward(
-    dest: *mut u8,
-    src: *const u8,
-    length: usize,
+    mut dest: *mut u8,
+    mut src: *const u8,
+    mut length: usize,
     failure: *mut AccessFailure,
 ) -> i32 {
-    unsafe {
-        asm_recover! {
-            failure,
-            ["
-            cbz {len}, 2f
-            1:
-            ldrb {s1:w}, [{src}], #1
-            subs {len}, {len}, #1
-            strb {s1:w}, [{dest}], #1
-            bne 1b
-            mov w0, wzr
-            2:
-            "],
-            [],
-            dest = inout(reg) dest => _,
-            src = inout(reg) src => _,
-            len = inout(reg) length => _,
-            s1 = out(reg) _,
-            options(nostack),
+    macro_rules! copy {
+        ($name:ident, $n:expr, $width:expr, $ldr:expr, $str:expr) => {
+            fn $name(
+                dest: *mut u8,
+                src: *const u8,
+                length: usize,
+                failure: *mut AccessFailure,
+            ) -> i32 {
+                unsafe {
+                    core::arch::asm! {
+                        concat!("cbz {len}, 2f
+                        1:
+                        ", $ldr, " {s1:", $width, "}, [{src}], #", $n, "
+                        subs {len}, {len}, #", $n, "
+                        ", $str, " {s1:", $width, "}, [{dest}], #", $n, "
+                        bne 1b
+                        mov w0, wzr
+                        2:"),
+                        super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                        dest = inout(reg) dest => _,
+                        src = inout(reg) src => _,
+                        len = inout(reg) length => _,
+                        s1 = out(reg) _,
+                        in("x3") failure,
+                        bail = label { return -1 },
+                        options(nostack),
+                    }
+                }
+                0
+            }
+        };
+    }
+    copy!(copy1, 1, "w", "ldrb", "strb");
+    copy!(copy8, 8, "x", "ldr", "str");
+
+    if length < 8 {
+        return copy1(dest, src, length, failure);
+    }
+    if dest.addr() % 8 != 0 {
+        let align = 8 - (dest.addr() % 8);
+        if copy1(dest, src, align, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(align);
+        src = src.wrapping_add(align);
+        length -= align;
+    }
+    if copy8(dest, src, length & !7, failure) < 0 {
+        return -1;
+    }
+    let rem = length & 7;
+    if rem > 0 {
+        let dest = dest.wrapping_add(length & !7);
+        let src = src.wrapping_add(length & !7);
+        if copy1(dest, src, rem, failure) < 0 {
+            return -1;
         }
     }
+    0
 }
 
 unsafe fn try_copy_backward(

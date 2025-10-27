@@ -16,34 +16,36 @@ type Context = libc::ucontext_t;
 type Context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 #[repr(C)]
-struct Recover {
+struct RecoverDescriptor {
     start: i32,
     end: i32,
+    recover: i32,
+    set_result: i32,
 }
 
 unsafe fn recover(context: &mut Context, failure: AccessFailure) -> bool {
     #[cfg(target_os = "linux")]
     unsafe extern "C" {
         #[link_name = "__start_try_copy"]
-        static START_TRY_COPY: [Recover; 0];
+        static START_TRY_COPY: [RecoverDescriptor; 0];
         #[link_name = "__stop_try_copy"]
-        static STOP_TRY_COPY: [Recover; 0];
+        static STOP_TRY_COPY: [RecoverDescriptor; 0];
     }
 
     #[cfg(target_os = "macos")]
     unsafe extern "C" {
         #[link_name = "\x01section$start$__DATA$__try_copy"]
-        static START_TRY_COPY: [Recover; 0];
+        static START_TRY_COPY: [RecoverDescriptor; 0];
         #[link_name = "\x01section$end$__DATA$__try_copy"]
-        static STOP_TRY_COPY: [Recover; 0];
+        static STOP_TRY_COPY: [RecoverDescriptor; 0];
     }
 
     #[cfg(windows)]
     #[unsafe(link_section = ".rdata.trycopy@a")]
-    static START_TRY_COPY: [Recover; 0] = [];
+    static START_TRY_COPY: [RecoverDescriptor; 0] = [];
     #[cfg(windows)]
     #[unsafe(link_section = ".rdata.trycopy@c")]
-    static STOP_TRY_COPY: [Recover; 0] = [];
+    static STOP_TRY_COPY: [RecoverDescriptor; 0] = [];
 
     let table = unsafe {
         std::slice::from_raw_parts(
@@ -65,7 +67,7 @@ unsafe fn recover(context: &mut Context, failure: AccessFailure) -> bool {
 
             // Adjust the instruction pointer to the recovery address and write
             // the failure code.
-            inject(context, end, -1);
+            inject(context, end, (r.set_result != 0).then_some(-1));
             return true;
         }
     }
@@ -133,7 +135,7 @@ pub(crate) unsafe fn install_signal_handlers() {
 
 #[cfg(target_os = "linux")]
 macro_rules! recover_descriptor {
-    ($start:tt, $stop:tt) => {
+    ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
         concat!(
             ".pushsection try_copy,\"a\"\n",
             ".align 4\n",
@@ -143,6 +145,12 @@ macro_rules! recover_descriptor {
             ".long ",
             $stop,
             " - .\n",
+            ".long ",
+            $recover,
+            " - .\n",
+            ".long ",
+            $set_result,
+            " - .\n",
             ".popsection"
         )
     };
@@ -150,7 +158,7 @@ macro_rules! recover_descriptor {
 
 #[cfg(target_os = "windows")]
 macro_rules! recover_descriptor {
-    ($start:tt, $stop:tt) => {
+    ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
         concat!(
             ".pushsection .rdata.trycopy@b,\"dr\"\n",
             ".align 4\n",
@@ -160,6 +168,12 @@ macro_rules! recover_descriptor {
             ".long ",
             $stop,
             " - .\n",
+            ".long ",
+            $recover,
+            " - .\n",
+            ".long ",
+            $set_result,
+            " - .\n",
             ".popsection"
         )
     };
@@ -167,7 +181,7 @@ macro_rules! recover_descriptor {
 
 #[cfg(target_os = "macos")]
 macro_rules! recover_descriptor {
-    ($start:tt, $stop:tt) => {
+    ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
         concat!(
             ".section __DATA,__try_copy,regular,no_dead_strip\n",
             ".align 4\n",
@@ -176,6 +190,12 @@ macro_rules! recover_descriptor {
             " - .\n",
             ".long ",
             $stop,
+            " - .\n",
+            ".long ",
+            $recover,
+            " - .\n",
+            ".long ",
+            $set_result,
             " - .\n",
             ".previous"
         )

@@ -184,7 +184,7 @@ macro_rules! recover_descriptor {
 macro_rules! recover_descriptor {
     ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
         concat!(
-            ".section __DATA,__try_copy,regular,no_dead_strip\n",
+            ".pushsection __DATA,__try_copy,regular,no_dead_strip\n",
             ".align 4\n",
             ".long ",
             $start,
@@ -198,7 +198,7 @@ macro_rules! recover_descriptor {
             ".long ",
             $set_result,
             "\n",
-            ".previous"
+            ".popsection"
         )
     };
 }

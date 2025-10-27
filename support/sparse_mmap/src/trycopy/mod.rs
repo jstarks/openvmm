@@ -150,7 +150,7 @@ macro_rules! recover_descriptor {
             " - .\n",
             ".long ",
             $set_result,
-            " - .\n",
+            "\n",
             ".popsection"
         )
     };
@@ -173,7 +173,7 @@ macro_rules! recover_descriptor {
             " - .\n",
             ".long ",
             $set_result,
-            " - .\n",
+            "\n",
             ".popsection"
         )
     };
@@ -196,7 +196,7 @@ macro_rules! recover_descriptor {
             " - .\n",
             ".long ",
             $set_result,
-            " - .\n",
+            "\n",
             ".previous"
         )
     };

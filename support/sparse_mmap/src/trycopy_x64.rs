@@ -26,6 +26,15 @@ unsafe fn recover(
         #[link_name = "__stop_try_copy"]
         static STOP_TRY_COPY: [Recover; 0];
     }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        #[link_name = "\x01section$start$__DATA$__try_copy"]
+        static START_TRY_COPY: [Recover; 0];
+        #[link_name = "\x01section$end$__DATA$__try_copy"]
+        static STOP_TRY_COPY: [Recover; 0];
+    }
+
     #[cfg(windows)]
     #[unsafe(link_section = ".rdata.trycopy@a")]
     static START_TRY_COPY: [Recover; 0] = [];
@@ -63,19 +72,29 @@ unsafe fn recover(
 #[cfg(unix)]
 pub(crate) unsafe fn install_signal_handlers() {
     fn handle_signal(sig: i32, info: &libc::siginfo_t, ucontext: &mut libc::ucontext_t) {
-        let mcontext = &mut ucontext.uc_mcontext;
+        #[cfg(target_os = "linux")]
+        let ctx = &mut ucontext.uc_mcontext;
+        #[cfg(target_os = "macos")]
+        let ctx = unsafe { &mut *ucontext.uc_mcontext };
+
         let (mut ip, mut result, failure_ptr);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            ip = mcontext.regs[libc::REG_RIP as usize] as _;
-            result = mcontext.regs[libc::REG_RCX as usize] as _;
-            failure_ptr = mcontext.regs[libc::REG_RDX as usize] as _;
+            ip = ctx.regs[libc::REG_RIP as usize] as _;
+            result = ctx.regs[libc::REG_RCX as usize] as _;
+            failure_ptr = ctx.regs[libc::REG_RDX as usize] as _;
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         {
-            ip = mcontext.pc as _;
-            result = mcontext.regs[0] as _;
-            failure_ptr = mcontext.regs[3] as _;
+            ip = ctx.pc as _;
+            result = ctx.regs[0] as _;
+            failure_ptr = ctx.regs[3] as _;
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            ip = ctx.__ss.__pc as _;
+            result = ctx.__ss.__x[0] as _;
+            failure_ptr = ctx.__ss.__x[3] as _;
         }
         let failure = AccessFailure {
             address: unsafe { info.si_addr().cast() },
@@ -88,15 +107,20 @@ pub(crate) unsafe fn install_signal_handlers() {
             std::process::abort();
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            mcontext.regs[libc::REG_RIP as usize] = ip as _;
-            mcontext.regs[libc::REG_RCX as usize] = result as _;
+            ctx.regs[libc::REG_RIP as usize] = ip as _;
+            ctx.regs[libc::REG_RCX as usize] = result as _;
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         {
-            mcontext.pc = ip as _;
-            mcontext.regs[0] = result as _;
+            ctx.pc = ip as _;
+            ctx.regs[0] = result as _;
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            ctx.__ss.__pc = ip as _;
+            ctx.__ss.__x[0] = result as _;
         }
     }
 
@@ -171,7 +195,7 @@ pub(crate) unsafe fn install_signal_handlers() {
 }
 
 #[cfg(target_os = "linux")]
-macro_rules! recover_asm {
+macro_rules! recover_descriptor {
     ($start:tt, $stop:tt) => {
         concat!(
             ".pushsection try_copy,\"a\"\n",
@@ -188,7 +212,7 @@ macro_rules! recover_asm {
 }
 
 #[cfg(target_os = "windows")]
-macro_rules! recover_asm {
+macro_rules! recover_descriptor {
     ($start:tt, $stop:tt) => {
         concat!(
             ".pushsection .rdata.trycopy@b,\"dr\"\n",
@@ -200,6 +224,21 @@ macro_rules! recover_asm {
             $stop,
             " - .\n",
             ".popsection"
+        )
+    };
+}
+
+#[cfg(target_os = "macos")]
+macro_rules! recover_descriptor {
+    ($start:tt, $stop:tt) => {
+        concat!(
+            ".section __DATA,__try_copy,regular,no_dead_strip\n",
+            ".align 4\n",
+            ".long ",
+            $start, " - .\n",
+            ".long ",
+            $stop, " - .\n",
+            ".previous"
         )
     };
 }
@@ -217,7 +256,7 @@ mod x86_64 {
                 $($asm,)*
                 "2001:",
                 $($postasm,)*
-                recover_asm!("2000b", "2001b"),
+                recover_descriptor!("2000b", "2001b"),
                 in("rdx") $failure,
                 lateout("rcx") recover_result,
                 $($rest)*
@@ -393,7 +432,7 @@ mod aarch64 {
                 $($asm,)*
                 "2001:",
                 $($postasm,)*
-                recover_asm!("2000b", "2001b"),
+                recover_descriptor!("2000b", "2001b"),
                 in("x3") $failure,
                 lateout("x0") recover_result,
                 $($rest)*

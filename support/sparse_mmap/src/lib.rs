@@ -39,10 +39,10 @@ fn cold_path() {}
 
 /// Must be called before using try_copy on Unix platforms.
 pub fn initialize_try_copy() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| unsafe {
-            install_signal_handlers();
-        });
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        install_signal_handlers();
+    });
 }
 
 #[cfg(false)]

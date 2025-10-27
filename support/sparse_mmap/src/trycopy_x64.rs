@@ -7,18 +7,18 @@ pub(crate) use x86_64::*;
 
 use crate::AccessFailure;
 
+#[cfg(unix)]
+type Context = libc::ucontext_t;
+#[cfg(windows)]
+type Context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+
 #[repr(C)]
 struct Recover {
     start: i32,
     end: i32,
 }
 
-unsafe fn recover(
-    ip: &mut usize,
-    result: &mut isize,
-    failure_ptr: usize,
-    failure: AccessFailure,
-) -> bool {
+unsafe fn recover(context: &mut Context, failure: AccessFailure) -> bool {
     #[cfg(target_os = "linux")]
     unsafe extern "C" {
         #[link_name = "__start_try_copy"]
@@ -51,18 +51,18 @@ unsafe fn recover(
         )
     };
 
+    let (ip, failure_ptr) = extract(context);
+
     for r in table {
         let start = ((&raw const r.start) as usize).wrapping_add_signed(r.start as isize);
         let end = ((&raw const r.end) as usize).wrapping_add_signed(r.end as isize);
-        if *ip >= start && *ip < end {
-            // Write the recovery info into rdx.
+        if ip >= start && ip < end {
+            // Write the recovery info.
             unsafe { (failure_ptr as *mut AccessFailure).write(failure) };
 
-            // Write a failure code into rcx.
-            *result = -1;
-
-            // Adjust the instruction pointer to the recovery address.
-            *ip = end;
+            // Adjust the instruction pointer to the recovery address and write
+            // the failure code.
+            inject(context, end, -1);
             return true;
         }
     }
@@ -72,55 +72,15 @@ unsafe fn recover(
 #[cfg(unix)]
 pub(crate) unsafe fn install_signal_handlers() {
     fn handle_signal(sig: i32, info: &libc::siginfo_t, ucontext: &mut libc::ucontext_t) {
-        #[cfg(target_os = "linux")]
-        let ctx = &mut ucontext.uc_mcontext;
-        #[cfg(target_os = "macos")]
-        let ctx = unsafe { &mut *ucontext.uc_mcontext };
-
-        let (mut ip, mut result, failure_ptr);
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
-            ip = ctx.gregs[libc::REG_RIP as usize] as _;
-            result = ctx.gregs[libc::REG_RCX as usize] as _;
-            failure_ptr = ctx.gregs[libc::REG_RDX as usize] as _;
-        }
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        {
-            ip = ctx.pc as _;
-            result = ctx.regs[0] as _;
-            failure_ptr = ctx.regs[3] as _;
-        }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            ip = ctx.__ss.__pc as _;
-            result = ctx.__ss.__x[0] as _;
-            failure_ptr = ctx.__ss.__x[3] as _;
-        }
         let failure = AccessFailure {
             address: unsafe { info.si_addr().cast() },
             si_signo: sig,
             si_code: info.si_code,
         };
-        let recovered = unsafe { recover(&mut ip, &mut result, failure_ptr, failure) };
+        let recovered = unsafe { recover(ucontext, failure) };
         if !recovered {
             unsafe { libc::raise(sig) };
             std::process::abort();
-        }
-
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
-            ctx.gregs[libc::REG_RIP as usize] = ip as _;
-            ctx.gregs[libc::REG_RCX as usize] = result as _;
-        }
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        {
-            ctx.pc = ip as _;
-            ctx.regs[0] = result as _;
-        }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            ctx.__ss.__pc = ip as _;
-            ctx.__ss.__x[0] = result as _;
         }
     }
 
@@ -152,36 +112,11 @@ pub(crate) unsafe fn install_signal_handlers() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
-        let (mut ip, mut result, failure_ptr);
-        #[cfg(target_arch = "x86_64")]
-        {
-          ip = context.Rip as _;
-          result = context.Rcx as _;
-         failure_ptr = context.Rdx as _;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            ip = context.Pc as _;
-            unsafe {
-            result = context.Anonymous.X[0] as _;
-            failure_ptr = context.Anonymous.X[3] as _;
-            }
-        }
         let failure = AccessFailure {
             address: record.ExceptionInformation[1] as *mut u8,
         };
-        let recovered = unsafe { recover(&mut ip, &mut result, failure_ptr, failure) };
+        let recovered = unsafe { recover(context, failure) };
         if recovered {
-            #[cfg(target_arch = "x86_64")]
-            {
-            context.Rip = ip as _;
-            context.Rcx = result as _;
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                context.Pc = ip as _;
-                unsafe { context.Anonymous.X[0] = result as _ };
-            }
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
@@ -235,9 +170,11 @@ macro_rules! recover_descriptor {
             ".section __DATA,__try_copy,regular,no_dead_strip\n",
             ".align 4\n",
             ".long ",
-            $start, " - .\n",
+            $start,
+            " - .\n",
             ".long ",
-            $stop, " - .\n",
+            $stop,
+            " - .\n",
             ".previous"
         )
     };
@@ -246,6 +183,39 @@ macro_rules! recover_descriptor {
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     use crate::AccessFailure;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn extract(ctx: &libc::ucontext_t) -> (usize, usize) {
+        let mctx = &ctx.uc_mcontext;
+        (
+            mctx.gregs[libc::REG_RIP as usize] as _,
+            mctx.gregs[libc::REG_RDX as usize] as _,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn inject(ctx: &mut libc::ucontext_t, ip: usize, result: isize) {
+        let mctx = &mut ctx.uc_mcontext;
+        mctx.gregs[libc::REG_RIP as usize] = ip as _;
+        mctx.gregs[libc::REG_RCX as usize] = result as _;
+    }
+
+    #[cfg(windows)]
+    pub(super) fn extract(
+        ctx: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    ) -> (usize, usize) {
+        (ctx.Rip as _, ctx.Rdx as _)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn inject(
+        ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+        ip: usize,
+        result: isize,
+    ) {
+        ctx.Rip = ip as _;
+        ctx.Rcx = result as _;
+    }
 
     macro_rules! asm_recover {
     ($failure:expr, [$($asm:expr),* $(,)?], [$($postasm:expr),*  $(,)?], $($rest:tt)*) => {
@@ -422,6 +392,49 @@ mod x86_64 {
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
     use crate::AccessFailure;
+
+    const FAILURE_REG: usize = 3;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn extract(ctx: &libc::ucontext_t) -> (usize, usize) {
+        let mctx = &ctx.uc_mcontext;
+        (mctx.pc as _, mctx.regs[FAILURE_REG] as _)
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn inject(ctx: &mut libc::ucontext_t, ip: usize, result: isize) {
+        let mctx = &mut ctx.uc_mcontext;
+        mctx.pc = ip as _;
+        mctx.regs[0] = result as _;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn extract(ctx: &libc::ucontext_t) -> (usize, usize) {
+        let mctx = unsafe { &*ctx.uc_mcontext };
+        (mctx.__ss.__pc as _, mctx.__ss.__x[FAILURE_REG] as _)
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn inject(ctx: &mut libc::ucontext_t, ip: usize, result: isize) {
+        let mctx = unsafe { &mut *ctx.uc_mcontext };
+        mctx.__ss.__pc = ip as _;
+        mctx.__ss.__x[0] = result as _;
+    }
+
+    #[cfg(windows)]
+    pub(super) fn extract(
+        ctx: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    ) -> (usize, usize) {
+        (ctx.Pc as _, unsafe { ctx.Anonymous.X[FAILURE_REG] as _ })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn inject(
+        ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+        ip: usize,
+        result: isize,
+    ) {
+        ctx.Pc = ip as _;
+        unsafe { ctx.Anonymous.X[0] = result as _ };
+    }
 
     macro_rules! asm_recover {
     ($failure:expr, [$($asm:expr),* $(,)?], [$($postasm:expr),*  $(,)?], $($rest:tt)*) => {

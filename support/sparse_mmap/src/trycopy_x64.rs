@@ -128,16 +128,36 @@ pub(crate) unsafe fn install_signal_handlers() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
-        let mut ip = context.Rip as _;
-        let mut result = context.Rcx as _;
-        let failure_ptr = context.Rdx as _;
+        let (mut ip, mut result, failure_ptr);
+        #[cfg(target_arch = "x86_64")]
+        {
+          ip = context.Rip as _;
+          result = context.Rcx as _;
+         failure_ptr = context.Rdx as _;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            ip = context.Pc as _;
+            unsafe {
+            result = context.Anonymous.X[0] as _;
+            failure_ptr = context.Anonymous.X[3] as _;
+            }
+        }
         let failure = AccessFailure {
             address: record.ExceptionInformation[1] as *mut u8,
         };
         let recovered = unsafe { recover(&mut ip, &mut result, failure_ptr, failure) };
         if recovered {
+            #[cfg(target_arch = "x86_64")]
+            {
             context.Rip = ip as _;
             context.Rcx = result as _;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.Pc = ip as _;
+                unsafe { context.Anonymous.X[0] = result as _ };
+            }
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
@@ -186,6 +206,8 @@ macro_rules! recover_asm {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
+    use crate::AccessFailure;
+
     macro_rules! asm_recover {
     ($failure:expr, [$($asm:expr),* $(,)?], [$($postasm:expr),*  $(,)?], $($rest:tt)*) => {
         {

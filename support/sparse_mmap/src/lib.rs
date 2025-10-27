@@ -9,7 +9,6 @@
 #![expect(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
 pub mod alloc;
-mod trycopy_windows_arm64;
 mod trycopy_x64;
 pub mod unix;
 pub mod windows;
@@ -40,13 +39,10 @@ fn cold_path() {}
 
 /// Must be called before using try_copy on Unix platforms.
 pub fn initialize_try_copy() {
-    #[cfg(any(unix, target_arch = "x86_64"))]
-    {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| unsafe {
             install_signal_handlers();
         });
-    }
 }
 
 #[cfg(false)]

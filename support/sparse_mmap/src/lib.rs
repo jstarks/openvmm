@@ -24,7 +24,6 @@ pub use sys::new_mappable_from_file;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU8;
 use thiserror::Error;
-#[cfg(target_arch = "x86_64")]
 use trycopy_x64::*;
 #[cfg(unix)]
 use unix as sys;
@@ -50,7 +49,7 @@ pub fn initialize_try_copy() {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(false)]
 unsafe extern "C" {
     fn try_memmove(
         dest: *mut u8,

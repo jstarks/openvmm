@@ -4,6 +4,7 @@
 #![expect(missing_docs)]
 
 fn main() {
+    return;
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         // Implemented in inline asm.
         return;

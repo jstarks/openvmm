@@ -89,7 +89,6 @@ unsafe fn try_copy_forward(
                         subs {len}, {len}, #", $n, "
                         ", $str, " {s1:", $width, "}, [{dest}], #", $n, "
                         bne 1b
-                        mov w0, wzr
                         2:"),
                         super::recover_descriptor!("1b", "2b", "{bail}", 0),
                         dest = inout(reg) dest => _,
@@ -111,6 +110,7 @@ unsafe fn try_copy_forward(
     if length < 8 {
         return copy1(dest, src, length, failure);
     }
+    /*
     if dest.addr() % 8 != 0 {
         let align = 8 - (dest.addr() % 8);
         if copy1(dest, src, align, failure) < 0 {
@@ -120,6 +120,7 @@ unsafe fn try_copy_forward(
         src = src.wrapping_add(align);
         length -= align;
     }
+    */
     if copy8(dest, src, length & !7, failure) < 0 {
         return -1;
     }

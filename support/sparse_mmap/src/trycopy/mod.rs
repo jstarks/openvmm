@@ -59,15 +59,16 @@ unsafe fn recover(context: &mut Context, failure: AccessFailure) -> bool {
     let (ip, failure_ptr) = extract(context);
 
     for r in table {
-        let start = ((&raw const r.start) as usize).wrapping_add_signed(r.start as isize);
-        let end = ((&raw const r.end) as usize).wrapping_add_signed(r.end as isize);
-        if ip >= start && ip < end {
+        let reloc = |addr: &i32| -> usize {
+            core::ptr::from_ref(addr).addr().wrapping_add_signed(*addr as isize)
+        };
+        if ip >= reloc(&r.start) && ip < reloc(&r.end) {
             // Write the recovery info.
             unsafe { (failure_ptr as *mut AccessFailure).write(failure) };
 
             // Adjust the instruction pointer to the recovery address and write
             // the failure code.
-            inject(context, end, (r.set_result != 0).then_some(-1));
+            inject(context, reloc(&r.recover), (r.set_result != 0).then_some(-1));
             return true;
         }
     }

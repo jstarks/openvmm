@@ -64,7 +64,7 @@ unsafe fn recover(
 pub(crate) unsafe fn install_signal_handlers() {
     fn handle_signal(sig: i32, info: &libc::siginfo_t, ucontext: &mut libc::ucontext_t) {
         let mcontext = &mut ucontext.uc_mcontext;
-        let (mut ip, mut result ,failure_ptr);
+        let (mut ip, mut result, failure_ptr);
         #[cfg(target_arch = "x86_64")]
         {
             ip = mcontext.regs[libc::REG_RIP as usize] as _;
@@ -388,9 +388,9 @@ mod aarch64 {
         failure: *mut AccessFailure,
     ) -> i32 {
         unsafe {
-        asm_recover! {
-            failure,
-            ["
+            asm_recover! {
+                failure,
+                ["
             cbz {len}, 2f
             1:
             ldrb {s1:w}, [{src}], #1
@@ -400,14 +400,14 @@ mod aarch64 {
             mov w0, wzr
             2:
             "],
-            [],
-            dest = inout(reg) dest => _,
-            src = inout(reg) src => _,
-            len = inout(reg) length => _,
-            s1 = out(reg) _,
-            options(nostack),
+                [],
+                dest = inout(reg) dest => _,
+                src = inout(reg) src => _,
+                len = inout(reg) length => _,
+                s1 = out(reg) _,
+                options(nostack),
+            }
         }
-    }
     }
 
     unsafe fn try_copy_backward(
@@ -417,9 +417,9 @@ mod aarch64 {
         failure: *mut AccessFailure,
     ) -> i32 {
         unsafe {
-        asm_recover! {
-            failure,
-            ["
+            asm_recover! {
+                failure,
+                ["
             cbz {len}, 2f
             sub {dest}, {dest}, #1
             sub {src}, {src}, #1
@@ -431,14 +431,14 @@ mod aarch64 {
             mov w0, wzr
             2:
             "],
-            [],
-            dest = inout(reg) dest => _,
-            src = inout(reg) src => _,
-            len = inout(reg) length => _,
-            s1 = out(reg) _,
-            options(nostack),
+                [],
+                dest = inout(reg) dest => _,
+                src = inout(reg) src => _,
+                len = inout(reg) length => _,
+                s1 = out(reg) _,
+                options(nostack),
+            }
         }
-    }
     }
 
     pub(crate) unsafe fn try_memmove(
@@ -455,17 +455,17 @@ mod aarch64 {
         }
     }
 
-    pub(crate) unsafe  fn try_memset(
+    pub(crate) unsafe fn try_memset(
         dest: *mut u8,
         c: i32,
         length: usize,
         failure: *mut AccessFailure,
     ) -> i32 {
         unsafe {
-        asm_recover! {
-            failure,
-            [
-            "
+            asm_recover! {
+                failure,
+                [
+                "
             cbz {len}, 2f
             1:
             strb {c:w}, [{dest}], #1
@@ -475,14 +475,14 @@ mod aarch64 {
             2:
             ret
             ",
-            ],
-            [],
-            dest = inout(reg) dest => _,
-            c = in(reg) c,
-            len = inout(reg) length => _,
-            options(nostack),
+                ],
+                [],
+                dest = inout(reg) dest => _,
+                c = in(reg) c,
+                len = inout(reg) length => _,
+                options(nostack),
+            }
         }
-    }
     }
 
     macro_rules! try_read {

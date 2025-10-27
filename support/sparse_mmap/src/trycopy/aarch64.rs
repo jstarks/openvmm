@@ -73,44 +73,53 @@ unsafe fn try_copy_forward(
     mut length: usize,
     failure: *mut AccessFailure,
 ) -> i32 {
-    macro_rules! copy {
-        ($name:ident, $n:expr, $width:expr, $ldr:expr, $str:expr) => {
-            fn $name(
-                dest: *mut u8,
-                src: *const u8,
-                length: usize,
-                failure: *mut AccessFailure,
-            ) -> i32 {
-                unsafe {
-                    core::arch::asm! {
-                        concat!("
-                        1:
-                        ", $ldr, " {s1:", $width, "}, [{src}], #", $n, "
-                        subs {len}, {len}, #", $n, "
-                        ", $str, " {s1:", $width, "}, [{dest}], #", $n, "
-                        bne 1b
-                        2:"),
-                        super::recover_descriptor!("1b", "2b", "{bail}", 0),
-                        dest = inout(reg) dest => _,
-                        src = inout(reg) src => _,
-                        len = inout(reg) length => _,
-                        s1 = out(reg) _,
-                        in("x3") failure,
-                        bail = label { return -1 },
-                        options(nostack),
-                    }
-                }
-                0
+    fn copy1(dest: *mut u8, src: *const u8, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                1:
+                ldrb {s1:w}, [{src}], #1
+                subs {len}, {len}, #1
+                strb {s1:w}, [{dest}], #1
+                bne 1b
+                2:",
+                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                dest = inout(reg) dest => _,
+                src = inout(reg) src => _,
+                len = inout(reg) length => _,
+                s1 = out(reg) _,
+                in("x3") failure,
+                bail = label { return -1 },
+                options(nostack),
             }
-        };
+        }
+        0
     }
 
-    fn copy32(
-        dest: *mut u8,
-        src: *const u8,
-        length: usize,
-        failure: *mut AccessFailure,
-    ) -> i32 {
+    fn copy8(dest: *mut u8, src: *const u8, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                1:
+                ldr {s1:x}, [{src}], #8
+                subs {len}, {len}, #8
+                str {s1:x}, [{dest}], #8
+                bne 1b
+                2:",
+                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                dest = inout(reg) dest => _,
+                src = inout(reg) src => _,
+                len = inout(reg) length => _,
+                s1 = out(reg) _,
+                in("x3") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    fn copy32(dest: *mut u8, src: *const u8, length: usize, failure: *mut AccessFailure) -> i32 {
         unsafe {
             core::arch::asm! {
                 "
@@ -136,12 +145,6 @@ unsafe fn try_copy_forward(
         0
     }
 
-    copy!(copy1, 1, "w", "ldrb", "strb");
-    copy!(copy8, 8, "x", "ldr", "str");
-
-    if length == 0 {
-        return 0;
-    }
     if length >= 32 {
         let this = length & !31;
         if copy32(dest, src, this, failure) < 0 {
@@ -149,7 +152,7 @@ unsafe fn try_copy_forward(
         }
         dest = dest.wrapping_add(this);
         src = src.wrapping_add(this);
-        length -= this;
+        length &= 31;
     }
     if length >= 8 {
         let this = length & !7;
@@ -158,14 +161,13 @@ unsafe fn try_copy_forward(
         }
         dest = dest.wrapping_add(this);
         src = src.wrapping_add(this);
-        length -= this;
+        length &= 7;
     }
     if length >= 1 {
-        if copy1(dest, src, length, failure) < 0 {
-            return -1;
-        }
+        copy1(dest, src, length, failure)
+    } else {
+        0
     }
-    0
 }
 
 unsafe fn try_copy_backward(
@@ -214,31 +216,95 @@ pub(crate) unsafe fn try_memmove(
 }
 
 pub(crate) unsafe fn try_memset(
-    dest: *mut u8,
+    mut dest: *mut u8,
     c: i32,
-    length: usize,
+    mut length: usize,
     failure: *mut AccessFailure,
 ) -> i32 {
-    unsafe {
-        asm_recover! {
-            failure,
-            [
-            "
-            cbz {len}, 2f
-            1:
-            strb {c:w}, [{dest}], #1
-            subs {len}, {len}, #1
-            bne 1b
-            mov w0, wzr
-            2:
-            ",
-            ],
-            [],
-            dest = inout(reg) dest => _,
-            c = in(reg) c,
-            len = inout(reg) length => _,
-            options(nostack),
+    fn set1(dest: *mut u8, c: i32, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                1:
+                strb {c:w}, [{dest}], #1
+                subs {len}, {len}, #1
+                bne 1b
+                2:",
+                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                dest = inout(reg) dest => _,
+                c = in(reg) c,
+                len = inout(reg) length => _,
+                in("x3") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
         }
+        0
+    }
+
+    fn set8(dest: *mut u8, c: i32, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                1:
+                str {c:x}, [{dest}], #8
+                subs {len}, {len}, #8
+                bne 1b
+                2:",
+                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                dest = inout(reg) dest => _,
+                c = in(reg) (c as u64 & 0xff) * 0x0101010101010101,
+                len = inout(reg) length => _,
+                in("x3") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    fn set32_zero(dest: *mut u8, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                1:
+                str {zero:q}, [{dest}], #16
+                str {zero:q}, [{dest}], #16
+                subs {len}, {len}, #32
+                bne 1b
+                2:",
+                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                dest = inout(reg) dest => _,
+                zero = in(vreg) 0,
+                len = inout(reg) length => _,
+                in("x3") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    if c == 0 && length >= 32 {
+        let this = length & !31;
+        if set32_zero(dest, this, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(this);
+        length &= 31;
+    }
+    if length >= 8 {
+        let this = length & !7;
+        if set8(dest, c, this, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(this);
+        length &= 7;
+    }
+    if length >= 1 {
+        set1(dest, c, length, failure)
+    } else {
+        0
     }
 }
 

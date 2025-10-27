@@ -61,20 +61,140 @@ macro_rules! asm_recover {
 }
 
 unsafe fn try_copy_forward(
-    dest: *mut u8,
-    src: *const u8,
-    length: usize,
+    mut dest: *mut u8,
+    mut src: *const u8,
+    mut length: usize,
     failure: *mut AccessFailure,
 ) -> i32 {
-    unsafe {
-        asm_recover! {
-            failure,
-            ["rep movsb", "xor ecx, ecx"],
-            [],
-            in("rdi") dest,
-            in("rsi") src,
-            in("rcx") length,
+    fn copy1(dest: *mut u8, src: *const u8, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                2:
+                mov {s1}, byte ptr [{src} + {i}]
+                mov byte ptr [{dest} + {i}], {s1}
+                inc {i}
+                cmp {i}, {len}
+                jne 2b
+                3:
+                ",
+                super::recover_descriptor!("2b", "3b", "{bail}", 0),
+                s1 = out(reg_byte) _,
+                i = inout(reg) 0u64 => _,
+                src = in(reg) src,
+                dest = in(reg) dest,
+                len = in(reg) length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
         }
+        0
+    }
+
+    fn copy8(dest: *mut u8, src: *const u8, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                2:
+                mov {s1}, qword ptr [{src} + {i}]
+                mov qword ptr [{dest} + {i}], {s1}
+                add {i}, 8
+                cmp {i}, {len}
+                jne 2b
+                3:
+                ",
+                super::recover_descriptor!("2b", "3b", "{bail}", 0),
+                s1 = out(reg) _,
+                i = inout(reg) 0u64 => _,
+                src = in(reg) src,
+                dest = in(reg) dest,
+                len = in(reg) length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    fn copy32(dest: *mut u8, src: *const u8, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                2:
+                movdqu {s1}, xmmword ptr [{src} + {i}]
+                movdqu {s2}, xmmword ptr [{src} + {i} + 16]
+                movdqu xmmword ptr [{dest} + {i}], {s1}
+                movdqu xmmword ptr [{dest} + {i} + 16], {s2}
+                add {i}, 32
+                cmp {i}, {len}
+                jne 2b
+                3:
+                ",
+                super::recover_descriptor!("2b", "3f", "{bail}", 0),
+                s1 = out(xmm_reg) _,
+                s2 = out(xmm_reg) _,
+                i = inout(reg) 0u64 => _,
+                src = in(reg) src,
+                dest = in(reg) dest,
+                len = in(reg) length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    fn copy_movsb(
+        dest: *mut u8,
+        src: *const u8,
+        length: usize,
+        failure: *mut AccessFailure,
+    ) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "2:",
+                "rep movsb",
+                "3:",
+                super::recover_descriptor!("2b", "3b", "{bail}", 0),
+                in("rdi") dest,
+                in("rsi") src,
+                in("rcx") length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    if length >= 1024 {
+        return copy_movsb(dest, src, length, failure);
+    }
+    if length >= 32 {
+        let this = length & !31;
+        if copy32(dest, src, this, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(this);
+        src = src.wrapping_add(this);
+        length &= 31;
+    }
+    if length >= 8 {
+        let this = length & !7;
+        if copy8(dest, src, this, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(this);
+        src = src.wrapping_add(this);
+        length &= 7;
+    }
+    if length > 0 {
+        copy1(dest, src, length, failure)
+    } else {
+        0
     }
 }
 
@@ -87,15 +207,22 @@ unsafe fn try_copy_backward(
     // Note, `rep movsb` with the direction flag set is slow, but this path
     // should be rare.
     unsafe {
-        asm_recover! {
-            failure,
-            ["std", "rep movsb", "xor ecx, ecx"],
-            ["cld"],
+        core::arch::asm! {
+            "2:",
+            "std",
+            "rep movsb",
+            "3:",
+            "cld",
+            super::recover_descriptor!("2b", "3b", "{bail}", 0),
             in("rdi") dest.add(length - 1),
             in("rsi") src.add(length - 1),
             in("rcx") length,
+            in("rdx") failure,
+            bail = label { return -1 },
+            options(nostack),
         }
     }
+    0
 }
 
 pub(crate) unsafe fn try_memmove(
@@ -113,21 +240,125 @@ pub(crate) unsafe fn try_memmove(
 }
 
 pub(crate) unsafe fn try_memset(
-    dest: *mut u8,
+    mut dest: *mut u8,
     c: i32,
-    length: usize,
+    mut length: usize,
     failure: *mut AccessFailure,
 ) -> i32 {
-    unsafe {
-        asm_recover! {
-            failure,
-            ["rep stosb", "xor ecx, ecx"],
-            [],
-            in("rdi") dest,
-            in("al") c as u8,
-            in("rcx") length,
-            options(nostack),
+    fn set_stosb(dest: *mut u8, c: i32, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "2:",
+                "rep stosb",
+                "3:",
+                super::recover_descriptor!("2b", "3b", "{bail}", 0),
+                in("rdi") dest,
+                in("al") c as u8,
+                in("rcx") length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
         }
+        0
+    }
+
+    fn set1(dest: *mut u8, c: i32, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                2:
+                mov byte ptr [{dest} + {i}], {c:l}
+                inc {i}
+                cmp {i}, {len}
+                jne 2b
+                3:
+                ",
+                super::recover_descriptor!("2b", "3b", "{bail}", 0),
+                c = in(reg) c,
+                i = inout(reg) 0u64 => _,
+                dest = in(reg) dest,
+                len = in(reg) length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    fn set8(dest: *mut u8, c: i32, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                2:
+                mov qword ptr [{dest} + {i}], {c}
+                add {i}, 8
+                cmp {i}, {len}
+                jne 2b
+                3:
+                ",
+                super::recover_descriptor!("2b", "3b", "{bail}", 0),
+                c = in(reg) (c & 0xff) as u64 * 0x0101010101010101,
+                i = inout(reg) 0u64 => _,
+                dest = in(reg) dest,
+                len = in(reg) length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    fn set32_zero(dest: *mut u8, length: usize, failure: *mut AccessFailure) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                2:
+                movdqu xmmword ptr [{dest} + {i}], {c}
+                movdqu xmmword ptr [{dest} + {i} + 16], {c}
+                add {i}, 32
+                cmp {i}, {len}
+                jne 2b
+                3:
+                ",
+                super::recover_descriptor!("2b", "3b", "{bail}", 0),
+                c = in(xmm_reg) 0,
+                i = inout(reg) 0u64 => _,
+                dest = in(reg) dest,
+                len = in(reg) length,
+                in("rdx") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
+    if length >= 1024 {
+        return set_stosb(dest, c, length, failure);
+    }
+    if c == 0 && length >= 32 {
+        let this = length & !31;
+        if set32_zero(dest, this, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(this);
+        length &= 31;
+    }
+    if length >= 8 {
+        let this = length & !7;
+        if set8(dest, c, this, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(this);
+        length &= 7;
+    }
+    if length > 0 {
+        set1(dest, c, length, failure)
+    } else {
+        0
     }
 }
 

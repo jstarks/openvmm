@@ -80,9 +80,9 @@ pub(crate) unsafe fn install_signal_handlers() {
         let (mut ip, mut result, failure_ptr);
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            ip = ctx.regs[libc::REG_RIP as usize] as _;
-            result = ctx.regs[libc::REG_RCX as usize] as _;
-            failure_ptr = ctx.regs[libc::REG_RDX as usize] as _;
+            ip = ctx.gregs[libc::REG_RIP as usize] as _;
+            result = ctx.gregs[libc::REG_RCX as usize] as _;
+            failure_ptr = ctx.gregs[libc::REG_RDX as usize] as _;
         }
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         {
@@ -109,8 +109,8 @@ pub(crate) unsafe fn install_signal_handlers() {
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            ctx.regs[libc::REG_RIP as usize] = ip as _;
-            ctx.regs[libc::REG_RCX as usize] = result as _;
+            ctx.gregs[libc::REG_RIP as usize] = ip as _;
+            ctx.gregs[libc::REG_RCX as usize] = result as _;
         }
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         {

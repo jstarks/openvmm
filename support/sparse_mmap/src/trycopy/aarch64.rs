@@ -1,8 +1,12 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+// xtask-fmt allow-target-arch sys-crate
 #![cfg(target_arch = "aarch64")]
 
 use super::Context;
-use crate::AccessFailure;
 use super::recover_descriptor;
+use crate::AccessFailure;
 
 const FAILURE_REG: usize = 3;
 

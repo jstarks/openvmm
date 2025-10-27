@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 mod aarch64;
 mod x86_64;
 
@@ -60,7 +63,9 @@ unsafe fn recover(context: &mut Context, failure: AccessFailure) -> bool {
 
     for r in table {
         let reloc = |addr: &i32| -> usize {
-            core::ptr::from_ref(addr).addr().wrapping_add_signed(*addr as isize)
+            core::ptr::from_ref(addr)
+                .addr()
+                .wrapping_add_signed(*addr as isize)
         };
         if ip >= reloc(&r.start) && ip < reloc(&r.end) {
             // Write the recovery info.
@@ -68,7 +73,11 @@ unsafe fn recover(context: &mut Context, failure: AccessFailure) -> bool {
 
             // Adjust the instruction pointer to the recovery address and write
             // the failure code.
-            inject(context, reloc(&r.recover), (r.set_result != 0).then_some(-1));
+            inject(
+                context,
+                reloc(&r.recover),
+                (r.set_result != 0).then_some(-1),
+            );
             return true;
         }
     }
@@ -158,7 +167,9 @@ macro_rules! recover_section {
 macro_rules! recover_descriptor {
     ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
         concat!(
-            ".pushsection ", crate::trycopy::recover_section!(), "\n",
+            ".pushsection ",
+            crate::trycopy::recover_section!(),
+            "\n",
             ".align 4\n",
             ".long ",
             $start,

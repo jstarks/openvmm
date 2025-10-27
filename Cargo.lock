@@ -6878,7 +6878,6 @@ dependencies = [
 name = "sparse_mmap"
 version = "0.0.0"
 dependencies = [
- "cc",
  "criterion",
  "getrandom 0.3.3",
  "libc",

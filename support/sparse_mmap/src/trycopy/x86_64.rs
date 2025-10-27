@@ -1,8 +1,12 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+// xtask-fmt allow-target-arch sys-crate
 #![cfg(target_arch = "x86_64")]
 
 use super::Context;
-use crate::AccessFailure;
 use super::recover_descriptor;
+use crate::AccessFailure;
 
 pub(super) fn extract(ctx: &Context) -> (usize, usize) {
     #[cfg(target_os = "linux")]

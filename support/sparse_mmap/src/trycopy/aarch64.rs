@@ -83,7 +83,7 @@ unsafe fn try_copy_forward(
             ) -> i32 {
                 unsafe {
                     core::arch::asm! {
-                        concat!("cbz {len}, 2f
+                        concat!("
                         1:
                         ", $ldr, " {s1:", $width, "}, [{src}], #", $n, "
                         subs {len}, {len}, #", $n, "
@@ -104,31 +104,64 @@ unsafe fn try_copy_forward(
             }
         };
     }
+
+    fn copy32(
+        dest: *mut u8,
+        src: *const u8,
+        length: usize,
+        failure: *mut AccessFailure,
+    ) -> i32 {
+        unsafe {
+            core::arch::asm! {
+                "
+                1:
+                ldr {s1:q}, [{src}], #16
+                ldr {s2:q}, [{src}], #16
+                subs {len}, {len}, #32
+                str {s1:q}, [{dest}], #16
+                str {s2:q}, [{dest}], #16
+                bne 1b
+                2:",
+                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                dest = inout(reg) dest => _,
+                src = inout(reg) src => _,
+                len = inout(reg) length => _,
+                s1 = out(vreg) _,
+                s2 = out(vreg) _,
+                in("x3") failure,
+                bail = label { return -1 },
+                options(nostack),
+            }
+        }
+        0
+    }
+
     copy!(copy1, 1, "w", "ldrb", "strb");
     copy!(copy8, 8, "x", "ldr", "str");
 
-    if length < 8 {
-        return copy1(dest, src, length, failure);
+    if length == 0 {
+        return 0;
     }
-    /*
-    if dest.addr() % 8 != 0 {
-        let align = 8 - (dest.addr() % 8);
-        if copy1(dest, src, align, failure) < 0 {
+    if length >= 32 {
+        let this = length & !31;
+        if copy32(dest, src, this, failure) < 0 {
             return -1;
         }
-        dest = dest.wrapping_add(align);
-        src = src.wrapping_add(align);
-        length -= align;
+        dest = dest.wrapping_add(this);
+        src = src.wrapping_add(this);
+        length -= this;
     }
-    */
-    if copy8(dest, src, length & !7, failure) < 0 {
-        return -1;
+    if length >= 8 {
+        let this = length & !7;
+        if copy8(dest, src, this, failure) < 0 {
+            return -1;
+        }
+        dest = dest.wrapping_add(this);
+        src = src.wrapping_add(this);
+        length -= this;
     }
-    let rem = length & 7;
-    if rem > 0 {
-        let dest = dest.wrapping_add(length & !7);
-        let src = src.wrapping_add(length & !7);
-        if copy1(dest, src, rem, failure) < 0 {
+    if length >= 1 {
+        if copy1(dest, src, length, failure) < 0 {
             return -1;
         }
     }

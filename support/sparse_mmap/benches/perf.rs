@@ -31,6 +31,8 @@ fn bench_access(c: &mut criterion::Criterion) {
         })
     })
     .bench_function("try-copy-1", |b| try_copy_n::<1>(b))
+    .bench_function("try-copy-4", |b| try_copy_n::<4>(b))
+    .bench_function("try-copy-8", |b| try_copy_n::<8>(b))
     .bench_function("try-copy-32", |b| try_copy_n::<32>(b))
     .bench_function("try-copy-256", |b| try_copy_n::<256>(b))
     .bench_function("try-copy-4096", |b| try_copy_n::<4096>(b))

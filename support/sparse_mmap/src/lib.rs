@@ -37,7 +37,7 @@ use zerocopy::KnownLayout;
 #[cold]
 fn cold_path() {}
 
-/// Must be called before using try_copy on Unix platforms.
+/// Must be called before using try_copy.
 pub fn initialize_try_copy() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| unsafe {
@@ -45,50 +45,6 @@ pub fn initialize_try_copy() {
     });
 }
 
-#[cfg(false)]
-unsafe extern "C" {
-    fn try_memmove(
-        dest: *mut u8,
-        src: *const u8,
-        length: usize,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_memset(dest: *mut u8, c: i32, length: usize, failure: *mut AccessFailure) -> i32;
-    fn try_read8(dest: *mut u8, src: *const u8, failure: *mut AccessFailure) -> i32;
-    fn try_read16(dest: *mut u16, src: *const u16, failure: *mut AccessFailure) -> i32;
-    fn try_read32(dest: *mut u32, src: *const u32, failure: *mut AccessFailure) -> i32;
-    fn try_read64(dest: *mut u64, src: *const u64, failure: *mut AccessFailure) -> i32;
-    fn try_write8(dest: *mut u8, value: u8, failure: *mut AccessFailure) -> i32;
-    fn try_write16(dest: *mut u16, value: u16, failure: *mut AccessFailure) -> i32;
-    fn try_write32(dest: *mut u32, value: u32, failure: *mut AccessFailure) -> i32;
-    fn try_write64(dest: *mut u64, value: u64, failure: *mut AccessFailure) -> i32;
-    fn try_cmpxchg8(
-        dest: *mut u8,
-        expected: &mut u8,
-        desired: u8,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_cmpxchg16(
-        dest: *mut u16,
-        expected: &mut u16,
-        desired: u16,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_cmpxchg32(
-        dest: *mut u32,
-        expected: &mut u32,
-        desired: u32,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_cmpxchg64(
-        dest: *mut u64,
-        expected: &mut u64,
-        desired: u64,
-        failure: *mut AccessFailure,
-    ) -> i32;
-}
-
-#[repr(C)]
 struct AccessFailure {
     address: *mut u8,
     #[cfg(unix)]

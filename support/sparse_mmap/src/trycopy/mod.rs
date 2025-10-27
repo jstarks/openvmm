@@ -135,56 +135,30 @@ pub(crate) unsafe fn install_signal_handlers() {
 }
 
 #[cfg(target_os = "linux")]
-macro_rules! recover_descriptor {
-    ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
-        concat!(
-            ".pushsection try_copy,\"a\"\n",
-            ".align 4\n",
-            ".long ",
-            $start,
-            " - .\n",
-            ".long ",
-            $stop,
-            " - .\n",
-            ".long ",
-            $recover,
-            " - .\n",
-            ".long ",
-            $set_result,
-            "\n",
-            ".popsection"
-        )
+macro_rules! recover_section {
+    () => {
+        "try_copy,\"a\""
     };
 }
 
 #[cfg(target_os = "windows")]
-macro_rules! recover_descriptor {
-    ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
-        concat!(
-            ".pushsection .rdata.trycopy@b,\"dr\"\n",
-            ".align 4\n",
-            ".long ",
-            $start,
-            " - .\n",
-            ".long ",
-            $stop,
-            " - .\n",
-            ".long ",
-            $recover,
-            " - .\n",
-            ".long ",
-            $set_result,
-            "\n",
-            ".popsection"
-        )
+macro_rules! recover_section {
+    () => {
+        ".rdata.trycopy@b,\"dr\""
     };
 }
 
 #[cfg(target_os = "macos")]
+macro_rules! recover_section {
+    () => {
+        "__DATA,__try_copy,regular,no_dead_strip"
+    };
+}
+
 macro_rules! recover_descriptor {
     ($start:tt, $stop:tt, $recover:tt, $set_result:tt) => {
         concat!(
-            ".pushsection __DATA,__try_copy,regular,no_dead_strip\n",
+            ".pushsection ", crate::trycopy::recover_section!(), "\n",
             ".align 4\n",
             ".long ",
             $start,
@@ -204,3 +178,4 @@ macro_rules! recover_descriptor {
 }
 
 use recover_descriptor;
+use recover_section;

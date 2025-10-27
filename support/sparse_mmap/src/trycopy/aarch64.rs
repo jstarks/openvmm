@@ -2,6 +2,7 @@
 
 use super::Context;
 use crate::AccessFailure;
+use super::recover_descriptor;
 
 const FAILURE_REG: usize = 3;
 
@@ -48,25 +49,6 @@ pub(super) fn inject(ctx: &mut Context, ip: usize, result: Option<isize>) {
     }
 }
 
-macro_rules! asm_recover {
-    ($failure:expr, [$($asm:expr),* $(,)?], [$($postasm:expr),*  $(,)?], $($rest:tt)*) => {
-        {
-            let recover_result: i32;
-            core::arch::asm! {
-                "2000:",
-                $($asm,)*
-                "2001:",
-                $($postasm,)*
-                super::recover_descriptor!("2000b", "2001b", "2001b", 1),
-                in("x3") $failure,
-                lateout("x0") recover_result,
-                $($rest)*
-            }
-            recover_result
-        }
-    };
-}
-
 unsafe fn try_copy_forward(
     mut dest: *mut u8,
     mut src: *const u8,
@@ -83,7 +65,7 @@ unsafe fn try_copy_forward(
                 strb {s1:w}, [{dest}], #1
                 bne 1b
                 2:",
-                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                recover_descriptor!("1b", "2b", "{bail}", 0),
                 dest = inout(reg) dest => _,
                 src = inout(reg) src => _,
                 len = inout(reg) length => _,
@@ -106,7 +88,7 @@ unsafe fn try_copy_forward(
                 str {s1:x}, [{dest}], #8
                 bne 1b
                 2:",
-                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                recover_descriptor!("1b", "2b", "{bail}", 0),
                 dest = inout(reg) dest => _,
                 src = inout(reg) src => _,
                 len = inout(reg) length => _,
@@ -131,7 +113,7 @@ unsafe fn try_copy_forward(
                 str {s2:q}, [{dest}], #16
                 bne 1b
                 2:",
-                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                recover_descriptor!("1b", "2b", "{bail}", 0),
                 dest = inout(reg) dest => _,
                 src = inout(reg) src => _,
                 len = inout(reg) length => _,
@@ -177,9 +159,8 @@ unsafe fn try_copy_backward(
     failure: *mut AccessFailure,
 ) -> i32 {
     unsafe {
-        asm_recover! {
-            failure,
-            ["
+        core::arch::asm! {
+            "
             cbz {len}, 2f
             sub {dest}, {dest}, #1
             sub {src}, {src}, #1
@@ -188,14 +169,15 @@ unsafe fn try_copy_backward(
             strb {s1:w}, [{dest}, {len}]
             subs {len}, {len}, #1
             bne 1b
-            mov w0, wzr
             2:
-            "],
-            [],
+            ",
+            recover_descriptor!("1b", "2b", "{bail}", 0),
             dest = inout(reg) dest => _,
             src = inout(reg) src => _,
             len = inout(reg) length => _,
             s1 = out(reg) _,
+            in("x3") failure,
+            bail = label { return -1 },
             options(nostack),
         }
     }
@@ -230,7 +212,7 @@ pub(crate) unsafe fn try_memset(
                 subs {len}, {len}, #1
                 bne 1b
                 2:",
-                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                recover_descriptor!("1b", "2b", "{bail}", 0),
                 dest = inout(reg) dest => _,
                 c = in(reg) c,
                 len = inout(reg) length => _,
@@ -251,7 +233,7 @@ pub(crate) unsafe fn try_memset(
                 subs {len}, {len}, #8
                 bne 1b
                 2:",
-                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                recover_descriptor!("1b", "2b", "{bail}", 0),
                 dest = inout(reg) dest => _,
                 c = in(reg) (c as u64 & 0xff) * 0x0101010101010101,
                 len = inout(reg) length => _,
@@ -273,7 +255,7 @@ pub(crate) unsafe fn try_memset(
                 subs {len}, {len}, #32
                 bne 1b
                 2:",
-                super::recover_descriptor!("1b", "2b", "{bail}", 0),
+                recover_descriptor!("1b", "2b", "{bail}", 0),
                 dest = inout(reg) dest => _,
                 zero = in(vreg) 0,
                 len = inout(reg) length => _,
@@ -313,12 +295,17 @@ macro_rules! try_read {
         $vis unsafe fn $func(dest: *mut $ty, src: *const $ty, failure: *mut AccessFailure) -> i32 {
             unsafe {
                 let out: u64;
-                let result = asm_recover!(
-                    failure,
-                    [$asm, "mov w0, wzr"],
-                    [],
+                let result;
+                core::arch::asm!(
+                    "1:",
+                    $asm,
+                    "mov w0, wzr",
+                    "2:",
+                    recover_descriptor!("1b", "2b", "2b", 1),
                     out = out(reg) out,
                     src = in(reg) src,
+                    in("x3") failure,
+                    lateout("x0") result,
                     options(nostack, readonly),
                 );
                 if result == 0 {
@@ -339,12 +326,15 @@ macro_rules! try_write {
     ($vis:vis $func:ident, $ty:ty, $asm:expr) => {
         $vis unsafe fn $func(dest: *mut $ty, val: $ty, failure: *mut AccessFailure) -> i32 {
             unsafe {
-                asm_recover!(
-                    failure,
-                    [$asm, "mov w0, wzr"],
-                    [],
+                core::arch::asm!(
+                    "1:",
+                    $asm,
+                    "2:",
+                    recover_descriptor!("1b", "2b", "{bail}", 0),
                     dest = in(reg) dest,
                     val = in(reg) val as u64,
+                    in("x3") failure,
+                    bail = label { return -1 },
                     options(nostack),
                 )
             }
@@ -366,14 +356,20 @@ macro_rules! try_cmpxchg {
             failure: *mut AccessFailure,
         ) -> i32 {
             let actual;
-            let result = unsafe {
-                asm_recover! {
-                    failure,
-                    [$asm, "mov w0, wzr"],
-                    [],
+            let result;
+            unsafe {
+                core::arch::asm! {
+                    "1:",
+                    $asm,
+                    "mov w0, wzr",
+                    "2:",
+                    recover_descriptor!("1b", "2b", "2b", 1),
                     dest = in(reg) dest,
                     desired = in(reg) desired,
                     expected = inout(reg) *expected => actual,
+                    in("x3") failure,
+                    lateout("x0") result,
+                    options(nostack),
                 }
             };
             if result == 0 {

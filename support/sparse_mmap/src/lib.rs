@@ -9,8 +9,8 @@
 #![expect(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
 pub mod alloc;
-mod trycopy_x64;
 mod trycopy_windows_arm64;
+mod trycopy_x64;
 pub mod unix;
 pub mod windows;
 
@@ -21,11 +21,11 @@ pub use sys::SparseMapping;
 pub use sys::alloc_shared_memory;
 pub use sys::new_mappable_from_file;
 
-#[cfg(target_arch = "x86_64")]
-use trycopy_x64::*;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU8;
 use thiserror::Error;
+#[cfg(target_arch = "x86_64")]
+use trycopy_x64::*;
 #[cfg(unix)]
 use unix as sys;
 #[cfg(windows)]
@@ -92,7 +92,6 @@ unsafe extern "C" {
         failure: *mut AccessFailure,
     ) -> i32;
 }
-
 
 #[repr(C)]
 struct AccessFailure {
@@ -207,12 +206,13 @@ pub unsafe fn try_copy<T>(src: *const T, dest: *mut T, count: usize) -> Result<(
         _ => {
             cold_path();
             Err(MemoryError::new(
-            Some(src.cast()),
-            dest.cast(),
-            len,
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        ))}
+                Some(src.cast()),
+                dest.cast(),
+                len,
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -246,8 +246,9 @@ pub unsafe fn try_write_bytes<T>(dest: *mut T, val: u8, count: usize) -> Result<
                 dest.cast(),
                 len,
                 // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        ))}
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -315,13 +316,15 @@ pub unsafe fn try_compare_exchange<T: IntoBytes + FromBytes + Immutable + KnownL
         n if n > 0 => Ok(Ok(new)),
         0 => Ok(Err(current)),
         _ => {
-            cold_path();Err(MemoryError::new(
-            None,
-            dest.cast(),
-            size_of::<T>(),
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        ))}
+            cold_path();
+            Err(MemoryError::new(
+                None,
+                dest.cast(),
+                size_of::<T>(),
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -371,12 +374,13 @@ pub unsafe fn try_read_volatile<T: FromBytes + Immutable + KnownLayout>(
         _ => {
             cold_path();
             Err(MemoryError::new(
-            Some(src.cast()),
-            dest.as_mut_ptr().cast(),
-            size_of::<T>(),
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        ))}
+                Some(src.cast()),
+                dest.as_mut_ptr().cast(),
+                size_of::<T>(),
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -437,13 +441,15 @@ pub unsafe fn try_write_volatile<T: IntoBytes + Immutable + KnownLayout>(
     match ret {
         0 => Ok(()),
         _ => {
-            cold_path();Err(MemoryError::new(
-            None,
-            dest.cast(),
-            size_of::<T>(),
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        ))}
+            cold_path();
+            Err(MemoryError::new(
+                None,
+                dest.cast(),
+                size_of::<T>(),
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -784,7 +790,15 @@ mod tests {
         {
             let mut buf = data.clone();
             unsafe {
-                assert_eq!(try_memmove(buf.as_mut_ptr(), buf.as_mut_ptr().add(1), 255, failure.as_mut_ptr()), 0);
+                assert_eq!(
+                    try_memmove(
+                        buf.as_mut_ptr(),
+                        buf.as_mut_ptr().add(1),
+                        255,
+                        failure.as_mut_ptr()
+                    ),
+                    0
+                );
             }
             assert_eq!(&buf[0..255], &data[1..256]);
         }
@@ -793,7 +807,15 @@ mod tests {
         {
             let mut buf = data.clone();
             unsafe {
-                assert_eq!(try_memmove(buf.as_mut_ptr().add(1), buf.as_mut_ptr(), 255, failure.as_mut_ptr()), 0);
+                assert_eq!(
+                    try_memmove(
+                        buf.as_mut_ptr().add(1),
+                        buf.as_mut_ptr(),
+                        255,
+                        failure.as_mut_ptr()
+                    ),
+                    0
+                );
             }
             assert_eq!(&buf[1..256], &data[0..255]);
         }

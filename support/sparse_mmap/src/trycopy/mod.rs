@@ -82,7 +82,6 @@ pub(crate) unsafe fn install_signal_handlers() {
         };
         let recovered = unsafe { recover(ucontext, failure) };
         if !recovered {
-            unsafe { libc::raise(sig) };
             std::process::abort();
         }
     }

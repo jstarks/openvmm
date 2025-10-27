@@ -138,7 +138,7 @@ macro_rules! try_read {
                     [],
                     out = out(reg) out,
                     src = in(reg) src,
-                    options(nostack),
+                    options(nostack, readonly),
                 );
                 if result == 0 {
                     dest.write(out as $ty);

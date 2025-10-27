@@ -817,6 +817,25 @@ mod tests {
     }
 
     #[test]
+    fn test_try_memset() {
+        initialize_try_copy();
+
+        let mut buf = [0u8; 256];
+        let mut failure = MaybeUninit::uninit();
+        unsafe {
+            assert_eq!(
+                try_memset(buf.as_mut_ptr(), 0x5a, buf.len(), failure.as_mut_ptr()),
+                0
+            );
+        }
+        assert_eq!(&buf, &[0x5a; 256]);
+
+        unsafe {
+            assert!(try_memset(0x100 as *mut u8, 0x5a, 100, failure.as_mut_ptr()) < 0);
+        }
+    }
+
+    #[test]
     fn test_cmpxchg() {
         initialize_try_copy();
 

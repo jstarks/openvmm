@@ -9,7 +9,7 @@
 #![expect(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
 pub mod alloc;
-mod trycopy_x64;
+mod trycopy;
 pub mod unix;
 pub mod windows;
 
@@ -23,7 +23,7 @@ pub use sys::new_mappable_from_file;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU8;
 use thiserror::Error;
-use trycopy_x64::*;
+use trycopy::*;
 #[cfg(unix)]
 use unix as sys;
 #[cfg(windows)]

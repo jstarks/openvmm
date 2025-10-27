@@ -14,12 +14,19 @@ unsafe fn recover(
     failure_ptr: usize,
     failure: AccessFailure,
 ) -> bool {
+    #[cfg(target_os = "linux")]
     unsafe extern "C" {
         #[link_name = "__start_try_copy"]
         static START_TRY_COPY: [Recover; 0];
         #[link_name = "__stop_try_copy"]
         static STOP_TRY_COPY: [Recover; 0];
     }
+    #[cfg(windows)]
+    #[unsafe(link_section = ".rdata.trycopy@a")]
+    static START_TRY_COPY: [Recover; 0] = [];
+    #[cfg(windows)]
+    #[unsafe(link_section = ".rdata.trycopy@c")]
+    static STOP_TRY_COPY: [Recover; 0] = [];
 
     let table = unsafe {
         std::slice::from_raw_parts(
@@ -141,27 +148,25 @@ macro_rules! recover_asm {
     };
 }
 
+/*
 #[cfg(target_os = "windows")]
 core::arch::global_asm! {
     "
-    .section .try_copy@a,\"a\"
+    .section .rdata.trycopy@a,\"dr\"
     .align 4
-    .global __start_try_copy
 __start_try_copy:
-    .quad 0
-    .section .try_copy@c,\"a\"
+    .section .rdata.trycopy@c,\"dr\"
     .align 4
-    .global __stop_try_copy
 __stop_try_copy:
-    .quad 0
     "
 }
+*/
 
 #[cfg(target_os = "windows")]
 macro_rules! recover_asm {
     ($start:tt, $stop:tt) => {
         concat!(
-            ".pushsection .try_copy@b,\"a\"\n",
+            ".pushsection .rdata.trycopy@b,\"dr\"\n",
             ".align 4\n",
             ".long ",
             $start,

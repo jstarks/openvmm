@@ -9,8 +9,7 @@
 #![expect(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
 pub mod alloc;
-mod trycopy_windows_arm64;
-mod trycopy_windows_x64;
+mod trycopy;
 pub mod unix;
 pub mod windows;
 
@@ -24,6 +23,7 @@ pub use sys::new_mappable_from_file;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU8;
 use thiserror::Error;
+use trycopy::*;
 #[cfg(unix)]
 use unix as sys;
 #[cfg(windows)]
@@ -33,69 +33,18 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 
-/// Must be called before using try_copy on Unix platforms.
+// FUTURE: replace with [`core::hint::cold_path`] when stabilized.
+#[cold]
+fn cold_path() {}
+
+/// Must be called before using try_copy.
 pub fn initialize_try_copy() {
-    #[cfg(unix)]
-    {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| unsafe {
-            let err = install_signal_handlers();
-            if err != 0 {
-                panic!(
-                    "could not install signal handlers: {}",
-                    std::io::Error::from_raw_os_error(err)
-                )
-            }
-        });
-    }
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        install_signal_handlers();
+    });
 }
 
-unsafe extern "C" {
-    #[cfg(unix)]
-    fn install_signal_handlers() -> i32;
-
-    fn try_memmove(
-        dest: *mut u8,
-        src: *const u8,
-        length: usize,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_memset(dest: *mut u8, c: i32, length: usize, failure: *mut AccessFailure) -> i32;
-    fn try_cmpxchg8(
-        dest: *mut u8,
-        expected: &mut u8,
-        desired: u8,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_cmpxchg16(
-        dest: *mut u16,
-        expected: &mut u16,
-        desired: u16,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_cmpxchg32(
-        dest: *mut u32,
-        expected: &mut u32,
-        desired: u32,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_cmpxchg64(
-        dest: *mut u64,
-        expected: &mut u64,
-        desired: u64,
-        failure: *mut AccessFailure,
-    ) -> i32;
-    fn try_read8(dest: *mut u8, src: *const u8, failure: *mut AccessFailure) -> i32;
-    fn try_read16(dest: *mut u16, src: *const u16, failure: *mut AccessFailure) -> i32;
-    fn try_read32(dest: *mut u32, src: *const u32, failure: *mut AccessFailure) -> i32;
-    fn try_read64(dest: *mut u64, src: *const u64, failure: *mut AccessFailure) -> i32;
-    fn try_write8(dest: *mut u8, value: u8, failure: *mut AccessFailure) -> i32;
-    fn try_write16(dest: *mut u16, value: u16, failure: *mut AccessFailure) -> i32;
-    fn try_write32(dest: *mut u32, value: u32, failure: *mut AccessFailure) -> i32;
-    fn try_write64(dest: *mut u64, value: u64, failure: *mut AccessFailure) -> i32;
-}
-
-#[repr(C)]
 struct AccessFailure {
     address: *mut u8,
     #[cfg(unix)]
@@ -205,13 +154,16 @@ pub unsafe fn try_copy<T>(src: *const T, dest: *mut T, count: usize) -> Result<(
     };
     match ret {
         0 => Ok(()),
-        _ => Err(MemoryError::new(
-            Some(src.cast()),
-            dest.cast(),
-            len,
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        )),
+        _ => {
+            cold_path();
+            Err(MemoryError::new(
+                Some(src.cast()),
+                dest.cast(),
+                len,
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -238,13 +190,16 @@ pub unsafe fn try_write_bytes<T>(dest: *mut T, val: u8, count: usize) -> Result<
     let ret = unsafe { try_memset(dest.cast::<u8>(), val.into(), len, failure.as_mut_ptr()) };
     match ret {
         0 => Ok(()),
-        _ => Err(MemoryError::new(
-            None,
-            dest.cast(),
-            len,
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        )),
+        _ => {
+            cold_path();
+            Err(MemoryError::new(
+                None,
+                dest.cast(),
+                len,
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -311,13 +266,16 @@ pub unsafe fn try_compare_exchange<T: IntoBytes + FromBytes + Immutable + KnownL
     match ret {
         n if n > 0 => Ok(Ok(new)),
         0 => Ok(Err(current)),
-        _ => Err(MemoryError::new(
-            None,
-            dest.cast(),
-            size_of::<T>(),
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        )),
+        _ => {
+            cold_path();
+            Err(MemoryError::new(
+                None,
+                dest.cast(),
+                size_of::<T>(),
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -364,13 +322,16 @@ pub unsafe fn try_read_volatile<T: FromBytes + Immutable + KnownLayout>(
             // SAFETY: dest was fully initialized by try_read.
             Ok(unsafe { dest.assume_init() })
         }
-        _ => Err(MemoryError::new(
-            Some(src.cast()),
-            dest.as_mut_ptr().cast(),
-            size_of::<T>(),
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        )),
+        _ => {
+            cold_path();
+            Err(MemoryError::new(
+                Some(src.cast()),
+                dest.as_mut_ptr().cast(),
+                size_of::<T>(),
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -430,13 +391,16 @@ pub unsafe fn try_write_volatile<T: IntoBytes + Immutable + KnownLayout>(
     };
     match ret {
         0 => Ok(()),
-        _ => Err(MemoryError::new(
-            None,
-            dest.cast(),
-            size_of::<T>(),
-            // SAFETY: failure is initialized in the failure path.
-            unsafe { failure.assume_init_ref() },
-        )),
+        _ => {
+            cold_path();
+            Err(MemoryError::new(
+                None,
+                dest.cast(),
+                size_of::<T>(),
+                // SAFETY: failure is initialized in the failure path.
+                unsafe { failure.assume_init_ref() },
+            ))
+        }
     }
 }
 
@@ -763,6 +727,67 @@ mod tests {
             try_copy(BUF.as_ptr(), base, 100).unwrap_err();
             try_copy(BUF.as_ptr(), base.add(page_size), 100).unwrap();
             try_copy(BUF.as_ptr(), base.add(page_size), page_size + 1).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn test_try_memmove_overlapping() {
+        initialize_try_copy();
+
+        let data = (0..256).map(|i| i as u8).collect::<Vec<_>>();
+        let mut failure = MaybeUninit::uninit();
+
+        // Reverse overlap
+        {
+            let mut buf = data.clone();
+            unsafe {
+                assert_eq!(
+                    try_memmove(
+                        buf.as_mut_ptr(),
+                        buf.as_mut_ptr().add(1),
+                        255,
+                        failure.as_mut_ptr()
+                    ),
+                    0
+                );
+            }
+            assert_eq!(&buf[0..255], &data[1..256]);
+        }
+
+        // Forward overlap
+        {
+            let mut buf = data.clone();
+            unsafe {
+                assert_eq!(
+                    try_memmove(
+                        buf.as_mut_ptr().add(1),
+                        buf.as_mut_ptr(),
+                        255,
+                        failure.as_mut_ptr()
+                    ),
+                    0
+                );
+            }
+            assert_eq!(&buf[1..256], &data[0..255]);
+        }
+    }
+
+    #[test]
+    fn test_try_memset() {
+        initialize_try_copy();
+
+        let mut buf = [0u8; 256];
+        let mut failure = MaybeUninit::uninit();
+        unsafe {
+            assert_eq!(
+                try_memset(buf.as_mut_ptr(), 0x5a, buf.len(), failure.as_mut_ptr()),
+                0
+            );
+        }
+        assert_eq!(&buf, &[0x5a; 256]);
+
+        unsafe {
+            assert!(try_memset(0x100 as *mut u8, 0x5a, 100, failure.as_mut_ptr()) < 0);
         }
     }
 

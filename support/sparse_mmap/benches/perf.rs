@@ -29,5 +29,32 @@ fn bench_access(c: &mut criterion::Criterion) {
             let n = 0u8;
             std::ptr::read_volatile(black_box(&n));
         })
-    });
+    })
+    .bench_function("try-copy-1", |b| try_copy_n::<1>(b))
+    .bench_function("try-copy-4", |b| try_copy_n::<4>(b))
+    .bench_function("try-copy-8", |b| try_copy_n::<8>(b))
+    .bench_function("try-copy-32", |b| try_copy_n::<32>(b))
+    .bench_function("try-copy-256", |b| try_copy_n::<256>(b))
+    .bench_function("try-copy-4096", |b| try_copy_n::<4096>(b))
+    .bench_function("try-set-1", |b| try_set_n::<1>(b))
+    .bench_function("try-set-32", |b| try_set_n::<32>(b))
+    .bench_function("try-set-256", |b| try_set_n::<256>(b))
+    .bench_function("try-set-4096", |b| try_set_n::<4096>(b));
+}
+
+fn try_copy_n<const N: usize>(b: &mut criterion::Bencher<'_>) {
+    let src = [0u8; N];
+    let mut dest = [0u8; N];
+    // SAFETY: passing valid src and dest.
+    b.iter(|| unsafe {
+        sparse_mmap::try_copy(black_box(src.as_ptr()), black_box(dest.as_mut_ptr()), N).unwrap();
+    })
+}
+
+fn try_set_n<const N: usize>(b: &mut criterion::Bencher<'_>) {
+    let mut dest = [0u8; N];
+    // SAFETY: passing valid dest.
+    b.iter(|| unsafe {
+        sparse_mmap::try_write_bytes(black_box(dest.as_mut_ptr()), 0u8, N).unwrap();
+    })
 }

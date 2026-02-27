@@ -54,6 +54,10 @@ pub struct CreateParams {
     /// If true, mark all blocks as allocated (fixed VHD).
     pub is_fully_allocated: bool,
 
+    /// Data write GUID. If zero GUID, a random one will be generated.
+    /// Callers can supply a specific GUID for re-parenting workflows.
+    pub data_write_guid: Guid,
+
     /// Page 83 SCSI identifier. If zero GUID, a random one will be generated.
     pub page_83_data: Guid,
 }
@@ -69,6 +73,7 @@ impl Default for CreateParams {
             block_alignment: 0,
             create_incomplete: false,
             is_fully_allocated: false,
+            data_write_guid: Guid::ZERO,
             page_83_data: Guid::ZERO,
         }
     }
@@ -200,7 +205,11 @@ pub async fn create(
 
     // Generate random GUIDs for the headers.
     let file_write_guid = Guid::new_random();
-    let data_write_guid = Guid::new_random();
+    let data_write_guid = if params.data_write_guid != Guid::ZERO {
+        params.data_write_guid
+    } else {
+        Guid::new_random()
+    };
 
     // Header 1 (sequence number 0).
     let mut header = Header::new_zeroed();

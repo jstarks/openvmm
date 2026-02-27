@@ -1,8 +1,30 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implements the partition mapper, which is responsible for mapping regions
-//! into VM partitions.
+//! The partition mapper — maps guest memory regions into a hypervisor partition.
+//!
+//! Each `PartitionMapper` binds a [`VaMapper`]'s VA range to a hypervisor
+//! partition's guest physical address (GPA) space. When the region manager
+//! activates a region, the partition mapper calls
+//! `PartitionMemoryMap::map_range()` (i.e., `WHvMapGpaRange` on Windows /
+//! the appropriate KVM ioctl on Linux) to establish a second-level address
+//! translation (SLAT / EPT / NPT) entry pointing at the VaMapper's host VA.
+//!
+//! Before mapping, the partition mapper calls
+//! [`VaMapper::ensure_mapped()`] to pre-populate the file-backed VA. The
+//! result is intentionally discarded (`let _ =`) — in private-RAM mode there
+//! is no file mapping to establish, and in normal mode a failure here just
+//! means the hypervisor will fault on first access and the VMM will
+//! lazily resolve it. This design allows both modes to share the same
+//! `PartitionMapper` code with no branching.
+//!
+//! An optional `offset` shifts all GPA mappings, which is used for the VTL0
+//! alias map (a mirror of VTL0 RAM at a high physical address visible to
+//! VTL2).
+//!
+//! On drop, the partition mapper unmaps the entire range from the partition
+//! to ensure the hypervisor doesn't hold stale references to the VaMapper's
+//! VA, which is about to be freed.
 
 // UNSAFETY: Calling unsafe partition memory mapping functions.
 #![expect(unsafe_code)]

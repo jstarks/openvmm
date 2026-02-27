@@ -1,7 +1,51 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Interfaces to read and write guest memory.
+//! Guest memory access interfaces for OpenVMM.
+//!
+//! This crate provides the core abstractions for reading and writing guest
+//! virtual machine memory from within the VMM process. The two central types
+//! are:
+//!
+//! - [`GuestMemoryAccess`] — an `unsafe` trait implemented by memory
+//!   backings. It describes how the backing provides VA access to guest
+//!   memory (via [`mapping()`](GuestMemoryAccess::mapping)), and defines
+//!   fallback + page-fault hooks for lazy population and error recovery.
+//!
+//! - [`GuestMemory`] — the primary handle used by device emulation code.
+//!   Wraps a `GuestMemoryAccess` implementation and provides ergonomic,
+//!   safe methods for typed reads/writes, range operations, and page
+//!   locking.
+//!
+//! # How access works
+//!
+//! 1. The backing returns a base VA from `mapping()`. `GuestMemory` adds
+//!    the guest physical address (GPA) to this base, yielding a host VA.
+//! 2. The VMM reads/writes the host VA directly (volatile, to handle
+//!    concurrent guest and hypervisor access).
+//! 3. If the access faults (the page is unmapped or bitmap-protected),
+//!    `page_fault()` is called. The backing can:
+//!    - [`Retry`](PageFaultAction::Retry) — it just mapped the page in; try again.
+//!    - [`Fail`](PageFaultAction::Fail) — the address is truly invalid.
+//!    - [`Fallback`](PageFaultAction::Fallback) — use `read_fallback` /
+//!      `write_fallback` (e.g., for remote-process access where no local
+//!      VA exists).
+//! 4. Step 2–3 repeats on `Retry` (bounded by implementation).
+//!
+//! # Implementations
+//!
+//! The primary production implementation is
+//! `VaMapper` (from the `membacking` crate), which maintains a
+//! [`SparseMapping`](sparse_mmap::SparseMapping) covering the full guest
+//! address space. Simpler implementations exist for testing:
+//! [`AlignedHeapMemory`] (heap-backed) and
+//! [`SharedMem`](sparse_mmap::alloc::SharedMem) (shared-memory-backed).
+//!
+//! # Submodules
+//!
+//! - [`ranges`] — types for working with contiguous and page-list-based
+//!   guest memory ranges ([`PagedRange`]), including
+//!   reader/writer adapters.
 
 // UNSAFETY: This crate's whole purpose is manual memory mapping and management.
 #![expect(unsafe_code)]

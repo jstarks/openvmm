@@ -1,7 +1,42 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! OpenVMM's memory manager.
+//! OpenVMM's top-level memory manager.
+//!
+//! [`GuestMemoryManager`] is the entry point for all guest RAM and device
+//! memory management. It is responsible for:
+//!
+//! - **Allocating guest RAM** — either as a shared file-backed section
+//!   (`CreateFileMappingW` / `memfd_create`) or as private anonymous memory
+//!   (`VirtualAlloc` / `mmap MAP_ANONYMOUS`) depending on configuration.
+//! - **Coordinating the internal pipeline**: region manager → mapping
+//!   manager → VA mappers → partition mappers.
+//! - **Providing access handles**: [`GuestMemoryClient`] gives callers a
+//!   [`GuestMemory`] object backed by a `VaMapper`, and
+//!   [`DeviceMemoryMapper`] lets devices map VRAM / ROM regions into guest
+//!   address space.
+//!
+//! # Construction via [`GuestMemoryBuilder`]
+//!
+//! The builder offers several mutually exclusive modes:
+//!
+//! - **Default (file-backed)**: `alloc_shared_memory()` creates a page-file-
+//!   backed section sized to hold all RAM. Each RAM range becomes a region
+//!   with a single mapping into this section.
+//! - **Existing backing**: An already-allocated `Mappable` is reused (for
+//!   servicing / live migration).
+//! - **Private memory**: No shared section is created. RAM regions have no
+//!   file-backed mapping; instead `VaMapper::alloc_range()` eagerly commits
+//!   anonymous pages in the `SparseMapping`. This eliminates page-file
+//!   pressure on Windows and enables decommit.
+//!
+//! # Partition attachment
+//!
+//! Once built, `attach_partition()` creates a [`PartitionMapper`] that maps
+//! the VA mapper's address range into the hypervisor partition's GPA space.
+//! On Windows, a separate remote-process VA mapper can be created to work
+//! around WHP's limitation of mapping a single VA range to a single
+//! partition.
 
 mod device_memory;
 
@@ -28,13 +63,25 @@ use std::thread::JoinHandle;
 use thiserror::Error;
 use vm_topology::memory::MemoryLayout;
 
-/// The OpenVMM memory manager.
+/// The top-level memory manager for an OpenVMM VM instance.
+///
+/// Owns all the infrastructure for guest memory: the shared RAM allocation
+/// (if any), the region manager, the mapping manager, the primary
+/// `VaMapper`, and the background thread that drives them. Created via
+/// [`GuestMemoryBuilder::build()`].
+///
+/// After construction, call [`attach_partition()`](Self::attach_partition)
+/// to wire the VA mapper into a hypervisor partition's GPA space.
 #[derive(Debug, Inspect)]
 pub struct GuestMemoryManager {
-    /// Guest RAM allocation. None in private memory mode.
+    /// Guest RAM allocation (file-backed section). `None` in private memory
+    /// mode, where RAM is backed by anonymous pages in the `VaMapper`'s
+    /// `SparseMapping` instead.
     #[inspect(skip)]
     guest_ram: Option<Mappable>,
 
+    /// RAM regions, in GPA order. Used by `RamVisibilityControl` to
+    /// manipulate individual RAM sub-ranges (e.g., VGA window, PAM regions).
     #[inspect(skip)]
     ram_regions: Arc<Vec<RamRegion>>,
 
@@ -44,13 +91,18 @@ pub struct GuestMemoryManager {
     #[inspect(flatten)]
     region_manager: RegionManager,
 
+    /// The primary VA mapper for this process. Shared by all callers of
+    /// `client().guest_memory()` (deduplicated via the mapper cache).
     #[inspect(skip)]
     va_mapper: Arc<VaMapper>,
 
+    /// Background thread running the memory manager's async event loop.
     #[inspect(skip)]
     _thread: JoinHandle<()>,
 
+    /// Offset for the VTL0 alias map, if enabled.
     vtl0_alias_map_offset: Option<u64>,
+    /// Whether to pin all mapped ranges (for device assignment / IOMMU).
     pin_mappings: bool,
 }
 
@@ -101,6 +153,11 @@ pub enum MemoryBuildError {
 }
 
 /// A builder for [`GuestMemoryManager`].
+///
+/// Configures RAM allocation strategy, VTL aliasing, page pinning, and
+/// platform-specific legacy support before constructing the full memory
+/// management pipeline. See the module documentation for the
+/// supported modes (file-backed vs. private vs. existing backing).
 pub struct GuestMemoryBuilder {
     existing_mapping: Option<SharedMemoryBacking>,
     vtl0_alias_map: Option<u64>,
@@ -358,13 +415,25 @@ impl GuestMemoryBuilder {
     }
 }
 
-/// The backing objects used to transfer guest memory between processes.
+/// The transferable backing objects used to recreate guest memory across
+/// processes (e.g., during VM servicing or live migration).
+///
+/// Contains the file-backed `Mappable` for guest RAM. Not available in
+/// private-memory mode — calling
+/// [`GuestMemoryManager::shared_memory_backing()`] will panic if no
+/// shared backing exists.
 #[derive(Debug, MeshPayload)]
 pub struct SharedMemoryBacking {
     guest_ram: Mappable,
 }
 
-/// A mesh-serializable object for providing access to guest memory.
+/// A mesh-serializable client for obtaining [`GuestMemory`] handles.
+///
+/// Can be sent across mesh channels to remote processes. Each call to
+/// [`guest_memory()`](Self::guest_memory) is deduplicated via the
+/// per-process `MAPPER_CACHE`, ensuring only one `VaMapper` (and thus
+/// one `SparseMapping`) is allocated per process, regardless of how many
+/// callers request access.
 #[derive(Debug, MeshPayload)]
 pub struct GuestMemoryClient {
     mapping_manager: MappingManagerClient,
@@ -385,10 +454,14 @@ impl GuestMemoryClient {
     }
 }
 
-// The region priority for RAM. Overrides anything else.
+/// Region priority for RAM. This is the highest priority, so RAM always
+/// shadows overlapping device memory unless explicitly unmapped via
+/// `RamVisibilityControl`.
 const RAM_PRIORITY: u8 = 255;
 
-// The region priority for device memory.
+/// Region priority for device memory. Lower than RAM, so device MMIO /
+/// VRAM regions only become guest-visible in address ranges not covered
+/// by an active RAM region.
 const DEVICE_PRIORITY: u8 = 0;
 
 impl GuestMemoryManager {

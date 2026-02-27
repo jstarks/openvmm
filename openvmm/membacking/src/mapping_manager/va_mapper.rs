@@ -1,23 +1,69 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implements the VA mapper, which maintains a linear virtual address space for
-//! all memory mapped into a partition.
+//! The VA mapper — a linear virtual address space backing guest memory.
 //!
-//! The VA mapper sends messages to the mapping manager to request mappings for
-//! specific address ranges, on demand. The mapping manager later sends
-//! invalidation requests back when tearing down mappings, e.g. when some device
-//! memory is unmapped from the partition.
+//! Each `VaMapper` owns a [`SparseMapping`] that reserves a contiguous VA
+//! range equal to the guest physical address space. This VA is registered
+//! with the hypervisor (via [`PartitionMapper`](crate::partition_mapper::PartitionMapper))
+//! so that VCPU memory accesses resolve through the host MMU to this VA.
+//! Device emulation code accesses the same VA through the
+//! [`GuestMemoryAccess`] trait.
 //!
-//! This lazy approach is taken to avoid having to keep each VA mapper
-//! up-to-date with all mappings at all times.
+//! # Modes of operation
 //!
-//! TODO: This is a bit dubious because the backing hypervisor will not
-//! necessarily propagate a page fault. E.g., KVM will just fail the VP. So at
-//! least for the mapper used by the partition itself, this optimization
-//! probably needs to be removed and replaced with a guarantee that replacement
-//! mappings are established immediately (and atomically?) instead of just by
-//! invalidating the existing mappings.
+//! ## File-backed (normal) mode — `private_ram = false`
+//!
+//! Pages are populated lazily: when the VMM first accesses an address, the
+//! `SparseMapping` has no backing at that offset, triggering a page fault.
+//! [`GuestMemoryAccess::page_fault`] sends a request to the
+//! [`MappingManager`](super::manager::MappingManager), which responds with
+//! the [`Mappable`](super::mappable::Mappable) + file offset for the range.
+//! The mapper then calls `SparseMapping::map_file()` and returns
+//! [`PageFaultAction::Retry`].
+//!
+//! This lazy approach avoids keeping every VA mapper synchronized with every
+//! mapping change, but it has a caveat: the hypervisor may not propagate
+//! host page faults back to the VMM. KVM, for example, will fail the VP
+//! instead of delivering a clean exit. For the partition-facing mapper,
+//! [`PartitionMapper`](crate::partition_mapper::PartitionMapper) calls
+//! `ensure_mapped()` eagerly to pre-populate the VA before handing the range
+//! to the hypervisor, but this is best-effort (the result is discarded with
+//! `let _ =`).
+//!
+//! ## Private-RAM mode — `private_ram = true`
+//!
+//! Guest RAM is backed by anonymous committed pages rather than file-backed
+//! sections. During `build()`,
+//! [`GuestMemoryBuilder`](crate::memory_manager::GuestMemoryBuilder) calls
+//! `alloc_range()` to eagerly replace the `SparseMapping`'s placeholders
+//! with committed anonymous memory for each RAM range.
+//!
+//! - **Windows**: `page_fault()` calls `SparseMapping::commit()` in
+//!   64 KB-aligned chunks, returns `Retry`. This handles the case where a
+//!   page was previously decommitted and the hypervisor delivers a memory
+//!   access exit when the VCPU touches the uncommitted VA.
+//! - **Linux**: The kernel handles anonymous page faults transparently
+//!   (copy-on-write from zero page). `page_fault()` should never be
+//!   reached in normal operation — if it is, something is wrong.
+//!
+//! Device memory (VRAM, ROM BARs, etc.) always goes through the file-backed
+//! `map_file()` path, even when RAM is private. Both RAM and device data
+//! coexist in the same `SparseMapping`.
+//!
+//! # Decommit support
+//!
+//! In private-RAM mode, `decommit(offset, len)` releases physical pages
+//! back to the host:
+//! - **Windows**: `VirtualFree(MEM_DECOMMIT)` — pages return to reserved
+//!   state; next VCPU access triggers a memory intercept → `page_fault()` →
+//!   `commit()` → resume.
+//! - **Linux**: `madvise(MADV_DONTNEED)` — pages are released; next access
+//!   gets fresh zero pages from the kernel with no VMM involvement.
+//!
+//! This enables future balloon / free-page-reporting integration without
+//! needing a tracking bitmap — the OS commit state *is* the tracking
+//! mechanism.
 
 // UNSAFETY: Implementing the unsafe GuestMemoryAccess trait by calling unsafe
 // low level memory manipulation functions.
@@ -42,9 +88,23 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use thiserror::Error;
 
+/// A linear VA space covering all guest memory.
+///
+/// See the [module documentation](self) for a full description of normal
+/// vs. private-RAM mode. A `VaMapper` is always created through the
+/// [`MappingManager`](super::manager::MappingManager) so it can receive
+/// mapping updates and invalidations.
+///
+/// # Thread model
+///
+/// The mapper spawns a background thread that runs the `MapperTask` event
+/// loop, processing `MapperRequest` messages from the mapping manager.
+/// This thread is joined on drop.
 pub struct VaMapper {
     inner: Arc<MapperInner>,
+    /// Remote process handle for cross-process VA mapping (WHP workaround).
     process: Option<RemoteProcess>,
+    /// When `true`, guest RAM is anonymous committed memory, not file-backed.
     private_ram: bool,
     _thread: JoinHandle<()>,
 }
@@ -58,11 +118,21 @@ impl std::fmt::Debug for VaMapper {
     }
 }
 
+/// Shared state between the `VaMapper` (GuestMemoryAccess impl) and the
+/// `MapperTask` (async event loop). The `SparseMapping` is the actual VA
+/// reservation that backs all guest memory access.
 #[derive(Debug)]
 struct MapperInner {
+    /// The underlying VA reservation. Covers `[0, max_guest_address)` and
+    /// is populated either by `map_file()` (file-backed) or `alloc()` /
+    /// `commit()` (private-RAM).
     mapping: SparseMapping,
+    /// Pending page-fault waiters. `None` after the mapper task exits, to
+    /// prevent new waiters from blocking forever.
     waiters: Mutex<Option<Vec<MapWaiter>>>,
+    /// Channel to the mapping manager for requesting mappings.
     req_send: mesh::Sender<MappingRequest>,
+    /// Unique ID assigned by the mapping manager.
     id: MapperId,
 }
 
@@ -246,19 +316,30 @@ impl VaMapper {
         })
     }
 
-    /// Ensures a mapping has been established for the given range.
+    /// Ensures a file-backed mapping has been established for the given range.
+    ///
+    /// In normal mode, this triggers a round-trip to the mapping manager to
+    /// populate the VA with `map_file()`. In private-RAM mode, this is a
+    /// no-op for RAM ranges (the VA is already committed) but the result
+    /// is intentionally discarded by callers, so failure is benign.
     pub async fn ensure_mapped(&self, range: MemoryRange) -> Result<(), NoMapping> {
         self.inner.request_mapping(range, false).await
     }
 
+    /// Returns a raw pointer to the base of the VA mapping.
+    ///
+    /// This pointer remains valid for the lifetime of the `VaMapper`, but
+    /// individual pages may be uncommitted or unmapped.
     pub fn as_ptr(&self) -> *mut u8 {
         self.inner.mapping.as_ptr().cast()
     }
 
+    /// Returns the length of the VA reservation in bytes.
     pub fn len(&self) -> usize {
         self.inner.mapping.len()
     }
 
+    /// Returns the remote process handle, if this is a cross-process mapper.
     pub fn process(&self) -> Option<&RemoteProcess> {
         self.process.as_ref()
     }
@@ -283,8 +364,11 @@ impl VaMapper {
     }
 }
 
-/// SAFETY: the underlying VA mapping is guaranteed to be valid for the lifetime
-/// of this object.
+/// SAFETY: the underlying VA mapping is guaranteed to be reserved (though not
+/// necessarily committed at every offset) for the lifetime of this object.
+/// In file-backed mode, individual pages are lazily mapped on fault.
+/// In private-RAM mode, pages are eagerly committed in `build()` and may be
+/// decommitted/recommitted during the VM's lifetime.
 unsafe impl GuestMemoryAccess for VaMapper {
     fn mapping(&self) -> Option<NonNull<u8>> {
         // No one should be using this as a GuestMemoryAccess for remote

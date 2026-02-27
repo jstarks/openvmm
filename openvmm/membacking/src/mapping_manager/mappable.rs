@@ -1,6 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! A cross-platform handle to a memory-mappable OS object.
+//!
+//! On Windows this wraps an `OwnedHandle` (typically a section object created
+//! by `CreateFileMappingW`); on Linux it wraps an `OwnedFd` (typically from
+//! `memfd_create` or an open file). The handle is reference-counted via `Arc`
+//! so clones are cheap and infallible.
+//!
+//! [`Mappable`] is the currency type that flows through the region manager →
+//! mapping manager → VA mapper pipeline: the region manager stores a
+//! `Mappable` per mapping, the mapping manager forwards it, and the VA mapper
+//! calls
+//! [`SparseMapping::map_file()`](sparse_mmap::SparseMapping::map_file) with it
+//! to establish a file-backed VA range.
+//!
+//! In private-RAM mode, guest RAM has no `Mappable` — the VA mapper's
+//! `SparseMapping` is backed by anonymous committed pages instead.
+
 use mesh::payload::DefaultEncoding;
 use mesh::payload::encoding::ResourceField;
 use std::sync::Arc;

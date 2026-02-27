@@ -1,9 +1,35 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implements the mapping manager, which keeps track of the VA mappers and
-//! their currently active mappings. It is responsible for invalidating mappings
-//! in each VA range when they are torn down by the region manager.
+//! The mapping manager — coordinates mappings across VA mappers.
+//!
+//! The mapping manager sits between the region manager and the individual
+//! [`VaMapper`] instances. It has two main responsibilities:
+//!
+//! 1. **On-demand mapping dispatch.** When a VA mapper encounters an
+//!    unmapped address (via [`GuestMemoryAccess::page_fault`]),
+//!    it sends a [`MappingRequest::SendMappings`] to the mapping manager,
+//!    which looks up the active mappings for the requested range and sends
+//!    the corresponding [`Mappable`] + offset back as a
+//!    [`MapperRequest::Map`]. The VA mapper then calls `map_file()` to
+//!    establish the file-backed VA.
+//!
+//! 2. **Invalidation.** When the region manager tears down a mapping (e.g.,
+//!    because a higher-priority region now covers the range, or because a
+//!    device unmaps MMIO), it tells the mapping manager via
+//!    `remove_mappings()`. The mapping manager fans out
+//!    [`MapperRequest::Unmap`] to every VA mapper that had that mapping, and
+//!    the mapper calls `SparseMapping::unmap()` to drop its file-backed VA.
+//!
+//! The mapping manager is an async task spawned on a dedicated pool. VA
+//! mappers are deduplicated per-process via an [`ObjectCache`](super::object_cache::ObjectCache),
+//! so calling `new_mapper()` multiple times from the same process returns
+//! the same `VaMapper` (and therefore the same `SparseMapping`).
+//!
+//! In private-RAM mode, the mapping manager still exists but RAM ranges
+//! have no [`Mappable`] — the VA mapper's anonymous committed pages serve
+//! that role. Device memory (VRAM, ROM BARs) still flows through this
+//! normal file-backed path even when RAM is private.
 
 use super::mappable::Mappable;
 use super::object_cache::ObjectCache;
@@ -61,7 +87,11 @@ impl MappingManager {
     }
 }
 
-/// Provides access to the mapping manager.
+/// Provides access to the mapping manager from any process.
+///
+/// Cheaply cloneable and mesh-serializable. The `MAPPER_CACHE` ensures
+/// only one `VaMapper` is allocated per process per `MappingManagerClient`
+/// identity (keyed by [`ObjectId`]).
 #[derive(Debug, MeshPayload, Clone)]
 pub struct MappingManagerClient {
     req_send: mesh::Sender<MappingRequest>,

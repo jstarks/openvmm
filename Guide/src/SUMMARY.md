@@ -115,6 +115,7 @@
   - [Networking]()
 - [Architecture](./reference/architecture.md)
   - [OpenVMM Architecture](./reference/architecture/openvmm.md)
+    - [Memory Management](./reference/architecture/openvmm/memory.md)
     - [mesh]()
     - [inspect]()
   - [OpenHCL Architecture](./reference/architecture/openhcl.md)

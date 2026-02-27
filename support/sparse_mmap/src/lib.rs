@@ -1,7 +1,37 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Memory-related abstractions.
+//! Low-level virtual memory abstractions for sparse guest memory mappings.
+//!
+//! This crate provides [`SparseMapping`], a cross-platform wrapper around a
+//! contiguous virtual address (VA) reservation that supports:
+//!
+//! - **File-backed mapping** via [`map_file()`](SparseMapping::map_file):
+//!   maps a slice of a [`Mappable`] (section handle on Windows, fd on Linux)
+//!   at a given offset within the reservation.
+//! - **Anonymous allocation** via [`alloc()`](SparseMapping::alloc):
+//!   replaces a placeholder region with committed anonymous pages.
+//! - **Commit / decommit** via [`commit()`](SparseMapping::commit) and
+//!   [`decommit()`](SparseMapping::decommit): controls the physical backing
+//!   of anonymous pages without tearing down the VA reservation. Used by
+//!   the private-memory backend to release and re-acquire physical pages.
+//! - **Unmapping** via [`unmap()`](SparseMapping::unmap): returns a range to
+//!   the uncommitted / placeholder state.
+//!
+//! # Platform Implementation
+//!
+//! - **Windows** (`windows` module): Uses `VirtualAlloc2` with
+//!   `MEM_RESERVE_PLACEHOLDER` for the initial reservation, then
+//!   `MEM_REPLACE_PLACEHOLDER` for allocations and `MapViewOfFile3` for
+//!   file mappings. Decommit uses `VirtualFreeEx(MEM_DECOMMIT)`, recommit
+//!   uses `VirtualAlloc(MEM_COMMIT)`.
+//! - **Linux** (`unix` module): Uses a single `mmap(PROT_NONE)` for the
+//!   reservation, then `mmap(MAP_FIXED)` to overlay file or anonymous
+//!   mappings. Decommit uses `madvise(MADV_DONTNEED)`.
+//!
+//! Also provides [`alloc_shared_memory()`] for creating a page-file-backed
+//! section (`CreateFileMappingW` on Windows, `memfd_create` on Linux) and
+//! [`SharedMem`](alloc::SharedMem) for a simple shared memory allocation.
 
 // UNSAFETY: Manual pointer manipulation, dealing with mmap, and a signal handler.
 #![expect(unsafe_code)]

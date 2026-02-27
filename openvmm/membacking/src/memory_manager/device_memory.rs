@@ -1,8 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! This implements the [`MemoryMapper`] trait and related functionality for
-//! [`GuestMemoryManager`](super::GuestMemoryManager).
+//! Device memory mapping — maps device-owned regions into guest address space.
+//!
+//! [`DeviceMemoryMapper`] implements the [`MemoryMapper`] trait, allowing
+//! device backends (NVMe, virtio-fs, GPU, etc.) to dynamically allocate
+//! guest-visible memory regions and map file-backed data into them.
+//!
+//! Each call to `new_region()` creates a [`RegionHandle`] (at device
+//! priority, which is lower than RAM priority) and returns a
+//! [`MappedMemoryRegion`] for adding / removing file-backed mappings and a
+//! [`MappableGuestMemory`] control for positioning the region in GPA space.
+//!
+//! This subsystem is orthogonal to the private-memory feature: device
+//! memory always uses file-backed [`Mappable`] objects, regardless of
+//! whether guest RAM is private or shared. Both coexist in the same
+//! [`VaMapper`](super::va_mapper::VaMapper) `SparseMapping`.
 
 use super::DEVICE_PRIORITY;
 use crate::mapping_manager::Mappable;

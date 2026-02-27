@@ -1,8 +1,34 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implements the region manager, which tracks regions and their mappings, as
-//! well as partitions to map the regions into.
+//! The region manager — tracks memory regions, their priority, and their
+//! mappings.
+//!
+//! A *region* is a fixed-length range of guest physical address space with a
+//! priority. Regions are the fundamental unit of memory layout management:
+//! RAM is modeled as one or more regions, device MMIO / VRAM windows are
+//! separate regions, and ROM BARs are yet another set. Higher-priority
+//! regions shadow lower-priority ones when they overlap.
+//!
+//! Each region contains zero or more *mappings* — each mapping associates a
+//! sub-range of the region with a slice of a [`Mappable`] (a file-backed
+//! section / fd). Many regions (e.g., RAM) have exactly one mapping that
+//! covers the entire region; others (e.g., a virtio-fs DAX window) may
+//! dynamically add and remove mappings.
+//!
+//! The region manager determines the *active set* of mappings — the set
+//! visible to the guest after priority resolution — and propagates changes
+//! to two downstream consumers:
+//!
+//! 1. The **mapping manager** receives active-mapping additions and removals
+//!    so that VA mappers can `map_file()` / `unmap()` accordingly.
+//! 2. The **partition mappers** receive map / unmap commands so that the
+//!    hypervisor's GPA → HVA translation tables stay in sync.
+//!
+//! In private-RAM mode, RAM regions are created normally but have no
+//! mappings added (since there is no file-backed `Mappable`). The region
+//! still gets mapped into the partition, pointing at the VaMapper's
+//! already-committed anonymous VA.
 
 use crate::mapping_manager::Mappable;
 use crate::mapping_manager::MappingManagerClient;

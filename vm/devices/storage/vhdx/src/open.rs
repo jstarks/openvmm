@@ -10,15 +10,24 @@
 use crate::AsyncFile;
 use crate::bat::BAT_TAG;
 use crate::bat::Bat;
+use crate::bat::BatState;
 use crate::bat::BlockMapping;
+use crate::bat::InternalBlockMapping;
 use crate::bat::METADATA_TAG;
 use crate::sector_bitmap::SBM_TAG;
+use crate::cache::AccessMode;
 use crate::cache::PageCache;
+use crate::cache::PageKey;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format;
+use crate::format::BatEntry;
+use crate::format::BatEntryState;
+use crate::format::CACHE_PAGE_SIZE;
+use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::FileIdentifier;
 use crate::format::Header;
+use crate::format::MB1;
 use crate::header::parse_headers;
 use crate::known_meta::read_known_metadata;
 use crate::known_meta::verify_known_metadata;
@@ -26,6 +35,7 @@ use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use guid::Guid;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::sync::Arc;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -82,9 +92,24 @@ pub struct VhdxFile<F: AsyncFile> {
     // Mutable header / write-mode state.
     pub(crate) write_state: Mutex<WriteState>,
 
-    // Region offsets (for future use)
-    #[allow(dead_code)] // Phase 9+: used for space management
-    bat_offset: u64,
+    // In-memory BAT state.
+    pub(crate) bat_state: RwLock<BatState>,
+
+    /// Serializes block allocation decisions. Only one allocation sequence
+    /// runs at a time. Uses futures::lock::Mutex because it may be held
+    /// across .await points.
+    pub(crate) allocation_lock: futures::lock::Mutex<()>,
+
+    /// Broadcast event notified when a TFP block completes post-allocation.
+    /// Writers that encounter a TFP block listen on this event and retry.
+    pub(crate) allocation_event: event_listener::Event,
+
+    /// In-memory EOF counter. Synchronous (no I/O) — initialized from file
+    /// size at open time, bumped synchronously during allocation.
+    pub(crate) eof_offset: Mutex<u64>,
+
+    // Region offsets
+    pub(crate) bat_offset: u64,
     #[allow(dead_code)] // Phase 9+: used for space management
     bat_length: u32,
     #[allow(dead_code)] // Phase 9+: used for metadata writes
@@ -162,7 +187,13 @@ impl<F: AsyncFile> VhdxFile<F> {
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
         cache.register_tag(SBM_TAG, 0);
 
-        // 13. Construct VhdxFile.
+        // 13. Load in-memory BAT from disk.
+        let bat_state = Self::load_bat_state(&cache, &bat).await?;
+
+        // 14. Initialize eof_offset from file size, rounded up to MB1.
+        let eof_offset = (file_length + MB1 - 1) & !(MB1 - 1);
+
+        // 15. Construct VhdxFile.
         Ok(VhdxFile {
             file,
             cache,
@@ -181,6 +212,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                 data_write_guid: header.data_write_guid,
                 first_header_current: header.first_header_current,
             }),
+            bat_state: RwLock::new(bat_state),
+            allocation_lock: futures::lock::Mutex::new(()),
+            allocation_event: event_listener::Event::new(),
+            eof_offset: Mutex::new(eof_offset),
             bat_offset: regions.bat_offset,
             bat_length: regions.bat_length,
             metadata_offset: regions.metadata_offset,
@@ -190,6 +225,81 @@ impl<F: AsyncFile> VhdxFile<F> {
             read_only,
             failed: None,
         })
+    }
+
+    /// Load the in-memory BAT state from disk BAT pages.
+    async fn load_bat_state(
+        cache: &PageCache<F>,
+        bat: &Bat,
+    ) -> Result<BatState, VhdxError> {
+        let mut payload_mappings = Vec::with_capacity(bat.data_block_count as usize);
+        let mut sector_bitmap_mappings = Vec::with_capacity(bat.sector_bitmap_block_count as usize);
+        let mut allocated_block_count: u32 = 0;
+
+        // Read all payload entries.
+        for block in 0..bat.data_block_count {
+            let entry_index = bat.payload_entry_index(block);
+            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
+            // Validate the entry state.
+            let raw_state = entry.state();
+            if BatEntryState::from_raw(raw_state).is_none() {
+                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
+            }
+            let internal = InternalBlockMapping::from_bat_entry(entry);
+            if raw_state == BatEntryState::FullyPresent as u8
+                || raw_state == BatEntryState::PartiallyPresent as u8
+            {
+                allocated_block_count += 1;
+            }
+            payload_mappings.push(internal);
+        }
+
+        // Read all sector bitmap entries.
+        for chunk in 0..bat.sector_bitmap_block_count {
+            let entry_index = bat.sector_bitmap_entry_index(chunk);
+            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
+            let raw_state = entry.state();
+            if BatEntryState::from_raw(raw_state).is_none() {
+                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
+            }
+            let internal = InternalBlockMapping::from_bat_entry(entry);
+            sector_bitmap_mappings.push(internal);
+        }
+
+        let total_bat_pages = bat.total_bat_pages();
+        Ok(BatState {
+            payload_mappings,
+            sector_bitmap_mappings,
+            allocated_block_count,
+            dirty_bat_pages: vec![false; total_bat_pages],
+        })
+    }
+
+    /// Read a single raw BAT entry from disk through the cache.
+    async fn read_bat_entry_raw(
+        cache: &PageCache<F>,
+        entry_index: u32,
+    ) -> Result<BatEntry, VhdxError> {
+        let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
+        let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
+
+        let guard = cache
+            .acquire(
+                PageKey {
+                    tag: BAT_TAG,
+                    offset: page_offset,
+                },
+                AccessMode::Read,
+            )
+            .await?;
+
+        let byte_offset = entry_within_page * size_of::<BatEntry>();
+        let entry_bytes = &guard[byte_offset..byte_offset + size_of::<BatEntry>()];
+        let entry = BatEntry::read_from_bytes(entry_bytes)
+            .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
+
+        guard.release().await?;
+        Ok(entry)
     }
 
     /// Virtual disk size in bytes.
@@ -538,5 +648,53 @@ mod tests {
         let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, true).await.unwrap();
         assert!(vhdx.is_read_only());
+    }
+
+    #[async_test]
+    async fn open_populates_in_memory_bat() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let bat_state = vhdx.bat_state.read();
+        // All payload entries should be NotPresent.
+        for (i, mapping) in bat_state.payload_mappings.iter().enumerate() {
+            assert_eq!(
+                mapping.state(),
+                BatEntryState::NotPresent as u8,
+                "block {i} should be NotPresent"
+            );
+        }
+        assert_eq!(bat_state.allocated_block_count, 0);
+        assert_eq!(
+            bat_state.payload_mappings.len(),
+            vhdx.bat.data_block_count as usize
+        );
+        assert_eq!(
+            bat_state.sector_bitmap_mappings.len(),
+            vhdx.bat.sector_bitmap_block_count as usize
+        );
+    }
+
+    #[async_test]
+    async fn open_with_allocated_blocks() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let regions = crate::region::parse_region_tables(&file).await.unwrap();
+
+        // Manually write a FullyPresent BAT entry for block 0 at offset 100 MB.
+        let entry = BatEntry::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_offset_mb(100);
+        file.write_at(regions.bat_offset, entry.as_bytes())
+            .await
+            .unwrap();
+
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let bat_state = vhdx.bat_state.read();
+        assert_eq!(
+            bat_state.payload_mappings[0].state(),
+            BatEntryState::FullyPresent as u8,
+        );
+        assert_eq!(bat_state.payload_mappings[0].file_megabyte(), 100);
+        assert_eq!(bat_state.allocated_block_count, 1);
     }
 }

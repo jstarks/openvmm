@@ -236,8 +236,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut header =
-            Header::read_from_prefix(&buf).unwrap().0.clone();
+        let mut header = Header::read_from_prefix(&buf).unwrap().0.clone();
         header.log_offset = 12345; // Not aligned to REGION_ALIGNMENT.
         header.log_length = format::REGION_ALIGNMENT as u32;
         header.sequence_number = 100; // Make this the winning header.

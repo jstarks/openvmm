@@ -5,14 +5,14 @@ pub mod support;
 
 #[cfg(test)]
 mod integration {
+    use crate::AsyncFile;
     use crate::create::{self, CreateParams};
+    use crate::format;
     use crate::header;
     use crate::known_meta;
     use crate::metadata::MetadataTable;
     use crate::region;
     use crate::tests::support::InMemoryFile;
-    use crate::format;
-    use crate::AsyncFile;
     use guid::Guid;
     use pal_async::async_test;
 
@@ -44,13 +44,9 @@ mod integration {
         assert!(regions.metadata_offset > 0);
 
         // 3. Read metadata table.
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         // 4. Verify known metadata.
         known_meta::verify_known_metadata(&table, false).unwrap();
@@ -82,13 +78,9 @@ mod integration {
 
         let _header = header::parse_headers(&file, file_length).await.unwrap();
         let regions = region::parse_region_tables(&file).await.unwrap();
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         known_meta::verify_known_metadata(&table, false).unwrap();
         let meta = known_meta::read_known_metadata(&file, &table, regions.metadata_offset)

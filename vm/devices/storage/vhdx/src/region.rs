@@ -57,9 +57,7 @@ async fn read_and_validate_region_table(
 
 /// Read both region tables from the file, validate, and extract BAT/metadata
 /// region locations.
-pub(crate) async fn parse_region_tables(
-    file: &impl AsyncFile,
-) -> Result<ParsedRegions, VhdxError> {
+pub(crate) async fn parse_region_tables(file: &impl AsyncFile) -> Result<ParsedRegions, VhdxError> {
     let table1 = read_and_validate_region_table(file, format::REGION_TABLE_OFFSET).await?;
     let table2 = read_and_validate_region_table(file, format::ALT_REGION_TABLE_OFFSET).await?;
 
@@ -89,11 +87,10 @@ pub(crate) async fn parse_region_tables(
     let mut entries = Vec::with_capacity(header.entry_count as usize);
     for i in 0..header.entry_count as usize {
         let offset = header_size + i * entry_size;
-        let entry =
-            RegionTableEntry::read_from_prefix(&table_buf[offset..])
-                .unwrap()
-                .0
-                .clone();
+        let entry = RegionTableEntry::read_from_prefix(&table_buf[offset..])
+            .unwrap()
+            .0
+            .clone();
         entries.push(entry);
     }
 
@@ -182,7 +179,10 @@ mod tests {
 
         // Metadata at 2 MiB, BAT at 3 MiB (based on create layout).
         assert_eq!(regions.metadata_offset, 2 * format::MB1);
-        assert_eq!(regions.metadata_length, format::DEFAULT_METADATA_REGION_SIZE);
+        assert_eq!(
+            regions.metadata_length,
+            format::DEFAULT_METADATA_REGION_SIZE
+        );
         assert_eq!(regions.bat_offset, 3 * format::MB1);
         assert!(!regions.needs_rewrite);
     }
@@ -271,7 +271,9 @@ mod tests {
         let result = parse_region_tables(&file).await;
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::MissingBatOrMetadataRegion))
+            Err(VhdxError::Corrupt(
+                CorruptionType::MissingBatOrMetadataRegion
+            ))
         ));
     }
 
@@ -324,7 +326,9 @@ mod tests {
         let result = parse_region_tables(&file).await;
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::OffsetOrLengthInRegionTable))
+            Err(VhdxError::Corrupt(
+                CorruptionType::OffsetOrLengthInRegionTable
+            ))
         ));
     }
 }

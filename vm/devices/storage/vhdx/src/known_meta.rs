@@ -252,13 +252,9 @@ mod tests {
     async fn read_known_metadata_from_created_file() {
         let (file, params) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         let meta = read_known_metadata(&file, &table, regions.metadata_offset)
             .await
@@ -277,13 +273,9 @@ mod tests {
     async fn verify_known_metadata_all_known() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         // All standard entries should be recognized.
         verify_known_metadata(&table, false).unwrap();
@@ -326,13 +318,9 @@ mod tests {
 
         file.write_at(regions.metadata_offset, &buf).await.unwrap();
 
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         let result = verify_known_metadata(&table, false);
         assert!(matches!(
@@ -376,13 +364,9 @@ mod tests {
 
         file.write_at(regions.metadata_offset, &buf).await.unwrap();
 
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         // With allow_incomplete=false, should fail.
         let result = verify_known_metadata(&table, false);
@@ -399,13 +383,9 @@ mod tests {
     async fn validate_block_size_power_of_two() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         // Overwrite file parameters with a non-power-of-2 block size.
         let entry = table
@@ -432,13 +412,9 @@ mod tests {
     async fn validate_sector_sizes() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
-        let table = MetadataTable::read(
-            &file,
-            regions.metadata_offset,
-            regions.metadata_length,
-        )
-        .await
-        .unwrap();
+        let table = MetadataTable::read(&file, regions.metadata_offset, regions.metadata_length)
+            .await
+            .unwrap();
 
         // Overwrite logical sector size with an invalid value.
         let entry = table

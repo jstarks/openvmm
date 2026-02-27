@@ -156,17 +156,12 @@ impl ParentLocator {
 /// Helper to encode a Rust string into a UTF-16LE byte vector.
 #[cfg(test)]
 fn encode_utf16le(s: &str) -> Vec<u8> {
-    s.encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect()
+    s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
 }
 
 /// Build a valid parent locator binary blob from parts.
 #[cfg(test)]
-fn build_locator(
-    locator_type: Guid,
-    kvs: &[(&str, &str)],
-) -> Vec<u8> {
+fn build_locator(locator_type: Guid, kvs: &[(&str, &str)]) -> Vec<u8> {
     use zerocopy::IntoBytes;
 
     let header_size = size_of::<ParentLocatorHeader>();
@@ -245,10 +240,7 @@ mod tests {
     fn find_by_key() {
         let data = build_locator(
             format::PARENT_LOCATOR_VHDX_TYPE_GUID,
-            &[
-                ("parent_linkage", "link-val"),
-                ("relative_path", "rel-val"),
-            ],
+            &[("parent_linkage", "link-val"), ("relative_path", "rel-val")],
         );
 
         let locator = ParentLocator::parse(&data).unwrap();
@@ -270,7 +262,9 @@ mod tests {
         let result = ParentLocator::parse(&data);
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::InvalidLocatorKeyValueCount))
+            Err(VhdxError::Corrupt(
+                CorruptionType::InvalidLocatorKeyValueCount
+            ))
         ));
     }
 
@@ -370,7 +364,9 @@ mod tests {
         let result = ParentLocator::parse(&data);
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::LocatorTooSmallForEntries))
+            Err(VhdxError::Corrupt(
+                CorruptionType::LocatorTooSmallForEntries
+            ))
         ));
     }
 }

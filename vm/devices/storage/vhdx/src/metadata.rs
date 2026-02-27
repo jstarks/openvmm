@@ -197,8 +197,8 @@ impl MetadataTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::support::InMemoryFile;
     use crate::region;
+    use crate::tests::support::InMemoryFile;
     use pal_async::async_test;
     use zerocopy::IntoBytes;
 
@@ -226,26 +226,38 @@ mod tests {
             .unwrap();
 
         // Known GUIDs should be found.
-        assert!(table
-            .find_entry(false, &format::FILE_PARAMETERS_ITEM_GUID)
-            .is_some());
-        assert!(table
-            .find_entry(false, &format::VIRTUAL_DISK_SIZE_ITEM_GUID)
-            .is_some());
-        assert!(table
-            .find_entry(false, &format::LOGICAL_SECTOR_SIZE_ITEM_GUID)
-            .is_some());
-        assert!(table
-            .find_entry(false, &format::PHYSICAL_SECTOR_SIZE_ITEM_GUID)
-            .is_some());
-        assert!(table
-            .find_entry(false, &format::PAGE_83_ITEM_GUID)
-            .is_some());
+        assert!(
+            table
+                .find_entry(false, &format::FILE_PARAMETERS_ITEM_GUID)
+                .is_some()
+        );
+        assert!(
+            table
+                .find_entry(false, &format::VIRTUAL_DISK_SIZE_ITEM_GUID)
+                .is_some()
+        );
+        assert!(
+            table
+                .find_entry(false, &format::LOGICAL_SECTOR_SIZE_ITEM_GUID)
+                .is_some()
+        );
+        assert!(
+            table
+                .find_entry(false, &format::PHYSICAL_SECTOR_SIZE_ITEM_GUID)
+                .is_some()
+        );
+        assert!(
+            table
+                .find_entry(false, &format::PAGE_83_ITEM_GUID)
+                .is_some()
+        );
 
         // Unknown GUID should not be found.
-        assert!(table
-            .find_entry(false, &format::PARENT_LOCATOR_ITEM_GUID)
-            .is_none());
+        assert!(
+            table
+                .find_entry(false, &format::PARENT_LOCATOR_ITEM_GUID)
+                .is_none()
+        );
     }
 
     #[async_test]

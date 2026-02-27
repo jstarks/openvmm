@@ -11,6 +11,7 @@ use crate::AsyncFile;
 use crate::bat;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
+use crate::format;
 use crate::format::BatEntryState;
 use crate::open::VhdxFile;
 use crate::open::WriteMode;
@@ -121,7 +122,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 len - current_offset,
             );
 
-            let mapping = self.get_block_mapping(block_number).await?;
+            let mapping = self.get_block_mapping(block_number);
 
             match mapping.state {
                 BatEntryState::FullyPresent => {
@@ -135,7 +136,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 BatEntryState::PartiallyPresent => {
                     sector_bitmap::resolve_partial_block_read(
                         &self.cache,
-                        &self.bat,
+                        self,
                         mapping.file_offset,
                         self.block_size,
                         self.logical_sector_size,
@@ -231,7 +232,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 len - current_offset,
             );
 
-            let mapping = self.get_block_mapping(block_number).await?;
+            let mapping = self.get_block_mapping(block_number);
 
             match mapping.state {
                 BatEntryState::FullyPresent => {
@@ -294,6 +295,20 @@ impl<F: AsyncFile> VhdxFile<F> {
                             new_offset,
                         )
                         .await?;
+
+                    // Update the in-memory BAT to match.
+                    {
+                        use crate::bat::InternalBlockMapping;
+                        let internal = InternalBlockMapping::new()
+                            .with_state(BatEntryState::FullyPresent as u8)
+                            .with_file_megabyte((new_offset / format::MB1) as u32);
+                        let mut bat_state = self.bat_state.write();
+                        bat_state.set_payload_mapping(
+                            &self.bat,
+                            block_number,
+                            internal,
+                        );
+                    }
                 }
             }
 
@@ -335,13 +350,13 @@ impl<F: AsyncFile> VhdxFile<F> {
                 len - current_offset,
             );
 
-            let mapping = self.get_block_mapping(block_number).await?;
+            let mapping = self.get_block_mapping(block_number);
 
             if mapping.state == BatEntryState::PartiallyPresent {
                 // Set sector bitmap bits for the written sectors.
                 sector_bitmap::set_sector_bitmap_bits(
                     &self.cache,
-                    &self.bat,
+                    self,
                     virtual_offset,
                     block_length,
                     self.logical_sector_size,

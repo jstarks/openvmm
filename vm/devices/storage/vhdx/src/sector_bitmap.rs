@@ -12,7 +12,7 @@
 //! covers `4096 * 8 = 32768` sectors.
 
 use crate::AsyncFile;
-use crate::bat::Bat;
+use crate::bat::BlockMapping;
 use crate::cache::AccessMode;
 use crate::cache::PageCache;
 use crate::cache::PageKey;
@@ -22,6 +22,7 @@ use crate::format::BatEntryState;
 use crate::format::CACHE_PAGE_SIZE;
 use crate::format::SECTORS_PER_CHUNK;
 use crate::io::ReadRange;
+use crate::open::VhdxFile;
 
 /// Cache tag for sector bitmap pages.
 ///
@@ -59,7 +60,7 @@ fn find_bit(page: &[u8], start: u64, end: u64, set: bool) -> u64 {
 /// # Arguments
 ///
 /// * `cache` - The page cache for reading SBM pages.
-/// * `bat` - The BAT manager (to look up the SBM block mapping).
+/// * `vhdx` - The open VhdxFile (for synchronous SBM mapping lookup).
 /// * `data_file_offset` - The file offset of the data block (from the
 ///   payload BAT entry). Used to compute file offsets for present sectors.
 /// * `block_size` - The block size in bytes.
@@ -70,7 +71,7 @@ fn find_bit(page: &[u8], start: u64, end: u64, set: bool) -> u64 {
 /// * `ranges` - Output vector to append ranges to.
 pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
     cache: &PageCache<F>,
-    bat: &Bat,
+    vhdx: &VhdxFile<F>,
     data_file_offset: u64,
     block_size: u32,
     logical_sector_size: u32,
@@ -83,8 +84,8 @@ pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
     let chunk_number = (sector_number / SECTORS_PER_CHUNK) as u32;
     let sector_count = length as u64 / logical_sector_size as u64;
 
-    // 2. Get sector bitmap block mapping.
-    let sbm_mapping = bat.get_sector_bitmap_mapping(cache, chunk_number).await?;
+    // 2. Get sector bitmap block mapping (synchronous).
+    let sbm_mapping = vhdx.get_sector_bitmap_mapping(chunk_number);
     if sbm_mapping.state != BatEntryState::FullyPresent {
         return Err(VhdxError::Corrupt(
             CorruptionType::UnallocatedSectorBitmapBlock,
@@ -175,7 +176,7 @@ pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
 /// # Arguments
 ///
 /// * `cache` - The page cache for reading/writing SBM pages.
-/// * `bat` - The BAT manager (to look up the SBM block mapping).
+/// * `vhdx` - The open VhdxFile (for synchronous SBM mapping lookup).
 /// * `virtual_offset` - Virtual disk byte offset of the start of the range.
 /// * `length` - Length in bytes.
 /// * `logical_sector_size` - Logical sector size in bytes.
@@ -183,7 +184,7 @@ pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
 /// * `set` - If true, set bits (mark sectors present); if false, clear bits.
 pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
     cache: &PageCache<F>,
-    bat: &Bat,
+    vhdx: &VhdxFile<F>,
     virtual_offset: u64,
     length: u32,
     logical_sector_size: u32,
@@ -194,8 +195,8 @@ pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
     let chunk_number = (sector_number / SECTORS_PER_CHUNK) as u32;
     let sector_count = length as u64 / logical_sector_size as u64;
 
-    // Get sector bitmap block mapping.
-    let sbm_mapping = bat.get_sector_bitmap_mapping(cache, chunk_number).await?;
+    // Get sector bitmap block mapping (synchronous).
+    let sbm_mapping = vhdx.get_sector_bitmap_mapping(chunk_number);
     if sbm_mapping.state != BatEntryState::FullyPresent {
         return Err(VhdxError::Corrupt(
             CorruptionType::UnallocatedSectorBitmapBlock,
@@ -248,6 +249,7 @@ pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bat::Bat;
     use crate::create::{self, CreateParams};
     use crate::format;
     use crate::format::BatEntry;
@@ -636,7 +638,7 @@ mod tests {
         // Set bits for sectors 0-3 (first 2048 bytes).
         set_sector_bitmap_bits(
             &vhdx.cache,
-            &vhdx.bat,
+            &vhdx,
             0,    // virtual_offset
             2048, // length (4 sectors * 512)
             512,  // logical_sector_size

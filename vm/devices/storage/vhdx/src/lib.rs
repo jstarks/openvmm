@@ -16,6 +16,7 @@
 #![allow(missing_docs)]
 #![allow(async_fn_in_trait)]
 
+pub(crate) mod bat;
 pub(crate) mod cache;
 pub mod create;
 pub mod error;
@@ -24,11 +25,13 @@ pub(crate) mod header;
 pub(crate) mod known_meta;
 pub(crate) mod locator;
 pub(crate) mod metadata;
+pub mod open;
 pub(crate) mod region;
 
 pub use error::CorruptionType;
 pub use error::InvalidFormatReason;
 pub use error::VhdxError;
+pub use open::VhdxFile;
 
 #[cfg(test)]
 mod tests;

@@ -205,11 +205,10 @@ pub async fn create(
 
     // Generate random GUIDs for the headers.
     let file_write_guid = Guid::new_random();
-    let data_write_guid = if params.data_write_guid != Guid::ZERO {
-        params.data_write_guid
-    } else {
-        Guid::new_random()
-    };
+    if params.data_write_guid == Guid::ZERO {
+        params.data_write_guid = Guid::new_random();
+    }
+    let data_write_guid = params.data_write_guid;
 
     // Header 1 (sequence number 0).
     let mut header = Header::new_zeroed();

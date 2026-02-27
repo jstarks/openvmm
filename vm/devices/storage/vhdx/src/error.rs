@@ -297,4 +297,9 @@ pub enum CorruptionType {
     /// The file is unreasonably large (exceeds implementation limits).
     #[error("file size exceeds implementation limits")]
     HugeFile,
+
+    /// The log GUID is non-zero, indicating log replay is required.
+    /// Log replay is not yet implemented.
+    #[error("log replay required (log GUID is non-zero)")]
+    LogReplayRequired,
 }

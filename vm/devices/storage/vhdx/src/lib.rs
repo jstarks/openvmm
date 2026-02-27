@@ -34,6 +34,7 @@ pub use error::CorruptionType;
 pub use error::InvalidFormatReason;
 pub use error::VhdxError;
 pub use io::ReadRange;
+pub use io::WriteRange;
 pub use open::VhdxFile;
 
 #[cfg(test)]

@@ -22,6 +22,10 @@ pub enum VhdxError {
     /// A parameter validation error.
     #[error("invalid format parameters")]
     InvalidFormat(#[from] InvalidFormatReason),
+
+    /// A write was attempted on a read-only file.
+    #[error("VHDX file is opened read-only")]
+    ReadOnly,
 }
 
 /// Specific reasons a VHDX creation or parameter validation may fail.

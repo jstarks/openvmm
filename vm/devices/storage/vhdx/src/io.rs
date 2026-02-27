@@ -46,6 +46,30 @@ pub enum ReadRange {
     },
 }
 
+/// Resolved range from a write operation.
+///
+/// Each range describes a contiguous portion of the write target and
+/// what the caller needs to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteRange {
+    /// Write caller's data at this file offset.
+    Data {
+        /// Byte offset within the virtual disk.
+        guest_offset: u64,
+        /// Length in bytes.
+        length: u32,
+        /// Byte offset within the VHDX file where data should be written.
+        file_offset: u64,
+    },
+    /// Zero-fill this file range (e.g. newly allocated block padding).
+    Zero {
+        /// Byte offset within the VHDX file to zero-fill.
+        file_offset: u64,
+        /// Length in bytes.
+        length: u32,
+    },
+}
+
 impl<F: AsyncFile> VhdxFile<F> {
     /// Resolve a read request into file-level ranges.
     ///

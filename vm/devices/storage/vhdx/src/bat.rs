@@ -175,6 +175,7 @@ impl BatState {
     /// Update the in-memory mapping for a sector bitmap block.
     ///
     /// Does NOT mark the BAT page dirty — callers decide when to mark dirty.
+    #[allow(dead_code)] // will be used by allocation write path in a later phase
     pub fn set_sbm_mapping(
         &mut self,
         bat: &Bat,
@@ -213,6 +214,7 @@ impl BatState {
     }
 
     /// Total number of BAT pages.
+    #[allow(dead_code)] // will be used by BAT write-back in a later phase
     pub fn total_bat_pages(&self) -> usize {
         self.dirty_bat_pages.len()
     }
@@ -367,6 +369,7 @@ impl Bat {
     }
 
     /// Look up the mapping for a sector bitmap block, reading from the cache.
+    #[allow(dead_code)] // superseded by VhdxFile::get_sector_bitmap_mapping; kept for reference
     pub async fn get_sector_bitmap_mapping<F: AsyncFile>(
         &self,
         cache: &PageCache<F>,
@@ -487,6 +490,7 @@ impl Bat {
     }
 
     /// Parse and validate a sector bitmap BAT entry.
+    #[allow(dead_code)] // used by get_sector_bitmap_mapping above
     fn parse_sector_bitmap_entry(&self, entry: BatEntry) -> Result<BlockMapping, VhdxError> {
         let raw_state = entry.state();
         let state = BatEntryState::from_raw(raw_state)

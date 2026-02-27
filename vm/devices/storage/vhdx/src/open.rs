@@ -98,10 +98,12 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Serializes block allocation decisions. Only one allocation sequence
     /// runs at a time. Uses futures::lock::Mutex because it may be held
     /// across .await points.
+    #[allow(dead_code)] // will be used by allocation write path in a later phase
     pub(crate) allocation_lock: futures::lock::Mutex<()>,
 
     /// Broadcast event notified when a TFP block completes post-allocation.
     /// Writers that encounter a TFP block listen on this event and retry.
+    #[allow(dead_code)] // will be used by allocation write path in a later phase
     pub(crate) allocation_event: event_listener::Event,
 
     /// In-memory EOF counter. Synchronous (no I/O) — initialized from file
@@ -109,6 +111,7 @@ pub struct VhdxFile<F: AsyncFile> {
     pub(crate) eof_offset: Mutex<u64>,
 
     // Region offsets
+    #[allow(dead_code)] // will be used by BAT write-back in a later phase
     pub(crate) bat_offset: u64,
     #[allow(dead_code)] // Phase 9+: used for space management
     bat_length: u32,
@@ -363,7 +366,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Synchronous — no I/O. Called under `allocation_lock`.
     pub(crate) fn allocate_space(&self, size: u32) -> u64 {
         debug_assert!(
-            size as u64 % MB1 == 0,
+            (size as u64).is_multiple_of(MB1),
             "allocation size must be MB1-aligned"
         );
         let mut eof = self.eof_offset.lock();
@@ -538,10 +541,10 @@ mod tests {
     #[async_test]
     async fn open_various_block_sizes() {
         for &block_size in &[
-            format::MB1 as u32,
-            2 * format::MB1 as u32,
-            32 * format::MB1 as u32,
-            256 * format::MB1 as u32,
+            MB1 as u32,
+            2 * MB1 as u32,
+            32 * MB1 as u32,
+            256 * MB1 as u32,
         ] {
             let file = InMemoryFile::new(0);
             let mut params = CreateParams {
@@ -649,7 +652,7 @@ mod tests {
 
     #[async_test]
     async fn open_bat_all_blocks_default() {
-        let disk_size = 4 * format::MB1; // Small disk → 2 blocks.
+        let disk_size = 4 * MB1; // Small disk → 2 blocks.
         let file = InMemoryFile::new(0);
         let mut params = CreateParams {
             disk_size,
@@ -702,7 +705,7 @@ mod tests {
     #[async_test]
     async fn open_with_allocated_blocks() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let regions = crate::region::parse_region_tables(&file).await.unwrap();
+        let regions = parse_region_tables(&file).await.unwrap();
 
         // Manually write a FullyPresent BAT entry for block 0 at offset 100 MB.
         let entry = BatEntry::new()
@@ -736,18 +739,18 @@ mod tests {
     async fn eof_counter_no_overlap() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
-        let a = vhdx.allocate_space(format::MB1 as u32);
-        let b = vhdx.allocate_space(format::MB1 as u32);
+        let a = vhdx.allocate_space(MB1 as u32);
+        let b = vhdx.allocate_space(MB1 as u32);
         // Two allocations must not overlap.
         assert_ne!(a, b);
-        assert!(b >= a + format::MB1);
+        assert!(b >= a + MB1);
     }
 
     #[async_test]
     async fn eof_counter_mb_aligned() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
-        let offset = vhdx.allocate_space(format::MB1 as u32);
-        assert_eq!(offset % format::MB1, 0, "offset must be MB1-aligned");
+        let offset = vhdx.allocate_space(MB1 as u32);
+        assert_eq!(offset % MB1, 0, "offset must be MB1-aligned");
     }
 }

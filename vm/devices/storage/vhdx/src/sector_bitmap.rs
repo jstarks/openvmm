@@ -12,7 +12,6 @@
 //! covers `4096 * 8 = 32768` sectors.
 
 use crate::AsyncFile;
-use crate::bat::BlockMapping;
 use crate::cache::AccessMode;
 use crate::cache::PageCache;
 use crate::cache::PageKey;

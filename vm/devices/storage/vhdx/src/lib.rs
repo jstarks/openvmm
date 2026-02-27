@@ -19,6 +19,11 @@
 pub mod create;
 pub mod error;
 pub mod format;
+pub(crate) mod header;
+pub(crate) mod known_meta;
+pub(crate) mod locator;
+pub(crate) mod metadata;
+pub(crate) mod region;
 
 pub use error::CorruptionType;
 pub use error::InvalidFormatReason;

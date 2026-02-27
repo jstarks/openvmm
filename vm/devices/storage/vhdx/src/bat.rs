@@ -21,7 +21,6 @@ use crate::format::BatEntryState;
 use crate::format::CACHE_PAGE_SIZE;
 use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::MB1;
-use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 /// Cache tag for BAT region pages.
@@ -357,29 +356,6 @@ impl Bat {
         mapping
     }
 
-    /// Look up the mapping for a data block, reading from the cache.
-    pub async fn get_block_mapping<F: AsyncFile>(
-        &self,
-        cache: &PageCache<F>,
-        block_number: u32,
-    ) -> Result<BlockMapping, VhdxError> {
-        let entry_index = self.payload_entry_index(block_number);
-        let raw = self.read_bat_entry(cache, entry_index).await?;
-        self.parse_payload_entry(raw)
-    }
-
-    /// Look up the mapping for a sector bitmap block, reading from the cache.
-    #[allow(dead_code)] // superseded by VhdxFile::get_sector_bitmap_mapping; kept for reference
-    pub async fn get_sector_bitmap_mapping<F: AsyncFile>(
-        &self,
-        cache: &PageCache<F>,
-        chunk_number: u32,
-    ) -> Result<BlockMapping, VhdxError> {
-        let entry_index = self.sector_bitmap_entry_index(chunk_number);
-        let raw = self.read_bat_entry(cache, entry_index).await?;
-        self.parse_sector_bitmap_entry(raw)
-    }
-
     /// Convert a virtual disk byte offset to a block number.
     pub fn offset_to_block(&self, offset: u64) -> u32 {
         (offset / self.block_size as u64) as u32
@@ -388,34 +364,6 @@ impl Bat {
     /// Compute the byte offset within a block for a given virtual disk offset.
     pub fn offset_within_block(&self, offset: u64) -> u32 {
         (offset % self.block_size as u64) as u32
-    }
-
-    /// Read a raw BAT entry from the cache at the given entry index.
-    async fn read_bat_entry<F: AsyncFile>(
-        &self,
-        cache: &PageCache<F>,
-        entry_index: u32,
-    ) -> Result<BatEntry, VhdxError> {
-        let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
-        let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
-
-        let guard = cache
-            .acquire(
-                PageKey {
-                    tag: BAT_TAG,
-                    offset: page_offset,
-                },
-                AccessMode::Read,
-            )
-            .await?;
-
-        let byte_offset = entry_within_page * size_of::<BatEntry>();
-        let entry_bytes = &guard[byte_offset..byte_offset + size_of::<BatEntry>()];
-        let entry = BatEntry::read_from_bytes(entry_bytes)
-            .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
-
-        guard.release().await?;
-        Ok(entry)
     }
 
     /// Parse and validate a payload BAT entry.
@@ -489,34 +437,6 @@ impl Bat {
         }
     }
 
-    /// Parse and validate a sector bitmap BAT entry.
-    #[allow(dead_code)] // used by get_sector_bitmap_mapping above
-    fn parse_sector_bitmap_entry(&self, entry: BatEntry) -> Result<BlockMapping, VhdxError> {
-        let raw_state = entry.state();
-        let state = BatEntryState::from_raw(raw_state)
-            .ok_or(VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
-        let file_offset = entry.file_offset();
-
-        match state {
-            BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => {
-                // PartiallyPresent treated as FullyPresent for SBM entries
-                // (compatibility quirk).
-                if file_offset == 0 {
-                    return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-                }
-                Ok(BlockMapping {
-                    state: BatEntryState::FullyPresent,
-                    file_offset,
-                })
-            }
-            BatEntryState::NotPresent => Ok(BlockMapping {
-                state: BatEntryState::NotPresent,
-                file_offset: 0,
-            }),
-            _ => Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState)),
-        }
-    }
-
     /// Write a raw BAT entry to the cache at the given entry index.
     ///
     /// Acquires the page in Modify mode, writes the entry at the correct
@@ -548,51 +468,6 @@ impl Bat {
         Ok(())
     }
 
-    /// Update the BAT entry for a data block with the given state and file offset.
-    ///
-    /// Constructs a `BatEntry` and writes it through the cache.
-    pub async fn set_block_mapping<F: AsyncFile>(
-        &self,
-        cache: &PageCache<F>,
-        block_number: u32,
-        state: BatEntryState,
-        file_offset: u64,
-    ) -> Result<(), VhdxError> {
-        let file_offset_mb = file_offset / MB1;
-
-        // Validate: FullyPresent and PartiallyPresent require non-zero offset.
-        match state {
-            BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => {
-                debug_assert!(file_offset_mb > 0, "present block must have non-zero offset");
-            }
-            BatEntryState::Zero | BatEntryState::NotPresent => {
-                debug_assert_eq!(file_offset_mb, 0, "zero/not-present block must have zero offset");
-            }
-            _ => {}
-        }
-
-        let entry = BatEntry::new()
-            .with_state(state as u8)
-            .with_file_offset_mb(file_offset_mb);
-
-        let entry_index = self.payload_entry_index(block_number);
-        self.write_bat_entry(cache, entry_index, entry).await
-    }
-}
-
-/// Allocate a new block by extending the file to the next MB-aligned boundary.
-///
-/// Returns the file offset of the newly allocated block.
-pub(crate) async fn allocate_block_eof<F: AsyncFile>(
-    file: &F,
-    block_size: u32,
-) -> Result<u64, VhdxError> {
-    let current_size = file.file_size().await.map_err(VhdxError::Io)?;
-    // Round up to next MB boundary.
-    let aligned_offset = (current_size + MB1 - 1) & !(MB1 - 1);
-    let new_size = aligned_offset + block_size as u64;
-    file.set_file_size(new_size).await.map_err(VhdxError::Io)?;
-    Ok(aligned_offset)
 }
 
 #[cfg(test)]
@@ -697,42 +572,6 @@ mod tests {
         ));
     }
 
-    #[async_test]
-    async fn get_block_mapping_default() {
-        // Create a VHDX, set up cache, look up block 0 → should be NotPresent.
-        let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let regions = region::parse_region_tables(&file).await.unwrap();
-
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let mut cache = PageCache::new(Arc::new(file));
-        cache.register_tag(BAT_TAG, regions.bat_offset);
-
-        let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
-        assert_eq!(mapping.state, BatEntryState::NotPresent);
-        assert_eq!(mapping.file_offset, 0);
-    }
-
-    #[async_test]
-    async fn get_block_mapping_fully_present() {
-        // Create a VHDX, manually write a FullyPresent BAT entry, look it up.
-        let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let regions = region::parse_region_tables(&file).await.unwrap();
-
-        // Write a FullyPresent entry for block 0 at the BAT region start.
-        let entry = BatEntry::new().with_state(6).with_file_offset_mb(100);
-        file.write_at(regions.bat_offset, entry.as_bytes())
-            .await
-            .unwrap();
-
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let mut cache = PageCache::new(Arc::new(file));
-        cache.register_tag(BAT_TAG, regions.bat_offset);
-
-        let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
-        assert_eq!(mapping.state, BatEntryState::FullyPresent);
-        assert_eq!(mapping.file_offset, 100 * MB1);
-    }
-
     #[test]
     fn offset_to_block_calculations() {
         let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
@@ -783,88 +622,6 @@ mod tests {
             result,
             Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState))
         ));
-    }
-
-    #[async_test]
-    async fn get_block_mapping_all_blocks_default() {
-        // Create a VHDX, verify all blocks are NotPresent.
-        let disk_size = 4 * MB1; // small disk: 2 blocks with 2 MiB block size
-        let file = InMemoryFile::new(0);
-        let mut params = create::CreateParams {
-            disk_size,
-            ..Default::default()
-        };
-        create::create(&file, &mut params).await.unwrap();
-
-        let regions = region::parse_region_tables(&file).await.unwrap();
-        let bat = Bat::new(disk_size, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let mut cache = PageCache::new(Arc::new(file));
-        cache.register_tag(BAT_TAG, regions.bat_offset);
-
-        for block in 0..bat.data_block_count {
-            let mapping = bat.get_block_mapping(&cache, block).await.unwrap();
-            assert_eq!(mapping.state, BatEntryState::NotPresent);
-            assert_eq!(mapping.file_offset, 0);
-        }
-    }
-
-    #[async_test]
-    async fn write_bat_entry_roundtrip() {
-        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let regions = region::parse_region_tables(&file).await.unwrap();
-
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let file = Arc::new(file);
-        let mut cache = PageCache::new(file.clone());
-        cache.register_tag(BAT_TAG, regions.bat_offset);
-
-        // Block 0 should start as NotPresent.
-        let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
-        assert_eq!(mapping.state, BatEntryState::NotPresent);
-
-        // Write a FullyPresent entry at file_offset = 50 MiB.
-        bat.set_block_mapping(
-            &cache,
-            0,
-            BatEntryState::FullyPresent,
-            50 * MB1,
-        )
-        .await
-        .unwrap();
-
-        // Read it back.
-        let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
-        assert_eq!(mapping.state, BatEntryState::FullyPresent);
-        assert_eq!(mapping.file_offset, 50 * MB1);
-    }
-
-    #[async_test]
-    async fn allocate_block_eof_test() {
-        let file = InMemoryFile::new(0);
-        let mut params = create::CreateParams {
-            disk_size: 4 * MB1,
-            ..Default::default()
-        };
-        create::create(&file, &mut params).await.unwrap();
-
-        let initial_size = file.file_size().await.unwrap();
-
-        // Allocate a 2 MiB block.
-        let offset = allocate_block_eof(&file, format::DEFAULT_BLOCK_SIZE).await.unwrap();
-
-        // Offset should be MB-aligned and >= initial size.
-        assert!(offset >= initial_size);
-        assert_eq!(offset % MB1, 0);
-
-        // File should have grown by block_size.
-        let new_size = file.file_size().await.unwrap();
-        assert_eq!(new_size, offset + format::DEFAULT_BLOCK_SIZE as u64);
-
-        // Second allocation should be after the first.
-        let offset2 = allocate_block_eof(&file, format::DEFAULT_BLOCK_SIZE).await.unwrap();
-        assert!(offset2 > offset);
-        assert_eq!(offset2 % MB1, 0);
-        assert_eq!(offset2, offset + format::DEFAULT_BLOCK_SIZE as u64);
     }
 
     #[test]

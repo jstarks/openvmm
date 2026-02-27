@@ -99,12 +99,10 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Serializes block allocation decisions. Only one allocation sequence
     /// runs at a time. Uses futures::lock::Mutex because it may be held
     /// across .await points.
-    #[allow(dead_code)] // will be used by allocation write path in a later phase
     pub(crate) allocation_lock: futures::lock::Mutex<()>,
 
     /// Broadcast event notified when a TFP block completes post-allocation.
     /// Writers that encounter a TFP block listen on this event and retry.
-    #[allow(dead_code)] // will be used by allocation write path in a later phase
     pub(crate) allocation_event: event_listener::Event,
 
     /// In-memory EOF counter. Synchronous (no I/O) — initialized from file
@@ -112,7 +110,6 @@ pub struct VhdxFile<F: AsyncFile> {
     pub(crate) eof_offset: Mutex<u64>,
 
     // Region offsets
-    #[allow(dead_code)] // will be used by BAT write-back in a later phase
     pub(crate) bat_offset: u64,
     #[allow(dead_code)] // Phase 9+: used for space management
     bat_length: u32,

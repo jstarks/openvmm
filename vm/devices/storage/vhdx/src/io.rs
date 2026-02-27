@@ -8,7 +8,6 @@
 //! and emits [`ReadRange`] entries describing where to find the data.
 
 use crate::AsyncFile;
-use crate::bat;
 use crate::bat::BlockType;
 use crate::bat::InternalBlockMapping;
 use crate::error::CorruptionType;

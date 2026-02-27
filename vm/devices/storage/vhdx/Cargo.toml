@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 bitfield-struct.workspace = true
 crc32c.workspace = true
+event-listener.workspace = true
+futures.workspace = true
 guid.workspace = true
 parking_lot = { workspace = true, features = ["arc_lock"] }
 thiserror.workspace = true

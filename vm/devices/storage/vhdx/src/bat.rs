@@ -7,6 +7,7 @@
 //! the correct BAT page offset for any given block number. Handles the
 //! interleaving of payload block entries with sector bitmap entries.
 
+use bitfield_struct::bitfield;
 use crate::AsyncFile;
 use crate::cache::AccessMode;
 use crate::cache::PageCache;
@@ -58,6 +59,55 @@ pub(crate) struct BlockMapping {
     pub state: BatEntryState,
     /// File byte offset of the block data (0 if not backed by file data).
     pub file_offset: u64,
+}
+
+/// In-memory BAT entry. Compact 32-bit representation used in the in-memory
+/// BAT array (not on disk).
+///
+/// Layout: state (3 bits) | transitioning_to_fully_present (1 bit) | file_megabyte (28 bits)
+///
+/// The 28-bit `file_megabyte` field supports files up to 2^28 MB = 256 TB.
+#[bitfield(u32)]
+#[derive(PartialEq, Eq)]
+pub(crate) struct InternalBlockMapping {
+    /// Block state (same values as BatEntryState).
+    #[bits(3)]
+    pub state: u8,
+    /// Set during allocation: space has been allocated but data I/O may still
+    /// be in flight. Other writers to this block must wait.
+    #[bits(1)]
+    pub transitioning_to_fully_present: bool,
+    /// File offset in megabytes.
+    #[bits(28)]
+    pub file_megabyte: u32,
+}
+
+impl InternalBlockMapping {
+    /// Convert this in-memory mapping to a [`BlockMapping`] for the read path.
+    pub fn to_block_mapping(self) -> BlockMapping {
+        let state = BatEntryState::from_raw(self.state())
+            .unwrap_or(BatEntryState::NotPresent);
+        BlockMapping {
+            state,
+            file_offset: self.file_megabyte() as u64 * MB1,
+        }
+    }
+
+    /// Create an `InternalBlockMapping` from an on-disk [`BatEntry`].
+    ///
+    /// Panics if the on-disk file offset exceeds the 28-bit megabyte field
+    /// (files > 256 TB).
+    pub fn from_bat_entry(entry: BatEntry) -> Self {
+        let file_mb = entry.file_offset_mb();
+        assert!(
+            file_mb <= 0x0FFF_FFFF,
+            "file offset {file_mb} MB exceeds 28-bit InternalBlockMapping limit (256 TB)"
+        );
+        InternalBlockMapping::new()
+            .with_state(entry.state())
+            .with_transitioning_to_fully_present(false)
+            .with_file_megabyte(file_mb as u32)
+    }
 }
 
 impl Bat {
@@ -629,5 +679,57 @@ mod tests {
         assert!(offset2 > offset);
         assert_eq!(offset2 % MB1, 0);
         assert_eq!(offset2, offset + format::DEFAULT_BLOCK_SIZE as u64);
+    }
+
+    #[test]
+    fn internal_mapping_roundtrip() {
+        let mapping = InternalBlockMapping::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_transitioning_to_fully_present(true)
+            .with_file_megabyte(12345);
+        let raw = u32::from(mapping);
+        let restored = InternalBlockMapping::from(raw);
+        assert_eq!(restored.state(), BatEntryState::FullyPresent as u8);
+        assert!(restored.transitioning_to_fully_present());
+        assert_eq!(restored.file_megabyte(), 12345);
+    }
+
+    #[test]
+    fn internal_mapping_max_file_megabyte() {
+        let max_mb: u32 = (1 << 28) - 1; // 268435455
+        let mapping = InternalBlockMapping::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_megabyte(max_mb);
+        assert_eq!(mapping.file_megabyte(), max_mb);
+        let bm = mapping.to_block_mapping();
+        assert_eq!(bm.file_offset, max_mb as u64 * MB1);
+    }
+
+    #[test]
+    fn internal_mapping_tfp_flag() {
+        let with_tfp = InternalBlockMapping::new()
+            .with_state(BatEntryState::NotPresent as u8)
+            .with_transitioning_to_fully_present(true);
+        assert!(with_tfp.transitioning_to_fully_present());
+
+        let without_tfp = InternalBlockMapping::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_transitioning_to_fully_present(false);
+        assert!(!without_tfp.transitioning_to_fully_present());
+
+        // TFP is independent of state.
+        assert_eq!(with_tfp.state(), BatEntryState::NotPresent as u8);
+        assert_eq!(without_tfp.state(), BatEntryState::FullyPresent as u8);
+    }
+
+    #[test]
+    fn internal_mapping_from_bat_entry() {
+        let entry = BatEntry::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_offset_mb(100);
+        let internal = InternalBlockMapping::from_bat_entry(entry);
+        assert_eq!(internal.state(), BatEntryState::FullyPresent as u8);
+        assert_eq!(internal.file_megabyte(), 100);
+        assert!(!internal.transitioning_to_fully_present());
     }
 }

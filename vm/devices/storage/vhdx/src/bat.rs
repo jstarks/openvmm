@@ -110,6 +110,114 @@ impl InternalBlockMapping {
     }
 }
 
+/// Block type discriminator for BAT entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockType {
+    /// A data payload block.
+    Payload,
+    /// A sector bitmap block (differencing disks only).
+    SectorBitmap,
+}
+
+/// In-memory BAT state. Protected by `parking_lot::RwLock` on `VhdxFile`.
+/// All block state lookups read from this structure — no file I/O needed.
+pub(crate) struct BatState {
+    /// One entry per payload block (indexed by block number).
+    pub payload_mappings: Vec<InternalBlockMapping>,
+    /// One entry per sector bitmap block (indexed by chunk number).
+    pub sector_bitmap_mappings: Vec<InternalBlockMapping>,
+    /// Running count of allocated (FullyPresent or PartiallyPresent) blocks.
+    pub allocated_block_count: u32,
+    /// Tracks which BAT pages have been modified and need writeback to disk.
+    /// Indexed by BAT page number (entry_index / ENTRIES_PER_BAT_PAGE).
+    pub dirty_bat_pages: Vec<bool>,
+}
+
+/// Whether a block state counts as "allocated" for `allocated_block_count`.
+fn is_allocated_state(state: u8) -> bool {
+    state == BatEntryState::FullyPresent as u8
+        || state == BatEntryState::PartiallyPresent as u8
+}
+
+impl BatState {
+    /// Get the in-memory mapping for a payload block.
+    pub fn get_payload_mapping(&self, block_number: u32) -> InternalBlockMapping {
+        self.payload_mappings[block_number as usize]
+    }
+
+    /// Get the in-memory mapping for a sector bitmap block.
+    pub fn get_sbm_mapping(&self, chunk_number: u32) -> InternalBlockMapping {
+        self.sector_bitmap_mappings[chunk_number as usize]
+    }
+
+    /// Update the in-memory mapping for a payload block.
+    ///
+    /// Adjusts `allocated_block_count` based on the old and new states.
+    /// Does NOT mark the BAT page dirty — callers decide when to mark dirty.
+    pub fn set_payload_mapping(
+        &mut self,
+        bat: &Bat,
+        block_number: u32,
+        mapping: InternalBlockMapping,
+    ) {
+        let _ = bat; // Used for consistency; entry index needed only for dirty tracking.
+        let old = self.payload_mappings[block_number as usize];
+        let was_allocated = is_allocated_state(old.state());
+        let now_allocated = is_allocated_state(mapping.state());
+        if was_allocated && !now_allocated {
+            self.allocated_block_count -= 1;
+        } else if !was_allocated && now_allocated {
+            self.allocated_block_count += 1;
+        }
+        self.payload_mappings[block_number as usize] = mapping;
+    }
+
+    /// Update the in-memory mapping for a sector bitmap block.
+    ///
+    /// Does NOT mark the BAT page dirty — callers decide when to mark dirty.
+    pub fn set_sbm_mapping(
+        &mut self,
+        bat: &Bat,
+        chunk_number: u32,
+        mapping: InternalBlockMapping,
+    ) {
+        let _ = bat;
+        self.sector_bitmap_mappings[chunk_number as usize] = mapping;
+    }
+
+    /// Mark the BAT page containing the given block's entry as dirty.
+    pub fn mark_bat_page_dirty(&mut self, bat: &Bat, block_type: BlockType, block_number: u32) {
+        let entry_index = match block_type {
+            BlockType::Payload => bat.payload_entry_index(block_number),
+            BlockType::SectorBitmap => bat.sector_bitmap_entry_index(block_number),
+        };
+        let page_index = entry_index as usize / ENTRIES_PER_BAT_PAGE as usize;
+        if page_index < self.dirty_bat_pages.len() {
+            self.dirty_bat_pages[page_index] = true;
+        }
+    }
+
+    /// Yields indices of dirty BAT pages.
+    pub fn dirty_page_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.dirty_bat_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &dirty)| dirty.then_some(i))
+    }
+
+    /// Clear the dirty flag for a BAT page.
+    pub fn clear_dirty(&mut self, page_index: usize) {
+        if page_index < self.dirty_bat_pages.len() {
+            self.dirty_bat_pages[page_index] = false;
+        }
+    }
+
+    /// Total number of BAT pages.
+    pub fn total_bat_pages(&self) -> usize {
+        self.dirty_bat_pages.len()
+    }
+}
+
 impl Bat {
     /// Create a new BAT manager from parsed metadata.
     ///
@@ -171,6 +279,80 @@ impl Bat {
     /// The sector bitmap entry follows every `chunk_ratio` payload entries.
     pub fn sector_bitmap_entry_index(&self, chunk_number: u32) -> u32 {
         ((chunk_number + 1) * self.chunk_ratio) + chunk_number
+    }
+
+    /// Reverse-map a flat BAT entry number to (block_type, block_number).
+    ///
+    /// Returns `None` if the entry is beyond the end of the disk.
+    pub fn entry_number_to_block_id(&self, entry_number: u32) -> Option<(BlockType, u32)> {
+        let group_size = self.chunk_ratio + 1;
+        let group = entry_number / group_size;
+        let position = entry_number % group_size;
+
+        if self.has_parent && position == self.chunk_ratio {
+            // This is a sector bitmap entry.
+            if group < self.sector_bitmap_block_count {
+                Some((BlockType::SectorBitmap, group))
+            } else {
+                None
+            }
+        } else {
+            // This is a payload entry.
+            let block_number = group * self.chunk_ratio + position;
+            if block_number < self.data_block_count {
+                Some((BlockType::Payload, block_number))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Compute the total number of BAT pages needed.
+    pub fn total_bat_pages(&self) -> usize {
+        let total_entries = if self.has_parent {
+            self.sector_bitmap_block_count as u64 * (self.chunk_ratio as u64 + 1)
+        } else {
+            self.data_block_count as u64
+                + (self.data_block_count.saturating_sub(1) as u64 / self.chunk_ratio as u64)
+                + 1 // account for the partial group's SBM slot
+        };
+        // Each page holds ENTRIES_PER_BAT_PAGE entries.
+        ceil_div(total_entries, ENTRIES_PER_BAT_PAGE) as usize
+    }
+
+    /// Look up the payload block mapping from in-memory state.
+    ///
+    /// Synchronous — no I/O. Reads from the in-memory `BatState`.
+    pub fn get_block_mapping_from_state(
+        &self,
+        bat_state: &BatState,
+        block_number: u32,
+    ) -> BlockMapping {
+        let internal = bat_state.get_payload_mapping(block_number);
+        let mut mapping = internal.to_block_mapping();
+        // Apply the same validation/normalization as parse_payload_entry:
+        // For non-differencing disks, PartiallyPresent → FullyPresent.
+        if !self.has_parent && mapping.state == BatEntryState::PartiallyPresent {
+            mapping.state = BatEntryState::FullyPresent;
+        }
+        mapping
+    }
+
+    /// Look up the sector bitmap block mapping from in-memory state.
+    ///
+    /// Synchronous — no I/O. Reads from the in-memory `BatState`.
+    pub fn get_sbm_mapping_from_state(
+        &self,
+        bat_state: &BatState,
+        chunk_number: u32,
+    ) -> BlockMapping {
+        let internal = bat_state.get_sbm_mapping(chunk_number);
+        let mut mapping = internal.to_block_mapping();
+        // SBM entries: PartiallyPresent → FullyPresent (compatibility).
+        if mapping.state == BatEntryState::PartiallyPresent {
+            mapping.state = BatEntryState::FullyPresent;
+        }
+        mapping
     }
 
     /// Look up the mapping for a data block, reading from the cache.
@@ -731,5 +913,111 @@ mod tests {
         assert_eq!(internal.state(), BatEntryState::FullyPresent as u8);
         assert_eq!(internal.file_megabyte(), 100);
         assert!(!internal.transitioning_to_fully_present());
+    }
+
+    #[test]
+    fn entry_number_to_block_id_payload() {
+        // Non-differencing: all entries are payload.
+        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        // chunk_ratio = 2048, data_block_count = 512
+        for i in 0..bat.data_block_count {
+            let entry_index = bat.payload_entry_index(i);
+            let result = bat.entry_number_to_block_id(entry_index);
+            assert_eq!(result, Some((BlockType::Payload, i)), "block {i}");
+        }
+    }
+
+    #[test]
+    fn entry_number_to_block_id_with_sbm() {
+        // Differencing disk with SBM entries.
+        // Use small chunk_ratio to exercise interleaving.
+        // 1 MiB blocks, 4096 sectors → chunk_ratio = 32768.
+        // Use 256 MiB blocks, 512 sectors → chunk_ratio = 16.
+        let bat = Bat::new(
+            format::GB1,
+            256 * MB1 as u32,
+            512,
+            true,
+        )
+        .unwrap();
+        assert_eq!(bat.chunk_ratio, 16);
+        // data_block_count = 4, sector_bitmap_block_count = 1
+
+        // Payload entries for group 0: positions 0..15 → blocks 0..3
+        for i in 0..bat.data_block_count {
+            let entry_index = bat.payload_entry_index(i);
+            let result = bat.entry_number_to_block_id(entry_index);
+            assert_eq!(result, Some((BlockType::Payload, i)), "payload block {i}");
+        }
+
+        // SBM entry for chunk 0 at position chunk_ratio = 16
+        let sbm_index = bat.sector_bitmap_entry_index(0);
+        assert_eq!(
+            bat.entry_number_to_block_id(sbm_index),
+            Some((BlockType::SectorBitmap, 0))
+        );
+    }
+
+    #[test]
+    fn entry_number_to_block_id_beyond_end() {
+        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        // Entry beyond all data blocks should return None.
+        let beyond = bat.payload_entry_index(bat.data_block_count);
+        assert_eq!(bat.entry_number_to_block_id(beyond), None);
+    }
+
+    #[test]
+    fn bat_state_allocated_count_tracking() {
+        let bat = Bat::new(4 * MB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        // 2 blocks
+        let mut state = BatState {
+            payload_mappings: vec![InternalBlockMapping::new(); bat.data_block_count as usize],
+            sector_bitmap_mappings: vec![],
+            allocated_block_count: 0,
+            dirty_bat_pages: vec![false; bat.total_bat_pages()],
+        };
+
+        // Allocate block 0.
+        let mapping = InternalBlockMapping::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_megabyte(100);
+        state.set_payload_mapping(&bat, 0, mapping);
+        assert_eq!(state.allocated_block_count, 1);
+
+        // Allocate block 1.
+        let mapping2 = InternalBlockMapping::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_megabyte(102);
+        state.set_payload_mapping(&bat, 1, mapping2);
+        assert_eq!(state.allocated_block_count, 2);
+
+        // Deallocate block 0 → NotPresent.
+        let dealloc = InternalBlockMapping::new()
+            .with_state(BatEntryState::NotPresent as u8);
+        state.set_payload_mapping(&bat, 0, dealloc);
+        assert_eq!(state.allocated_block_count, 1);
+    }
+
+    #[test]
+    fn bat_state_dirty_tracking() {
+        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let mut state = BatState {
+            payload_mappings: vec![InternalBlockMapping::new(); bat.data_block_count as usize],
+            sector_bitmap_mappings: vec![],
+            allocated_block_count: 0,
+            dirty_bat_pages: vec![false; bat.total_bat_pages()],
+        };
+
+        // No pages dirty initially.
+        assert_eq!(state.dirty_page_indices().count(), 0);
+
+        // Mark block 0's BAT page dirty.
+        state.mark_bat_page_dirty(&bat, BlockType::Payload, 0);
+        let dirty: Vec<_> = state.dirty_page_indices().collect();
+        assert_eq!(dirty, vec![0]);
+
+        // Clear it.
+        state.clear_dirty(0);
+        assert_eq!(state.dirty_page_indices().count(), 0);
     }
 }

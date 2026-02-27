@@ -380,19 +380,19 @@ mod tests {
     #[test]
     fn chunk_ratio_various_sizes() {
         // 1 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, format::MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, MB1 as u32, 512, false).unwrap();
         assert_eq!(bat.chunk_ratio, 4096);
 
         // 4 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, 4 * format::MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, 4 * MB1 as u32, 512, false).unwrap();
         assert_eq!(bat.chunk_ratio, 1024);
 
         // 32 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, 32 * format::MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, 32 * MB1 as u32, 512, false).unwrap();
         assert_eq!(bat.chunk_ratio, 128);
 
         // 256 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, 256 * format::MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, 256 * MB1 as u32, 512, false).unwrap();
         assert_eq!(bat.chunk_ratio, 16);
 
         // 2 MiB blocks, 4096 sectors: sectors_per_block = 512, chunk_ratio = 8388608 / 512 = 16384
@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(bat.chunk_ratio, 16384);
 
         // 1 MiB blocks, 4096 sectors: sectors_per_block = 256, chunk_ratio = 8388608 / 256 = 32768
-        let bat = Bat::new(format::GB1, format::MB1 as u32, 4096, false).unwrap();
+        let bat = Bat::new(format::GB1, MB1 as u32, 4096, false).unwrap();
         assert_eq!(bat.chunk_ratio, 32768);
     }
 
@@ -447,7 +447,7 @@ mod tests {
         // Actually: entries = 512 + ((512-1)/2048) = 512 + 0 = 512
         // 512 * 8 = 4096 bytes. Round up to 1 MiB.
         // Any bat_length >= 4096 is fine.
-        bat.validate_bat_size(format::MB1 as u32).unwrap();
+        bat.validate_bat_size(MB1 as u32).unwrap();
     }
 
     #[test]
@@ -494,7 +494,7 @@ mod tests {
 
         let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
         assert_eq!(mapping.state, BatEntryState::FullyPresent);
-        assert_eq!(mapping.file_offset, 100 * format::MB1);
+        assert_eq!(mapping.file_offset, 100 * MB1);
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
     #[async_test]
     async fn get_block_mapping_all_blocks_default() {
         // Create a VHDX, verify all blocks are NotPresent.
-        let disk_size = 4 * format::MB1; // small disk: 2 blocks with 2 MiB block size
+        let disk_size = 4 * MB1; // small disk: 2 blocks with 2 MiB block size
         let file = InMemoryFile::new(0);
         let mut params = create::CreateParams {
             disk_size,
@@ -570,5 +570,64 @@ mod tests {
             assert_eq!(mapping.state, BatEntryState::NotPresent);
             assert_eq!(mapping.file_offset, 0);
         }
+    }
+
+    #[async_test]
+    async fn write_bat_entry_roundtrip() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let regions = region::parse_region_tables(&file).await.unwrap();
+
+        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let file = Arc::new(file);
+        let mut cache = PageCache::new(file.clone());
+        cache.register_tag(BAT_TAG, regions.bat_offset);
+
+        // Block 0 should start as NotPresent.
+        let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
+        assert_eq!(mapping.state, BatEntryState::NotPresent);
+
+        // Write a FullyPresent entry at file_offset = 50 MiB.
+        bat.set_block_mapping(
+            &cache,
+            0,
+            BatEntryState::FullyPresent,
+            50 * MB1,
+        )
+        .await
+        .unwrap();
+
+        // Read it back.
+        let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
+        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+        assert_eq!(mapping.file_offset, 50 * MB1);
+    }
+
+    #[async_test]
+    async fn allocate_block_eof_test() {
+        let file = InMemoryFile::new(0);
+        let mut params = create::CreateParams {
+            disk_size: 4 * MB1,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+
+        let initial_size = file.file_size().await.unwrap();
+
+        // Allocate a 2 MiB block.
+        let offset = allocate_block_eof(&file, format::DEFAULT_BLOCK_SIZE).await.unwrap();
+
+        // Offset should be MB-aligned and >= initial size.
+        assert!(offset >= initial_size);
+        assert_eq!(offset % MB1, 0);
+
+        // File should have grown by block_size.
+        let new_size = file.file_size().await.unwrap();
+        assert_eq!(new_size, offset + format::DEFAULT_BLOCK_SIZE as u64);
+
+        // Second allocation should be after the first.
+        let offset2 = allocate_block_eof(&file, format::DEFAULT_BLOCK_SIZE).await.unwrap();
+        assert!(offset2 > offset);
+        assert_eq!(offset2 % MB1, 0);
+        assert_eq!(offset2, offset + format::DEFAULT_BLOCK_SIZE as u64);
     }
 }

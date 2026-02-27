@@ -614,4 +614,56 @@ mod tests {
             Err(VhdxError::Corrupt(CorruptionType::UnallocatedSectorBitmapBlock))
         ));
     }
+
+    #[async_test]
+    async fn set_sector_bitmap_bits_roundtrip() {
+        // Create a differencing VHDX with all-zero bitmap (all transparent).
+        let bitmap = [0x00u8; 4096];
+        let (_, vhdx, data_offset, _) = create_partial_block_vhdx(&bitmap).await;
+
+        // Verify initial state: sectors 0-7 are transparent.
+        let mut ranges = Vec::new();
+        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0],
+            ReadRange::Unmapped {
+                guest_offset: 0,
+                length: 4096,
+            }
+        );
+
+        // Set bits for sectors 0-3 (first 2048 bytes).
+        set_sector_bitmap_bits(
+            &vhdx.cache,
+            &vhdx.bat,
+            0,    // virtual_offset
+            2048, // length (4 sectors * 512)
+            512,  // logical_sector_size
+            format::DEFAULT_BLOCK_SIZE, // block_size
+            true, // set
+        )
+        .await
+        .unwrap();
+
+        // Now read again: first 4 sectors should be Data, last 4 Unmapped.
+        let mut ranges2 = Vec::new();
+        vhdx.resolve_read(0, 4096, &mut ranges2).await.unwrap();
+        assert_eq!(ranges2.len(), 2);
+        assert_eq!(
+            ranges2[0],
+            ReadRange::Data {
+                guest_offset: 0,
+                length: 2048,
+                file_offset: data_offset,
+            }
+        );
+        assert_eq!(
+            ranges2[1],
+            ReadRange::Unmapped {
+                guest_offset: 2048,
+                length: 2048,
+            }
+        );
+    }
 }

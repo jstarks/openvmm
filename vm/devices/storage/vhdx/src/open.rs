@@ -251,10 +251,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // Check if the mode is already enabled (fast path).
         let needs_update = {
             let state = self.write_state.lock();
-            match state.write_mode {
-                Some(current) if current >= mode => false,
-                _ => true,
-            }
+            !matches!(state.write_mode, Some(current) if current >= mode)
         };
 
         if !needs_update {

@@ -375,6 +375,7 @@ mod tests {
     use crate::open::VhdxFile;
     use crate::region;
     use crate::tests::support::InMemoryFile;
+    use guid::Guid;
     use pal_async::async_test;
     use zerocopy::IntoBytes;
 
@@ -741,5 +742,403 @@ mod tests {
             result,
             Err(VhdxError::Corrupt(CorruptionType::UnalignedIo))
         ));
+    }
+
+    // ---- Write tests ----
+
+    #[async_test]
+    async fn write_to_empty_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+
+        // Should allocate a new block: Zero padding before (none at offset 0),
+        // Data for the write, Zero padding after.
+        // At offset 0 within block: no leading padding.
+        // block_size = 2 MiB, writing 4096 bytes at offset 0:
+        //   Data(0, 4096, file_offset)
+        //   Zero(file_offset+4096, block_size-4096)
+        assert!(ranges.len() >= 2);
+        // First should be Data
+        match ranges[0] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                file_offset,
+            } => {
+                assert_eq!(guest_offset, 0);
+                assert_eq!(length, 4096);
+                // file_offset should be MB-aligned.
+                assert!(file_offset > 0);
+                assert_eq!(file_offset % format::MB1, 0);
+            }
+            _ => panic!("expected Data range, got {:?}", ranges[0]),
+        }
+        // Second should be Zero (trailing padding to fill the block).
+        match ranges[1] {
+            WriteRange::Zero {
+                file_offset,
+                length,
+            } => {
+                assert_eq!(length, format::DEFAULT_BLOCK_SIZE - 4096);
+                assert!(file_offset > 0);
+            }
+            _ => panic!("expected Zero range, got {:?}", ranges[1]),
+        }
+    }
+
+    #[async_test]
+    async fn write_to_fully_present_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let regions = region::parse_region_tables(&file).await.unwrap();
+
+        // Write a FullyPresent BAT entry for block 0 at file_offset_mb = 100.
+        let entry = BatEntry::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_offset_mb(100);
+        file.write_at(regions.bat_offset, entry.as_bytes())
+            .await
+            .unwrap();
+
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+
+        // Should write directly to the existing block — single Data range.
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0],
+            WriteRange::Data {
+                guest_offset: 0,
+                length: 4096,
+                file_offset: 100 * format::MB1,
+            }
+        );
+    }
+
+    #[async_test]
+    async fn write_spanning_two_blocks() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let block_size = vhdx.block_size() as u64;
+        let mut ranges = Vec::new();
+        // Write last 512 bytes of block 0 and first 512 bytes of block 1.
+        vhdx.resolve_write((block_size - 512) as u64, 1024, &mut ranges)
+            .await
+            .unwrap();
+
+        // Each block needs allocation. Filter out the data ranges.
+        let data_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| matches!(r, WriteRange::Data { .. }))
+            .collect();
+        assert_eq!(data_ranges.len(), 2, "expected 2 Data ranges for 2 blocks");
+
+        // First Data: last 512 bytes of block 0.
+        match data_ranges[0] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*guest_offset, block_size - 512);
+                assert_eq!(*length, 512);
+            }
+            _ => unreachable!(),
+        }
+        // Second Data: first 512 bytes of block 1.
+        match data_ranges[1] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*guest_offset, block_size);
+                assert_eq!(*length, 512);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[async_test]
+    async fn write_then_read_roundtrip() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Step 1: resolve_write to get file offsets.
+        let mut write_ranges = Vec::new();
+        vhdx.resolve_write(0, 512, &mut write_ranges).await.unwrap();
+
+        // Step 2: Write actual data at the returned Data offsets.
+        let pattern: Vec<u8> = (0..512u16).map(|i| (i % 256) as u8).collect();
+        for wr in &write_ranges {
+            match wr {
+                WriteRange::Data { file_offset, length, .. } => {
+                    vhdx.file
+                        .write_at(*file_offset, &pattern[..(*length as usize)])
+                        .await
+                        .unwrap();
+                }
+                WriteRange::Zero { file_offset, length } => {
+                    let zeros = vec![0u8; *length as usize];
+                    vhdx.file.write_at(*file_offset, &zeros).await.unwrap();
+                }
+            }
+        }
+
+        // Step 3: complete_write.
+        vhdx.complete_write(0, 512).await.unwrap();
+
+        // Step 4: resolve_read at the same offset.
+        let mut read_ranges = Vec::new();
+        vhdx.resolve_read(0, 512, &mut read_ranges).await.unwrap();
+
+        // Should now be Data (block was allocated).
+        assert_eq!(read_ranges.len(), 1);
+        match &read_ranges[0] {
+            ReadRange::Data {
+                file_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*length, 512);
+                let mut buf = vec![0u8; 512];
+                vhdx.file.read_at(*file_offset, &mut buf).await.unwrap();
+                assert_eq!(buf, pattern);
+            }
+            other => panic!("expected Data read range, got {:?}", other),
+        }
+    }
+
+    #[async_test]
+    async fn write_partial_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Write 512 bytes at offset 4096 within block 0.
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(4096, 512, &mut ranges).await.unwrap();
+
+        // Should have: Zero(leading 4096), Data(512), Zero(trailing).
+        assert_eq!(ranges.len(), 3);
+        match ranges[0] {
+            WriteRange::Zero { length, .. } => assert_eq!(length, 4096),
+            _ => panic!("expected leading Zero, got {:?}", ranges[0]),
+        }
+        match ranges[1] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(guest_offset, 4096);
+                assert_eq!(length, 512);
+            }
+            _ => panic!("expected Data, got {:?}", ranges[1]),
+        }
+        match ranges[2] {
+            WriteRange::Zero { length, .. } => {
+                assert_eq!(
+                    length,
+                    format::DEFAULT_BLOCK_SIZE - 4096 - 512
+                );
+            }
+            _ => panic!("expected trailing Zero, got {:?}", ranges[2]),
+        }
+    }
+
+    #[async_test]
+    async fn write_full_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Write exactly one full block (no padding needed).
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, format::DEFAULT_BLOCK_SIZE, &mut ranges)
+            .await
+            .unwrap();
+
+        // Should be exactly one Data range — no zero padding.
+        assert_eq!(ranges.len(), 1);
+        match ranges[0] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                file_offset,
+            } => {
+                assert_eq!(guest_offset, 0);
+                assert_eq!(length, format::DEFAULT_BLOCK_SIZE);
+                assert!(file_offset > 0);
+                assert_eq!(file_offset % format::MB1, 0);
+            }
+            _ => panic!("expected Data range, got {:?}", ranges[0]),
+        }
+    }
+
+    #[async_test]
+    async fn write_zero_length() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 0, &mut ranges).await.unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[async_test]
+    async fn write_beyond_end_of_disk() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let mut ranges = Vec::new();
+        let result = vhdx
+            .resolve_write(format::GB1 - 512, 1024, &mut ranges)
+            .await;
+        assert!(matches!(
+            result,
+            Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))
+        ));
+    }
+
+    #[async_test]
+    async fn write_read_only() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, true).await.unwrap();
+
+        let mut ranges = Vec::new();
+        let result = vhdx.resolve_write(0, 4096, &mut ranges).await;
+        assert!(matches!(result, Err(VhdxError::ReadOnly)));
+    }
+
+    #[async_test]
+    async fn write_large_spanning_many_blocks() {
+        // 4 MiB disk with 1 MiB blocks → 4 blocks.
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size: 4 * format::MB1,
+            block_size: format::MB1 as u32,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Write 3 MiB starting at offset 512 KiB (spans blocks 0,1,2,3).
+        let start = format::MB1 / 2;
+        let length = (3 * format::MB1) as u32;
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(start, length, &mut ranges)
+            .await
+            .unwrap();
+
+        let data_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| matches!(r, WriteRange::Data { .. }))
+            .collect();
+        // Should span 4 blocks: partial block 0, full block 1, full block 2, partial block 3.
+        assert_eq!(data_ranges.len(), 4);
+
+        // Verify guest offsets and lengths.
+        let block_size = format::MB1;
+        match data_ranges[0] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*guest_offset, start);
+                assert_eq!(*length as u64, block_size - start);
+            }
+            _ => unreachable!(),
+        }
+        match data_ranges[1] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*guest_offset, block_size);
+                assert_eq!(*length as u64, block_size);
+            }
+            _ => unreachable!(),
+        }
+        match data_ranges[2] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*guest_offset, 2 * block_size);
+                assert_eq!(*length as u64, block_size);
+            }
+            _ => unreachable!(),
+        }
+        match data_ranges[3] {
+            WriteRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*guest_offset, 3 * block_size);
+                assert_eq!(*length as u64, start); // remaining half of last block
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[async_test]
+    async fn first_write_updates_header() {
+        let (file, params) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let original_data_guid = params.data_write_guid;
+        assert_eq!(vhdx.data_write_guid(), original_data_guid);
+
+        // Perform a write — this triggers enable_write_mode.
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+
+        // data_write_guid should have changed.
+        let new_data_guid = vhdx.data_write_guid();
+        assert_ne!(new_data_guid, original_data_guid);
+        assert_ne!(new_data_guid, Guid::ZERO);
+    }
+
+    #[async_test]
+    async fn second_write_no_header_update() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // First write — triggers header update.
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+        let guid_after_first = vhdx.data_write_guid();
+
+        // Second write — should NOT update header again.
+        let mut ranges2 = Vec::new();
+        vhdx.resolve_write(512, 512, &mut ranges2).await.unwrap();
+        let guid_after_second = vhdx.data_write_guid();
+
+        assert_eq!(guid_after_first, guid_after_second);
+    }
+
+    #[async_test]
+    async fn file_writable_only_does_not_change_data_guid() {
+        let (file, params) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let original_data_guid = params.data_write_guid;
+
+        // Enable FileWritable mode (metadata-only modification).
+        vhdx.enable_write_mode(WriteMode::FileWritable).await.unwrap();
+
+        // data_write_guid should NOT have changed.
+        assert_eq!(vhdx.data_write_guid(), original_data_guid);
+
+        // But the write mode should be set (subsequent DataWritable will escalate).
+        let state = vhdx.write_state.lock();
+        assert_eq!(state.write_mode, Some(WriteMode::FileWritable));
     }
 }

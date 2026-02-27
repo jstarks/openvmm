@@ -9,10 +9,13 @@
 
 use crate::AsyncFile;
 use crate::bat;
+use crate::bat::BlockType;
+use crate::bat::InternalBlockMapping;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format;
 use crate::format::BatEntryState;
+use crate::format::MB1;
 use crate::open::VhdxFile;
 use crate::open::WriteMode;
 use crate::sector_bitmap;
@@ -182,11 +185,16 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// the caller should write data, and [`WriteRange::Zero`] entries for
     /// any newly allocated regions that must be zero-filled.
     ///
+    /// Blocks that are fully-covering writes use TFP (Transitioning to Fully
+    /// Present) to defer BAT commit to [`complete_write()`]. Partial writes
+    /// commit the BAT immediately via per-entry cache write.
+    ///
     /// Before any ranges are returned, the header is updated with new GUIDs
     /// and flushed to disk (first-write gate).
     ///
-    /// After the caller writes data at the returned offsets, it must call
-    /// [`complete_write()`](Self::complete_write) to finalize sector bitmaps.
+    /// After the caller writes data at the returned offsets, it **must** call
+    /// [`complete_write()`](Self::complete_write) to finalize the BAT and
+    /// sector bitmaps — even if the data I/O failed (pass `success: false`).
     pub async fn resolve_write(
         &self,
         offset: u64,
@@ -221,8 +229,19 @@ impl<F: AsyncFile> VhdxFile<F> {
         // First-write gate: update header with new GUIDs before any data.
         self.enable_write_mode(WriteMode::DataWritable).await?;
 
-        let mut current_offset: u32 = 0;
+        // Track which blocks we've resolved in the read phase.
+        // Blocks needing allocation are collected for the allocation phase.
+        struct BlockInfo {
+            block_number: u32,
+            block_offset: u32,
+            block_length: u32,
+            virtual_offset: u64,
+        }
 
+        let mut current_offset: u32 = 0;
+        let mut blocks_needing_allocation = Vec::new();
+
+        // --- Read phase: check BAT state for each block ---
         while current_offset < len {
             let virtual_offset = offset + current_offset as u64;
             let block_number = self.bat.offset_to_block(virtual_offset);
@@ -232,82 +251,75 @@ impl<F: AsyncFile> VhdxFile<F> {
                 len - current_offset,
             );
 
-            let mapping = self.get_block_mapping(block_number);
+            let is_full_block = block_offset == 0 && block_length >= self.block_size;
 
-            match mapping.state {
-                BatEntryState::FullyPresent => {
-                    // Block already allocated — write directly.
-                    let file_offset = mapping.file_offset + block_offset as u64;
-                    ranges.push(WriteRange::Data {
-                        guest_offset: virtual_offset,
-                        length: block_length,
-                        file_offset,
-                    });
+            // Read the in-memory BAT state.
+            loop {
+                let (state, file_offset, has_tfp) = {
+                    let bat_state = self.bat_state.read();
+                    let internal = bat_state.get_payload_mapping(block_number);
+                    let mapping = self.bat.get_block_mapping_from_state(&bat_state, block_number);
+                    (mapping.state, mapping.file_offset, internal.transitioning_to_fully_present())
+                };
+
+                if has_tfp {
+                    // Block is being allocated by another task — wait and retry.
+                    let listener = {
+                        let _bat_state = self.bat_state.read();
+                        // Re-check under lock to avoid wake-miss race.
+                        let internal = _bat_state.get_payload_mapping(block_number);
+                        if !internal.transitioning_to_fully_present() {
+                            continue; // TFP cleared while we were setting up — retry
+                        }
+                        self.allocation_event.listen()
+                    };
+                    listener.await;
+                    continue;
                 }
-                BatEntryState::PartiallyPresent => {
-                    // Block already allocated (differencing disk) — write directly.
-                    // complete_write() will update the sector bitmap.
-                    let file_offset = mapping.file_offset + block_offset as u64;
-                    ranges.push(WriteRange::Data {
-                        guest_offset: virtual_offset,
-                        length: block_length,
-                        file_offset,
-                    });
-                }
-                BatEntryState::NotPresent
-                | BatEntryState::Zero
-                | BatEntryState::Unmapped
-                | BatEntryState::Undefined => {
-                    // Block not allocated — allocate by extending EOF.
-                    let new_offset =
-                        bat::allocate_block_eof(&*self.file, self.block_size).await?;
 
-                    // Emit zero-fill for portions of the block before the write.
-                    if block_offset > 0 {
-                        ranges.push(WriteRange::Zero {
-                            file_offset: new_offset,
-                            length: block_offset,
+                match state {
+                    BatEntryState::FullyPresent => {
+                        ranges.push(WriteRange::Data {
+                            guest_offset: virtual_offset,
+                            length: block_length,
+                            file_offset: file_offset + block_offset as u64,
                         });
+                        break;
                     }
-
-                    // Emit the data range.
-                    ranges.push(WriteRange::Data {
-                        guest_offset: virtual_offset,
-                        length: block_length,
-                        file_offset: new_offset + block_offset as u64,
-                    });
-
-                    // Emit zero-fill for portions of the block after the write.
-                    let end_offset = block_offset + block_length;
-                    if end_offset < self.block_size {
-                        ranges.push(WriteRange::Zero {
-                            file_offset: new_offset + end_offset as u64,
-                            length: self.block_size - end_offset,
+                    BatEntryState::PartiallyPresent if !is_full_block => {
+                        // Partial write to already-allocated block — write
+                        // directly. complete_write() updates sector bitmaps.
+                        ranges.push(WriteRange::Data {
+                            guest_offset: virtual_offset,
+                            length: block_length,
+                            file_offset: file_offset + block_offset as u64,
                         });
+                        break;
                     }
-
-                    // Update BAT to FullyPresent with the new offset.
-                    self.bat
-                        .set_block_mapping(
-                            &self.cache,
+                    BatEntryState::PartiallyPresent => {
+                        // Fully-covering write to PartiallyPresent block —
+                        // needs TFP to promote to FullyPresent. Fall through
+                        // to allocation phase.
+                        blocks_needing_allocation.push(BlockInfo {
                             block_number,
-                            BatEntryState::FullyPresent,
-                            new_offset,
-                        )
-                        .await?;
-
-                    // Update the in-memory BAT to match.
-                    {
-                        use crate::bat::InternalBlockMapping;
-                        let internal = InternalBlockMapping::new()
-                            .with_state(BatEntryState::FullyPresent as u8)
-                            .with_file_megabyte((new_offset / format::MB1) as u32);
-                        let mut bat_state = self.bat_state.write();
-                        bat_state.set_payload_mapping(
-                            &self.bat,
+                            block_offset,
+                            block_length,
+                            virtual_offset,
+                        });
+                        break;
+                    }
+                    BatEntryState::NotPresent
+                    | BatEntryState::Zero
+                    | BatEntryState::Unmapped
+                    | BatEntryState::Undefined => {
+                        // Unallocated — needs allocation.
+                        blocks_needing_allocation.push(BlockInfo {
                             block_number,
-                            internal,
-                        );
+                            block_offset,
+                            block_length,
+                            virtual_offset,
+                        });
+                        break;
                     }
                 }
             }
@@ -315,30 +327,231 @@ impl<F: AsyncFile> VhdxFile<F> {
             current_offset += block_length;
         }
 
+        // If nothing needs allocation, we're done.
+        if blocks_needing_allocation.is_empty() {
+            return Ok(());
+        }
+
+        // --- Allocation phase: acquire BlockAllocationLock ---
+        let _alloc_guard = self.allocation_lock.lock().await;
+
+        // Track blocks that got TFP set (for error cleanup).
+        struct TfpRecord {
+            block_number: u32,
+            original_mapping: InternalBlockMapping,
+        }
+        let mut tfp_records: Vec<TfpRecord> = Vec::new();
+
+        // Re-check and allocate under the lock.
+        let allocation_result = async {
+            // Re-check all blocks under bat_state read lock for TFP set by
+            // a concurrent allocator.
+            {
+                let bat_state = self.bat_state.read();
+                for block_info in &blocks_needing_allocation {
+                    let internal = bat_state.get_payload_mapping(block_info.block_number);
+                    if internal.transitioning_to_fully_present() {
+                        // Another allocator just claimed this block.
+                        // We need to drop everything and restart.
+                        // For simplicity in the sequential case, this
+                        // should not happen. If it does, we'll get an
+                        // error that the caller can retry.
+                        return Err(VhdxError::Corrupt(CorruptionType::Other));
+                    }
+                }
+            }
+
+            for block_info in &blocks_needing_allocation {
+                let is_full_block =
+                    block_info.block_offset == 0 && block_info.block_length >= self.block_size;
+
+                // Re-read mapping under lock (may have changed since read phase).
+                let (internal, mapping) = {
+                    let bat_state = self.bat_state.read();
+                    let internal = bat_state.get_payload_mapping(block_info.block_number);
+                    let mapping =
+                        self.bat.get_block_mapping_from_state(&bat_state, block_info.block_number);
+                    (internal, mapping)
+                };
+
+                match mapping.state {
+                    BatEntryState::FullyPresent => {
+                        // Already allocated by a concurrent writer — just emit range.
+                        ranges.push(WriteRange::Data {
+                            guest_offset: block_info.virtual_offset,
+                            length: block_info.block_length,
+                            file_offset: mapping.file_offset + block_info.block_offset as u64,
+                        });
+                    }
+                    BatEntryState::PartiallyPresent if is_full_block => {
+                        // Fully-covering write to PartiallyPresent — set TFP
+                        // on existing mapping, no new space.
+                        let original = internal;
+                        let new_mapping = InternalBlockMapping::new()
+                            .with_state(internal.state())
+                            .with_transitioning_to_fully_present(true)
+                            .with_file_megabyte(internal.file_megabyte());
+
+                        {
+                            let mut bat_state = self.bat_state.write();
+                            bat_state.set_payload_mapping(
+                                &self.bat,
+                                block_info.block_number,
+                                new_mapping,
+                            );
+                        }
+
+                        tfp_records.push(TfpRecord {
+                            block_number: block_info.block_number,
+                            original_mapping: original,
+                        });
+
+                        ranges.push(WriteRange::Data {
+                            guest_offset: block_info.virtual_offset,
+                            length: block_info.block_length,
+                            file_offset: mapping.file_offset + block_info.block_offset as u64,
+                        });
+                    }
+                    _ => {
+                        // Unallocated block — allocate space.
+                        let new_offset = self.allocate_space(self.block_size);
+                        let original = internal;
+
+                        if is_full_block {
+                            // Fully-covering: set TFP, defer BAT commit.
+                            let new_mapping = InternalBlockMapping::new()
+                                .with_state(internal.state())
+                                .with_transitioning_to_fully_present(true)
+                                .with_file_megabyte((new_offset / MB1) as u32);
+
+                            {
+                                let mut bat_state = self.bat_state.write();
+                                bat_state.set_payload_mapping(
+                                    &self.bat,
+                                    block_info.block_number,
+                                    new_mapping,
+                                );
+                            }
+
+                            tfp_records.push(TfpRecord {
+                                block_number: block_info.block_number,
+                                original_mapping: original,
+                            });
+
+                            ranges.push(WriteRange::Data {
+                                guest_offset: block_info.virtual_offset,
+                                length: block_info.block_length,
+                                file_offset: new_offset + block_info.block_offset as u64,
+                            });
+                        } else {
+                            // Partial write — commit BAT immediately.
+                            let new_mapping = InternalBlockMapping::new()
+                                .with_state(BatEntryState::FullyPresent as u8)
+                                .with_transitioning_to_fully_present(false)
+                                .with_file_megabyte((new_offset / MB1) as u32);
+
+                            {
+                                let mut bat_state = self.bat_state.write();
+                                bat_state.set_payload_mapping(
+                                    &self.bat,
+                                    block_info.block_number,
+                                    new_mapping,
+                                );
+                            }
+
+                            // Per-entry cache write (write-through to disk).
+                            self.write_bat_entry_to_cache(
+                                BlockType::Payload,
+                                block_info.block_number,
+                                new_mapping,
+                            )
+                            .await?;
+
+                            // Emit zero + data + zero ranges.
+                            if block_info.block_offset > 0 {
+                                ranges.push(WriteRange::Zero {
+                                    file_offset: new_offset,
+                                    length: block_info.block_offset,
+                                });
+                            }
+
+                            ranges.push(WriteRange::Data {
+                                guest_offset: block_info.virtual_offset,
+                                length: block_info.block_length,
+                                file_offset: new_offset + block_info.block_offset as u64,
+                            });
+
+                            let end_offset = block_info.block_offset + block_info.block_length;
+                            if end_offset < self.block_size {
+                                ranges.push(WriteRange::Zero {
+                                    file_offset: new_offset + end_offset as u64,
+                                    length: self.block_size - end_offset,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Extend the file to cover new allocations (under allocation lock).
+            let target_eof = *self.eof_offset.lock();
+            self.file
+                .set_file_size(target_eof)
+                .await
+                .map_err(VhdxError::Io)?;
+
+            Ok(())
+        }
+        .await;
+
+        // Error cleanup: revert TFP-marked blocks on failure.
+        if let Err(e) = allocation_result {
+            {
+                let mut bat_state = self.bat_state.write();
+                for record in &tfp_records {
+                    bat_state.set_payload_mapping(
+                        &self.bat,
+                        record.block_number,
+                        record.original_mapping,
+                    );
+                }
+            }
+            self.allocation_event.notify(usize::MAX);
+            return Err(e);
+        }
+
+        // Allocation lock is released when _alloc_guard drops (after
+        // returning ranges to caller).
         Ok(())
     }
 
-    /// Finalize a write operation by updating sector bitmaps.
+    /// Finalize a write operation.
     ///
-    /// For non-differencing disks, this is a no-op (all newly allocated
-    /// blocks are FullyPresent). For differencing disks with pre-existing
-    /// PartiallyPresent blocks, this sets the sector bitmap bits for the
-    /// written sectors.
+    /// Must be called after every successful [`resolve_write()`], regardless
+    /// of whether the data I/O succeeded. Pass `success: false` if the data
+    /// writes failed to revert TFP blocks and unblock concurrent writers.
+    ///
+    /// **Success path**: Clears TFP flags, sets state to FullyPresent, writes
+    /// per-entry BAT to cache, notifies waiters. For PartiallyPresent blocks
+    /// (non-TFP, i.e. partial writes to differencing disks), updates sector
+    /// bitmaps.
+    ///
+    /// **Failure path**: Reverts TFP blocks to their original state and
+    /// notifies waiters. Does not write BAT entries to cache.
     pub async fn complete_write(
         &self,
         offset: u64,
         len: u32,
+        success: bool,
     ) -> Result<(), VhdxError> {
-        // No SBM updates needed for non-differencing disks.
-        if !self.has_parent {
-            return Ok(());
-        }
-
         // Zero-length — nothing to do.
         if len == 0 {
             return Ok(());
         }
 
+        let mut had_tfp = false;
+        let mut bat_write_error: Option<VhdxError> = None;
+
         let mut current_offset: u32 = 0;
 
         while current_offset < len {
@@ -350,23 +563,111 @@ impl<F: AsyncFile> VhdxFile<F> {
                 len - current_offset,
             );
 
-            let mapping = self.get_block_mapping(block_number);
+            // Read the in-memory mapping to check for TFP.
+            let internal = {
+                let bat_state = self.bat_state.read();
+                bat_state.get_payload_mapping(block_number)
+            };
 
-            if mapping.state == BatEntryState::PartiallyPresent {
-                // Set sector bitmap bits for the written sectors.
-                sector_bitmap::set_sector_bitmap_bits(
-                    &self.cache,
-                    self,
-                    virtual_offset,
-                    block_length,
-                    self.logical_sector_size,
-                    self.block_size,
-                    true,
-                )
-                .await?;
+            if internal.transitioning_to_fully_present() {
+                had_tfp = true;
+
+                if success {
+                    // Success: clear TFP, set FullyPresent.
+                    let final_mapping = InternalBlockMapping::new()
+                        .with_state(BatEntryState::FullyPresent as u8)
+                        .with_transitioning_to_fully_present(false)
+                        .with_file_megabyte(internal.file_megabyte());
+
+                    {
+                        let mut bat_state = self.bat_state.write();
+                        bat_state.set_payload_mapping(
+                            &self.bat,
+                            block_number,
+                            final_mapping,
+                        );
+                    }
+
+                    // Write per-entry to cache. Errors are deferred so we
+                    // can still notify waiters.
+                    if bat_write_error.is_none() {
+                        if let Err(e) = self
+                            .write_bat_entry_to_cache(
+                                BlockType::Payload,
+                                block_number,
+                                final_mapping,
+                            )
+                            .await
+                        {
+                            bat_write_error = Some(e);
+                        }
+                    }
+                } else {
+                    // Failure: revert to original state.
+                    // If the original state was PartiallyPresent (block was
+                    // already allocated), keep the file_megabyte.
+                    // Otherwise, restore zero offset.
+                    let original_state =
+                        BatEntryState::from_raw(internal.state()).unwrap_or(BatEntryState::NotPresent);
+                    let reverted = match original_state {
+                        BatEntryState::PartiallyPresent => {
+                            InternalBlockMapping::new()
+                                .with_state(internal.state())
+                                .with_transitioning_to_fully_present(false)
+                                .with_file_megabyte(internal.file_megabyte())
+                        }
+                        _ => {
+                            // Freshly allocated — revert to original state
+                            // with zero offset. Space is leaked.
+                            InternalBlockMapping::new()
+                                .with_state(internal.state())
+                                .with_transitioning_to_fully_present(false)
+                                .with_file_megabyte(0)
+                        }
+                    };
+
+                    {
+                        let mut bat_state = self.bat_state.write();
+                        bat_state.set_payload_mapping(
+                            &self.bat,
+                            block_number,
+                            reverted,
+                        );
+                        bat_state.mark_bat_page_dirty(
+                            &self.bat,
+                            BlockType::Payload,
+                            block_number,
+                        );
+                    }
+                }
+            } else if success && self.has_parent {
+                // Non-TFP PartiallyPresent blocks: update sector bitmaps.
+                let mapping = self.get_block_mapping(block_number);
+                if mapping.state == BatEntryState::PartiallyPresent {
+                    sector_bitmap::set_sector_bitmap_bits(
+                        &self.cache,
+                        self,
+                        virtual_offset,
+                        block_length,
+                        self.logical_sector_size,
+                        self.block_size,
+                        true,
+                    )
+                    .await?;
+                }
             }
 
             current_offset += block_length;
+        }
+
+        // Notify waiters ALWAYS, even on failure or cache write error.
+        if had_tfp {
+            self.allocation_event.notify(usize::MAX);
+        }
+
+        // Propagate any deferred BAT cache write error.
+        if let Some(e) = bat_write_error {
+            return Err(e);
         }
 
         Ok(())
@@ -374,9 +675,10 @@ impl<F: AsyncFile> VhdxFile<F> {
 
     /// Flush all writes to stable storage.
     ///
-    /// For Phase 9 (no log), this simply issues a file-level flush to
-    /// ensure all OS-buffered writes are durable.
+    /// Writes any dirty BAT pages to disk, then issues a file-level flush
+    /// for durability.
     pub async fn flush(&self) -> Result<(), VhdxError> {
+        self.flush_dirty_bat_pages().await?;
         self.file.flush().await.map_err(VhdxError::Io)
     }
 }
@@ -905,7 +1207,7 @@ mod tests {
         }
 
         // Step 3: complete_write.
-        vhdx.complete_write(0, 512).await.unwrap();
+        vhdx.complete_write(0, 512, true).await.unwrap();
 
         // Step 4: resolve_read at the same offset.
         let mut read_ranges = Vec::new();

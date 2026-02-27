@@ -247,13 +247,13 @@ mod tests {
     #[async_test]
     async fn open_4k_sector_vhdx() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             logical_sector_size: 4096,
             physical_sector_size: 4096,
             ..Default::default()
         };
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         assert_eq!(vhdx.logical_sector_size(), 4096);
@@ -263,13 +263,13 @@ mod tests {
     #[async_test]
     async fn open_512_sector_vhdx() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             logical_sector_size: 512,
             physical_sector_size: 512,
             ..Default::default()
         };
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         assert_eq!(vhdx.logical_sector_size(), 512);
@@ -285,12 +285,12 @@ mod tests {
             256 * format::MB1 as u32,
         ] {
             let file = InMemoryFile::new(0);
-            let params = CreateParams {
+            let mut params = CreateParams {
                 disk_size: format::GB1,
                 block_size,
                 ..Default::default()
             };
-            create::create(&file, params).await.unwrap();
+            create::create(&file, &mut params).await.unwrap();
 
             let vhdx = VhdxFile::open(file, false).await.unwrap();
             assert_eq!(vhdx.block_size(), block_size);
@@ -300,12 +300,12 @@ mod tests {
     #[async_test]
     async fn open_differencing_disk() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             has_parent: true,
             ..Default::default()
         };
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         assert!(vhdx.has_parent());
@@ -314,12 +314,12 @@ mod tests {
     #[async_test]
     async fn open_fully_allocated() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             is_fully_allocated: true,
             ..Default::default()
         };
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         assert!(vhdx.is_fully_allocated());
@@ -392,11 +392,11 @@ mod tests {
     async fn open_bat_all_blocks_default() {
         let disk_size = 4 * format::MB1; // Small disk → 2 blocks.
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size,
             ..Default::default()
         };
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let block_count = (disk_size / vhdx.block_size() as u64) as u32;

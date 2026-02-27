@@ -102,11 +102,12 @@ pub(crate) fn chunk_block_count(block_size: u32, sector_size: u32) -> u32 {
 /// table with standard metadata items, and an empty BAT to the provided
 /// file. The file is truncated/extended to the required size.
 ///
-/// Returns the validated `CreateParams` (with defaults filled in).
+/// `params` is updated in place with defaults filled in (e.g. zero
+/// `block_size` becomes 2 MiB, zero GUIDs become random).
 pub async fn create(
     file: &impl AsyncFile,
-    mut params: CreateParams,
-) -> Result<CreateParams, VhdxError> {
+    params: &mut CreateParams,
+) -> Result<(), VhdxError> {
     // --- Validate and default parameters ---
 
     if params.logical_sector_size == 0 {
@@ -474,7 +475,7 @@ pub async fn create(
 
     file.set_file_size(file_size).await?;
 
-    Ok(params)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -540,16 +541,16 @@ mod tests {
     async fn create_default_params() {
         let disk_size = format::GB1;
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size,
             ..Default::default()
         };
-        let result = create(&file, params).await.unwrap();
+        create(&file, &mut params).await.unwrap();
 
-        assert_eq!(result.disk_size, disk_size);
-        assert_eq!(result.block_size, format::DEFAULT_BLOCK_SIZE);
-        assert_eq!(result.logical_sector_size, 512);
-        assert_eq!(result.physical_sector_size, 512);
+        assert_eq!(params.disk_size, disk_size);
+        assert_eq!(params.block_size, format::DEFAULT_BLOCK_SIZE);
+        assert_eq!(params.logical_sector_size, 512);
+        assert_eq!(params.physical_sector_size, 512);
 
         let snapshot = file.snapshot();
         let file_size = file.file_size().await.unwrap();
@@ -623,22 +624,22 @@ mod tests {
     #[async_test]
     async fn create_validates_disk_size_zero() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: 0,
             ..Default::default()
         };
-        assert!(create(&file, params).await.is_err());
+        assert!(create(&file, &mut params).await.is_err());
     }
 
     #[async_test]
     async fn create_validates_disk_size_alignment() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: 1000, // not a multiple of 512
             logical_sector_size: 512,
             ..Default::default()
         };
-        assert!(create(&file, params).await.is_err());
+        assert!(create(&file, &mut params).await.is_err());
     }
 
     #[async_test]
@@ -646,20 +647,20 @@ mod tests {
         let file = InMemoryFile::new(0);
 
         // Invalid logical sector size.
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             logical_sector_size: 1024,
             ..Default::default()
         };
-        assert!(create(&file, params).await.is_err());
+        assert!(create(&file, &mut params).await.is_err());
 
         // Invalid physical sector size.
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             physical_sector_size: 8192,
             ..Default::default()
         };
-        assert!(create(&file, params).await.is_err());
+        assert!(create(&file, &mut params).await.is_err());
     }
 
     #[async_test]
@@ -667,45 +668,45 @@ mod tests {
         let file = InMemoryFile::new(0);
 
         // Not a multiple of 1 MiB.
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             block_size: 500_000,
             ..Default::default()
         };
-        assert!(create(&file, params).await.is_err());
+        assert!(create(&file, &mut params).await.is_err());
 
         // Greater than maximum (256 MiB).
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             block_size: 512 * 1024 * 1024,
             ..Default::default()
         };
-        assert!(create(&file, params).await.is_err());
+        assert!(create(&file, &mut params).await.is_err());
     }
 
     #[async_test]
     async fn create_validates_block_alignment() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             block_alignment: 3, // not a power of 2
             ..Default::default()
         };
-        assert!(create(&file, params).await.is_err());
+        assert!(create(&file, &mut params).await.is_err());
     }
 
     #[async_test]
     async fn create_with_512_sectors() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             logical_sector_size: 512,
             physical_sector_size: 512,
             ..Default::default()
         };
-        let result = create(&file, params).await.unwrap();
-        assert_eq!(result.logical_sector_size, 512);
-        assert_eq!(result.physical_sector_size, 512);
+        create(&file, &mut params).await.unwrap();
+        assert_eq!(params.logical_sector_size, 512);
+        assert_eq!(params.physical_sector_size, 512);
 
         let snapshot = file.snapshot();
         let meta_offset = 2 * format::MB1 as usize;
@@ -725,15 +726,15 @@ mod tests {
     #[async_test]
     async fn create_with_4k_sectors() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             logical_sector_size: 4096,
             physical_sector_size: 4096,
             ..Default::default()
         };
-        let result = create(&file, params).await.unwrap();
-        assert_eq!(result.logical_sector_size, 4096);
-        assert_eq!(result.physical_sector_size, 4096);
+        create(&file, &mut params).await.unwrap();
+        assert_eq!(params.logical_sector_size, 4096);
+        assert_eq!(params.physical_sector_size, 4096);
 
         let snapshot = file.snapshot();
         let meta_offset = 2 * format::MB1 as usize;
@@ -756,12 +757,12 @@ mod tests {
 
         for &bs in &block_sizes {
             let file = InMemoryFile::new(0);
-            let params = CreateParams {
+            let mut params = CreateParams {
                 disk_size: format::GB1,
                 block_size: bs,
                 ..Default::default()
             };
-            let result = create(&file, params).await;
+            let result = create(&file, &mut params).await;
             assert!(result.is_ok(), "failed for block_size={bs}");
 
             let snapshot = file.snapshot();
@@ -774,23 +775,23 @@ mod tests {
     async fn create_block_alignment() {
         // No alignment: file ends right after BAT.
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             block_alignment: 0,
             ..Default::default()
         };
-        let result = create(&file, params).await.unwrap();
+        create(&file, &mut params).await.unwrap();
         let size_no_align = file.file_size().await.unwrap();
 
         // With 2 MiB alignment.
         let file2 = InMemoryFile::new(0);
         let align = 2 * format::MB1 as u32;
-        let params2 = CreateParams {
+        let mut params2 = CreateParams {
             disk_size: format::GB1,
             block_alignment: align,
             ..Default::default()
         };
-        create(&file2, params2).await.unwrap();
+        create(&file2, &mut params2).await.unwrap();
         let size_aligned = file2.file_size().await.unwrap();
 
         // Aligned size should be >= non-aligned and a multiple of alignment.
@@ -800,25 +801,25 @@ mod tests {
         // With alignment == block_size (should be honored since
         // block_alignment <= block_size).
         let file3 = InMemoryFile::new(0);
-        let params3 = CreateParams {
+        let mut params3 = CreateParams {
             disk_size: format::GB1,
-            block_alignment: result.block_size,
+            block_alignment: params.block_size,
             ..Default::default()
         };
-        create(&file3, params3).await.unwrap();
+        create(&file3, &mut params3).await.unwrap();
         let size3 = file3.file_size().await.unwrap();
-        assert_eq!(size3 % result.block_size as u64, 0);
+        assert_eq!(size3 % params.block_size as u64, 0);
     }
 
     #[async_test]
     async fn create_differencing_disk() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             has_parent: true,
             ..Default::default()
         };
-        create(&file, params).await.unwrap();
+        create(&file, &mut params).await.unwrap();
 
         let snapshot = file.snapshot();
         let meta_offset = 2 * format::MB1 as usize;
@@ -848,12 +849,12 @@ mod tests {
     #[async_test]
     async fn create_incomplete() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             create_incomplete: true,
             ..Default::default()
         };
-        create(&file, params).await.unwrap();
+        create(&file, &mut params).await.unwrap();
 
         let snapshot = file.snapshot();
         let meta_offset = 2 * format::MB1 as usize;
@@ -872,11 +873,11 @@ mod tests {
     #[async_test]
     async fn create_headers_have_different_sequence_numbers() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             ..Default::default()
         };
-        create(&file, params).await.unwrap();
+        create(&file, &mut params).await.unwrap();
 
         let snapshot = file.snapshot();
         let h1 = read_header(&snapshot, format::HEADER_OFFSET_1 as usize);
@@ -889,11 +890,11 @@ mod tests {
     #[async_test]
     async fn create_region_tables_are_identical() {
         let file = InMemoryFile::new(0);
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             ..Default::default()
         };
-        create(&file, params).await.unwrap();
+        create(&file, &mut params).await.unwrap();
 
         let snapshot = file.snapshot();
         let rt1_start = format::REGION_TABLE_OFFSET as usize;

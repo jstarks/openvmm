@@ -19,7 +19,7 @@ mod integration {
     #[async_test]
     async fn create_then_parse_full_roundtrip() {
         let disk_size = 2 * format::GB1;
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size,
             block_size: 2 * format::MB1 as u32,
             logical_sector_size: 512,
@@ -27,7 +27,7 @@ mod integration {
             ..CreateParams::default()
         };
         let file = InMemoryFile::new(0);
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
         let file_length = file.file_size().await.unwrap();
 
         // 1. Parse headers.
@@ -67,13 +67,13 @@ mod integration {
 
     #[async_test]
     async fn create_differencing_then_parse() {
-        let params = CreateParams {
+        let mut params = CreateParams {
             disk_size: format::GB1,
             has_parent: true,
             ..CreateParams::default()
         };
         let file = InMemoryFile::new(0);
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
         let file_length = file.file_size().await.unwrap();
 
         let _header = header::parse_headers(&file, file_length).await.unwrap();

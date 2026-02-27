@@ -126,11 +126,11 @@ impl InMemoryFile {
     /// Returns the `InMemoryFile` and the validated `CreateParams`.
     pub async fn create_test_vhdx(disk_size: u64) -> (InMemoryFile, crate::create::CreateParams) {
         let file = InMemoryFile::new(0);
-        let params = crate::create::CreateParams {
+        let mut params = crate::create::CreateParams {
             disk_size,
             ..Default::default()
         };
-        let params = crate::create::create(&file, params).await.unwrap();
+        crate::create::create(&file, &mut params).await.unwrap();
         (file, params)
     }
 }

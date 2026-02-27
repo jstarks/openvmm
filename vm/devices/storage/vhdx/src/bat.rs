@@ -480,11 +480,11 @@ mod tests {
         // Create a VHDX, verify all blocks are NotPresent.
         let disk_size = 4 * format::MB1; // small disk: 2 blocks with 2 MiB block size
         let file = InMemoryFile::new(0);
-        let params = create::CreateParams {
+        let mut params = create::CreateParams {
             disk_size,
             ..Default::default()
         };
-        create::create(&file, params).await.unwrap();
+        create::create(&file, &mut params).await.unwrap();
 
         let regions = region::parse_region_tables(&file).await.unwrap();
         let bat = Bat::new(disk_size, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();

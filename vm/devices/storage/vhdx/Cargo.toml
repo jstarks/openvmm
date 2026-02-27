@@ -10,12 +10,12 @@ rust-version.workspace = true
 bitfield-struct.workspace = true
 crc32c.workspace = true
 guid.workspace = true
+parking_lot = { workspace = true, features = ["arc_lock"] }
 thiserror.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]
 pal_async.workspace = true
-parking_lot.workspace = true
 
 [lints]
 workspace = true

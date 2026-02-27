@@ -302,4 +302,12 @@ pub enum CorruptionType {
     /// Log replay is not yet implemented.
     #[error("log replay required (log GUID is non-zero)")]
     LogReplayRequired,
+
+    /// A read or write request extends beyond the end of the virtual disk.
+    #[error("read or write request extends beyond end of virtual disk")]
+    ReadBeyondEndOfDisk,
+
+    /// A read or write request is not aligned to the logical sector size.
+    #[error("I/O request is not aligned to logical sector size")]
+    UnalignedIo,
 }

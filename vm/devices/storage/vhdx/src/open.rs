@@ -12,6 +12,7 @@ use crate::bat::BAT_TAG;
 use crate::bat::Bat;
 use crate::bat::BlockMapping;
 use crate::bat::METADATA_TAG;
+use crate::sector_bitmap::SBM_TAG;
 use crate::cache::PageCache;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
@@ -30,15 +31,15 @@ use zerocopy::FromBytes;
 /// Created via [`VhdxFile::open()`], this provides read access to the
 /// virtual disk's metadata and BAT (block allocation table).
 pub struct VhdxFile<F: AsyncFile> {
-    cache: PageCache<F>,
-    bat: Bat,
+    pub(crate) cache: PageCache<F>,
+    pub(crate) bat: Bat,
 
     // Parsed metadata
-    disk_size: u64,
-    block_size: u32,
-    logical_sector_size: u32,
+    pub(crate) disk_size: u64,
+    pub(crate) block_size: u32,
+    pub(crate) logical_sector_size: u32,
     physical_sector_size: u32,
-    has_parent: bool,
+    pub(crate) has_parent: bool,
     is_fully_allocated: bool,
     #[allow(dead_code)] // Phase 7+: used for disk_backend integration
     page_83_data: Guid,
@@ -127,6 +128,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         let mut cache = PageCache::new(file);
         cache.register_tag(BAT_TAG, regions.bat_offset);
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
+        cache.register_tag(SBM_TAG, 0);
 
         // 12. Construct VhdxFile.
         Ok(VhdxFile {

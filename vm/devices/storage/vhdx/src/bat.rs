@@ -28,7 +28,7 @@ pub(crate) const BAT_TAG: u8 = 0;
 pub(crate) const METADATA_TAG: u8 = 1;
 
 /// Size of a sector bitmap block in bytes (1 MiB).
-#[allow(dead_code)] // Phase 8+: used for sector bitmap reads
+#[allow(dead_code)] // Phase 9+: used for space management
 pub(crate) const SECTOR_BITMAP_BLOCK_SIZE: u32 = 1024 * 1024;
 
 /// Manages BAT (Block Allocation Table) lookups through the page cache.
@@ -44,7 +44,6 @@ pub(crate) struct Bat {
     /// Chunk ratio: number of data blocks per sector bitmap entry.
     pub chunk_ratio: u32,
     /// Block size in bytes.
-    #[allow(dead_code)] // Phase 7+: used for I/O path
     pub block_size: u32,
     /// Whether the disk has a parent (differencing).
     pub has_parent: bool,
@@ -118,7 +117,6 @@ impl Bat {
     /// Compute the BAT entry index for a given sector bitmap block (chunk number).
     ///
     /// The sector bitmap entry follows every `chunk_ratio` payload entries.
-    #[allow(dead_code)] // Phase 8+: used for sector bitmap reads
     pub fn sector_bitmap_entry_index(&self, chunk_number: u32) -> u32 {
         ((chunk_number + 1) * self.chunk_ratio) + chunk_number
     }
@@ -135,7 +133,6 @@ impl Bat {
     }
 
     /// Look up the mapping for a sector bitmap block, reading from the cache.
-    #[allow(dead_code)] // Phase 8+: used for sector bitmap reads
     pub async fn get_sector_bitmap_mapping<F: AsyncFile>(
         &self,
         cache: &PageCache<F>,
@@ -147,13 +144,11 @@ impl Bat {
     }
 
     /// Convert a virtual disk byte offset to a block number.
-    #[allow(dead_code)] // Phase 7+: used for I/O path
     pub fn offset_to_block(&self, offset: u64) -> u32 {
         (offset / self.block_size as u64) as u32
     }
 
     /// Compute the byte offset within a block for a given virtual disk offset.
-    #[allow(dead_code)] // Phase 7+: used for I/O path
     pub fn offset_within_block(&self, offset: u64) -> u32 {
         (offset % self.block_size as u64) as u32
     }
@@ -258,7 +253,6 @@ impl Bat {
     }
 
     /// Parse and validate a sector bitmap BAT entry.
-    #[allow(dead_code)] // Phase 8+: used for sector bitmap reads
     fn parse_sector_bitmap_entry(&self, entry: BatEntry) -> Result<BlockMapping, VhdxError> {
         let raw_state = entry.state();
         let state = BatEntryState::from_raw(raw_state)

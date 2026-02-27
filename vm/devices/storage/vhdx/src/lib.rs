@@ -22,15 +22,18 @@ pub mod create;
 pub mod error;
 pub mod format;
 pub(crate) mod header;
+pub mod io;
 pub(crate) mod known_meta;
 pub(crate) mod locator;
 pub(crate) mod metadata;
 pub mod open;
 pub(crate) mod region;
+pub(crate) mod sector_bitmap;
 
 pub use error::CorruptionType;
 pub use error::InvalidFormatReason;
 pub use error::VhdxError;
+pub use io::ReadRange;
 pub use open::VhdxFile;
 
 #[cfg(test)]

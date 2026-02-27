@@ -27,6 +27,12 @@ pub trait IoInterceptor: Send + Sync {
         Ok(())
     }
 
+    /// Called before a set_file_size operation.
+    fn before_set_file_size(&self, size: u64) -> Result<(), std::io::Error> {
+        let _ = size;
+        Ok(())
+    }
+
     /// Returns `true` if the write should be silently discarded (data not
     /// written). The default is `false`.
     fn should_discard_write(&self, offset: u64, data: &[u8]) -> bool {
@@ -43,6 +49,8 @@ pub struct FailingInterceptor {
     pub fail_writes: bool,
     /// Whether flushes should fail.
     pub fail_flushes: bool,
+    /// Whether set_file_size should fail.
+    pub fail_set_file_size: bool,
 }
 
 impl IoInterceptor for FailingInterceptor {
@@ -62,6 +70,13 @@ impl IoInterceptor for FailingInterceptor {
 
     fn before_flush(&self) -> Result<(), std::io::Error> {
         if self.fail_flushes {
+            return Err(std::io::Error::other("injected I/O failure"));
+        }
+        Ok(())
+    }
+
+    fn before_set_file_size(&self, _size: u64) -> Result<(), std::io::Error> {
+        if self.fail_set_file_size {
             return Err(std::io::Error::other("injected I/O failure"));
         }
         Ok(())
@@ -185,6 +200,9 @@ impl AsyncFile for InMemoryFile {
     }
 
     async fn set_file_size(&self, size: u64) -> Result<(), std::io::Error> {
+        if let Some(interceptor) = &self.interceptor {
+            interceptor.before_set_file_size(size)?;
+        }
         let mut inner = self.inner.lock();
         inner.data.resize(size as usize, 0);
         Ok(())
@@ -310,6 +328,7 @@ mod tests {
                 fail_reads: true,
                 fail_writes: false,
                 fail_flushes: false,
+                fail_set_file_size: false,
             }),
         );
 
@@ -326,6 +345,7 @@ mod tests {
                 fail_reads: false,
                 fail_writes: true,
                 fail_flushes: false,
+                fail_set_file_size: false,
             }),
         );
 
@@ -345,6 +365,7 @@ mod tests {
                 fail_reads: false,
                 fail_writes: false,
                 fail_flushes: true,
+                fail_set_file_size: false,
             }),
         );
 

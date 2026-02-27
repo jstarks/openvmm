@@ -105,8 +105,7 @@ pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
             std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
 
         // Acquire the bitmap page for this portion.
-        let page_file_offset =
-            sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
+        let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
         let guard = cache
             .acquire(
                 PageKey {
@@ -136,15 +135,12 @@ pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
 
             if one < bits_in_this_page {
                 // Find first clear bit (end of data run).
-                let next_zero =
-                    find_bit(page_data, one, bits_in_this_page, false);
+                let next_zero = find_bit(page_data, one, bits_in_this_page, false);
                 let data_sectors = next_zero - one;
                 let data_bytes = data_sectors * logical_sector_size as u64;
                 // File offset = data block offset + position within block.
-                let block_offset =
-                    (current_virtual_offset % block_size as u64) as u32;
-                let file_offset =
-                    data_file_offset + block_offset as u64;
+                let block_offset = (current_virtual_offset % block_size as u64) as u32;
+                let file_offset = data_file_offset + block_offset as u64;
                 ranges.push(ReadRange::Data {
                     guest_offset: current_virtual_offset,
                     length: data_bytes as u32,
@@ -213,8 +209,7 @@ pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
         let bits_in_this_page =
             std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
 
-        let page_file_offset =
-            sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
+        let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
         let mut guard = cache
             .acquire(
                 PageKey {
@@ -252,10 +247,10 @@ mod tests {
     use crate::create::{self, CreateParams};
     use crate::format;
     use crate::format::BatEntry;
+    use crate::io::ReadRange;
     use crate::open::VhdxFile;
     use crate::region;
     use crate::tests::support::InMemoryFile;
-    use crate::io::ReadRange;
     use pal_async::async_test;
     use zerocopy::IntoBytes;
 
@@ -293,24 +288,18 @@ mod tests {
         let data_entry = BatEntry::new()
             .with_state(BatEntryState::PartiallyPresent as u8)
             .with_file_offset_mb(data_block_offset >> 20);
-        file.write_at(
-            bat_offset + payload_index as u64 * 8,
-            data_entry.as_bytes(),
-        )
-        .await
-        .unwrap();
+        file.write_at(bat_offset + payload_index as u64 * 8, data_entry.as_bytes())
+            .await
+            .unwrap();
 
         // Place SBM block at 10 MiB (file_offset_mb = 10).
         let sbm_block_offset = 10 * format::MB1;
         let sbm_entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_offset_mb(sbm_block_offset >> 20);
-        file.write_at(
-            bat_offset + sbm_index as u64 * 8,
-            sbm_entry.as_bytes(),
-        )
-        .await
-        .unwrap();
+        file.write_at(bat_offset + sbm_index as u64 * 8, sbm_entry.as_bytes())
+            .await
+            .unwrap();
 
         // Write the bitmap data at the SBM page offset (first page of SBM block).
         file.write_at(sbm_block_offset, bitmap_data).await.unwrap();
@@ -600,19 +589,18 @@ mod tests {
         let data_entry = BatEntry::new()
             .with_state(BatEntryState::PartiallyPresent as u8)
             .with_file_offset_mb(data_block_offset >> 20);
-        file.write_at(
-            bat_offset + payload_index as u64 * 8,
-            data_entry.as_bytes(),
-        )
-        .await
-        .unwrap();
+        file.write_at(bat_offset + payload_index as u64 * 8, data_entry.as_bytes())
+            .await
+            .unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
         let result = vhdx.resolve_read(0, 4096, &mut ranges).await;
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::UnallocatedSectorBitmapBlock))
+            Err(VhdxError::Corrupt(
+                CorruptionType::UnallocatedSectorBitmapBlock
+            ))
         ));
     }
 
@@ -638,11 +626,11 @@ mod tests {
         set_sector_bitmap_bits(
             &vhdx.cache,
             &vhdx,
-            0,    // virtual_offset
-            2048, // length (4 sectors * 512)
-            512,  // logical_sector_size
+            0,                          // virtual_offset
+            2048,                       // length (4 sectors * 512)
+            512,                        // logical_sector_size
             format::DEFAULT_BLOCK_SIZE, // block_size
-            true, // set
+            true,                       // set
         )
         .await
         .unwrap();

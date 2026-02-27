@@ -12,7 +12,6 @@ use crate::bat::BlockType;
 use crate::bat::InternalBlockMapping;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
-use crate::format;
 use crate::format::BatEntryState;
 use crate::format::MB1;
 use crate::open::VhdxFile;
@@ -119,10 +118,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let virtual_offset = offset + current_offset as u64;
             let block_number = self.bat.offset_to_block(virtual_offset);
             let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(
-                self.block_size - block_offset,
-                len - current_offset,
-            );
+            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
             let mapping = self.get_block_mapping(block_number);
 
@@ -161,9 +157,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         });
                     }
                 }
-                BatEntryState::Zero
-                | BatEntryState::Unmapped
-                | BatEntryState::Undefined => {
+                BatEntryState::Zero | BatEntryState::Unmapped | BatEntryState::Undefined => {
                     ranges.push(ReadRange::Zero {
                         guest_offset: virtual_offset,
                         length: block_length,
@@ -245,10 +239,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let virtual_offset = offset + current_offset as u64;
             let block_number = self.bat.offset_to_block(virtual_offset);
             let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(
-                self.block_size - block_offset,
-                len - current_offset,
-            );
+            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
             let is_full_block = block_offset == 0 && block_length >= self.block_size;
 
@@ -257,8 +248,14 @@ impl<F: AsyncFile> VhdxFile<F> {
                 let (state, file_offset, has_tfp) = {
                     let bat_state = self.bat_state.read();
                     let internal = bat_state.get_payload_mapping(block_number);
-                    let mapping = self.bat.get_block_mapping_from_state(&bat_state, block_number);
-                    (mapping.state, mapping.file_offset, internal.transitioning_to_fully_present())
+                    let mapping = self
+                        .bat
+                        .get_block_mapping_from_state(&bat_state, block_number);
+                    (
+                        mapping.state,
+                        mapping.file_offset,
+                        internal.transitioning_to_fully_present(),
+                    )
                 };
 
                 if has_tfp {
@@ -368,8 +365,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                 let (internal, mapping) = {
                     let bat_state = self.bat_state.read();
                     let internal = bat_state.get_payload_mapping(block_info.block_number);
-                    let mapping =
-                        self.bat.get_block_mapping_from_state(&bat_state, block_info.block_number);
+                    let mapping = self
+                        .bat
+                        .get_block_mapping_from_state(&bat_state, block_info.block_number);
                     (internal, mapping)
                 };
 
@@ -557,10 +555,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let virtual_offset = offset + current_offset as u64;
             let block_number = self.bat.offset_to_block(virtual_offset);
             let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(
-                self.block_size - block_offset,
-                len - current_offset,
-            );
+            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
             // Read the in-memory mapping to check for TFP.
             let internal = {
@@ -580,11 +575,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                     {
                         let mut bat_state = self.bat_state.write();
-                        bat_state.set_payload_mapping(
-                            &self.bat,
-                            block_number,
-                            final_mapping,
-                        );
+                        bat_state.set_payload_mapping(&self.bat, block_number, final_mapping);
                     }
 
                     // Write per-entry to cache. Errors are deferred so we
@@ -606,15 +597,13 @@ impl<F: AsyncFile> VhdxFile<F> {
                     // If the original state was PartiallyPresent (block was
                     // already allocated), keep the file_megabyte.
                     // Otherwise, restore zero offset.
-                    let original_state =
-                        BatEntryState::from_raw(internal.state()).unwrap_or(BatEntryState::NotPresent);
+                    let original_state = BatEntryState::from_raw(internal.state())
+                        .unwrap_or(BatEntryState::NotPresent);
                     let reverted = match original_state {
-                        BatEntryState::PartiallyPresent => {
-                            InternalBlockMapping::new()
-                                .with_state(internal.state())
-                                .with_transitioning_to_fully_present(false)
-                                .with_file_megabyte(internal.file_megabyte())
-                        }
+                        BatEntryState::PartiallyPresent => InternalBlockMapping::new()
+                            .with_state(internal.state())
+                            .with_transitioning_to_fully_present(false)
+                            .with_file_megabyte(internal.file_megabyte()),
                         _ => {
                             // Freshly allocated — revert to original state
                             // with zero offset. Space is leaked.
@@ -627,16 +616,8 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                     {
                         let mut bat_state = self.bat_state.write();
-                        bat_state.set_payload_mapping(
-                            &self.bat,
-                            block_number,
-                            reverted,
-                        );
-                        bat_state.mark_bat_page_dirty(
-                            &self.bat,
-                            BlockType::Payload,
-                            block_number,
-                        );
+                        bat_state.set_payload_mapping(&self.bat, block_number, reverted);
+                        bat_state.mark_bat_page_dirty(&self.bat, BlockType::Payload, block_number);
                     }
                 }
             } else if success && self.has_parent {
@@ -691,8 +672,12 @@ mod tests {
     use crate::open::VhdxFile;
     use crate::region;
     use crate::tests::support::InMemoryFile;
+    use crate::tests::support::IoInterceptor;
     use guid::Guid;
     use pal_async::async_test;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use zerocopy::IntoBytes;
 
     #[async_test]
@@ -782,7 +767,7 @@ mod tests {
             ReadRange::Data {
                 guest_offset: 0,
                 length: 4096,
-                file_offset: 100 * format::MB1,
+                file_offset: 100 * MB1,
             }
         );
     }
@@ -820,9 +805,9 @@ mod tests {
     async fn read_spanning_multiple_blocks() {
         // Use a small disk with 1 MiB blocks so spans are easier to test.
         let file = InMemoryFile::new(0);
-        let block_size = format::MB1 as u32;
+        let block_size = MB1 as u32;
         let mut params = CreateParams {
-            disk_size: 4 * format::MB1,
+            disk_size: 4 * MB1,
             block_size,
             ..Default::default()
         };
@@ -832,8 +817,8 @@ mod tests {
         let mut ranges = Vec::new();
         // Read across blocks 0, 1, 2: start at 512 KiB, length = 2 MiB.
         // Block 0: 512 KiB remaining. Block 1: full 1 MiB. Block 2: 512 KiB.
-        let start = format::MB1 / 2; // middle of block 0
-        let len = (2 * format::MB1) as u32; // spans 3 blocks
+        let start = MB1 / 2; // middle of block 0
+        let len = (2 * MB1) as u32; // spans 3 blocks
         vhdx.resolve_read(start, len, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 3);
@@ -842,14 +827,14 @@ mod tests {
             ranges[0],
             ReadRange::Zero {
                 guest_offset: start,
-                length: (format::MB1 / 2) as u32,
+                length: (MB1 / 2) as u32,
             }
         );
         // Block 1: full block
         assert_eq!(
             ranges[1],
             ReadRange::Zero {
-                guest_offset: format::MB1,
+                guest_offset: MB1,
                 length: block_size,
             }
         );
@@ -857,8 +842,8 @@ mod tests {
         assert_eq!(
             ranges[2],
             ReadRange::Zero {
-                guest_offset: 2 * format::MB1,
-                length: (format::MB1 / 2) as u32,
+                guest_offset: 2 * MB1,
+                length: (MB1 / 2) as u32,
             }
         );
     }
@@ -887,7 +872,7 @@ mod tests {
             ReadRange::Data {
                 guest_offset: 5120,
                 length: 512,
-                file_offset: 50 * format::MB1 + 5120,
+                file_offset: 50 * MB1 + 5120,
             }
         );
     }
@@ -1000,7 +985,7 @@ mod tests {
     #[async_test]
     async fn read_entire_disk() {
         // Small disk: 4 MiB with 2 MiB blocks = 2 blocks.
-        let disk_size = 4 * format::MB1;
+        let disk_size = 4 * MB1;
         let (file, _) = InMemoryFile::create_test_vhdx(disk_size).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
@@ -1088,7 +1073,7 @@ mod tests {
                 assert_eq!(length, 4096);
                 // file_offset should be MB-aligned.
                 assert!(file_offset > 0);
-                assert_eq!(file_offset % format::MB1, 0);
+                assert_eq!(file_offset % MB1, 0);
             }
             _ => panic!("expected Data range, got {:?}", ranges[0]),
         }
@@ -1129,7 +1114,7 @@ mod tests {
             WriteRange::Data {
                 guest_offset: 0,
                 length: 4096,
-                file_offset: 100 * format::MB1,
+                file_offset: 100 * MB1,
             }
         );
     }
@@ -1192,13 +1177,20 @@ mod tests {
         let pattern: Vec<u8> = (0..512u16).map(|i| (i % 256) as u8).collect();
         for wr in &write_ranges {
             match wr {
-                WriteRange::Data { file_offset, length, .. } => {
+                WriteRange::Data {
+                    file_offset,
+                    length,
+                    ..
+                } => {
                     vhdx.file
                         .write_at(*file_offset, &pattern[..(*length as usize)])
                         .await
                         .unwrap();
                 }
-                WriteRange::Zero { file_offset, length } => {
+                WriteRange::Zero {
+                    file_offset,
+                    length,
+                } => {
                     let zeros = vec![0u8; *length as usize];
                     vhdx.file.write_at(*file_offset, &zeros).await.unwrap();
                 }
@@ -1257,10 +1249,7 @@ mod tests {
         }
         match ranges[2] {
             WriteRange::Zero { length, .. } => {
-                assert_eq!(
-                    length,
-                    format::DEFAULT_BLOCK_SIZE - 4096 - 512
-                );
+                assert_eq!(length, format::DEFAULT_BLOCK_SIZE - 4096 - 512);
             }
             _ => panic!("expected trailing Zero, got {:?}", ranges[2]),
         }
@@ -1288,7 +1277,7 @@ mod tests {
                 assert_eq!(guest_offset, 0);
                 assert_eq!(length, format::DEFAULT_BLOCK_SIZE);
                 assert!(file_offset > 0);
-                assert_eq!(file_offset % format::MB1, 0);
+                assert_eq!(file_offset % MB1, 0);
             }
             _ => panic!("expected Data range, got {:?}", ranges[0]),
         }
@@ -1334,16 +1323,16 @@ mod tests {
         // 4 MiB disk with 1 MiB blocks → 4 blocks.
         let file = InMemoryFile::new(0);
         let mut params = CreateParams {
-            disk_size: 4 * format::MB1,
-            block_size: format::MB1 as u32,
+            disk_size: 4 * MB1,
+            block_size: MB1 as u32,
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         // Write 3 MiB starting at offset 512 KiB (spans blocks 0,1,2,3).
-        let start = format::MB1 / 2;
-        let length = (3 * format::MB1) as u32;
+        let start = MB1 / 2;
+        let length = (3 * MB1) as u32;
         let mut ranges = Vec::new();
         vhdx.resolve_write(start, length, &mut ranges)
             .await
@@ -1357,7 +1346,7 @@ mod tests {
         assert_eq!(data_ranges.len(), 4);
 
         // Verify guest offsets and lengths.
-        let block_size = format::MB1;
+        let block_size = MB1;
         match data_ranges[0] {
             WriteRange::Data {
                 guest_offset,
@@ -1448,7 +1437,9 @@ mod tests {
         let original_data_guid = params.data_write_guid;
 
         // Enable FileWritable mode (metadata-only modification).
-        vhdx.enable_write_mode(WriteMode::FileWritable).await.unwrap();
+        vhdx.enable_write_mode(WriteMode::FileWritable)
+            .await
+            .unwrap();
 
         // data_write_guid should NOT have changed.
         assert_eq!(vhdx.data_write_guid(), original_data_guid);
@@ -1456,5 +1447,528 @@ mod tests {
         // But the write mode should be set (subsequent DataWritable will escalate).
         let state = vhdx.write_state.lock();
         assert_eq!(state.write_mode, Some(WriteMode::FileWritable));
+    }
+
+    // --- Phase 9.5b: TFP mechanics, write integration, and error path tests ---
+
+    /// Interceptor with toggleable failure for mid-test fault injection.
+    struct ToggleableInterceptor {
+        fail_writes: Arc<AtomicBool>,
+        fail_set_file_size: Arc<AtomicBool>,
+    }
+
+    impl IoInterceptor for ToggleableInterceptor {
+        fn before_write(&self, _offset: u64, _data: &[u8]) -> Result<(), std::io::Error> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            Ok(())
+        }
+
+        fn before_set_file_size(&self, _size: u64) -> Result<(), std::io::Error> {
+            if self.fail_set_file_size.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected set_file_size failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_test]
+    async fn resolve_write_sets_tfp_on_full_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        // Full-block write should set TFP on block 0.
+        let bat_state = vhdx.bat_state.read();
+        let mapping = bat_state.get_payload_mapping(0);
+        assert!(
+            mapping.transitioning_to_fully_present(),
+            "full-block resolve_write should set TFP"
+        );
+        assert!(
+            mapping.file_megabyte() > 0,
+            "allocated block should have non-zero file offset"
+        );
+    }
+
+    #[async_test]
+    async fn resolve_write_no_tfp_on_partial_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+
+        // Partial-block write should NOT set TFP — BAT committed immediately.
+        let bat_state = vhdx.bat_state.read();
+        let mapping = bat_state.get_payload_mapping(0);
+        assert!(
+            !mapping.transitioning_to_fully_present(),
+            "partial-block resolve_write should not set TFP"
+        );
+        assert_eq!(
+            mapping.state(),
+            BatEntryState::FullyPresent as u8,
+            "partial allocation should set FullyPresent immediately"
+        );
+    }
+
+    #[async_test]
+    async fn write_read_roundtrip_multi_block() {
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size: 4 * MB1,
+            block_size: MB1 as u32,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let block_size = vhdx.block_size() as u64;
+        // Write 2 full blocks starting at offset 0.
+        let length = (2 * block_size) as u32;
+        let mut write_ranges = Vec::new();
+        vhdx.resolve_write(0, length, &mut write_ranges)
+            .await
+            .unwrap();
+
+        // Write recognizable pattern to each Data range.
+        for wr in &write_ranges {
+            match wr {
+                WriteRange::Data {
+                    guest_offset,
+                    length,
+                    file_offset,
+                } => {
+                    let pattern: Vec<u8> = (0..*length)
+                        .map(|i| ((guest_offset + i as u64) % 251) as u8)
+                        .collect();
+                    vhdx.file.write_at(*file_offset, &pattern).await.unwrap();
+                }
+                WriteRange::Zero {
+                    file_offset,
+                    length,
+                } => {
+                    let zeros = vec![0u8; *length as usize];
+                    vhdx.file.write_at(*file_offset, &zeros).await.unwrap();
+                }
+            }
+        }
+        vhdx.complete_write(0, length, true).await.unwrap();
+
+        // Read back both blocks.
+        let mut read_ranges = Vec::new();
+        vhdx.resolve_read(0, length, &mut read_ranges)
+            .await
+            .unwrap();
+
+        for rr in &read_ranges {
+            match rr {
+                ReadRange::Data {
+                    guest_offset,
+                    length,
+                    file_offset,
+                } => {
+                    let mut buf = vec![0u8; *length as usize];
+                    vhdx.file.read_at(*file_offset, &mut buf).await.unwrap();
+                    let expected: Vec<u8> = (0..*length)
+                        .map(|i| ((guest_offset + i as u64) % 251) as u8)
+                        .collect();
+                    assert_eq!(
+                        buf, expected,
+                        "data mismatch at guest offset {guest_offset}"
+                    );
+                }
+                ReadRange::Zero { .. } => {
+                    panic!("expected Data range after write, got Zero");
+                }
+                ReadRange::Unmapped { .. } => {
+                    panic!("expected Data range after write, got Unmapped");
+                }
+            }
+        }
+    }
+
+    #[async_test]
+    async fn write_to_already_allocated_no_growth() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let regions = region::parse_region_tables(&file).await.unwrap();
+
+        // Pre-allocate block 0 as FullyPresent at offset 100 MB.
+        let entry = BatEntry::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_offset_mb(100);
+        file.write_at(regions.bat_offset, entry.as_bytes())
+            .await
+            .unwrap();
+
+        // Ensure file is big enough to cover that offset.
+        let needed_size = 100 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
+        file.set_file_size(needed_size).await.unwrap();
+
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let eof_before = *vhdx.eof_offset.lock();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+
+        // No new allocation should occur — verify eof_offset unchanged.
+        let eof_after = *vhdx.eof_offset.lock();
+        assert_eq!(
+            eof_before, eof_after,
+            "eof should not change for existing block"
+        );
+
+        // Should point to the existing block.
+        assert_eq!(ranges.len(), 1);
+        match ranges[0] {
+            WriteRange::Data { file_offset, .. } => {
+                assert_eq!(file_offset, 100 * MB1);
+            }
+            _ => panic!("expected Data range"),
+        }
+    }
+
+    #[async_test]
+    async fn write_flush_persists_bat() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let regions = region::parse_region_tables(&file).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Write and complete a full block.
+        let block_size = vhdx.block_size();
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+        vhdx.complete_write(0, block_size, true).await.unwrap();
+        vhdx.flush().await.unwrap();
+
+        // Read the BAT entry directly from the file.
+        let mut entry_bytes = [0u8; 8];
+        vhdx.file
+            .read_at(regions.bat_offset, &mut entry_bytes)
+            .await
+            .unwrap();
+        let entry = BatEntry::from(u64::from_le_bytes(entry_bytes));
+        assert_eq!(
+            entry.state(),
+            BatEntryState::FullyPresent as u8,
+            "flushed BAT should show FullyPresent"
+        );
+        assert!(
+            entry.file_offset_mb() > 0,
+            "flushed BAT should have non-zero offset"
+        );
+    }
+
+    #[async_test]
+    async fn complete_write_clears_tfp() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // resolve_write should set TFP.
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        {
+            let bat_state = vhdx.bat_state.read();
+            let mapping = bat_state.get_payload_mapping(0);
+            assert!(mapping.transitioning_to_fully_present());
+        }
+
+        // complete_write should clear TFP.
+        vhdx.complete_write(0, block_size, true).await.unwrap();
+
+        {
+            let bat_state = vhdx.bat_state.read();
+            let mapping = bat_state.get_payload_mapping(0);
+            assert!(
+                !mapping.transitioning_to_fully_present(),
+                "TFP should be cleared after complete_write"
+            );
+            assert_eq!(
+                mapping.state(),
+                BatEntryState::FullyPresent as u8,
+                "block should be FullyPresent after complete"
+            );
+        }
+    }
+
+    #[async_test]
+    async fn complete_write_writes_bat_to_disk() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let regions = region::parse_region_tables(&file).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        // Get the allocated offset from in-memory BAT.
+        let expected_mb = {
+            let bat_state = vhdx.bat_state.read();
+            bat_state.get_payload_mapping(0).file_megabyte()
+        };
+
+        vhdx.complete_write(0, block_size, true).await.unwrap();
+
+        // Read the BAT entry from disk via the file.
+        let mut entry_bytes = [0u8; 8];
+        vhdx.file
+            .read_at(regions.bat_offset, &mut entry_bytes)
+            .await
+            .unwrap();
+        let entry = BatEntry::from(u64::from_le_bytes(entry_bytes));
+        assert_eq!(entry.state(), BatEntryState::FullyPresent as u8);
+        assert_eq!(entry.file_offset_mb(), expected_mb as u64);
+    }
+
+    #[async_test]
+    async fn resolve_write_extends_file() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        let size_before = vhdx.file.file_size().await.unwrap();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+
+        let size_after = vhdx.file.file_size().await.unwrap();
+        assert!(
+            size_after > size_before,
+            "file should grow after allocating a new block \
+             (before={size_before}, after={size_after})"
+        );
+    }
+
+    #[async_test]
+    async fn dirty_page_after_abort() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // No dirty pages initially.
+        {
+            let state = vhdx.bat_state.read();
+            assert!(
+                state.dirty_page_indices().next().is_none(),
+                "should have no dirty pages initially"
+            );
+        }
+
+        // resolve_write for a full block → sets TFP.
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        // Abort → marks the BAT page dirty.
+        vhdx.complete_write(0, block_size, false).await.unwrap();
+
+        {
+            let state = vhdx.bat_state.read();
+            let dirty_count = state.dirty_page_indices().count();
+            assert!(dirty_count > 0, "BAT page should be dirty after abort");
+        }
+
+        // Flushing should write the dirty page and clear the flag.
+        vhdx.flush().await.unwrap();
+
+        {
+            let state = vhdx.bat_state.read();
+            assert!(
+                state.dirty_page_indices().next().is_none(),
+                "dirty pages should be cleared after flush"
+            );
+        }
+    }
+
+    #[async_test]
+    async fn abort_write_clears_tfp() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        // TFP should be set.
+        {
+            let bat_state = vhdx.bat_state.read();
+            assert!(
+                bat_state
+                    .get_payload_mapping(0)
+                    .transitioning_to_fully_present()
+            );
+        }
+
+        // Abort.
+        vhdx.complete_write(0, block_size, false).await.unwrap();
+
+        // TFP should be cleared and state reverted to NotPresent.
+        {
+            let bat_state = vhdx.bat_state.read();
+            let mapping = bat_state.get_payload_mapping(0);
+            assert!(
+                !mapping.transitioning_to_fully_present(),
+                "TFP should be cleared after abort"
+            );
+            assert_eq!(
+                mapping.state(),
+                BatEntryState::NotPresent as u8,
+                "should revert to original NotPresent state"
+            );
+            assert_eq!(
+                mapping.file_megabyte(),
+                0,
+                "should revert file_megabyte to 0"
+            );
+        }
+    }
+
+    #[async_test]
+    async fn abort_write_allows_subsequent_write() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // First write: allocate and abort.
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+        vhdx.complete_write(0, block_size, false).await.unwrap();
+
+        // Second write: should succeed (no TFP blocking).
+        let mut ranges2 = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges2)
+            .await
+            .unwrap();
+        vhdx.complete_write(0, block_size, true).await.unwrap();
+
+        // Block should be FullyPresent now.
+        let bat_state = vhdx.bat_state.read();
+        let mapping = bat_state.get_payload_mapping(0);
+        assert_eq!(mapping.state(), BatEntryState::FullyPresent as u8);
+        assert!(!mapping.transitioning_to_fully_present());
+    }
+
+    #[async_test]
+    async fn complete_write_notifies_on_cache_failure() {
+        // Create VHDX normally, then snapshot to new file with toggleable interceptor.
+        let (orig_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let data = orig_file.snapshot();
+
+        let fail_writes = Arc::new(AtomicBool::new(false));
+        let interceptor = Box::new(ToggleableInterceptor {
+            fail_writes: fail_writes.clone(),
+            fail_set_file_size: Arc::new(AtomicBool::new(false)),
+        });
+        let file = InMemoryFile::with_interceptor(0, interceptor);
+        file.write_at(0, &data).await.unwrap();
+
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // resolve_write succeeds (writes for header update, set_file_size).
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        // Enable write failure — BAT cache write will fail.
+        fail_writes.store(true, Ordering::SeqCst);
+
+        // complete_write should fail (BAT cache write uses write_at).
+        let result = vhdx.complete_write(0, block_size, true).await;
+        assert!(
+            result.is_err(),
+            "complete_write should fail when cache writes fail"
+        );
+
+        // Despite the error, TFP should be cleared and state set to FullyPresent.
+        {
+            let bat_state = vhdx.bat_state.read();
+            let mapping = bat_state.get_payload_mapping(0);
+            assert!(
+                !mapping.transitioning_to_fully_present(),
+                "TFP should be cleared even on cache write failure"
+            );
+            assert_eq!(
+                mapping.state(),
+                BatEntryState::FullyPresent as u8,
+                "state should be FullyPresent despite cache write failure"
+            );
+        }
+
+        // Re-enable writes.
+        fail_writes.store(false, Ordering::SeqCst);
+
+        // A subsequent resolve_write should work (not hang on TFP).
+        let mut ranges2 = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges2)
+            .await
+            .unwrap();
+    }
+
+    #[async_test]
+    async fn resolve_write_error_reverts_tfp() {
+        // Create VHDX normally, then snapshot to new file with toggleable interceptor.
+        let (orig_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let data = orig_file.snapshot();
+
+        let fail_set_file_size = Arc::new(AtomicBool::new(false));
+        let interceptor = Box::new(ToggleableInterceptor {
+            fail_writes: Arc::new(AtomicBool::new(false)),
+            fail_set_file_size: fail_set_file_size.clone(),
+        });
+        let file = InMemoryFile::with_interceptor(0, interceptor);
+        file.write_at(0, &data).await.unwrap();
+
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // Enable set_file_size failure.
+        fail_set_file_size.store(true, Ordering::SeqCst);
+
+        // resolve_write should fail when set_file_size fails during allocation.
+        let mut ranges = Vec::new();
+        let result = vhdx.resolve_write(0, block_size, &mut ranges).await;
+        assert!(
+            result.is_err(),
+            "resolve_write should fail when set_file_size fails"
+        );
+
+        // TFP should be reverted.
+        {
+            let bat_state = vhdx.bat_state.read();
+            let mapping = bat_state.get_payload_mapping(0);
+            assert!(
+                !mapping.transitioning_to_fully_present(),
+                "TFP should be reverted on resolve_write error"
+            );
+        }
+
+        // Disable failure, retry should succeed.
+        fail_set_file_size.store(false, Ordering::SeqCst);
+
+        let mut ranges2 = Vec::new();
+        vhdx.resolve_write(0, block_size, &mut ranges2)
+            .await
+            .unwrap();
     }
 }

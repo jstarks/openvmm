@@ -104,10 +104,7 @@ pub(crate) fn chunk_block_count(block_size: u32, sector_size: u32) -> u32 {
 ///
 /// `params` is updated in place with defaults filled in (e.g. zero
 /// `block_size` becomes 2 MiB, zero GUIDs become random).
-pub async fn create(
-    file: &impl AsyncFile,
-    params: &mut CreateParams,
-) -> Result<(), VhdxError> {
+pub async fn create(file: &impl AsyncFile, params: &mut CreateParams) -> Result<(), VhdxError> {
     // --- Validate and default parameters ---
 
     if params.logical_sector_size == 0 {

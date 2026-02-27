@@ -341,6 +341,7 @@ mod tests {
                 fail_reads: true,
                 fail_writes: false,
                 fail_flushes: false,
+                fail_set_file_size: false,
             }),
         );
 

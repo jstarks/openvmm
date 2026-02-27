@@ -7,7 +7,6 @@
 //! the correct BAT page offset for any given block number. Handles the
 //! interleaving of payload block entries with sector bitmap entries.
 
-use bitfield_struct::bitfield;
 use crate::AsyncFile;
 use crate::cache::AccessMode;
 use crate::cache::PageCache;
@@ -21,6 +20,7 @@ use crate::format::BatEntryState;
 use crate::format::CACHE_PAGE_SIZE;
 use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::MB1;
+use bitfield_struct::bitfield;
 use zerocopy::IntoBytes;
 
 /// Cache tag for BAT region pages.
@@ -84,8 +84,7 @@ pub(crate) struct InternalBlockMapping {
 impl InternalBlockMapping {
     /// Convert this in-memory mapping to a [`BlockMapping`] for the read path.
     pub fn to_block_mapping(self) -> BlockMapping {
-        let state = BatEntryState::from_raw(self.state())
-            .unwrap_or(BatEntryState::NotPresent);
+        let state = BatEntryState::from_raw(self.state()).unwrap_or(BatEntryState::NotPresent);
         BlockMapping {
             state,
             file_offset: self.file_megabyte() as u64 * MB1,
@@ -134,8 +133,7 @@ pub(crate) struct BatState {
 
 /// Whether a block state counts as "allocated" for `allocated_block_count`.
 fn is_allocated_state(state: u8) -> bool {
-    state == BatEntryState::FullyPresent as u8
-        || state == BatEntryState::PartiallyPresent as u8
+    state == BatEntryState::FullyPresent as u8 || state == BatEntryState::PartiallyPresent as u8
 }
 
 impl BatState {
@@ -175,12 +173,7 @@ impl BatState {
     ///
     /// Does NOT mark the BAT page dirty — callers decide when to mark dirty.
     #[allow(dead_code)] // will be used by allocation write path in a later phase
-    pub fn set_sbm_mapping(
-        &mut self,
-        bat: &Bat,
-        chunk_number: u32,
-        mapping: InternalBlockMapping,
-    ) {
+    pub fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: InternalBlockMapping) {
         let _ = bat;
         self.sector_bitmap_mappings[chunk_number as usize] = mapping;
     }
@@ -461,25 +454,17 @@ impl Bat {
             .await?;
 
         let byte_offset = entry_within_page * size_of::<BatEntry>();
-        guard[byte_offset..byte_offset + size_of::<BatEntry>()]
-            .copy_from_slice(entry.as_bytes());
+        guard[byte_offset..byte_offset + size_of::<BatEntry>()].copy_from_slice(entry.as_bytes());
 
         guard.release().await?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create;
     use crate::format;
-    use crate::region;
-    use crate::tests::support::InMemoryFile;
-    use pal_async::async_test;
-    use std::sync::Arc;
-    use zerocopy::IntoBytes;
 
     #[test]
     fn chunk_ratio_default_params() {
@@ -694,13 +679,7 @@ mod tests {
         // Use small chunk_ratio to exercise interleaving.
         // 1 MiB blocks, 4096 sectors → chunk_ratio = 32768.
         // Use 256 MiB blocks, 512 sectors → chunk_ratio = 16.
-        let bat = Bat::new(
-            format::GB1,
-            256 * MB1 as u32,
-            512,
-            true,
-        )
-        .unwrap();
+        let bat = Bat::new(format::GB1, 256 * MB1 as u32, 512, true).unwrap();
         assert_eq!(bat.chunk_ratio, 16);
         // data_block_count = 4, sector_bitmap_block_count = 1
 
@@ -753,8 +732,7 @@ mod tests {
         assert_eq!(state.allocated_block_count, 2);
 
         // Deallocate block 0 → NotPresent.
-        let dealloc = InternalBlockMapping::new()
-            .with_state(BatEntryState::NotPresent as u8);
+        let dealloc = InternalBlockMapping::new().with_state(BatEntryState::NotPresent as u8);
         state.set_payload_mapping(&bat, 0, dealloc);
         assert_eq!(state.allocated_block_count, 1);
     }

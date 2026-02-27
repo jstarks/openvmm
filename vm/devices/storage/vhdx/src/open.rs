@@ -15,7 +15,6 @@ use crate::bat::BlockMapping;
 use crate::bat::BlockType;
 use crate::bat::InternalBlockMapping;
 use crate::bat::METADATA_TAG;
-use crate::sector_bitmap::SBM_TAG;
 use crate::cache::AccessMode;
 use crate::cache::PageCache;
 use crate::cache::PageKey;
@@ -34,6 +33,7 @@ use crate::known_meta::read_known_metadata;
 use crate::known_meta::verify_known_metadata;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
+use crate::sector_bitmap::SBM_TAG;
 use guid::Guid;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -110,7 +110,6 @@ pub struct VhdxFile<F: AsyncFile> {
     pub(crate) eof_offset: Mutex<u64>,
 
     // Region offsets
-    pub(crate) bat_offset: u64,
     #[allow(dead_code)] // Phase 9+: used for space management
     bat_length: u32,
     #[allow(dead_code)] // Phase 9+: used for metadata writes
@@ -217,7 +216,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             allocation_lock: futures::lock::Mutex::new(()),
             allocation_event: event_listener::Event::new(),
             eof_offset: Mutex::new(eof_offset),
-            bat_offset: regions.bat_offset,
+
             bat_length: regions.bat_length,
             metadata_offset: regions.metadata_offset,
             metadata_length: regions.metadata_length,
@@ -229,10 +228,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     }
 
     /// Load the in-memory BAT state from disk BAT pages.
-    async fn load_bat_state(
-        cache: &PageCache<F>,
-        bat: &Bat,
-    ) -> Result<BatState, VhdxError> {
+    async fn load_bat_state(cache: &PageCache<F>, bat: &Bat) -> Result<BatState, VhdxError> {
         let mut payload_mappings = Vec::with_capacity(bat.data_block_count as usize);
         let mut sector_bitmap_mappings = Vec::with_capacity(bat.sector_bitmap_block_count as usize);
         let mut allocated_block_count: u32 = 0;
@@ -348,7 +344,8 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Synchronous — reads from the in-memory BAT, no I/O.
     pub(crate) fn get_block_mapping(&self, block_number: u32) -> BlockMapping {
         let bat_state = self.bat_state.read();
-        self.bat.get_block_mapping_from_state(&bat_state, block_number)
+        self.bat
+            .get_block_mapping_from_state(&bat_state, block_number)
     }
 
     /// Look up the sector bitmap block mapping for a given chunk number.
@@ -356,7 +353,8 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Synchronous — reads from the in-memory BAT, no I/O.
     pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
         let bat_state = self.bat_state.read();
-        self.bat.get_sbm_mapping_from_state(&bat_state, chunk_number)
+        self.bat
+            .get_sbm_mapping_from_state(&bat_state, chunk_number)
     }
 
     /// Allocate space for a new block. Returns the file offset (MB-aligned).
@@ -408,8 +406,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 None => BatEntry::new(),
             };
             let offset = i as usize * size_of::<BatEntry>();
-            buf[offset..offset + size_of::<BatEntry>()]
-                .copy_from_slice(bat_entry.as_bytes());
+            buf[offset..offset + size_of::<BatEntry>()].copy_from_slice(bat_entry.as_bytes());
         }
         buf
     }

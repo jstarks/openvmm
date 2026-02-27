@@ -119,6 +119,20 @@ impl InMemoryFile {
     pub fn snapshot(&self) -> Vec<u8> {
         self.inner.lock().data.clone()
     }
+
+    /// Create a VHDX file in memory with the given disk size and default parameters.
+    #[allow(dead_code)]
+    ///
+    /// Returns the `InMemoryFile` and the validated `CreateParams`.
+    pub async fn create_test_vhdx(disk_size: u64) -> (InMemoryFile, crate::create::CreateParams) {
+        let file = InMemoryFile::new(0);
+        let params = crate::create::CreateParams {
+            disk_size,
+            ..Default::default()
+        };
+        let params = crate::create::create(&file, params).await.unwrap();
+        (file, params)
+    }
 }
 
 impl AsyncFile for InMemoryFile {

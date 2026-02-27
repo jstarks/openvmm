@@ -16,12 +16,63 @@ pub enum VhdxError {
     Io(#[from] std::io::Error),
 
     /// The VHDX file is corrupt.
-    #[error("VHDX file is corrupt: {0}")]
+    #[error("VHDX file is corrupt")]
     Corrupt(#[from] CorruptionType),
 
-    /// A generic validation error with a descriptive message.
-    #[error("{0}")]
-    InvalidFormat(String),
+    /// A parameter validation error.
+    #[error("invalid format parameters")]
+    InvalidFormat(#[from] InvalidFormatReason),
+}
+
+/// Specific reasons a VHDX creation or parameter validation may fail.
+///
+/// Each variant corresponds to a distinct validation error detected
+/// when processing VHDX parameters (e.g. during file creation).
+#[derive(Debug, Clone, Error)]
+pub enum InvalidFormatReason {
+    /// The logical sector size is not 512 or 4096.
+    #[error("logical sector size must be 512 or 4096")]
+    InvalidLogicalSectorSize,
+
+    /// The physical sector size is not 512 or 4096.
+    #[error("physical sector size must be 512 or 4096")]
+    InvalidPhysicalSectorSize,
+
+    /// The disk size is zero.
+    #[error("disk size must be > 0")]
+    DiskSizeZero,
+
+    /// The disk size is not a multiple of the logical sector size.
+    #[error("disk size must be a multiple of logical sector size")]
+    DiskSizeNotAligned,
+
+    /// The disk size exceeds the maximum (64 TiB).
+    #[error("disk size exceeds maximum (64 TiB)")]
+    DiskSizeTooLarge,
+
+    /// The block size is not a multiple of 1 MiB.
+    #[error("block size must be a multiple of 1 MiB")]
+    BlockSizeNotAligned,
+
+    /// The block size exceeds the maximum (256 MiB).
+    #[error("block size exceeds maximum (256 MiB)")]
+    BlockSizeTooLarge,
+
+    /// The block alignment is not a power of 2.
+    #[error("block alignment must be a power of 2")]
+    BlockAlignmentNotPowerOfTwo,
+
+    /// The block size / logical sector size combination is invalid (chunk ratio is zero).
+    #[error("invalid block size / logical sector size combination")]
+    InvalidChunkRatio,
+
+    /// The computed BAT entry count exceeds the absolute maximum.
+    #[error("BAT entry count exceeds absolute maximum")]
+    BatEntryCountTooLarge,
+
+    /// The computed BAT size exceeds the maximum.
+    #[error("BAT size exceeds maximum")]
+    BatSizeTooLarge,
 }
 
 /// Specific reasons a VHDX file may be considered corrupt.

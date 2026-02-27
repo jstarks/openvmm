@@ -16,10 +16,12 @@
 #![allow(missing_docs)]
 #![allow(async_fn_in_trait)]
 
+pub mod create;
 pub mod error;
 pub mod format;
 
 pub use error::CorruptionType;
+pub use error::InvalidFormatReason;
 pub use error::VhdxError;
 
 #[cfg(test)]

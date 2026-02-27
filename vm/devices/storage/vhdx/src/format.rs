@@ -198,6 +198,28 @@ pub const LOG_DATA_SECTOR_SIGNATURE: u32 = u32::from_le_bytes(*b"data");
 // File identifier signature
 // ---------------------------------------------------------------------------
 
+/// Default block size (2 MiB).
+pub const DEFAULT_BLOCK_SIZE: u32 = 2 * MB1 as u32;
+
+/// Default logical/physical sector size (512 bytes).
+pub const DEFAULT_SECTOR_SIZE: u32 = 512;
+
+/// Default metadata region size (1 MiB).
+pub const DEFAULT_METADATA_REGION_SIZE: u32 = MB1 as u32;
+
+/// Default log region size (1 MiB).
+pub const DEFAULT_LOG_SIZE: u32 = MB1 as u32;
+
+/// Cache page size (4 KiB) — the granularity of BAT page I/O.
+pub const CACHE_PAGE_SIZE: u64 = KB4;
+
+/// Number of BAT entries per cache page (4096 / 8 = 512).
+pub const ENTRIES_PER_BAT_PAGE: u64 = CACHE_PAGE_SIZE / size_of::<BatEntry>() as u64;
+
+/// Maximum hosting sector size (64 KiB) — largest sector the metadata
+/// table items should fit in.
+pub const MAX_HOSTING_SECTOR_SIZE: u64 = KB64;
+
 /// Signature for [`FileIdentifier`] (`"vhdxfile"` as a little-endian u64).
 pub const FILE_IDENTIFIER_SIGNATURE: u64 = u64::from_le_bytes(*b"vhdxfile");
 

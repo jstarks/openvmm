@@ -8,10 +8,12 @@
 //! and emits [`ReadRange`] entries describing where to find the data.
 
 use crate::AsyncFile;
+use crate::bat;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
 use crate::open::VhdxFile;
+use crate::open::WriteMode;
 use crate::sector_bitmap;
 
 /// Resolved range from a read operation.
@@ -170,6 +172,197 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         Ok(())
+    }
+
+    /// Resolve a write request into file-level ranges.
+    ///
+    /// Walks the write request block-by-block, allocating blocks as needed.
+    /// For each block, emits [`WriteRange::Data`] entries describing where
+    /// the caller should write data, and [`WriteRange::Zero`] entries for
+    /// any newly allocated regions that must be zero-filled.
+    ///
+    /// Before any ranges are returned, the header is updated with new GUIDs
+    /// and flushed to disk (first-write gate).
+    ///
+    /// After the caller writes data at the returned offsets, it must call
+    /// [`complete_write()`](Self::complete_write) to finalize sector bitmaps.
+    pub async fn resolve_write(
+        &self,
+        offset: u64,
+        len: u32,
+        ranges: &mut Vec<WriteRange>,
+    ) -> Result<(), VhdxError> {
+        // Check read-only.
+        if self.read_only {
+            return Err(VhdxError::ReadOnly);
+        }
+
+        // Zero-length writes succeed immediately.
+        if len == 0 {
+            return Ok(());
+        }
+
+        // Validate alignment to logical sector size.
+        if !offset.is_multiple_of(self.logical_sector_size as u64)
+            || !(len as u64).is_multiple_of(self.logical_sector_size as u64)
+        {
+            return Err(VhdxError::Corrupt(CorruptionType::UnalignedIo));
+        }
+
+        // Validate bounds.
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.disk_size)
+        {
+            return Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk));
+        }
+
+        // First-write gate: update header with new GUIDs before any data.
+        self.enable_write_mode(WriteMode::DataWritable).await?;
+
+        let mut current_offset: u32 = 0;
+
+        while current_offset < len {
+            let virtual_offset = offset + current_offset as u64;
+            let block_number = self.bat.offset_to_block(virtual_offset);
+            let block_offset = self.bat.offset_within_block(virtual_offset);
+            let block_length = std::cmp::min(
+                self.block_size - block_offset,
+                len - current_offset,
+            );
+
+            let mapping = self.get_block_mapping(block_number).await?;
+
+            match mapping.state {
+                BatEntryState::FullyPresent => {
+                    // Block already allocated — write directly.
+                    let file_offset = mapping.file_offset + block_offset as u64;
+                    ranges.push(WriteRange::Data {
+                        guest_offset: virtual_offset,
+                        length: block_length,
+                        file_offset,
+                    });
+                }
+                BatEntryState::PartiallyPresent => {
+                    // Block already allocated (differencing disk) — write directly.
+                    // complete_write() will update the sector bitmap.
+                    let file_offset = mapping.file_offset + block_offset as u64;
+                    ranges.push(WriteRange::Data {
+                        guest_offset: virtual_offset,
+                        length: block_length,
+                        file_offset,
+                    });
+                }
+                BatEntryState::NotPresent
+                | BatEntryState::Zero
+                | BatEntryState::Unmapped
+                | BatEntryState::Undefined => {
+                    // Block not allocated — allocate by extending EOF.
+                    let new_offset =
+                        bat::allocate_block_eof(&*self.file, self.block_size).await?;
+
+                    // Emit zero-fill for portions of the block before the write.
+                    if block_offset > 0 {
+                        ranges.push(WriteRange::Zero {
+                            file_offset: new_offset,
+                            length: block_offset,
+                        });
+                    }
+
+                    // Emit the data range.
+                    ranges.push(WriteRange::Data {
+                        guest_offset: virtual_offset,
+                        length: block_length,
+                        file_offset: new_offset + block_offset as u64,
+                    });
+
+                    // Emit zero-fill for portions of the block after the write.
+                    let end_offset = block_offset + block_length;
+                    if end_offset < self.block_size {
+                        ranges.push(WriteRange::Zero {
+                            file_offset: new_offset + end_offset as u64,
+                            length: self.block_size - end_offset,
+                        });
+                    }
+
+                    // Update BAT to FullyPresent with the new offset.
+                    self.bat
+                        .set_block_mapping(
+                            &self.cache,
+                            block_number,
+                            BatEntryState::FullyPresent,
+                            new_offset,
+                        )
+                        .await?;
+                }
+            }
+
+            current_offset += block_length;
+        }
+
+        Ok(())
+    }
+
+    /// Finalize a write operation by updating sector bitmaps.
+    ///
+    /// For non-differencing disks, this is a no-op (all newly allocated
+    /// blocks are FullyPresent). For differencing disks with pre-existing
+    /// PartiallyPresent blocks, this sets the sector bitmap bits for the
+    /// written sectors.
+    pub async fn complete_write(
+        &self,
+        offset: u64,
+        len: u32,
+    ) -> Result<(), VhdxError> {
+        // No SBM updates needed for non-differencing disks.
+        if !self.has_parent {
+            return Ok(());
+        }
+
+        // Zero-length — nothing to do.
+        if len == 0 {
+            return Ok(());
+        }
+
+        let mut current_offset: u32 = 0;
+
+        while current_offset < len {
+            let virtual_offset = offset + current_offset as u64;
+            let block_number = self.bat.offset_to_block(virtual_offset);
+            let block_offset = self.bat.offset_within_block(virtual_offset);
+            let block_length = std::cmp::min(
+                self.block_size - block_offset,
+                len - current_offset,
+            );
+
+            let mapping = self.get_block_mapping(block_number).await?;
+
+            if mapping.state == BatEntryState::PartiallyPresent {
+                // Set sector bitmap bits for the written sectors.
+                sector_bitmap::set_sector_bitmap_bits(
+                    &self.cache,
+                    &self.bat,
+                    virtual_offset,
+                    block_length,
+                    self.logical_sector_size,
+                    self.block_size,
+                    true,
+                )
+                .await?;
+            }
+
+            current_offset += block_length;
+        }
+
+        Ok(())
+    }
+
+    /// Flush all writes to stable storage.
+    ///
+    /// For Phase 9 (no log), this simply issues a file-level flush to
+    /// ensure all OS-buffered writes are durable.
+    pub async fn flush(&self) -> Result<(), VhdxError> {
+        self.file.flush().await.map_err(VhdxError::Io)
     }
 }
 

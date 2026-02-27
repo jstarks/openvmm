@@ -18,6 +18,7 @@ use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format;
 use crate::format::FileIdentifier;
+use crate::format::Header;
 use crate::header::parse_headers;
 use crate::known_meta::read_known_metadata;
 use crate::known_meta::verify_known_metadata;
@@ -27,6 +28,8 @@ use guid::Guid;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use zerocopy::FromBytes;
+use zerocopy::FromZeros;
+use zerocopy::IntoBytes;
 
 /// Mutable header and write-mode state, protected by a mutex.
 ///
@@ -94,7 +97,7 @@ pub struct VhdxFile<F: AsyncFile> {
     log_length: u32,
 
     // Mode
-    read_only: bool,
+    pub(crate) read_only: bool,
 
     // Error state: once set, all operations fail.
     #[allow(dead_code)] // Phase 7+: used for error propagation on I/O path
@@ -235,6 +238,96 @@ impl<F: AsyncFile> VhdxFile<F> {
         block_number: u32,
     ) -> Result<BlockMapping, VhdxError> {
         self.bat.get_block_mapping(&self.cache, block_number).await
+    }
+
+    /// Ensures the requested write mode is enabled, updating the header
+    /// and flushing if needed. If the current mode already satisfies the
+    /// request, this is a no-op.
+    ///
+    /// The header is written to the non-current slot with new GUIDs and
+    /// an incremented sequence number, then flushed to disk. Only after
+    /// the flush completes is the mode committed in memory.
+    pub(crate) async fn enable_write_mode(&self, mode: WriteMode) -> Result<(), VhdxError> {
+        // Check if the mode is already enabled (fast path).
+        let needs_update = {
+            let state = self.write_state.lock();
+            match state.write_mode {
+                Some(current) if current >= mode => false,
+                _ => true,
+            }
+        };
+
+        if !needs_update {
+            return Ok(());
+        }
+
+        // Prepare the header update under the lock, then release before I/O.
+        let (header_buf, header_offset) = {
+            let mut state = self.write_state.lock();
+
+            // Double-check under lock (another caller may have raced).
+            if let Some(current) = state.write_mode {
+                if current >= mode {
+                    return Ok(());
+                }
+            }
+
+            // Always update file_write_guid (any write mode implies file modification).
+            state.file_write_guid = Guid::new_random();
+
+            // Update data_write_guid if escalating to DataWritable.
+            if mode >= WriteMode::DataWritable {
+                state.data_write_guid = Guid::new_random();
+            }
+
+            // Increment sequence number.
+            state.sequence_number += 1;
+
+            // Build the header.
+            let mut header = Header::new_zeroed();
+            header.signature = format::HEADER_SIGNATURE;
+            header.sequence_number = state.sequence_number;
+            header.file_write_guid = state.file_write_guid;
+            header.data_write_guid = state.data_write_guid;
+            header.log_guid = Guid::ZERO;
+            header.log_version = format::LOG_VERSION;
+            header.version = format::VERSION_1;
+            header.log_length = self.log_length;
+            header.log_offset = self.log_offset;
+            header.checksum = 0;
+
+            // Serialize to a 4 KiB buffer and compute CRC.
+            let mut buf = vec![0u8; format::HEADER_SIZE as usize];
+            let header_bytes = header.as_bytes();
+            buf[..header_bytes.len()].copy_from_slice(header_bytes);
+            let crc = format::compute_checksum(&buf, 4);
+            buf[4..8].copy_from_slice(&crc.to_le_bytes());
+
+            // Write to the non-current slot.
+            let offset = if state.first_header_current {
+                format::HEADER_OFFSET_2
+            } else {
+                format::HEADER_OFFSET_1
+            };
+
+            (buf, offset)
+        };
+        // Lock is released here — safe to do async I/O.
+
+        // Write the header to disk.
+        self.file.write_at(header_offset, &header_buf).await?;
+
+        // Flush to ensure the header is on stable storage before any data writes.
+        self.file.flush().await?;
+
+        // Re-acquire lock to commit the state change.
+        {
+            let mut state = self.write_state.lock();
+            state.first_header_current = !state.first_header_current;
+            state.write_mode = Some(mode);
+        }
+
+        Ok(())
     }
 }
 

@@ -19,7 +19,9 @@ use crate::format::BatEntry;
 use crate::format::BatEntryState;
 use crate::format::CACHE_PAGE_SIZE;
 use crate::format::ENTRIES_PER_BAT_PAGE;
+use crate::format::MB1;
 use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 /// Cache tag for BAT region pages.
 pub(crate) const BAT_TAG: u8 = 0;
@@ -278,6 +280,83 @@ impl Bat {
             _ => Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState)),
         }
     }
+
+    /// Write a raw BAT entry to the cache at the given entry index.
+    ///
+    /// Acquires the page in Modify mode, writes the entry at the correct
+    /// offset, and releases the guard (write-through to disk).
+    pub async fn write_bat_entry<F: AsyncFile>(
+        &self,
+        cache: &PageCache<F>,
+        entry_index: u32,
+        entry: BatEntry,
+    ) -> Result<(), VhdxError> {
+        let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
+        let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
+
+        let mut guard = cache
+            .acquire(
+                PageKey {
+                    tag: BAT_TAG,
+                    offset: page_offset,
+                },
+                AccessMode::Modify,
+            )
+            .await?;
+
+        let byte_offset = entry_within_page * size_of::<BatEntry>();
+        guard[byte_offset..byte_offset + size_of::<BatEntry>()]
+            .copy_from_slice(entry.as_bytes());
+
+        guard.release().await?;
+        Ok(())
+    }
+
+    /// Update the BAT entry for a data block with the given state and file offset.
+    ///
+    /// Constructs a `BatEntry` and writes it through the cache.
+    pub async fn set_block_mapping<F: AsyncFile>(
+        &self,
+        cache: &PageCache<F>,
+        block_number: u32,
+        state: BatEntryState,
+        file_offset: u64,
+    ) -> Result<(), VhdxError> {
+        let file_offset_mb = file_offset / MB1;
+
+        // Validate: FullyPresent and PartiallyPresent require non-zero offset.
+        match state {
+            BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => {
+                debug_assert!(file_offset_mb > 0, "present block must have non-zero offset");
+            }
+            BatEntryState::Zero | BatEntryState::NotPresent => {
+                debug_assert_eq!(file_offset_mb, 0, "zero/not-present block must have zero offset");
+            }
+            _ => {}
+        }
+
+        let entry = BatEntry::new()
+            .with_state(state as u8)
+            .with_file_offset_mb(file_offset_mb);
+
+        let entry_index = self.payload_entry_index(block_number);
+        self.write_bat_entry(cache, entry_index, entry).await
+    }
+}
+
+/// Allocate a new block by extending the file to the next MB-aligned boundary.
+///
+/// Returns the file offset of the newly allocated block.
+pub(crate) async fn allocate_block_eof<F: AsyncFile>(
+    file: &F,
+    block_size: u32,
+) -> Result<u64, VhdxError> {
+    let current_size = file.file_size().await.map_err(VhdxError::Io)?;
+    // Round up to next MB boundary.
+    let aligned_offset = (current_size + MB1 - 1) & !(MB1 - 1);
+    let new_size = aligned_offset + block_size as u64;
+    file.set_file_size(new_size).await.map_err(VhdxError::Io)?;
+    Ok(aligned_offset)
 }
 
 #[cfg(test)]

@@ -358,6 +358,22 @@ impl<F: AsyncFile> VhdxFile<F> {
         self.bat.get_sbm_mapping_from_state(&bat_state, chunk_number)
     }
 
+    /// Allocate space for a new block. Returns the file offset (MB-aligned).
+    ///
+    /// Synchronous — no I/O. Called under `allocation_lock`.
+    pub(crate) fn allocate_space(&self, size: u32) -> u64 {
+        debug_assert!(
+            size as u64 % MB1 == 0,
+            "allocation size must be MB1-aligned"
+        );
+        let mut eof = self.eof_offset.lock();
+        let offset = *eof;
+        // Round up to MB1 boundary (should already be aligned, but be safe).
+        let aligned = (offset + MB1 - 1) & !(MB1 - 1);
+        *eof = aligned + size as u64;
+        aligned
+    }
+
     /// Ensures the requested write mode is enabled, updating the header
     /// and flushing if needed. If the current mode already satisfies the
     /// request, this is a no-op.
@@ -714,5 +730,24 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mapping: BlockMapping = vhdx.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::NotPresent);
+    }
+
+    #[async_test]
+    async fn eof_counter_no_overlap() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let a = vhdx.allocate_space(format::MB1 as u32);
+        let b = vhdx.allocate_space(format::MB1 as u32);
+        // Two allocations must not overlap.
+        assert_ne!(a, b);
+        assert!(b >= a + format::MB1);
+    }
+
+    #[async_test]
+    async fn eof_counter_mb_aligned() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let offset = vhdx.allocate_space(format::MB1 as u32);
+        assert_eq!(offset % format::MB1, 0, "offset must be MB1-aligned");
     }
 }

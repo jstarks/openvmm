@@ -9,7 +9,7 @@
 //!
 //! # Modules
 //!
-//! - [`format`] — On-disk structure definitions, constants, and well-known GUIDs.
+//! - [`format`](mod@format) — On-disk structure definitions, constants, and well-known GUIDs.
 //! - [`error`] — Error and corruption types.
 
 #![forbid(unsafe_code)]
@@ -21,6 +21,9 @@ pub mod format;
 
 pub use error::CorruptionType;
 pub use error::VhdxError;
+
+#[cfg(test)]
+mod tests;
 
 /// Trait abstracting file I/O for the VHDX parser.
 ///

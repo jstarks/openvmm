@@ -12,6 +12,7 @@ use crate::bat::BAT_TAG;
 use crate::bat::Bat;
 use crate::bat::BatState;
 use crate::bat::BlockMapping;
+use crate::bat::BlockType;
 use crate::bat::InternalBlockMapping;
 use crate::bat::METADATA_TAG;
 use crate::sector_bitmap::SBM_TAG;
@@ -375,6 +376,148 @@ impl<F: AsyncFile> VhdxFile<F> {
         let aligned = (offset + MB1 - 1) & !(MB1 - 1);
         *eof = aligned + size as u64;
         aligned
+    }
+
+    /// Serialize a single BAT page from in-memory state into a raw byte buffer.
+    ///
+    /// For each of the 512 entries on the page, reverse-maps the flat entry
+    /// number to (BlockType, block_number) and reads the in-memory mapping.
+    /// Entries beyond the disk end are written as zero.
+    ///
+    /// The caller must hold a `BatState` lock (read or write) while calling
+    /// this, passing in the locked state reference.
+    fn produce_bat_page(
+        &self,
+        bat_state: &BatState,
+        page_index: usize,
+    ) -> [u8; CACHE_PAGE_SIZE as usize] {
+        let mut buf = [0u8; CACHE_PAGE_SIZE as usize];
+        let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
+        for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
+            let entry_number = base_entry + i;
+            let bat_entry = match self.bat.entry_number_to_block_id(entry_number) {
+                Some((BlockType::Payload, block_number)) => {
+                    let mapping = bat_state.get_payload_mapping(block_number);
+                    BatEntry::new()
+                        .with_state(mapping.state())
+                        .with_file_offset_mb(mapping.file_megabyte() as u64)
+                }
+                Some((BlockType::SectorBitmap, chunk_number)) => {
+                    let mapping = bat_state.get_sbm_mapping(chunk_number);
+                    BatEntry::new()
+                        .with_state(mapping.state())
+                        .with_file_offset_mb(mapping.file_megabyte() as u64)
+                }
+                None => BatEntry::new(),
+            };
+            let offset = i as usize * size_of::<BatEntry>();
+            buf[offset..offset + size_of::<BatEntry>()]
+                .copy_from_slice(bat_entry.as_bytes());
+        }
+        buf
+    }
+
+    /// Write a single BAT entry to the cache page (write-through to disk).
+    ///
+    /// This is the primary BAT writeback mechanism, matching the C code's
+    /// `UpdateBatAfterAcquire` pattern.
+    ///
+    /// The caller must have already updated the in-memory BAT via
+    /// `BatState::set_payload_mapping()` or `set_sbm_mapping()`.
+    pub(crate) async fn write_bat_entry_to_cache(
+        &self,
+        block_type: BlockType,
+        block_number: u32,
+        mapping: InternalBlockMapping,
+    ) -> Result<(), VhdxError> {
+        let entry_number = match block_type {
+            BlockType::Payload => self.bat.payload_entry_index(block_number),
+            BlockType::SectorBitmap => self.bat.sector_bitmap_entry_index(block_number),
+        };
+        let page_number = entry_number as u64 / ENTRIES_PER_BAT_PAGE;
+        let page_offset = page_number * CACHE_PAGE_SIZE;
+
+        // Check if the page is dirty under read lock.
+        let is_dirty = {
+            let state = self.bat_state.read();
+            let page_idx = page_number as usize;
+            page_idx < state.dirty_bat_pages.len() && state.dirty_bat_pages[page_idx]
+        };
+
+        if !is_dirty {
+            // Fast path: page is NOT dirty — read existing page and update
+            // just the single entry.
+            let bat_entry = BatEntry::new()
+                .with_state(mapping.state())
+                .with_file_offset_mb(mapping.file_megabyte() as u64);
+
+            self.bat
+                .write_bat_entry(&self.cache, entry_number, bat_entry)
+                .await?;
+        } else {
+            // Slow path: page IS dirty — rebuild the entire page from
+            // in-memory state under write lock and clear dirty flag.
+            let page_buf = {
+                let mut state = self.bat_state.write();
+                let buf = self.produce_bat_page(&state, page_number as usize);
+                state.clear_dirty(page_number as usize);
+                buf
+            };
+
+            let mut guard = self
+                .cache
+                .acquire(
+                    PageKey {
+                        tag: BAT_TAG,
+                        offset: page_offset,
+                    },
+                    AccessMode::Overwrite,
+                )
+                .await?;
+            guard.copy_from_slice(&page_buf);
+            guard.release().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Write all dirty in-memory BAT pages to disk via PageCache.
+    ///
+    /// Used for clean-close and batch operations. The normal write path
+    /// uses per-entry cache writes instead.
+    pub(crate) async fn flush_dirty_bat_pages(&self) -> Result<(), VhdxError> {
+        // Under write lock: snapshot dirty pages and serialize them,
+        // then clear dirty flags atomically.
+        let pages_to_write: Vec<(usize, [u8; CACHE_PAGE_SIZE as usize])> = {
+            let mut state = self.bat_state.write();
+            let dirty_indices: Vec<usize> = state.dirty_page_indices().collect();
+            let mut result = Vec::with_capacity(dirty_indices.len());
+            for &page_index in &dirty_indices {
+                let buf = self.produce_bat_page(&state, page_index);
+                state.clear_dirty(page_index);
+                result.push((page_index, buf));
+            }
+            result
+        };
+
+        // Write each serialized page to the cache (write-through to disk).
+        for (page_index, page_buf) in pages_to_write {
+            let page_offset = page_index as u64 * CACHE_PAGE_SIZE;
+            let mut guard = self
+                .cache
+                .acquire(
+                    PageKey {
+                        tag: BAT_TAG,
+                        offset: page_offset,
+                    },
+                    AccessMode::Overwrite,
+                )
+                .await?;
+            guard.copy_from_slice(&page_buf);
+            guard.release().await?;
+        }
+
+        Ok(())
     }
 
     /// Ensures the requested write mode is enabled, updating the header

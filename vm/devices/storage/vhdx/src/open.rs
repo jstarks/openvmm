@@ -24,13 +24,43 @@ use crate::known_meta::verify_known_metadata;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use guid::Guid;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use zerocopy::FromBytes;
 
+/// Mutable header and write-mode state, protected by a mutex.
+///
+/// All fields here may change during write operations. The mutex must
+/// be dropped before any `.await` point.
+pub(crate) struct WriteState {
+    /// Current write mode (None if no writes have occurred).
+    pub write_mode: Option<WriteMode>,
+    /// Current header sequence number.
+    pub sequence_number: u64,
+    /// GUID changed on every file-level write.
+    pub file_write_guid: Guid,
+    /// GUID changed on every virtual-disk data write.
+    pub data_write_guid: Guid,
+    /// True if header slot 1 (offset 64 KiB) is the current header.
+    pub first_header_current: bool,
+}
+
+/// The kind of modification being made to the VHDX file. Controls which
+/// GUIDs are updated in the header before the first write.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WriteMode {
+    /// The file is being modified (metadata only, e.g. resize/compact).
+    /// Updates FileWriteGuid.
+    FileWritable,
+    /// User-visible virtual disk data is being modified.
+    /// Updates both FileWriteGuid and DataWriteGuid.
+    DataWritable,
+}
+
 /// An open VHDX file handle.
 ///
-/// Created via [`VhdxFile::open()`], this provides read access to the
-/// virtual disk's metadata and BAT (block allocation table).
+/// Created via [`VhdxFile::open()`], this provides read and write access
+/// to the virtual disk's metadata and BAT (block allocation table).
 pub struct VhdxFile<F: AsyncFile> {
     pub(crate) file: Arc<F>,
     pub(crate) cache: PageCache<F>,
@@ -46,14 +76,8 @@ pub struct VhdxFile<F: AsyncFile> {
     #[allow(dead_code)] // Phase 7+: used for disk_backend integration
     page_83_data: Guid,
 
-    // Header state
-    #[allow(dead_code)] // Phase 7+: used for header updates on write
-    sequence_number: u64,
-    #[allow(dead_code)] // Phase 7+: used for header updates on write
-    file_write_guid: Guid,
-    data_write_guid: Guid,
-    #[allow(dead_code)] // Phase 7+: used for header updates on write
-    first_header_current: bool,
+    // Mutable header / write-mode state.
+    pub(crate) write_state: Mutex<WriteState>,
 
     // Region offsets (for future use)
     #[allow(dead_code)] // Phase 9+: used for space management
@@ -147,10 +171,13 @@ impl<F: AsyncFile> VhdxFile<F> {
             has_parent: known.has_parent,
             is_fully_allocated: known.leave_blocks_allocated,
             page_83_data: known.page_83_data,
-            sequence_number: header.sequence_number,
-            file_write_guid: header.file_write_guid,
-            data_write_guid: header.data_write_guid,
-            first_header_current: header.first_header_current,
+            write_state: Mutex::new(WriteState {
+                write_mode: None,
+                sequence_number: header.sequence_number,
+                file_write_guid: header.file_write_guid,
+                data_write_guid: header.data_write_guid,
+                first_header_current: header.first_header_current,
+            }),
             bat_offset: regions.bat_offset,
             bat_length: regions.bat_length,
             metadata_offset: regions.metadata_offset,
@@ -194,7 +221,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
     /// GUID changed on every virtual-disk data write.
     pub fn data_write_guid(&self) -> Guid {
-        self.data_write_guid
+        self.write_state.lock().data_write_guid
     }
 
     /// Whether the file was opened in read-only mode.

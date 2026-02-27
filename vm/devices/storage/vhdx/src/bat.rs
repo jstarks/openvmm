@@ -288,6 +288,7 @@ mod tests {
     use crate::region;
     use crate::tests::support::InMemoryFile;
     use pal_async::async_test;
+    use std::sync::Arc;
     use zerocopy::IntoBytes;
 
     #[test]
@@ -388,7 +389,7 @@ mod tests {
         let regions = region::parse_region_tables(&file).await.unwrap();
 
         let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(BAT_TAG, regions.bat_offset);
 
         let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
@@ -409,7 +410,7 @@ mod tests {
             .unwrap();
 
         let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(BAT_TAG, regions.bat_offset);
 
         let mapping = bat.get_block_mapping(&cache, 0).await.unwrap();
@@ -482,7 +483,7 @@ mod tests {
 
         let regions = region::parse_region_tables(&file).await.unwrap();
         let bat = Bat::new(disk_size, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(BAT_TAG, regions.bat_offset);
 
         for block in 0..bat.data_block_count {

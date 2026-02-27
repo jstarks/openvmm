@@ -24,6 +24,7 @@ use crate::known_meta::verify_known_metadata;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use guid::Guid;
+use std::sync::Arc;
 use zerocopy::FromBytes;
 
 /// An open VHDX file handle.
@@ -31,6 +32,7 @@ use zerocopy::FromBytes;
 /// Created via [`VhdxFile::open()`], this provides read access to the
 /// virtual disk's metadata and BAT (block allocation table).
 pub struct VhdxFile<F: AsyncFile> {
+    pub(crate) file: Arc<F>,
     pub(crate) cache: PageCache<F>,
     pub(crate) bat: Bat,
 
@@ -124,14 +126,18 @@ impl<F: AsyncFile> VhdxFile<F> {
         // 10. Validate BAT region size.
         bat.validate_bat_size(regions.bat_length)?;
 
-        // 11. Create PageCache and register tags.
-        let mut cache = PageCache::new(file);
+        // 11. Wrap file in Arc for shared access.
+        let file = Arc::new(file);
+
+        // 12. Create PageCache and register tags.
+        let mut cache = PageCache::new(file.clone());
         cache.register_tag(BAT_TAG, regions.bat_offset);
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
         cache.register_tag(SBM_TAG, 0);
 
-        // 12. Construct VhdxFile.
+        // 13. Construct VhdxFile.
         Ok(VhdxFile {
+            file,
             cache,
             bat,
             disk_size: known.disk_size,

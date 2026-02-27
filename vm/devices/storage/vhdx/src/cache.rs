@@ -52,7 +52,7 @@ struct PageData {
 /// eviction). Modified pages are written back to the file when the guard
 /// is released via [`PageGuard::release()`].
 pub struct PageCache<F: AsyncFile> {
-    file: F,
+    file: Arc<F>,
     /// Page map: `PageKey` → shared handle to the cached page mutex.
     pages: Mutex<HashMap<PageKey, Arc<Mutex<PageData>>>>,
     /// Tag → base file offset mapping.
@@ -61,12 +61,17 @@ pub struct PageCache<F: AsyncFile> {
 
 impl<F: AsyncFile> PageCache<F> {
     /// Create a new cache backed by the given file.
-    pub fn new(file: F) -> Self {
+    pub fn new(file: Arc<F>) -> Self {
         Self {
             file,
             pages: Mutex::new(HashMap::new()),
             tags: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Returns a reference to the underlying file.
+    pub(crate) fn file(&self) -> &F {
+        &self.file
     }
 
     /// Register a tag with its base file offset.
@@ -276,6 +281,7 @@ mod tests {
     use super::*;
     use crate::tests::support::{FailingInterceptor, InMemoryFile};
     use pal_async::async_test;
+    use std::sync::Arc;
 
     #[async_test]
     async fn acquire_read_loads_from_file() {
@@ -284,7 +290,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| (i & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         let guard = cache
@@ -301,7 +307,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| (i & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         {
@@ -319,7 +325,7 @@ mod tests {
         }
 
         // Read directly from the file to verify write-through.
-        let snap = cache.file.snapshot();
+        let snap = cache.file().snapshot();
         assert_eq!(snap[0], 0xAA);
         assert_eq!(snap[1], 0xBB);
         // Rest unchanged.
@@ -338,7 +344,7 @@ mod tests {
             }),
         );
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         // Overwrite should succeed even though reads fail.
@@ -350,7 +356,7 @@ mod tests {
         guard.release().await.unwrap();
 
         // Verify the data was written to the file.
-        let snap = cache.file.snapshot();
+        let snap = cache.file().snapshot();
         assert!(snap.iter().all(|&b| b == 0xCC));
     }
 
@@ -360,7 +366,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| ((i * 3) & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         // First read loads from file.
@@ -384,7 +390,7 @@ mod tests {
     async fn sequential_modify_acquires_work() {
         let file = InMemoryFile::new(PAGE_SIZE as u64);
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         // First modify.
@@ -409,7 +415,7 @@ mod tests {
             guard.release().await.unwrap();
         }
 
-        let snap = cache.file.snapshot();
+        let snap = cache.file().snapshot();
         assert_eq!(snap[0], 0x22);
     }
 
@@ -417,7 +423,7 @@ mod tests {
     async fn modify_then_modify_same_page() {
         let file = InMemoryFile::new(PAGE_SIZE as u64);
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         {
@@ -439,7 +445,7 @@ mod tests {
             g.release().await.unwrap();
         }
 
-        let snap = cache.file.snapshot();
+        let snap = cache.file().snapshot();
         assert_eq!(snap[0], 0xAA);
         assert_eq!(snap[1], 0xBB);
     }
@@ -448,7 +454,7 @@ mod tests {
     async fn different_pages_independent() {
         let file = InMemoryFile::new(PAGE_SIZE as u64 * 4);
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         // Write to page at offset 0.
@@ -478,7 +484,7 @@ mod tests {
         }
 
         // Verify both pages are independent.
-        let snap = cache.file.snapshot();
+        let snap = cache.file().snapshot();
         assert_eq!(snap[0], 0x11);
         assert_eq!(snap[PAGE_SIZE], 0x22);
     }
@@ -493,7 +499,7 @@ mod tests {
         let pattern = [0xDE; PAGE_SIZE];
         file.write_at(base + page_offset, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, base);
 
         let guard = cache
@@ -522,7 +528,7 @@ mod tests {
         file.write_at(old_base, &old_pattern).await.unwrap();
         file.write_at(new_base, &new_pattern).await.unwrap();
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, old_base);
 
         // Read from old base.
@@ -537,7 +543,7 @@ mod tests {
 
         // Invalidate the cached page by creating a fresh cache (update_tag_offset
         // doesn't invalidate). For a true relocation test, use a fresh cache.
-        let mut cache = PageCache::new(cache.file);
+        let mut cache = PageCache::new(cache.file.clone());
         cache.register_tag(0, old_base);
         cache.update_tag_offset(0, new_base);
 
@@ -553,7 +559,7 @@ mod tests {
     async fn write_through_then_read_back() {
         let file = InMemoryFile::new(PAGE_SIZE as u64);
 
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         // Modify and release (write-through).
@@ -567,7 +573,7 @@ mod tests {
         }
 
         // Verify the file was updated.
-        let snap = cache.file.snapshot();
+        let snap = cache.file().snapshot();
         assert_eq!(snap[42], 0xFF);
 
         // Re-acquire as Read and verify cached data.
@@ -582,7 +588,7 @@ mod tests {
     #[async_test]
     async fn flush_delegates_to_file() {
         let file = InMemoryFile::new(PAGE_SIZE as u64);
-        let mut cache = PageCache::new(file);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         // Write some data, release, then flush.
@@ -596,7 +602,7 @@ mod tests {
         // flush() should succeed (delegates to InMemoryFile::flush which is a no-op).
         cache.flush().await.unwrap();
 
-        let snap = cache.file.snapshot();
+        let snap = cache.file().snapshot();
         assert_eq!(snap[0], 0x42);
     }
 }

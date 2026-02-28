@@ -77,6 +77,18 @@ pub(crate) enum WriteMode {
 ///
 /// Created via [`VhdxFile::open()`], this provides read and write access
 /// to the virtual disk's metadata and BAT (block allocation table).
+//
+// Lock ordering (must acquire in this order, never reverse):
+//   1. allocation_lock    (futures::lock::Mutex — async, may be held across .await)
+//   2. bat_state           (parking_lot::RwLock — synchronous, NEVER across .await)
+//   3. write_state         (parking_lot::Mutex — synchronous, NEVER across .await)
+//   4. free_space.inner    (parking_lot::Mutex — synchronous, NEVER across .await)
+//   5. cache.pages/tags    (parking_lot::Mutex — brief, NEVER across .await)
+//
+// The allocation_lock serializes the entire allocation decision (check BAT, allocate
+// space, mark TFP). It is released AFTER TFP is set but BEFORE data I/O begins.
+// The bat_state RwLock is held for < 1μs per access (reading/writing in-memory entries).
+// The write_state Mutex is held only in enable_write_mode() to check/update the mode.
 pub struct VhdxFile<F: AsyncFile> {
     pub(crate) file: Arc<F>,
     pub(crate) cache: PageCache<F>,

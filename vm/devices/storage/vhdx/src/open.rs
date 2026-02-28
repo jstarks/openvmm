@@ -453,6 +453,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             // Priority 4: extend EOF.
             let target = self.free_space.required_file_length(size, aligned);
+            // LOCK AUDIT: bat_state read-lock dropped (end of block above). allocation_lock held (async Mutex — OK across .await).
             self.file
                 .set_file_size(target)
                 .await
@@ -591,6 +592,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         };
 
         // Write each serialized page to the cache (write-through to disk).
+        // LOCK AUDIT: bat_state write-lock dropped (end of block above). No sync locks held.
         for (page_index, page_buf) in pages_to_write {
             let page_offset = page_index as u64 * CACHE_PAGE_SIZE;
             let mut guard = self
@@ -679,7 +681,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             (buf, offset)
         };
-        // Lock is released here — safe to do async I/O.
+        // LOCK AUDIT: write_state Mutex dropped here (end of block). Safe to do async I/O.
 
         // Write the header to disk.
         self.file.write_at(header_offset, &header_buf).await?;

@@ -283,6 +283,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         }
                         self.allocation_event.listen()
                     };
+                    // LOCK AUDIT: bat_state read-lock dropped above (end of block). Safe to await.
                     listener.await;
                     continue;
                 }
@@ -366,6 +367,8 @@ impl<F: AsyncFile> VhdxFile<F> {
         // OverlappingAllocations serialization: if another writer is
         // transitioning any of our blocks, we park and wait for that
         // writer's post-allocate to clear TFP before proceeding.
+        // LOCK AUDIT: No synchronous locks held entering allocation loop.
+        // allocation_lock (futures::Mutex) is acquired via .await — fine.
         let _alloc_guard = loop {
             let alloc_guard = self.allocation_lock.lock().await;
 
@@ -389,6 +392,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             // Drop the allocation lock before waiting so that the
             // concurrent writer can complete its post-allocate.
             drop(alloc_guard);
+            // LOCK AUDIT: Both allocation_lock and bat_state dropped above. Safe to await.
             listener.await;
         };
 
@@ -468,6 +472,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     }
                     _ => {
                         // Unallocated block — allocate space.
+                        // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
                         let alloc_result = self.allocate_space(self.block_size, false).await?;
                         let new_offset = alloc_result.file_offset;
                         let is_safe_data = alloc_result.is_safe_data;
@@ -517,6 +522,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             }
 
                             // Per-entry cache write (write-through to disk).
+                            // LOCK AUDIT: bat_state write-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
                             self.write_bat_entry_to_cache(
                                 BlockType::Payload,
                                 block_info.block_number,
@@ -657,6 +663,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                     // Write per-entry to cache. Errors are deferred so we
                     // can still notify waiters.
+                    // LOCK AUDIT: bat_state write-lock dropped (end of prior block). No sync locks held.
                     if bat_write_error.is_none() {
                         if let Err(e) = self
                             .write_bat_entry_to_cache(

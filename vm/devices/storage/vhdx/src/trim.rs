@@ -268,6 +268,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // 6. Enable write mode (unless skip_write_guid_change AND mode
         //    skips write guid).
+        // LOCK AUDIT: No synchronous locks held. enable_write_mode acquires/drops write_state internally.
         if !skip_write_guid_change && !mode_skips_write_guid(mode) {
             self.enable_write_mode(WriteMode::DataWritable).await?;
         } else if !mode_skips_write_guid(mode) {
@@ -315,6 +316,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         break;
                     }
                 }
+                // LOCK AUDIT: bat_state read-lock dropped (end of block above). Safe to await.
                 listener.await;
             }
 
@@ -354,6 +356,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             };
 
             // 9c. Enable write mode lazily for RemoveSoftAnchors.
+            // LOCK AUDIT: No synchronous locks held (bat_state read-lock from scan_result dropped).
             if mode_skips_write_guid(mode) {
                 self.enable_write_mode(WriteMode::FileWritable).await?;
             }
@@ -366,6 +369,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             }
 
             // 9e. Write BAT entry to cache (async).
+            // LOCK AUDIT: bat_state write-lock dropped in step 9d block. No sync locks held.
             self.write_bat_entry_to_cache(BlockType::Payload, block_number, new_mapping)
                 .await?;
 

@@ -476,7 +476,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // If the block is currently soft-anchored (trimmed
                         // with file space preserved), try to reclaim its own
                         // space first — matching `Vhd2iAllocateDataBlock` in
-                        // the C code.
+                        // the C code. This is `is_safe_data = true` because
+                        // the space still contains this block's own old
+                        // data, so a power failure after BAT commit but
+                        // before data write would only expose the block's
+                        // own stale data — no cross-block leak.
                         let original = internal;
                         let (new_offset, is_safe_data) = if crate::trim::is_soft_anchored(internal)
                         {

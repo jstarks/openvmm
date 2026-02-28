@@ -223,8 +223,17 @@ struct AnchoredSpacePool {
     lowest_bit_hint: u32,
 }
 
-/// Tracks which block numbers have soft-anchored file offsets.
-/// 1-bit-per-block-number: SET = has soft-anchored block.
+/// Tracks which data blocks have been trimmed but still hold a
+/// "soft anchor" to their file space.
+///
+/// When a block is trimmed with `TrimMode::FileSpace`, the BAT entry
+/// transitions to Unmapped but the `file_megabyte` field is preserved.
+/// The space is *not* released to the free pool. This avoids the cost
+/// of zeroing + flushing the space before a future BAT commit, because
+/// the space still contains only the block's own old data — no
+/// cross-block data leak is possible on power failure.
+///
+/// Bitmap: 1-bit-per-block-number, SET = has soft-anchored file offset.
 struct TrimmedBlockTracker {
     bitmap: SpaceBitmap,
     lowest_block_number_hint: u32,
@@ -276,8 +285,21 @@ pub(crate) struct FreeSpaceTracker {
 pub(crate) struct AllocateResult {
     /// File byte offset of the allocated region.
     pub file_offset: u64,
-    /// If true, the allocated space is already guaranteed to be zero
-    /// (came from beyond the old `ZeroOffset`). Caller can skip zeroing.
+    /// If true, the allocated space is safe to commit before flushing
+    /// the data write. This is true when:
+    ///
+    /// - The space came from beyond `ZeroOffset` (priority 2) — the
+    ///   region is guaranteed zeroed on disk, so a power failure after
+    ///   BAT commit but before data write just reads zeros, not stale
+    ///   data from another block.
+    /// - The space was reclaimed from the *same* block's soft anchor
+    ///   (see `io.rs` reclaim path) — the space still holds the block's
+    ///   own old data, so no cross-block data leak is possible.
+    ///
+    /// When false, the caller must flush (persist the data write)
+    /// *before* committing the BAT entry, to prevent a power-failure
+    /// scenario where block B's BAT entry points to space that still
+    /// contains block A's data.
     pub is_safe_data: bool,
 }
 
@@ -794,6 +816,16 @@ fn try_allocate_inner(
     }
 
     // Priority 3: soft-anchored space from trimmed blocks (in-memory only).
+    //
+    // Reclaim space held by a *different* trimmed block. This is NOT
+    // is_safe_data because the space contains that other block's old
+    // data — a flush is required before the BAT entry for the new
+    // block can be committed, to prevent cross-block data leaks on
+    // power failure.
+    //
+    // (When a block reclaims its *own* soft-anchored space, the io.rs
+    // write path handles that directly and marks it is_safe_data=true,
+    // since leaking a block's old data back to itself is harmless.)
     if size <= inner.block_size {
         if let Some(bat_state) = bat_state {
             if let Some((file_offset, block_number)) =

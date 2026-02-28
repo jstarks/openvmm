@@ -31,6 +31,7 @@ pub mod open;
 pub(crate) mod region;
 pub(crate) mod sector_bitmap;
 pub(crate) mod space;
+pub mod trim;
 
 pub use error::CorruptionType;
 pub use error::InvalidFormatReason;
@@ -40,6 +41,7 @@ pub use io::WriteRange;
 pub use io_guard::ReadIoGuard;
 pub use io_guard::WriteIoGuard;
 pub use open::VhdxFile;
+pub use trim::TrimMode;
 
 #[cfg(test)]
 mod tests;

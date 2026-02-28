@@ -239,7 +239,8 @@ impl<F: AsyncFile> VhdxFile<F> {
             let virtual_offset = offset + current_offset as u64;
             let block_number = self.bat.offset_to_block(virtual_offset);
             let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
+            let block_length =
+                std::cmp::min(self.block_size - block_offset, len - current_offset);
 
             let is_full_block = block_offset == 0 && block_length >= self.block_size;
 
@@ -329,7 +330,36 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         // --- Allocation phase: acquire BlockAllocationLock ---
-        let _alloc_guard = self.allocation_lock.lock().await;
+        // Wait until no blocks in our allocation set have TFP set by
+        // a concurrent allocator. This matches the C code's
+        // OverlappingAllocations serialization: if another writer is
+        // transitioning any of our blocks, we park and wait for that
+        // writer's post-allocate to clear TFP before proceeding.
+        let _alloc_guard = loop {
+            let alloc_guard = self.allocation_lock.lock().await;
+
+            // Check all blocks under BAT lock for TFP overlap.
+            // Register listener before dropping locks to avoid missed wakes.
+            let listener = {
+                let bat_state = self.bat_state.read();
+                let has_overlap = blocks_needing_allocation.iter().any(|block_info| {
+                    bat_state
+                        .get_payload_mapping(block_info.block_number)
+                        .transitioning_to_fully_present()
+                });
+                if !has_overlap {
+                    break alloc_guard;
+                }
+                // Register listener while holding bat_state lock to
+                // avoid wake-miss race.
+                self.allocation_event.listen()
+            };
+
+            // Drop the allocation lock before waiting so that the
+            // concurrent writer can complete its post-allocate.
+            drop(alloc_guard);
+            listener.await;
+        };
 
         // Track blocks that got TFP set (for error cleanup).
         struct TfpRecord {
@@ -341,24 +371,9 @@ impl<F: AsyncFile> VhdxFile<F> {
         let mut tfp_records: Vec<TfpRecord> = Vec::new();
 
         // Re-check and allocate under the lock.
+        // No block in our set should have TFP at this point — we waited
+        // for all concurrent allocators to finish above.
         let allocation_result = async {
-            // Re-check all blocks under bat_state read lock for TFP set by
-            // a concurrent allocator.
-            {
-                let bat_state = self.bat_state.read();
-                for block_info in &blocks_needing_allocation {
-                    let internal = bat_state.get_payload_mapping(block_info.block_number);
-                    if internal.transitioning_to_fully_present() {
-                        // Another allocator just claimed this block.
-                        // We need to drop everything and restart.
-                        // For simplicity in the sequential case, this
-                        // should not happen. If it does, we'll get an
-                        // error that the caller can retry.
-                        return Err(VhdxError::Corrupt(CorruptionType::Other));
-                    }
-                }
-            }
-
             for block_info in &blocks_needing_allocation {
                 let is_full_block =
                     block_info.block_offset == 0 && block_info.block_length >= self.block_size;
@@ -372,6 +387,14 @@ impl<F: AsyncFile> VhdxFile<F> {
                         .get_block_mapping_from_state(&bat_state, block_info.block_number);
                     (internal, mapping)
                 };
+
+                // Assert no TFP — we serialized against concurrent
+                // allocators in the loop above.
+                debug_assert!(
+                    !internal.transitioning_to_fully_present(),
+                    "block {} has TFP after overlap wait",
+                    block_info.block_number
+                );
 
                 match mapping.state {
                     BatEntryState::FullyPresent => {
@@ -2293,18 +2316,18 @@ mod tests {
 
     #[async_test]
     async fn concurrent_writes_same_block() {
-        // This test exercises the TFP-retry bug: two concurrent tasks both
-        // try to allocate the same unallocated block. With the bug present,
-        // the second task returns Corrupt(Other) instead of retrying.
+        // This test exercises concurrent writes to the same unallocated block.
+        // The correct behavior (matching the C code) is serialization:
+        //   1. task_a: resolve_write → acquires allocation lock → allocates
+        //      → sets TFP → returns ranges
+        //   2. task_a: complete_write → clears TFP → FullyPresent → notifies
+        //   3. task_b: resolve_write → was waiting for TFP to clear (either
+        //      in the read phase or after acquiring the lock). Once cleared,
+        //      sees FullyPresent → emits Data range → returns.
         //
         // Uses YieldingFile to force a yield during set_file_size (inside
-        // allocate_space), creating the exact interleaving needed:
-        //   1. task_a: read phase → NotPresent → acquires allocation_lock
-        //      → allocate_space → set_file_size → YIELD
-        //   2. task_b: read phase → NotPresent (TFP not yet set) →
-        //      tries allocation_lock → blocked → YIELD
-        //   3. task_a resumes: set_file_size completes → sets TFP → returns
-        //   4. task_b resumes: acquires lock → re-check → sees TFP → BUG!
+        // allocate_space), creating the interleaving where task_b's read
+        // phase may see NotPresent before task_a sets TFP.
 
         let (inner_file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
         let data = inner_file.snapshot();
@@ -2318,36 +2341,41 @@ mod tests {
         let block_size = vhdx.block_size();
 
         // Both tasks write to block 0 (offset 0, full block).
+        // task_a does resolve + complete as a unit so TFP clears and
+        // task_b (serialized behind task_a) can proceed.
         let vhdx_a = vhdx.clone();
         let vhdx_b = vhdx.clone();
 
         let task_a = async {
             let mut ranges = Vec::new();
-            vhdx_a.resolve_write(0, block_size, &mut ranges).await
+            vhdx_a
+                .resolve_write(0, block_size, &mut ranges)
+                .await
+                .unwrap();
+            vhdx_a
+                .complete_write(0, block_size, true)
+                .await
+                .unwrap();
+            ranges
         };
 
         let task_b = async {
             let mut ranges = Vec::new();
-            vhdx_b.resolve_write(0, block_size, &mut ranges).await
+            vhdx_b
+                .resolve_write(0, block_size, &mut ranges)
+                .await
+                .unwrap();
+            ranges
         };
 
-        let (result_a, result_b) = futures::join!(task_a, task_b);
+        let (ranges_a, ranges_b) = futures::join!(task_a, task_b);
 
-        // Both should succeed (no Corrupt error).
-        assert!(
-            result_a.is_ok(),
-            "task_a failed: {:?}",
-            result_a.unwrap_err()
-        );
-        assert!(
-            result_b.is_ok(),
-            "task_b failed: {:?}",
-            result_b.unwrap_err()
-        );
+        // Both should have produced data ranges.
+        assert!(!ranges_a.is_empty(), "task_a produced no ranges");
+        assert!(!ranges_b.is_empty(), "task_b produced no ranges");
 
-        // Both complete_write calls should succeed.
-        vhdx.complete_write(0, block_size, true).await.unwrap();
-        // Second complete_write is a no-op (TFP already cleared).
+        // task_b's complete_write: block is already FullyPresent, so this
+        // is a no-op (no TFP to clear).
         vhdx.complete_write(0, block_size, true).await.unwrap();
 
         // Block should be FullyPresent.

@@ -96,7 +96,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     ) -> Result<ReadIoGuard<'_, F>, VhdxError> {
         // Zero-length reads succeed immediately.
         if len == 0 {
-            return Ok(ReadIoGuard::new(self));
+            return Ok(ReadIoGuard::new(self, 0, 0));
         }
 
         // Validate alignment to logical sector size.
@@ -170,7 +170,19 @@ impl<F: AsyncFile> VhdxFile<F> {
             current_offset += block_length;
         }
 
-        Ok(ReadIoGuard::new(self))
+        // Compute the block range and increment refcounts.
+        let start_block = self.bat.offset_to_block(offset);
+        let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
+        let block_count = end_block - start_block + 1;
+
+        {
+            let mut bat_state = self.bat_state.write();
+            for block in start_block..start_block + block_count {
+                bat_state.increment_io_refcount(block);
+            }
+        }
+
+        Ok(ReadIoGuard::new(self, start_block, block_count))
     }
 
     /// Resolve a write request into file-level ranges.
@@ -181,7 +193,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// any newly allocated regions that must be zero-filled.
     ///
     /// Blocks that are fully-covering writes use TFP (Transitioning to Fully
-    /// Present) to defer BAT commit to [`complete_write()`]. Partial writes
+    /// Present) to defer BAT commit to [`WriteIoGuard::complete()`]. Partial writes
     /// commit the BAT immediately via per-entry cache write.
     ///
     /// Before any ranges are returned, the header is updated with new GUIDs
@@ -327,7 +339,25 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // If nothing needs allocation, we're done.
         if blocks_needing_allocation.is_empty() {
-            return Ok(WriteIoGuard::new(self, offset, len));
+            // Compute block range and increment refcounts.
+            let start_block = self.bat.offset_to_block(offset);
+            let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
+            let block_count = end_block - start_block + 1;
+
+            {
+                let mut bat_state = self.bat_state.write();
+                for block in start_block..start_block + block_count {
+                    bat_state.increment_io_refcount(block);
+                }
+            }
+
+            return Ok(WriteIoGuard::new(
+                self,
+                offset,
+                len,
+                start_block,
+                block_count,
+            ));
         }
 
         // --- Allocation phase: acquire BlockAllocationLock ---
@@ -547,7 +577,26 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Allocation lock is released when _alloc_guard drops (after
         // returning ranges to caller).
-        Ok(WriteIoGuard::new(self, offset, len))
+
+        // Compute block range and increment refcounts on success path.
+        let start_block = self.bat.offset_to_block(offset);
+        let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
+        let block_count = end_block - start_block + 1;
+
+        {
+            let mut bat_state = self.bat_state.write();
+            for block in start_block..start_block + block_count {
+                bat_state.increment_io_refcount(block);
+            }
+        }
+
+        Ok(WriteIoGuard::new(
+            self,
+            offset,
+            len,
+            start_block,
+            block_count,
+        ))
     }
 
     /// Finalize a write operation (internal implementation).
@@ -2542,5 +2591,207 @@ mod tests {
         verify_block_pattern(&*vhdx, 0, block_size, 0xCC).await;
         // Verify block 1 has new data.
         verify_block_pattern(&*vhdx, block_size as u64, block_size, 0xDD).await;
+    }
+
+    // ---- IoGuard refcount tracking tests (Phase 10.5 Step 2) ----
+
+    #[async_test]
+    async fn read_guard_increments_refcount() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // Pre-allocate block 0 so it's FullyPresent.
+        write_block(&vhdx, 0, block_size, 0xAA).await;
+
+        // Resolve a read — refcount should be 1 while guard is alive.
+        let mut ranges = Vec::new();
+        let guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+
+        {
+            let bat_state = vhdx.bat_state.read();
+            assert_eq!(bat_state.io_refcount(0), 1);
+        }
+
+        // Drop the guard — refcount should go back to 0.
+        drop(guard);
+
+        {
+            let bat_state = vhdx.bat_state.read();
+            assert_eq!(bat_state.io_refcount(0), 0);
+        }
+    }
+
+    #[async_test]
+    async fn read_guard_drop_decrements_refcount() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // Pre-allocate block 0.
+        write_block(&vhdx, 0, block_size, 0xBB).await;
+
+        let mut ranges = Vec::new();
+        let guard = vhdx.resolve_read(0, block_size, &mut ranges).await.unwrap();
+
+        // Refcount is 1 while guard is held.
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 1);
+
+        // Drop explicitly.
+        drop(guard);
+
+        // Refcount back to 0.
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 0);
+    }
+
+    #[async_test]
+    async fn read_guard_multiple_blocks() {
+        let (file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // Write 3 blocks.
+        write_block(&vhdx, 0, block_size, 0x11).await;
+        write_block(&vhdx, block_size as u64, block_size, 0x22).await;
+        write_block(&vhdx, 2 * block_size as u64, block_size, 0x33).await;
+
+        // Read spanning all 3 blocks.
+        let mut ranges = Vec::new();
+        let guard = vhdx
+            .resolve_read(0, 3 * block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        assert_eq!(guard.block_count(), 3);
+        assert_eq!(guard.start_block(), 0);
+
+        {
+            let bat_state = vhdx.bat_state.read();
+            assert_eq!(bat_state.io_refcount(0), 1);
+            assert_eq!(bat_state.io_refcount(1), 1);
+            assert_eq!(bat_state.io_refcount(2), 1);
+        }
+
+        drop(guard);
+
+        {
+            let bat_state = vhdx.bat_state.read();
+            assert_eq!(bat_state.io_refcount(0), 0);
+            assert_eq!(bat_state.io_refcount(1), 0);
+            assert_eq!(bat_state.io_refcount(2), 0);
+        }
+    }
+
+    #[async_test]
+    async fn read_guard_zero_range_has_refcount() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Read an unallocated (Zero) block — refcount is still incremented
+        // (harmless, since trim won't touch unallocated blocks).
+        let mut ranges = Vec::new();
+        let guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+
+        assert!(guard.block_count() > 0);
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 1);
+
+        drop(guard);
+
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 0);
+    }
+
+    #[async_test]
+    async fn write_guard_complete_drops_refcount() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        let mut ranges = Vec::new();
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        // Refcount should be 1.
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 1);
+
+        // Write data and complete.
+        for wr in &ranges {
+            match wr {
+                WriteRange::Data {
+                    file_offset,
+                    length,
+                    ..
+                } => {
+                    let data = vec![0xEE; *length as usize];
+                    vhdx.file.write_at(*file_offset, &data).await.unwrap();
+                }
+                WriteRange::Zero {
+                    file_offset,
+                    length,
+                } => {
+                    let zeros = vec![0u8; *length as usize];
+                    vhdx.file.write_at(*file_offset, &zeros).await.unwrap();
+                }
+            }
+        }
+
+        guard.complete().await.unwrap();
+
+        // After complete + drop, refcount should be 0 and block should be FullyPresent.
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 0);
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+    }
+
+    #[async_test]
+    async fn write_guard_drop_aborts_and_decrements_refcount() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        let mut ranges = Vec::new();
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
+            .await
+            .unwrap();
+
+        // Refcount should be 1.
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 1);
+
+        // Drop without calling complete() — abort.
+        drop(guard);
+
+        // Refcount should be 0, block should be back to NotPresent.
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 0);
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(mapping.state, BatEntryState::NotPresent);
+    }
+
+    #[async_test]
+    async fn concurrent_read_guards_same_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // Pre-allocate block 0.
+        write_block(&vhdx, 0, block_size, 0xFF).await;
+
+        // Two concurrent reads on the same block.
+        let mut ranges1 = Vec::new();
+        let mut ranges2 = Vec::new();
+        let guard1 = vhdx.resolve_read(0, 4096, &mut ranges1).await.unwrap();
+        let guard2 = vhdx.resolve_read(0, 4096, &mut ranges2).await.unwrap();
+
+        // Refcount should be 2.
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 2);
+
+        // Drop first guard — refcount should be 1.
+        drop(guard1);
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 1);
+
+        // Drop second guard — refcount should be 0.
+        drop(guard2);
+        assert_eq!(vhdx.bat_state.read().io_refcount(0), 0);
     }
 }

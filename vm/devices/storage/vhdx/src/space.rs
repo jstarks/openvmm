@@ -1169,6 +1169,7 @@ mod tests {
             sector_bitmap_mappings: Vec::new(),
             allocated_block_count: 0,
             dirty_bat_pages: vec![false; 1],
+            io_refcounts: vec![0u32; data_block_count as usize],
         }
     }
 
@@ -1589,6 +1590,7 @@ mod tests {
             sector_bitmap_mappings: Vec::new(),
             allocated_block_count: 0,
             dirty_bat_pages: vec![false; 1],
+            io_refcounts: vec![0u32; 16],
         };
 
         // First allocate gets block 2 (lowest block number).

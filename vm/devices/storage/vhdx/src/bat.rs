@@ -129,6 +129,10 @@ pub(crate) struct BatState {
     /// Tracks which BAT pages have been modified and need writeback to disk.
     /// Indexed by BAT page number (entry_index / ENTRIES_PER_BAT_PAGE).
     pub dirty_bat_pages: Vec<bool>,
+    /// Per-payload-block I/O refcounts. While a block's refcount is > 0,
+    /// trim must not free that block's file space. One entry per payload
+    /// block, parallel to `payload_mappings`.
+    pub io_refcounts: Vec<u32>,
 }
 
 /// Whether a block state counts as "allocated" for `allocated_block_count`.
@@ -209,6 +213,24 @@ impl BatState {
     #[allow(dead_code)] // will be used by BAT write-back in a later phase
     pub fn total_bat_pages(&self) -> usize {
         self.dirty_bat_pages.len()
+    }
+
+    /// Increment the I/O refcount for a payload block.
+    pub fn increment_io_refcount(&mut self, block_number: u32) {
+        self.io_refcounts[block_number as usize] += 1;
+    }
+
+    /// Decrement the I/O refcount for a payload block.
+    /// Returns the new refcount value.
+    pub fn decrement_io_refcount(&mut self, block_number: u32) -> u32 {
+        let rc = &mut self.io_refcounts[block_number as usize];
+        *rc = rc.checked_sub(1).expect("io_refcount underflow");
+        *rc
+    }
+
+    /// Get the I/O refcount for a payload block.
+    pub fn io_refcount(&self, block_number: u32) -> u32 {
+        self.io_refcounts[block_number as usize]
     }
 }
 
@@ -715,6 +737,7 @@ mod tests {
             sector_bitmap_mappings: vec![],
             allocated_block_count: 0,
             dirty_bat_pages: vec![false; bat.total_bat_pages()],
+            io_refcounts: vec![0u32; bat.data_block_count as usize],
         };
 
         // Allocate block 0.
@@ -745,6 +768,7 @@ mod tests {
             sector_bitmap_mappings: vec![],
             allocated_block_count: 0,
             dirty_bat_pages: vec![false; bat.total_bat_pages()],
+            io_refcounts: vec![0u32; bat.data_block_count as usize],
         };
 
         // No pages dirty initially.

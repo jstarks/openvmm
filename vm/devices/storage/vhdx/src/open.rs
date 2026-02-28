@@ -119,6 +119,11 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Writers that encounter a TFP block listen on this event and retry.
     pub(crate) allocation_event: event_listener::Event,
 
+    /// Broadcast event notified when any I/O guard is dropped and a block's
+    /// refcount reaches zero. Trim (Phase 11) waits on this event when it
+    /// finds a block with refcount > 0.
+    pub(crate) trim_event: event_listener::Event,
+
     /// Free space tracker. Manages all space allocation within the file,
     /// replacing the simple EOF-bump allocator.
     pub(crate) free_space: FreeSpaceTracker,
@@ -243,6 +248,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             bat_state: RwLock::new(bat_state),
             allocation_lock: futures::lock::Mutex::new(()),
             allocation_event: event_listener::Event::new(),
+            trim_event: event_listener::Event::new(),
             free_space,
 
             bat_length: regions.bat_length,
@@ -321,11 +327,13 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         let total_bat_pages = bat.total_bat_pages();
+        let payload_count = payload_mappings.len();
         Ok(BatState {
             payload_mappings,
             sector_bitmap_mappings,
             allocated_block_count,
             dirty_bat_pages: vec![false; total_bat_pages],
+            io_refcounts: vec![0u32; payload_count],
         })
     }
 

@@ -2040,4 +2040,411 @@ mod tests {
             "pool allocation should emit zero padding, but got 0 Zero ranges",
         );
     }
+
+    // ---- Concurrent I/O stress tests ----
+
+    /// Wrapper around `InMemoryFile` that yields once on `set_file_size`.
+    ///
+    /// `InMemoryFile`'s async methods are synchronous (return Ready
+    /// immediately), so `futures::join!` won't interleave two
+    /// `resolve_write` calls. This wrapper inserts a
+    /// `futures::pending!()` call inside `set_file_size`, creating a yield
+    /// point during `allocate_space` while the `allocation_lock` is held.
+    struct YieldingFile {
+        inner: InMemoryFile,
+    }
+
+    impl AsyncFile for YieldingFile {
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), std::io::Error> {
+            self.inner.read_at(offset, buf).await
+        }
+        async fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
+            self.inner.write_at(offset, buf).await
+        }
+        async fn flush(&self) -> Result<(), std::io::Error> {
+            self.inner.flush().await
+        }
+        async fn file_size(&self) -> Result<u64, std::io::Error> {
+            self.inner.file_size().await
+        }
+        async fn set_file_size(&self, size: u64) -> Result<(), std::io::Error> {
+            // Yield once to allow other futures to run, then resume.
+            // We must wake ourselves before returning Pending, otherwise
+            // the executor won't re-poll us (deadlock).
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if !yielded {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            })
+            .await;
+            self.inner.set_file_size(size).await
+        }
+    }
+
+    /// Helper: create a VHDX with custom block size on an `InMemoryFile`,
+    /// returning the file and params.
+    async fn create_vhdx_with_block_size(
+        disk_size: u64,
+        block_size: u32,
+    ) -> (InMemoryFile, CreateParams) {
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size,
+            block_size,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        (file, params)
+    }
+
+    /// Helper: perform a full write-complete cycle on a single block.
+    async fn write_block<F: AsyncFile>(
+        vhdx: &VhdxFile<F>,
+        guest_offset: u64,
+        length: u32,
+        pattern_byte: u8,
+    ) {
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(guest_offset, length, &mut ranges)
+            .await
+            .unwrap();
+
+        // Write pattern data at each Data range, zero at each Zero range.
+        for wr in &ranges {
+            match wr {
+                WriteRange::Data {
+                    file_offset,
+                    length,
+                    ..
+                } => {
+                    let data = vec![pattern_byte; *length as usize];
+                    vhdx.file.write_at(*file_offset, &data).await.unwrap();
+                }
+                WriteRange::Zero {
+                    file_offset,
+                    length,
+                } => {
+                    let zeros = vec![0u8; *length as usize];
+                    vhdx.file.write_at(*file_offset, &zeros).await.unwrap();
+                }
+            }
+        }
+
+        vhdx.complete_write(guest_offset, length, true)
+            .await
+            .unwrap();
+    }
+
+    /// Helper: read a block and verify the pattern byte.
+    async fn verify_block_pattern<F: AsyncFile>(
+        vhdx: &VhdxFile<F>,
+        guest_offset: u64,
+        length: u32,
+        expected_byte: u8,
+    ) {
+        let mut ranges = Vec::new();
+        vhdx.resolve_read(guest_offset, length, &mut ranges)
+            .await
+            .unwrap();
+
+        for rr in &ranges {
+            match rr {
+                ReadRange::Data {
+                    file_offset,
+                    length,
+                    ..
+                } => {
+                    let mut buf = vec![0u8; *length as usize];
+                    vhdx.file.read_at(*file_offset, &mut buf).await.unwrap();
+                    assert!(
+                        buf.iter().all(|&b| b == expected_byte),
+                        "expected all bytes to be 0x{:02x} at file_offset {}, \
+                         but found mismatch",
+                        expected_byte,
+                        file_offset,
+                    );
+                }
+                ReadRange::Zero { .. } => {
+                    assert_eq!(
+                        expected_byte, 0,
+                        "expected data but got Zero range"
+                    );
+                }
+                ReadRange::Unmapped { .. } => {
+                    panic!("unexpected Unmapped range in non-differencing disk");
+                }
+            }
+        }
+    }
+
+    #[async_test]
+    async fn concurrent_reads_same_block() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Pre-allocate block 0 with known data.
+        write_block(&*vhdx, 0, block_size, 0xAA).await;
+
+        // Spawn 10 concurrent reads to the same block.
+        let futures: Vec<_> = (0..10)
+            .map(|_| {
+                let vhdx = vhdx.clone();
+                async move {
+                    let mut ranges = Vec::new();
+                    vhdx.resolve_read(0, block_size, &mut ranges)
+                        .await
+                        .unwrap();
+                    assert_eq!(ranges.len(), 1);
+                    match &ranges[0] {
+                        ReadRange::Data {
+                            guest_offset,
+                            length,
+                            file_offset,
+                        } => {
+                            assert_eq!(*guest_offset, 0);
+                            assert_eq!(*length, block_size);
+                            assert!(*file_offset > 0);
+                        }
+                        other => panic!("expected Data range, got {:?}", other),
+                    }
+                    ranges
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        // All results should be identical.
+        let first = &results[0];
+        for result in &results[1..] {
+            assert_eq!(first, result);
+        }
+    }
+
+    #[async_test]
+    async fn concurrent_reads_different_blocks() {
+        let (file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Pre-allocate blocks 0, 1, 2.
+        for i in 0..3u8 {
+            write_block(&*vhdx, i as u64 * block_size as u64, block_size, 0x10 + i).await;
+        }
+
+        // Spawn 3 concurrent reads, one per block.
+        let futures: Vec<_> = (0..3u32)
+            .map(|i| {
+                let vhdx = vhdx.clone();
+                let bs = block_size;
+                async move {
+                    let mut ranges = Vec::new();
+                    vhdx.resolve_read(i as u64 * bs as u64, bs, &mut ranges)
+                        .await
+                        .unwrap();
+                    assert_eq!(ranges.len(), 1);
+                    match &ranges[0] {
+                        ReadRange::Data { file_offset, .. } => {
+                            assert!(*file_offset > 0);
+                        }
+                        other => panic!("expected Data range for block {}, got {:?}", i, other),
+                    }
+                }
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
+    }
+
+    #[async_test]
+    async fn concurrent_writes_different_blocks() {
+        // 8 MiB disk with 1 MiB blocks → 8 blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Spawn 4 concurrent tasks, each writing to a unique block.
+        let futures: Vec<_> = (0..4u8)
+            .map(|i| {
+                let vhdx = vhdx.clone();
+                let bs = block_size;
+                async move {
+                    let offset = i as u64 * bs as u64;
+                    let pattern = 0x40 + i;
+                    write_block(&*vhdx, offset, bs, pattern).await;
+                }
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
+
+        // Verify each block reads back the correct pattern.
+        for i in 0..4u8 {
+            let offset = i as u64 * block_size as u64;
+            verify_block_pattern(&*vhdx, offset, block_size, 0x40 + i).await;
+        }
+    }
+
+    #[async_test]
+    async fn concurrent_writes_same_block() {
+        // This test exercises the TFP-retry bug: two concurrent tasks both
+        // try to allocate the same unallocated block. With the bug present,
+        // the second task returns Corrupt(Other) instead of retrying.
+        //
+        // Uses YieldingFile to force a yield during set_file_size (inside
+        // allocate_space), creating the exact interleaving needed:
+        //   1. task_a: read phase → NotPresent → acquires allocation_lock
+        //      → allocate_space → set_file_size → YIELD
+        //   2. task_b: read phase → NotPresent (TFP not yet set) →
+        //      tries allocation_lock → blocked → YIELD
+        //   3. task_a resumes: set_file_size completes → sets TFP → returns
+        //   4. task_b resumes: acquires lock → re-check → sees TFP → BUG!
+
+        let (inner_file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
+        let data = inner_file.snapshot();
+
+        let yielding_file = YieldingFile {
+            inner: InMemoryFile::new(0),
+        };
+        yielding_file.inner.write_at(0, &data).await.unwrap();
+
+        let vhdx = Arc::new(VhdxFile::open(yielding_file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Both tasks write to block 0 (offset 0, full block).
+        let vhdx_a = vhdx.clone();
+        let vhdx_b = vhdx.clone();
+
+        let task_a = async {
+            let mut ranges = Vec::new();
+            vhdx_a.resolve_write(0, block_size, &mut ranges).await
+        };
+
+        let task_b = async {
+            let mut ranges = Vec::new();
+            vhdx_b.resolve_write(0, block_size, &mut ranges).await
+        };
+
+        let (result_a, result_b) = futures::join!(task_a, task_b);
+
+        // Both should succeed (no Corrupt error).
+        assert!(
+            result_a.is_ok(),
+            "task_a failed: {:?}",
+            result_a.unwrap_err()
+        );
+        assert!(
+            result_b.is_ok(),
+            "task_b failed: {:?}",
+            result_b.unwrap_err()
+        );
+
+        // Both complete_write calls should succeed.
+        vhdx.complete_write(0, block_size, true).await.unwrap();
+        // Second complete_write is a no-op (TFP already cleared).
+        vhdx.complete_write(0, block_size, true).await.unwrap();
+
+        // Block should be FullyPresent.
+        let bat_state = vhdx.bat_state.read();
+        let mapping = bat_state.get_payload_mapping(0);
+        assert_eq!(mapping.state(), BatEntryState::FullyPresent as u8);
+        assert!(!mapping.transitioning_to_fully_present());
+    }
+
+    #[async_test]
+    async fn concurrent_flush_requests() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Write to a block, complete.
+        write_block(&*vhdx, 0, block_size, 0xBB).await;
+
+        // Spawn 5 concurrent flush calls.
+        let futures: Vec<_> = (0..5)
+            .map(|_| {
+                let vhdx = vhdx.clone();
+                async move {
+                    vhdx.flush().await.unwrap();
+                }
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
+    }
+
+    #[async_test]
+    async fn stress_random_writes_no_corruption() {
+        // 8 MiB disk with 1 MiB blocks → 8 blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Spawn 8 tasks, each claiming a unique block.
+        let futures: Vec<_> = (0..8u8)
+            .map(|i| {
+                let vhdx = vhdx.clone();
+                let bs = block_size;
+                async move {
+                    let offset = i as u64 * bs as u64;
+                    let pattern = 0x80 + i;
+                    write_block(&*vhdx, offset, bs, pattern).await;
+                    vhdx.flush().await.unwrap();
+                }
+            })
+            .collect();
+
+        futures::future::join_all(futures).await;
+
+        // Verify all blocks.
+        for i in 0..8u8 {
+            let offset = i as u64 * block_size as u64;
+            verify_block_pattern(&*vhdx, offset, block_size, 0x80 + i).await;
+        }
+    }
+
+    #[async_test]
+    async fn concurrent_read_and_write_same_block() {
+        let (file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Pre-allocate block 0 with known data.
+        write_block(&*vhdx, 0, block_size, 0xCC).await;
+
+        // Concurrent: read block 0, write block 1.
+        let vhdx_r = vhdx.clone();
+        let vhdx_w = vhdx.clone();
+
+        let read_task = async move {
+            let mut ranges = Vec::new();
+            vhdx_r
+                .resolve_read(0, block_size, &mut ranges)
+                .await
+                .unwrap();
+            assert_eq!(ranges.len(), 1);
+            match &ranges[0] {
+                ReadRange::Data { .. } => {}
+                other => panic!("expected Data range, got {:?}", other),
+            }
+        };
+
+        let write_task = async move {
+            let offset = block_size as u64;
+            write_block(&*vhdx_w, offset, block_size, 0xDD).await;
+        };
+
+        futures::join!(read_task, write_task);
+
+        // Verify block 0 still has original data.
+        verify_block_pattern(&*vhdx, 0, block_size, 0xCC).await;
+        // Verify block 1 has new data.
+        verify_block_pattern(&*vhdx, block_size as u64, block_size, 0xDD).await;
+    }
 }

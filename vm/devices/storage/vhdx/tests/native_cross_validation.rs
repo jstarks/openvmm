@@ -24,6 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 use vhdx::AsyncFile;
 use vhdx::ReadRange;
+use vhdx::TrimMode;
 use vhdx::WriteRange;
 
 use windows::Win32::Foundation::CloseHandle;
@@ -324,7 +325,6 @@ impl RawDiskHandle {
         Ok(bytes_read as usize)
     }
 
-    #[allow(dead_code)]
     /// Write `data.len()` bytes to the raw disk at the given byte offset.
     /// Offset and length must be sector-aligned (multiples of 512).
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<usize> {
@@ -413,7 +413,6 @@ impl RustVhdx {
     }
 
     /// Read data at a virtual offset. Returns a Vec<u8> of `len` bytes.
-    #[allow(dead_code)]
     async fn read_data(&self, offset: u64, len: u32) -> Vec<u8> {
         let mut ranges = Vec::new();
         let guard = self
@@ -449,7 +448,6 @@ impl RustVhdx {
     }
 
     /// Write data at a virtual offset.
-    #[allow(dead_code)]
     async fn write_data(&self, offset: u64, data: &[u8]) {
         let mut ranges = Vec::new();
         let guard = self
@@ -493,11 +491,31 @@ impl RustVhdx {
         self.vhdx.flush().await.expect("flush");
     }
 
+    /// Trim a range of the virtual disk.
+    async fn trim_range(&self, offset: u64, length: u64) {
+        self.vhdx
+            .trim(TrimMode::Zero, offset, length, false, false)
+            .await
+            .expect("trim");
+    }
+
     /// Close the VHDX (consume self).
     async fn close(self) {
         self.vhdx.flush().await.expect("flush on close");
         drop(self);
     }
+}
+
+// =====================================================================
+// Test Data Pattern
+// =====================================================================
+
+/// Generate a test pattern for a given offset: the pattern byte
+/// is derived from the offset so each location has unique data.
+fn test_pattern(offset: u64, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((offset as usize + i) % 251) as u8) // prime modulus avoids power-of-2 alignment
+        .collect()
 }
 
 // =====================================================================
@@ -586,4 +604,417 @@ async fn rust_create_native_attach_read_zeros() {
 
     // A freshly-created, never-written VHDX should return all zeros.
     assert!(buf.iter().all(|&b| b == 0), "first sector should be zeros");
+}
+
+/// Test 4: Native-Create → Native-Write → Rust-Read (Data)
+///
+/// Native creates dynamic VHDX (1 GiB, default sizes) → attach → write
+/// known patterns at 3 offsets across different blocks → detach → close →
+/// Rust opens → reads at each offset → data matches.
+#[pal_async::async_test]
+async fn native_create_rust_read_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    // Determine block size after native create (typically 32 MiB).
+    let block_size: u64;
+
+    // Native create + write.
+    {
+        let mut native = NativeVhdx::create_dynamic(&vhdx_path, 1024 * 1024 * 1024, 0, 0);
+        let raw = native.attach_raw();
+
+        // We need to know the block size to write across blocks.
+        // Native defaults to 32 MiB blocks.
+        block_size = 32 * 1024 * 1024;
+
+        let offsets = [0u64, block_size, 2 * block_size];
+        for &off in &offsets {
+            let pattern = test_pattern(off, 512);
+            let written = raw.write_at(off, &pattern).expect("native write");
+            assert_eq!(written, 512);
+        }
+        // Drop detaches and closes.
+    }
+
+    // Rust open + read + verify.
+    let rust = RustVhdx::open(&vhdx_path, true).await;
+
+    let offsets = [0u64, block_size, 2 * block_size];
+    for &off in &offsets {
+        let expected = test_pattern(off, 512);
+        let actual = rust.read_data(off, 512).await;
+        assert_eq!(actual, expected, "data mismatch at offset {off:#x}");
+    }
+
+    rust.close().await;
+}
+
+/// Test 5: Native-Create → Rust-Read (Custom 32 MiB Block Size)
+///
+/// Native creates with explicit 32 MiB block size → Rust opens →
+/// `block_size()` == 32 MiB.
+#[pal_async::async_test]
+async fn native_create_custom_block_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    {
+        let _native =
+            NativeVhdx::create_dynamic(&vhdx_path, 1024 * 1024 * 1024, 32 * 1024 * 1024, 0);
+    }
+
+    let rust = RustVhdx::open(&vhdx_path, true).await;
+    assert_eq!(
+        rust.vhdx.block_size(),
+        33554432,
+        "block_size should be 32 MiB"
+    );
+    rust.close().await;
+}
+
+/// Test 6: Native-Create → Rust-Read (4K Logical Sector)
+///
+/// Native creates with 4096 logical sector size → Rust opens →
+/// `logical_sector_size()` == 4096.
+#[pal_async::async_test]
+async fn native_create_4k_sector() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    {
+        let _native = NativeVhdx::create_dynamic(&vhdx_path, 1024 * 1024 * 1024, 0, 4096);
+    }
+
+    let rust = RustVhdx::open(&vhdx_path, true).await;
+    assert_eq!(
+        rust.vhdx.logical_sector_size(),
+        4096,
+        "logical_sector_size should be 4096"
+    );
+    rust.close().await;
+}
+
+/// Test 7: Rust-Create → Native-Read (Data)
+///
+/// Rust creates + writes data at multiple offsets across block boundaries →
+/// flush → close → native opens → attach → raw-read at each offset →
+/// data matches.
+#[pal_async::async_test]
+async fn rust_create_native_read_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024; // 2 MiB
+
+    // Rust create + write.
+    {
+        let rust = RustVhdx::create(&vhdx_path, 32 * 1024 * 1024, block_size as u32).await;
+
+        // Write to 3 different blocks (blocks 1, 3, 5 — skip block 0 since test 3 uses it).
+        let offsets = [block_size, 3 * block_size, 5 * block_size];
+        for &off in &offsets {
+            let pattern = test_pattern(off, 512);
+            rust.write_data(off, &pattern).await;
+        }
+        rust.flush().await;
+        rust.close().await;
+    }
+
+    // Native open + attach + read + verify.
+    let mut native = NativeVhdx::open(&vhdx_path, false);
+    let raw = native.attach_raw();
+
+    let offsets = [block_size, 3 * block_size, 5 * block_size];
+    for &off in &offsets {
+        let expected = test_pattern(off, 512);
+        let mut buf = vec![0u8; 512];
+        let bytes_read = raw.read_at(off, &mut buf).expect("native read");
+        assert_eq!(bytes_read, 512);
+        assert_eq!(buf, expected, "data mismatch at offset {off:#x}");
+    }
+}
+
+/// Test 8: Rust-Create → Native-Open (Various Block Sizes)
+///
+/// Rust creates VHDX files with 2 MiB, 4 MiB, and 32 MiB block sizes →
+/// native opens each → open succeeds without error.
+#[pal_async::async_test]
+async fn rust_create_various_block_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_sizes: &[u32] = &[2 * 1024 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024];
+
+    for &bs in block_sizes {
+        let name = format!("test_bs_{bs}.vhdx");
+        let vhdx_path = dir.path().join(&name);
+
+        {
+            let rust = RustVhdx::create(&vhdx_path, 64 * 1024 * 1024, bs).await;
+            rust.close().await;
+        }
+
+        let _native = NativeVhdx::open(&vhdx_path, true);
+        // If we get here, the native stack accepted the file.
+    }
+}
+
+/// Test 9: Interleaved — Native-Write Then Rust-Write
+///
+/// Native creates → attach → write region A (offset 0) → detach → close →
+/// Rust opens → writes region B (second block) → flush → close →
+/// native opens → attach → reads both regions → both intact.
+#[pal_async::async_test]
+async fn interleaved_native_then_rust() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 32 * 1024 * 1024; // native default
+
+    // Step 1: Native create + write region A at offset 0.
+    {
+        let mut native = NativeVhdx::create_dynamic(&vhdx_path, 1024 * 1024 * 1024, 0, 0);
+        let raw = native.attach_raw();
+        let pattern_a = test_pattern(0, 512);
+        let written = raw.write_at(0, &pattern_a).expect("native write region A");
+        assert_eq!(written, 512);
+    }
+
+    // Step 2: Rust opens → writes region B at block_size offset.
+    {
+        let rust = RustVhdx::open(&vhdx_path, false).await;
+        let pattern_b = test_pattern(block_size, 512);
+        rust.write_data(block_size, &pattern_b).await;
+        rust.flush().await;
+        rust.close().await;
+    }
+
+    // Step 3: Native opens → reads both regions → verifies.
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+
+        let expected_a = test_pattern(0, 512);
+        let mut buf_a = vec![0u8; 512];
+        let bytes = raw.read_at(0, &mut buf_a).expect("read region A");
+        assert_eq!(bytes, 512);
+        assert_eq!(buf_a, expected_a, "region A corrupted");
+
+        let expected_b = test_pattern(block_size, 512);
+        let mut buf_b = vec![0u8; 512];
+        let bytes = raw.read_at(block_size, &mut buf_b).expect("read region B");
+        assert_eq!(bytes, 512);
+        assert_eq!(buf_b, expected_b, "region B corrupted");
+    }
+}
+
+/// Test 10: Interleaved — Rust-Write Then Native-Write
+///
+/// Rust creates → writes blocks 0, 2, 4 → flush → close →
+/// native opens → attach → writes blocks 1, 3 → detach → close →
+/// Rust opens → reads all blocks → all data intact.
+#[pal_async::async_test]
+async fn interleaved_rust_then_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024; // 2 MiB
+
+    // Step 1: Rust create + write blocks 0, 2, 4.
+    let rust_offsets = [0u64, 2 * block_size, 4 * block_size];
+    {
+        let rust = RustVhdx::create(&vhdx_path, 32 * 1024 * 1024, block_size as u32).await;
+        for &off in &rust_offsets {
+            rust.write_data(off, &test_pattern(off, 512)).await;
+        }
+        rust.flush().await;
+        rust.close().await;
+    }
+
+    // Step 2: Native opens → writes blocks 1, 3.
+    let native_offsets = [block_size, 3 * block_size];
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+        for &off in &native_offsets {
+            let pattern = test_pattern(off, 512);
+            let written = raw.write_at(off, &pattern).expect("native write");
+            assert_eq!(written, 512);
+        }
+    }
+
+    // Step 3: Rust opens → reads all blocks → verifies.
+    {
+        let rust = RustVhdx::open(&vhdx_path, true).await;
+
+        for &off in rust_offsets.iter().chain(native_offsets.iter()) {
+            let expected = test_pattern(off, 512);
+            let actual = rust.read_data(off, 512).await;
+            assert_eq!(actual, expected, "data mismatch at offset {off:#x}");
+        }
+
+        rust.close().await;
+    }
+}
+
+/// Test 11: Three-Way Round-Trip
+///
+/// Rust creates → writes block 0 → flush → close → native opens → attach →
+/// writes block 1 → detach → close → Rust opens → reads blocks 0 and 1 →
+/// both correct.
+#[pal_async::async_test]
+async fn three_way_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Step 1: Rust creates and writes block 0.
+    {
+        let rust = RustVhdx::create(&vhdx_path, 16 * 1024 * 1024, block_size as u32).await;
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.flush().await;
+        rust.close().await;
+    }
+
+    // Step 2: Native opens and writes block 1.
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+        let pattern = test_pattern(block_size, 512);
+        let written = raw
+            .write_at(block_size, &pattern)
+            .expect("native write block 1");
+        assert_eq!(written, 512);
+    }
+
+    // Step 3: Rust opens → reads blocks 0 and 1 → verifies.
+    {
+        let rust = RustVhdx::open(&vhdx_path, true).await;
+
+        let data0 = rust.read_data(0, 512).await;
+        assert_eq!(data0, test_pattern(0, 512), "block 0 data mismatch");
+
+        let data1 = rust.read_data(block_size, 512).await;
+        assert_eq!(
+            data1,
+            test_pattern(block_size, 512),
+            "block 1 data mismatch"
+        );
+
+        rust.close().await;
+    }
+}
+
+/// Test 12: Trim — Rust-Trim → Native-Read
+///
+/// Rust creates small disk (4 MiB, 2 MiB blocks) → writes all blocks →
+/// trims block 1 → flush → close → native opens → attach →
+/// raw-read block 0 (data intact) → raw-read block 1 (zeros).
+#[pal_async::async_test]
+async fn trim_rust_trim_native_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Rust create + write both blocks + trim block 1.
+    {
+        let rust = RustVhdx::create(&vhdx_path, 4 * 1024 * 1024, block_size as u32).await;
+
+        // Write block 0 and block 1.
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.write_data(block_size, &test_pattern(block_size, 512))
+            .await;
+        rust.flush().await;
+
+        // Trim block 1 entirely.
+        rust.trim_range(block_size, block_size).await;
+        rust.flush().await;
+        rust.close().await;
+    }
+
+    // Native open + attach + verify.
+    let mut native = NativeVhdx::open(&vhdx_path, false);
+    let raw = native.attach_raw();
+
+    // Block 0 should still have data.
+    let mut buf0 = vec![0u8; 512];
+    let bytes = raw.read_at(0, &mut buf0).expect("read block 0");
+    assert_eq!(bytes, 512);
+    assert_eq!(buf0, test_pattern(0, 512), "block 0 should be intact");
+
+    // Block 1 should be zeros after trim.
+    let mut buf1 = vec![0u8; 512];
+    let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
+    assert_eq!(bytes, 512);
+    assert!(
+        buf1.iter().all(|&b| b == 0),
+        "block 1 should be zeros after trim"
+    );
+}
+
+/// Test 13: Trim — Native-Write → Rust-Trim → Native-Read
+///
+/// Native creates → attach → writes blocks 0 and 1 → detach → close →
+/// Rust opens → trims block 1 → flush → close → native opens → attach →
+/// raw-read block 0 (intact) → raw-read block 1 (zeros).
+#[pal_async::async_test]
+async fn trim_native_write_rust_trim_native_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    // Native default block size is 32 MiB. Use a smaller Rust-created disk
+    // so trim covers a full block efficiently.
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Step 1: Rust creates to control block size, then close.
+    {
+        let rust = RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32).await;
+        rust.close().await;
+    }
+
+    // Step 2: Native writes blocks 0 and 1.
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+
+        let written = raw
+            .write_at(0, &test_pattern(0, 512))
+            .expect("native write block 0");
+        assert_eq!(written, 512);
+
+        let written = raw
+            .write_at(block_size, &test_pattern(block_size, 512))
+            .expect("native write block 1");
+        assert_eq!(written, 512);
+    }
+
+    // Step 3: Rust opens → trims block 1 → flush → close.
+    {
+        let rust = RustVhdx::open(&vhdx_path, false).await;
+        rust.trim_range(block_size, block_size).await;
+        rust.flush().await;
+        rust.close().await;
+    }
+
+    // Step 4: Native opens → reads → verifies.
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+
+        // Block 0 intact.
+        let mut buf0 = vec![0u8; 512];
+        let bytes = raw.read_at(0, &mut buf0).expect("read block 0");
+        assert_eq!(bytes, 512);
+        assert_eq!(buf0, test_pattern(0, 512), "block 0 should be intact");
+
+        // Block 1 zeros.
+        let mut buf1 = vec![0u8; 512];
+        let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
+        assert_eq!(bytes, 512);
+        assert!(
+            buf1.iter().all(|&b| b == 0),
+            "block 1 should be zeros after trim"
+        );
+    }
 }

@@ -472,11 +472,38 @@ impl<F: AsyncFile> VhdxFile<F> {
                     }
                     _ => {
                         // Unallocated block — allocate space.
-                        // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
-                        let alloc_result = self.allocate_space(self.block_size, false).await?;
-                        let new_offset = alloc_result.file_offset;
-                        let is_safe_data = alloc_result.is_safe_data;
+                        //
+                        // If the block is currently soft-anchored (trimmed
+                        // with file space preserved), try to reclaim its own
+                        // space first — matching `Vhd2iAllocateDataBlock` in
+                        // the C code.
                         let original = internal;
+                        let (new_offset, is_safe_data) = if crate::trim::is_soft_anchored(internal)
+                        {
+                            let old_file_offset = internal.file_megabyte() as u64 * MB1;
+                            if self
+                                .free_space
+                                .unmark_trimmed_block(
+                                    block_info.block_number,
+                                    old_file_offset,
+                                    self.block_size,
+                                )
+                                .is_ok()
+                            {
+                                // Reusing the soft-anchored block's own space.
+                                (old_file_offset, true)
+                            } else {
+                                // Unmark failed (race) — fall through to
+                                // normal allocation.
+                                // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
+                                let r = self.allocate_space(self.block_size, false).await?;
+                                (r.file_offset, r.is_safe_data)
+                            }
+                        } else {
+                            // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
+                            let r = self.allocate_space(self.block_size, false).await?;
+                            (r.file_offset, r.is_safe_data)
+                        };
 
                         if is_full_block {
                             // Fully-covering: set TFP, defer BAT commit.
@@ -821,6 +848,7 @@ mod tests {
     use crate::tests::support::IoInterceptor;
     use guid::Guid;
     use pal_async::async_test;
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -2800,5 +2828,560 @@ mod tests {
         // Drop second guard — refcount should be 0.
         drop(guard2);
         assert_eq!(vhdx.bat_state.read().io_refcount(0), 0);
+    }
+
+    // ---- Phase 16b: Concurrent write+trim and mixed-workload stress tests ----
+
+    use crate::trim::TrimMode;
+
+    #[async_test]
+    async fn concurrent_write_and_trim_same_block() {
+        // Setup: 8 MiB disk, 1 MiB blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Write block 0 with pattern 0xAA, complete.
+        write_block(&*vhdx, 0, block_size, 0xAA).await;
+
+        // Concurrently: write block 0 with 0xEE + trim block 0 (FileSpace).
+        let vhdx_w = vhdx.clone();
+        let vhdx_t = vhdx.clone();
+
+        let (write_result, trim_result) = futures::join!(
+            async {
+                write_block(&*vhdx_w, 0, block_size, 0xEE).await;
+                Ok::<(), VhdxError>(())
+            },
+            async {
+                vhdx_t
+                    .trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+                    .await
+            }
+        );
+
+        write_result.unwrap();
+        trim_result.unwrap();
+
+        // Check what actually happened by examining block state.
+        let mapping = vhdx.get_block_mapping(0);
+        match mapping.state {
+            BatEntryState::Unmapped => {
+                // Trim won — read should return zeros.
+                verify_block_pattern(&*vhdx, 0, block_size, 0x00).await;
+            }
+            BatEntryState::FullyPresent => {
+                // Write won — read should return 0xEE.
+                verify_block_pattern(&*vhdx, 0, block_size, 0xEE).await;
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+
+    #[async_test]
+    async fn concurrent_trim_then_rewrite() {
+        // Setup: 8 MiB disk, 1 MiB blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Write block 0 with pattern 0xAA.
+        write_block(&*vhdx, 0, block_size, 0xAA).await;
+
+        // Sequential: trim → rewrite. Verify the trim→re-allocate path.
+        vhdx.trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+            .await
+            .unwrap();
+
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(
+            mapping.state,
+            BatEntryState::Unmapped,
+            "block should be Unmapped after trim"
+        );
+
+        // Re-write with pattern 0xBB.
+        write_block(&*vhdx, 0, block_size, 0xBB).await;
+
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+        verify_block_pattern(&*vhdx, 0, block_size, 0xBB).await;
+
+        // Now do trim + write concurrently.
+        let vhdx_t = vhdx.clone();
+        let vhdx_w = vhdx.clone();
+
+        let (trim_result, write_result) = futures::join!(
+            async {
+                vhdx_t
+                    .trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+                    .await
+            },
+            async {
+                write_block(&*vhdx_w, 0, block_size, 0xCC).await;
+                Ok::<(), VhdxError>(())
+            }
+        );
+
+        trim_result.unwrap();
+        write_result.unwrap();
+
+        // Verify no panics and data is consistent.
+        let mapping = vhdx.get_block_mapping(0);
+        match mapping.state {
+            BatEntryState::Unmapped => {
+                verify_block_pattern(&*vhdx, 0, block_size, 0x00).await;
+            }
+            BatEntryState::FullyPresent => {
+                verify_block_pattern(&*vhdx, 0, block_size, 0xCC).await;
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+
+    #[async_test]
+    async fn mixed_workload_stress() {
+        // 8 MiB disk with 1 MiB blocks → 8 blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+        let num_blocks: u32 = 8;
+
+        // Shadow state: None = unwritten/trimmed (expect zeros), Some(pattern) = last written pattern.
+        let shadow: Arc<parking_lot::Mutex<Vec<Option<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(vec![None; num_blocks as usize]));
+
+        let num_tasks: u32 = 8;
+        let iters_per_task: u8 = 16;
+
+        let tasks: Vec<_> = (0..num_tasks)
+            .map(|task_id| {
+                let vhdx = vhdx.clone();
+                let shadow = shadow.clone();
+                let bs = block_size;
+
+                async move {
+                    for iter in 0..iters_per_task {
+                        let block =
+                            (task_id.wrapping_mul(3).wrapping_add(iter as u32)) % num_blocks;
+                        let pattern = ((task_id as u16 * 16 + iter as u16) as u8) | 0x01; // always nonzero
+                        let block_offset = block as u64 * bs as u64;
+
+                        let op = (task_id as u8).wrapping_add(iter) % 10;
+                        match op {
+                            0..=4 => {
+                                // Write (50%)
+                                write_block(&*vhdx, block_offset, bs, pattern).await;
+                                shadow.lock()[block as usize] = Some(pattern);
+                            }
+                            5..=7 => {
+                                // Read + verify (30%)
+                                let expected = shadow.lock()[block as usize];
+                                let mut ranges = Vec::new();
+                                let guard = vhdx
+                                    .resolve_read(block_offset, bs, &mut ranges)
+                                    .await
+                                    .unwrap();
+                                for rr in &ranges {
+                                    match rr {
+                                        ReadRange::Data {
+                                            file_offset,
+                                            length,
+                                            ..
+                                        } => {
+                                            let mut buf = vec![0u8; *length as usize];
+                                            vhdx.file
+                                                .read_at(*file_offset, &mut buf)
+                                                .await
+                                                .unwrap();
+                                            let exp = expected.unwrap_or_else(|| {
+                                                panic!(
+                                                    "task {task_id} iter {iter}: shadow says \
+                                                     None but got Data range"
+                                                )
+                                            });
+                                            assert!(
+                                                buf.iter().all(|&b| b == exp),
+                                                "task {task_id} iter {iter}: expected \
+                                                 0x{exp:02x}, got mismatch"
+                                            );
+                                        }
+                                        ReadRange::Zero { .. } => {
+                                            assert!(
+                                                expected.is_none(),
+                                                "task {task_id} iter {iter}: got Zero but \
+                                                 expected Some({:02x})",
+                                                expected.unwrap()
+                                            );
+                                        }
+                                        ReadRange::Unmapped { .. } => {
+                                            panic!("unexpected Unmapped on non-differencing disk");
+                                        }
+                                    }
+                                }
+                                drop(guard);
+                            }
+                            8 => {
+                                // Trim (10%)
+                                vhdx.trim(
+                                    TrimMode::FileSpace,
+                                    block_offset,
+                                    bs as u64,
+                                    false,
+                                    false,
+                                )
+                                .await
+                                .unwrap();
+                                shadow.lock()[block as usize] = None;
+                            }
+                            9 => {
+                                // Flush (10%)
+                                vhdx.flush().await.unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        futures::future::join_all(tasks).await;
+
+        // Post-check: verify every block against final shadow state.
+        let final_shadow = shadow.lock().clone();
+        for block in 0..num_blocks {
+            let block_offset = block as u64 * block_size as u64;
+            let expected = final_shadow[block as usize];
+            match expected {
+                Some(pattern) => {
+                    verify_block_pattern(&*vhdx, block_offset, block_size, pattern).await;
+                }
+                None => {
+                    // Should be zeros.
+                    let mut ranges = Vec::new();
+                    let _guard = vhdx
+                        .resolve_read(block_offset, block_size, &mut ranges)
+                        .await
+                        .unwrap();
+                    for rr in &ranges {
+                        match rr {
+                            ReadRange::Zero { .. } => {}
+                            ReadRange::Data {
+                                file_offset,
+                                length,
+                                ..
+                            } => {
+                                let mut buf = vec![0u8; *length as usize];
+                                vhdx.file.read_at(*file_offset, &mut buf).await.unwrap();
+                                assert!(
+                                    buf.iter().all(|&b| b == 0),
+                                    "block {block}: shadow says None but data is non-zero"
+                                );
+                            }
+                            ReadRange::Unmapped { .. } => {
+                                panic!("unexpected Unmapped on non-differencing disk");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[async_test]
+    async fn concurrent_partial_writes_same_block() {
+        // 8 MiB disk, 1 MiB blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Pre-allocate block 0 with pattern 0xAA.
+        write_block(&*vhdx, 0, block_size, 0xAA).await;
+
+        let half = block_size / 2;
+        let vhdx_a = vhdx.clone();
+        let vhdx_b = vhdx.clone();
+
+        // Concurrently write first half with 0xBB, second half with 0xCC.
+        let ((), ()) = futures::join!(
+            async {
+                // Task A: write first half.
+                let mut ranges = Vec::new();
+                let guard = vhdx_a.resolve_write(0, half, &mut ranges).await.unwrap();
+                for wr in &ranges {
+                    match wr {
+                        WriteRange::Data {
+                            file_offset,
+                            length,
+                            ..
+                        } => {
+                            let data = vec![0xBB; *length as usize];
+                            vhdx_a.file.write_at(*file_offset, &data).await.unwrap();
+                        }
+                        WriteRange::Zero {
+                            file_offset,
+                            length,
+                        } => {
+                            let zeros = vec![0u8; *length as usize];
+                            vhdx_a.file.write_at(*file_offset, &zeros).await.unwrap();
+                        }
+                    }
+                }
+                guard.complete().await.unwrap();
+            },
+            async {
+                // Task B: write second half.
+                let mut ranges = Vec::new();
+                let guard = vhdx_b
+                    .resolve_write(half as u64, half, &mut ranges)
+                    .await
+                    .unwrap();
+                for wr in &ranges {
+                    match wr {
+                        WriteRange::Data {
+                            file_offset,
+                            length,
+                            ..
+                        } => {
+                            let data = vec![0xCC; *length as usize];
+                            vhdx_b.file.write_at(*file_offset, &data).await.unwrap();
+                        }
+                        WriteRange::Zero {
+                            file_offset,
+                            length,
+                        } => {
+                            let zeros = vec![0u8; *length as usize];
+                            vhdx_b.file.write_at(*file_offset, &zeros).await.unwrap();
+                        }
+                    }
+                }
+                guard.complete().await.unwrap();
+            }
+        );
+
+        // Read back full block: first half should be 0xBB, second half 0xCC.
+        let mut ranges = Vec::new();
+        let _guard = vhdx.resolve_read(0, block_size, &mut ranges).await.unwrap();
+
+        for rr in &ranges {
+            match rr {
+                ReadRange::Data {
+                    guest_offset,
+                    length,
+                    file_offset,
+                } => {
+                    let mut buf = vec![0u8; *length as usize];
+                    vhdx.file.read_at(*file_offset, &mut buf).await.unwrap();
+
+                    // Determine expected pattern based on position within block.
+                    for (i, &byte) in buf.iter().enumerate() {
+                        let pos = (*guest_offset as usize) + i;
+                        let expected = if pos < half as usize { 0xBB } else { 0xCC };
+                        assert_eq!(
+                            byte, expected,
+                            "byte at guest offset {pos}: expected 0x{expected:02x}, got 0x{byte:02x}"
+                        );
+                    }
+                }
+                other => panic!("expected Data range, got {other:?}"),
+            }
+        }
+    }
+
+    #[async_test]
+    async fn concurrent_write_flush_trim_interleaved() {
+        // Setup: 8 MiB disk, 1 MiB blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        // Write block 0 with 0xDD, complete.
+        write_block(&*vhdx, 0, block_size, 0xDD).await;
+
+        let vhdx_f = vhdx.clone();
+        let vhdx_t = vhdx.clone();
+        let vhdx_r = vhdx.clone();
+
+        // Concurrently: flush + trim block 0 + read block 1 (unallocated → zeros).
+        let (flush_result, trim_result, read_result) = futures::join!(
+            async { vhdx_f.flush().await },
+            async {
+                vhdx_t
+                    .trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+                    .await
+            },
+            async {
+                let mut ranges = Vec::new();
+                let _guard = vhdx_r
+                    .resolve_read(block_size as u64, block_size, &mut ranges)
+                    .await
+                    .unwrap();
+                // Block 1 is unallocated → should be Zero.
+                for rr in &ranges {
+                    assert!(
+                        matches!(rr, ReadRange::Zero { .. }),
+                        "block 1 should be Zero, got {rr:?}"
+                    );
+                }
+                Ok::<(), VhdxError>(())
+            }
+        );
+
+        flush_result.unwrap();
+        trim_result.unwrap();
+        read_result.unwrap();
+
+        // Verify block 0 state is consistent.
+        let mapping = vhdx.get_block_mapping(0);
+        match mapping.state {
+            BatEntryState::Unmapped => {
+                // Trim completed — read should return zeros.
+                verify_block_pattern(&*vhdx, 0, block_size, 0x00).await;
+            }
+            BatEntryState::FullyPresent => {
+                // Flush completed before trim could run — data preserved.
+                verify_block_pattern(&*vhdx, 0, block_size, 0xDD).await;
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+
+    #[async_test]
+    async fn stress_write_trim_cycle() {
+        // 8 MiB disk with 1 MiB blocks → 8 blocks.
+        let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let block_size = vhdx.block_size();
+
+        let num_writer_tasks: u32 = 4;
+        let num_reader_tasks: u32 = 2;
+        let iters_per_writer: u8 = 8;
+
+        // Shadow state: None = unwritten/trimmed (zeros), Some(pattern) = last written.
+        let shadow: Arc<parking_lot::Mutex<Vec<Option<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(vec![None; 4]));
+
+        // Writer tasks: write → trim → write again on block `task_id`.
+        let writer_tasks: Vec<_> = (0..num_writer_tasks)
+            .map(|task_id| {
+                let vhdx = vhdx.clone();
+                let shadow = shadow.clone();
+                let bs = block_size;
+
+                async move {
+                    for iter in 0..iters_per_writer {
+                        let block_offset = task_id as u64 * bs as u64;
+                        let pattern_a = ((task_id as u16 * 32 + iter as u16 * 2) as u8) | 0x01;
+                        let pattern_b = ((task_id as u16 * 32 + iter as u16 * 2 + 1) as u8) | 0x01;
+
+                        // Write with pattern_a.
+                        write_block(&*vhdx, block_offset, bs, pattern_a).await;
+                        shadow.lock()[task_id as usize] = Some(pattern_a);
+
+                        // Trim.
+                        vhdx.trim(TrimMode::FileSpace, block_offset, bs as u64, false, false)
+                            .await
+                            .unwrap();
+                        shadow.lock()[task_id as usize] = None;
+
+                        // Write with pattern_b.
+                        write_block(&*vhdx, block_offset, bs, pattern_b).await;
+                        shadow.lock()[task_id as usize] = Some(pattern_b);
+                    }
+                }
+            })
+            .collect();
+
+        // Reader tasks: continuously read all 4 blocks, verify consistency.
+        let reader_tasks: Vec<_> = (0..num_reader_tasks)
+            .map(|_reader_id| {
+                let vhdx = vhdx.clone();
+                let shadow = shadow.clone();
+                let bs = block_size;
+
+                async move {
+                    // Read all 4 blocks multiple times.
+                    for _round in 0..16 {
+                        for block in 0..4u32 {
+                            let block_offset = block as u64 * bs as u64;
+                            let expected = shadow.lock()[block as usize];
+
+                            let mut ranges = Vec::new();
+                            let guard = vhdx
+                                .resolve_read(block_offset, bs, &mut ranges)
+                                .await
+                                .unwrap();
+                            for rr in &ranges {
+                                match rr {
+                                    ReadRange::Data {
+                                        file_offset,
+                                        length,
+                                        ..
+                                    } => {
+                                        let mut buf = vec![0u8; *length as usize];
+                                        vhdx.file.read_at(*file_offset, &mut buf).await.unwrap();
+                                        match expected {
+                                            Some(exp) => {
+                                                assert!(
+                                                    buf.iter().all(|&b| b == exp),
+                                                    "reader block {block}: expected \
+                                                     0x{exp:02x}, got mismatch"
+                                                );
+                                            }
+                                            None => {
+                                                assert!(
+                                                    buf.iter().all(|&b| b == 0),
+                                                    "reader block {block}: expected zeros, \
+                                                     got non-zero data"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    ReadRange::Zero { .. } => {
+                                        assert!(
+                                            expected.is_none(),
+                                            "reader block {block}: got Zero but expected \
+                                             Some({:02x})",
+                                            expected.unwrap()
+                                        );
+                                    }
+                                    ReadRange::Unmapped { .. } => {
+                                        panic!("unexpected Unmapped on non-differencing disk");
+                                    }
+                                }
+                            }
+                            drop(guard);
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Run all tasks concurrently.
+        let all_tasks: Vec<_> = writer_tasks
+            .into_iter()
+            .map(|t| Box::pin(t) as std::pin::Pin<Box<dyn Future<Output = ()>>>)
+            .chain(
+                reader_tasks
+                    .into_iter()
+                    .map(|t| Box::pin(t) as std::pin::Pin<Box<dyn Future<Output = ()>>>),
+            )
+            .collect();
+
+        futures::future::join_all(all_tasks).await;
+
+        // Post-check: verify final state of all 4 blocks.
+        let final_shadow = shadow.lock().clone();
+        for block in 0..4u32 {
+            let block_offset = block as u64 * block_size as u64;
+            match final_shadow[block as usize] {
+                Some(pattern) => {
+                    verify_block_pattern(&*vhdx, block_offset, block_size, pattern).await;
+                }
+                None => {
+                    verify_block_pattern(&*vhdx, block_offset, block_size, 0x00).await;
+                }
+            }
+        }
     }
 }

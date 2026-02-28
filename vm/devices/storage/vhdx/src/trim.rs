@@ -70,7 +70,7 @@ fn mode_skips_write_guid(mode: TrimMode) -> bool {
 
 /// Check whether a block mapping is soft-anchored: unmapped/undefined
 /// with a non-zero file offset.
-fn is_soft_anchored(mapping: InternalBlockMapping) -> bool {
+pub(crate) fn is_soft_anchored(mapping: InternalBlockMapping) -> bool {
     let state = BatEntryState::from_raw(mapping.state());
     matches!(
         state,

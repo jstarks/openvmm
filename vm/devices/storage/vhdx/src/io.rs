@@ -14,6 +14,8 @@ use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
 use crate::format::MB1;
+use crate::io_guard::ReadIoGuard;
+use crate::io_guard::WriteIoGuard;
 use crate::open::VhdxFile;
 use crate::open::WriteMode;
 use crate::sector_bitmap;
@@ -91,10 +93,10 @@ impl<F: AsyncFile> VhdxFile<F> {
         offset: u64,
         len: u32,
         ranges: &mut Vec<ReadRange>,
-    ) -> Result<(), VhdxError> {
+    ) -> Result<ReadIoGuard<'_, F>, VhdxError> {
         // Zero-length reads succeed immediately.
         if len == 0 {
-            return Ok(());
+            return Ok(ReadIoGuard::new(self));
         }
 
         // Validate alignment to logical sector size.
@@ -168,7 +170,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             current_offset += block_length;
         }
 
-        Ok(())
+        Ok(ReadIoGuard::new(self))
     }
 
     /// Resolve a write request into file-level ranges.
@@ -186,14 +188,14 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// and flushed to disk (first-write gate).
     ///
     /// After the caller writes data at the returned offsets, it **must** call
-    /// [`complete_write()`](Self::complete_write) to finalize the BAT and
-    /// sector bitmaps — even if the data I/O failed (pass `success: false`).
+    /// [`WriteIoGuard::complete()`] to finalize the BAT and sector bitmaps.
+    /// Dropping the guard without calling `complete()` aborts the write.
     pub async fn resolve_write(
         &self,
         offset: u64,
         len: u32,
         ranges: &mut Vec<WriteRange>,
-    ) -> Result<(), VhdxError> {
+    ) -> Result<WriteIoGuard<'_, F>, VhdxError> {
         // Check read-only.
         if self.read_only {
             return Err(VhdxError::ReadOnly);
@@ -201,7 +203,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Zero-length writes succeed immediately.
         if len == 0 {
-            return Ok(());
+            return Ok(WriteIoGuard::new_completed(self));
         }
 
         // Validate alignment to logical sector size.
@@ -239,8 +241,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let virtual_offset = offset + current_offset as u64;
             let block_number = self.bat.offset_to_block(virtual_offset);
             let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length =
-                std::cmp::min(self.block_size - block_offset, len - current_offset);
+            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
             let is_full_block = block_offset == 0 && block_length >= self.block_size;
 
@@ -326,7 +327,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // If nothing needs allocation, we're done.
         if blocks_needing_allocation.is_empty() {
-            return Ok(());
+            return Ok(WriteIoGuard::new(self, offset, len));
         }
 
         // --- Allocation phase: acquire BlockAllocationLock ---
@@ -546,10 +547,10 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Allocation lock is released when _alloc_guard drops (after
         // returning ranges to caller).
-        Ok(())
+        Ok(WriteIoGuard::new(self, offset, len))
     }
 
-    /// Finalize a write operation.
+    /// Finalize a write operation (internal implementation).
     ///
     /// Must be called after every successful [`resolve_write()`], regardless
     /// of whether the data I/O succeeded. Pass `success: false` if the data
@@ -562,7 +563,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     ///
     /// **Failure path**: Reverts TFP blocks to their original state and
     /// notifies waiters. Does not write BAT entries to cache.
-    pub async fn complete_write(
+    pub(crate) async fn complete_write_inner(
         &self,
         offset: u64,
         len: u32,
@@ -684,6 +685,64 @@ impl<F: AsyncFile> VhdxFile<F> {
         Ok(())
     }
 
+    /// Synchronous abort path for `WriteIoGuard::drop()`.
+    ///
+    /// Reverts TFP blocks to their original state, releases any newly
+    /// allocated space back to the free pool, marks BAT pages dirty, and
+    /// notifies allocation waiters. Does not perform any file I/O.
+    pub(crate) fn abort_write_sync(&self, offset: u64, len: u32) {
+        if len == 0 {
+            return;
+        }
+
+        let mut had_tfp = false;
+        let mut current_offset: u32 = 0;
+
+        while current_offset < len {
+            let virtual_offset = offset + current_offset as u64;
+            let block_number = self.bat.offset_to_block(virtual_offset);
+            let block_offset = self.bat.offset_within_block(virtual_offset);
+            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
+
+            let internal = {
+                let bat_state = self.bat_state.read();
+                bat_state.get_payload_mapping(block_number)
+            };
+
+            if internal.transitioning_to_fully_present() {
+                had_tfp = true;
+                let original_state =
+                    BatEntryState::from_raw(internal.state()).unwrap_or(BatEntryState::NotPresent);
+                let reverted = match original_state {
+                    BatEntryState::PartiallyPresent => InternalBlockMapping::new()
+                        .with_state(internal.state())
+                        .with_transitioning_to_fully_present(false)
+                        .with_file_megabyte(internal.file_megabyte()),
+                    _ => {
+                        let file_offset = internal.file_megabyte() as u64 * MB1;
+                        if file_offset != 0 {
+                            self.free_space.release(file_offset, self.block_size);
+                        }
+                        InternalBlockMapping::new()
+                            .with_state(internal.state())
+                            .with_transitioning_to_fully_present(false)
+                            .with_file_megabyte(0)
+                    }
+                };
+
+                let mut bat_state = self.bat_state.write();
+                bat_state.set_payload_mapping(&self.bat, block_number, reverted);
+                bat_state.mark_bat_page_dirty(&self.bat, BlockType::Payload, block_number);
+            }
+
+            current_offset += block_length;
+        }
+
+        if had_tfp {
+            self.allocation_event.notify(usize::MAX);
+        }
+    }
+
     /// Flush all writes to stable storage.
     ///
     /// Writes any dirty BAT pages to disk, then issues a file-level flush
@@ -717,7 +776,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -735,7 +794,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, 0, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 0, &mut ranges).await.unwrap();
 
         assert!(ranges.is_empty());
     }
@@ -762,7 +821,8 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_read(format::GB1 - 4096, 4096, &mut ranges)
+        let _guard = vhdx
+            .resolve_read(format::GB1 - 4096, 4096, &mut ranges)
             .await
             .unwrap();
 
@@ -794,7 +854,7 @@ mod tests {
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -815,7 +875,8 @@ mod tests {
         let block_size = vhdx.block_size() as u64;
         let mut ranges = Vec::new();
         // Read last 512 bytes of block 0 and first 512 bytes of block 1.
-        vhdx.resolve_read((block_size - 512) as u64, 1024, &mut ranges)
+        let _guard = vhdx
+            .resolve_read((block_size - 512) as u64, 1024, &mut ranges)
             .await
             .unwrap();
 
@@ -854,7 +915,7 @@ mod tests {
         // Block 0: 512 KiB remaining. Block 1: full 1 MiB. Block 2: 512 KiB.
         let start = MB1 / 2; // middle of block 0
         let len = (2 * MB1) as u32; // spans 3 blocks
-        vhdx.resolve_read(start, len, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(start, len, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 3);
         // Block 0: remaining half
@@ -903,7 +964,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
         // Read 512 bytes starting at sector 10 (offset 5120).
-        vhdx.resolve_read(5120, 512, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(5120, 512, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -928,7 +989,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -955,7 +1016,7 @@ mod tests {
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -982,7 +1043,7 @@ mod tests {
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -1009,7 +1070,7 @@ mod tests {
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(
@@ -1029,7 +1090,8 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_read(0, disk_size as u32, &mut ranges)
+        let _guard = vhdx
+            .resolve_read(0, disk_size as u32, &mut ranges)
             .await
             .unwrap();
 
@@ -1065,7 +1127,7 @@ mod tests {
 
         let mut ranges = Vec::new();
         // Read one 4K sector.
-        vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(
             ranges[0],
@@ -1092,7 +1154,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
         // Should allocate a new block. With is_safe_data (near-EOF or
         // extension space), zero padding is skipped — only Data emitted.
@@ -1149,7 +1211,7 @@ mod tests {
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
         // Should write directly to the existing block — single Data range.
         assert_eq!(ranges.len(), 1);
@@ -1171,7 +1233,8 @@ mod tests {
         let block_size = vhdx.block_size() as u64;
         let mut ranges = Vec::new();
         // Write last 512 bytes of block 0 and first 512 bytes of block 1.
-        vhdx.resolve_write((block_size - 512) as u64, 1024, &mut ranges)
+        let _guard = vhdx
+            .resolve_write((block_size - 512) as u64, 1024, &mut ranges)
             .await
             .unwrap();
 
@@ -1215,7 +1278,7 @@ mod tests {
 
         // Step 1: resolve_write to get file offsets.
         let mut write_ranges = Vec::new();
-        vhdx.resolve_write(0, 512, &mut write_ranges).await.unwrap();
+        let guard = vhdx.resolve_write(0, 512, &mut write_ranges).await.unwrap();
 
         // Step 2: Write actual data at the returned Data offsets.
         let pattern: Vec<u8> = (0..512u16).map(|i| (i % 256) as u8).collect();
@@ -1241,12 +1304,12 @@ mod tests {
             }
         }
 
-        // Step 3: complete_write.
-        vhdx.complete_write(0, 512, true).await.unwrap();
+        // Step 3: complete via guard.
+        guard.complete().await.unwrap();
 
         // Step 4: resolve_read at the same offset.
         let mut read_ranges = Vec::new();
-        vhdx.resolve_read(0, 512, &mut read_ranges).await.unwrap();
+        let _guard = vhdx.resolve_read(0, 512, &mut read_ranges).await.unwrap();
 
         // Should now be Data (block was allocated).
         assert_eq!(read_ranges.len(), 1);
@@ -1272,7 +1335,7 @@ mod tests {
 
         // Write 512 bytes at offset 4096 within block 0.
         let mut ranges = Vec::new();
-        vhdx.resolve_write(4096, 512, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(4096, 512, &mut ranges).await.unwrap();
 
         // With safe data (near-EOF or extension space), Zero padding is
         // skipped. Only expect the Data range.
@@ -1303,7 +1366,8 @@ mod tests {
 
         // Write exactly one full block (no padding needed).
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, format::DEFAULT_BLOCK_SIZE, &mut ranges)
+        let _guard = vhdx
+            .resolve_write(0, format::DEFAULT_BLOCK_SIZE, &mut ranges)
             .await
             .unwrap();
 
@@ -1330,7 +1394,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 0, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 0, &mut ranges).await.unwrap();
         assert!(ranges.is_empty());
     }
 
@@ -1375,7 +1439,8 @@ mod tests {
         let start = MB1 / 2;
         let length = (3 * MB1) as u32;
         let mut ranges = Vec::new();
-        vhdx.resolve_write(start, length, &mut ranges)
+        let _guard = vhdx
+            .resolve_write(start, length, &mut ranges)
             .await
             .unwrap();
 
@@ -1444,7 +1509,7 @@ mod tests {
 
         // Perform a write — this triggers enable_write_mode.
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
 
         // data_write_guid should have changed.
         let new_data_guid = vhdx.data_write_guid();
@@ -1459,12 +1524,12 @@ mod tests {
 
         // First write — triggers header update.
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
         let guid_after_first = vhdx.data_write_guid();
 
         // Second write — should NOT update header again.
         let mut ranges2 = Vec::new();
-        vhdx.resolve_write(512, 512, &mut ranges2).await.unwrap();
+        let _guard2 = vhdx.resolve_write(512, 512, &mut ranges2).await.unwrap();
         let guid_after_second = vhdx.data_write_guid();
 
         assert_eq!(guid_after_first, guid_after_second);
@@ -1521,7 +1586,8 @@ mod tests {
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let _guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
 
@@ -1544,7 +1610,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
 
         // Partial-block write should NOT set TFP — BAT committed immediately.
         let bat_state = vhdx.bat_state.read();
@@ -1575,7 +1641,8 @@ mod tests {
         // Write 2 full blocks starting at offset 0.
         let length = (2 * block_size) as u32;
         let mut write_ranges = Vec::new();
-        vhdx.resolve_write(0, length, &mut write_ranges)
+        let guard = vhdx
+            .resolve_write(0, length, &mut write_ranges)
             .await
             .unwrap();
 
@@ -1601,11 +1668,12 @@ mod tests {
                 }
             }
         }
-        vhdx.complete_write(0, length, true).await.unwrap();
+        guard.complete().await.unwrap();
 
         // Read back both blocks.
         let mut read_ranges = Vec::new();
-        vhdx.resolve_read(0, length, &mut read_ranges)
+        let _guard = vhdx
+            .resolve_read(0, length, &mut read_ranges)
             .await
             .unwrap();
 
@@ -1657,7 +1725,7 @@ mod tests {
         let eof_before = vhdx.free_space.file_length();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
         // No new allocation should occur — verify file length unchanged.
         let eof_after = vhdx.free_space.file_length();
@@ -1685,10 +1753,11 @@ mod tests {
         // Write and complete a full block.
         let block_size = vhdx.block_size();
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
-        vhdx.complete_write(0, block_size, true).await.unwrap();
+        guard.complete().await.unwrap();
         vhdx.flush().await.unwrap();
 
         // Read the BAT entry directly from the file.
@@ -1717,7 +1786,8 @@ mod tests {
 
         // resolve_write should set TFP.
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
 
@@ -1727,8 +1797,8 @@ mod tests {
             assert!(mapping.transitioning_to_fully_present());
         }
 
-        // complete_write should clear TFP.
-        vhdx.complete_write(0, block_size, true).await.unwrap();
+        // guard.complete() should clear TFP.
+        guard.complete().await.unwrap();
 
         {
             let bat_state = vhdx.bat_state.read();
@@ -1753,7 +1823,8 @@ mod tests {
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
 
@@ -1763,7 +1834,7 @@ mod tests {
             bat_state.get_payload_mapping(0).file_megabyte()
         };
 
-        vhdx.complete_write(0, block_size, true).await.unwrap();
+        guard.complete().await.unwrap();
 
         // Read the BAT entry from disk via the file.
         let mut entry_bytes = [0u8; 8];
@@ -1784,7 +1855,7 @@ mod tests {
         let size_before = vhdx.file.file_size().await.unwrap();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
 
         let size_after = vhdx.file.file_size().await.unwrap();
         assert!(
@@ -1811,12 +1882,13 @@ mod tests {
 
         // resolve_write for a full block → sets TFP.
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
 
-        // Abort → marks the BAT page dirty.
-        vhdx.complete_write(0, block_size, false).await.unwrap();
+        // Abort (drop guard without complete) → marks the BAT page dirty.
+        drop(guard);
 
         {
             let state = vhdx.bat_state.read();
@@ -1843,7 +1915,8 @@ mod tests {
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
 
@@ -1857,8 +1930,8 @@ mod tests {
             );
         }
 
-        // Abort.
-        vhdx.complete_write(0, block_size, false).await.unwrap();
+        // Abort (drop guard without complete).
+        drop(guard);
 
         // TFP should be cleared and state reverted to NotPresent.
         {
@@ -1889,17 +1962,19 @@ mod tests {
 
         // First write: allocate and abort.
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
-        vhdx.complete_write(0, block_size, false).await.unwrap();
+        drop(guard);
 
         // Second write: should succeed (no TFP blocking).
         let mut ranges2 = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges2)
+        let guard2 = vhdx
+            .resolve_write(0, block_size, &mut ranges2)
             .await
             .unwrap();
-        vhdx.complete_write(0, block_size, true).await.unwrap();
+        guard2.complete().await.unwrap();
 
         // Block should be FullyPresent now.
         let bat_state = vhdx.bat_state.read();
@@ -1927,18 +2002,19 @@ mod tests {
 
         // resolve_write succeeds (writes for header update, set_file_size).
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges)
+        let guard = vhdx
+            .resolve_write(0, block_size, &mut ranges)
             .await
             .unwrap();
 
         // Enable write failure — BAT cache write will fail.
         fail_writes.store(true, Ordering::SeqCst);
 
-        // complete_write should fail (BAT cache write uses write_at).
-        let result = vhdx.complete_write(0, block_size, true).await;
+        // guard.complete() should fail (BAT cache write uses write_at).
+        let result = guard.complete().await;
         assert!(
             result.is_err(),
-            "complete_write should fail when cache writes fail"
+            "complete should fail when cache writes fail"
         );
 
         // Despite the error, TFP should be cleared and state set to FullyPresent.
@@ -1961,7 +2037,8 @@ mod tests {
 
         // A subsequent resolve_write should work (not hang on TFP).
         let mut ranges2 = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges2)
+        let _guard2 = vhdx
+            .resolve_write(0, block_size, &mut ranges2)
             .await
             .unwrap();
     }
@@ -2008,7 +2085,8 @@ mod tests {
         fail_set_file_size.store(false, Ordering::SeqCst);
 
         let mut ranges2 = Vec::new();
-        vhdx.resolve_write(0, block_size, &mut ranges2)
+        let _guard = vhdx
+            .resolve_write(0, block_size, &mut ranges2)
             .await
             .unwrap();
     }
@@ -2024,7 +2102,7 @@ mod tests {
         // Step 1: Partial write to block 0 at guest_offset=0, len=512.
         // Allocation comes from near-EOF → is_safe_data = true → no zero ranges.
         let mut ranges = Vec::new();
-        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+        let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
 
         let zero_ranges: Vec<_> = ranges
             .iter()
@@ -2050,7 +2128,8 @@ mod tests {
         // Step 3: Partial write to block 1 at block-aligned guest offset.
         // Should allocate from pool (unsafe data) → zero ranges emitted.
         let mut ranges2 = Vec::new();
-        vhdx.resolve_write(block_size, 512, &mut ranges2)
+        let _guard2 = vhdx
+            .resolve_write(block_size, 512, &mut ranges2)
             .await
             .unwrap();
 
@@ -2133,7 +2212,8 @@ mod tests {
         pattern_byte: u8,
     ) {
         let mut ranges = Vec::new();
-        vhdx.resolve_write(guest_offset, length, &mut ranges)
+        let guard = vhdx
+            .resolve_write(guest_offset, length, &mut ranges)
             .await
             .unwrap();
 
@@ -2158,9 +2238,7 @@ mod tests {
             }
         }
 
-        vhdx.complete_write(guest_offset, length, true)
-            .await
-            .unwrap();
+        guard.complete().await.unwrap();
     }
 
     /// Helper: read a block and verify the pattern byte.
@@ -2171,7 +2249,8 @@ mod tests {
         expected_byte: u8,
     ) {
         let mut ranges = Vec::new();
-        vhdx.resolve_read(guest_offset, length, &mut ranges)
+        let _guard = vhdx
+            .resolve_read(guest_offset, length, &mut ranges)
             .await
             .unwrap();
 
@@ -2193,10 +2272,7 @@ mod tests {
                     );
                 }
                 ReadRange::Zero { .. } => {
-                    assert_eq!(
-                        expected_byte, 0,
-                        "expected data but got Zero range"
-                    );
+                    assert_eq!(expected_byte, 0, "expected data but got Zero range");
                 }
                 ReadRange::Unmapped { .. } => {
                     panic!("unexpected Unmapped range in non-differencing disk");
@@ -2220,9 +2296,7 @@ mod tests {
                 let vhdx = vhdx.clone();
                 async move {
                     let mut ranges = Vec::new();
-                    vhdx.resolve_read(0, block_size, &mut ranges)
-                        .await
-                        .unwrap();
+                    let _guard = vhdx.resolve_read(0, block_size, &mut ranges).await.unwrap();
                     assert_eq!(ranges.len(), 1);
                     match &ranges[0] {
                         ReadRange::Data {
@@ -2268,7 +2342,8 @@ mod tests {
                 let bs = block_size;
                 async move {
                     let mut ranges = Vec::new();
-                    vhdx.resolve_read(i as u64 * bs as u64, bs, &mut ranges)
+                    let _guard = vhdx
+                        .resolve_read(i as u64 * bs as u64, bs, &mut ranges)
                         .await
                         .unwrap();
                     assert_eq!(ranges.len(), 1);
@@ -2348,20 +2423,17 @@ mod tests {
 
         let task_a = async {
             let mut ranges = Vec::new();
-            vhdx_a
+            let guard = vhdx_a
                 .resolve_write(0, block_size, &mut ranges)
                 .await
                 .unwrap();
-            vhdx_a
-                .complete_write(0, block_size, true)
-                .await
-                .unwrap();
+            guard.complete().await.unwrap();
             ranges
         };
 
         let task_b = async {
             let mut ranges = Vec::new();
-            vhdx_b
+            let _guard = vhdx_b
                 .resolve_write(0, block_size, &mut ranges)
                 .await
                 .unwrap();
@@ -2373,10 +2445,6 @@ mod tests {
         // Both should have produced data ranges.
         assert!(!ranges_a.is_empty(), "task_a produced no ranges");
         assert!(!ranges_b.is_empty(), "task_b produced no ranges");
-
-        // task_b's complete_write: block is already FullyPresent, so this
-        // is a no-op (no TFP to clear).
-        vhdx.complete_write(0, block_size, true).await.unwrap();
 
         // Block should be FullyPresent.
         let bat_state = vhdx.bat_state.read();
@@ -2452,7 +2520,7 @@ mod tests {
 
         let read_task = async move {
             let mut ranges = Vec::new();
-            vhdx_r
+            let _guard = vhdx_r
                 .resolve_read(0, block_size, &mut ranges)
                 .await
                 .unwrap();

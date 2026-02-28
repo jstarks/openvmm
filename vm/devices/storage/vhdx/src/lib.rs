@@ -23,6 +23,7 @@ pub mod error;
 pub mod format;
 pub(crate) mod header;
 pub mod io;
+pub mod io_guard;
 pub(crate) mod known_meta;
 pub(crate) mod locator;
 pub(crate) mod metadata;
@@ -36,6 +37,8 @@ pub use error::InvalidFormatReason;
 pub use error::VhdxError;
 pub use io::ReadRange;
 pub use io::WriteRange;
+pub use io_guard::ReadIoGuard;
+pub use io_guard::WriteIoGuard;
 pub use open::VhdxFile;
 
 #[cfg(test)]

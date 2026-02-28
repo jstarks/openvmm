@@ -8772,7 +8772,9 @@ dependencies = [
  "guid",
  "pal_async",
  "parking_lot",
+ "tempfile",
  "thiserror 2.0.16",
+ "windows 0.62.0",
  "zerocopy",
 ]
 

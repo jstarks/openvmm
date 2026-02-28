@@ -19,5 +19,15 @@ zerocopy.workspace = true
 [dev-dependencies]
 pal_async.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = [
+    "Win32_Storage_Vhd",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+tempfile.workspace = true
+
 [lints]
 workspace = true

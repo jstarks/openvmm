@@ -593,6 +593,10 @@ mod tests {
             .await
             .unwrap();
 
+        // Extend file to cover the data block offset + block size.
+        let needed = data_block_offset + format::DEFAULT_BLOCK_SIZE as u64;
+        file.set_file_size(needed).await.unwrap();
+
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
         let result = vhdx.resolve_read(0, 4096, &mut ranges).await;

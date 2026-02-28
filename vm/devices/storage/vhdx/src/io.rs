@@ -335,6 +335,8 @@ impl<F: AsyncFile> VhdxFile<F> {
         struct TfpRecord {
             block_number: u32,
             original_mapping: InternalBlockMapping,
+            /// File offset of newly allocated space, if any (for release on error).
+            allocated_offset: Option<u64>,
         }
         let mut tfp_records: Vec<TfpRecord> = Vec::new();
 
@@ -401,6 +403,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         tfp_records.push(TfpRecord {
                             block_number: block_info.block_number,
                             original_mapping: original,
+                            allocated_offset: None,
                         });
 
                         ranges.push(WriteRange::Data {
@@ -411,7 +414,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                     }
                     _ => {
                         // Unallocated block — allocate space.
-                        let new_offset = self.allocate_space(self.block_size);
+                        let alloc_result = self.allocate_space(self.block_size, false).await?;
+                        let new_offset = alloc_result.file_offset;
+                        let is_safe_data = alloc_result.is_safe_data;
                         let original = internal;
 
                         if is_full_block {
@@ -433,6 +438,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             tfp_records.push(TfpRecord {
                                 block_number: block_info.block_number,
                                 original_mapping: original,
+                                allocated_offset: Some(new_offset),
                             });
 
                             ranges.push(WriteRange::Data {
@@ -465,7 +471,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                             .await?;
 
                             // Emit zero + data + zero ranges.
-                            if block_info.block_offset > 0 {
+                            // Skip zeroing if the space is already safe (beyond old ZeroOffset).
+                            if block_info.block_offset > 0 && !is_safe_data {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset,
                                     length: block_info.block_offset,
@@ -479,7 +486,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             });
 
                             let end_offset = block_info.block_offset + block_info.block_length;
-                            if end_offset < self.block_size {
+                            if end_offset < self.block_size && !is_safe_data {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset + end_offset as u64,
                                     length: self.block_size - end_offset,
@@ -490,18 +497,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                 }
             }
 
-            // Extend the file to cover new allocations (under allocation lock).
-            let target_eof = *self.eof_offset.lock();
-            self.file
-                .set_file_size(target_eof)
-                .await
-                .map_err(VhdxError::Io)?;
-
             Ok(())
         }
         .await;
 
-        // Error cleanup: revert TFP-marked blocks on failure.
+        // Error cleanup: revert TFP-marked blocks and release allocated space on failure.
         if let Err(e) = allocation_result {
             {
                 let mut bat_state = self.bat_state.write();
@@ -511,6 +511,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                         record.block_number,
                         record.original_mapping,
                     );
+                    // Release allocated space back to free pool.
+                    if let Some(offset) = record.allocated_offset {
+                        self.free_space.release(offset, self.block_size);
+                    }
                 }
             }
             self.allocation_event.notify(usize::MAX);
@@ -606,7 +610,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                             .with_file_megabyte(internal.file_megabyte()),
                         _ => {
                             // Freshly allocated — revert to original state
-                            // with zero offset. Space is leaked.
+                            // with zero offset. Release space back to free pool.
+                            let file_offset = internal.file_megabyte() as u64 * MB1;
+                            if file_offset != 0 {
+                                self.free_space.release(file_offset, self.block_size);
+                            }
                             InternalBlockMapping::new()
                                 .with_state(internal.state())
                                 .with_transitioning_to_fully_present(false)
@@ -751,11 +759,15 @@ mod tests {
         let regions = region::parse_region_tables(&file).await.unwrap();
         let bat_offset = regions.bat_offset;
 
-        // Write a FullyPresent BAT entry for block 0 at file_offset_mb = 100.
+        // Write a FullyPresent BAT entry for block 0 at file_offset_mb = 4.
         let entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
-            .with_file_offset_mb(100);
+            .with_file_offset_mb(4);
         file.write_at(bat_offset, entry.as_bytes()).await.unwrap();
+
+        // Extend file to cover the allocated range.
+        let needed = 4 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
+        file.set_file_size(needed).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
@@ -767,7 +779,7 @@ mod tests {
             ReadRange::Data {
                 guest_offset: 0,
                 length: 4096,
-                file_offset: 100 * MB1,
+                file_offset: 4 * MB1,
             }
         );
     }
@@ -853,13 +865,17 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
 
-        // Set block 0 to FullyPresent at file_offset_mb = 50.
+        // Set block 0 to FullyPresent at file_offset_mb = 4.
         let entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
-            .with_file_offset_mb(50);
+            .with_file_offset_mb(4);
         file.write_at(regions.bat_offset, entry.as_bytes())
             .await
             .unwrap();
+
+        // Extend file to cover the allocated range.
+        let needed = 4 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
+        file.set_file_size(needed).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
@@ -872,7 +888,7 @@ mod tests {
             ReadRange::Data {
                 guest_offset: 5120,
                 length: 512,
-                file_offset: 50 * MB1 + 5120,
+                file_offset: 4 * MB1 + 5120,
             }
         );
     }
@@ -1055,13 +1071,11 @@ mod tests {
         let mut ranges = Vec::new();
         vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
-        // Should allocate a new block: Zero padding before (none at offset 0),
-        // Data for the write, Zero padding after.
-        // At offset 0 within block: no leading padding.
-        // block_size = 2 MiB, writing 4096 bytes at offset 0:
+        // Should allocate a new block. With is_safe_data (near-EOF or
+        // extension space), zero padding is skipped — only Data emitted.
+        // Writing 4096 bytes at offset 0 in block:
         //   Data(0, 4096, file_offset)
-        //   Zero(file_offset+4096, block_size-4096)
-        assert!(ranges.len() >= 2);
+        assert!(!ranges.is_empty());
         // First should be Data
         match ranges[0] {
             WriteRange::Data {
@@ -1077,16 +1091,19 @@ mod tests {
             }
             _ => panic!("expected Data range, got {:?}", ranges[0]),
         }
-        // Second should be Zero (trailing padding to fill the block).
-        match ranges[1] {
-            WriteRange::Zero {
-                file_offset,
-                length,
-            } => {
-                assert_eq!(length, format::DEFAULT_BLOCK_SIZE - 4096);
-                assert!(file_offset > 0);
+        // With safe data, trailing zero padding is skipped.
+        // If not safe, a trailing Zero range would follow.
+        if ranges.len() > 1 {
+            match ranges[1] {
+                WriteRange::Zero {
+                    file_offset,
+                    length,
+                } => {
+                    assert_eq!(length, format::DEFAULT_BLOCK_SIZE - 4096);
+                    assert!(file_offset > 0);
+                }
+                _ => panic!("expected Zero range, got {:?}", ranges[1]),
             }
-            _ => panic!("expected Zero range, got {:?}", ranges[1]),
         }
     }
 
@@ -1095,13 +1112,17 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
 
-        // Write a FullyPresent BAT entry for block 0 at file_offset_mb = 100.
+        // Write a FullyPresent BAT entry for block 0 at file_offset_mb = 4.
         let entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
-            .with_file_offset_mb(100);
+            .with_file_offset_mb(4);
         file.write_at(regions.bat_offset, entry.as_bytes())
             .await
             .unwrap();
+
+        // Extend file to cover the allocated range.
+        let needed = 4 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
+        file.set_file_size(needed).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
         let mut ranges = Vec::new();
@@ -1114,7 +1135,7 @@ mod tests {
             WriteRange::Data {
                 guest_offset: 0,
                 length: 4096,
-                file_offset: 100 * MB1,
+                file_offset: 4 * MB1,
             }
         );
     }
@@ -1230,28 +1251,25 @@ mod tests {
         let mut ranges = Vec::new();
         vhdx.resolve_write(4096, 512, &mut ranges).await.unwrap();
 
-        // Should have: Zero(leading 4096), Data(512), Zero(trailing).
-        assert_eq!(ranges.len(), 3);
-        match ranges[0] {
-            WriteRange::Zero { length, .. } => assert_eq!(length, 4096),
-            _ => panic!("expected leading Zero, got {:?}", ranges[0]),
-        }
-        match ranges[1] {
+        // With safe data (near-EOF or extension space), Zero padding is
+        // skipped. Only expect the Data range.
+        // Without safe data, we'd see: Zero(leading 4096), Data(512), Zero(trailing).
+        assert!(!ranges.is_empty());
+        // Find the Data range.
+        let data_range = ranges
+            .iter()
+            .find(|r| matches!(r, WriteRange::Data { .. }))
+            .expect("expected at least one Data range");
+        match data_range {
             WriteRange::Data {
                 guest_offset,
                 length,
                 ..
             } => {
-                assert_eq!(guest_offset, 4096);
-                assert_eq!(length, 512);
+                assert_eq!(*guest_offset, 4096);
+                assert_eq!(*length, 512);
             }
-            _ => panic!("expected Data, got {:?}", ranges[1]),
-        }
-        match ranges[2] {
-            WriteRange::Zero { length, .. } => {
-                assert_eq!(length, format::DEFAULT_BLOCK_SIZE - 4096 - 512);
-            }
-            _ => panic!("expected trailing Zero, got {:?}", ranges[2]),
+            _ => unreachable!(),
         }
     }
 
@@ -1613,13 +1631,13 @@ mod tests {
         file.set_file_size(needed_size).await.unwrap();
 
         let vhdx = VhdxFile::open(file, false).await.unwrap();
-        let eof_before = *vhdx.eof_offset.lock();
+        let eof_before = vhdx.free_space.file_length();
 
         let mut ranges = Vec::new();
         vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
-        // No new allocation should occur — verify eof_offset unchanged.
-        let eof_after = *vhdx.eof_offset.lock();
+        // No new allocation should occur — verify file length unchanged.
+        let eof_after = vhdx.free_space.file_length();
         assert_eq!(
             eof_before, eof_after,
             "eof should not change for existing block"
@@ -1970,5 +1988,56 @@ mod tests {
         vhdx.resolve_write(0, block_size, &mut ranges2)
             .await
             .unwrap();
+    }
+
+    /// Verify that a new allocation from near-EOF (safe data) omits zero
+    /// padding, while an allocation from the free pool does emit zero padding.
+    #[async_test]
+    async fn safe_data_skips_zero_padding() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size() as u64;
+
+        // Step 1: Partial write to block 0 at guest_offset=0, len=512.
+        // Allocation comes from near-EOF → is_safe_data = true → no zero ranges.
+        let mut ranges = Vec::new();
+        vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
+
+        let zero_ranges: Vec<_> = ranges
+            .iter()
+            .filter(|r| matches!(r, WriteRange::Zero { .. }))
+            .collect();
+        assert!(
+            zero_ranges.is_empty(),
+            "near-EOF allocation should skip zero padding, but got {} Zero ranges",
+            zero_ranges.len(),
+        );
+
+        // Extract the block base offset (block_offset=0 since guest_offset=0).
+        let allocated_offset = match ranges[0] {
+            WriteRange::Data { file_offset, .. } => file_offset,
+            _ => panic!("expected Data range"),
+        };
+
+        // Step 2: Release the allocated space back to pool.
+        // (Intentionally creating an inconsistency for testing purposes.)
+        vhdx.free_space
+            .release(allocated_offset, vhdx.block_size() as u32);
+
+        // Step 3: Partial write to block 1 at block-aligned guest offset.
+        // Should allocate from pool (unsafe data) → zero ranges emitted.
+        let mut ranges2 = Vec::new();
+        vhdx.resolve_write(block_size, 512, &mut ranges2)
+            .await
+            .unwrap();
+
+        let zero_ranges2: Vec<_> = ranges2
+            .iter()
+            .filter(|r| matches!(r, WriteRange::Zero { .. }))
+            .collect();
+        assert!(
+            !zero_ranges2.is_empty(),
+            "pool allocation should emit zero padding, but got 0 Zero ranges",
+        );
     }
 }

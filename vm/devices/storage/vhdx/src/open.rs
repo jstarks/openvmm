@@ -34,6 +34,8 @@ use crate::known_meta::verify_known_metadata;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use crate::sector_bitmap::SBM_TAG;
+use crate::space::AllocateResult;
+use crate::space::FreeSpaceTracker;
 use guid::Guid;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -105,9 +107,9 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Writers that encounter a TFP block listen on this event and retry.
     pub(crate) allocation_event: event_listener::Event,
 
-    /// In-memory EOF counter. Synchronous (no I/O) — initialized from file
-    /// size at open time, bumped synchronously during allocation.
-    pub(crate) eof_offset: Mutex<u64>,
+    /// Free space tracker. Manages all space allocation within the file,
+    /// replacing the simple EOF-bump allocator.
+    pub(crate) free_space: FreeSpaceTracker,
 
     // Region offsets
     #[allow(dead_code)] // Phase 9+: used for space management
@@ -187,13 +189,27 @@ impl<F: AsyncFile> VhdxFile<F> {
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
         cache.register_tag(SBM_TAG, 0);
 
-        // 13. Load in-memory BAT from disk.
-        let bat_state = Self::load_bat_state(&cache, &bat).await?;
+        // 13. Create FreeSpaceTracker.
+        let free_space = FreeSpaceTracker::new(
+            file_length,
+            known.block_size,
+            format::HEADER_AREA_SIZE,
+            header.log_offset,
+            header.log_length,
+            regions.bat_offset,
+            regions.bat_length,
+            regions.metadata_offset,
+            regions.metadata_length,
+            bat.data_block_count,
+        )?;
 
-        // 14. Initialize eof_offset from file size, rounded up to MB1.
-        let eof_offset = (file_length + MB1 - 1) & !(MB1 - 1);
+        // 14. Load in-memory BAT from disk.
+        let bat_state = Self::load_bat_state(&cache, &bat, &free_space).await?;
 
-        // 15. Construct VhdxFile.
+        // 15. Finalize free space initialization after BAT parse.
+        free_space.complete_initialization();
+
+        // 16. Construct VhdxFile.
         Ok(VhdxFile {
             file,
             cache,
@@ -215,7 +231,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             bat_state: RwLock::new(bat_state),
             allocation_lock: futures::lock::Mutex::new(()),
             allocation_event: event_listener::Event::new(),
-            eof_offset: Mutex::new(eof_offset),
+            free_space,
 
             bat_length: regions.bat_length,
             metadata_offset: regions.metadata_offset,
@@ -228,7 +244,14 @@ impl<F: AsyncFile> VhdxFile<F> {
     }
 
     /// Load the in-memory BAT state from disk BAT pages.
-    async fn load_bat_state(cache: &PageCache<F>, bat: &Bat) -> Result<BatState, VhdxError> {
+    ///
+    /// During parse, marks allocated blocks in the FreeSpaceTracker and
+    /// records soft-anchored blocks.
+    async fn load_bat_state(
+        cache: &PageCache<F>,
+        bat: &Bat,
+        free_space: &FreeSpaceTracker,
+    ) -> Result<BatState, VhdxError> {
         let mut payload_mappings = Vec::with_capacity(bat.data_block_count as usize);
         let mut sector_bitmap_mappings = Vec::with_capacity(bat.sector_bitmap_block_count as usize);
         let mut allocated_block_count: u32 = 0;
@@ -247,6 +270,18 @@ impl<F: AsyncFile> VhdxFile<F> {
                 || raw_state == BatEntryState::PartiallyPresent as u8
             {
                 allocated_block_count += 1;
+                // Mark the block's file region as in-use in the space tracker.
+                let file_offset = internal.file_megabyte() as u64 * MB1;
+                if file_offset != 0 {
+                    free_space.mark_range_in_use(file_offset, bat.block_size)?;
+                }
+            } else if (raw_state == BatEntryState::Unmapped as u8
+                || raw_state == BatEntryState::Undefined as u8)
+                && internal.file_megabyte() != 0
+            {
+                // Soft-anchored block: unmapped/undefined with non-zero file offset.
+                let file_offset = internal.file_megabyte() as u64 * MB1;
+                free_space.mark_trimmed_block(block, file_offset, bat.block_size)?;
             }
             payload_mappings.push(internal);
         }
@@ -260,6 +295,16 @@ impl<F: AsyncFile> VhdxFile<F> {
                 return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
             }
             let internal = InternalBlockMapping::from_bat_entry(entry);
+            // Mark sector bitmap block's file region as in-use if allocated.
+            if raw_state == BatEntryState::FullyPresent as u8
+                || raw_state == BatEntryState::PartiallyPresent as u8
+            {
+                let file_offset = internal.file_megabyte() as u64 * MB1;
+                if file_offset != 0 {
+                    free_space
+                        .mark_range_in_use(file_offset, crate::bat::SECTOR_BITMAP_BLOCK_SIZE)?;
+                }
+            }
             sector_bitmap_mappings.push(internal);
         }
 
@@ -357,20 +402,51 @@ impl<F: AsyncFile> VhdxFile<F> {
             .get_sbm_mapping_from_state(&bat_state, chunk_number)
     }
 
-    /// Allocate space for a new block. Returns the file offset (MB-aligned).
+    /// Allocate space for a new block. Async — may extend the file.
     ///
-    /// Synchronous — no I/O. Called under `allocation_lock`.
-    pub(crate) fn allocate_space(&self, size: u32) -> u64 {
+    /// Called under `allocation_lock` (the `FreeSpaceWorkerLock` equivalent).
+    /// Tries pool → near-EOF → anchored, extends file and retries if needed.
+    ///
+    /// Corresponds to `Vhd2iContinueAllocateSpace`.
+    pub(crate) async fn allocate_space(
+        &self,
+        size: u32,
+        aligned: bool,
+    ) -> Result<AllocateResult, VhdxError> {
         debug_assert!(
             (size as u64).is_multiple_of(MB1),
             "allocation size must be MB1-aligned"
         );
-        let mut eof = self.eof_offset.lock();
-        let offset = *eof;
-        // Round up to MB1 boundary (should already be aligned, but be safe).
-        let aligned = (offset + MB1 - 1) & !(MB1 - 1);
-        *eof = aligned + size as u64;
-        aligned
+
+        loop {
+            // Try priorities 1–3 (pool, near-EOF, anchored).
+            // Pass BAT state for soft-anchor lookup.
+            let result = {
+                let bat_state = self.bat_state.read();
+                self.free_space
+                    .try_allocate_with_bat(size, aligned, &bat_state)
+            };
+
+            if let Some(alloc) = result {
+                return Ok(alloc);
+            }
+
+            // Priority 4: extend EOF.
+            let target = self.free_space.required_file_length(size, aligned);
+            self.file
+                .set_file_size(target)
+                .await
+                .map_err(VhdxError::Io)?;
+            self.free_space.complete_file_extend(target);
+            // Retry — will succeed from near-EOF space.
+        }
+    }
+
+    /// Set block alignment for aligned allocations.
+    ///
+    /// Corresponds to `Vhd2SetBlockAlignment`.
+    pub fn set_block_alignment(&self, alignment: u32) -> Result<(), VhdxError> {
+        self.free_space.set_block_alignment(alignment)
     }
 
     /// Serialize a single BAT page from in-memory state into a raw byte buffer.
@@ -844,10 +920,14 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = parse_region_tables(&file).await.unwrap();
 
-        // Manually write a FullyPresent BAT entry for block 0 at offset 100 MB.
+        // Manually write a FullyPresent BAT entry for block 0 at offset 4 MB
+        // (just after the metadata region, within the file).
+        // First extend the file to cover the block (4 MB offset + 2 MB block = 6 MB).
+        file.set_file_size(6 * MB1).await.unwrap();
+
         let entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
-            .with_file_offset_mb(100);
+            .with_file_offset_mb(4);
         file.write_at(regions.bat_offset, entry.as_bytes())
             .await
             .unwrap();
@@ -858,7 +938,7 @@ mod tests {
             bat_state.payload_mappings[0].state(),
             BatEntryState::FullyPresent as u8,
         );
-        assert_eq!(bat_state.payload_mappings[0].file_megabyte(), 100);
+        assert_eq!(bat_state.payload_mappings[0].file_megabyte(), 4);
         assert_eq!(bat_state.allocated_block_count, 1);
     }
 
@@ -876,18 +956,39 @@ mod tests {
     async fn eof_counter_no_overlap() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
-        let a = vhdx.allocate_space(MB1 as u32);
-        let b = vhdx.allocate_space(MB1 as u32);
+        let a = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
+        let b = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
         // Two allocations must not overlap.
-        assert_ne!(a, b);
-        assert!(b >= a + MB1);
+        assert_ne!(a.file_offset, b.file_offset);
+        assert!(b.file_offset >= a.file_offset + MB1);
     }
 
     #[async_test]
     async fn eof_counter_mb_aligned() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
-        let offset = vhdx.allocate_space(MB1 as u32);
-        assert_eq!(offset % MB1, 0, "offset must be MB1-aligned");
+        let result = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
+        assert_eq!(result.file_offset % MB1, 0, "offset must be MB1-aligned");
+    }
+
+    #[async_test]
+    async fn open_with_allocated_blocks_inits_space() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let regions = parse_region_tables(&file).await.unwrap();
+
+        // Extend file to 8 MB then write a FullyPresent BAT entry at offset 4 MB.
+        file.set_file_size(8 * MB1).await.unwrap();
+
+        let entry = BatEntry::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_offset_mb(4);
+        file.write_at(regions.bat_offset, entry.as_bytes())
+            .await
+            .unwrap();
+
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // The free space tracker should have offset 4*MB marked as in-use.
+        assert!(vhdx.free_space.is_range_in_use(4 * MB1, vhdx.block_size()));
     }
 }

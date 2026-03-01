@@ -1018,3 +1018,510 @@ async fn trim_native_write_rust_trim_native_read() {
         );
     }
 }
+
+// =====================================================================
+// Phase 8.3 — Differencing Disk Helpers
+// =====================================================================
+
+impl NativeVhdx {
+    /// Create a differencing VHDX child (parent must already exist).
+    fn create_differencing(path: &Path, parent_path: &Path) -> Self {
+        let storage_type = VIRTUAL_STORAGE_TYPE {
+            DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+            VendorId: VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
+        };
+
+        let wide = to_wide(path);
+        let parent_wide = to_wide(parent_path);
+
+        let mut params = CREATE_VIRTUAL_DISK_PARAMETERS {
+            Version: CREATE_VIRTUAL_DISK_VERSION_2,
+            ..Default::default()
+        };
+        // ParentPath tells CreateVirtualDisk to create a differencing child.
+        // MaximumSize, BlockSizeInBytes, and SectorSizeInBytes are inherited
+        // from the parent (set to 0 / left default).
+        params.Anonymous.Version2.ParentPath = PCWSTR(parent_wide.as_ptr());
+
+        let mut handle = HANDLE::default();
+
+        // SAFETY: All parameters are correctly initialized, paths are
+        // null-terminated, and handle is written by the API on success.
+        // `parent_wide` is alive for the duration of this call.
+        let result = unsafe {
+            CreateVirtualDisk(
+                &storage_type,
+                PCWSTR(wide.as_ptr()),
+                VIRTUAL_DISK_ACCESS_MASK(0),
+                None,
+                CREATE_VIRTUAL_DISK_FLAG_NONE,
+                0,
+                &params,
+                None,
+                &mut handle,
+            )
+        };
+        assert!(
+            result.is_ok(),
+            "CreateVirtualDisk (differencing) failed: {result:?}"
+        );
+
+        NativeVhdx {
+            handle,
+            attached: false,
+        }
+    }
+}
+
+impl RustVhdx {
+    /// Create a differencing VHDX via the Rust API (`has_parent: true`).
+    ///
+    /// No parent locator is written — this is sufficient for Rust-only
+    /// chained reads but NOT for native-open.
+    async fn create_diff(path: &Path, disk_size: u64, block_size: u32) -> Self {
+        let file = StdFile::create(path).expect("create backing file");
+        let mut params = vhdx::create::CreateParams {
+            disk_size,
+            block_size,
+            has_parent: true,
+            ..Default::default()
+        };
+        vhdx::create::create(&file, &mut params)
+            .await
+            .expect("vhdx create diff");
+        drop(file);
+
+        Self::open(path, false).await
+    }
+}
+
+/// Read data from a child, resolving Unmapped ranges from the parent.
+///
+/// For each `ReadRange::Unmapped` in the child's read resolution,
+/// reads the corresponding range from the parent. `Data` and `Zero`
+/// ranges are handled normally from the child.
+async fn chained_read(child: &RustVhdx, parent: &RustVhdx, offset: u64, len: u32) -> Vec<u8> {
+    let mut ranges = Vec::new();
+    let guard = child
+        .vhdx
+        .resolve_read(offset, len, &mut ranges)
+        .await
+        .expect("child resolve_read");
+
+    let mut result = vec![0u8; len as usize];
+
+    for range in &ranges {
+        match range {
+            ReadRange::Data {
+                guest_offset,
+                length,
+                file_offset,
+            } => {
+                let buf_offset = (*guest_offset - offset) as usize;
+                let buf_len = *length as usize;
+                child
+                    .io_file
+                    .read_at(*file_offset, &mut result[buf_offset..buf_offset + buf_len])
+                    .await
+                    .expect("read child data");
+            }
+            ReadRange::Zero {
+                guest_offset,
+                length,
+            } => {
+                // Already zero-initialized in result.
+                let _ = (guest_offset, length);
+            }
+            ReadRange::Unmapped {
+                guest_offset,
+                length,
+            } => {
+                // Fall through to parent.
+                let parent_data = parent.read_data(*guest_offset, *length).await;
+                let buf_offset = (*guest_offset - offset) as usize;
+                result[buf_offset..buf_offset + parent_data.len()].copy_from_slice(&parent_data);
+            }
+        }
+    }
+
+    drop(guard);
+    result
+}
+
+// =====================================================================
+// Phase 8.3 — Differencing Disk Test Cases
+// =====================================================================
+
+/// Test 14: Rust-Only Chained Read — Unwritten Child
+///
+/// Rust creates parent + writes data → Rust creates diff child →
+/// child read returns zeros (Unmapped) → chained_read falls through
+/// to parent → data matches.
+#[pal_async::async_test]
+async fn diff_rust_chained_read_unwritten_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_path = dir.path().join("parent.vhdx");
+    let child_path = dir.path().join("child.vhdx");
+
+    let block_size: u32 = 2 * 1024 * 1024;
+    let disk_size: u64 = 4 * 1024 * 1024;
+
+    // Step 1: Rust-create parent, write test_pattern at offset 0.
+    {
+        let parent = RustVhdx::create(&parent_path, disk_size, block_size).await;
+        parent.write_data(0, &test_pattern(0, 512)).await;
+        parent.flush().await;
+        parent.close().await;
+    }
+
+    // Step 2: Rust-create diff child (has_parent: true).
+    let child = RustVhdx::create_diff(&child_path, disk_size, block_size).await;
+
+    // Step 3: child.read_data returns zeros (Unmapped treated as zero).
+    let child_data = child.read_data(0, 512).await;
+    assert!(
+        child_data.iter().all(|&b| b == 0),
+        "unwritten child should return zeros"
+    );
+
+    // Step 4: chained_read falls through to parent.
+    let parent = RustVhdx::open(&parent_path, true).await;
+    let chained = chained_read(&child, &parent, 0, 512).await;
+    assert_eq!(
+        chained,
+        test_pattern(0, 512),
+        "chained read should return parent data"
+    );
+
+    // Step 5: Verify child is a differencing disk.
+    assert!(child.vhdx.has_parent(), "child should have has_parent set");
+
+    child.close().await;
+    parent.close().await;
+}
+
+/// Test 15: Rust-Only Chained Read — Partial Block Write
+///
+/// Rust creates parent + writes 2 sectors → Rust creates diff child →
+/// writes 1 sector to child with different data → chained_read returns
+/// child data for written sector, parent data for unwritten sector.
+///
+/// This exercises PartiallyPresent block handling: the Rust write allocates
+/// the block as PartiallyPresent (not FullyPresent), and the sector bitmap
+/// tracks which sectors are present in the child vs. transparent to parent.
+#[pal_async::async_test]
+async fn diff_rust_chained_read_partial_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_path = dir.path().join("parent.vhdx");
+    let child_path = dir.path().join("child.vhdx");
+
+    let block_size: u32 = 2 * 1024 * 1024;
+    let disk_size: u64 = 4 * 1024 * 1024;
+
+    // Step 1: Rust-create parent, write 2 sectors at offset 0.
+    {
+        let parent = RustVhdx::create(&parent_path, disk_size, block_size).await;
+        parent.write_data(0, &test_pattern(0, 1024)).await;
+        parent.flush().await;
+        parent.close().await;
+    }
+
+    // Step 2: Rust-create diff child.
+    let child = RustVhdx::create_diff(&child_path, disk_size, block_size).await;
+
+    // Step 3: Write only sector 0 in child with a distinguishable pattern.
+    // The block should become PartiallyPresent with SBM bit 0 set.
+    let child_pattern = vec![0xAA; 512];
+    child.write_data(0, &child_pattern).await;
+    child.flush().await;
+
+    // Step 4: chained_read should return child data for sector 0,
+    //         parent data for sector 1.
+    let parent = RustVhdx::open(&parent_path, true).await;
+    let chained = chained_read(&child, &parent, 0, 1024).await;
+
+    // Sector 0 (bytes 0..512): from child → [0xAA; 512]
+    assert_eq!(
+        &chained[..512],
+        &child_pattern[..],
+        "sector 0 should come from child"
+    );
+    // Sector 1 (bytes 512..1024): from parent → test_pattern(512, 512)
+    assert_eq!(
+        &chained[512..1024],
+        &test_pattern(512, 512)[..],
+        "sector 1 should come from parent"
+    );
+
+    child.close().await;
+    parent.close().await;
+}
+
+/// Test 16: Native-Create Diff → Rust Reads
+///
+/// Native creates parent + writes data → native creates diff child →
+/// writes different data to child block 0 → Rust opens child → reads
+/// child data for block 0 + Unmapped for block 1 → chained_read resolves
+/// parent data for block 1.
+#[pal_async::async_test]
+async fn diff_native_create_rust_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_path = dir.path().join("parent.vhdx");
+    let child_path = dir.path().join("child.vhdx");
+
+    // Native default: 32 MiB blocks.
+    let block_size: u64 = 32 * 1024 * 1024;
+
+    // Step 1: Native-create parent (1 GiB).
+    // Write test_pattern at offset 0 and offset block_size.
+    {
+        let mut native = NativeVhdx::create_dynamic(&parent_path, 1024 * 1024 * 1024, 0, 0);
+        let raw = native.attach_raw();
+
+        let written = raw
+            .write_at(0, &test_pattern(0, 512))
+            .expect("write parent block 0");
+        assert_eq!(written, 512);
+
+        let written = raw
+            .write_at(block_size, &test_pattern(block_size, 512))
+            .expect("write parent block 1");
+        assert_eq!(written, 512);
+    }
+
+    // Step 2: Native-create differencing child.
+    // Write [0xBB; 512] at offset 0 (overwrites parent's block 0).
+    {
+        let mut native = NativeVhdx::create_differencing(&child_path, &parent_path);
+        let raw = native.attach_raw();
+
+        let child_data = vec![0xBBu8; 512];
+        let written = raw.write_at(0, &child_data).expect("write child block 0");
+        assert_eq!(written, 512);
+    }
+
+    // Step 3: Rust opens child (read-only).
+    let child = RustVhdx::open(&child_path, true).await;
+
+    // Block 0, sector 0: child has data → should be [0xBB; 512].
+    let data_block0 = child.read_data(0, 512).await;
+    assert_eq!(
+        data_block0,
+        vec![0xBBu8; 512],
+        "child block 0 sector 0 should be 0xBB"
+    );
+
+    // Block 1: Unmapped in child → read_data returns zeros.
+    let data_block1 = child.read_data(block_size, 512).await;
+    assert!(
+        data_block1.iter().all(|&b| b == 0),
+        "child block 1 should be zeros (Unmapped)"
+    );
+
+    // Step 4: Rust opens parent (read-only).
+    let parent = RustVhdx::open(&parent_path, true).await;
+
+    // Verify parent block 1 data directly.
+    let parent_block1 = parent.read_data(block_size, 512).await;
+    assert_eq!(
+        parent_block1,
+        test_pattern(block_size, 512),
+        "parent block 1 should have original data"
+    );
+
+    // Step 5: chained_read for block 1 → falls through to parent.
+    let chained = chained_read(&child, &parent, block_size, 512).await;
+    assert_eq!(
+        chained,
+        test_pattern(block_size, 512),
+        "chained read block 1 should return parent data"
+    );
+
+    child.close().await;
+    parent.close().await;
+}
+
+/// Test 17: Native-Create Diff → Rust Reads Empty Child
+///
+/// Native creates parent + writes data → native creates diff child →
+/// no writes to child → Rust reads child → all Unmapped → chained read
+/// falls through to parent.
+#[pal_async::async_test]
+async fn diff_native_create_empty_child_rust_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_path = dir.path().join("parent.vhdx");
+    let child_path = dir.path().join("child.vhdx");
+
+    // Step 1: Native-create parent (1 GiB), write data at offset 0.
+    {
+        let mut native = NativeVhdx::create_dynamic(&parent_path, 1024 * 1024 * 1024, 0, 0);
+        let raw = native.attach_raw();
+
+        let written = raw
+            .write_at(0, &test_pattern(0, 512))
+            .expect("write parent");
+        assert_eq!(written, 512);
+    }
+
+    // Step 2: Native-create differencing child (no writes).
+    {
+        let _native = NativeVhdx::create_differencing(&child_path, &parent_path);
+    }
+
+    // Step 3: Rust opens child.
+    let child = RustVhdx::open(&child_path, true).await;
+
+    // Child has_parent should be true.
+    assert!(child.vhdx.has_parent(), "child should be a diff disk");
+
+    // read_data returns zeros (Unmapped).
+    let child_data = child.read_data(0, 512).await;
+    assert!(
+        child_data.iter().all(|&b| b == 0),
+        "empty child should return zeros"
+    );
+
+    // Step 4: Rust opens parent; chained_read falls through.
+    let parent = RustVhdx::open(&parent_path, true).await;
+    let chained = chained_read(&child, &parent, 0, 512).await;
+    assert_eq!(
+        chained,
+        test_pattern(0, 512),
+        "chained read should return parent data"
+    );
+
+    child.close().await;
+    parent.close().await;
+}
+
+/// Test 18: Rust Writes to Native-Created Diff
+///
+/// Native creates parent → writes data at offsets 0 and 512 → native creates
+/// diff child → Rust opens child writable → writes sector 0 with different
+/// data → close → native opens child (with parent chain) → attach →
+/// raw-read → child data present at sector 0, parent data for sector 1
+/// (unwritten in child, falls through via native chain and SBM resolution).
+#[pal_async::async_test]
+async fn diff_rust_writes_to_native_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_path = dir.path().join("parent.vhdx");
+    let child_path = dir.path().join("child.vhdx");
+
+    // Step 1: Native-create parent (1 GiB), write data at offsets 0 and 512.
+    {
+        let mut native = NativeVhdx::create_dynamic(&parent_path, 1024 * 1024 * 1024, 0, 0);
+        let raw = native.attach_raw();
+
+        let written = raw
+            .write_at(0, &test_pattern(0, 512))
+            .expect("write parent sector 0");
+        assert_eq!(written, 512);
+
+        let written = raw
+            .write_at(512, &test_pattern(512, 512))
+            .expect("write parent sector 1");
+        assert_eq!(written, 512);
+    }
+
+    // Step 2: Native-create diff child (no writes yet).
+    {
+        let _native = NativeVhdx::create_differencing(&child_path, &parent_path);
+    }
+
+    // Step 3: Rust opens child writable, writes only sector 0.
+    // The block should become PartiallyPresent with SBM bit 0 set.
+    {
+        let child = RustVhdx::open(&child_path, false).await;
+        let child_data = vec![0xCCu8; 512];
+        child.write_data(0, &child_data).await;
+        child.flush().await;
+        child.close().await;
+    }
+
+    // Step 4: Native opens child (chain resolves automatically).
+    // Sector 0: from child (SBM bit set) → [0xCC; 512]
+    // Sector 1: from parent (SBM bit clear, falls through) → test_pattern(512, 512)
+    {
+        let mut native = NativeVhdx::open(&child_path, false);
+        let raw = native.attach_raw();
+
+        let mut buf0 = vec![0u8; 512];
+        let bytes = raw.read_at(0, &mut buf0).expect("read child sector 0");
+        assert_eq!(bytes, 512);
+        assert_eq!(buf0, vec![0xCCu8; 512], "sector 0 should be child's data");
+
+        let mut buf1 = vec![0u8; 512];
+        let bytes = raw.read_at(512, &mut buf1).expect("read child sector 1");
+        assert_eq!(bytes, 512);
+        assert_eq!(
+            buf1,
+            test_pattern(512, 512),
+            "sector 1 should come from parent via chain"
+        );
+    }
+}
+
+/// Test 19: Rust Writes + Trims in Diff Child
+///
+/// Rust-create parent → write data to blocks 0 and 1 → native-create diff
+/// child → Rust writes to child blocks 0 and 1 → Rust trims block 1 →
+/// native reads → block 0 has child data, block 1 is zeros.
+#[pal_async::async_test]
+async fn diff_rust_writes_and_trims() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_path = dir.path().join("parent.vhdx");
+    let child_path = dir.path().join("child.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Step 1: Rust-create parent (to control block size), write blocks 0 and 1.
+    {
+        let parent = RustVhdx::create(&parent_path, 8 * 1024 * 1024, block_size as u32).await;
+        parent.write_data(0, &test_pattern(0, 512)).await;
+        parent
+            .write_data(block_size, &test_pattern(block_size, 512))
+            .await;
+        parent.flush().await;
+        parent.close().await;
+    }
+
+    // Step 2: Native-create diff child.
+    {
+        let _native = NativeVhdx::create_differencing(&child_path, &parent_path);
+    }
+
+    // Step 3: Rust opens child writable.
+    //   - Write [0xDD; 512] at offset 0 (block 0, sector 0)
+    //   - Write [0xEE; 512] at offset block_size (block 1, sector 0)
+    //   - Trim block 1 entirely
+    {
+        let child = RustVhdx::open(&child_path, false).await;
+        child.write_data(0, &vec![0xDDu8; 512]).await;
+        child.write_data(block_size, &vec![0xEEu8; 512]).await;
+        child.trim_range(block_size, block_size).await;
+        child.flush().await;
+        child.close().await;
+    }
+
+    // Step 4: Native opens child (chain). Attach + read.
+    {
+        let mut native = NativeVhdx::open(&child_path, false);
+        let raw = native.attach_raw();
+
+        // Block 0: child's write → [0xDD; 512]
+        let mut buf0 = vec![0u8; 512];
+        let bytes = raw.read_at(0, &mut buf0).expect("read block 0");
+        assert_eq!(bytes, 512);
+        assert_eq!(buf0, vec![0xDDu8; 512], "block 0 should be child's data");
+
+        // Block 1: trimmed → zeros (TrimMode::Zero makes block Zero state;
+        // through native chain, Zero means zeros).
+        let mut buf1 = vec![0u8; 512];
+        let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
+        assert_eq!(bytes, 512);
+        assert!(
+            buf1.iter().all(|&b| b == 0),
+            "block 1 should be zeros after trim"
+        );
+    }
+}

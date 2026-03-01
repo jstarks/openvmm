@@ -538,8 +538,28 @@ impl<F: AsyncFile> VhdxFile<F> {
                             });
                         } else {
                             // Partial write — commit BAT immediately.
+                            //
+                            // For differencing disks: if the block was
+                            // NotPresent (transparent to parent), allocate
+                            // as PartiallyPresent so that unwritten sectors
+                            // remain transparent. The sector bitmap will be
+                            // updated in complete_write_inner() to mark
+                            // only the written sectors as present.
+                            //
+                            // For non-diff disks or blocks in other states
+                            // (Zero, Unmapped, Undefined): allocate as
+                            // FullyPresent with zero-padding.
+                            let is_partial_present = self.has_parent
+                                && mapping.state == BatEntryState::NotPresent;
+
+                            let new_state = if is_partial_present {
+                                BatEntryState::PartiallyPresent
+                            } else {
+                                BatEntryState::FullyPresent
+                            };
+
                             let new_mapping = InternalBlockMapping::new()
-                                .with_state(BatEntryState::FullyPresent as u8)
+                                .with_state(new_state as u8)
                                 .with_transitioning_to_fully_present(false)
                                 .with_file_megabyte((new_offset / MB1) as u32);
 
@@ -562,8 +582,15 @@ impl<F: AsyncFile> VhdxFile<F> {
                             .await?;
 
                             // Emit zero + data + zero ranges.
-                            // Skip zeroing if the space is already safe (beyond old ZeroOffset).
-                            if block_info.block_offset > 0 && !is_safe_data {
+                            // For PartiallyPresent blocks, skip zero-fill —
+                            // unwritten sectors are transparent to parent
+                            // (the sector bitmap tracks presence).
+                            // For FullyPresent blocks, zero-fill surround
+                            // unless the space is already safe.
+                            if !is_partial_present
+                                && block_info.block_offset > 0
+                                && !is_safe_data
+                            {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset,
                                     length: block_info.block_offset,
@@ -577,7 +604,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                             });
 
                             let end_offset = block_info.block_offset + block_info.block_length;
-                            if end_offset < self.block_size && !is_safe_data {
+                            if !is_partial_present
+                                && end_offset < self.block_size
+                                && !is_safe_data
+                            {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset + end_offset as u64,
                                     length: self.block_size - end_offset,

@@ -549,8 +549,46 @@ impl<F: AsyncFile> VhdxFile<F> {
                             // For non-diff disks or blocks in other states
                             // (Zero, Unmapped, Undefined): allocate as
                             // FullyPresent with zero-padding.
-                            let is_partial_present = self.has_parent
-                                && mapping.state == BatEntryState::NotPresent;
+                            let is_partial_present =
+                                self.has_parent && mapping.state == BatEntryState::NotPresent;
+
+                            // --- SBM block allocation for PartiallyPresent ---
+                            if is_partial_present {
+                                let chunk_number = block_info.block_number / self.bat.chunk_ratio;
+                                let sbm_mapping = self.get_sector_bitmap_mapping(chunk_number);
+
+                                if sbm_mapping.state != BatEntryState::FullyPresent {
+                                    // Allocate 1 MiB for the SBM block.
+                                    let sbm_alloc = self
+                                        .allocate_space(crate::bat::SECTOR_BITMAP_BLOCK_SIZE, false)
+                                        .await?;
+
+                                    // Zero the SBM block — all bits clear = all sectors transparent.
+                                    sector_bitmap::zero_sector_bitmap_block(
+                                        &self.cache,
+                                        sbm_alloc.file_offset,
+                                    )
+                                    .await?;
+
+                                    // Update in-memory SBM BAT entry.
+                                    let new_sbm = InternalBlockMapping::new()
+                                        .with_state(BatEntryState::FullyPresent as u8)
+                                        .with_file_megabyte((sbm_alloc.file_offset / MB1) as u32);
+
+                                    {
+                                        let mut bat_state = self.bat_state.write();
+                                        bat_state.set_sbm_mapping(&self.bat, chunk_number, new_sbm);
+                                    }
+
+                                    // Persist SBM BAT entry to disk.
+                                    self.write_bat_entry_to_cache(
+                                        BlockType::SectorBitmap,
+                                        chunk_number,
+                                        new_sbm,
+                                    )
+                                    .await?;
+                                }
+                            }
 
                             let new_state = if is_partial_present {
                                 BatEntryState::PartiallyPresent
@@ -587,10 +625,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             // (the sector bitmap tracks presence).
                             // For FullyPresent blocks, zero-fill surround
                             // unless the space is already safe.
-                            if !is_partial_present
-                                && block_info.block_offset > 0
-                                && !is_safe_data
-                            {
+                            if !is_partial_present && block_info.block_offset > 0 && !is_safe_data {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset,
                                     length: block_info.block_offset,
@@ -604,9 +639,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             });
 
                             let end_offset = block_info.block_offset + block_info.block_length;
-                            if !is_partial_present
-                                && end_offset < self.block_size
-                                && !is_safe_data
+                            if !is_partial_present && end_offset < self.block_size && !is_safe_data
                             {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset + end_offset as u64,
@@ -3415,6 +3448,212 @@ mod tests {
                 None => {
                     verify_block_pattern(&*vhdx, block_offset, block_size, 0x00).await;
                 }
+            }
+        }
+    }
+
+    // ---- SBM allocation tests ----
+
+    #[async_test]
+    async fn partial_write_diff_disk_allocates_sbm() {
+        // A sub-block write to a NotPresent block in a differencing disk
+        // should allocate the SBM block and set the payload to PartiallyPresent.
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size: format::GB1,
+            has_parent: true,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Partial write: 4096 bytes at offset 0 (sub-block).
+        write_block(&vhdx, 0, 4096, 0xAB).await;
+
+        // Block 0 should be PartiallyPresent.
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(mapping.state, BatEntryState::PartiallyPresent);
+
+        // SBM block for chunk 0 should be FullyPresent (allocated).
+        let sbm_mapping = vhdx.get_sector_bitmap_mapping(0);
+        assert_eq!(sbm_mapping.state, BatEntryState::FullyPresent);
+
+        // Read the written range — should return Data.
+        let mut ranges = Vec::new();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        let has_data = ranges.iter().any(|r| matches!(r, ReadRange::Data { .. }));
+        assert!(has_data, "written sectors should return Data");
+
+        // Read an unwritten range in the same block — should return Unmapped.
+        let mut ranges2 = Vec::new();
+        let _guard2 = vhdx.resolve_read(4096, 512, &mut ranges2).await.unwrap();
+        assert_eq!(ranges2.len(), 1);
+        assert!(
+            matches!(ranges2[0], ReadRange::Unmapped { .. }),
+            "unwritten sectors in diff disk should return Unmapped"
+        );
+    }
+
+    #[async_test]
+    async fn partial_write_diff_disk_sbm_bits_set_correctly() {
+        // Write 4096 bytes (sectors 0-7 for 512-byte sectors) to a diff disk.
+        // Verify that the written sectors read as Data and unwritten ones as Unmapped.
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size: format::GB1,
+            has_parent: true,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        write_block(&vhdx, 0, 4096, 0xCD).await;
+
+        // Sectors 0-7 should be Data.
+        let mut ranges = Vec::new();
+        let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
+        assert_eq!(ranges.len(), 1);
+        match &ranges[0] {
+            ReadRange::Data {
+                guest_offset,
+                length,
+                ..
+            } => {
+                assert_eq!(*guest_offset, 0);
+                assert_eq!(*length, 4096);
+            }
+            other => panic!("expected Data, got {:?}", other),
+        }
+
+        // Sector 8 onward should be Unmapped (transparent to parent).
+        let mut ranges2 = Vec::new();
+        let _guard2 = vhdx.resolve_read(4096, 512, &mut ranges2).await.unwrap();
+        assert_eq!(ranges2.len(), 1);
+        assert_eq!(
+            ranges2[0],
+            ReadRange::Unmapped {
+                guest_offset: 4096,
+                length: 512,
+            }
+        );
+    }
+
+    #[async_test]
+    async fn full_block_write_diff_disk_no_sbm() {
+        // A full-block write to a diff disk should set FullyPresent, not allocate SBM.
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size: format::GB1,
+            has_parent: true,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size();
+
+        // Full-block write.
+        write_block(&vhdx, 0, block_size, 0xEE).await;
+
+        // Block 0 should be FullyPresent (TFP path).
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+
+        // SBM block for chunk 0 should NOT be allocated.
+        let sbm_mapping = vhdx.get_sector_bitmap_mapping(0);
+        assert_ne!(
+            sbm_mapping.state,
+            BatEntryState::FullyPresent,
+            "full-block write should not allocate SBM"
+        );
+    }
+
+    #[async_test]
+    async fn second_partial_write_same_chunk_reuses_sbm() {
+        // Two partial writes to different blocks in the same chunk should
+        // reuse the same SBM block.
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size: format::GB1,
+            has_parent: true,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let block_size = vhdx.block_size() as u64;
+
+        // First partial write to block 0.
+        write_block(&vhdx, 0, 4096, 0x11).await;
+
+        let sbm_mapping_1 = vhdx.get_sector_bitmap_mapping(0);
+        assert_eq!(sbm_mapping_1.state, BatEntryState::FullyPresent);
+        let sbm_offset_1 = sbm_mapping_1.file_offset;
+
+        // Second partial write to block 1 (same chunk).
+        write_block(&vhdx, block_size, 4096, 0x22).await;
+
+        let sbm_mapping_2 = vhdx.get_sector_bitmap_mapping(0);
+        assert_eq!(sbm_mapping_2.state, BatEntryState::FullyPresent);
+        let sbm_offset_2 = sbm_mapping_2.file_offset;
+
+        // SBM should be reused (same file offset).
+        assert_eq!(
+            sbm_offset_1, sbm_offset_2,
+            "SBM block should be reused, not reallocated"
+        );
+
+        // Both blocks should read back correctly.
+        let mut ranges0 = Vec::new();
+        let _g0 = vhdx.resolve_read(0, 4096, &mut ranges0).await.unwrap();
+        assert!(matches!(ranges0[0], ReadRange::Data { .. }));
+
+        let mut ranges1 = Vec::new();
+        let _g1 = vhdx
+            .resolve_read(block_size, 4096, &mut ranges1)
+            .await
+            .unwrap();
+        assert!(matches!(ranges1[0], ReadRange::Data { .. }));
+    }
+
+    #[async_test]
+    async fn partial_write_non_diff_disk_no_sbm() {
+        // A sub-block write to a non-differencing disk should set FullyPresent
+        // and NOT allocate any SBM block.
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+
+        // Partial write: 4096 bytes at offset 0.
+        write_block(&vhdx, 0, 4096, 0x77).await;
+
+        // Block should be FullyPresent (not PartiallyPresent).
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+
+        // SBM should NOT be allocated.
+        // For non-diff disks, sector_bitmap_block_count may be 0,
+        // so we check via bat_state directly.
+        let sbm_count = vhdx.bat.sector_bitmap_block_count;
+        if sbm_count > 0 {
+            let sbm_mapping = vhdx.get_sector_bitmap_mapping(0);
+            assert_ne!(
+                sbm_mapping.state,
+                BatEntryState::FullyPresent,
+                "non-diff disk should not allocate SBM"
+            );
+        }
+
+        // Unwritten sectors within the block should read as Zero (not Unmapped).
+        let mut ranges = Vec::new();
+        let _guard = vhdx.resolve_read(4096, 512, &mut ranges).await.unwrap();
+        assert_eq!(ranges.len(), 1);
+        match &ranges[0] {
+            ReadRange::Data { .. } => {
+                // Data range is fine — zero-padded data within an allocated block.
+            }
+            ReadRange::Zero { .. } => {
+                // Zero range is also acceptable (block may be zero-padded).
+            }
+            ReadRange::Unmapped { .. } => {
+                panic!("non-diff disk should never return Unmapped for allocated block");
             }
         }
     }

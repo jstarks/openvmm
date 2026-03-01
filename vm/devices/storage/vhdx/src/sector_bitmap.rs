@@ -240,6 +240,32 @@ pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
     Ok(())
 }
 
+/// Zero all pages of a sector bitmap block at the given file offset.
+///
+/// This sets all SBM bits to 0, meaning all sectors are transparent to
+/// parent. Called when allocating a new SBM block for a differencing disk.
+pub(crate) async fn zero_sector_bitmap_block<F: AsyncFile>(
+    cache: &PageCache<F>,
+    sbm_file_offset: u64,
+) -> Result<(), VhdxError> {
+    let page_count = crate::bat::SECTOR_BITMAP_BLOCK_SIZE as u64 / CACHE_PAGE_SIZE;
+    for page in 0..page_count {
+        let page_offset = sbm_file_offset + page * CACHE_PAGE_SIZE;
+        let mut guard = cache
+            .acquire(
+                PageKey {
+                    tag: SBM_TAG,
+                    offset: page_offset,
+                },
+                AccessMode::Modify,
+            )
+            .await?;
+        guard.fill(0);
+        guard.release().await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

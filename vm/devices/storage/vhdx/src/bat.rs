@@ -30,7 +30,6 @@ pub(crate) const BAT_TAG: u8 = 0;
 pub(crate) const METADATA_TAG: u8 = 1;
 
 /// Size of a sector bitmap block in bytes (1 MiB).
-#[allow(dead_code)] // Phase 9+: used for space management
 pub(crate) const SECTOR_BITMAP_BLOCK_SIZE: u32 = 1024 * 1024;
 
 /// Manages BAT (Block Allocation Table) lookups through the page cache.
@@ -176,7 +175,6 @@ impl BatState {
     /// Update the in-memory mapping for a sector bitmap block.
     ///
     /// Does NOT mark the BAT page dirty — callers decide when to mark dirty.
-    #[allow(dead_code)] // will be used by allocation write path in a later phase
     pub fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: InternalBlockMapping) {
         let _ = bat;
         self.sector_bitmap_mappings[chunk_number as usize] = mapping;

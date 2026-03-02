@@ -25,9 +25,15 @@ fn disk_open_error(path: &Path, verb: &str) -> String {
 /// Opens the resources needed for using a disk from a file at `path`.
 ///
 /// If the file ends with .vhd and is a fixed VHD1, it will be opened using
-/// the user-mode VHD parser. Otherwise, if the file ends with .vhd or
-/// .vhdx, the file will be opened using the kernel-mode VHD parser.
-pub fn open_disk_type(path: &Path, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
+/// the user-mode VHD parser. Otherwise, if the file ends with .vhd, the
+/// file will be opened using the kernel-mode VHD parser (Windows only).
+///
+/// If the file ends with .vhdx, the pure-Rust VHDX parser is used, with
+/// automatic parent-locator walking for differencing chains.
+pub async fn open_disk_type(
+    path: &Path,
+    read_only: bool,
+) -> anyhow::Result<Resource<DiskHandleKind>> {
     Ok(match path.extension().and_then(|s| s.to_str()) {
         Some("vhd") => {
             let file = std::fs::OpenOptions::new()
@@ -54,17 +60,7 @@ pub fn open_disk_type(path: &Path, read_only: bool) -> anyhow::Result<Resource<D
                 Err(err) => return Err(err.into()),
             }
         }
-        Some("vhdx") => {
-            #[cfg(windows)]
-            {
-                Resource::new(disk_vhdmp::OpenVhdmpDiskConfig(
-                    disk_vhdmp::VhdmpDisk::open_vhd(path, read_only)
-                        .with_context(|| disk_open_error(path, "failed to open"))?,
-                ))
-            }
-            #[cfg(not(windows))]
-            anyhow::bail!("VHDX not supported on Linux");
-        }
+        Some("vhdx") => disk_vhdx::chain::open_vhdx_chain(path, read_only).await?,
         Some("iso") if !read_only => {
             anyhow::bail!("iso file cannot be opened as read/write")
         }

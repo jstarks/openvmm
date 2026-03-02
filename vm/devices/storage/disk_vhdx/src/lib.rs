@@ -404,4 +404,82 @@ mod tests {
 
         disk.sync_cache().await.unwrap();
     }
+
+    #[async_test]
+    async fn write_close_reopen_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.vhdx");
+
+        // Create and write data
+        {
+            let layer = create_and_open_layer(&path).await;
+            let disk = wrap_in_layered_disk(layer).await;
+
+            let mem = GuestMemory::allocate(512);
+            let pattern: Vec<u8> = (0..512u16).map(|i| (i % 251) as u8).collect();
+            mem.write_at(0, &pattern).unwrap();
+            let owned = OwnedRequestBuffers::linear(0, 512, false);
+            disk.write_vectored(&owned.buffer(&mem), 0, false)
+                .await
+                .unwrap();
+
+            // Flush to ensure data is on disk
+            disk.sync_cache().await.unwrap();
+        }
+
+        // Re-open and read back
+        {
+            let bf = BlockingFile::open(&path, true).unwrap();
+            let bf2 = bf.clone();
+            let vhdx = VhdxFile::open(bf, true).await.unwrap();
+            let layer = VhdxLayer::new(vhdx, bf2, true);
+            let disk = LayeredDisk::new(
+                true,
+                vec![LayerConfiguration {
+                    layer: DiskLayer::new(layer),
+                    write_through: false,
+                    read_cache: false,
+                }],
+            )
+            .await
+            .unwrap();
+
+            let mem = GuestMemory::allocate(512);
+            let owned = OwnedRequestBuffers::linear(0, 512, true);
+            disk.read_vectored(&owned.buffer(&mem), 0).await.unwrap();
+
+            let mut buf = vec![0u8; 512];
+            mem.read_at(0, &mut buf).unwrap();
+            let expected: Vec<u8> = (0..512u16).map(|i| (i % 251) as u8).collect();
+            assert_eq!(buf, expected);
+        }
+    }
+
+    #[async_test]
+    async fn multi_sector_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.vhdx");
+
+        let layer = create_and_open_layer(&path).await;
+        let disk = wrap_in_layered_disk(layer).await;
+
+        // Write 4 KiB (8 sectors) starting at sector 0
+        let len = 4096usize;
+        let mem = GuestMemory::allocate(len);
+        let pattern: Vec<u8> = (0..len).map(|i| (i % 137) as u8).collect();
+        mem.write_at(0, &pattern).unwrap();
+
+        let owned = OwnedRequestBuffers::linear(0, len, false);
+        disk.write_vectored(&owned.buffer(&mem), 0, false)
+            .await
+            .unwrap();
+
+        // Read back and verify
+        let owned = OwnedRequestBuffers::linear(0, len, true);
+        disk.read_vectored(&owned.buffer(&mem), 0).await.unwrap();
+
+        let mut buf = vec![0u8; len];
+        mem.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf, pattern);
+    }
 }

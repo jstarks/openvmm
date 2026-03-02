@@ -202,9 +202,9 @@ impl PetriVmConfigOpenVmm {
             None => (None, None, None),
         };
 
-        let ide_disks = ide_controllers_to_openvmm(firmware.ide_controllers())?;
+        let ide_disks = ide_controllers_to_openvmm(firmware.ide_controllers()).await?;
         let (mut vmbus_devices, vpci_devices) =
-            vmbus_storage_controllers_to_openvmm(&vmbus_storage_controllers)?;
+            vmbus_storage_controllers_to_openvmm(&vmbus_storage_controllers).await?;
 
         let (firmware_event_send, firmware_event_recv) = mesh::mpsc_channel();
 
@@ -215,12 +215,14 @@ impl PetriVmConfigOpenVmm {
         };
 
         let (with_vtl2, vtl2_vmbus, ged, ged_send, vtl2_vsock_path) = if firmware.is_openhcl() {
-            let (ged, ged_send) = setup.config_openhcl_vmbus_devices(
-                &mut emulated_serial_config,
-                &mut vmbus_devices,
-                &firmware_event_send,
-                framebuffer.is_some(),
-            )?;
+            let (ged, ged_send) = setup
+                .config_openhcl_vmbus_devices(
+                    &mut emulated_serial_config,
+                    &mut vmbus_devices,
+                    &firmware_event_send,
+                    framebuffer.is_some(),
+                )
+                .await?;
 
             let late_map_vtl0_memory = match load_mode {
                 LoadMode::Igvm {
@@ -423,7 +425,7 @@ impl PetriVmConfigOpenVmm {
         let vmgs = if firmware.is_openhcl() {
             None
         } else {
-            Some(memdiff_vmgs(&vmgs)?)
+            Some(memdiff_vmgs(&vmgs).await?)
         };
 
         let VmChipsetResult {
@@ -842,7 +844,7 @@ impl PetriVmConfigSetupCore<'_> {
         })
     }
 
-    fn config_openhcl_vmbus_devices(
+    async fn config_openhcl_vmbus_devices(
         &self,
         serial: &mut [Option<Resource<SerialBackendHandle>>],
         devices: &mut impl Extend<(DeviceVtl, Resource<VmbusDeviceHandleKind>)>,
@@ -916,7 +918,7 @@ impl PetriVmConfigSetupCore<'_> {
             serial_tx_only: false,
             vmbus_redirection: *vmbus_redirect,
             vtl2_settings: None, // Will be added at startup to allow tests to modify
-            vmgs: memdiff_vmgs(self.vmgs)?,
+            vmgs: memdiff_vmgs(self.vmgs).await?,
             framebuffer: framebuffer.then(|| SharedFramebufferHandle.into_resource()),
             guest_request_recv,
             enable_tpm: self.tpm_config.is_some(),
@@ -1075,7 +1077,7 @@ fn spawn_dump_handler(driver: &DefaultDriver, logger: &PetriLogSource) -> GuestC
 }
 
 /// Convert the generic IDE configuration to OpenVMM IDE disks.
-fn ide_controllers_to_openvmm(
+async fn ide_controllers_to_openvmm(
     ide_controllers: Option<&[[Option<Drive>; 2]; 2]>,
 ) -> anyhow::Result<Vec<IdeDeviceConfig>> {
     let mut ide_disks = Vec::new();
@@ -1085,7 +1087,7 @@ fn ide_controllers_to_openvmm(
             for (controller_location, drive) in controller.iter().enumerate() {
                 if let Some(drive) = drive {
                     if let Some(disk) = &drive.disk {
-                        let disk = petri_disk_to_openvmm(disk)?;
+                        let disk = petri_disk_to_openvmm(disk).await?;
                         let guest_media = if drive.is_dvd {
                             GuestMedia::Dvd(
                                 SimpleScsiDvdHandle {
@@ -1119,7 +1121,7 @@ fn ide_controllers_to_openvmm(
 }
 
 /// Convert the generic VMBUS storage configuration to OpenVMM VMBUS and VPCI devices.
-fn vmbus_storage_controllers_to_openvmm(
+async fn vmbus_storage_controllers_to_openvmm(
     vmbus_storage_controllers: &HashMap<Guid, VmbusStorageController>,
 ) -> anyhow::Result<(
     Vec<(DeviceVtl, Resource<VmbusDeviceHandleKind>)>,
@@ -1147,7 +1149,7 @@ fn vmbus_storage_controllers_to_openvmm(
                                 lun: (*lun).try_into().expect("invalid scsi lun"),
                             },
                             device: SimpleScsiDiskHandle {
-                                disk: petri_disk_to_openvmm(disk)?,
+                                disk: petri_disk_to_openvmm(disk).await?,
                                 read_only: false,
                                 parameters: Default::default(),
                             }
@@ -1178,7 +1180,7 @@ fn vmbus_storage_controllers_to_openvmm(
                         namespaces.push(NamespaceDefinition {
                             nsid: *nsid,
                             read_only: false,
-                            disk: petri_disk_to_openvmm(disk)?,
+                            disk: petri_disk_to_openvmm(disk).await?,
                         });
                     } else {
                         todo!("dvd ({}) or empty ({})", *is_dvd, disk.is_none())

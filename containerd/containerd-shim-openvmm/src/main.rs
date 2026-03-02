@@ -44,11 +44,14 @@ enum Command {
 fn parse_args() -> anyhow::Result<Command> {
     let raw: Vec<String> = std::env::args().collect();
     if raw.len() < 2 {
-        anyhow::bail!("usage: containerd-shim-openvmm-v2 <start|serve|delete> [flags]");
+        anyhow::bail!("usage: containerd-shim-openvmm-v2 [flags] <start|serve|delete>");
     }
 
-    let subcommand = &raw[1];
+    // Containerd invokes the shim as: binary [flags...] <subcommand>
+    // Our own re-exec uses:            binary serve [flags...]
+    // Parse flexibly: the subcommand can appear anywhere as a positional arg.
 
+    let mut subcommand = None;
     let mut namespace = None;
     let mut id = None;
     let mut address = None;
@@ -56,7 +59,7 @@ fn parse_args() -> anyhow::Result<Command> {
     let mut bundle = None;
     let mut pipe_fd = None;
 
-    let mut i = 2;
+    let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
             "-namespace" => {
@@ -89,12 +92,17 @@ fn parse_args() -> anyhow::Result<Command> {
                         .context("invalid -pipe-fd value")?,
                 );
             }
+            "start" | "serve" | "delete" if subcommand.is_none() => {
+                subcommand = Some(raw[i].clone());
+            }
             other => {
                 anyhow::bail!("unknown flag: {other}");
             }
         }
         i += 1;
     }
+
+    let subcommand = subcommand.context("missing subcommand (start, serve, or delete)")?;
 
     let args = ShimArgs {
         namespace: namespace.unwrap_or_default(),
@@ -114,7 +122,7 @@ fn parse_args() -> anyhow::Result<Command> {
             })
         }
         "delete" => Ok(Command::Delete(args)),
-        other => anyhow::bail!("unknown subcommand: {other}"),
+        _ => unreachable!(),
     }
 }
 
@@ -134,7 +142,17 @@ struct Bootstrap {
 // ---------------------------------------------------------------------------
 
 fn cmd_start(args: ShimArgs) -> anyhow::Result<()> {
-    let socket_path = PathBuf::from(&args.bundle).join("shim.sock");
+    // When containerd calls `start`, it sets CWD to the bundle directory
+    // but may not pass `-bundle`. Use CWD as the bundle path if not provided.
+    let bundle = if args.bundle.is_empty() {
+        std::env::current_dir().context("failed to get current directory")?
+    } else {
+        PathBuf::from(&args.bundle)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&args.bundle))
+    };
+
+    let socket_path = bundle.join("shim.sock");
     let address = format!("unix://{}", socket_path.display());
 
     // Idempotent start: if socket already exists, return it.
@@ -149,7 +167,7 @@ fn cmd_start(args: ShimArgs) -> anyhow::Result<()> {
     }
 
     // Create bundle directory if it doesn't exist.
-    std::fs::create_dir_all(&args.bundle)?;
+    std::fs::create_dir_all(&bundle)?;
 
     // Create pipe for readiness signaling.
     let mut fds = [0i32; 2];
@@ -173,7 +191,7 @@ fn cmd_start(args: ShimArgs) -> anyhow::Result<()> {
         .arg("-publish-binary")
         .arg(&args.publish_binary)
         .arg("-bundle")
-        .arg(&args.bundle)
+        .arg(&bundle)
         .arg("-pipe-fd")
         .arg(write_fd.to_string());
 

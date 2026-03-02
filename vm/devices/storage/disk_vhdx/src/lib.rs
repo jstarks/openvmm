@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod io;
+pub mod resolver;
 
 use disk_backend::DiskError;
 use disk_backend::UnmapBehavior;

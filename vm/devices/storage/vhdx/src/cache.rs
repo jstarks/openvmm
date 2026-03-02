@@ -153,10 +153,7 @@ impl<F: AsyncFile> PageCache<F> {
     /// Returns a [`ReadPageGuard`] that provides `&[u8; PAGE_SIZE]`.
     /// The page is loaded from disk if not already cached. The lock
     /// is released when the guard is dropped.
-    pub async fn acquire_read(
-        &self,
-        key: PageKey,
-    ) -> Result<ReadPageGuard, std::io::Error> {
+    pub async fn acquire_read(&self, key: PageKey) -> Result<ReadPageGuard, std::io::Error> {
         let guard = self.acquire_inner(key, true).await?;
         Ok(ReadPageGuard { guard })
     }
@@ -311,7 +308,10 @@ impl<F: AsyncFile> PageCommit<'_, F> {
     pub async fn commit(self) -> Result<(), std::io::Error> {
         if let Some(data) = self.dirty_data {
             let file_offset = self.cache.resolve_offset(self.key)?;
-            self.cache.file.write_at(file_offset, data.as_slice()).await?;
+            self.cache
+                .file
+                .write_at(file_offset, data.as_slice())
+                .await?;
         }
         Ok(())
     }

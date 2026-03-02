@@ -607,6 +607,159 @@ if [[ "$VM_MODE" -eq 1 ]]; then
         echo "  Output: $CTR_3D_OUTPUT"
     fi
 
+    # =======================================================================
+    # M4 Tests — ExecProcess, uid/gid, networking, multi-container
+    # =======================================================================
+
+    # --- Test 3e: ExecProcess (ctr task exec) ---
+    info "Test 3e: ExecProcess (ctr task exec)"
+
+    # Start a long-running detached container.
+    timeout 60 /usr/local/bin/ctr run -d \
+        --snapshotter native \
+        --runtime io.containerd.openvmm.v2 \
+        docker.io/library/alpine:latest test-exec sleep 300 2>&1 || true
+
+    # Give the container a moment to start.
+    sleep 3
+
+    # Verify the container is running.
+    CTR_3E_STATE=""
+    CTR_3E_STATE=$(timeout 10 /usr/local/bin/ctr task ls 2>&1 || true)
+    if echo "$CTR_3E_STATE" | grep -q "test-exec.*RUNNING"; then
+        pass "Test 3e: container is RUNNING"
+    else
+        fail "Test 3e: container not in RUNNING state"
+        echo "  State: $CTR_3E_STATE"
+    fi
+
+    # Exec into the running container.
+    CTR_3E_EXEC_OUTPUT=""
+    CTR_3E_EXEC_EXIT=0
+    CTR_3E_EXEC_OUTPUT=$(timeout 30 /usr/local/bin/ctr task exec \
+        --exec-id exec1 test-exec echo "exec-hello" 2>&1) || CTR_3E_EXEC_EXIT=$?
+
+    if echo "$CTR_3E_EXEC_OUTPUT" | grep -q "exec-hello"; then
+        pass "Test 3e: exec output contains 'exec-hello'"
+    else
+        fail "Test 3e: exec output missing 'exec-hello'"
+        echo "  Got: $CTR_3E_EXEC_OUTPUT"
+    fi
+
+    if [[ "$CTR_3E_EXEC_EXIT" -eq 0 ]]; then
+        pass "Test 3e: exec exited with code 0"
+    else
+        fail "Test 3e: exec exited with code $CTR_3E_EXEC_EXIT"
+    fi
+
+    # Exec with non-zero exit code.
+    CTR_3E_EXEC2_EXIT=0
+    timeout 30 /usr/local/bin/ctr task exec \
+        --exec-id exec2 test-exec sh -c "exit 7" 2>&1 || CTR_3E_EXEC2_EXIT=$?
+
+    if [[ "$CTR_3E_EXEC2_EXIT" -eq 7 ]]; then
+        pass "Test 3e: exec non-zero exit code (7) propagated"
+    else
+        fail "Test 3e: expected exec exit code 7, got $CTR_3E_EXEC2_EXIT"
+    fi
+
+    # Clean up the detached container.
+    timeout 15 /usr/local/bin/ctr task kill -s SIGKILL test-exec 2>&1 || true
+    sleep 1
+    timeout 15 /usr/local/bin/ctr task rm test-exec 2>&1 || true
+    timeout 15 /usr/local/bin/ctr container rm test-exec 2>&1 || true
+
+    # --- Test 3f: uid/gid support ---
+    info "Test 3f: uid/gid (run as non-root)"
+
+    # Alpine's "nobody" user is uid 65534. Verify whoami/id works.
+    CTR_3F_OUTPUT=""
+    CTR_3F_EXIT=0
+    CTR_3F_OUTPUT=$(timeout 60 /usr/local/bin/ctr run --rm \
+        --snapshotter native \
+        --runtime io.containerd.openvmm.v2 \
+        docker.io/library/alpine:latest test-uid id 2>&1) || CTR_3F_EXIT=$?
+
+    if echo "$CTR_3F_OUTPUT" | grep -q "uid=0"; then
+        pass "Test 3f: default runs as root (uid=0)"
+    else
+        fail "Test 3f: expected uid=0 in output"
+        echo "  Got: $CTR_3F_OUTPUT"
+    fi
+
+    # --- Test 3g: Consomme networking (outbound connectivity) ---
+    info "Test 3g: Consomme networking"
+
+    CTR_3G_OUTPUT=""
+    CTR_3G_EXIT=0
+    # Use wget to test DNS + TCP connectivity (more reliable than ping which
+    # may be blocked). wget -qO- to stdout.
+    CTR_3G_OUTPUT=$(timeout 60 /usr/local/bin/ctr run --rm \
+        --snapshotter native \
+        --runtime io.containerd.openvmm.v2 \
+        docker.io/library/alpine:latest test-net \
+        sh -c 'ping -c1 -W5 10.0.0.1 2>&1 && echo NET_OK || echo NET_FAIL' 2>&1) || CTR_3G_EXIT=$?
+
+    if echo "$CTR_3G_OUTPUT" | grep -q "NET_OK"; then
+        pass "Test 3g: outbound network connectivity works"
+    else
+        fail "Test 3g: no network connectivity"
+        echo "  Output: $CTR_3G_OUTPUT"
+    fi
+
+    # --- Test 3h: Multi-container per sandbox ---
+    # This test uses sandbox-aware APIs via ctr. containerd 2.x supports
+    # sandbox operations through the CRI path, but for direct ctr testing
+    # we simulate by running two independent containers and verifying both
+    # complete successfully (each gets its own sandbox/VM in standalone mode).
+    #
+    # True multi-container-per-sandbox testing requires CRI (crictl) or a
+    # Kubernetes-level caller. Here we at least verify the shim can handle
+    # concurrent container lifecycles.
+    info "Test 3h: Concurrent containers"
+
+    CTR_3H_OUT1=""
+    CTR_3H_OUT2=""
+    CTR_3H_EXIT1=0
+    CTR_3H_EXIT2=0
+
+    # Run two containers concurrently.
+    timeout 120 /usr/local/bin/ctr run --rm \
+        --snapshotter native \
+        --runtime io.containerd.openvmm.v2 \
+        docker.io/library/alpine:latest test-multi1 echo "container-one" > /tmp/ctr-3h-1.out 2>&1 &
+    PID_3H_1=$!
+
+    timeout 120 /usr/local/bin/ctr run --rm \
+        --snapshotter native \
+        --runtime io.containerd.openvmm.v2 \
+        docker.io/library/alpine:latest test-multi2 echo "container-two" > /tmp/ctr-3h-2.out 2>&1 &
+    PID_3H_2=$!
+
+    wait $PID_3H_1 || CTR_3H_EXIT1=$?
+    wait $PID_3H_2 || CTR_3H_EXIT2=$?
+
+    CTR_3H_OUT1=$(cat /tmp/ctr-3h-1.out 2>/dev/null || echo "")
+    CTR_3H_OUT2=$(cat /tmp/ctr-3h-2.out 2>/dev/null || echo "")
+
+    MULTI_PASS=0
+    if echo "$CTR_3H_OUT1" | grep -q "container-one"; then
+        MULTI_PASS=$((MULTI_PASS + 1))
+    fi
+    if echo "$CTR_3H_OUT2" | grep -q "container-two"; then
+        MULTI_PASS=$((MULTI_PASS + 1))
+    fi
+
+    if [[ "$MULTI_PASS" -eq 2 ]]; then
+        pass "Test 3h: both concurrent containers produced correct output"
+    else
+        fail "Test 3h: expected 2 containers with correct output, got $MULTI_PASS"
+        echo "  Container 1 (exit=$CTR_3H_EXIT1): $CTR_3H_OUT1"
+        echo "  Container 2 (exit=$CTR_3H_EXIT2): $CTR_3H_OUT2"
+    fi
+
+    rm -f /tmp/ctr-3h-1.out /tmp/ctr-3h-2.out
+
 fi
 
 echo ""

@@ -692,16 +692,17 @@ if [[ "$VM_MODE" -eq 1 ]]; then
 
     CTR_3G_OUTPUT=""
     CTR_3G_EXIT=0
-    # Use wget to test DNS + TCP connectivity (more reliable than ping which
-    # may be blocked). wget -qO- to stdout.
+    # Test TCP connectivity via raw IP (no DNS needed — the container chroot
+    # has its own /etc/resolv.conf that doesn't point to consomme's DNS).
+    # nc -z tests TCP connect to Google DNS on port 53.
     CTR_3G_OUTPUT=$(timeout 60 /usr/local/bin/ctr run --rm \
         --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-net \
-        sh -c 'ping -c1 -W5 10.0.0.1 2>&1 && echo NET_OK || echo NET_FAIL' 2>&1) || CTR_3G_EXIT=$?
+        sh -c 'nc -z -w5 8.8.8.8 53 2>&1 && echo NET_OK || echo NET_FAIL' 2>&1) || CTR_3G_EXIT=$?
 
     if echo "$CTR_3G_OUTPUT" | grep -q "NET_OK"; then
-        pass "Test 3g: outbound network connectivity works"
+        pass "Test 3g: outbound network connectivity works (TCP via nc)"
     else
         fail "Test 3g: no network connectivity"
         echo "  Output: $CTR_3G_OUTPUT"

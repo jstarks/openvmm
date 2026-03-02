@@ -41,6 +41,10 @@ pub enum AgentRequest {
     KillContainer(FailableRpc<KillRequest, ()>),
     /// Delete a container and clean up resources.
     DeleteContainer(FailableRpc<DeleteContainerRequest, ()>),
+    /// Execute an additional process inside a running container.
+    ExecProcess(FailableRpc<ExecProcessRequest, ExecProcessResponse>),
+    /// List processes running inside a container.
+    ListPids(FailableRpc<ListPidsRequest, ListPidsResponse>),
 }
 
 /// Request to create a container.
@@ -90,6 +94,8 @@ pub struct KillRequest {
     pub id: String,
     /// Signal number (e.g. SIGTERM=15, SIGKILL=9).
     pub signal: u32,
+    /// If set, target a specific exec process instead of the init process.
+    pub exec_id: Option<String>,
 }
 
 /// Request to delete a container.
@@ -97,6 +103,8 @@ pub struct KillRequest {
 pub struct DeleteContainerRequest {
     /// Container ID.
     pub id: String,
+    /// If set, delete a specific exec process instead of the whole container.
+    pub exec_id: Option<String>,
 }
 
 /// Exit status of a container process.
@@ -106,4 +114,53 @@ pub struct ExitStatus {
     pub code: i32,
     /// When the process exited (Unix timestamp, nanoseconds).
     pub exited_at: u64,
+}
+
+/// Request to execute an additional process inside a running container.
+#[derive(MeshPayload)]
+pub struct ExecProcessRequest {
+    /// Container ID.
+    pub container_id: String,
+    /// Unique exec identifier.
+    pub exec_id: String,
+    /// OCI Process spec JSON (just the "process" portion).
+    pub spec_json: String,
+    /// Stdin pipe (host→guest data flow). None if not requested.
+    pub stdin: Option<ReadPipe>,
+    /// Stdout pipe (guest→host data flow). None if not requested.
+    pub stdout: Option<WritePipe>,
+    /// Stderr pipe (guest→host data flow). None if not requested.
+    pub stderr: Option<WritePipe>,
+    /// Whether to allocate a PTY (terminal mode).
+    pub terminal: bool,
+}
+
+/// Response to ExecProcess.
+#[derive(MeshPayload)]
+pub struct ExecProcessResponse {
+    /// PID of the exec process inside the guest.
+    pub pid: u32,
+    /// Receives exit status when the exec process exits.
+    pub exit_status: mesh::OneshotReceiver<ExitStatus>,
+}
+
+/// Request to list processes in a container.
+#[derive(MeshPayload)]
+pub struct ListPidsRequest {
+    /// Container ID.
+    pub container_id: String,
+}
+
+/// Response to ListPids.
+#[derive(MeshPayload)]
+pub struct ListPidsResponse {
+    /// PIDs of processes running in the container.
+    pub pids: Vec<ProcessInfo>,
+}
+
+/// Information about a process.
+#[derive(MeshPayload)]
+pub struct ProcessInfo {
+    /// Process ID.
+    pub pid: u32,
 }

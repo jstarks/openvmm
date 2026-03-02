@@ -13,12 +13,15 @@ path = "src/main.rs"
 [dependencies]
 containerd_shim_agent_protocol.workspace = true
 containerd_shim_protos.workspace = true
+guid.workspace = true
 mesh.workspace = true
 mesh_remote.workspace = true
 mesh_rpc.workspace = true
 mesh_worker.workspace = true
+net_backend_resources.workspace = true
+netvsp_resources.workspace = true
 openvmm_defs.workspace = true
-openvmm_resources = { workspace = true, features = ["virt_kvm"] }
+openvmm_resources = { workspace = true, features = ["virt_kvm", "net_consomme"] }
 virtio_resources.workspace = true
 unix_socket.workspace = true
 pal_async.workspace = true

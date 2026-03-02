@@ -12,12 +12,17 @@ use containerd_shim_agent_protocol::AgentBootstrap;
 use containerd_shim_agent_protocol::AgentRequest;
 use futures::FutureExt;
 use futures::StreamExt;
+use guid::Guid;
 use mesh::rpc::RpcSend;
 use mesh_remote::PointToPointMesh;
 use mesh_worker::RegisteredWorkers;
+use net_backend_resources::consomme::ConsommeHandle;
+use net_backend_resources::mac_address::MacAddress;
+use netvsp_resources::NetvspHandle;
 use openvmm_defs::config::Config;
 use openvmm_defs::config::DEFAULT_MMIO_GAPS_X86;
 use openvmm_defs::config::DEFAULT_PCIE_ECAM_BASE;
+use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MemoryConfig;
@@ -54,6 +59,8 @@ pub struct VmConfig {
     pub memory_mb: u64,
     /// Directory shared into the VM via virtiofs for container rootfs mounts.
     pub containers_dir: PathBuf,
+    /// Whether to attach a network device (consomme userspace NAT).
+    pub networking: bool,
 }
 
 /// A running VM with its control channels.
@@ -83,29 +90,52 @@ impl Drop for RunningVm {
     }
 }
 
-/// Resolve VM configuration from environment variables.
+/// Resolve VM configuration from environment variables and sandbox annotations.
+///
+/// Annotations (from `CreateSandboxRequest.annotations`) override environment
+/// variables. Supported annotation keys:
+///
+/// | Annotation key              | Env var equivalent          | Default |
+/// |-----------------------------|-----------------------------|---------|
+/// | `io.openvmm.kernel`         | `OPENVMM_SHIM_KERNEL`       | (required) |
+/// | `io.openvmm.agent`          | `OPENVMM_SHIM_AGENT`        | (required) |
+/// | `io.openvmm.cpus`           | `OPENVMM_SHIM_CPUS`         | 1       |
+/// | `io.openvmm.memory_mb`      | `OPENVMM_SHIM_MEMORY_MB`    | 256     |
+/// | `io.openvmm.networking`     | `OPENVMM_SHIM_NETWORKING`   | true    |
 ///
 /// `bundle` is the containerd bundle directory — a `containers/` subdirectory
 /// is created under it and shared into the VM via virtiofs.
-pub fn resolve_config(bundle: &std::path::Path) -> anyhow::Result<VmConfig> {
-    let kernel_path = std::env::var("OPENVMM_SHIM_KERNEL")
-        .context("OPENVMM_SHIM_KERNEL environment variable not set")?;
-    let agent_path = std::env::var("OPENVMM_SHIM_AGENT")
-        .context("OPENVMM_SHIM_AGENT environment variable not set")?;
+pub fn resolve_config(
+    bundle: &std::path::Path,
+    annotations: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<VmConfig> {
+    // Helper: try annotation first, then env var.
+    let get = |annotation_key: &str, env_key: &str| -> Option<String> {
+        annotations
+            .get(annotation_key)
+            .cloned()
+            .or_else(|| std::env::var(env_key).ok())
+    };
+
+    let kernel_path = get("io.openvmm.kernel", "OPENVMM_SHIM_KERNEL")
+        .context("kernel path not set (set OPENVMM_SHIM_KERNEL or annotation io.openvmm.kernel)")?;
+    let agent_path = get("io.openvmm.agent", "OPENVMM_SHIM_AGENT")
+        .context("agent path not set (set OPENVMM_SHIM_AGENT or annotation io.openvmm.agent)")?;
     let containers_dir = bundle.join("containers");
     std::fs::create_dir_all(&containers_dir).context("failed to create containers dir")?;
     Ok(VmConfig {
         kernel_path: PathBuf::from(kernel_path),
         agent_path: PathBuf::from(agent_path),
-        cpus: std::env::var("OPENVMM_SHIM_CPUS")
-            .ok()
+        cpus: get("io.openvmm.cpus", "OPENVMM_SHIM_CPUS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
-        memory_mb: std::env::var("OPENVMM_SHIM_MEMORY_MB")
-            .ok()
+        memory_mb: get("io.openvmm.memory_mb", "OPENVMM_SHIM_MEMORY_MB")
             .and_then(|v| v.parse().ok())
             .unwrap_or(256),
         containers_dir,
+        networking: get("io.openvmm.networking", "OPENVMM_SHIM_NETWORKING")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true),
     })
 }
 
@@ -207,7 +237,20 @@ pub async fn launch_vm(
             vtl2_redirect: false,
         }),
         vtl2_vmbus: None,
-        vmbus_devices: vec![],
+        vmbus_devices: if config.networking {
+            vec![(
+                DeviceVtl::Vtl0,
+                NetvspHandle {
+                    instance_id: Guid::new_random(),
+                    mac_address: MacAddress::new([0x00, 0x15, 0x5D, 0xDE, 0xAD, 0x01]),
+                    endpoint: ConsommeHandle { cidr: None }.into_resource(),
+                    max_queues: None,
+                }
+                .into_resource(),
+            )]
+        } else {
+            vec![]
+        },
         chipset_devices: chipset.chipset_devices,
         input: mesh::Receiver::new(),
         framebuffer: None,

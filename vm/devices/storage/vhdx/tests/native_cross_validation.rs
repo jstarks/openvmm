@@ -25,6 +25,7 @@ use std::sync::Arc;
 use vhdx::AsyncFile;
 use vhdx::ReadRange;
 use vhdx::TrimMode;
+use vhdx::TrimRequest;
 use vhdx::WriteRange;
 
 use windows::Win32::Foundation::CloseHandle;
@@ -494,7 +495,7 @@ impl RustVhdx {
     /// Trim a range of the virtual disk.
     async fn trim_range(&self, offset: u64, length: u64) {
         self.vhdx
-            .trim(TrimMode::Zero, offset, length, false, false)
+            .trim(TrimRequest::new(TrimMode::Zero, offset, length))
             .await
             .expect("trim");
     }

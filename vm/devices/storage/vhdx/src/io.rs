@@ -2900,6 +2900,7 @@ mod tests {
     // ---- Phase 16b: Concurrent write+trim and mixed-workload stress tests ----
 
     use crate::trim::TrimMode;
+    use crate::trim::TrimRequest;
 
     #[async_test]
     async fn concurrent_write_and_trim_same_block() {
@@ -2922,7 +2923,7 @@ mod tests {
             },
             async {
                 vhdx_t
-                    .trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+                    .trim(TrimRequest::new(TrimMode::FileSpace, 0, block_size as u64))
                     .await
             }
         );
@@ -2956,7 +2957,7 @@ mod tests {
         write_block(&*vhdx, 0, block_size, 0xAA).await;
 
         // Sequential: trim → rewrite. Verify the trim→re-allocate path.
-        vhdx.trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, block_size as u64))
             .await
             .unwrap();
 
@@ -2981,7 +2982,7 @@ mod tests {
         let (trim_result, write_result) = futures::join!(
             async {
                 vhdx_t
-                    .trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+                    .trim(TrimRequest::new(TrimMode::FileSpace, 0, block_size as u64))
                     .await
             },
             async {
@@ -3091,11 +3092,11 @@ mod tests {
                             8 => {
                                 // Trim (10%)
                                 vhdx.trim(
-                                    TrimMode::FileSpace,
-                                    block_offset,
-                                    bs as u64,
-                                    false,
-                                    false,
+                                    TrimRequest::new(
+                                        TrimMode::FileSpace,
+                                        block_offset,
+                                        bs as u64,
+                                    ),
                                 )
                                 .await
                                 .unwrap();
@@ -3274,7 +3275,7 @@ mod tests {
             async { vhdx_f.flush().await },
             async {
                 vhdx_t
-                    .trim(TrimMode::FileSpace, 0, block_size as u64, false, false)
+                    .trim(TrimRequest::new(TrimMode::FileSpace, 0, block_size as u64))
                     .await
             },
             async {
@@ -3346,7 +3347,7 @@ mod tests {
                         shadow.lock()[task_id as usize] = Some(pattern_a);
 
                         // Trim.
-                        vhdx.trim(TrimMode::FileSpace, block_offset, bs as u64, false, false)
+                        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, block_offset, bs as u64))
                             .await
                             .unwrap();
                         shadow.lock()[task_id as usize] = None;

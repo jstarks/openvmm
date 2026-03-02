@@ -42,6 +42,7 @@ pub use io_guard::ReadIoGuard;
 pub use io_guard::WriteIoGuard;
 pub use open::VhdxFile;
 pub use trim::TrimMode;
+pub use trim::TrimRequest;
 
 #[cfg(test)]
 mod tests;

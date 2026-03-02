@@ -290,7 +290,7 @@ impl LayerIo for VhdxLayer {
         };
 
         self.vhdx
-            .trim(mode, offset, length, false, false)
+            .trim(vhdx::TrimRequest::new(mode, offset, length))
             .await
             .map_err(vhdx_to_disk_error)
     }

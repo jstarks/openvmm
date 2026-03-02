@@ -55,6 +55,49 @@ pub enum TrimMode {
     RemoveSoftAnchors,
 }
 
+/// Builder for a trim operation on a VHDX file.
+///
+/// Created via [`VhdxFile::trim`]. Required parameters (`mode`, `offset`,
+/// `length`) are provided at construction; optional flags default to the
+/// safe/common values and can be overridden with builder methods.
+#[derive(Debug, Clone)]
+pub struct TrimRequest {
+    mode: TrimMode,
+    offset: u64,
+    length: u64,
+    skip_disk_size_check: bool,
+    skip_write_guid_change: bool,
+}
+
+impl TrimRequest {
+    /// Create a new trim request.
+    ///
+    /// * `mode` - Determines the target block state.
+    /// * `offset` - Virtual disk byte offset (must be sector-aligned).
+    /// * `length` - Length in bytes (must be sector-aligned).
+    pub fn new(mode: TrimMode, offset: u64, length: u64) -> Self {
+        Self {
+            mode,
+            offset,
+            length,
+            skip_disk_size_check: false,
+            skip_write_guid_change: false,
+        }
+    }
+
+    /// Skip bounds checking against the virtual disk size.
+    pub fn skip_disk_size_check(mut self, skip: bool) -> Self {
+        self.skip_disk_size_check = skip;
+        self
+    }
+
+    /// Don't update DataWriteGuid when trimming.
+    pub fn skip_write_guid_change(mut self, skip: bool) -> Self {
+        self.skip_write_guid_change = skip;
+        self
+    }
+}
+
 /// Returns true if the given trim mode is allowed on fully-allocated (fixed) disks.
 fn mode_allowed_on_fixed(mode: TrimMode) -> bool {
     matches!(
@@ -209,31 +252,25 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Trim (unmap) a range of virtual disk blocks.
     ///
     /// Transitions blocks to unmapped/zero/transparent state depending on
-    /// `mode`. Only blocks fully covered by the range are trimmed.
-    ///
-    /// # Arguments
-    ///
-    /// * `mode` - Determines the target block state.
-    /// * `offset` - Virtual disk byte offset (must be sector-aligned).
-    /// * `length` - Length in bytes (must be sector-aligned).
-    /// * `skip_disk_size_check` - Skip bounds checking.
-    /// * `skip_write_guid_change` - Don't update DataWriteGuid.
+    /// the mode specified in `request`. Only blocks fully covered by the
+    /// range are trimmed.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file is read-only
     /// - Offset or length is not aligned to the logical sector size
-    /// - The range extends beyond the disk size (unless skip_disk_size_check)
+    /// - The range extends beyond the disk size (unless `skip_disk_size_check`)
     /// - The file is in a permanently failed state
-    pub async fn trim(
-        &self,
-        mode: TrimMode,
-        offset: u64,
-        length: u64,
-        skip_disk_size_check: bool,
-        skip_write_guid_change: bool,
-    ) -> Result<(), VhdxError> {
+    pub async fn trim(&self, request: TrimRequest) -> Result<(), VhdxError> {
+        let TrimRequest {
+            mode,
+            offset,
+            length,
+            skip_disk_size_check,
+            skip_write_guid_change,
+        } = request;
+
         // 1. Check read-only.
         if self.read_only {
             return Err(VhdxError::ReadOnly);
@@ -521,13 +558,11 @@ mod tests {
         assert_block_state(&vhdx, 0, BatEntryState::FullyPresent);
         assert!(block_has_file_offset(&vhdx, 0));
 
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
 
@@ -540,13 +575,11 @@ mod tests {
     async fn trim_full_block_free_space() {
         let vhdx = create_and_write_block(format::GB1, 0).await;
 
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FreeSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
 
@@ -559,7 +592,7 @@ mod tests {
     async fn trim_full_block_zero() {
         let vhdx = create_and_write_block(format::GB1, 0).await;
 
-        vhdx.trim(TrimMode::Zero, 0, vhdx.block_size() as u64, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::Zero, 0, vhdx.block_size() as u64))
             .await
             .unwrap();
 
@@ -571,13 +604,11 @@ mod tests {
     async fn trim_full_block_make_transparent() {
         let vhdx = create_and_write_block(format::GB1, 0).await;
 
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::MakeTransparent,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
 
@@ -590,26 +621,22 @@ mod tests {
         let vhdx = create_and_write_block(format::GB1, 0).await;
 
         // First trim with FileSpace to create a soft anchor.
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
         assert_block_state(&vhdx, 0, BatEntryState::Unmapped);
         assert!(block_has_file_offset(&vhdx, 0));
 
         // Now remove the soft anchor.
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::RemoveSoftAnchors,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
         assert_block_state(&vhdx, 0, BatEntryState::Unmapped);
@@ -620,25 +647,21 @@ mod tests {
     async fn trim_already_trimmed_idempotent() {
         let vhdx = create_and_write_block(format::GB1, 0).await;
 
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
         assert_block_state(&vhdx, 0, BatEntryState::Unmapped);
 
         // Second trim with FileSpace → no-op.
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
         assert_block_state(&vhdx, 0, BatEntryState::Unmapped);
@@ -652,13 +675,11 @@ mod tests {
         // Block 0 starts as NotPresent on a fresh non-differencing disk.
         assert_block_state(&vhdx, 0, BatEntryState::NotPresent);
 
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
 
@@ -699,13 +720,13 @@ mod tests {
         }
         guard.complete().await.unwrap();
 
-        vhdx.trim(TrimMode::Zero, 0, block_size as u64, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::Zero, 0, block_size as u64))
             .await
             .unwrap();
         assert_block_state(&vhdx, 0, BatEntryState::Zero);
 
         // Second Zero trim → no-op.
-        vhdx.trim(TrimMode::Zero, 0, block_size as u64, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::Zero, 0, block_size as u64))
             .await
             .unwrap();
         assert_block_state(&vhdx, 0, BatEntryState::Zero);
@@ -747,7 +768,7 @@ mod tests {
         }
 
         // Trim all 3 blocks at once.
-        vhdx.trim(TrimMode::FileSpace, 0, 3 * bs as u64, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 3 * bs as u64))
             .await
             .unwrap();
 
@@ -799,7 +820,7 @@ mod tests {
         // Trim from mid-block-0 through mid-block-2 → only block 1 is trimmed.
         let trim_offset = MB1 / 2; // mid-block-0
         let trim_length = 2 * MB1; // covers block 1 fully, partial block 0 and 2
-        vhdx.trim(TrimMode::FileSpace, trim_offset, trim_length, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, trim_offset, trim_length))
             .await
             .unwrap();
 
@@ -848,7 +869,7 @@ mod tests {
         }
 
         // Trim the entire disk.
-        vhdx.trim(TrimMode::FileSpace, 0, 4 * MB1, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 4 * MB1))
             .await
             .unwrap();
 
@@ -904,13 +925,11 @@ mod tests {
         guard.complete().await.unwrap();
 
         // Trim from block 3 to end of disk.
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             block3_offset,
             disk_size - block3_offset,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
 
@@ -931,13 +950,11 @@ mod tests {
         drop(guard);
 
         // Trim.
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
 
@@ -957,13 +974,11 @@ mod tests {
         let vhdx = create_and_write_block(format::GB1, 0).await;
 
         // Trim with FileSpace (soft anchor).
-        vhdx.trim(
+        vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
             0,
             vhdx.block_size() as u64,
-            false,
-            false,
-        )
+        ))
         .await
         .unwrap();
         assert_block_state(&vhdx, 0, BatEntryState::Unmapped);
@@ -1011,7 +1026,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         // FileSpace trim on fixed → no-op.
-        vhdx.trim(TrimMode::FileSpace, 0, 4 * MB1, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 4 * MB1))
             .await
             .unwrap();
 
@@ -1037,7 +1052,7 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         // MakeTransparent on fixed → allowed.
-        vhdx.trim(TrimMode::MakeTransparent, 0, 4 * MB1, false, false)
+        vhdx.trim(TrimRequest::new(TrimMode::MakeTransparent, 0, 4 * MB1))
             .await
             .unwrap();
 
@@ -1062,13 +1077,11 @@ mod tests {
         let (trim_result, _) = futures::join!(
             async {
                 let r = vhdx
-                    .trim(
+                    .trim(TrimRequest::new(
                         TrimMode::FileSpace,
                         0,
                         vhdx.block_size() as u64,
-                        false,
-                        false,
-                    )
+                    ))
                     .await;
                 trim_done2.store(true, std::sync::atomic::Ordering::SeqCst);
                 r
@@ -1111,13 +1124,11 @@ mod tests {
         let (trim_result, _) = futures::join!(
             async {
                 let r = vhdx
-                    .trim(
+                    .trim(TrimRequest::new(
                         TrimMode::FileSpace,
                         0,
                         vhdx.block_size() as u64,
-                        false,
-                        false,
-                    )
+                    ))
                     .await;
                 trim_done2.store(true, std::sync::atomic::Ordering::SeqCst);
                 r
@@ -1177,7 +1188,7 @@ mod tests {
 
         // Trim block 0, read block 1 concurrently.
         let (trim_result, read_result) = futures::join!(
-            vhdx.trim(TrimMode::FileSpace, 0, bs as u64, false, false),
+            vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, bs as u64)),
             async {
                 let mut ranges = Vec::new();
                 let guard = vhdx
@@ -1203,13 +1214,11 @@ mod tests {
         let vhdx = VhdxFile::open(file, true).await.unwrap();
 
         let result = vhdx
-            .trim(
+            .trim(TrimRequest::new(
                 TrimMode::FileSpace,
                 0,
                 vhdx.block_size() as u64,
-                false,
-                false,
-            )
+            ))
             .await;
         assert!(matches!(result, Err(VhdxError::ReadOnly)));
     }
@@ -1219,7 +1228,9 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
-        let result = vhdx.trim(TrimMode::FileSpace, 1, 512, false, false).await;
+        let result = vhdx
+            .trim(TrimRequest::new(TrimMode::FileSpace, 1, 512))
+            .await;
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::UnalignedIo))
@@ -1232,7 +1243,11 @@ mod tests {
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
         let result = vhdx
-            .trim(TrimMode::FileSpace, format::GB1 - 512, 1024, false, false)
+            .trim(TrimRequest::new(
+                TrimMode::FileSpace,
+                format::GB1 - 512,
+                1024,
+            ))
             .await;
         assert!(matches!(
             result,
@@ -1247,7 +1262,10 @@ mod tests {
 
         // With skip_disk_size_check, goes beyond but computes no included blocks → ok.
         let result = vhdx
-            .trim(TrimMode::FileSpace, format::GB1 - 512, 1024, true, false)
+            .trim(
+                TrimRequest::new(TrimMode::FileSpace, format::GB1 - 512, 1024)
+                    .skip_disk_size_check(true),
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -1257,7 +1275,9 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
-        let result = vhdx.trim(TrimMode::FileSpace, 0, 0, false, false).await;
+        let result = vhdx
+            .trim(TrimRequest::new(TrimMode::FileSpace, 0, 0))
+            .await;
         assert!(result.is_ok());
     }
 

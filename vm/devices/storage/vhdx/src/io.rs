@@ -3091,13 +3091,11 @@ mod tests {
                             }
                             8 => {
                                 // Trim (10%)
-                                vhdx.trim(
-                                    TrimRequest::new(
-                                        TrimMode::FileSpace,
-                                        block_offset,
-                                        bs as u64,
-                                    ),
-                                )
+                                vhdx.trim(TrimRequest::new(
+                                    TrimMode::FileSpace,
+                                    block_offset,
+                                    bs as u64,
+                                ))
                                 .await
                                 .unwrap();
                                 shadow.lock()[block as usize] = None;
@@ -3347,9 +3345,13 @@ mod tests {
                         shadow.lock()[task_id as usize] = Some(pattern_a);
 
                         // Trim.
-                        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, block_offset, bs as u64))
-                            .await
-                            .unwrap();
+                        vhdx.trim(TrimRequest::new(
+                            TrimMode::FileSpace,
+                            block_offset,
+                            bs as u64,
+                        ))
+                        .await
+                        .unwrap();
                         shadow.lock()[task_id as usize] = None;
 
                         // Write with pattern_b.

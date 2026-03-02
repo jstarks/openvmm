@@ -592,9 +592,13 @@ mod tests {
     async fn trim_full_block_zero() {
         let vhdx = create_and_write_block(format::GB1, 0).await;
 
-        vhdx.trim(TrimRequest::new(TrimMode::Zero, 0, vhdx.block_size() as u64))
-            .await
-            .unwrap();
+        vhdx.trim(TrimRequest::new(
+            TrimMode::Zero,
+            0,
+            vhdx.block_size() as u64,
+        ))
+        .await
+        .unwrap();
 
         assert_block_state(&vhdx, 0, BatEntryState::Zero);
         assert!(!block_has_file_offset(&vhdx, 0));
@@ -820,9 +824,13 @@ mod tests {
         // Trim from mid-block-0 through mid-block-2 → only block 1 is trimmed.
         let trim_offset = MB1 / 2; // mid-block-0
         let trim_length = 2 * MB1; // covers block 1 fully, partial block 0 and 2
-        vhdx.trim(TrimRequest::new(TrimMode::FileSpace, trim_offset, trim_length))
-            .await
-            .unwrap();
+        vhdx.trim(TrimRequest::new(
+            TrimMode::FileSpace,
+            trim_offset,
+            trim_length,
+        ))
+        .await
+        .unwrap();
 
         assert_block_state(&vhdx, 0, BatEntryState::FullyPresent); // partial → not trimmed
         assert_block_state(&vhdx, 1, BatEntryState::Unmapped); // fully covered → trimmed
@@ -1275,9 +1283,7 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file, false).await.unwrap();
 
-        let result = vhdx
-            .trim(TrimRequest::new(TrimMode::FileSpace, 0, 0))
-            .await;
+        let result = vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 0)).await;
         assert!(result.is_ok());
     }
 

@@ -302,6 +302,10 @@ pub enum CorruptionType {
     #[error("file size exceeds implementation limits")]
     HugeFile,
 
+    /// The log is full; not enough space for the requested entry.
+    #[error("log is full")]
+    LogFull,
+
     /// The log GUID is non-zero, indicating log replay is required.
     /// Log replay is not yet implemented.
     #[error("log replay required (log GUID is non-zero)")]

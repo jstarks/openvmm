@@ -394,9 +394,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     ///
     /// Returns `Ok(None)` for base (non-differencing) disks.
     /// Returns an error if the locator item is missing or corrupt.
-    pub async fn parent_locator(
-        &self,
-    ) -> Result<Option<crate::locator::ParentLocator>, VhdxError> {
+    pub async fn parent_locator(&self) -> Result<Option<crate::locator::ParentLocator>, VhdxError> {
         if !self.has_parent {
             return Ok(None);
         }

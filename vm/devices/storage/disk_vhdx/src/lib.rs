@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chain;
 pub mod io;
 pub mod resolver;
 

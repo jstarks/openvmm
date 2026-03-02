@@ -1576,6 +1576,7 @@ dependencies = [
 name = "disk_vhdx"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blocking",
  "disk_backend",

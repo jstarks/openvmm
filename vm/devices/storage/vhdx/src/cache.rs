@@ -1,20 +1,34 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Generic page cache for VHDX metadata pages.
+//! Write-back page cache for VHDX metadata pages.
 //!
 //! Provides a hash-table-backed, page-granularity (4 KiB) caching layer over
 //! an [`AsyncFile`]. Pages are identified by a [`PageKey`] consisting of a tag
 //! (u8) and an offset within a tagged region. Tags map to base file offsets,
 //! allowing region relocation without invalidating cached pages.
 //!
-//! This module is fully generic — it has no VHDX-specific knowledge and depends
-//! only on [`AsyncFile`] from the crate root.
+//! Modified pages accumulate as **Dirty** in the cache. On [`flush()`](PageCache::flush),
+//! dirty pages are sent to the log task via a mesh channel for WAL persistence.
+//! The log task applies them to their final file offsets in the background.
+//!
+//! Page data is stored as `Arc<[u8; PAGE_SIZE]>` to enable zero-copy flush
+//! (Arc::clone) and implicit COW (Arc::make_mut) when a page is modified while
+//! the log task holds a reference.
 
 use crate::AsyncFile;
+use crate::error::VhdxError;
+use crate::log_task::DirtyPage;
+use crate::log_task::LogRequest;
+use crate::log_task::PAGE_CLEAN;
+use crate::log_task::PAGE_DIRTY;
+use crate::log_task::PAGE_IN_LOG;
+use mesh::rpc::RpcSend;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 
 /// Page size used by the cache (4 KiB).
 pub const PAGE_SIZE: usize = 4096;
@@ -39,21 +53,29 @@ pub enum WriteMode {
 
 /// Internal per-page data.
 struct PageData {
-    /// The page contents. `None` if the page has not been loaded yet.
-    data: Option<Box<[u8; PAGE_SIZE]>>,
+    /// The page contents as `Arc` for zero-copy flush and COW.
+    /// `None` if the page has not been loaded yet.
+    data: Option<Arc<[u8; PAGE_SIZE]>>,
+    /// Page state: Clean, Dirty, or InLog.
+    state: Arc<AtomicU8>,
 }
 
-/// Write-through page cache backed by an [`AsyncFile`].
+/// Write-back page cache backed by an [`AsyncFile`].
 ///
 /// Pages are loaded on first access and kept in memory indefinitely (no
-/// eviction). Modified pages are written back to the file when a
-/// [`WritePageGuard`] is released and committed.
+/// eviction). Modified pages are marked dirty in the cache and sent to
+/// the log task on [`flush()`](Self::flush).
+///
+/// When no log sender is configured (read-only mode), dirty pages are
+/// written directly to the file on commit (write-through fallback).
 pub struct PageCache<F: AsyncFile> {
     file: Arc<F>,
     /// Page map: `PageKey` → shared handle to the cached page mutex.
     pages: Mutex<HashMap<PageKey, Arc<Mutex<PageData>>>>,
     /// Tag → base file offset mapping.
     tags: Mutex<HashMap<u8, u64>>,
+    /// Sender for log requests. `None` for read-only files.
+    log_sender: Option<mesh::Sender<LogRequest>>,
 }
 
 impl<F: AsyncFile> PageCache<F> {
@@ -63,6 +85,7 @@ impl<F: AsyncFile> PageCache<F> {
             file,
             pages: Mutex::new(HashMap::new()),
             tags: Mutex::new(HashMap::new()),
+            log_sender: None,
         }
     }
 
@@ -71,9 +94,17 @@ impl<F: AsyncFile> PageCache<F> {
         &self.file
     }
 
+    /// Set the log sender for write-back mode.
+    ///
+    /// Must be called before any writes. When set, dirty pages are sent
+    /// to the log task on flush() instead of being written directly.
+    pub fn set_log_sender(&mut self, tx: mesh::Sender<LogRequest>) {
+        self.log_sender = Some(tx);
+    }
+
     /// Register a tag with its base file offset.
     ///
-    /// Must be called before any [`acquire()`](Self::acquire) with that tag.
+    /// Must be called before any [`acquire()`](Self::acquire_read) with that tag.
     pub fn register_tag(&mut self, tag: u8, base_offset: u64) {
         self.tags.lock().insert(tag, base_offset);
     }
@@ -88,7 +119,7 @@ impl<F: AsyncFile> PageCache<F> {
     }
 
     /// Resolve a [`PageKey`] to an absolute file offset.
-    fn resolve_offset(&self, key: PageKey) -> Result<u64, std::io::Error> {
+    pub(crate) fn resolve_offset(&self, key: PageKey) -> Result<u64, std::io::Error> {
         let tags = self.tags.lock();
         let base = tags.get(&key.tag).ok_or_else(|| {
             std::io::Error::other(format!("cache tag {} not registered", key.tag))
@@ -118,7 +149,12 @@ impl<F: AsyncFile> PageCache<F> {
             let mut pages = self.pages.lock();
             pages
                 .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(PageData { data: None })))
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(PageData {
+                        data: None,
+                        state: Arc::new(AtomicU8::new(PAGE_CLEAN)),
+                    }))
+                })
                 .clone()
         };
 
@@ -128,19 +164,19 @@ impl<F: AsyncFile> PageCache<F> {
         if load_from_disk {
             let needs_load = entry.lock().data.is_none();
             if needs_load {
-                let mut buf = Box::new([0u8; PAGE_SIZE]);
-                self.file.read_at(file_offset, buf.as_mut_slice()).await?;
+                let mut buf = [0u8; PAGE_SIZE];
+                self.file.read_at(file_offset, &mut buf).await?;
 
                 let mut page = entry.lock();
                 // Another task may have loaded while we were reading.
                 if page.data.is_none() {
-                    page.data = Some(buf);
+                    page.data = Some(Arc::new(buf));
                 }
             }
         } else {
             let mut page = entry.lock();
             if page.data.is_none() {
-                page.data = Some(Box::new([0u8; PAGE_SIZE]));
+                page.data = Some(Arc::new([0u8; PAGE_SIZE]));
             }
         }
 
@@ -165,7 +201,7 @@ impl<F: AsyncFile> PageCache<F> {
     /// is loaded from disk first; with [`WriteMode::Overwrite`] it is not.
     ///
     /// The caller **must** call [`WritePageGuard::release()`] to produce a
-    /// [`PageCommit`], then `.commit().await` to write dirty data to disk.
+    /// [`PageCommit`], then `.commit().await` to mark the page dirty.
     pub async fn acquire_write(
         &self,
         key: PageKey,
@@ -181,13 +217,102 @@ impl<F: AsyncFile> PageCache<F> {
         })
     }
 
-    /// Ensure all previously written pages are durable on disk.
+    /// Flush all dirty pages through the log task.
     ///
-    /// In write-through mode every [`PageCommit::commit()`] already writes
-    /// the page data to the file. This method calls `file.flush()` to
-    /// ensure OS-level durability.
-    pub async fn flush(&self) -> Result<(), std::io::Error> {
-        self.file.flush().await
+    /// Collects all dirty pages, clones their data via `Arc::clone`
+    /// (cheap refcount bump), transitions them to InLog, and sends
+    /// a `LogRequest::Flush` to the log task.
+    ///
+    /// Returns the FSN after the log entry is durable.
+    ///
+    /// If no log sender is configured (read-only mode), delegates to
+    /// `file.flush()` directly.
+    pub async fn flush(&self) -> Result<u64, VhdxError> {
+        if self.log_sender.is_none() {
+            // No log task — write-through fallback for read-only.
+            self.file.flush().await?;
+            return Ok(0);
+        }
+
+        // Collect dirty pages.
+        let dirty_pages = {
+            let pages = self.pages.lock();
+            let mut dirty = Vec::new();
+            for (&key, entry) in pages.iter() {
+                let page = entry.lock();
+                if page.state.load(Ordering::Acquire) == PAGE_DIRTY {
+                    let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
+                    let data = page.data.as_ref().expect("dirty page has no data").clone();
+                    let state = page.state.clone();
+                    // Transition to InLog.
+                    state.store(PAGE_IN_LOG, Ordering::Release);
+                    dirty.push(DirtyPage {
+                        file_offset,
+                        data,
+                        state,
+                        pre_log_fsn: None,
+                    });
+                }
+            }
+            dirty
+        };
+
+        if dirty_pages.is_empty() {
+            return Ok(0);
+        }
+
+        // Send to log task via Rpc.
+        let sender = self.log_sender.as_ref().unwrap();
+        let result = sender
+            .call(LogRequest::Flush, dirty_pages)
+            .await
+            .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?;
+        result
+    }
+
+    /// Flush all dirty pages with an optional pre_log_fsn constraint.
+    ///
+    /// Like [`flush()`](Self::flush), but attaches the given FSN as a
+    /// pre_log_fsn to all dirty pages. The log task will wait for this
+    /// FSN to complete before including the pages in a log entry.
+    pub async fn flush_with_pre_log_fsn(&self, pre_log_fsn: Option<u64>) -> Result<u64, VhdxError> {
+        if self.log_sender.is_none() {
+            self.file.flush().await?;
+            return Ok(0);
+        }
+
+        // Collect dirty pages.
+        let dirty_pages = {
+            let pages = self.pages.lock();
+            let mut dirty = Vec::new();
+            for (&key, entry) in pages.iter() {
+                let page = entry.lock();
+                if page.state.load(Ordering::Acquire) == PAGE_DIRTY {
+                    let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
+                    let data = page.data.as_ref().expect("dirty page has no data").clone();
+                    let state = page.state.clone();
+                    state.store(PAGE_IN_LOG, Ordering::Release);
+                    dirty.push(DirtyPage {
+                        file_offset,
+                        data,
+                        state,
+                        pre_log_fsn,
+                    });
+                }
+            }
+            dirty
+        };
+
+        if dirty_pages.is_empty() {
+            return Ok(0);
+        }
+
+        let sender = self.log_sender.as_ref().unwrap();
+        let result = sender
+            .call(LogRequest::Flush, dirty_pages)
+            .await
+            .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?;
+        result
     }
 }
 
@@ -212,11 +337,14 @@ impl std::ops::Deref for ReadPageGuard {
 ///
 /// Provides `Deref<Target = [u8; PAGE_SIZE]>` and `DerefMut`.
 /// The caller **must** call [`release()`](Self::release) to get a
-/// [`PageCommit`], then `.commit().await` to write dirty data back
-/// to the file.
+/// [`PageCommit`], then `.commit().await` to mark the page dirty.
 ///
 /// Dropping a dirty `WritePageGuard` without calling `release()` panics
 /// in debug builds.
+///
+/// Arc COW: When the page is InLog (refcount > 1), `DerefMut` calls
+/// `Arc::make_mut`, which automatically clones the underlying buffer.
+/// The writer gets a private copy while the log task retains the original.
 #[must_use = "write guard must be released via .release().commit().await"]
 pub struct WritePageGuard<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
@@ -228,23 +356,31 @@ pub struct WritePageGuard<'a, F: AsyncFile> {
 impl<'a, F: AsyncFile> WritePageGuard<'a, F> {
     /// Release the page lock and return a [`PageCommit`] handle.
     ///
+    /// If the page was mutated, it is marked dirty in the cache.
     /// The `ArcMutexGuard` is dropped synchronously in this method,
     /// so the returned [`PageCommit`] is `Send`.
-    #[must_use = "call .commit().await to write dirty data to disk"]
+    #[must_use = "call .commit().await to finalize the page write"]
     pub fn release(mut self) -> PageCommit<'a, F> {
         let guard = self.guard.take().expect("guard already released");
 
-        let dirty_data = if self.dirty {
-            Some(guard.data.as_ref().expect("page data missing").clone())
-        } else {
-            None
-        };
+        if self.dirty {
+            // Mark the page dirty in the cache (if not already InLog or Dirty).
+            let current = guard.state.load(Ordering::Acquire);
+            if current == PAGE_CLEAN {
+                guard.state.store(PAGE_DIRTY, Ordering::Release);
+            } else if current == PAGE_IN_LOG {
+                // Page was InLog — Arc::make_mut already gave us a new copy.
+                // Mark the new copy as dirty.
+                guard.state.store(PAGE_DIRTY, Ordering::Release);
+            }
+            // If already Dirty, keep it Dirty.
+        }
         drop(guard);
 
         PageCommit {
             cache: self.cache,
             key: self.key,
-            dirty_data,
+            was_dirty: self.dirty,
         }
     }
 }
@@ -265,12 +401,10 @@ impl<F: AsyncFile> std::ops::Deref for WritePageGuard<'_, F> {
 impl<F: AsyncFile> std::ops::DerefMut for WritePageGuard<'_, F> {
     fn deref_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         self.dirty = true;
-        self.guard
-            .as_mut()
-            .expect("guard already released")
-            .data
-            .as_mut()
-            .expect("page data missing")
+        let guard = self.guard.as_mut().expect("guard already released");
+        // Arc COW: if page is InLog (refcount > 1), this clones the buffer.
+        // If refcount == 1 (Clean or Dirty), this is a no-op.
+        Arc::make_mut(guard.data.as_mut().expect("page data missing"))
     }
 }
 
@@ -287,31 +421,61 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
     }
 }
 
-/// Handle for committing dirty page data to disk.
+/// Handle for completing a page write operation.
 ///
 /// Returned by [`WritePageGuard::release()`]. This type is `Send` (it does
 /// not hold any mutex guard).
 ///
-/// Call [`.commit()`](Self::commit) to write the page data to the file.
-/// If the page was not mutated, `commit()` is a no-op.
-#[must_use = "call .commit().await to write dirty data to disk"]
+/// In write-back mode, [`commit()`](Self::commit) is a no-op — the page
+/// is already marked dirty in the cache by `release()`. The actual disk
+/// write happens through the log task on flush.
+///
+/// In write-through mode (no log sender), `commit()` writes the dirty
+/// page data directly to disk.
+#[must_use = "call .commit().await to finalize the page write"]
 pub struct PageCommit<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
     key: PageKey,
-    dirty_data: Option<Box<[u8; PAGE_SIZE]>>,
+    was_dirty: bool,
 }
 
 impl<F: AsyncFile> PageCommit<'_, F> {
-    /// Write the dirty page data to the file, if any.
+    /// Finalize the page write.
     ///
-    /// This is a no-op if the page was not mutated.
+    /// In write-back mode (log sender configured): no-op, the page
+    /// is already marked dirty in the cache.
+    ///
+    /// In write-through mode (no log sender): writes the dirty page
+    /// data directly to the file. This provides backward compatibility
+    /// for read-only mode and tests.
     pub async fn commit(self) -> Result<(), std::io::Error> {
-        if let Some(data) = self.dirty_data {
-            let file_offset = self.cache.resolve_offset(self.key)?;
-            self.cache
-                .file
-                .write_at(file_offset, data.as_slice())
-                .await?;
+        if !self.was_dirty {
+            return Ok(());
+        }
+
+        if self.cache.log_sender.is_some() {
+            // Write-back mode: page is already dirty in cache.
+            // Actual write happens via flush() → log task.
+            return Ok(());
+        }
+
+        // Write-through fallback: read the page data from the cache and
+        // write it directly to the file.
+        let file_offset = self.cache.resolve_offset(self.key)?;
+        let entry = {
+            let pages = self.cache.pages.lock();
+            pages.get(&self.key).cloned()
+        };
+        if let Some(entry) = entry {
+            let page = entry.lock();
+            if let Some(data) = &page.data {
+                self.cache
+                    .file
+                    .write_at(file_offset, data.as_slice())
+                    .await?;
+                // Mark clean after write-through.
+                page.state.store(PAGE_CLEAN, Ordering::Release);
+            }
         }
         Ok(())
     }

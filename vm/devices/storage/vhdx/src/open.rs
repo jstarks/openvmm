@@ -19,6 +19,7 @@ use crate::cache::PageCache;
 use crate::cache::PageKey;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
+use crate::flush::FlushSequencer;
 use crate::format;
 use crate::format::BatEntry;
 use crate::format::BatEntryState;
@@ -32,6 +33,7 @@ use crate::known_meta::read_known_metadata;
 use crate::known_meta::verify_known_metadata;
 use crate::log;
 use crate::log::LogRegion;
+use crate::log_task::LogRequest;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use crate::sector_bitmap::SBM_TAG;
@@ -148,6 +150,15 @@ pub struct VhdxFile<F: AsyncFile> {
     // Error state: once set, all operations fail.
     #[allow(dead_code)] // Phase 7+: used for error propagation on I/O path
     failed: Option<VhdxError>,
+
+    // Log task state (set when opened with log task via open_with_log).
+    /// Sender for log requests. `None` for read-only files or files opened
+    /// without a log task.
+    log_sender: Option<mesh::Sender<LogRequest>>,
+    /// Handle to the spawned log task. `None` if no log task is running.
+    log_task: Option<pal_async::task::Task<()>>,
+    /// Flush sequencer for FSN-gated ordering. `None` for read-only files.
+    pub(crate) flush_sequencer: Option<Arc<FlushSequencer>>,
 }
 
 impl<F: AsyncFile> VhdxFile<F> {
@@ -312,9 +323,156 @@ impl<F: AsyncFile> VhdxFile<F> {
             log_length: header.log_length,
             read_only,
             failed: None,
+
+            log_sender: None,
+            log_task: None,
+            flush_sequencer: None,
         })
     }
 
+    /// Open an existing VHDX file in read-only mode.
+    ///
+    /// Convenience wrapper for `open(file, true)`. No log task is spawned.
+    pub async fn open_read_only(file: F) -> Result<Self, VhdxError> {
+        Self::open(file, true).await
+    }
+}
+
+impl<F: AsyncFile + 'static> VhdxFile<F> {
+    /// Open an existing VHDX file in writable mode with a log task.
+    ///
+    /// Like [`open()`](Self::open) with `read_only = false`, but additionally
+    /// spawns a log task for crash-consistent metadata writes. The log task
+    /// receives dirty pages on `flush()` and writes them as WAL entries.
+    ///
+    /// The spawner must implement [`pal_async::task::Spawn`] to spawn the
+    /// background log task.
+    ///
+    /// Call [`close()`](Self::close) for a clean shutdown. Dropping without
+    /// close leaves the VHDX file dirty (log will be replayed on next open).
+    pub async fn open_with_log(
+        file: F,
+        spawner: &impl pal_async::task::Spawn,
+    ) -> Result<Self, VhdxError> {
+        let mut vhdx = Self::open(file, false).await?;
+
+        // Create mesh channel for log requests.
+        let (tx, rx) = mesh::channel::<LogRequest>();
+
+        // Create flush sequencer.
+        let flush_sequencer = Arc::new(FlushSequencer::new());
+
+        // Initialize the log writer.
+        let log_guid = Guid::new_random();
+        let log_region = LogRegion {
+            file_offset: vhdx.log_offset,
+            length: vhdx.log_length,
+        };
+        let file_length = vhdx.file.file_size().await.map_err(VhdxError::Io)?;
+        let log_writer =
+            log::LogWriter::initialize(vhdx.file.as_ref(), log_region, log_guid, file_length)
+                .await?;
+
+        // Write header with log_guid set (marks file as dirty).
+        // This is done BEFORE spawning the log task so the file is marked
+        // dirty before any log entries are written.
+        {
+            let mut state = vhdx.write_state.lock();
+            state.sequence_number += 1;
+
+            let mut header = Header::new_zeroed();
+            header.signature = format::HEADER_SIGNATURE;
+            header.sequence_number = state.sequence_number;
+            header.file_write_guid = state.file_write_guid;
+            header.data_write_guid = state.data_write_guid;
+            header.log_guid = log_guid;
+            header.log_version = format::LOG_VERSION;
+            header.version = format::VERSION_1;
+            header.log_length = vhdx.log_length;
+            header.log_offset = vhdx.log_offset;
+            header.checksum = 0;
+
+            let mut buf = vec![0u8; format::HEADER_SIZE as usize];
+            let hdr_bytes = header.as_bytes();
+            buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
+            let crc = format::compute_checksum(&buf, 4);
+            buf[4..8].copy_from_slice(&crc.to_le_bytes());
+
+            let offset = if state.first_header_current {
+                format::HEADER_OFFSET_2
+            } else {
+                format::HEADER_OFFSET_1
+            };
+
+            // Drop the lock before async I/O.
+            drop(state);
+            vhdx.file.write_at(offset, &buf).await?;
+            vhdx.file.flush().await?;
+
+            // Update state after flush.
+            let mut state = vhdx.write_state.lock();
+            state.first_header_current = !state.first_header_current;
+        }
+
+        // Set the log sender on the cache.
+        vhdx.cache.set_log_sender(tx.clone());
+
+        // Spawn the log task.
+        let file_clone = vhdx.file.clone();
+        let fsn_clone = flush_sequencer.clone();
+        let log_offset = vhdx.log_offset;
+        let log_length = vhdx.log_length;
+        let task = spawner.spawn(
+            "vhdx-log-task",
+            crate::log_task::run_log_task(
+                rx, file_clone, log_writer, fsn_clone, log_offset, log_length,
+            ),
+        );
+
+        vhdx.log_sender = Some(tx);
+        vhdx.log_task = Some(task);
+        vhdx.flush_sequencer = Some(flush_sequencer);
+
+        Ok(vhdx)
+    }
+
+    /// Gracefully close the VHDX file.
+    ///
+    /// Flushes all dirty pages through the log, applies all logged entries,
+    /// clears the log GUID in the header, and waits for the log task to exit.
+    ///
+    /// After this returns, the file is in a clean state (no log replay needed
+    /// on next open).
+    ///
+    /// If no log task is running (read-only or opened without log), this is
+    /// a no-op.
+    pub async fn close(mut self) -> Result<(), VhdxError> {
+        use mesh::rpc::RpcSend;
+
+        if let Some(sender) = self.log_sender.take() {
+            // First flush any dirty pages from the cache through the log.
+            self.cache.flush().await?;
+
+            // Send Close request and await response.
+            let result = sender
+                .call(LogRequest::Close, ())
+                .await
+                .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?;
+            result?;
+
+            // Drop the sender to close the channel.
+            drop(sender);
+
+            // Await the log task to exit.
+            if let Some(task) = self.log_task.take() {
+                task.await;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<F: AsyncFile> VhdxFile<F> {
     /// Load the in-memory BAT state from disk BAT pages.
     ///
     /// During parse, marks allocated blocks in the FreeSpaceTracker and

@@ -16,8 +16,8 @@
 
 #![allow(dead_code)]
 
-use crate::error::VhdxError;
 use crate::AsyncFile;
+use crate::error::VhdxError;
 use event_listener::Event;
 use parking_lot::Mutex;
 
@@ -125,11 +125,7 @@ impl FlushSequencer {
     /// is a no-op — the flush is either in progress or completed. Otherwise,
     /// it triggers a flush. Combined with [`wait_for_fsn()`](Self::wait_for_fsn),
     /// this guarantees the FSN will eventually complete.
-    pub async fn require_fsn(
-        &self,
-        file: &impl AsyncFile,
-        fsn: u64,
-    ) -> Result<(), VhdxError> {
+    pub async fn require_fsn(&self, file: &impl AsyncFile, fsn: u64) -> Result<(), VhdxError> {
         {
             let state = self.state.lock();
             if state.issued_fsn >= fsn {
@@ -149,11 +145,7 @@ impl FlushSequencer {
     }
 
     /// Inner loop: keep flushing until `completed_fsn >= target_fsn`.
-    async fn flush_until(
-        &self,
-        file: &impl AsyncFile,
-        target_fsn: u64,
-    ) -> Result<(), VhdxError> {
+    async fn flush_until(&self, file: &impl AsyncFile, target_fsn: u64) -> Result<(), VhdxError> {
         enum Action {
             Done,
             Flush(u64),
@@ -222,8 +214,8 @@ mod tests {
     use super::*;
     use crate::tests::support::InMemoryFile;
     use pal_async::async_test;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     // -- Helper wrappers --
 
@@ -364,15 +356,13 @@ mod tests {
 
         let file1 = file.clone();
         let seq1 = seq.clone();
-        let t1 = futures::FutureExt::boxed(async move {
-            seq1.flush(file1.as_ref()).await.unwrap()
-        });
+        let t1 =
+            futures::FutureExt::boxed(async move { seq1.flush(file1.as_ref()).await.unwrap() });
 
         let file2 = file.clone();
         let seq2 = seq.clone();
-        let t2 = futures::FutureExt::boxed(async move {
-            seq2.flush(file2.as_ref()).await.unwrap()
-        });
+        let t2 =
+            futures::FutureExt::boxed(async move { seq2.flush(file2.as_ref()).await.unwrap() });
 
         let (fsn1, fsn2) = futures::join!(t1, t2);
 

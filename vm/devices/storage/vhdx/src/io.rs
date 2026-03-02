@@ -895,11 +895,31 @@ impl<F: AsyncFile> VhdxFile<F> {
 
     /// Flush all writes to stable storage.
     ///
-    /// Writes any dirty BAT pages to disk, then issues a file-level flush
-    /// for durability.
+    /// Writes any dirty BAT pages to disk via the page cache, then sends
+    /// all dirty pages to the log task for WAL persistence. Finally issues
+    /// a file-level flush for durability.
+    ///
+    /// When a log task is configured (writable mode with log), dirty pages
+    /// are flushed through the log. Otherwise, falls back to direct
+    /// file flush.
     pub async fn flush(&self) -> Result<(), VhdxError> {
         self.flush_dirty_bat_pages().await?;
-        self.file.flush().await.map_err(VhdxError::Io)
+        // Flush the cache (sends dirty pages to log task or direct flush).
+        //
+        // NOTE: FSN-gated BAT logging (pre_log_fsn) is NOT applied here.
+        // The pre_log_fsn mechanism is designed to be set per-page at
+        // block-allocation time (during resolve_write), so that BAT updates
+        // referencing newly allocated blocks are not logged until the user
+        // data is durable. Setting it here would deadlock: we'd capture
+        // the current FSN, but that FSN can only complete when the log task
+        // calls flush_sequencer.flush() — which happens after it processes
+        // the very pages we're sending.
+        let _fsn = self.cache.flush().await?;
+        // If no log task, also do a direct file flush for safety.
+        if self.flush_sequencer.is_none() {
+            self.file.flush().await.map_err(VhdxError::Io)?;
+        }
+        Ok(())
     }
 }
 

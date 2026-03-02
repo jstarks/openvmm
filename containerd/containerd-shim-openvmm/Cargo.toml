@@ -11,9 +11,14 @@ name = "containerd-shim-openvmm-v2"
 path = "src/main.rs"
 
 [dependencies]
+containerd_shim_agent_protocol.workspace = true
 containerd_shim_protos.workspace = true
 mesh.workspace = true
+mesh_remote.workspace = true
 mesh_rpc.workspace = true
+mesh_worker.workspace = true
+openvmm_defs.workspace = true
+openvmm_resources = { workspace = true, features = ["virt_kvm"] }
 unix_socket.workspace = true
 pal_async.workspace = true
 futures.workspace = true
@@ -21,9 +26,14 @@ anyhow.workspace = true
 prost-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
+serial_core.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
+vm_manifest_builder.workspace = true
+vm_resource.workspace = true
+vmm_core_defs.workspace = true
 
 [lints]
 workspace = true

@@ -107,6 +107,50 @@ fi
 
 pass "Build succeeded: $SHIM_BIN"
 
+# Also build the guest agent (static musl binary for the initrd).
+info "  Building containerd-shim-agent (musl)"
+MUSL_TARGET="x86_64-unknown-linux-musl"
+if [[ "$ARCH" == "aarch64" ]]; then
+    MUSL_TARGET="aarch64-unknown-linux-musl"
+fi
+
+cargo build -p containerd_shim_agent --target "$MUSL_TARGET" --release 2>&1
+if [[ $? -ne 0 ]]; then
+    info "  musl agent build failed — Phase 3 VM tests will be skipped"
+    AGENT_BIN=""
+else
+    AGENT_BIN="$REPO_ROOT/target/$MUSL_TARGET/release/containerd-shim-agent"
+    if [[ ! -x "$AGENT_BIN" ]]; then
+        info "  Agent binary not found at $AGENT_BIN — Phase 3 VM tests will be skipped"
+        AGENT_BIN=""
+    else
+        pass "Agent build succeeded: $AGENT_BIN"
+    fi
+fi
+
+# Locate kernel for VM tests. User can override with OPENVMM_SHIM_KERNEL env var.
+KERNEL_PATH="${OPENVMM_SHIM_KERNEL:-$REPO_ROOT/.packages/underhill-deps-private/x64/vmlinux}"
+if [[ ! -f "$KERNEL_PATH" ]]; then
+    info "  Kernel not found at $KERNEL_PATH — Phase 3 VM tests will be skipped"
+    KERNEL_PATH=""
+fi
+
+# Determine if Phase 3 can run VM tests (needs agent + kernel + KVM).
+HAS_KVM=0
+if [[ -e /dev/kvm ]]; then
+    HAS_KVM=1
+fi
+CAN_VM_TEST=0
+if [[ -n "$AGENT_BIN" && -n "$KERNEL_PATH" && "$HAS_KVM" -eq 1 ]]; then
+    CAN_VM_TEST=1
+    pass "VM test prerequisites met (agent + kernel + KVM)"
+else
+    info "  VM test prerequisites not met — Phase 3 will run without VM boot validation"
+    [[ -z "$AGENT_BIN" ]] && info "    Missing: agent binary"
+    [[ -z "$KERNEL_PATH" ]] && info "    Missing: kernel ($OPENVMM_SHIM_KERNEL or default path)"
+    [[ "$HAS_KVM" -eq 0 ]] && info "    Missing: /dev/kvm"
+fi
+
 # =========================================================================
 # Phase 2: Standalone smoke tests
 # =========================================================================
@@ -309,6 +353,28 @@ info() { echo "==> $1"; }
 CTRD_VER=$(/usr/local/bin/containerd --version 2>&1 || true)
 info "containerd version: $CTRD_VER"
 
+# Create wrapper script that injects environment variables.
+# containerd does not pass env vars to shims — it exec's them directly with
+# a cleaned environment. The wrapper sets the required vars and exec's the
+# real binary.
+if [[ -f /usr/local/share/vmlinux && -f /usr/local/share/containerd-shim-agent ]]; then
+    VM_MODE=1
+    info "VM mode: kernel + agent available"
+    cat > /usr/local/bin/containerd-shim-openvmm-v2 << 'WRAPPER'
+#!/bin/bash
+export OPENVMM_SHIM_KERNEL=/usr/local/share/vmlinux
+export OPENVMM_SHIM_AGENT=/usr/local/share/containerd-shim-agent
+exec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"
+WRAPPER
+    chmod +x /usr/local/bin/containerd-shim-openvmm-v2
+else
+    VM_MODE=0
+    info "Stub mode: no kernel/agent — testing shim RPC plumbing only"
+    # Use the real binary directly (no wrapper needed).
+    ln -sf /usr/local/bin/containerd-shim-openvmm-v2-real \
+           /usr/local/bin/containerd-shim-openvmm-v2 2>/dev/null || true
+fi
+
 # Verify shim is on PATH.
 if command -v containerd-shim-openvmm-v2 &>/dev/null; then
     pass "Shim binary found on PATH: $(which containerd-shim-openvmm-v2)"
@@ -355,11 +421,17 @@ else
     pass "Image pulled"
 fi
 
-# --- Run container with our runtime ---
-info "Running ctr run --runtime io.containerd.openvmm.v2"
-timeout 15 /usr/local/bin/ctr run \
+# --- Test 3a: Standalone mode (ctr run triggers Task.Create implicit VM boot) ---
+info "Test 3a: Standalone mode (ctr run)"
+
+TIMEOUT_SECS=15
+if [[ "$VM_MODE" -eq 1 ]]; then
+    TIMEOUT_SECS=60  # VM boot takes longer
+fi
+
+timeout "$TIMEOUT_SECS" /usr/local/bin/ctr run \
     --runtime io.containerd.openvmm.v2 \
-    docker.io/library/alpine:latest test-1 echo hello 2>&1 || true
+    docker.io/library/alpine:latest test-standalone echo hello 2>&1 || true
 
 # Give shim log a moment to flush.
 sleep 1
@@ -406,6 +478,41 @@ else
     fail "shim.log missing both 'task.Create' and 'sandbox.CreateSandbox'"
 fi
 
+# VM-specific checks (only if kernel + agent were available).
+if [[ "$VM_MODE" -eq 1 ]]; then
+    if grep -q "standalone mode: VM booted" "$SHIM_LOG"; then
+        pass "shim.log contains 'standalone mode: VM booted'"
+    else
+        fail "shim.log missing 'standalone mode: VM booted'"
+    fi
+
+    if grep -q "VM resumed" "$SHIM_LOG"; then
+        pass "shim.log contains 'VM resumed'"
+    else
+        fail "shim.log missing 'VM resumed'"
+    fi
+
+    if grep -q "agent connected" "$SHIM_LOG"; then
+        pass "shim.log contains 'agent connected'"
+    else
+        fail "shim.log missing 'agent connected'"
+    fi
+
+    if grep -q "agent bootstrap complete" "$SHIM_LOG"; then
+        pass "shim.log contains 'agent bootstrap complete'"
+    else
+        fail "shim.log missing 'agent bootstrap complete'"
+    fi
+
+    # Check for failures.
+    if grep -q "failed to" "$SHIM_LOG"; then
+        fail "shim.log contains 'failed to' error(s):"
+        grep "failed to" "$SHIM_LOG" | while read -r line; do
+            echo "  $line"
+        done
+    fi
+fi
+
 # Bonus checks (don't fail on these).
 if grep -q "sandbox.CreateSandbox" "$SHIM_LOG"; then
     info "Bonus: shim.log contains 'sandbox.CreateSandbox'"
@@ -424,8 +531,27 @@ exit $FAILURES
 INNER_EOF
 
 DOCKER_EXIT=0
-DOCKER_OUTPUT=$(docker run --rm --privileged \
-    -v "$SHIM_BIN":/usr/local/bin/containerd-shim-openvmm-v2:ro \
+
+# Build docker run arguments.
+DOCKER_ARGS=(
+    --rm --privileged
+    -v "$SHIM_BIN":/usr/local/bin/containerd-shim-openvmm-v2-real:ro
+)
+
+# Mount KVM device if available.
+if [[ -e /dev/kvm ]]; then
+    DOCKER_ARGS+=(--device /dev/kvm)
+fi
+
+# Mount agent and kernel binaries if available (for VM tests).
+if [[ -n "${AGENT_BIN:-}" && -f "${AGENT_BIN:-}" ]]; then
+    DOCKER_ARGS+=(-v "$AGENT_BIN":/usr/local/share/containerd-shim-agent:ro)
+fi
+if [[ -n "${KERNEL_PATH:-}" && -f "${KERNEL_PATH:-}" ]]; then
+    DOCKER_ARGS+=(-v "$KERNEL_PATH":/usr/local/share/vmlinux:ro)
+fi
+
+DOCKER_OUTPUT=$(docker run "${DOCKER_ARGS[@]}" \
     "$DOCKER_IMAGE" \
     bash -c "$INNER_SCRIPT" 2>&1) || DOCKER_EXIT=$?
 

@@ -857,18 +857,28 @@ name = "containerd_shim_openvmm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "containerd_shim_agent_protocol",
  "containerd_shim_protos",
  "futures",
  "libc",
  "mesh",
+ "mesh_remote",
  "mesh_rpc",
+ "mesh_worker",
+ "openvmm_defs",
+ "openvmm_resources",
  "pal_async",
  "prost-types",
  "serde",
  "serde_json",
+ "serial_core",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "unix_socket",
+ "vm_manifest_builder",
+ "vm_resource",
+ "vmm_core_defs",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ pub fn build_initrd(agent_binary: &[u8]) -> Vec<u8> {
 }
 
 /// Write a cpio newc archive to a file, containing the given binary as `/init`.
+#[allow(dead_code)]
 pub fn write_initrd(mut writer: impl Write, agent_binary: &[u8]) -> io::Result<()> {
     let data = build_initrd(agent_binary);
     writer.write_all(&data)

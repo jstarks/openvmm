@@ -11,10 +11,16 @@
 #![allow(unsafe_code)]
 
 mod initrd;
+mod vm;
+
+// Force-link openvmm_resources to register workers and resource resolvers.
+extern crate openvmm_resources as _;
 
 use anyhow::Context as _;
+use containerd_shim_agent_protocol::AgentRequest;
 use containerd_shim_protos as protos;
 use futures::StreamExt;
+use mesh::rpc::RpcSend;
 use mesh_rpc::service::Code;
 use mesh_rpc::service::ServiceRpc;
 use mesh_rpc::service::Status;
@@ -313,13 +319,13 @@ async fn run_server(
         }
     });
 
-    let mut state = ShimState::new(args);
+    let mut state = ShimState::new(args, driver.clone());
 
     loop {
         futures::select! {
             msg = task_recv.next() => match msg {
                 Some((_ctx, request)) => {
-                    if state.handle_task(request) {
+                    if state.handle_task(request).await {
                         break;
                     }
                 }
@@ -327,7 +333,7 @@ async fn run_server(
             },
             msg = sandbox_recv.next() => match msg {
                 Some((_ctx, request)) => {
-                    state.handle_sandbox(request);
+                    state.handle_sandbox(request).await;
                 }
                 None => break,
             },
@@ -351,8 +357,22 @@ async fn run_server(
 
 struct ShimState {
     args: ShimArgs,
-    sandbox_created: bool,
+    driver: pal_async::DefaultDriver,
+    /// VM lifecycle state.
+    vm_state: VmState,
+    /// Task metadata (container tracking).
     containers: HashMap<String, ContainerState>,
+}
+
+enum VmState {
+    /// No sandbox created yet. VM will be booted on first Task.Create (standalone mode).
+    Initial,
+    /// Sandbox created, VM config resolved, but VM not yet booted.
+    Configured(vm::VmConfig),
+    /// VM is running, agent connected.
+    Running(vm::RunningVm),
+    /// VM has stopped.
+    Stopped,
 }
 
 struct ContainerState {
@@ -363,19 +383,55 @@ struct ContainerState {
 }
 
 impl ShimState {
-    fn new(args: ShimArgs) -> Self {
+    fn new(args: ShimArgs, driver: pal_async::DefaultDriver) -> Self {
         Self {
             args,
-            sandbox_created: false,
+            driver,
+            vm_state: VmState::Initial,
             containers: HashMap::new(),
         }
     }
 
+    fn sandbox_created(&self) -> bool {
+        !matches!(self.vm_state, VmState::Initial)
+    }
+
     /// Handle a Task RPC. Returns `true` if the shim should shut down.
-    fn handle_task(&mut self, request: protos::Task) -> bool {
+    async fn handle_task(&mut self, request: protos::Task) -> bool {
         match request {
             protos::Task::Create(req, resp) => {
                 tracing::info!(id = %req.id, bundle = %req.bundle, "task.Create");
+
+                // Standalone mode: if no VM running, boot one now.
+                if matches!(self.vm_state, VmState::Initial) {
+                    match vm::resolve_config() {
+                        Ok(config) => match vm::launch_vm(&self.driver, &config).await {
+                            Ok(running) => {
+                                self.vm_state = VmState::Running(running);
+                                tracing::info!("standalone mode: VM booted");
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to boot VM in standalone mode");
+                                resp.send(Err(Status {
+                                    code: Code::Internal.into(),
+                                    message: format!("{e:#}"),
+                                    details: vec![],
+                                }));
+                                return false;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to resolve VM config");
+                            resp.send(Err(Status {
+                                code: Code::Internal.into(),
+                                message: format!("{e:#}"),
+                                details: vec![],
+                            }));
+                            return false;
+                        }
+                    }
+                }
+
                 self.containers.insert(
                     req.id.clone(),
                     ContainerState {
@@ -446,8 +502,15 @@ impl ShimState {
             protos::Task::Shutdown(_req, resp) => {
                 tracing::info!("task.Shutdown");
                 resp.send(Ok(()));
-                // Only shut down if we are NOT in sandbox mode.
-                !self.sandbox_created
+                if !self.sandbox_created() {
+                    // Standalone mode — shut down VM.
+                    if let VmState::Running(ref mut vm) = self.vm_state {
+                        let _ = vm::shutdown_vm(&self.driver, vm).await;
+                    }
+                    self.vm_state = VmState::Stopped;
+                    return true; // exit shim
+                }
+                false
             }
             other => {
                 tracing::warn!(method = other.method(), "unimplemented task method");
@@ -461,25 +524,67 @@ impl ShimState {
         }
     }
 
-    fn handle_sandbox(&mut self, request: protos::Sandbox) {
+    async fn handle_sandbox(&mut self, request: protos::Sandbox) {
         match request {
             protos::Sandbox::CreateSandbox(req, resp) => {
                 tracing::info!(sandbox_id = %req.sandbox_id, "sandbox.CreateSandbox");
-                self.sandbox_created = true;
-                resp.send(Ok(
-                    protos::containerd::runtime::sandbox::v1::CreateSandboxResponse {},
-                ));
+                match vm::resolve_config() {
+                    Ok(config) => {
+                        self.vm_state = VmState::Configured(config);
+                        resp.send(Ok(
+                            protos::containerd::runtime::sandbox::v1::CreateSandboxResponse {},
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to resolve VM config");
+                        resp.send(Err(Status {
+                            code: Code::InvalidArgument.into(),
+                            message: format!("{e:#}"),
+                            details: vec![],
+                        }));
+                    }
+                }
             }
             protos::Sandbox::StartSandbox(_req, resp) => {
-                let pid = std::process::id();
-                tracing::info!(pid, "sandbox.StartSandbox");
-                resp.send(Ok(
-                    protos::containerd::runtime::sandbox::v1::StartSandboxResponse {
-                        pid,
-                        created_at: Some(prost_types::Timestamp::default()),
-                        spec: None,
-                    },
-                ));
+                tracing::info!("sandbox.StartSandbox");
+                match &self.vm_state {
+                    VmState::Configured(_) => {
+                        // Take the config out of the state.
+                        let config =
+                            match std::mem::replace(&mut self.vm_state, VmState::Initial) {
+                                VmState::Configured(c) => c,
+                                _ => unreachable!(),
+                            };
+                        match vm::launch_vm(&self.driver, &config).await {
+                            Ok(running) => {
+                                self.vm_state = VmState::Running(running);
+                                resp.send(Ok(
+                                    protos::containerd::runtime::sandbox::v1::StartSandboxResponse {
+                                        pid: std::process::id(),
+                                        created_at: Some(prost_types::Timestamp::default()),
+                                        spec: None,
+                                    },
+                                ));
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to launch VM");
+                                self.vm_state = VmState::Stopped;
+                                resp.send(Err(Status {
+                                    code: Code::Internal.into(),
+                                    message: format!("{e:#}"),
+                                    details: vec![],
+                                }));
+                            }
+                        }
+                    }
+                    _ => {
+                        resp.send(Err(Status {
+                            code: Code::FailedPrecondition.into(),
+                            message: "sandbox not in Configured state".into(),
+                            details: vec![],
+                        }));
+                    }
+                }
             }
             protos::Sandbox::Platform(_req, resp) => {
                 tracing::info!("sandbox.Platform");
@@ -496,6 +601,12 @@ impl ShimState {
             }
             protos::Sandbox::StopSandbox(_req, resp) => {
                 tracing::info!("sandbox.StopSandbox");
+                if let VmState::Running(ref mut vm) = self.vm_state {
+                    if let Err(e) = vm::shutdown_vm(&self.driver, vm).await {
+                        tracing::error!(error = %e, "VM shutdown error");
+                    }
+                }
+                self.vm_state = VmState::Stopped;
                 resp.send(Ok(
                     protos::containerd::runtime::sandbox::v1::StopSandboxResponse {},
                 ));
@@ -512,9 +623,26 @@ impl ShimState {
             }
             protos::Sandbox::PingSandbox(_req, resp) => {
                 tracing::info!("sandbox.PingSandbox");
-                resp.send(Ok(
-                    protos::containerd::runtime::sandbox::v1::PingResponse {},
-                ));
+                if let VmState::Running(vm) = &self.vm_state {
+                    match vm.agent_requests.call(AgentRequest::Ping, ()).await {
+                        Ok(()) => {
+                            resp.send(Ok(
+                                protos::containerd::runtime::sandbox::v1::PingResponse {},
+                            ));
+                        }
+                        Err(e) => {
+                            resp.send(Err(Status {
+                                code: Code::Unavailable.into(),
+                                message: format!("ping failed: {e}"),
+                                details: vec![],
+                            }));
+                        }
+                    }
+                } else {
+                    resp.send(Ok(
+                        protos::containerd::runtime::sandbox::v1::PingResponse {},
+                    ));
+                }
             }
             protos::Sandbox::SandboxStatus(_req, resp) => {
                 tracing::info!("sandbox.SandboxStatus");

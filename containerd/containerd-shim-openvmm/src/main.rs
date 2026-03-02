@@ -90,8 +90,7 @@ fn parse_args() -> anyhow::Result<Command> {
             }
             "-publish-binary" => {
                 i += 1;
-                publish_binary =
-                    Some(raw.get(i).context("missing -publish-binary value")?.clone());
+                publish_binary = Some(raw.get(i).context("missing -publish-binary value")?.clone());
             }
             "-bundle" => {
                 i += 1;
@@ -130,10 +129,7 @@ fn parse_args() -> anyhow::Result<Command> {
         "start" => Ok(Command::Start(args)),
         "serve" => {
             let fd = pipe_fd.context("-pipe-fd is required for serve")?;
-            Ok(Command::Serve {
-                args,
-                pipe_fd: fd,
-            })
+            Ok(Command::Serve { args, pipe_fd: fd })
         }
         "delete" => Ok(Command::Delete(args)),
         _ => unreachable!(),
@@ -187,8 +183,7 @@ fn cmd_start(args: ShimArgs) -> anyhow::Result<()> {
     let mut fds = [0i32; 2];
     // SAFETY: libc::pipe writes two fds into the array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to create readiness pipe");
+        return Err(std::io::Error::last_os_error()).context("failed to create readiness pipe");
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
 
@@ -239,7 +234,9 @@ fn cmd_start(args: ShimArgs) -> anyhow::Result<()> {
     // SAFETY: read_fd is a valid fd we just created via pipe().
     let mut read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
     let mut buf = [0u8; 64];
-    let _n = read_file.read(&mut buf).context("failed to read readiness signal")?;
+    let _n = read_file
+        .read(&mut buf)
+        .context("failed to read readiness signal")?;
 
     // Print bootstrap JSON.
     let bootstrap = Bootstrap {
@@ -280,8 +277,8 @@ fn cmd_serve(args: ShimArgs, pipe_fd: i32) -> anyhow::Result<()> {
         let socket_path = PathBuf::from(&args.bundle).join("shim.sock");
 
         // Bind Unix socket.
-        let listener = unix_socket::UnixListener::bind(&socket_path)
-            .context("failed to bind shim socket")?;
+        let listener =
+            unix_socket::UnixListener::bind(&socket_path).context("failed to bind shim socket")?;
 
         tracing::info!(path = %socket_path.display(), "listening");
 
@@ -619,10 +616,7 @@ impl ShimState {
                     .write(true)
                     .open(&stdout_path)
                     .expect("failed to open stdout FIFO");
-                let _ = block_on(futures::io::copy(
-                    read_pipe,
-                    &mut AllowStdIo::new(file),
-                ));
+                let _ = block_on(futures::io::copy(read_pipe, &mut AllowStdIo::new(file)));
             }));
         }
 
@@ -636,10 +630,7 @@ impl ShimState {
                     .write(true)
                     .open(&stderr_path)
                     .expect("failed to open stderr FIFO");
-                let _ = block_on(futures::io::copy(
-                    read_pipe,
-                    &mut AllowStdIo::new(file),
-                ));
+                let _ = block_on(futures::io::copy(read_pipe, &mut AllowStdIo::new(file)));
             }));
         }
 
@@ -653,10 +644,7 @@ impl ShimState {
                     .read(true)
                     .open(&stdin_path)
                     .expect("failed to open stdin FIFO");
-                let _ = block_on(futures::io::copy(
-                    AllowStdIo::new(file),
-                    &mut write_pipe,
-                ));
+                let _ = block_on(futures::io::copy(AllowStdIo::new(file), &mut write_pipe));
             }));
         }
 
@@ -717,10 +705,7 @@ impl ShimState {
             .map_err(|e| anyhow::anyhow!("StartContainer RPC failed: {e}"))?
             .map_err(|e| anyhow::anyhow!("StartContainer failed: {e}"))?;
 
-        let container = self
-            .containers
-            .get_mut(id)
-            .context("container not found")?;
+        let container = self.containers.get_mut(id).context("container not found")?;
 
         container.pid = start_resp.pid;
         container.status = protos::containerd::v1::types::Status::Running as i32;
@@ -735,10 +720,7 @@ impl ShimState {
         &mut self,
         id: &str,
     ) -> anyhow::Result<protos::containerd::task::v3::WaitResponse> {
-        let container = self
-            .containers
-            .get_mut(id)
-            .context("container not found")?;
+        let container = self.containers.get_mut(id).context("container not found")?;
 
         // If we already have cached exit info, return it.
         if let (Some(code), Some(exited_at)) = (container.exit_code, container.exited_at.clone()) {
@@ -807,24 +789,19 @@ impl ShimState {
         vm.agent_requests
             .call(
                 AgentRequest::DeleteContainer,
-                DeleteContainerRequest {
-                    id: id.to_string(),
-                },
+                DeleteContainerRequest { id: id.to_string() },
             )
             .await
             .map_err(|e| anyhow::anyhow!("DeleteContainer RPC failed: {e}"))?
             .map_err(|e| anyhow::anyhow!("DeleteContainer failed: {e}"))?;
 
         // Clean up host-side state.
-        let container = self
-            .containers
-            .remove(id)
-            .context("container not found")?;
+        let container = self.containers.remove(id).context("container not found")?;
 
         // Unmount overlay.
         if let Some(rootfs_mount) = &container.rootfs_mount_path {
-            let path_c = std::ffi::CString::new(rootfs_mount.to_string_lossy().as_ref())
-                .unwrap_or_default();
+            let path_c =
+                std::ffi::CString::new(rootfs_mount.to_string_lossy().as_ref()).unwrap_or_default();
             // SAFETY: umount2 with a valid path.
             unsafe {
                 libc::umount2(path_c.as_ptr(), 0);
@@ -878,11 +855,10 @@ impl ShimState {
                 match &self.vm_state {
                     VmState::Configured(_) => {
                         // Take the config out of the state.
-                        let config =
-                            match std::mem::replace(&mut self.vm_state, VmState::Initial) {
-                                VmState::Configured(c) => c,
-                                _ => unreachable!(),
-                            };
+                        let config = match std::mem::replace(&mut self.vm_state, VmState::Initial) {
+                            VmState::Configured(c) => c,
+                            _ => unreachable!(),
+                        };
                         match vm::launch_vm(&self.driver, &config).await {
                             Ok(running) => {
                                 self.vm_state = VmState::Running(running);
@@ -1010,13 +986,22 @@ fn cmd_delete(args: ShimArgs) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    // Print a DeleteResponse to stdout (containerd reads this).
-    let response = serde_json::json!({
-        "pid": 0,
-        "exitStatus": 0,
-        "exitedAt": "0001-01-01T00:00:00Z"
-    });
-    println!("{response}");
+    // Write protobuf-encoded DeleteResponse to stdout.
+    // containerd expects wire-format protobuf, not JSON.
+    use prost::Message;
+    let response = protos::containerd::task::v3::DeleteResponse {
+        pid: 0,
+        exit_status: 0,
+        exited_at: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 0,
+        }),
+    };
+    let mut buf = Vec::with_capacity(response.encoded_len());
+    response.encode(&mut buf).context("failed to encode DeleteResponse")?;
+    std::io::stdout()
+        .write_all(&buf)
+        .context("failed to write DeleteResponse")?;
     Ok(())
 }
 
@@ -1054,21 +1039,43 @@ use std::os::unix::io::FromRawFd;
 // Overlay mount helpers
 // ---------------------------------------------------------------------------
 
-/// Apply containerd's rootfs mounts (typically overlay) on the host.
+/// Apply containerd's rootfs mounts (typically overlay or bind) on the host.
 fn apply_rootfs_mounts(
     mounts: &[protos::containerd::types::Mount],
     target: &std::path::Path,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(target)?;
     for mount in mounts {
-        let options = mount.options.join(",");
+        let mut flags: u64 = 0;
+        let mut data_opts = Vec::new();
+
+        // Parse mount options into flags vs. data.
+        for opt in &mount.options {
+            match opt.as_str() {
+                "rbind" => flags |= libc::MS_BIND as u64 | libc::MS_REC as u64,
+                "bind" => flags |= libc::MS_BIND as u64,
+                "ro" => flags |= libc::MS_RDONLY as u64,
+                "nosuid" => flags |= libc::MS_NOSUID as u64,
+                "nodev" => flags |= libc::MS_NODEV as u64,
+                "noexec" => flags |= libc::MS_NOEXEC as u64,
+                "rw" => {} // default, no flag needed
+                _ => data_opts.push(opt.as_str()),
+            }
+        }
+
+        // If mount type is "bind", ensure MS_BIND is set.
+        if mount.r#type == "bind" {
+            flags |= libc::MS_BIND as u64;
+        }
+
+        let data = data_opts.join(",");
         let target_str = target.to_string_lossy();
         let source = if mount.source.is_empty() {
             &mount.r#type
         } else {
             &mount.source
         };
-        c_mount(source, &target_str, &mount.r#type, 0, &options)
+        c_mount(source, &target_str, &mount.r#type, flags, &data)
             .with_context(|| format!("failed to mount {} at {}", mount.r#type, target_str))?;
     }
     Ok(())

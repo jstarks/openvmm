@@ -9,6 +9,7 @@
 #![expect(unsafe_code)]
 
 use anyhow::Context;
+use containerd_shim_agent_protocol::AGENT_VSOCK_PORT;
 use containerd_shim_agent_protocol::AgentBootstrap;
 use containerd_shim_agent_protocol::AgentRequest;
 use containerd_shim_agent_protocol::CreateContainerRequest;
@@ -18,7 +19,6 @@ use containerd_shim_agent_protocol::ExitStatus;
 use containerd_shim_agent_protocol::KillRequest;
 use containerd_shim_agent_protocol::StartContainerRequest;
 use containerd_shim_agent_protocol::StartContainerResponse;
-use containerd_shim_agent_protocol::AGENT_VSOCK_PORT;
 use futures::executor::block_on;
 use futures::io::AllowStdIo;
 use mesh::pipe::ReadPipe;
@@ -131,10 +131,7 @@ async fn run_agent(driver: DefaultDriver) -> anyhow::Result<()> {
 }
 
 /// Handle one request. Returns `true` if the agent should shut down.
-fn handle_request(
-    req: AgentRequest,
-    containers: &mut HashMap<String, ContainerState>,
-) -> bool {
+fn handle_request(req: AgentRequest, containers: &mut HashMap<String, ContainerState>) -> bool {
     match req {
         AgentRequest::Ping(rpc) => {
             eprintln!("containerd-shim-agent: ping");
@@ -207,9 +204,7 @@ fn handle_start_container(
 ) -> anyhow::Result<StartContainerResponse> {
     eprintln!("containerd-shim-agent: StartContainer id={}", req.id);
 
-    let container = containers
-        .get_mut(&req.id)
-        .context("container not found")?;
+    let container = containers.get_mut(&req.id).context("container not found")?;
 
     if container.process.is_some() {
         anyhow::bail!("container {} already started", req.id);
@@ -221,10 +216,7 @@ fn handle_start_container(
         .as_ref()
         .context("no process in OCI spec")?;
 
-    let args = process
-        .args()
-        .as_ref()
-        .context("no args in OCI process")?;
+    let args = process.args().as_ref().context("no args in OCI process")?;
 
     if args.is_empty() {
         anyhow::bail!("empty args in OCI process spec");
@@ -295,10 +287,15 @@ fn handle_start_container(
         });
     }
 
-    let mut child = command.spawn().context("failed to spawn container process")?;
+    let mut child = command
+        .spawn()
+        .context("failed to spawn container process")?;
     let pid = child.id();
 
-    eprintln!("containerd-shim-agent: container {} spawned with PID {}", req.id, pid);
+    eprintln!(
+        "containerd-shim-agent: container {} spawned with PID {}",
+        req.id, pid
+    );
 
     // Bridge I/O.
     let mut io_threads = Vec::new();
@@ -380,9 +377,7 @@ fn handle_kill_container(
         req.id, req.signal
     );
 
-    let container = containers
-        .get(&req.id)
-        .context("container not found")?;
+    let container = containers.get(&req.id).context("container not found")?;
 
     let proc = container
         .process
@@ -432,9 +427,7 @@ fn prepare_container_rootfs(rootfs: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn connect_to_host(
-    driver: &DefaultDriver,
-) -> anyhow::Result<PolledSocket<socket2::Socket>> {
+async fn connect_to_host(driver: &DefaultDriver) -> anyhow::Result<PolledSocket<socket2::Socket>> {
     let socket = VmSocket::new().context("failed to create vsock")?;
     let mut socket: PolledSocket<socket2::Socket> = PolledSocket::new(driver, socket)
         .context("failed to create polled socket")?

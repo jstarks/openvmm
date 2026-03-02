@@ -870,6 +870,7 @@ dependencies = [
  "openvmm_defs",
  "openvmm_resources",
  "pal_async",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",

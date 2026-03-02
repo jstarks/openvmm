@@ -24,6 +24,7 @@ unix_socket.workspace = true
 pal_async.workspace = true
 futures.workspace = true
 anyhow.workspace = true
+prost.workspace = true
 prost-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }

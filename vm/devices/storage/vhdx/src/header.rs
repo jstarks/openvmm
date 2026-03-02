@@ -26,10 +26,8 @@ pub(crate) struct ParsedHeader {
     /// GUID identifying the active log. Zero means no active log.
     pub log_guid: Guid,
     /// File offset of the log region.
-    #[allow(dead_code)]
     pub log_offset: u64,
     /// Length of the log region in bytes.
-    #[allow(dead_code)]
     pub log_length: u32,
     /// File format version.
     pub version: u16,

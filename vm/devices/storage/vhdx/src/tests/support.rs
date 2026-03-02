@@ -135,6 +135,28 @@ impl InMemoryFile {
         self.inner.lock().data.clone()
     }
 
+    /// Create a new `InMemoryFile` with a copy of this file's current data.
+    ///
+    /// Useful when a test needs to pass a file to `VhdxFile::open()` (which
+    /// takes ownership) while keeping a handle for subsequent operations.
+    #[allow(dead_code)]
+    pub fn clone_file(&self) -> InMemoryFile {
+        InMemoryFile {
+            inner: Mutex::new(InMemoryFileInner {
+                data: self.inner.lock().data.clone(),
+            }),
+            interceptor: None,
+        }
+    }
+
+    /// Create an `InMemoryFile` from existing data (e.g. a snapshot).
+    pub fn from_snapshot(data: Vec<u8>) -> InMemoryFile {
+        InMemoryFile {
+            inner: Mutex::new(InMemoryFileInner { data }),
+            interceptor: None,
+        }
+    }
+
     /// Create a VHDX file in memory with the given disk size and default parameters.
     #[allow(dead_code)]
     ///

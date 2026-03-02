@@ -30,6 +30,8 @@ use crate::format::MB1;
 use crate::header::parse_headers;
 use crate::known_meta::read_known_metadata;
 use crate::known_meta::verify_known_metadata;
+use crate::log;
+use crate::log::LogRegion;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use crate::sector_bitmap::SBM_TAG;
@@ -137,9 +139,7 @@ pub struct VhdxFile<F: AsyncFile> {
     metadata_offset: u64,
     #[allow(dead_code)] // Phase 9+: used for metadata writes
     metadata_length: u32,
-    #[allow(dead_code)] // Phase 12: used for log replay
     log_offset: u64,
-    #[allow(dead_code)] // Phase 12: used for log replay
     log_length: u32,
 
     // Mode
@@ -154,9 +154,9 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Open an existing VHDX file.
     ///
     /// Validates the file identifier, headers, region tables, and metadata.
-    /// If the log GUID is non-zero (indicating a dirty log), returns
-    /// [`CorruptionType::LogReplayRequired`] since log replay is not yet
-    /// implemented.
+    /// If the log GUID is non-zero (indicating a dirty log), replays the
+    /// log to recover the file. Read-only opens with a dirty log return
+    /// [`CorruptionType::LogReplayRequired`].
     pub async fn open(file: F, read_only: bool) -> Result<Self, VhdxError> {
         // 1. Validate minimum file size.
         let file_length = file.file_size().await.map_err(VhdxError::Io)?;
@@ -168,11 +168,62 @@ impl<F: AsyncFile> VhdxFile<F> {
         validate_file_identifier(&file).await?;
 
         // 3. Parse dual headers.
-        let header = parse_headers(&file, file_length).await?;
+        let mut header = parse_headers(&file, file_length).await?;
 
-        // 4. Check for dirty log — reject if log replay is needed.
+        // 4. If log_guid is non-zero, replay the log.
         if header.log_guid != Guid::ZERO {
-            return Err(VhdxError::Corrupt(CorruptionType::LogReplayRequired));
+            // A dirty log requires writing to the file to replay. If the caller
+            // opened read-only, we cannot proceed — the metadata may be
+            // inconsistent and we're not allowed to fix it.
+            if read_only {
+                return Err(VhdxError::Corrupt(CorruptionType::LogReplayRequired));
+            }
+
+            // The file handle hasn't been Arc-wrapped yet — pass &file directly.
+            let log_region = LogRegion {
+                file_offset: header.log_offset,
+                length: header.log_length,
+            };
+
+            let replay_result = log::replay_log(&file, &log_region, header.log_guid).await?;
+
+            if replay_result.replayed {
+                // Write a clean header: clear log_guid, bump sequence number.
+                // Write to the non-current header slot, then flush.
+                let new_seq = header.sequence_number + 1;
+
+                let mut clean_header = Header::new_zeroed();
+                clean_header.signature = format::HEADER_SIGNATURE;
+                clean_header.sequence_number = new_seq;
+                clean_header.file_write_guid = header.file_write_guid;
+                clean_header.data_write_guid = header.data_write_guid;
+                clean_header.log_guid = Guid::ZERO;
+                clean_header.log_version = format::LOG_VERSION;
+                clean_header.version = format::VERSION_1;
+                clean_header.log_length = header.log_length;
+                clean_header.log_offset = header.log_offset;
+                clean_header.checksum = 0;
+
+                let mut buf = vec![0u8; format::HEADER_SIZE as usize];
+                let hdr_bytes = clean_header.as_bytes();
+                buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
+                let crc = format::compute_checksum(&buf, 4);
+                buf[4..8].copy_from_slice(&crc.to_le_bytes());
+
+                // Write to the non-current slot.
+                let write_offset = if header.first_header_current {
+                    format::HEADER_OFFSET_2
+                } else {
+                    format::HEADER_OFFSET_1
+                };
+                file.write_at(write_offset, &buf).await?;
+                file.flush().await?;
+
+                // Update the in-flight header state for the rest of the open path.
+                header.sequence_number = new_seq;
+                header.log_guid = Guid::ZERO;
+                header.first_header_current = !header.first_header_current;
+            }
         }
 
         // 5. Parse region tables.
@@ -850,7 +901,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn open_dirty_log_rejected() {
+    async fn open_dirty_log_no_valid_entries() {
+        // Setting log_guid to a random GUID without writing matching log
+        // entries causes replay_log to return NoValidLogEntries.
         let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
 
         // Overwrite header 2's log_guid with a non-zero GUID, then fix the CRC.
@@ -872,7 +925,7 @@ mod tests {
         let result = VhdxFile::open(file, false).await;
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::LogReplayRequired))
+            Err(VhdxError::Corrupt(CorruptionType::NoValidLogEntries))
         ));
     }
 
@@ -1224,5 +1277,215 @@ mod tests {
         assert!(vhdx.has_parent());
         let result = vhdx.parent_locator().await;
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Log replay integration tests
+    // -----------------------------------------------------------------------
+
+    /// Inject a dirty log into a VHDX file:
+    /// 1. Write log entries using LogWriter
+    /// 2. Set the header's log_guid to match
+    /// 3. Update header CRC
+    ///
+    /// Returns the log_guid used.
+    async fn inject_dirty_log(
+        file: &InMemoryFile,
+        data_pages: &[log::DataPage<'_>],
+        zero_ranges: &[log::ZeroRange],
+    ) -> Guid {
+        // Read the active header (header 2, sequence_number=1 after create).
+        let mut hdr_buf = vec![0u8; format::HEADER_SIZE as usize];
+        file.read_at(format::HEADER_OFFSET_2, &mut hdr_buf)
+            .await
+            .unwrap();
+        let header = Header::read_from_prefix(&hdr_buf).unwrap().0.clone();
+
+        let log_guid = Guid::new_random();
+        let log_region = LogRegion {
+            file_offset: header.log_offset,
+            length: header.log_length,
+        };
+
+        // Initialize a LogWriter and write the entry.
+        let file_size = file.file_size().await.unwrap();
+        let mut writer = log::LogWriter::initialize(file, log_region, log_guid, file_size)
+            .await
+            .unwrap();
+
+        if !data_pages.is_empty() || !zero_ranges.is_empty() {
+            writer
+                .write_entry(file, data_pages, zero_ranges)
+                .await
+                .unwrap();
+        }
+
+        // Set log_guid in a new header with bumped sequence number.
+        // Write to header 1 (the non-current slot) with a higher sequence
+        // number so it becomes the active header.
+        let mut header_copy = header;
+        header_copy.log_guid = log_guid;
+        header_copy.sequence_number += 1;
+        header_copy.checksum = 0;
+
+        let mut buf = vec![0u8; format::HEADER_SIZE as usize];
+        let hdr_bytes = header_copy.as_bytes();
+        buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
+        let crc = format::compute_checksum(&buf, 4);
+        buf[4..8].copy_from_slice(&crc.to_le_bytes());
+
+        // Write to header 1 (which now has a higher seq, becoming active).
+        file.write_at(format::HEADER_OFFSET_1, &buf).await.unwrap();
+
+        log_guid
+    }
+
+    #[async_test]
+    async fn open_replays_dirty_log_data() {
+        let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
+
+        // Pick a target offset >= LOGABLE_OFFSET (192 KiB = region table offset).
+        // Use 320 KiB (= 5 * 64 KiB) to be past both region tables.
+        let target_offset: u64 = 5 * format::KB64;
+
+        // Build a recognizable data pattern.
+        let pattern = [0xABu8; 4096];
+        let data_page = log::DataPage {
+            file_offset: target_offset,
+            data: &pattern,
+        };
+
+        inject_dirty_log(&file, &[data_page], &[]).await;
+
+        // Open should replay the log and succeed.
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        assert_eq!(vhdx.disk_size(), format::GB1);
+
+        // Verify the data pattern was written at the target offset via the
+        // Arc<InMemoryFile> inside the VhdxFile.
+        let mut readback = [0u8; 4096];
+        vhdx.file
+            .read_at(target_offset, &mut readback)
+            .await
+            .unwrap();
+        assert_eq!(readback, pattern);
+    }
+
+    #[async_test]
+    async fn open_replays_dirty_log_zeros() {
+        let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
+
+        // Write non-zero data at a target offset first.
+        let target_offset: u64 = 5 * format::KB64;
+        let non_zero = [0xFFu8; 4096];
+        file.write_at(target_offset, &non_zero).await.unwrap();
+
+        // Inject a dirty log with a zero descriptor targeting that offset.
+        let zero_range = log::ZeroRange {
+            file_offset: target_offset,
+            length: 4096,
+        };
+
+        inject_dirty_log(&file, &[], &[zero_range]).await;
+
+        // Open should replay the log and succeed.
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        assert_eq!(vhdx.disk_size(), format::GB1);
+
+        // Verify the range is now zeroed.
+        let mut readback = [0u8; 4096];
+        vhdx.file
+            .read_at(target_offset, &mut readback)
+            .await
+            .unwrap();
+        assert_eq!(readback, [0u8; 4096]);
+    }
+
+    #[async_test]
+    async fn open_replay_then_reopen_clean() {
+        let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
+
+        let target_offset: u64 = 5 * format::KB64;
+        let pattern = [0xCDu8; 4096];
+        let data_page = log::DataPage {
+            file_offset: target_offset,
+            data: &pattern,
+        };
+
+        inject_dirty_log(&file, &[data_page], &[]).await;
+
+        // First open triggers replay.
+        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        // The clean header was written to the file inside vhdx.
+        // Make a snapshot of the replayed file for the second open.
+        let snapshot = vhdx.file.snapshot();
+        drop(vhdx);
+
+        // Create a new InMemoryFile from the snapshot for the second open.
+        let file3 = InMemoryFile::from_snapshot(snapshot);
+
+        // Second open should succeed without replay (log_guid is now ZERO).
+        let vhdx2 = VhdxFile::open(file3, false).await.unwrap();
+        assert_eq!(vhdx2.disk_size(), format::GB1);
+    }
+
+    #[async_test]
+    async fn open_replay_corrupt_log_entry() {
+        let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
+
+        let target_offset: u64 = 5 * format::KB64;
+        let pattern = [0xEEu8; 4096];
+        let data_page = log::DataPage {
+            file_offset: target_offset,
+            data: &pattern,
+        };
+
+        let _log_guid = inject_dirty_log(&file, &[data_page], &[]).await;
+
+        // Read the active header to find the log region offset.
+        let mut hdr_buf = vec![0u8; format::HEADER_SIZE as usize];
+        file.read_at(format::HEADER_OFFSET_1, &mut hdr_buf)
+            .await
+            .unwrap();
+        let header = Header::read_from_prefix(&hdr_buf).unwrap().0.clone();
+
+        // Corrupt the first byte of the log region (flip a byte in the CRC
+        // of the log entry).
+        let mut corrupt_buf = [0u8; 1];
+        file.read_at(header.log_offset + 4, &mut corrupt_buf)
+            .await
+            .unwrap();
+        corrupt_buf[0] ^= 0xFF;
+        file.write_at(header.log_offset + 4, &corrupt_buf)
+            .await
+            .unwrap();
+
+        // Open should fail because there are no valid log entries for this GUID.
+        let result = VhdxFile::open(file, false).await;
+        assert!(matches!(
+            result,
+            Err(VhdxError::Corrupt(CorruptionType::NoValidLogEntries))
+        ));
+    }
+
+    #[async_test]
+    async fn open_read_only_dirty_log_rejected() {
+        let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
+
+        let target_offset: u64 = 5 * format::KB64;
+        let pattern = [0xBBu8; 4096];
+        let data_page = log::DataPage {
+            file_offset: target_offset,
+            data: &pattern,
+        };
+
+        inject_dirty_log(&file, &[data_page], &[]).await;
+
+        // Read-only open with a dirty log should return LogReplayRequired.
+        let result = VhdxFile::open(file, true).await;
+        assert!(matches!(
+            result,
+            Err(VhdxError::Corrupt(CorruptionType::LogReplayRequired))
+        ));
     }
 }

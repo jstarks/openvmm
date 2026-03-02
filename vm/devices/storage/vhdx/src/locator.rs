@@ -16,7 +16,7 @@ use zerocopy::FromBytes;
 
 /// A parsed key-value pair from a parent locator.
 #[derive(Debug, Clone)]
-pub(crate) struct LocatorKeyValue {
+pub struct LocatorKeyValue {
     /// The key string.
     pub key: String,
     /// The value string.
@@ -25,7 +25,7 @@ pub(crate) struct LocatorKeyValue {
 
 /// A parsed parent locator.
 #[derive(Debug, Clone)]
-pub(crate) struct ParentLocator {
+pub struct ParentLocator {
     /// The locator type GUID.
     pub locator_type: Guid,
     /// The key-value entries.
@@ -151,6 +151,45 @@ impl ParentLocator {
             .find(|e| e.key == key)
             .map(|e| e.value.as_str())
     }
+
+    /// Extract well-known parent paths from the locator.
+    ///
+    /// This looks up the standard VHDX parent locator keys and returns
+    /// them in a structured form. Returns `None` for any key not present.
+    pub fn parent_paths(&self) -> ParentPaths {
+        ParentPaths {
+            parent_linkage: self
+                .find(format::PARENT_LOCATOR_KEY_PARENT_LINKAGE)
+                .map(String::from),
+            relative_path: self
+                .find(format::PARENT_LOCATOR_KEY_RELATIVE_PATH)
+                .map(String::from),
+            absolute_win32_path: self
+                .find(format::PARENT_LOCATOR_KEY_ABSOLUTE_PATH)
+                .map(String::from),
+            volume_path: self
+                .find(format::PARENT_LOCATOR_KEY_VOLUME_PATH)
+                .map(String::from),
+        }
+    }
+}
+
+/// Paths extracted from a VHDX parent locator.
+///
+/// Contains the well-known path entries from the standard VHDX parent
+/// locator type. The caller should try paths in order of preference:
+/// relative, then absolute, then volume path.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ParentPaths {
+    /// Parent's data write GUID at child creation time.
+    pub parent_linkage: Option<String>,
+    /// Relative path from child to parent.
+    pub relative_path: Option<String>,
+    /// Absolute Win32 path to parent.
+    pub absolute_win32_path: Option<String>,
+    /// Volume GUID path to parent.
+    pub volume_path: Option<String>,
 }
 
 /// Helper to encode a Rust string into a UTF-16LE byte vector.
@@ -161,7 +200,7 @@ fn encode_utf16le(s: &str) -> Vec<u8> {
 
 /// Build a valid parent locator binary blob from parts.
 #[cfg(test)]
-fn build_locator(locator_type: Guid, kvs: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn build_locator(locator_type: Guid, kvs: &[(&str, &str)]) -> Vec<u8> {
     use zerocopy::IntoBytes;
 
     let header_size = size_of::<ParentLocatorHeader>();

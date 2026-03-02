@@ -25,7 +25,7 @@ pub(crate) mod header;
 pub mod io;
 pub mod io_guard;
 pub(crate) mod known_meta;
-pub(crate) mod locator;
+pub mod locator;
 pub(crate) mod metadata;
 pub mod open;
 pub(crate) mod region;

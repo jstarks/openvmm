@@ -1,0 +1,29 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "containerd_shim_openvmm"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "containerd-shim-openvmm-v2"
+path = "src/main.rs"
+
+[dependencies]
+containerd_shim_protos.workspace = true
+mesh.workspace = true
+mesh_rpc.workspace = true
+unix_socket.workspace = true
+pal_async.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+prost-types.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

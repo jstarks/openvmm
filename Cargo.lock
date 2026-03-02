@@ -831,6 +831,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
+name = "containerd_shim_openvmm"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "containerd_shim_protos",
+ "futures",
+ "libc",
+ "mesh",
+ "mesh_rpc",
+ "pal_async",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "unix_socket",
+]
+
+[[package]]
 name = "containerd_shim_protos"
 version = "0.0.0"
 dependencies = [

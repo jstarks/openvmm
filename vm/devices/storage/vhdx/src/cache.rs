@@ -28,15 +28,12 @@ pub struct PageKey {
     pub offset: u64,
 }
 
-/// Access mode for page acquisition.
+/// Write mode for page acquisition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessMode {
-    /// Shared read access. Page is loaded from file if not cached.
-    Read,
-    /// Exclusive write access. Page is loaded from file if not cached.
+pub enum WriteMode {
+    /// Page is loaded from file if not cached. Caller will modify parts.
     Modify,
-    /// Exclusive write access. Page is NOT loaded from file (caller
-    /// will overwrite the entire page).
+    /// Page is NOT loaded from file (caller will overwrite the entire page).
     Overwrite,
 }
 
@@ -49,8 +46,8 @@ struct PageData {
 /// Write-through page cache backed by an [`AsyncFile`].
 ///
 /// Pages are loaded on first access and kept in memory indefinitely (no
-/// eviction). Modified pages are written back to the file when the guard
-/// is released via [`PageGuard::release()`].
+/// eviction). Modified pages are written back to the file when a
+/// [`WritePageGuard`] is released and committed.
 pub struct PageCache<F: AsyncFile> {
     file: Arc<F>,
     /// Page map: `PageKey` → shared handle to the cached page mutex.
@@ -99,22 +96,12 @@ impl<F: AsyncFile> PageCache<F> {
         Ok(base + key.offset)
     }
 
-    /// Acquire access to a page.
-    ///
-    /// Returns a [`PageGuard`] that provides `&[u8; PAGE_SIZE]` (for read) or
-    /// `&mut [u8; PAGE_SIZE]` (for modify/overwrite). The caller **must** call
-    /// [`PageGuard::release()`] when done — dropping the guard without
-    /// releasing it will panic in debug builds.
-    ///
-    /// The returned guard holds the page's mutex via an [`ArcMutexGuard`],
-    /// giving zero-copy access to the cached data. Only dirty releases
-    /// perform a copy (to avoid holding the sync lock across the async
-    /// file write).
-    pub async fn acquire(
+    /// Internal: validate key, load page if needed, acquire lock.
+    async fn acquire_inner(
         &self,
         key: PageKey,
-        mode: AccessMode,
-    ) -> Result<PageGuard<'_, F>, std::io::Error> {
+        load_from_disk: bool,
+    ) -> Result<parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>, std::io::Error> {
         // Validate alignment.
         if !key.offset.is_multiple_of(PAGE_SIZE as u64) {
             return Err(std::io::Error::other(format!(
@@ -138,104 +125,134 @@ impl<F: AsyncFile> PageCache<F> {
         // Load the page from disk if necessary. We do the async I/O
         // *before* acquiring the long-held ArcMutexGuard so we never
         // hold a sync lock across an await point.
-        match mode {
-            AccessMode::Read | AccessMode::Modify => {
-                let needs_load = entry.lock().data.is_none();
-                if needs_load {
-                    let mut buf = Box::new([0u8; PAGE_SIZE]);
-                    self.file.read_at(file_offset, buf.as_mut_slice()).await?;
+        if load_from_disk {
+            let needs_load = entry.lock().data.is_none();
+            if needs_load {
+                let mut buf = Box::new([0u8; PAGE_SIZE]);
+                self.file.read_at(file_offset, buf.as_mut_slice()).await?;
 
-                    let mut page = entry.lock();
-                    // Another task may have loaded while we were reading.
-                    if page.data.is_none() {
-                        page.data = Some(buf);
-                    }
+                let mut page = entry.lock();
+                // Another task may have loaded while we were reading.
+                if page.data.is_none() {
+                    page.data = Some(buf);
                 }
             }
-            AccessMode::Overwrite => {
-                let mut page = entry.lock();
-                if page.data.is_none() {
-                    page.data = Some(Box::new([0u8; PAGE_SIZE]));
-                }
+        } else {
+            let mut page = entry.lock();
+            if page.data.is_none() {
+                page.data = Some(Box::new([0u8; PAGE_SIZE]));
             }
         }
 
         // Acquire the page lock for the lifetime of the guard.
-        let guard = Mutex::lock_arc(&entry);
+        Ok(Mutex::lock_arc(&entry))
+    }
 
-        Ok(PageGuard {
+    /// Acquire read access to a page.
+    ///
+    /// Returns a [`ReadPageGuard`] that provides `&[u8; PAGE_SIZE]`.
+    /// The page is loaded from disk if not already cached. The lock
+    /// is released when the guard is dropped.
+    pub async fn acquire_read(
+        &self,
+        key: PageKey,
+    ) -> Result<ReadPageGuard, std::io::Error> {
+        let guard = self.acquire_inner(key, true).await?;
+        Ok(ReadPageGuard { guard })
+    }
+
+    /// Acquire write access to a page.
+    ///
+    /// Returns a [`WritePageGuard`] that provides `&[u8; PAGE_SIZE]`
+    /// and `&mut [u8; PAGE_SIZE]`. With [`WriteMode::Modify`] the page
+    /// is loaded from disk first; with [`WriteMode::Overwrite`] it is not.
+    ///
+    /// The caller **must** call [`WritePageGuard::release()`] to produce a
+    /// [`PageCommit`], then `.commit().await` to write dirty data to disk.
+    pub async fn acquire_write(
+        &self,
+        key: PageKey,
+        mode: WriteMode,
+    ) -> Result<WritePageGuard<'_, F>, std::io::Error> {
+        let load = mode == WriteMode::Modify;
+        let guard = self.acquire_inner(key, load).await?;
+        Ok(WritePageGuard {
             cache: self,
             key,
             guard: Some(guard),
-            writable: mode != AccessMode::Read,
             dirty: false,
-            released: false,
         })
     }
 
     /// Ensure all previously written pages are durable on disk.
     ///
-    /// In write-through mode every [`PageGuard::release()`] already writes the
-    /// page data to the file. This method calls `file.flush()` to ensure
-    /// OS-level durability.
-    ///
-    /// The caller must ensure all guards have been released before calling
-    /// this.
+    /// In write-through mode every [`PageCommit::commit()`] already writes
+    /// the page data to the file. This method calls `file.flush()` to
+    /// ensure OS-level durability.
     pub async fn flush(&self) -> Result<(), std::io::Error> {
         self.file.flush().await
     }
 }
 
-/// RAII guard providing access to a cached page.
+/// RAII guard providing read-only access to a cached page.
 ///
-/// Provides `Deref<Target = [u8; PAGE_SIZE]>` for read access and `DerefMut`
-/// when the page was acquired with [`AccessMode::Modify`] or
-/// [`AccessMode::Overwrite`].
-///
-/// The caller **must** call [`release()`](Self::release) to write dirty pages
-/// back to the file and release the page lock. Dropping without releasing
-/// panics in debug builds.
-pub struct PageGuard<'a, F: AsyncFile> {
-    cache: &'a PageCache<F>,
-    key: PageKey,
-    /// Arc-owned mutex guard — keeps the `Arc<Mutex<PageData>>` alive and
-    /// the lock held, giving zero-copy access to the cached page data.
-    guard: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>>,
-    /// Whether the guard permits mutation (acquired with Modify or Overwrite).
-    writable: bool,
-    /// Whether the page has actually been mutated (set on first `DerefMut`).
-    dirty: bool,
-    /// Set to `true` by [`release()`](Self::release).
-    released: bool,
+/// The page lock is released when the guard is dropped.
+/// No explicit release is needed for reads.
+#[must_use = "page guard holds a lock; drop it when done reading"]
+pub struct ReadPageGuard {
+    guard: parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>,
 }
 
-impl<F: AsyncFile> PageGuard<'_, F> {
-    /// Write the page back to the file (if dirty) and release the page lock.
-    ///
-    /// This is the only correct way to finish using a `PageGuard`. Dropping
-    /// the guard without calling this method panics in debug builds.
-    pub async fn release(mut self) -> Result<(), std::io::Error> {
-        let guard = self.guard.take().expect("guard already released");
-        self.released = true;
+impl std::ops::Deref for ReadPageGuard {
+    type Target = [u8; PAGE_SIZE];
 
-        if self.dirty {
-            // Copy the data so we can release the sync lock before
-            // the async file write.
-            let data = guard.data.as_ref().expect("page data missing").clone();
-            drop(guard);
-
-            let file_offset = self.cache.resolve_offset(self.key)?;
-            self.cache
-                .file
-                .write_at(file_offset, data.as_slice())
-                .await?;
-        }
-        // If not dirty, `guard` is dropped here, releasing the lock.
-        Ok(())
+    fn deref(&self) -> &[u8; PAGE_SIZE] {
+        self.guard.data.as_ref().expect("page data missing")
     }
 }
 
-impl<F: AsyncFile> std::ops::Deref for PageGuard<'_, F> {
+/// RAII guard providing write access to a cached page.
+///
+/// Provides `Deref<Target = [u8; PAGE_SIZE]>` and `DerefMut`.
+/// The caller **must** call [`release()`](Self::release) to get a
+/// [`PageCommit`], then `.commit().await` to write dirty data back
+/// to the file.
+///
+/// Dropping a dirty `WritePageGuard` without calling `release()` panics
+/// in debug builds.
+#[must_use = "write guard must be released via .release().commit().await"]
+pub struct WritePageGuard<'a, F: AsyncFile> {
+    cache: &'a PageCache<F>,
+    key: PageKey,
+    guard: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>>,
+    dirty: bool,
+}
+
+impl<'a, F: AsyncFile> WritePageGuard<'a, F> {
+    /// Release the page lock and return a [`PageCommit`] handle.
+    ///
+    /// The `ArcMutexGuard` is dropped synchronously in this method,
+    /// so the returned [`PageCommit`] is `Send`.
+    #[must_use = "call .commit().await to write dirty data to disk"]
+    pub fn release(mut self) -> PageCommit<'a, F> {
+        let guard = self.guard.take().expect("guard already released");
+
+        let dirty_data = if self.dirty {
+            Some(guard.data.as_ref().expect("page data missing").clone())
+        } else {
+            None
+        };
+        drop(guard);
+
+        PageCommit {
+            cache: self.cache,
+            key: self.key,
+            dirty_data,
+        }
+    }
+}
+
+impl<F: AsyncFile> std::ops::Deref for WritePageGuard<'_, F> {
     type Target = [u8; PAGE_SIZE];
 
     fn deref(&self) -> &[u8; PAGE_SIZE] {
@@ -248,9 +265,8 @@ impl<F: AsyncFile> std::ops::Deref for PageGuard<'_, F> {
     }
 }
 
-impl<F: AsyncFile> std::ops::DerefMut for PageGuard<'_, F> {
+impl<F: AsyncFile> std::ops::DerefMut for WritePageGuard<'_, F> {
     fn deref_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
-        assert!(self.writable, "cannot mutate a read-only page guard");
         self.dirty = true;
         self.guard
             .as_mut()
@@ -261,18 +277,43 @@ impl<F: AsyncFile> std::ops::DerefMut for PageGuard<'_, F> {
     }
 }
 
-impl<F: AsyncFile> Drop for PageGuard<'_, F> {
+impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
     fn drop(&mut self) {
-        if !self.released {
-            // The ArcMutexGuard is dropped here, releasing the lock.
-            // But dirty data may be lost since we can't do async I/O in Drop.
+        if let Some(_guard) = self.guard.take() {
             if self.dirty {
                 debug_assert!(
                     false,
-                    "dirty PageGuard dropped without calling release() — data may be lost"
+                    "dirty WritePageGuard dropped without calling release() — data may be lost"
                 );
             }
         }
+    }
+}
+
+/// Handle for committing dirty page data to disk.
+///
+/// Returned by [`WritePageGuard::release()`]. This type is `Send` (it does
+/// not hold any mutex guard).
+///
+/// Call [`.commit()`](Self::commit) to write the page data to the file.
+/// If the page was not mutated, `commit()` is a no-op.
+#[must_use = "call .commit().await to write dirty data to disk"]
+pub struct PageCommit<'a, F: AsyncFile> {
+    cache: &'a PageCache<F>,
+    key: PageKey,
+    dirty_data: Option<Box<[u8; PAGE_SIZE]>>,
+}
+
+impl<F: AsyncFile> PageCommit<'_, F> {
+    /// Write the dirty page data to the file, if any.
+    ///
+    /// This is a no-op if the page was not mutated.
+    pub async fn commit(self) -> Result<(), std::io::Error> {
+        if let Some(data) = self.dirty_data {
+            let file_offset = self.cache.resolve_offset(self.key)?;
+            self.cache.file.write_at(file_offset, data.as_slice()).await?;
+        }
+        Ok(())
     }
 }
 
@@ -294,11 +335,11 @@ mod tests {
         cache.register_tag(0, 0);
 
         let guard = cache
-            .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Read)
+            .acquire_read(PageKey { tag: 0, offset: 0 })
             .await
             .unwrap();
         assert_eq!(&guard[..], &pattern[..]);
-        guard.release().await.unwrap();
+        drop(guard);
     }
 
     #[async_test]
@@ -312,7 +353,7 @@ mod tests {
 
         {
             let mut guard = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
                 .await
                 .unwrap();
             // Verify data was loaded.
@@ -321,7 +362,7 @@ mod tests {
             // Mutate.
             guard[0] = 0xAA;
             guard[1] = 0xBB;
-            guard.release().await.unwrap();
+            guard.release().commit().await.unwrap();
         }
 
         // Read directly from the file to verify write-through.
@@ -350,11 +391,11 @@ mod tests {
 
         // Overwrite should succeed even though reads fail.
         let mut guard = cache
-            .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Overwrite)
+            .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Overwrite)
             .await
             .unwrap();
         guard.fill(0xCC);
-        guard.release().await.unwrap();
+        guard.release().commit().await.unwrap();
 
         // Verify the data was written to the file.
         let snap = cache.file().snapshot();
@@ -372,19 +413,19 @@ mod tests {
 
         // First read loads from file.
         let g1 = cache
-            .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Read)
+            .acquire_read(PageKey { tag: 0, offset: 0 })
             .await
             .unwrap();
         assert_eq!(&g1[..], &pattern[..]);
-        g1.release().await.unwrap();
+        drop(g1);
 
         // Second read uses cached data.
         let g2 = cache
-            .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Read)
+            .acquire_read(PageKey { tag: 0, offset: 0 })
             .await
             .unwrap();
         assert_eq!(&g2[..], &pattern[..]);
-        g2.release().await.unwrap();
+        drop(g2);
     }
 
     #[async_test]
@@ -397,23 +438,23 @@ mod tests {
         // First modify.
         {
             let mut guard = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
                 .await
                 .unwrap();
             guard[0] = 0x11;
-            guard.release().await.unwrap();
+            guard.release().commit().await.unwrap();
         }
 
         // Second modify on the same page.
         {
             let mut guard = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
                 .await
                 .unwrap();
             // Should see the previously written value.
             assert_eq!(guard[0], 0x11);
             guard[0] = 0x22;
-            guard.release().await.unwrap();
+            guard.release().commit().await.unwrap();
         }
 
         let snap = cache.file().snapshot();
@@ -429,21 +470,21 @@ mod tests {
 
         {
             let mut g = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
                 .await
                 .unwrap();
             g[0] = 0xAA;
-            g.release().await.unwrap();
+            g.release().commit().await.unwrap();
         }
 
         {
             let mut g = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
                 .await
                 .unwrap();
             assert_eq!(g[0], 0xAA);
             g[1] = 0xBB;
-            g.release().await.unwrap();
+            g.release().commit().await.unwrap();
         }
 
         let snap = cache.file().snapshot();
@@ -461,27 +502,27 @@ mod tests {
         // Write to page at offset 0.
         {
             let mut g = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
                 .await
                 .unwrap();
             g[0] = 0x11;
-            g.release().await.unwrap();
+            g.release().commit().await.unwrap();
         }
 
         // Write to page at offset PAGE_SIZE.
         {
             let mut g = cache
-                .acquire(
+                .acquire_write(
                     PageKey {
                         tag: 0,
                         offset: PAGE_SIZE as u64,
                     },
-                    AccessMode::Modify,
+                    WriteMode::Modify,
                 )
                 .await
                 .unwrap();
             g[0] = 0x22;
-            g.release().await.unwrap();
+            g.release().commit().await.unwrap();
         }
 
         // Verify both pages are independent.
@@ -504,17 +545,14 @@ mod tests {
         cache.register_tag(0, base);
 
         let guard = cache
-            .acquire(
-                PageKey {
-                    tag: 0,
-                    offset: page_offset,
-                },
-                AccessMode::Read,
-            )
+            .acquire_read(PageKey {
+                tag: 0,
+                offset: page_offset,
+            })
             .await
             .unwrap();
         assert_eq!(&guard[..], &pattern[..]);
-        guard.release().await.unwrap();
+        drop(guard);
     }
 
     #[async_test]
@@ -535,11 +573,11 @@ mod tests {
         // Read from old base.
         {
             let guard = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Read)
+                .acquire_read(PageKey { tag: 0, offset: 0 })
                 .await
                 .unwrap();
             assert_eq!(guard[0], 0xAA);
-            guard.release().await.unwrap();
+            drop(guard);
         }
 
         // Invalidate the cached page by creating a fresh cache (update_tag_offset
@@ -549,11 +587,11 @@ mod tests {
         cache.update_tag_offset(0, new_base);
 
         let guard = cache
-            .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Read)
+            .acquire_read(PageKey { tag: 0, offset: 0 })
             .await
             .unwrap();
         assert_eq!(guard[0], 0xBB);
-        guard.release().await.unwrap();
+        drop(guard);
     }
 
     #[async_test]
@@ -566,11 +604,11 @@ mod tests {
         // Modify and release (write-through).
         {
             let mut guard = cache
-                .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
                 .await
                 .unwrap();
             guard[42] = 0xFF;
-            guard.release().await.unwrap();
+            guard.release().commit().await.unwrap();
         }
 
         // Verify the file was updated.
@@ -579,11 +617,11 @@ mod tests {
 
         // Re-acquire as Read and verify cached data.
         let guard = cache
-            .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Read)
+            .acquire_read(PageKey { tag: 0, offset: 0 })
             .await
             .unwrap();
         assert_eq!(guard[42], 0xFF);
-        guard.release().await.unwrap();
+        drop(guard);
     }
 
     #[async_test]
@@ -594,11 +632,11 @@ mod tests {
 
         // Write some data, release, then flush.
         let mut guard = cache
-            .acquire(PageKey { tag: 0, offset: 0 }, AccessMode::Modify)
+            .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
             .await
             .unwrap();
         guard[0] = 0x42;
-        guard.release().await.unwrap();
+        guard.release().commit().await.unwrap();
 
         // flush() should succeed (delegates to InMemoryFile::flush which is a no-op).
         cache.flush().await.unwrap();

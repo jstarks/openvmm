@@ -12,9 +12,9 @@
 //! covers `4096 * 8 = 32768` sectors.
 
 use crate::AsyncFile;
-use crate::cache::AccessMode;
 use crate::cache::PageCache;
 use crate::cache::PageKey;
+use crate::cache::WriteMode;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
@@ -106,55 +106,53 @@ pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
 
         // Acquire the bitmap page for this portion.
         let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
-        let guard = cache
-            .acquire(
-                PageKey {
+        {
+            let guard = cache
+                .acquire_read(PageKey {
                     tag: SBM_TAG,
                     offset: page_file_offset,
-                },
-                AccessMode::Read,
-            )
-            .await?;
+                })
+                .await?;
 
-        // Scan bits within this page.
-        let page_data: &[u8] = &*guard;
-        let mut zero = start_bit;
-        while zero < bits_in_this_page {
-            // Find first set bit (data present).
-            let one = find_bit(page_data, zero, bits_in_this_page, true);
-            if one > zero {
-                // Emit Unmapped range for the run of 0 bits.
-                let unmapped_sectors = one - zero;
-                let unmapped_bytes = unmapped_sectors * logical_sector_size as u64;
-                ranges.push(ReadRange::Unmapped {
-                    guest_offset: current_virtual_offset,
-                    length: unmapped_bytes as u32,
-                });
-                current_virtual_offset += unmapped_bytes;
-            }
+            // Scan bits within this page.
+            let page_data: &[u8] = &*guard;
+            let mut zero = start_bit;
+            while zero < bits_in_this_page {
+                // Find first set bit (data present).
+                let one = find_bit(page_data, zero, bits_in_this_page, true);
+                if one > zero {
+                    // Emit Unmapped range for the run of 0 bits.
+                    let unmapped_sectors = one - zero;
+                    let unmapped_bytes = unmapped_sectors * logical_sector_size as u64;
+                    ranges.push(ReadRange::Unmapped {
+                        guest_offset: current_virtual_offset,
+                        length: unmapped_bytes as u32,
+                    });
+                    current_virtual_offset += unmapped_bytes;
+                }
 
-            if one < bits_in_this_page {
-                // Find first clear bit (end of data run).
-                let next_zero = find_bit(page_data, one, bits_in_this_page, false);
-                let data_sectors = next_zero - one;
-                let data_bytes = data_sectors * logical_sector_size as u64;
-                // File offset = data block offset + position within block.
-                let block_offset = (current_virtual_offset % block_size as u64) as u32;
-                let file_offset = data_file_offset + block_offset as u64;
-                ranges.push(ReadRange::Data {
-                    guest_offset: current_virtual_offset,
-                    length: data_bytes as u32,
-                    file_offset,
-                });
-                current_virtual_offset += data_bytes;
-                zero = next_zero;
-            } else {
-                zero = bits_in_this_page;
+                if one < bits_in_this_page {
+                    // Find first clear bit (end of data run).
+                    let next_zero = find_bit(page_data, one, bits_in_this_page, false);
+                    let data_sectors = next_zero - one;
+                    let data_bytes = data_sectors * logical_sector_size as u64;
+                    // File offset = data block offset + position within block.
+                    let block_offset = (current_virtual_offset % block_size as u64) as u32;
+                    let file_offset = data_file_offset + block_offset as u64;
+                    ranges.push(ReadRange::Data {
+                        guest_offset: current_virtual_offset,
+                        length: data_bytes as u32,
+                        file_offset,
+                    });
+                    current_virtual_offset += data_bytes;
+                    zero = next_zero;
+                } else {
+                    zero = bits_in_this_page;
+                }
             }
         }
 
-        // Release this page's guard and advance.
-        guard.release().await?;
+        // Advance to next page.
         let sectors_processed = bits_in_this_page - start_bit;
         remaining_sectors -= sectors_processed;
     }
@@ -210,28 +208,31 @@ pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
             std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
 
         let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
-        let mut guard = cache
-            .acquire(
-                PageKey {
-                    tag: SBM_TAG,
-                    offset: page_file_offset,
-                },
-                AccessMode::Modify,
-            )
-            .await?;
+        let commit = {
+            let mut guard = cache
+                .acquire_write(
+                    PageKey {
+                        tag: SBM_TAG,
+                        offset: page_file_offset,
+                    },
+                    WriteMode::Modify,
+                )
+                .await?;
 
-        // Set or clear each bit in the range.
-        for bit_index in start_bit..bits_in_this_page {
-            let byte_index = (bit_index / 8) as usize;
-            let bit_position = (bit_index % 8) as u32;
-            if set {
-                guard[byte_index] |= 1 << bit_position;
-            } else {
-                guard[byte_index] &= !(1 << bit_position);
+            // Set or clear each bit in the range.
+            for bit_index in start_bit..bits_in_this_page {
+                let byte_index = (bit_index / 8) as usize;
+                let bit_position = (bit_index % 8) as u32;
+                if set {
+                    guard[byte_index] |= 1 << bit_position;
+                } else {
+                    guard[byte_index] &= !(1 << bit_position);
+                }
             }
-        }
 
-        guard.release().await?;
+            guard.release()
+        };
+        commit.commit().await?;
         let sectors_processed = bits_in_this_page - start_bit;
         remaining_sectors -= sectors_processed;
         current_virtual_offset += sectors_processed * logical_sector_size as u64;
@@ -251,17 +252,20 @@ pub(crate) async fn zero_sector_bitmap_block<F: AsyncFile>(
     let page_count = crate::bat::SECTOR_BITMAP_BLOCK_SIZE as u64 / CACHE_PAGE_SIZE;
     for page in 0..page_count {
         let page_offset = sbm_file_offset + page * CACHE_PAGE_SIZE;
-        let mut guard = cache
-            .acquire(
-                PageKey {
-                    tag: SBM_TAG,
-                    offset: page_offset,
-                },
-                AccessMode::Modify,
-            )
-            .await?;
-        guard.fill(0);
-        guard.release().await?;
+        let commit = {
+            let mut guard = cache
+                .acquire_write(
+                    PageKey {
+                        tag: SBM_TAG,
+                        offset: page_offset,
+                    },
+                    WriteMode::Modify,
+                )
+                .await?;
+            guard.fill(0);
+            guard.release()
+        };
+        commit.commit().await?;
     }
     Ok(())
 }

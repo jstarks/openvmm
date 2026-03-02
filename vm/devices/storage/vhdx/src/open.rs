@@ -15,7 +15,6 @@ use crate::bat::BlockMapping;
 use crate::bat::BlockType;
 use crate::bat::InternalBlockMapping;
 use crate::bat::METADATA_TAG;
-use crate::cache::AccessMode;
 use crate::cache::PageCache;
 use crate::cache::PageKey;
 use crate::error::CorruptionType;
@@ -345,22 +344,20 @@ impl<F: AsyncFile> VhdxFile<F> {
         let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
         let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
 
-        let guard = cache
-            .acquire(
-                PageKey {
+        let entry = {
+            let guard = cache
+                .acquire_read(PageKey {
                     tag: BAT_TAG,
                     offset: page_offset,
-                },
-                AccessMode::Read,
-            )
-            .await?;
+                })
+                .await?;
 
-        let byte_offset = entry_within_page * size_of::<BatEntry>();
-        let entry_bytes = &guard[byte_offset..byte_offset + size_of::<BatEntry>()];
-        let entry = BatEntry::read_from_bytes(entry_bytes)
-            .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
+            let byte_offset = entry_within_page * size_of::<BatEntry>();
+            let entry_bytes = &guard[byte_offset..byte_offset + size_of::<BatEntry>()];
+            BatEntry::read_from_bytes(entry_bytes)
+                .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?
+        };
 
-        guard.release().await?;
         Ok(entry)
     }
 
@@ -555,18 +552,21 @@ impl<F: AsyncFile> VhdxFile<F> {
                 buf
             };
 
-            let mut guard = self
-                .cache
-                .acquire(
-                    PageKey {
-                        tag: BAT_TAG,
-                        offset: page_offset,
-                    },
-                    AccessMode::Overwrite,
-                )
-                .await?;
-            guard.copy_from_slice(&page_buf);
-            guard.release().await?;
+            let commit = {
+                let mut guard = self
+                    .cache
+                    .acquire_write(
+                        PageKey {
+                            tag: BAT_TAG,
+                            offset: page_offset,
+                        },
+                        crate::cache::WriteMode::Overwrite,
+                    )
+                    .await?;
+                guard.copy_from_slice(&page_buf);
+                guard.release()
+            };
+            commit.commit().await?;
         }
 
         Ok(())
@@ -595,18 +595,21 @@ impl<F: AsyncFile> VhdxFile<F> {
         // LOCK AUDIT: bat_state write-lock dropped (end of block above). No sync locks held.
         for (page_index, page_buf) in pages_to_write {
             let page_offset = page_index as u64 * CACHE_PAGE_SIZE;
-            let mut guard = self
-                .cache
-                .acquire(
-                    PageKey {
-                        tag: BAT_TAG,
-                        offset: page_offset,
-                    },
-                    AccessMode::Overwrite,
-                )
-                .await?;
-            guard.copy_from_slice(&page_buf);
-            guard.release().await?;
+            let commit = {
+                let mut guard = self
+                    .cache
+                    .acquire_write(
+                        PageKey {
+                            tag: BAT_TAG,
+                            offset: page_offset,
+                        },
+                        crate::cache::WriteMode::Overwrite,
+                    )
+                    .await?;
+                guard.copy_from_slice(&page_buf);
+                guard.release()
+            };
+            commit.commit().await?;
         }
 
         Ok(())

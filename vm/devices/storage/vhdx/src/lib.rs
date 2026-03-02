@@ -20,6 +20,7 @@ pub(crate) mod bat;
 pub(crate) mod cache;
 pub mod create;
 pub mod error;
+pub(crate) mod flush;
 pub mod format;
 pub(crate) mod header;
 pub mod io;

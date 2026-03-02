@@ -26,6 +26,8 @@ socket2 = { workspace = true, features = ["all"] }
 anyhow.workspace = true
 libc.workspace = true
 futures.workspace = true
+oci-spec.workspace = true
+serde_json = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

@@ -19,6 +19,7 @@ mesh_rpc.workspace = true
 mesh_worker.workspace = true
 openvmm_defs.workspace = true
 openvmm_resources = { workspace = true, features = ["virt_kvm"] }
+virtio_resources.workspace = true
 unix_socket.workspace = true
 pal_async.workspace = true
 futures.workspace = true

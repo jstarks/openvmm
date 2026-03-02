@@ -18,8 +18,14 @@ extern crate openvmm_resources as _;
 
 use anyhow::Context as _;
 use containerd_shim_agent_protocol::AgentRequest;
+use containerd_shim_agent_protocol::CreateContainerRequest;
+use containerd_shim_agent_protocol::DeleteContainerRequest;
+use containerd_shim_agent_protocol::KillRequest;
+use containerd_shim_agent_protocol::StartContainerRequest;
 use containerd_shim_protos as protos;
 use futures::StreamExt;
+use futures::executor::block_on;
+use futures::io::AllowStdIo;
 use mesh::rpc::RpcSend;
 use mesh_rpc::service::Code;
 use mesh_rpc::service::ServiceRpc;
@@ -380,6 +386,15 @@ struct ContainerState {
     bundle: String,
     status: i32,
     pid: u32,
+    /// Receives exit status from agent. Set by Task.Start, consumed by Task.Wait.
+    exit_recv: Option<mesh::OneshotReceiver<containerd_shim_agent_protocol::ExitStatus>>,
+    /// Cached after Wait completes, returned by Delete.
+    exit_code: Option<i32>,
+    exited_at: Option<prost_types::Timestamp>,
+    /// Host-side overlay mount path for cleanup on Delete.
+    rootfs_mount_path: Option<PathBuf>,
+    /// Keep relay threads alive (they exit when their pipes close).
+    _io_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl ShimState {
@@ -404,7 +419,8 @@ impl ShimState {
 
                 // Standalone mode: if no VM running, boot one now.
                 if matches!(self.vm_state, VmState::Initial) {
-                    match vm::resolve_config() {
+                    let bundle_path = PathBuf::from(&req.bundle);
+                    match vm::resolve_config(&bundle_path) {
                         Ok(config) => match vm::launch_vm(&self.driver, &config).await {
                             Ok(running) => {
                                 self.vm_state = VmState::Running(running);
@@ -432,35 +448,47 @@ impl ShimState {
                     }
                 }
 
-                self.containers.insert(
-                    req.id.clone(),
-                    ContainerState {
-                        bundle: req.bundle.clone(),
-                        status: protos::containerd::v1::types::Status::Created as i32,
-                        pid: 1,
-                    },
-                );
-                resp.send(Ok(protos::containerd::task::v3::CreateTaskResponse {
-                    pid: 1,
-                }));
+                match self.do_create_task(req).await {
+                    Ok(r) => resp.send(Ok(r)),
+                    Err(e) => {
+                        tracing::error!(error = %e, "task.Create failed");
+                        resp.send(Err(Status {
+                            code: Code::Internal.into(),
+                            message: format!("{e:#}"),
+                            details: vec![],
+                        }));
+                    }
+                }
                 false
             }
             protos::Task::Start(req, resp) => {
                 tracing::info!(id = %req.id, "task.Start");
-                if let Some(c) = self.containers.get_mut(&req.id) {
-                    c.status = protos::containerd::v1::types::Status::Running as i32;
+                match self.do_start_task(&req.id).await {
+                    Ok(r) => resp.send(Ok(r)),
+                    Err(e) => {
+                        tracing::error!(error = %e, "task.Start failed");
+                        resp.send(Err(Status {
+                            code: Code::Internal.into(),
+                            message: format!("{e:#}"),
+                            details: vec![],
+                        }));
+                    }
                 }
-                resp.send(Ok(protos::containerd::task::v3::StartResponse { pid: 1 }));
                 false
             }
             protos::Task::Delete(req, resp) => {
                 tracing::info!(id = %req.id, "task.Delete");
-                self.containers.remove(&req.id);
-                resp.send(Ok(protos::containerd::task::v3::DeleteResponse {
-                    pid: 1,
-                    exit_status: 0,
-                    exited_at: Some(prost_types::Timestamp::default()),
-                }));
+                match self.do_delete_task(&req.id).await {
+                    Ok(r) => resp.send(Ok(r)),
+                    Err(e) => {
+                        tracing::error!(error = %e, "task.Delete failed");
+                        resp.send(Err(Status {
+                            code: Code::Internal.into(),
+                            message: format!("{e:#}"),
+                            details: vec![],
+                        }));
+                    }
+                }
                 false
             }
             protos::Task::State(req, resp) => {
@@ -478,15 +506,34 @@ impl ShimState {
                 }));
                 false
             }
-            protos::Task::Wait(_req, _resp) => {
-                tracing::info!("task.Wait — blocking forever (stub)");
-                // Don't respond — keeps containerd waiting. The sender is
-                // leaked intentionally; the task never exits in this stub.
+            protos::Task::Wait(req, resp) => {
+                tracing::info!(id = %req.id, "task.Wait");
+                match self.do_wait_task(&req.id).await {
+                    Ok(r) => resp.send(Ok(r)),
+                    Err(e) => {
+                        tracing::error!(error = %e, "task.Wait failed");
+                        resp.send(Err(Status {
+                            code: Code::Internal.into(),
+                            message: format!("{e:#}"),
+                            details: vec![],
+                        }));
+                    }
+                }
                 false
             }
             protos::Task::Kill(req, resp) => {
                 tracing::info!(id = %req.id, signal = req.signal, "task.Kill");
-                resp.send(Ok(()));
+                match self.do_kill_task(&req.id, req.signal).await {
+                    Ok(()) => resp.send(Ok(())),
+                    Err(e) => {
+                        tracing::error!(error = %e, "task.Kill failed");
+                        resp.send(Err(Status {
+                            code: Code::Internal.into(),
+                            message: format!("{e:#}"),
+                            details: vec![],
+                        }));
+                    }
+                }
                 false
             }
             protos::Task::Connect(_req, resp) => {
@@ -524,11 +571,292 @@ impl ShimState {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Task implementation methods
+    // -----------------------------------------------------------------------
+
+    async fn do_create_task(
+        &mut self,
+        req: protos::containerd::task::v3::CreateTaskRequest,
+    ) -> anyhow::Result<protos::containerd::task::v3::CreateTaskResponse> {
+        let vm = match &self.vm_state {
+            VmState::Running(vm) => vm,
+            _ => anyhow::bail!("VM not running"),
+        };
+
+        // Read OCI spec from bundle.
+        let spec_path = PathBuf::from(&req.bundle).join("config.json");
+        let spec_json =
+            std::fs::read_to_string(&spec_path).context("failed to read config.json")?;
+
+        // Get the containers staging directory (under the bundle used to create
+        // the VM, which is the virtiofs root).
+        let containers_dir = self.containers_dir();
+
+        // Create staging directory for this container.
+        let staging = containers_dir.join(&req.id);
+        let rootfs_mount = staging.join("rootfs");
+        std::fs::create_dir_all(&rootfs_mount).context("failed to create staging rootfs dir")?;
+
+        // Apply overlay mount from containerd's rootfs mounts.
+        if !req.rootfs.is_empty() {
+            apply_rootfs_mounts(&req.rootfs, &rootfs_mount)?;
+        }
+
+        // Build mesh pipes for I/O bridging.
+        let mut io_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let mut guest_stdin: Option<mesh::pipe::ReadPipe> = None;
+        let mut guest_stdout: Option<mesh::pipe::WritePipe> = None;
+        let mut guest_stderr: Option<mesh::pipe::WritePipe> = None;
+
+        // stdout: guest → host FIFO
+        if !req.stdout.is_empty() {
+            let (read_pipe, write_pipe) = mesh::pipe::pipe();
+            guest_stdout = Some(write_pipe);
+            let stdout_path = req.stdout.clone();
+            io_threads.push(std::thread::spawn(move || {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&stdout_path)
+                    .expect("failed to open stdout FIFO");
+                let _ = block_on(futures::io::copy(
+                    read_pipe,
+                    &mut AllowStdIo::new(file),
+                ));
+            }));
+        }
+
+        // stderr: guest → host FIFO
+        if !req.stderr.is_empty() {
+            let (read_pipe, write_pipe) = mesh::pipe::pipe();
+            guest_stderr = Some(write_pipe);
+            let stderr_path = req.stderr.clone();
+            io_threads.push(std::thread::spawn(move || {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&stderr_path)
+                    .expect("failed to open stderr FIFO");
+                let _ = block_on(futures::io::copy(
+                    read_pipe,
+                    &mut AllowStdIo::new(file),
+                ));
+            }));
+        }
+
+        // stdin: host FIFO → guest
+        if !req.stdin.is_empty() {
+            let (read_pipe, mut write_pipe) = mesh::pipe::pipe();
+            guest_stdin = Some(read_pipe);
+            let stdin_path = req.stdin.clone();
+            io_threads.push(std::thread::spawn(move || {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&stdin_path)
+                    .expect("failed to open stdin FIFO");
+                let _ = block_on(futures::io::copy(
+                    AllowStdIo::new(file),
+                    &mut write_pipe,
+                ));
+            }));
+        }
+
+        // Guest-side rootfs path.
+        let guest_rootfs_path = format!("/run/containers/{}/rootfs", req.id);
+
+        // Send CreateContainer RPC to agent.
+        vm.agent_requests
+            .call(
+                AgentRequest::CreateContainer,
+                CreateContainerRequest {
+                    id: req.id.clone(),
+                    spec_json,
+                    rootfs_path: guest_rootfs_path,
+                    stdin: guest_stdin,
+                    stdout: guest_stdout,
+                    stderr: guest_stderr,
+                    terminal: req.terminal,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("CreateContainer RPC failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("CreateContainer failed: {e}"))?;
+
+        self.containers.insert(
+            req.id.clone(),
+            ContainerState {
+                bundle: req.bundle,
+                status: protos::containerd::v1::types::Status::Created as i32,
+                pid: 0,
+                exit_recv: None,
+                exit_code: None,
+                exited_at: None,
+                rootfs_mount_path: Some(rootfs_mount),
+                _io_threads: io_threads,
+            },
+        );
+
+        Ok(protos::containerd::task::v3::CreateTaskResponse { pid: 0 })
+    }
+
+    async fn do_start_task(
+        &mut self,
+        id: &str,
+    ) -> anyhow::Result<protos::containerd::task::v3::StartResponse> {
+        let vm = match &self.vm_state {
+            VmState::Running(vm) => vm,
+            _ => anyhow::bail!("VM not running"),
+        };
+
+        let start_resp = vm
+            .agent_requests
+            .call(
+                AgentRequest::StartContainer,
+                StartContainerRequest { id: id.to_string() },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("StartContainer RPC failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("StartContainer failed: {e}"))?;
+
+        let container = self
+            .containers
+            .get_mut(id)
+            .context("container not found")?;
+
+        container.pid = start_resp.pid;
+        container.status = protos::containerd::v1::types::Status::Running as i32;
+        container.exit_recv = Some(start_resp.exit_status);
+
+        Ok(protos::containerd::task::v3::StartResponse {
+            pid: start_resp.pid,
+        })
+    }
+
+    async fn do_wait_task(
+        &mut self,
+        id: &str,
+    ) -> anyhow::Result<protos::containerd::task::v3::WaitResponse> {
+        let container = self
+            .containers
+            .get_mut(id)
+            .context("container not found")?;
+
+        // If we already have cached exit info, return it.
+        if let (Some(code), Some(exited_at)) = (container.exit_code, container.exited_at.clone()) {
+            return Ok(protos::containerd::task::v3::WaitResponse {
+                exit_status: code as u32,
+                exited_at: Some(exited_at),
+            });
+        }
+
+        // Await exit status from agent.
+        let exit_recv = container
+            .exit_recv
+            .take()
+            .context("no exit receiver (not started or already waited)")?;
+
+        let exit_status = exit_recv
+            .await
+            .map_err(|_| anyhow::anyhow!("exit status channel broken"))?;
+
+        let exited_at = prost_types::Timestamp {
+            seconds: (exit_status.exited_at / 1_000_000_000) as i64,
+            nanos: (exit_status.exited_at % 1_000_000_000) as i32,
+        };
+
+        container.status = protos::containerd::v1::types::Status::Stopped as i32;
+        container.exit_code = Some(exit_status.code);
+        container.exited_at = Some(exited_at.clone());
+
+        Ok(protos::containerd::task::v3::WaitResponse {
+            exit_status: exit_status.code as u32,
+            exited_at: Some(exited_at),
+        })
+    }
+
+    async fn do_kill_task(&mut self, id: &str, signal: u32) -> anyhow::Result<()> {
+        let vm = match &self.vm_state {
+            VmState::Running(vm) => vm,
+            _ => anyhow::bail!("VM not running"),
+        };
+
+        vm.agent_requests
+            .call(
+                AgentRequest::KillContainer,
+                KillRequest {
+                    id: id.to_string(),
+                    signal,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("KillContainer RPC failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("KillContainer failed: {e}"))?;
+
+        Ok(())
+    }
+
+    async fn do_delete_task(
+        &mut self,
+        id: &str,
+    ) -> anyhow::Result<protos::containerd::task::v3::DeleteResponse> {
+        let vm = match &self.vm_state {
+            VmState::Running(vm) => vm,
+            _ => anyhow::bail!("VM not running"),
+        };
+
+        // Send DeleteContainer to agent.
+        vm.agent_requests
+            .call(
+                AgentRequest::DeleteContainer,
+                DeleteContainerRequest {
+                    id: id.to_string(),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("DeleteContainer RPC failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("DeleteContainer failed: {e}"))?;
+
+        // Clean up host-side state.
+        let container = self
+            .containers
+            .remove(id)
+            .context("container not found")?;
+
+        // Unmount overlay.
+        if let Some(rootfs_mount) = &container.rootfs_mount_path {
+            let path_c = std::ffi::CString::new(rootfs_mount.to_string_lossy().as_ref())
+                .unwrap_or_default();
+            // SAFETY: umount2 with a valid path.
+            unsafe {
+                libc::umount2(path_c.as_ptr(), 0);
+            }
+            // Remove staging directory.
+            let staging = rootfs_mount.parent().unwrap_or(rootfs_mount);
+            let _ = std::fs::remove_dir_all(staging);
+        }
+
+        let exit_status = container.exit_code.unwrap_or(0) as u32;
+        let exited_at = container
+            .exited_at
+            .unwrap_or(prost_types::Timestamp::default());
+
+        Ok(protos::containerd::task::v3::DeleteResponse {
+            pid: container.pid,
+            exit_status,
+            exited_at: Some(exited_at),
+        })
+    }
+
+    /// Get the containers staging directory (virtiofs root).
+    fn containers_dir(&self) -> PathBuf {
+        PathBuf::from(&self.args.bundle).join("containers")
+    }
+
     async fn handle_sandbox(&mut self, request: protos::Sandbox) {
         match request {
             protos::Sandbox::CreateSandbox(req, resp) => {
                 tracing::info!(sandbox_id = %req.sandbox_id, "sandbox.CreateSandbox");
-                match vm::resolve_config() {
+                let bundle_path = PathBuf::from(&self.args.bundle);
+                match vm::resolve_config(&bundle_path) {
                     Ok(config) => {
                         self.vm_state = VmState::Configured(config);
                         resp.send(Ok(
@@ -721,3 +1049,55 @@ fn main() {
 // Bring FromRawFd into scope for the unsafe fd conversions.
 // ---------------------------------------------------------------------------
 use std::os::unix::io::FromRawFd;
+
+// ---------------------------------------------------------------------------
+// Overlay mount helpers
+// ---------------------------------------------------------------------------
+
+/// Apply containerd's rootfs mounts (typically overlay) on the host.
+fn apply_rootfs_mounts(
+    mounts: &[protos::containerd::types::Mount],
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for mount in mounts {
+        let options = mount.options.join(",");
+        let target_str = target.to_string_lossy();
+        let source = if mount.source.is_empty() {
+            &mount.r#type
+        } else {
+            &mount.source
+        };
+        c_mount(source, &target_str, &mount.r#type, 0, &options)
+            .with_context(|| format!("failed to mount {} at {}", mount.r#type, target_str))?;
+    }
+    Ok(())
+}
+
+fn c_mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: u64,
+    data: &str,
+) -> std::io::Result<()> {
+    let source = std::ffi::CString::new(source).unwrap();
+    let target = std::ffi::CString::new(target).unwrap();
+    let fstype = std::ffi::CString::new(fstype).unwrap();
+    let data = std::ffi::CString::new(data).unwrap();
+    // SAFETY: Calling libc::mount with valid C string pointers.
+    let ret = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            flags as libc::c_ulong,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}

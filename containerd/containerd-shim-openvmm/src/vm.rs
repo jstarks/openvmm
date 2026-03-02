@@ -7,34 +7,38 @@
 //! setting up vsock relay, and connecting to the guest agent.
 
 use anyhow::Context as _;
+use containerd_shim_agent_protocol::AGENT_VSOCK_PORT;
 use containerd_shim_agent_protocol::AgentBootstrap;
 use containerd_shim_agent_protocol::AgentRequest;
-use containerd_shim_agent_protocol::AGENT_VSOCK_PORT;
 use futures::FutureExt;
 use futures::StreamExt;
 use mesh::rpc::RpcSend;
 use mesh_remote::PointToPointMesh;
 use mesh_worker::RegisteredWorkers;
 use openvmm_defs::config::Config;
+use openvmm_defs::config::DEFAULT_MMIO_GAPS_X86;
+use openvmm_defs::config::DEFAULT_PCIE_ECAM_BASE;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::ProcessorTopologyConfig;
+use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
-use openvmm_defs::config::DEFAULT_MMIO_GAPS_X86;
-use openvmm_defs::config::DEFAULT_PCIE_ECAM_BASE;
 use openvmm_defs::rpc::VmRpc;
-use openvmm_defs::worker::VmWorkerParameters;
 use openvmm_defs::worker::VM_WORKER;
+use openvmm_defs::worker::VmWorkerParameters;
 use pal_async::socket::PolledSocket;
 use pal_async::task::Spawn;
 use pal_async::timer::PolledTimer;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
+use virtio_resources::fs::VirtioFsBackend;
+use virtio_resources::fs::VirtioFsHandle;
 use vm_manifest_builder::BaseChipsetType;
 use vm_manifest_builder::MachineArch;
 use vm_manifest_builder::VmManifestBuilder;
+use vm_resource::IntoResource;
 use vmm_core_defs::HaltReason;
 
 /// Configuration for launching a VM, resolved from environment variables
@@ -48,6 +52,8 @@ pub struct VmConfig {
     pub cpus: u32,
     /// RAM in megabytes.
     pub memory_mb: u64,
+    /// Directory shared into the VM via virtiofs for container rootfs mounts.
+    pub containers_dir: PathBuf,
 }
 
 /// A running VM with its control channels.
@@ -78,11 +84,16 @@ impl Drop for RunningVm {
 }
 
 /// Resolve VM configuration from environment variables.
-pub fn resolve_config() -> anyhow::Result<VmConfig> {
+///
+/// `bundle` is the containerd bundle directory — a `containers/` subdirectory
+/// is created under it and shared into the VM via virtiofs.
+pub fn resolve_config(bundle: &std::path::Path) -> anyhow::Result<VmConfig> {
     let kernel_path = std::env::var("OPENVMM_SHIM_KERNEL")
         .context("OPENVMM_SHIM_KERNEL environment variable not set")?;
     let agent_path = std::env::var("OPENVMM_SHIM_AGENT")
         .context("OPENVMM_SHIM_AGENT environment variable not set")?;
+    let containers_dir = bundle.join("containers");
+    std::fs::create_dir_all(&containers_dir).context("failed to create containers dir")?;
     Ok(VmConfig {
         kernel_path: PathBuf::from(kernel_path),
         agent_path: PathBuf::from(agent_path),
@@ -94,6 +105,7 @@ pub fn resolve_config() -> anyhow::Result<VmConfig> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(256),
+        containers_dir,
     })
 }
 
@@ -105,7 +117,12 @@ pub async fn launch_vm(
     // 1. Read agent binary and build initrd.
     let mut agent_binary = Vec::new();
     std::fs::File::open(&config.agent_path)
-        .with_context(|| format!("failed to open agent binary: {}", config.agent_path.display()))?
+        .with_context(|| {
+            format!(
+                "failed to open agent binary: {}",
+                config.agent_path.display()
+            )
+        })?
         .read_to_end(&mut agent_binary)
         .context("failed to read agent binary")?;
 
@@ -121,8 +138,8 @@ pub async fn launch_vm(
         .flush()
         .context("failed to flush initrd temp file")?;
     // Reopen as a read-only File for Config.
-    let initrd_file = std::fs::File::open(initrd_tmpfile.path())
-        .context("failed to reopen initrd temp file")?;
+    let initrd_file =
+        std::fs::File::open(initrd_tmpfile.path()).context("failed to reopen initrd temp file")?;
 
     // 3. Open kernel file.
     let kernel_file = std::fs::File::open(&config.kernel_path)
@@ -142,13 +159,11 @@ pub async fn launch_vm(
         .context("failed to create polled agent listener")?;
 
     // 6. Build chipset.
-    let chipset = VmManifestBuilder::new(
-        BaseChipsetType::HyperVGen2LinuxDirect,
-        MachineArch::X86_64,
-    )
-    .with_serial([None, None, None, None])
-    .build()
-    .context("failed to build chipset")?;
+    let chipset =
+        VmManifestBuilder::new(BaseChipsetType::HyperVGen2LinuxDirect, MachineArch::X86_64)
+            .with_serial([None, None, None, None])
+            .build()
+            .context("failed to build chipset")?;
 
     // 7. Construct Config.
     let (vm_rpc_send, vm_rpc_recv) = mesh::channel::<VmRpc>();
@@ -198,7 +213,17 @@ pub async fn launch_vm(
         framebuffer: None,
         vga_firmware: None,
         vtl2_gfx: false,
-        virtio_devices: vec![],
+        virtio_devices: vec![(
+            VirtioBus::Mmio,
+            VirtioFsHandle {
+                tag: "containers".into(),
+                fs: VirtioFsBackend::HostFs {
+                    root_path: config.containers_dir.to_string_lossy().into_owned(),
+                    mount_options: String::new(),
+                },
+            }
+            .into_resource(),
+        )],
         vmgs: None,
         secure_boot_enabled: false,
         custom_uefi_vars: Default::default(),

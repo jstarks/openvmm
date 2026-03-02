@@ -161,7 +161,7 @@ pub async fn launch_vm(
     // 6. Build chipset.
     let chipset =
         VmManifestBuilder::new(BaseChipsetType::HyperVGen2LinuxDirect, MachineArch::X86_64)
-            .with_serial([None, None, None, None])
+            .with_serial([None, None, None, None]) // no serial backends
             .build()
             .context("failed to build chipset")?;
 
@@ -173,9 +173,9 @@ pub async fn launch_vm(
         load_mode: LoadMode::Linux {
             kernel: kernel_file,
             initrd: Some(initrd_file),
-            cmdline: "console=ttyS0 panic=-1".into(),
+            cmdline: "panic=-1".into(),
             custom_dsdt: None,
-            enable_serial: true,
+            enable_serial: false,
         },
         floppy_disks: vec![],
         ide_disks: vec![],

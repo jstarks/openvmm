@@ -1,0 +1,24 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "disk_vhdx"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vhdx.workspace = true
+blocking.workspace = true
+disk_backend.workspace = true
+disk_layered.workspace = true
+guestmem.workspace = true
+scsi_buffers.workspace = true
+inspect.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pal_async.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

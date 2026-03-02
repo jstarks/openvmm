@@ -41,6 +41,7 @@ members = [
   "vm/devices/storage/scsi_buffers/fuzz",
   "vm/devices/storage/storage_tests",
   "vm/devices/storage/storvsp/fuzz",
+  "vm/devices/storage/disk_vhdx",
   "vm/devices/storage/vhdx",
   "vm/vmcore/guestmem/fuzz",
   "vm/x86/x86emu/fuzz",
@@ -324,6 +325,7 @@ storvsc_driver = { path = "vm/devices/storage/storvsc_driver" }
 storvsp = { path = "vm/devices/storage/storvsp" }
 storvsp_protocol = { path = "vm/devices/storage/storvsp_protocol" }
 storvsp_resources = { path = "vm/devices/storage/storvsp_resources" }
+vhdx = { path = "vm/devices/storage/vhdx" }
 device_emulators = { path = "vm/devices/support/device_emulators" }
 fuse = { path = "vm/devices/support/fs/fuse" }
 lx = { path = "vm/devices/support/fs/lx" }

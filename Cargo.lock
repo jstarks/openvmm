@@ -1573,6 +1573,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk_vhdx"
+version = "0.0.0"
+dependencies = [
+ "blocking",
+ "disk_backend",
+ "disk_layered",
+ "guestmem",
+ "inspect",
+ "pal_async",
+ "scsi_buffers",
+ "tempfile",
+ "tracing",
+ "vhdx",
+]
+
+[[package]]
 name = "disklayer_ram"
 version = "0.0.0"
 dependencies = [

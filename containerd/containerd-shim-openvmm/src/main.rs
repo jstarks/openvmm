@@ -10,6 +10,8 @@
 
 #![allow(unsafe_code)]
 
+mod initrd;
+
 use anyhow::Context as _;
 use containerd_shim_protos as protos;
 use futures::StreamExt;

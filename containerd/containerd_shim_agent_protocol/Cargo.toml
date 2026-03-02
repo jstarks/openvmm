@@ -1,0 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "containerd_shim_agent_protocol"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh.workspace = true
+
+[lints]
+workspace = true

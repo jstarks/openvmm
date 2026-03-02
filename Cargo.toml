@@ -53,6 +53,8 @@ members = [
   "opentmk",
   # containerd
   "containerd/containerd_shim_protos",
+  "containerd/containerd_shim_agent_protocol",
+  "containerd/containerd-shim-agent",
   "containerd/containerd-shim-openvmm",
 ]
 exclude = [
@@ -82,6 +84,8 @@ openvmm_pcat_locator = { path = "openvmm/openvmm_pcat_locator" }
 openvmm_resources = { path = "openvmm/openvmm_resources" }
 openvmm_ttrpc_vmservice = { path = "openvmm/openvmm_ttrpc_vmservice" }
 containerd_shim_protos = { path = "containerd/containerd_shim_protos" }
+containerd_shim_agent_protocol = { path = "containerd/containerd_shim_agent_protocol" }
+containerd_shim_agent = { path = "containerd/containerd-shim-agent" }
 containerd_shim_openvmm = { path = "containerd/containerd-shim-openvmm" }
 membacking = { path = "openvmm/membacking" }
 

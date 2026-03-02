@@ -1,0 +1,31 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "containerd_shim_agent"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "containerd-shim-agent"
+path = "src/main.rs"
+
+[dependencies]
+containerd_shim_agent_protocol.workspace = true
+
+# mesh / async
+mesh.workspace = true
+mesh_remote.workspace = true
+pal_async.workspace = true
+
+# vsock
+vmsocket.workspace = true
+socket2 = { workspace = true, features = ["all"] }
+
+# utilities
+anyhow.workspace = true
+libc.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true

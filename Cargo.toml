@@ -51,6 +51,8 @@ members = [
   "vm/vmgs/vmgstool",
   # opentmk
   "opentmk",
+  # containerd
+  "containerd/containerd_shim_protos",
 ]
 exclude = [
   "xsync",
@@ -78,6 +80,7 @@ openvmm_helpers = { path = "openvmm/openvmm_helpers" }
 openvmm_pcat_locator = { path = "openvmm/openvmm_pcat_locator" }
 openvmm_resources = { path = "openvmm/openvmm_resources" }
 openvmm_ttrpc_vmservice = { path = "openvmm/openvmm_ttrpc_vmservice" }
+containerd_shim_protos = { path = "containerd/containerd_shim_protos" }
 membacking = { path = "openvmm/membacking" }
 
 petri_artifact_resolver_openvmm_known_paths = { path = "vmm_tests/petri_artifact_resolver_openvmm_known_paths" }

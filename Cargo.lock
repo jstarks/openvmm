@@ -831,6 +831,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
+name = "containerd_shim_protos"
+version = "0.0.0"
+dependencies = [
+ "mesh",
+ "mesh_build",
+ "mesh_rpc",
+ "prost",
+ "prost-build",
+ "prost-types",
+]
+
+[[package]]
 name = "cordyceps"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

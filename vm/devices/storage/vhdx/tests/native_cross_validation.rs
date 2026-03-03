@@ -18,6 +18,7 @@
 // UNSAFETY: Windows FFI calls for virtual disk APIs and raw disk I/O.
 #![expect(unsafe_code)]
 
+use pal_async::DefaultDriver;
 use parking_lot::Mutex;
 use std::io;
 use std::path::Path;
@@ -388,7 +389,12 @@ struct RustVhdx {
 }
 
 impl RustVhdx {
-    async fn create(path: &Path, disk_size: u64, block_size: u32) -> Self {
+    async fn create(
+        path: &Path,
+        disk_size: u64,
+        block_size: u32,
+        driver: &DefaultDriver,
+    ) -> Self {
         let file = StdFile::create(path).expect("create backing file");
         let mut params = vhdx::create::CreateParams {
             disk_size,
@@ -400,16 +406,27 @@ impl RustVhdx {
             .expect("vhdx create");
         drop(file);
 
-        // Re-open for use.
-        Self::open(path, false).await
+        // Re-open for use with log task.
+        Self::open(path, false, Some(driver)).await
     }
 
-    async fn open(path: &Path, read_only: bool) -> Self {
+    async fn open(
+        path: &Path,
+        read_only: bool,
+        driver: Option<&DefaultDriver>,
+    ) -> Self {
         let file = StdFile::open(path, read_only).expect("open backing file");
         let io_file = Arc::new(StdFile::open(path, read_only).expect("open io file"));
-        let vhdx = vhdx::VhdxFile::open(file, read_only)
-            .await
-            .expect("vhdx open");
+        let vhdx = if read_only {
+            vhdx::VhdxFile::open(file, true)
+                .await
+                .expect("vhdx open")
+        } else {
+            let driver = driver.expect("writable open requires a driver/spawner");
+            vhdx::VhdxFile::open_with_log(file, driver)
+                .await
+                .expect("vhdx open_with_log")
+        };
         RustVhdx { vhdx, io_file }
     }
 
@@ -502,8 +519,7 @@ impl RustVhdx {
 
     /// Close the VHDX (consume self).
     async fn close(self) {
-        self.vhdx.flush().await.expect("flush on close");
-        drop(self);
+        self.vhdx.close().await.expect("close");
     }
 }
 
@@ -539,7 +555,7 @@ async fn native_create_rust_open_metadata() {
     }
 
     // Rust open and verify metadata.
-    let rust = RustVhdx::open(&vhdx_path, true).await;
+    let rust = RustVhdx::open(&vhdx_path, true, None).await;
 
     // Native defaults: 1 GiB disk, typically 32 MiB block size, 512 sector sizes.
     assert_eq!(rust.vhdx.disk_size(), 1024 * 1024 * 1024, "disk_size");
@@ -563,13 +579,13 @@ async fn native_create_rust_open_metadata() {
 /// Rust creates a dynamic VHDX (1 GiB) → close → native OpenVirtualDisk
 /// succeeds.
 #[pal_async::async_test]
-async fn rust_create_native_open() {
+async fn rust_create_native_open(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
     // Rust create: 1 GiB, 2 MiB block size (Rust default), 512-byte sectors.
     {
-        let rust = RustVhdx::create(&vhdx_path, 1024 * 1024 * 1024, 0).await;
+        let rust = RustVhdx::create(&vhdx_path, 1024 * 1024 * 1024, 0, &driver).await;
         rust.close().await;
     }
 
@@ -583,13 +599,13 @@ async fn rust_create_native_open() {
 /// Rust creates a small dynamic VHDX (4 MiB, 2 MiB blocks) → close →
 /// native opens → attach → raw-read first sector → verify all zeros.
 #[pal_async::async_test]
-async fn rust_create_native_attach_read_zeros() {
+async fn rust_create_native_attach_read_zeros(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
     // Rust create: 4 MiB disk, 2 MiB block size.
     {
-        let rust = RustVhdx::create(&vhdx_path, 4 * 1024 * 1024, 2 * 1024 * 1024).await;
+        let rust = RustVhdx::create(&vhdx_path, 4 * 1024 * 1024, 2 * 1024 * 1024, &driver).await;
         rust.flush().await;
         rust.close().await;
     }
@@ -639,7 +655,7 @@ async fn native_create_rust_read_data() {
     }
 
     // Rust open + read + verify.
-    let rust = RustVhdx::open(&vhdx_path, true).await;
+    let rust = RustVhdx::open(&vhdx_path, true, None).await;
 
     let offsets = [0u64, block_size, 2 * block_size];
     for &off in &offsets {
@@ -665,7 +681,7 @@ async fn native_create_custom_block_size() {
             NativeVhdx::create_dynamic(&vhdx_path, 1024 * 1024 * 1024, 32 * 1024 * 1024, 0);
     }
 
-    let rust = RustVhdx::open(&vhdx_path, true).await;
+    let rust = RustVhdx::open(&vhdx_path, true, None).await;
     assert_eq!(
         rust.vhdx.block_size(),
         33554432,
@@ -687,7 +703,7 @@ async fn native_create_4k_sector() {
         let _native = NativeVhdx::create_dynamic(&vhdx_path, 1024 * 1024 * 1024, 0, 4096);
     }
 
-    let rust = RustVhdx::open(&vhdx_path, true).await;
+    let rust = RustVhdx::open(&vhdx_path, true, None).await;
     assert_eq!(
         rust.vhdx.logical_sector_size(),
         4096,
@@ -702,7 +718,7 @@ async fn native_create_4k_sector() {
 /// flush → close → native opens → attach → raw-read at each offset →
 /// data matches.
 #[pal_async::async_test]
-async fn rust_create_native_read_data() {
+async fn rust_create_native_read_data(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
@@ -710,7 +726,7 @@ async fn rust_create_native_read_data() {
 
     // Rust create + write.
     {
-        let rust = RustVhdx::create(&vhdx_path, 32 * 1024 * 1024, block_size as u32).await;
+        let rust = RustVhdx::create(&vhdx_path, 32 * 1024 * 1024, block_size as u32, &driver).await;
 
         // Write to 3 different blocks (blocks 1, 3, 5 — skip block 0 since test 3 uses it).
         let offsets = [block_size, 3 * block_size, 5 * block_size];
@@ -741,7 +757,7 @@ async fn rust_create_native_read_data() {
 /// Rust creates VHDX files with 2 MiB, 4 MiB, and 32 MiB block sizes →
 /// native opens each → open succeeds without error.
 #[pal_async::async_test]
-async fn rust_create_various_block_sizes() {
+async fn rust_create_various_block_sizes(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let block_sizes: &[u32] = &[2 * 1024 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024];
 
@@ -750,7 +766,7 @@ async fn rust_create_various_block_sizes() {
         let vhdx_path = dir.path().join(&name);
 
         {
-            let rust = RustVhdx::create(&vhdx_path, 64 * 1024 * 1024, bs).await;
+            let rust = RustVhdx::create(&vhdx_path, 64 * 1024 * 1024, bs, &driver).await;
             rust.close().await;
         }
 
@@ -765,7 +781,7 @@ async fn rust_create_various_block_sizes() {
 /// Rust opens → writes region B (second block) → flush → close →
 /// native opens → attach → reads both regions → both intact.
 #[pal_async::async_test]
-async fn interleaved_native_then_rust() {
+async fn interleaved_native_then_rust(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
@@ -782,7 +798,7 @@ async fn interleaved_native_then_rust() {
 
     // Step 2: Rust opens → writes region B at block_size offset.
     {
-        let rust = RustVhdx::open(&vhdx_path, false).await;
+        let rust = RustVhdx::open(&vhdx_path, false, Some(&driver)).await;
         let pattern_b = test_pattern(block_size, 512);
         rust.write_data(block_size, &pattern_b).await;
         rust.flush().await;
@@ -814,7 +830,7 @@ async fn interleaved_native_then_rust() {
 /// native opens → attach → writes blocks 1, 3 → detach → close →
 /// Rust opens → reads all blocks → all data intact.
 #[pal_async::async_test]
-async fn interleaved_rust_then_native() {
+async fn interleaved_rust_then_native(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
@@ -823,7 +839,7 @@ async fn interleaved_rust_then_native() {
     // Step 1: Rust create + write blocks 0, 2, 4.
     let rust_offsets = [0u64, 2 * block_size, 4 * block_size];
     {
-        let rust = RustVhdx::create(&vhdx_path, 32 * 1024 * 1024, block_size as u32).await;
+        let rust = RustVhdx::create(&vhdx_path, 32 * 1024 * 1024, block_size as u32, &driver).await;
         for &off in &rust_offsets {
             rust.write_data(off, &test_pattern(off, 512)).await;
         }
@@ -845,7 +861,7 @@ async fn interleaved_rust_then_native() {
 
     // Step 3: Rust opens → reads all blocks → verifies.
     {
-        let rust = RustVhdx::open(&vhdx_path, true).await;
+        let rust = RustVhdx::open(&vhdx_path, true, None).await;
 
         for &off in rust_offsets.iter().chain(native_offsets.iter()) {
             let expected = test_pattern(off, 512);
@@ -863,7 +879,7 @@ async fn interleaved_rust_then_native() {
 /// writes block 1 → detach → close → Rust opens → reads blocks 0 and 1 →
 /// both correct.
 #[pal_async::async_test]
-async fn three_way_round_trip() {
+async fn three_way_round_trip(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
@@ -871,7 +887,7 @@ async fn three_way_round_trip() {
 
     // Step 1: Rust creates and writes block 0.
     {
-        let rust = RustVhdx::create(&vhdx_path, 16 * 1024 * 1024, block_size as u32).await;
+        let rust = RustVhdx::create(&vhdx_path, 16 * 1024 * 1024, block_size as u32, &driver).await;
         rust.write_data(0, &test_pattern(0, 512)).await;
         rust.flush().await;
         rust.close().await;
@@ -890,7 +906,7 @@ async fn three_way_round_trip() {
 
     // Step 3: Rust opens → reads blocks 0 and 1 → verifies.
     {
-        let rust = RustVhdx::open(&vhdx_path, true).await;
+        let rust = RustVhdx::open(&vhdx_path, true, None).await;
 
         let data0 = rust.read_data(0, 512).await;
         assert_eq!(data0, test_pattern(0, 512), "block 0 data mismatch");
@@ -912,7 +928,7 @@ async fn three_way_round_trip() {
 /// trims block 1 → flush → close → native opens → attach →
 /// raw-read block 0 (data intact) → raw-read block 1 (zeros).
 #[pal_async::async_test]
-async fn trim_rust_trim_native_read() {
+async fn trim_rust_trim_native_read(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
@@ -920,7 +936,7 @@ async fn trim_rust_trim_native_read() {
 
     // Rust create + write both blocks + trim block 1.
     {
-        let rust = RustVhdx::create(&vhdx_path, 4 * 1024 * 1024, block_size as u32).await;
+        let rust = RustVhdx::create(&vhdx_path, 4 * 1024 * 1024, block_size as u32, &driver).await;
 
         // Write block 0 and block 1.
         rust.write_data(0, &test_pattern(0, 512)).await;
@@ -960,7 +976,7 @@ async fn trim_rust_trim_native_read() {
 /// Rust opens → trims block 1 → flush → close → native opens → attach →
 /// raw-read block 0 (intact) → raw-read block 1 (zeros).
 #[pal_async::async_test]
-async fn trim_native_write_rust_trim_native_read() {
+async fn trim_native_write_rust_trim_native_read(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let vhdx_path = dir.path().join("test.vhdx");
 
@@ -970,7 +986,7 @@ async fn trim_native_write_rust_trim_native_read() {
 
     // Step 1: Rust creates to control block size, then close.
     {
-        let rust = RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32).await;
+        let rust = RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
         rust.close().await;
     }
 
@@ -992,7 +1008,7 @@ async fn trim_native_write_rust_trim_native_read() {
 
     // Step 3: Rust opens → trims block 1 → flush → close.
     {
-        let rust = RustVhdx::open(&vhdx_path, false).await;
+        let rust = RustVhdx::open(&vhdx_path, false, Some(&driver)).await;
         rust.trim_range(block_size, block_size).await;
         rust.flush().await;
         rust.close().await;
@@ -1079,7 +1095,12 @@ impl RustVhdx {
     ///
     /// No parent locator is written — this is sufficient for Rust-only
     /// chained reads but NOT for native-open.
-    async fn create_diff(path: &Path, disk_size: u64, block_size: u32) -> Self {
+    async fn create_diff(
+        path: &Path,
+        disk_size: u64,
+        block_size: u32,
+        driver: &DefaultDriver,
+    ) -> Self {
         let file = StdFile::create(path).expect("create backing file");
         let mut params = vhdx::create::CreateParams {
             disk_size,
@@ -1092,7 +1113,7 @@ impl RustVhdx {
             .expect("vhdx create diff");
         drop(file);
 
-        Self::open(path, false).await
+        Self::open(path, false, Some(driver)).await
     }
 }
 
@@ -1159,7 +1180,7 @@ async fn chained_read(child: &RustVhdx, parent: &RustVhdx, offset: u64, len: u32
 /// child read returns zeros (Unmapped) → chained_read falls through
 /// to parent → data matches.
 #[pal_async::async_test]
-async fn diff_rust_chained_read_unwritten_child() {
+async fn diff_rust_chained_read_unwritten_child(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let parent_path = dir.path().join("parent.vhdx");
     let child_path = dir.path().join("child.vhdx");
@@ -1169,14 +1190,14 @@ async fn diff_rust_chained_read_unwritten_child() {
 
     // Step 1: Rust-create parent, write test_pattern at offset 0.
     {
-        let parent = RustVhdx::create(&parent_path, disk_size, block_size).await;
+        let parent = RustVhdx::create(&parent_path, disk_size, block_size, &driver).await;
         parent.write_data(0, &test_pattern(0, 512)).await;
         parent.flush().await;
         parent.close().await;
     }
 
     // Step 2: Rust-create diff child (has_parent: true).
-    let child = RustVhdx::create_diff(&child_path, disk_size, block_size).await;
+    let child = RustVhdx::create_diff(&child_path, disk_size, block_size, &driver).await;
 
     // Step 3: child.read_data returns zeros (Unmapped treated as zero).
     let child_data = child.read_data(0, 512).await;
@@ -1186,7 +1207,7 @@ async fn diff_rust_chained_read_unwritten_child() {
     );
 
     // Step 4: chained_read falls through to parent.
-    let parent = RustVhdx::open(&parent_path, true).await;
+    let parent = RustVhdx::open(&parent_path, true, None).await;
     let chained = chained_read(&child, &parent, 0, 512).await;
     assert_eq!(
         chained,
@@ -1211,7 +1232,7 @@ async fn diff_rust_chained_read_unwritten_child() {
 /// the block as PartiallyPresent (not FullyPresent), and the sector bitmap
 /// tracks which sectors are present in the child vs. transparent to parent.
 #[pal_async::async_test]
-async fn diff_rust_chained_read_partial_block() {
+async fn diff_rust_chained_read_partial_block(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let parent_path = dir.path().join("parent.vhdx");
     let child_path = dir.path().join("child.vhdx");
@@ -1221,14 +1242,14 @@ async fn diff_rust_chained_read_partial_block() {
 
     // Step 1: Rust-create parent, write 2 sectors at offset 0.
     {
-        let parent = RustVhdx::create(&parent_path, disk_size, block_size).await;
+        let parent = RustVhdx::create(&parent_path, disk_size, block_size, &driver).await;
         parent.write_data(0, &test_pattern(0, 1024)).await;
         parent.flush().await;
         parent.close().await;
     }
 
     // Step 2: Rust-create diff child.
-    let child = RustVhdx::create_diff(&child_path, disk_size, block_size).await;
+    let child = RustVhdx::create_diff(&child_path, disk_size, block_size, &driver).await;
 
     // Step 3: Write only sector 0 in child with a distinguishable pattern.
     // The block should become PartiallyPresent with SBM bit 0 set.
@@ -1238,7 +1259,7 @@ async fn diff_rust_chained_read_partial_block() {
 
     // Step 4: chained_read should return child data for sector 0,
     //         parent data for sector 1.
-    let parent = RustVhdx::open(&parent_path, true).await;
+    let parent = RustVhdx::open(&parent_path, true, None).await;
     let chained = chained_read(&child, &parent, 0, 1024).await;
 
     // Sector 0 (bytes 0..512): from child → [0xAA; 512]
@@ -1302,7 +1323,7 @@ async fn diff_native_create_rust_reads() {
     }
 
     // Step 3: Rust opens child (read-only).
-    let child = RustVhdx::open(&child_path, true).await;
+    let child = RustVhdx::open(&child_path, true, None).await;
 
     // Block 0, sector 0: child has data → should be [0xBB; 512].
     let data_block0 = child.read_data(0, 512).await;
@@ -1320,7 +1341,7 @@ async fn diff_native_create_rust_reads() {
     );
 
     // Step 4: Rust opens parent (read-only).
-    let parent = RustVhdx::open(&parent_path, true).await;
+    let parent = RustVhdx::open(&parent_path, true, None).await;
 
     // Verify parent block 1 data directly.
     let parent_block1 = parent.read_data(block_size, 512).await;
@@ -1370,7 +1391,7 @@ async fn diff_native_create_empty_child_rust_reads() {
     }
 
     // Step 3: Rust opens child.
-    let child = RustVhdx::open(&child_path, true).await;
+    let child = RustVhdx::open(&child_path, true, None).await;
 
     // Child has_parent should be true.
     assert!(child.vhdx.has_parent(), "child should be a diff disk");
@@ -1383,7 +1404,7 @@ async fn diff_native_create_empty_child_rust_reads() {
     );
 
     // Step 4: Rust opens parent; chained_read falls through.
-    let parent = RustVhdx::open(&parent_path, true).await;
+    let parent = RustVhdx::open(&parent_path, true, None).await;
     let chained = chained_read(&child, &parent, 0, 512).await;
     assert_eq!(
         chained,
@@ -1403,7 +1424,7 @@ async fn diff_native_create_empty_child_rust_reads() {
 /// raw-read → child data present at sector 0, parent data for sector 1
 /// (unwritten in child, falls through via native chain and SBM resolution).
 #[pal_async::async_test]
-async fn diff_rust_writes_to_native_diff() {
+async fn diff_rust_writes_to_native_diff(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let parent_path = dir.path().join("parent.vhdx");
     let child_path = dir.path().join("child.vhdx");
@@ -1432,7 +1453,7 @@ async fn diff_rust_writes_to_native_diff() {
     // Step 3: Rust opens child writable, writes only sector 0.
     // The block should become PartiallyPresent with SBM bit 0 set.
     {
-        let child = RustVhdx::open(&child_path, false).await;
+        let child = RustVhdx::open(&child_path, false, Some(&driver)).await;
         let child_data = vec![0xCCu8; 512];
         child.write_data(0, &child_data).await;
         child.flush().await;
@@ -1468,7 +1489,7 @@ async fn diff_rust_writes_to_native_diff() {
 /// child → Rust writes to child blocks 0 and 1 → Rust trims block 1 →
 /// native reads → block 0 has child data, block 1 is zeros.
 #[pal_async::async_test]
-async fn diff_rust_writes_and_trims() {
+async fn diff_rust_writes_and_trims(driver: DefaultDriver) {
     let dir = tempfile::tempdir().unwrap();
     let parent_path = dir.path().join("parent.vhdx");
     let child_path = dir.path().join("child.vhdx");
@@ -1477,7 +1498,7 @@ async fn diff_rust_writes_and_trims() {
 
     // Step 1: Rust-create parent (to control block size), write blocks 0 and 1.
     {
-        let parent = RustVhdx::create(&parent_path, 8 * 1024 * 1024, block_size as u32).await;
+        let parent = RustVhdx::create(&parent_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
         parent.write_data(0, &test_pattern(0, 512)).await;
         parent
             .write_data(block_size, &test_pattern(block_size, 512))
@@ -1496,7 +1517,7 @@ async fn diff_rust_writes_and_trims() {
     //   - Write [0xEE; 512] at offset block_size (block 1, sector 0)
     //   - Trim block 1 entirely
     {
-        let child = RustVhdx::open(&child_path, false).await;
+        let child = RustVhdx::open(&child_path, false, Some(&driver)).await;
         child.write_data(0, &vec![0xDDu8; 512]).await;
         child.write_data(block_size, &vec![0xEEu8; 512]).await;
         child.trim_range(block_size, block_size).await;

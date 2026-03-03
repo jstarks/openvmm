@@ -84,6 +84,14 @@ pub struct WriteIoGuard<'a, F: AsyncFile> {
     len: u32,
     /// Whether `complete()` was called. If false on drop, the write is aborted.
     completed: bool,
+    /// True when at least one TFP block was allocated from space that is
+    /// NOT safe (could contain stale data from another block). When true,
+    /// `complete_write_inner` must capture the current FSN and apply it
+    /// to the BAT pages so the log task waits for the data flush before
+    /// logging the BAT update.
+    ///
+    /// Matches C's `NeedsFlushDuringPostAllocate` flag.
+    needs_flush_before_log: bool,
 }
 
 impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
@@ -94,6 +102,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
         len: u32,
         start_block: u32,
         block_count: u32,
+        needs_flush_before_log: bool,
     ) -> Self {
         Self {
             vhdx,
@@ -102,6 +111,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             offset,
             len,
             completed: false,
+            needs_flush_before_log,
         }
     }
 
@@ -114,6 +124,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             offset: 0,
             len: 0,
             completed: true,
+            needs_flush_before_log: false,
         }
     }
 
@@ -125,7 +136,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     pub async fn complete(mut self) -> Result<(), VhdxError> {
         self.completed = true;
         self.vhdx
-            .complete_write_inner(self.offset, self.len, true)
+            .complete_write_inner(self.offset, self.len, true, self.needs_flush_before_log)
             .await
     }
 }

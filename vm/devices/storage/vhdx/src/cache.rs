@@ -58,6 +58,11 @@ struct PageData {
     data: Option<Arc<[u8; PAGE_SIZE]>>,
     /// Page state: Clean, Dirty, or InLog.
     state: Arc<AtomicU8>,
+    /// If set, the log task must wait for this FSN to complete before
+    /// including this page in a log entry. Set per-page by the write
+    /// path when a BAT page references newly-allocated data that may
+    /// not yet be flushed to stable storage.
+    pre_log_fsn: Option<u64>,
 }
 
 /// Write-back page cache backed by an [`AsyncFile`].
@@ -74,8 +79,10 @@ pub struct PageCache<F: AsyncFile> {
     pages: Mutex<HashMap<PageKey, Arc<Mutex<PageData>>>>,
     /// Tag → base file offset mapping.
     tags: Mutex<HashMap<u8, u64>>,
-    /// Sender for log requests. `None` for read-only files.
-    log_sender: Option<mesh::Sender<LogRequest>>,
+    /// When true, dirty pages are deferred to [`flush()`](Self::flush)
+    /// for write-back through the log task. When false, dirty pages are
+    /// written directly to the file on [`commit()`](PageCommit::commit).
+    write_back_mode: bool,
 }
 
 impl<F: AsyncFile> PageCache<F> {
@@ -85,7 +92,7 @@ impl<F: AsyncFile> PageCache<F> {
             file,
             pages: Mutex::new(HashMap::new()),
             tags: Mutex::new(HashMap::new()),
-            log_sender: None,
+            write_back_mode: false,
         }
     }
 
@@ -94,12 +101,14 @@ impl<F: AsyncFile> PageCache<F> {
         &self.file
     }
 
-    /// Set the log sender for write-back mode.
+    /// Enable write-back mode.
     ///
-    /// Must be called before any writes. When set, dirty pages are sent
-    /// to the log task on flush() instead of being written directly.
-    pub fn set_log_sender(&mut self, tx: mesh::Sender<LogRequest>) {
-        self.log_sender = Some(tx);
+    /// Must be called before any writes. When enabled, dirty pages are
+    /// deferred in the cache and sent to the log task on
+    /// [`flush()`](Self::flush) instead of being written directly on
+    /// [`commit()`](PageCommit::commit).
+    pub fn enable_write_back(&mut self) {
+        self.write_back_mode = true;
     }
 
     /// Register a tag with its base file offset.
@@ -153,6 +162,7 @@ impl<F: AsyncFile> PageCache<F> {
                     Arc::new(Mutex::new(PageData {
                         data: None,
                         state: Arc::new(AtomicU8::new(PAGE_CLEAN)),
+                        pre_log_fsn: None,
                     }))
                 })
                 .clone()
@@ -217,6 +227,38 @@ impl<F: AsyncFile> PageCache<F> {
         })
     }
 
+    /// Set the pre-log FSN on a specific page. The log task will wait for
+    /// this FSN to complete before including this page in a log entry.
+    /// Only meaningful for Dirty pages.
+    ///
+    /// If the page already has a pre_log_fsn, the maximum of the existing
+    /// and new values is used.
+    pub fn set_pre_log_fsn(&self, key: PageKey, fsn: u64) {
+        let pages = self.pages.lock();
+        if let Some(entry) = pages.get(&key) {
+            let mut page = entry.lock();
+            page.pre_log_fsn = Some(match page.pre_log_fsn {
+                Some(existing) => existing.max(fsn),
+                None => fsn,
+            });
+        }
+    }
+
+    /// Get the pre-log FSN for a specific page, if set.
+    ///
+    /// Returns `None` if the page does not exist in the cache or has no
+    /// pre_log_fsn constraint.
+    #[allow(dead_code)]
+    pub fn get_pre_log_fsn(&self, key: PageKey) -> Option<u64> {
+        let pages = self.pages.lock();
+        if let Some(entry) = pages.get(&key) {
+            let page = entry.lock();
+            page.pre_log_fsn
+        } else {
+            None
+        }
+    }
+
     /// Flush all dirty pages through the log task.
     ///
     /// Collects all dirty pages, clones their data via `Arc::clone`
@@ -225,72 +267,31 @@ impl<F: AsyncFile> PageCache<F> {
     ///
     /// Returns the FSN after the log entry is durable.
     ///
-    /// If no log sender is configured (read-only mode), delegates to
-    /// `file.flush()` directly.
-    pub async fn flush(&self) -> Result<u64, VhdxError> {
-        if self.log_sender.is_none() {
+    /// If no log sender is provided (read-only mode or no log task),
+    /// delegates to `file.flush()` directly.
+    pub async fn flush(
+        &self,
+        log_sender: Option<&mesh::Sender<LogRequest>>,
+    ) -> Result<u64, VhdxError> {
+        let Some(sender) = log_sender else {
             // No log task — write-through fallback for read-only.
             self.file.flush().await?;
             return Ok(0);
-        }
-
-        // Collect dirty pages.
-        let dirty_pages = {
-            let pages = self.pages.lock();
-            let mut dirty = Vec::new();
-            for (&key, entry) in pages.iter() {
-                let page = entry.lock();
-                if page.state.load(Ordering::Acquire) == PAGE_DIRTY {
-                    let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
-                    let data = page.data.as_ref().expect("dirty page has no data").clone();
-                    let state = page.state.clone();
-                    // Transition to InLog.
-                    state.store(PAGE_IN_LOG, Ordering::Release);
-                    dirty.push(DirtyPage {
-                        file_offset,
-                        data,
-                        state,
-                        pre_log_fsn: None,
-                    });
-                }
-            }
-            dirty
         };
 
-        if dirty_pages.is_empty() {
-            return Ok(0);
-        }
-
-        // Send to log task via Rpc.
-        let sender = self.log_sender.as_ref().unwrap();
-        let result = sender
-            .call(LogRequest::Flush, dirty_pages)
-            .await
-            .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?;
-        result
-    }
-
-    /// Flush all dirty pages with an optional pre_log_fsn constraint.
-    ///
-    /// Like [`flush()`](Self::flush), but attaches the given FSN as a
-    /// pre_log_fsn to all dirty pages. The log task will wait for this
-    /// FSN to complete before including the pages in a log entry.
-    pub async fn flush_with_pre_log_fsn(&self, pre_log_fsn: Option<u64>) -> Result<u64, VhdxError> {
-        if self.log_sender.is_none() {
-            self.file.flush().await?;
-            return Ok(0);
-        }
-
         // Collect dirty pages.
         let dirty_pages = {
             let pages = self.pages.lock();
             let mut dirty = Vec::new();
             for (&key, entry) in pages.iter() {
-                let page = entry.lock();
+                let mut page = entry.lock();
                 if page.state.load(Ordering::Acquire) == PAGE_DIRTY {
                     let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
                     let data = page.data.as_ref().expect("dirty page has no data").clone();
                     let state = page.state.clone();
+                    // Move per-page FSN to DirtyPage, clearing it from the cache.
+                    let pre_log_fsn = page.pre_log_fsn.take();
+                    // Transition to InLog.
                     state.store(PAGE_IN_LOG, Ordering::Release);
                     dirty.push(DirtyPage {
                         file_offset,
@@ -307,12 +308,66 @@ impl<F: AsyncFile> PageCache<F> {
             return Ok(0);
         }
 
-        let sender = self.log_sender.as_ref().unwrap();
-        let result = sender
+        sender
             .call(LogRequest::Flush, dirty_pages)
             .await
-            .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?;
-        result
+            .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?
+    }
+
+    /// Flush all dirty pages with an optional pre_log_fsn constraint.
+    ///
+    /// Like [`flush()`](Self::flush), but attaches the given FSN as a
+    /// pre_log_fsn to all dirty pages. The log task will wait for this
+    /// FSN to complete before including the pages in a log entry.
+    ///
+    /// If a page already has a per-page FSN set, the maximum of the
+    /// per-page FSN and the argument FSN is used.
+    #[allow(dead_code)]
+    pub async fn flush_with_pre_log_fsn(
+        &self,
+        log_sender: Option<&mesh::Sender<LogRequest>>,
+        pre_log_fsn: Option<u64>,
+    ) -> Result<u64, VhdxError> {
+        let Some(sender) = log_sender else {
+            self.file.flush().await?;
+            return Ok(0);
+        };
+
+        // Collect dirty pages.
+        let dirty_pages = {
+            let pages = self.pages.lock();
+            let mut dirty = Vec::new();
+            for (&key, entry) in pages.iter() {
+                let mut page = entry.lock();
+                if page.state.load(Ordering::Acquire) == PAGE_DIRTY {
+                    let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
+                    let data = page.data.as_ref().expect("dirty page has no data").clone();
+                    let state = page.state.clone();
+                    // Combine per-page FSN with argument FSN: use maximum.
+                    let effective_fsn = match (page.pre_log_fsn.take(), pre_log_fsn) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                    state.store(PAGE_IN_LOG, Ordering::Release);
+                    dirty.push(DirtyPage {
+                        file_offset,
+                        data,
+                        state,
+                        pre_log_fsn: effective_fsn,
+                    });
+                }
+            }
+            dirty
+        };
+
+        if dirty_pages.is_empty() {
+            return Ok(0);
+        }
+
+        sender
+            .call(LogRequest::Flush, dirty_pages)
+            .await
+            .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?
     }
 }
 
@@ -453,7 +508,7 @@ impl<F: AsyncFile> PageCommit<'_, F> {
             return Ok(());
         }
 
-        if self.cache.log_sender.is_some() {
+        if self.cache.write_back_mode {
             // Write-back mode: page is already dirty in cache.
             // Actual write happens via flush() → log task.
             return Ok(());
@@ -803,7 +858,7 @@ mod tests {
         guard.release().commit().await.unwrap();
 
         // flush() should succeed (delegates to InMemoryFile::flush which is a no-op).
-        cache.flush().await.unwrap();
+        cache.flush(None).await.unwrap();
 
         let snap = cache.file().snapshot();
         assert_eq!(snap[0], 0x42);

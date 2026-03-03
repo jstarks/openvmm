@@ -4,6 +4,9 @@
 pub mod support;
 
 #[cfg(test)]
+mod crash_tests;
+
+#[cfg(test)]
 mod integration {
     use crate::AsyncFile;
     use crate::create::{self, CreateParams};
@@ -208,12 +211,8 @@ mod log_task_integration {
             .unwrap();
         let h2 = format::Header::read_from_prefix(&buf).ok().map(|(h, _)| h);
 
-        let has_log_guid = h1
-            .as_ref()
-            .map_or(false, |h| h.log_guid != guid::Guid::ZERO)
-            || h2
-                .as_ref()
-                .map_or(false, |h| h.log_guid != guid::Guid::ZERO);
+        let has_log_guid = h1.as_ref().is_some_and(|h| h.log_guid != guid::Guid::ZERO)
+            || h2.as_ref().is_some_and(|h| h.log_guid != guid::Guid::ZERO);
         assert!(has_log_guid, "log_guid should be set after open_with_log");
 
         vhdx.close().await.unwrap();
@@ -330,7 +329,7 @@ mod log_task_integration {
         write_pattern(&vhdx, 0, 4096, 0xEE).await;
 
         // Flush should return a valid FSN via the cache.
-        let _fsn = vhdx.cache.flush().await.unwrap();
+        let _fsn = vhdx.cache.flush(vhdx.log_sender.as_ref()).await.unwrap();
         // FSN can be 0 if no dirty pages (BAT may or may not be dirty depending
         // on cache state). Just verify no errors.
 

@@ -231,6 +231,175 @@ impl AsyncFile for InMemoryFile {
     }
 }
 
+/// A file implementation that separates volatile and durable state,
+/// with a write log for verifying operation ordering.
+///
+/// - `write_at()` → writes to volatile only (reads see it, but it won't
+///   survive a crash).
+/// - `flush()` → copies volatile to durable (survives crash).
+/// - `crash()` → returns durable state; volatile-only writes are lost.
+/// - `from_durable(data)` → creates a new file from a crash snapshot.
+///
+/// The write log records every `write_at`, `flush`, and `set_file_size`
+/// call, enabling ordering tests that verify flush barriers exist between
+/// data writes and WAL writes.
+pub struct CrashTestFile {
+    inner: Mutex<CrashTestFileInner>,
+}
+
+impl std::fmt::Debug for CrashTestFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock();
+        f.debug_struct("CrashTestFile")
+            .field("durable_len", &inner.durable.len())
+            .field("volatile_len", &inner.volatile.len())
+            .field("flush_count", &inner.flush_count)
+            .field("write_log_len", &inner.write_log.len())
+            .finish()
+    }
+}
+
+struct CrashTestFileInner {
+    /// Data that has survived flush — survives power failure.
+    durable: Vec<u8>,
+    /// Data as seen by reads — includes unflushed writes.
+    volatile: Vec<u8>,
+    /// How many flush() calls have occurred.
+    flush_count: u64,
+    /// Ordered log of all I/O operations, for ordering verification.
+    write_log: Vec<WriteLogEntry>,
+}
+
+/// An entry in the write log, tracking I/O operations for ordering verification.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum WriteLogEntry {
+    /// A write operation at the given offset and length.
+    Write {
+        /// File offset of the write.
+        offset: u64,
+        /// Length of the write in bytes.
+        length: usize,
+    },
+    /// A flush operation (volatile → durable).
+    Flush,
+    /// A set_file_size operation.
+    SetFileSize {
+        /// The new file size.
+        size: u64,
+    },
+}
+
+impl CrashTestFile {
+    /// Create a new crash-test file of the given size (all zeros).
+    #[allow(dead_code)]
+    pub fn new(size: u64) -> Self {
+        let data = vec![0u8; size as usize];
+        Self {
+            inner: Mutex::new(CrashTestFileInner {
+                durable: data.clone(),
+                volatile: data,
+                flush_count: 0,
+                write_log: Vec::new(),
+            }),
+        }
+    }
+
+    /// Create a CrashTestFile from existing durable data (e.g. from a crash snapshot).
+    pub fn from_durable(data: Vec<u8>) -> Self {
+        Self {
+            inner: Mutex::new(CrashTestFileInner {
+                volatile: data.clone(),
+                durable: data,
+                flush_count: 0,
+                write_log: Vec::new(),
+            }),
+        }
+    }
+
+    /// Simulate power failure. Returns the durable state.
+    /// All unflushed (volatile-only) writes are lost.
+    #[allow(dead_code)]
+    pub fn crash(self) -> Vec<u8> {
+        self.inner.into_inner().durable
+    }
+
+    /// Snapshot durable state without consuming the file.
+    pub fn durable_snapshot(&self) -> Vec<u8> {
+        self.inner.lock().durable.clone()
+    }
+
+    /// How many flushes have occurred.
+    pub fn flush_count(&self) -> u64 {
+        self.inner.lock().flush_count
+    }
+
+    /// Get the write log for ordering verification.
+    #[allow(dead_code)]
+    pub fn write_log(&self) -> Vec<WriteLogEntry> {
+        self.inner.lock().write_log.clone()
+    }
+}
+
+impl AsyncFile for CrashTestFile {
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), std::io::Error> {
+        let inner = self.inner.lock();
+        let offset = offset as usize;
+        let file_len = inner.volatile.len();
+
+        for (i, byte) in buf.iter_mut().enumerate() {
+            let pos = offset + i;
+            *byte = if pos < file_len {
+                inner.volatile[pos]
+            } else {
+                0
+            };
+        }
+        Ok(())
+    }
+
+    async fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
+        let mut inner = self.inner.lock();
+        let off = offset as usize;
+        let end = off + buf.len();
+
+        // Grow volatile if needed (but NOT durable — only flush makes data durable).
+        if end > inner.volatile.len() {
+            inner.volatile.resize(end, 0);
+        }
+        inner.volatile[off..end].copy_from_slice(buf);
+
+        inner.write_log.push(WriteLogEntry::Write {
+            offset,
+            length: buf.len(),
+        });
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), std::io::Error> {
+        let mut inner = self.inner.lock();
+        // Copy volatile to durable (all unflushed writes become durable).
+        inner.durable = inner.volatile.clone();
+        inner.flush_count += 1;
+        inner.write_log.push(WriteLogEntry::Flush);
+        Ok(())
+    }
+
+    async fn file_size(&self) -> Result<u64, std::io::Error> {
+        // Return volatile size (latest state as seen by reads).
+        Ok(self.inner.lock().volatile.len() as u64)
+    }
+
+    async fn set_file_size(&self, size: u64) -> Result<(), std::io::Error> {
+        let mut inner = self.inner.lock();
+        // File size changes are immediately durable (metadata is sync).
+        inner.volatile.resize(size as usize, 0);
+        inner.durable.resize(size as usize, 0);
+        inner.write_log.push(WriteLogEntry::SetFileSize { size });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

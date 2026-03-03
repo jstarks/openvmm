@@ -60,6 +60,8 @@ pub(crate) struct WriteState {
     pub file_write_guid: Guid,
     /// GUID changed on every virtual-disk data write.
     pub data_write_guid: Guid,
+    /// Active log GUID. Zero when no log task is running.
+    pub log_guid: Guid,
     /// True if header slot 1 (offset 64 KiB) is the current header.
     pub first_header_current: bool,
 }
@@ -154,7 +156,7 @@ pub struct VhdxFile<F: AsyncFile> {
     // Log task state (set when opened with log task via open_with_log).
     /// Sender for log requests. `None` for read-only files or files opened
     /// without a log task.
-    log_sender: Option<mesh::Sender<LogRequest>>,
+    pub(crate) log_sender: Option<mesh::Sender<LogRequest>>,
     /// Handle to the spawned log task. `None` if no log task is running.
     log_task: Option<pal_async::task::Task<()>>,
     /// Flush sequencer for FSN-gated ordering. `None` for read-only files.
@@ -308,6 +310,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 sequence_number: header.sequence_number,
                 file_write_guid: header.file_write_guid,
                 data_write_guid: header.data_write_guid,
+                log_guid: Guid::ZERO,
                 first_header_current: header.first_header_current,
             }),
             bat_state: RwLock::new(bat_state),
@@ -412,10 +415,12 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             // Update state after flush.
             let mut state = vhdx.write_state.lock();
             state.first_header_current = !state.first_header_current;
+            state.log_guid = log_guid;
         }
 
-        // Set the log sender on the cache.
-        vhdx.cache.set_log_sender(tx.clone());
+        // Enable write-back mode on the cache so dirty pages are deferred
+        // to flush() rather than written directly on commit().
+        vhdx.cache.enable_write_back();
 
         // Spawn the log task.
         let file_clone = vhdx.file.clone();
@@ -451,7 +456,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
 
         if let Some(sender) = self.log_sender.take() {
             // First flush any dirty pages from the cache through the log.
-            self.cache.flush().await?;
+            self.cache.flush(Some(&sender)).await?;
 
             // Send Close request and await response.
             let result = sender
@@ -469,6 +474,26 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             }
         }
         Ok(())
+    }
+
+    /// Abort the VHDX file without graceful close.
+    ///
+    /// Drops the log channel (causing the log task to exit on its next
+    /// recv) and waits for the log task to finish. No pending batches are
+    /// applied and the log GUID is NOT cleared — the file remains dirty,
+    /// requiring log replay on the next open.
+    ///
+    /// This is the test-friendly equivalent of a crash: all state held by
+    /// the log task (including its `Arc<F>`) is released, but no new I/O
+    /// is issued.
+    pub async fn abort(mut self) {
+        // Drop the sender so the log task's recv() returns Err.
+        self.log_sender.take();
+
+        // Wait for the log task to notice the closed channel and exit.
+        if let Some(task) = self.log_task.take() {
+            task.await;
+        }
     }
 }
 
@@ -738,6 +763,20 @@ impl<F: AsyncFile> VhdxFile<F> {
         buf
     }
 
+    /// Compute the cache [`PageKey`] for the BAT page containing the given
+    /// payload block's entry.
+    ///
+    /// Used by the crash-consistency mechanism to attach per-page
+    /// `pre_log_fsn` constraints to BAT pages during block allocation.
+    pub(crate) fn bat_page_key_for_block(&self, block_number: u32) -> PageKey {
+        let entry_index = self.bat.payload_entry_index(block_number);
+        let page_offset = (entry_index as u64 * 8) & !(CACHE_PAGE_SIZE - 1);
+        PageKey {
+            tag: BAT_TAG,
+            offset: page_offset,
+        }
+    }
+
     /// Write a single BAT entry to the cache page (write-through to disk).
     ///
     /// This is the primary BAT writeback mechanism, matching the C code's
@@ -894,7 +933,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             header.sequence_number = state.sequence_number;
             header.file_write_guid = state.file_write_guid;
             header.data_write_guid = state.data_write_guid;
-            header.log_guid = Guid::ZERO;
+            header.log_guid = state.log_guid;
             header.log_version = format::LOG_VERSION;
             header.version = format::VERSION_1;
             header.log_length = self.log_length;

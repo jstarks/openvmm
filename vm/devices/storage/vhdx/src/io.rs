@@ -358,6 +358,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 len,
                 start_block,
                 block_count,
+                false, // no allocation → no flush barrier needed
             ));
         }
 
@@ -405,6 +406,12 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
         let mut tfp_records: Vec<TfpRecord> = Vec::new();
 
+        // Track whether any TFP allocation used unsafe (non-safe-data) space.
+        // When true, complete_write_inner() captures the current FSN and
+        // attaches it to the BAT page(s) so the log task waits for the
+        // data flush before logging the BAT update.
+        let mut needs_flush_before_log = false;
+
         // Re-check and allocate under the lock.
         // No block in our set should have TFP at this point — we waited
         // for all concurrent allocators to finish above.
@@ -443,6 +450,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                     BatEntryState::PartiallyPresent if is_full_block => {
                         // Fully-covering write to PartiallyPresent — set TFP
                         // on existing mapping, no new space.
+                        // This is always safe (space already has this block's
+                        // data), so no change to needs_flush_before_log.
                         let original = internal;
                         let new_mapping = InternalBlockMapping::new()
                             .with_state(internal.state())
@@ -530,6 +539,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 original_mapping: original,
                                 allocated_offset: Some(new_offset),
                             });
+
+                            // Track unsafe allocations for flush barrier.
+                            if !is_safe_data {
+                                needs_flush_before_log = true;
+                            }
 
                             ranges.push(WriteRange::Data {
                                 guest_offset: block_info.virtual_offset,
@@ -619,6 +633,19 @@ impl<F: AsyncFile> VhdxFile<F> {
                             )
                             .await?;
 
+                            // For non-TFP path: set per-page FSN when
+                            // !is_safe_data. The FSN is captured now (before
+                            // the caller writes data), matching the C code's
+                            // FreeSpace.RequiredFsn timing.
+                            if !is_safe_data {
+                                if let Some(fs) = &self.flush_sequencer {
+                                    let fsn = fs.current_fsn();
+                                    let page_key =
+                                        self.bat_page_key_for_block(block_info.block_number);
+                                    self.cache.set_pre_log_fsn(page_key, fsn);
+                                }
+                            }
+
                             // Emit zero + data + zero ranges.
                             // For PartiallyPresent blocks, skip zero-fill —
                             // unwritten sectors are transparent to parent
@@ -696,6 +723,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             len,
             start_block,
             block_count,
+            needs_flush_before_log,
         ))
     }
 
@@ -717,6 +745,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         offset: u64,
         len: u32,
         success: bool,
+        needs_flush_before_log: bool,
     ) -> Result<(), VhdxError> {
         // Zero-length — nothing to do.
         if len == 0 {
@@ -768,6 +797,15 @@ impl<F: AsyncFile> VhdxFile<F> {
                             .await
                         {
                             bat_write_error = Some(e);
+                        } else if needs_flush_before_log {
+                            // Capture FSN NOW (after caller's data writes,
+                            // matching C's Vhd2iDereferenceReadWrite →
+                            // Vhd2iGetCurrentFsn timing).
+                            if let Some(fs) = &self.flush_sequencer {
+                                let fsn = fs.current_fsn();
+                                let page_key = self.bat_page_key_for_block(block_number);
+                                self.cache.set_pre_log_fsn(page_key, fsn);
+                            }
                         }
                     }
                 } else {
@@ -914,9 +952,18 @@ impl<F: AsyncFile> VhdxFile<F> {
         // the current FSN, but that FSN can only complete when the log task
         // calls flush_sequencer.flush() — which happens after it processes
         // the very pages we're sending.
-        let _fsn = self.cache.flush().await?;
-        // If no log task, also do a direct file flush for safety.
-        if self.flush_sequencer.is_none() {
+        let _fsn = self.cache.flush(self.log_sender.as_ref()).await?;
+        // Ensure data writes are durable. When there's a flush sequencer,
+        // use it to coalesce and track FSNs properly. Without a flush
+        // sequencer (no log task), flush the file directly.
+        //
+        // This is necessary because cache.flush() only issues a file flush
+        // through the log task when there are dirty BAT pages. Overwrites
+        // to existing blocks don't dirty any BAT pages, so without this
+        // explicit flush the data would remain volatile.
+        if let Some(seq) = &self.flush_sequencer {
+            seq.flush(self.file.as_ref()).await?;
+        } else {
             self.file.flush().await.map_err(VhdxError::Io)?;
         }
         Ok(())

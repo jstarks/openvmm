@@ -145,9 +145,26 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                     }
                 }
 
-                // Wait for any pre_log_fsn constraints before logging.
-                for page in &all_pages {
-                    if let Some(fsn) = page.pre_log_fsn {
+                // Ensure pre_log_fsn constraints are met before logging.
+                // Use require_fsn (not just wait_for_fsn) to prevent
+                // deadlock: the log task may be the only entity that can
+                // issue the flush needed to advance the FSN past the
+                // required value.
+                {
+                    let max_fsn = all_pages.iter().filter_map(|p| p.pre_log_fsn).max();
+                    if let Some(fsn) = max_fsn {
+                        if let Err(e) = flush_sequencer.require_fsn(file.as_ref(), fsn).await {
+                            for page in &all_pages {
+                                page.state.store(PAGE_DIRTY, Ordering::Release);
+                            }
+                            let err_msg = format!("{e}");
+                            for r in responses {
+                                r.complete(Err(VhdxError::Io(std::io::Error::other(
+                                    err_msg.clone(),
+                                ))));
+                            }
+                            continue;
+                        }
                         flush_sequencer.wait_for_fsn(fsn).await;
                     }
                 }
@@ -248,7 +265,7 @@ async fn write_log_entry<F: AsyncFile>(
         .iter()
         .map(|p| DataPage {
             file_offset: p.file_offset,
-            data: &*p.data,
+            data: &p.data,
         })
         .collect();
 

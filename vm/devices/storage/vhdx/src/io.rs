@@ -942,17 +942,21 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// file flush.
     pub async fn flush(&self) -> Result<(), VhdxError> {
         self.flush_dirty_bat_pages().await?;
-        // Flush the cache (sends dirty pages to log task or direct flush).
-        //
-        // NOTE: FSN-gated BAT logging (pre_log_fsn) is NOT applied here.
-        // The pre_log_fsn mechanism is designed to be set per-page at
-        // block-allocation time (during resolve_write), so that BAT updates
-        // referencing newly allocated blocks are not logged until the user
-        // data is durable. Setting it here would deadlock: we'd capture
-        // the current FSN, but that FSN can only complete when the log task
-        // calls flush_sequencer.flush() — which happens after it processes
-        // the very pages we're sending.
-        let _fsn = self.cache.flush(self.log_sender.as_ref()).await?;
+
+        if let Some(sender) = self.log_sender.as_ref() {
+            // Flush the cache (sends dirty pages to log task).
+            //
+            // NOTE: FSN-gated BAT logging (pre_log_fsn) is NOT applied here.
+            // The pre_log_fsn mechanism is designed to be set per-page at
+            // block-allocation time (during resolve_write), so that BAT updates
+            // referencing newly allocated blocks are not logged until the user
+            // data is durable. Setting it here would deadlock: we'd capture
+            // the current FSN, but that FSN can only complete when the log task
+            // calls flush_sequencer.flush() — which happens after it processes
+            // the very pages we're sending.
+            let _fsn = self.cache.flush(sender).await?;
+        }
+
         // Ensure data writes are durable. When there's a flush sequencer,
         // use it to coalesce and track FSNs properly. Without a flush
         // sequencer (no log task), flush the file directly.
@@ -981,6 +985,7 @@ mod tests {
     use crate::tests::support::InMemoryFile;
     use crate::tests::support::IoInterceptor;
     use guid::Guid;
+    use pal_async::DefaultDriver;
     use pal_async::async_test;
     use std::future::Future;
     use std::sync::Arc;
@@ -1963,10 +1968,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_flush_persists_bat() {
+    async fn write_flush_persists_bat(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let regions = region::parse_region_tables(&file).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
 
         // Write and complete a full block.
         let block_size = vhdx.block_size();
@@ -1978,21 +1982,23 @@ mod tests {
         guard.complete().await.unwrap();
         vhdx.flush().await.unwrap();
 
-        // Read the BAT entry directly from the file.
-        let mut entry_bytes = [0u8; 8];
-        vhdx.file
-            .read_at(regions.bat_offset, &mut entry_bytes)
-            .await
-            .unwrap();
-        let entry = BatEntry::from(u64::from_le_bytes(entry_bytes));
+        // Snapshot immediately after flush — proves flush persisted the BAT.
+        // Log GUID is still set, so reopen will do log replay.
+        let snapshot = vhdx.file.snapshot();
+
+        // Reopen from snapshot (log replay recovers the state).
+        let recovered = InMemoryFile::from_snapshot(snapshot);
+        let vhdx2 = VhdxFile::open_with_log(recovered, &driver).await.unwrap();
+        let bat_state = vhdx2.bat_state.read();
+        let mapping = bat_state.get_payload_mapping(0);
         assert_eq!(
-            entry.state(),
+            mapping.state(),
             BatEntryState::FullyPresent as u8,
-            "flushed BAT should show FullyPresent"
+            "BAT should show FullyPresent after flush + reopen"
         );
         assert!(
-            entry.file_offset_mb() > 0,
-            "flushed BAT should have non-zero offset"
+            mapping.file_megabyte() > 0,
+            "BAT should have non-zero offset after flush + reopen"
         );
     }
 
@@ -2034,10 +2040,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn complete_write_writes_bat_to_disk() {
+    async fn complete_write_writes_bat_to_disk(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let regions = region::parse_region_tables(&file).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
@@ -2053,16 +2058,26 @@ mod tests {
         };
 
         guard.complete().await.unwrap();
+        vhdx.flush().await.unwrap();
 
-        // Read the BAT entry from disk via the file.
-        let mut entry_bytes = [0u8; 8];
-        vhdx.file
-            .read_at(regions.bat_offset, &mut entry_bytes)
-            .await
-            .unwrap();
-        let entry = BatEntry::from(u64::from_le_bytes(entry_bytes));
-        assert_eq!(entry.state(), BatEntryState::FullyPresent as u8);
-        assert_eq!(entry.file_offset_mb(), expected_mb as u64);
+        // Snapshot after flush — proves complete + flush persisted the BAT.
+        let snapshot = vhdx.file.snapshot();
+
+        // Reopen from snapshot (log replay recovers the state).
+        let recovered = InMemoryFile::from_snapshot(snapshot);
+        let vhdx2 = VhdxFile::open_with_log(recovered, &driver).await.unwrap();
+        let bat_state = vhdx2.bat_state.read();
+        let mapping = bat_state.get_payload_mapping(0);
+        assert_eq!(
+            mapping.state(),
+            BatEntryState::FullyPresent as u8,
+            "BAT should be FullyPresent after flush + reopen"
+        );
+        assert_eq!(
+            mapping.file_megabyte(),
+            expected_mb,
+            "BAT file offset should match after flush + reopen"
+        );
     }
 
     #[async_test]
@@ -2203,7 +2218,10 @@ mod tests {
 
     #[async_test]
     async fn complete_write_notifies_on_cache_failure() {
-        // Create VHDX normally, then snapshot to new file with toggleable interceptor.
+        // With write-back mode (no write-through), cache writes during
+        // complete() only mark pages dirty in the cache. The actual disk
+        // write happens on flush through the log task. So complete()
+        // itself should succeed even with write failures enabled.
         let (orig_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let data = orig_file.snapshot();
 
@@ -2225,28 +2243,29 @@ mod tests {
             .await
             .unwrap();
 
-        // Enable write failure — BAT cache write will fail.
+        // Enable write failure.
         fail_writes.store(true, Ordering::SeqCst);
 
-        // guard.complete() should fail (BAT cache write uses write_at).
+        // complete() should succeed — commit() is a no-op in write-back mode,
+        // and dirty pages are marked in cache without file I/O.
         let result = guard.complete().await;
         assert!(
-            result.is_err(),
-            "complete should fail when cache writes fail"
+            result.is_ok(),
+            "complete() should succeed in write-back mode even with write failures"
         );
 
-        // Despite the error, TFP should be cleared and state set to FullyPresent.
+        // TFP should be cleared and state set to FullyPresent.
         {
             let bat_state = vhdx.bat_state.read();
             let mapping = bat_state.get_payload_mapping(0);
             assert!(
                 !mapping.transitioning_to_fully_present(),
-                "TFP should be cleared even on cache write failure"
+                "TFP should be cleared after complete"
             );
             assert_eq!(
                 mapping.state(),
                 BatEntryState::FullyPresent as u8,
-                "state should be FullyPresent despite cache write failure"
+                "state should be FullyPresent after complete"
             );
         }
 

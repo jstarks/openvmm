@@ -306,21 +306,6 @@ mod log_task_integration {
     }
 
     #[async_test]
-    async fn cache_write_back_no_log_sender_falls_back() {
-        // Open without log task — write-through fallback.
-        let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
-
-        // Write and flush should work via write-through.
-        write_pattern(&vhdx, 0, 4096, 0xCD).await;
-        vhdx.flush().await.unwrap();
-
-        // Verify data was written.
-        let read_buf = read_pattern(&vhdx, 0, 4096).await;
-        assert!(read_buf.iter().all(|&b| b == 0xCD));
-    }
-
-    #[async_test]
     async fn flush_returns_fsn(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
         let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
@@ -329,7 +314,7 @@ mod log_task_integration {
         write_pattern(&vhdx, 0, 4096, 0xEE).await;
 
         // Flush should return a valid FSN via the cache.
-        let _fsn = vhdx.cache.flush(vhdx.log_sender.as_ref()).await.unwrap();
+        let _fsn = vhdx.cache.flush(vhdx.log_sender.as_ref().expect("log sender")).await.unwrap();
         // FSN can be 0 if no dirty pages (BAT may or may not be dirty depending
         // on cache state). Just verify no errors.
 

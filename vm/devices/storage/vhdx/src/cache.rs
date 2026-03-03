@@ -72,17 +72,13 @@ struct PageData {
 /// the log task on [`flush()`](Self::flush).
 ///
 /// When no log sender is configured (read-only mode), dirty pages are
-/// written directly to the file on commit (write-through fallback).
+/// Dirty pages are always deferred to [`flush()`](Self::flush).
 pub struct PageCache<F: AsyncFile> {
     file: Arc<F>,
     /// Page map: `PageKey` → shared handle to the cached page mutex.
     pages: Mutex<HashMap<PageKey, Arc<Mutex<PageData>>>>,
     /// Tag → base file offset mapping.
     tags: Mutex<HashMap<u8, u64>>,
-    /// When true, dirty pages are deferred to [`flush()`](Self::flush)
-    /// for write-back through the log task. When false, dirty pages are
-    /// written directly to the file on [`commit()`](PageCommit::commit).
-    write_back_mode: bool,
 }
 
 impl<F: AsyncFile> PageCache<F> {
@@ -92,23 +88,7 @@ impl<F: AsyncFile> PageCache<F> {
             file,
             pages: Mutex::new(HashMap::new()),
             tags: Mutex::new(HashMap::new()),
-            write_back_mode: false,
         }
-    }
-
-    /// Returns a reference to the underlying file.
-    pub(crate) fn file(&self) -> &F {
-        &self.file
-    }
-
-    /// Enable write-back mode.
-    ///
-    /// Must be called before any writes. When enabled, dirty pages are
-    /// deferred in the cache and sent to the log task on
-    /// [`flush()`](Self::flush) instead of being written directly on
-    /// [`commit()`](PageCommit::commit).
-    pub fn enable_write_back(&mut self) {
-        self.write_back_mode = true;
     }
 
     /// Register a tag with its base file offset.
@@ -267,18 +247,14 @@ impl<F: AsyncFile> PageCache<F> {
     ///
     /// Returns the FSN after the log entry is durable.
     ///
-    /// If no log sender is provided (read-only mode or no log task),
-    /// delegates to `file.flush()` directly.
+    /// Collects all dirty pages from the cache, transitions them to InLog,
+    /// and sends a `LogRequest::Flush` to the log task.
+    ///
+    /// Returns the FSN after the log entry is durable.
     pub async fn flush(
         &self,
-        log_sender: Option<&mesh::Sender<LogRequest>>,
+        log_sender: &mesh::Sender<LogRequest>,
     ) -> Result<u64, VhdxError> {
-        let Some(sender) = log_sender else {
-            // No log task — write-through fallback for read-only.
-            self.file.flush().await?;
-            return Ok(0);
-        };
-
         // Collect dirty pages.
         let dirty_pages = {
             let pages = self.pages.lock();
@@ -308,7 +284,7 @@ impl<F: AsyncFile> PageCache<F> {
             return Ok(0);
         }
 
-        sender
+        log_sender
             .call(LogRequest::Flush, dirty_pages)
             .await
             .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?
@@ -325,14 +301,9 @@ impl<F: AsyncFile> PageCache<F> {
     #[allow(dead_code)]
     pub async fn flush_with_pre_log_fsn(
         &self,
-        log_sender: Option<&mesh::Sender<LogRequest>>,
+        log_sender: &mesh::Sender<LogRequest>,
         pre_log_fsn: Option<u64>,
     ) -> Result<u64, VhdxError> {
-        let Some(sender) = log_sender else {
-            self.file.flush().await?;
-            return Ok(0);
-        };
-
         // Collect dirty pages.
         let dirty_pages = {
             let pages = self.pages.lock();
@@ -364,7 +335,7 @@ impl<F: AsyncFile> PageCache<F> {
             return Ok(0);
         }
 
-        sender
+        log_sender
             .call(LogRequest::Flush, dirty_pages)
             .await
             .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?
@@ -481,12 +452,9 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
 /// Returned by [`WritePageGuard::release()`]. This type is `Send` (it does
 /// not hold any mutex guard).
 ///
-/// In write-back mode, [`commit()`](Self::commit) is a no-op — the page
-/// is already marked dirty in the cache by `release()`. The actual disk
-/// write happens through the log task on flush.
-///
-/// In write-through mode (no log sender), `commit()` writes the dirty
-/// page data directly to disk.
+/// `commit()` is a no-op — the page is already marked dirty in the cache
+/// by `release()`. The actual disk write happens through
+/// [`PageCache::flush()`].
 #[must_use = "call .commit().await to finalize the page write"]
 pub struct PageCommit<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
@@ -497,41 +465,14 @@ pub struct PageCommit<'a, F: AsyncFile> {
 impl<F: AsyncFile> PageCommit<'_, F> {
     /// Finalize the page write.
     ///
-    /// In write-back mode (log sender configured): no-op, the page
-    /// is already marked dirty in the cache.
-    ///
-    /// In write-through mode (no log sender): writes the dirty page
-    /// data directly to the file. This provides backward compatibility
-    /// for read-only mode and tests.
+    /// This is a no-op — the page was already marked dirty by
+    /// [`WritePageGuard::release()`]. The actual disk write happens
+    /// through [`PageCache::flush()`].
     pub async fn commit(self) -> Result<(), std::io::Error> {
-        if !self.was_dirty {
-            return Ok(());
-        }
-
-        if self.cache.write_back_mode {
-            // Write-back mode: page is already dirty in cache.
-            // Actual write happens via flush() → log task.
-            return Ok(());
-        }
-
-        // Write-through fallback: read the page data from the cache and
-        // write it directly to the file.
-        let file_offset = self.cache.resolve_offset(self.key)?;
-        let entry = {
-            let pages = self.cache.pages.lock();
-            pages.get(&self.key).cloned()
-        };
-        if let Some(entry) = entry {
-            let page = entry.lock();
-            if let Some(data) = &page.data {
-                self.cache
-                    .file
-                    .write_at(file_offset, data.as_slice())
-                    .await?;
-                // Mark clean after write-through.
-                page.state.store(PAGE_CLEAN, Ordering::Release);
-            }
-        }
+        // Suppress unused-field warnings.
+        let _ = self.cache;
+        let _ = self.key;
+        let _ = self.was_dirty;
         Ok(())
     }
 }
@@ -584,12 +525,15 @@ mod tests {
             guard.release().commit().await.unwrap();
         }
 
-        // Read directly from the file to verify write-through.
-        let snap = cache.file().snapshot();
-        assert_eq!(snap[0], 0xAA);
-        assert_eq!(snap[1], 0xBB);
+        // Re-read via cache to verify mutation is visible.
+        let guard = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(guard[0], 0xAA);
+        assert_eq!(guard[1], 0xBB);
         // Rest unchanged.
-        assert_eq!(snap[2], 0x02);
+        assert_eq!(guard[2], 0x02);
     }
 
     #[async_test]
@@ -616,9 +560,12 @@ mod tests {
         guard.fill(0xCC);
         guard.release().commit().await.unwrap();
 
-        // Verify the data was written to the file.
-        let snap = cache.file().snapshot();
-        assert!(snap.iter().all(|&b| b == 0xCC));
+        // Verify via cache re-read that the overwrite took effect.
+        let guard = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert!(guard.iter().all(|&b| b == 0xCC));
     }
 
     #[async_test]
@@ -676,8 +623,12 @@ mod tests {
             guard.release().commit().await.unwrap();
         }
 
-        let snap = cache.file().snapshot();
-        assert_eq!(snap[0], 0x22);
+        // Verify via cache re-read.
+        let guard = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(guard[0], 0x22);
     }
 
     #[async_test]
@@ -706,9 +657,13 @@ mod tests {
             g.release().commit().await.unwrap();
         }
 
-        let snap = cache.file().snapshot();
-        assert_eq!(snap[0], 0xAA);
-        assert_eq!(snap[1], 0xBB);
+        // Verify via cache re-read.
+        let guard = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(guard[0], 0xAA);
+        assert_eq!(guard[1], 0xBB);
     }
 
     #[async_test]
@@ -744,10 +699,22 @@ mod tests {
             g.release().commit().await.unwrap();
         }
 
-        // Verify both pages are independent.
-        let snap = cache.file().snapshot();
-        assert_eq!(snap[0], 0x11);
-        assert_eq!(snap[PAGE_SIZE], 0x22);
+        // Verify both pages are independent via cache re-read.
+        let g1 = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(g1[0], 0x11);
+        drop(g1);
+
+        let g2 = cache
+            .acquire_read(PageKey {
+                tag: 0,
+                offset: PAGE_SIZE as u64,
+            })
+            .await
+            .unwrap();
+        assert_eq!(g2[0], 0x22);
     }
 
     #[async_test]
@@ -813,54 +780,4 @@ mod tests {
         drop(guard);
     }
 
-    #[async_test]
-    async fn write_through_then_read_back() {
-        let file = InMemoryFile::new(PAGE_SIZE as u64);
-
-        let mut cache = PageCache::new(Arc::new(file));
-        cache.register_tag(0, 0);
-
-        // Modify and release (write-through).
-        {
-            let mut guard = cache
-                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
-                .await
-                .unwrap();
-            guard[42] = 0xFF;
-            guard.release().commit().await.unwrap();
-        }
-
-        // Verify the file was updated.
-        let snap = cache.file().snapshot();
-        assert_eq!(snap[42], 0xFF);
-
-        // Re-acquire as Read and verify cached data.
-        let guard = cache
-            .acquire_read(PageKey { tag: 0, offset: 0 })
-            .await
-            .unwrap();
-        assert_eq!(guard[42], 0xFF);
-        drop(guard);
-    }
-
-    #[async_test]
-    async fn flush_delegates_to_file() {
-        let file = InMemoryFile::new(PAGE_SIZE as u64);
-        let mut cache = PageCache::new(Arc::new(file));
-        cache.register_tag(0, 0);
-
-        // Write some data, release, then flush.
-        let mut guard = cache
-            .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Modify)
-            .await
-            .unwrap();
-        guard[0] = 0x42;
-        guard.release().commit().await.unwrap();
-
-        // flush() should succeed (delegates to InMemoryFile::flush which is a no-op).
-        cache.flush(None).await.unwrap();
-
-        let snap = cache.file().snapshot();
-        assert_eq!(snap[0], 0x42);
-    }
 }

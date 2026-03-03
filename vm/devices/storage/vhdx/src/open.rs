@@ -418,10 +418,6 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             state.log_guid = log_guid;
         }
 
-        // Enable write-back mode on the cache so dirty pages are deferred
-        // to flush() rather than written directly on commit().
-        vhdx.cache.enable_write_back();
-
         // Spawn the log task.
         let file_clone = vhdx.file.clone();
         let fsn_clone = flush_sequencer.clone();
@@ -456,7 +452,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
 
         if let Some(sender) = self.log_sender.take() {
             // First flush any dirty pages from the cache through the log.
-            self.cache.flush(Some(&sender)).await?;
+            self.cache.flush(&sender).await?;
 
             // Send Close request and await response.
             let result = sender

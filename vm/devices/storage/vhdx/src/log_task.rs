@@ -38,10 +38,16 @@ use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
-/// Page state constants used with `AtomicU8`.
-pub(crate) const PAGE_CLEAN: u8 = 0;
-pub(crate) const PAGE_DIRTY: u8 = 1;
-pub(crate) const PAGE_IN_LOG: u8 = 2;
+/// Log completion state constants.
+///
+/// Each flush creates a **fresh** `Arc<AtomicU8>` per page. The cache
+/// stores one clone in `PageData::log_completion`; the `DirtyPage` sent
+/// to the log task holds the other clone. Communication is
+/// one-directional: the log task stores `LOG_APPLIED` or `LOG_FAILED`,
+/// and the cache reads the value on the next flush to learn the outcome.
+pub(crate) const LOG_PENDING: u8 = 0;
+pub(crate) const LOG_APPLIED: u8 = 1;
+pub(crate) const LOG_FAILED: u8 = 2;
 
 /// A request to the log task.
 pub(crate) enum LogRequest {
@@ -65,8 +71,10 @@ pub(crate) struct DirtyPage {
     pub file_offset: u64,
     /// The 4 KiB page data (shared with the cache entry via Arc COW).
     pub data: Arc<[u8; PAGE_SIZE]>,
-    /// State flag shared with the cache entry. Transitions InLog → Clean
-    /// after the page is applied to its final file offset.
+    /// Completion signal. Created fresh per-page per-flush by the cache.
+    /// The log task stores `LOG_APPLIED` after successful apply, or
+    /// `LOG_FAILED` on error. The cache reads this on the next flush
+    /// to learn whether to re-dirty the page.
     pub state: Arc<AtomicU8>,
     /// If set, the log task must wait for this FSN to complete before
     /// including this page in a log entry. This ensures user data is
@@ -155,7 +163,7 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                     if let Some(fsn) = max_fsn {
                         if let Err(e) = flush_sequencer.require_fsn(file.as_ref(), fsn).await {
                             for page in &all_pages {
-                                page.state.store(PAGE_DIRTY, Ordering::Release);
+                                page.state.store(LOG_FAILED, Ordering::Release);
                             }
                             let err_msg = format!("{e}");
                             for r in responses {
@@ -185,10 +193,9 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                         });
                     }
                     Err(e) => {
-                        // On error, transition pages back to Dirty so they
-                        // can be retried.
+                        // On error, signal failure so the cache re-dirties.
                         for page in &all_pages {
-                            page.state.store(PAGE_DIRTY, Ordering::Release);
+                            page.state.store(LOG_FAILED, Ordering::Release);
                         }
                         let err_msg = format!("{e}");
                         for r in responses {
@@ -285,7 +292,7 @@ async fn apply_batch<F: AsyncFile>(file: &Arc<F>, batch: LoggedBatch) -> Result<
     for page in &batch.pages {
         file.write_at(page.file_offset, page.data.as_slice())
             .await?;
-        page.state.store(PAGE_CLEAN, Ordering::Release);
+        page.state.store(LOG_APPLIED, Ordering::Release);
     }
     // Flush after applying to ensure pages are durable at final offsets.
     file.flush().await?;

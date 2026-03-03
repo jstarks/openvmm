@@ -19,10 +19,10 @@
 use crate::AsyncFile;
 use crate::error::VhdxError;
 use crate::log_task::DirtyPage;
+use crate::log_task::LOG_APPLIED;
+use crate::log_task::LOG_FAILED;
+use crate::log_task::LOG_PENDING;
 use crate::log_task::LogRequest;
-use crate::log_task::PAGE_CLEAN;
-use crate::log_task::PAGE_DIRTY;
-use crate::log_task::PAGE_IN_LOG;
 use mesh::rpc::RpcSend;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -56,8 +56,14 @@ struct PageData {
     /// The page contents as `Arc` for zero-copy flush and COW.
     /// `None` if the page has not been loaded yet.
     data: Option<Arc<[u8; PAGE_SIZE]>>,
-    /// Page state: Clean, Dirty, or InLog.
-    state: Arc<AtomicU8>,
+    /// Cache-local dirty flag. Only accessed under the page mutex.
+    dirty: bool,
+    /// Completion signal from the most recent flush that included this
+    /// page. The log task stores `LOG_APPLIED` or `LOG_FAILED` when it
+    /// finishes processing the batch. Each flush creates a **fresh**
+    /// `Arc<AtomicU8>` so that applying batch N does not clobber the
+    /// state of batch N+1.
+    log_completion: Option<Arc<AtomicU8>>,
     /// If set, the log task must wait for this FSN to complete before
     /// including this page in a log entry. Set per-page by the write
     /// path when a BAT page references newly-allocated data that may
@@ -141,7 +147,8 @@ impl<F: AsyncFile> PageCache<F> {
                 .or_insert_with(|| {
                     Arc::new(Mutex::new(PageData {
                         data: None,
-                        state: Arc::new(AtomicU8::new(PAGE_CLEAN)),
+                        dirty: false,
+                        log_completion: None,
                         pre_log_fsn: None,
                     }))
                 })
@@ -261,18 +268,33 @@ impl<F: AsyncFile> PageCache<F> {
             let mut dirty = Vec::new();
             for (&key, entry) in pages.iter() {
                 let mut page = entry.lock();
-                if page.state.load(Ordering::Acquire) == PAGE_DIRTY {
+                // Drain any completed log signal from a previous batch.
+                if let Some(ref completion) = page.log_completion {
+                    let status = completion.load(Ordering::Acquire);
+                    if status == LOG_APPLIED {
+                        page.log_completion = None;
+                    } else if status == LOG_FAILED {
+                        page.log_completion = None;
+                        page.dirty = true;
+                    }
+                    // LOG_PENDING: old batch still in flight — leave it.
+                    // If the page is dirty we'll create a fresh signal below,
+                    // replacing the old one (the old DirtyPage still holds
+                    // its clone, which is fine — we don't read it anymore).
+                }
+                if page.dirty {
                     let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
                     let data = page.data.as_ref().expect("dirty page has no data").clone();
-                    let state = page.state.clone();
+                    // Create a FRESH completion signal for this batch.
+                    let completion = Arc::new(AtomicU8::new(LOG_PENDING));
+                    page.log_completion = Some(completion.clone());
                     // Move per-page FSN to DirtyPage, clearing it from the cache.
                     let pre_log_fsn = page.pre_log_fsn.take();
-                    // Transition to InLog.
-                    state.store(PAGE_IN_LOG, Ordering::Release);
+                    page.dirty = false;
                     dirty.push(DirtyPage {
                         file_offset,
                         data,
-                        state,
+                        state: completion,
                         pre_log_fsn,
                     });
                 }
@@ -310,20 +332,31 @@ impl<F: AsyncFile> PageCache<F> {
             let mut dirty = Vec::new();
             for (&key, entry) in pages.iter() {
                 let mut page = entry.lock();
-                if page.state.load(Ordering::Acquire) == PAGE_DIRTY {
+                // Drain any completed log signal from a previous batch.
+                if let Some(ref completion) = page.log_completion {
+                    let status = completion.load(Ordering::Acquire);
+                    if status == LOG_APPLIED {
+                        page.log_completion = None;
+                    } else if status == LOG_FAILED {
+                        page.log_completion = None;
+                        page.dirty = true;
+                    }
+                }
+                if page.dirty {
                     let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
                     let data = page.data.as_ref().expect("dirty page has no data").clone();
-                    let state = page.state.clone();
+                    let completion = Arc::new(AtomicU8::new(LOG_PENDING));
+                    page.log_completion = Some(completion.clone());
                     // Combine per-page FSN with argument FSN: use maximum.
                     let effective_fsn = match (page.pre_log_fsn.take(), pre_log_fsn) {
                         (Some(a), Some(b)) => Some(a.max(b)),
                         (a, b) => a.or(b),
                     };
-                    state.store(PAGE_IN_LOG, Ordering::Release);
+                    page.dirty = false;
                     dirty.push(DirtyPage {
                         file_offset,
                         data,
-                        state,
+                        state: completion,
                         pre_log_fsn: effective_fsn,
                     });
                 }
@@ -387,19 +420,10 @@ impl<'a, F: AsyncFile> WritePageGuard<'a, F> {
     /// so the returned [`PageCommit`] is `Send`.
     #[must_use = "call .commit().await to finalize the page write"]
     pub fn release(mut self) -> PageCommit<'a, F> {
-        let guard = self.guard.take().expect("guard already released");
+        let mut guard = self.guard.take().expect("guard already released");
 
         if self.dirty {
-            // Mark the page dirty in the cache (if not already InLog or Dirty).
-            let current = guard.state.load(Ordering::Acquire);
-            if current == PAGE_CLEAN {
-                guard.state.store(PAGE_DIRTY, Ordering::Release);
-            } else if current == PAGE_IN_LOG {
-                // Page was InLog — Arc::make_mut already gave us a new copy.
-                // Mark the new copy as dirty.
-                guard.state.store(PAGE_DIRTY, Ordering::Release);
-            }
-            // If already Dirty, keep it Dirty.
+            guard.dirty = true;
         }
         drop(guard);
 
@@ -778,6 +802,103 @@ mod tests {
             .unwrap();
         assert_eq!(guard[0], 0xBB);
         drop(guard);
+    }
+
+    /// Regression test: when the same cache page is flushed in two
+    /// consecutive batches, applying batch 1 (state → APPLIED) must
+    /// not clobber batch 2's PENDING state. Each flush must create a
+    /// **fresh** `Arc<AtomicU8>` so that the log task's store on a
+    /// completed batch is invisible to newer batches.
+    #[async_test]
+    async fn flush_batches_have_independent_state() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64);
+        let mut cache = PageCache::new(Arc::new(file));
+        cache.register_tag(0, 0);
+        let key = PageKey { tag: 0, offset: 0 };
+
+        let (tx, mut rx) = mesh::channel::<LogRequest>();
+
+        // Write "A" and flush → batch 1.
+        {
+            let mut g = cache
+                .acquire_write(key, WriteMode::Modify)
+                .await
+                .unwrap();
+            g.fill(0xAA);
+            g.release().commit().await.unwrap();
+        }
+        let (flush1_result, batch1_pages) = futures::future::join(
+            cache.flush(&tx),
+            async {
+                match rx.recv().await.unwrap() {
+                    LogRequest::Flush(rpc) => {
+                        let (pages, response) = rpc.split();
+                        response.complete(Ok(1u64));
+                        pages
+                    }
+                    _ => panic!("expected Flush request"),
+                }
+            },
+        )
+        .await;
+        flush1_result.unwrap();
+        assert_eq!(batch1_pages.len(), 1, "batch 1 should have one page");
+
+        // Write "B" (re-dirty the same page) and flush → batch 2.
+        {
+            let mut g = cache
+                .acquire_write(key, WriteMode::Modify)
+                .await
+                .unwrap();
+            g.fill(0xBB);
+            g.release().commit().await.unwrap();
+        }
+        let (flush2_result, batch2_pages) = futures::future::join(
+            cache.flush(&tx),
+            async {
+                match rx.recv().await.unwrap() {
+                    LogRequest::Flush(rpc) => {
+                        let (pages, response) = rpc.split();
+                        response.complete(Ok(2u64));
+                        pages
+                    }
+                    _ => panic!("expected Flush request"),
+                }
+            },
+        )
+        .await;
+        flush2_result.unwrap();
+        assert_eq!(batch2_pages.len(), 1, "batch 2 should have one page");
+
+        // Both batches should have LOG_PENDING (fresh Arcs, not shared).
+        assert_eq!(
+            batch1_pages[0].state.load(Ordering::Acquire),
+            LOG_PENDING,
+            "batch 1 page should be LOG_PENDING"
+        );
+        assert_eq!(
+            batch2_pages[0].state.load(Ordering::Acquire),
+            LOG_PENDING,
+            "batch 2 page should be LOG_PENDING before any apply"
+        );
+
+        // The two Arcs must NOT be the same allocation.
+        assert!(
+            !Arc::ptr_eq(&batch1_pages[0].state, &batch2_pages[0].state),
+            "batches must have independent state Arcs"
+        );
+
+        // Simulate applying batch 1 (as apply_batch does).
+        batch1_pages[0]
+            .state
+            .store(LOG_APPLIED, Ordering::Release);
+
+        // CRITICAL INVARIANT: batch 2's state must still be LOG_PENDING.
+        assert_eq!(
+            batch2_pages[0].state.load(Ordering::Acquire),
+            LOG_PENDING,
+            "applying batch 1 must not clobber batch 2's LOG_PENDING state"
+        );
     }
 
 }

@@ -198,7 +198,7 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                 // unblocked.
                 if let Some(batch) = pending_apply.pop_front() {
                     let new_tail = batch.new_tail;
-                    if let Err(e) = apply_batch(&file, batch).await {
+                    if let Err(e) = apply_batch(&file, &flush_sequencer, batch).await {
                         tracing::warn!("VHDX log task: apply error: {e}");
                     } else {
                         log_writer.advance_tail(new_tail);
@@ -206,7 +206,7 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                 }
             }
             LogRequest::CleanRange(rpc) => {
-                handle_clean_range(rpc, &file, &mut pending_apply, &mut log_writer).await;
+                handle_clean_range(rpc, &file, &flush_sequencer, &mut pending_apply, &mut log_writer).await;
             }
             LogRequest::Close(rpc) => {
                 rpc.handle(async |()| {
@@ -241,6 +241,7 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
 async fn handle_clean_range<F: AsyncFile>(
     rpc: Rpc<std::ops::Range<u64>, Result<(), VhdxError>>,
     file: &Arc<F>,
+    flush_sequencer: &FlushSequencer,
     pending_apply: &mut VecDeque<LoggedBatch>,
     log_writer: &mut LogWriter,
 ) {
@@ -259,7 +260,7 @@ async fn handle_clean_range<F: AsyncFile>(
             for _ in 0..=last {
                 let batch = pending_apply.pop_front().unwrap();
                 let new_tail = batch.new_tail;
-                apply_batch(file, batch).await?;
+                apply_batch(file, flush_sequencer, batch).await?;
                 log_writer.advance_tail(new_tail);
             }
         }
@@ -296,14 +297,18 @@ async fn write_log_entry<F: AsyncFile>(
 }
 
 /// Apply a logged batch by writing pages to their final file offsets.
-async fn apply_batch<F: AsyncFile>(file: &Arc<F>, batch: LoggedBatch) -> Result<(), VhdxError> {
+async fn apply_batch<F: AsyncFile>(
+    file: &Arc<F>,
+    flush_sequencer: &FlushSequencer,
+    batch: LoggedBatch,
+) -> Result<(), VhdxError> {
     for page in &batch.pages {
         file.write_at(page.file_offset, page.data.as_slice())
             .await?;
         page.state.store(LOG_APPLIED, Ordering::Release);
     }
-    // Flush after applying to ensure pages are durable at final offsets.
-    file.flush().await?;
+    // Flush via sequencer to ensure apply writes are durable at final offsets.
+    flush_sequencer.flush(file.as_ref()).await?;
     Ok(())
 }
 
@@ -311,7 +316,7 @@ async fn apply_batch<F: AsyncFile>(file: &Arc<F>, batch: LoggedBatch) -> Result<
 async fn graceful_close<F: AsyncFile>(
     file: &Arc<F>,
     log_writer: &mut LogWriter,
-    _flush_sequencer: &Arc<FlushSequencer>,
+    flush_sequencer: &Arc<FlushSequencer>,
     pending_apply: &mut VecDeque<LoggedBatch>,
     _log_offset: u64,
     _log_length: u32,
@@ -319,7 +324,7 @@ async fn graceful_close<F: AsyncFile>(
     // Apply all pending batches.
     while let Some(batch) = pending_apply.pop_front() {
         let new_tail = batch.new_tail;
-        apply_batch(file, batch).await?;
+        apply_batch(file, flush_sequencer, batch).await?;
         log_writer.advance_tail(new_tail);
     }
 

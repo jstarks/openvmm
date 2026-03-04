@@ -12,9 +12,10 @@
 //!
 //! FSNs increase monotonically. Each `flush()` call is assigned the next FSN.
 //! When the flush I/O completes, the completed FSN advances to match. Callers
-//! can wait for a specific FSN to complete via [`FlushSequencer::wait_for_fsn`].
+//! can ensure all data through a specific FSN is flushed via
+//! [`FlushSequencer::flush_through`].
 
-#![allow(dead_code)]
+
 
 use crate::AsyncFile;
 use crate::error::VhdxError;
@@ -29,9 +30,9 @@ use parking_lot::Mutex;
 /// flush instead of issuing a redundant one.
 ///
 /// FSNs increase monotonically. Each [`flush()`](FlushSequencer::flush) call
-/// is assigned the next FSN. [`wait_for_fsn()`](FlushSequencer::wait_for_fsn)
-/// allows callers to block until a specific FSN has completed (used by the log
-/// task to enforce ordering constraints like "data must be flushed before BAT
+/// is assigned the next FSN. [`flush_through()`](FlushSequencer::flush_through)
+/// ensures all data through a specific FSN is flushed (used by the log task
+/// to enforce ordering constraints like "data must be flushed before BAT
 /// is logged").
 pub(crate) struct FlushSequencer {
     state: Mutex<FlushState>,
@@ -69,7 +70,7 @@ impl FlushSequencer {
     ///
     /// This is `issued_fsn + 1`. Callers use this to capture the "current
     /// point in time" before performing a write, so they can later
-    /// [`wait_for_fsn()`](Self::wait_for_fsn) to ensure that write has been
+    /// [`flush_through()`](Self::flush_through) to ensure that write has been
     /// flushed.
     pub fn current_fsn(&self) -> u64 {
         let state = self.state.lock();
@@ -87,54 +88,23 @@ impl FlushSequencer {
     ///
     /// Returns the FSN that was assigned to this flush request.
     pub async fn flush(&self, file: &impl AsyncFile) -> Result<u64, VhdxError> {
-        let my_fsn;
-        {
-            let mut state = self.state.lock();
-            state.issued_fsn += 1;
-            my_fsn = state.issued_fsn;
-        }
-        self.flush_until(file, my_fsn).await?;
-        Ok(my_fsn)
+        self.flush_until(file, None).await
     }
 
-    /// Wait for a specific FSN to complete.
+    /// Ensure all data through the given FSN is durably flushed.
     ///
-    /// Returns immediately if the FSN has already completed. Otherwise,
-    /// blocks until a flush completes that has an FSN >= the requested value.
+    /// If the FSN has already completed, returns immediately. Otherwise,
+    /// bumps `issued_fsn` if needed and waits for a flush to complete that
+    /// covers the requested FSN.
     ///
-    /// This does NOT issue a flush — it only waits. If no flush is pending
-    /// that will satisfy this FSN, the caller will wait indefinitely. Use
-    /// [`require_fsn()`](Self::require_fsn) to ensure a flush will eventually
-    /// be issued.
-    pub async fn wait_for_fsn(&self, fsn: u64) {
-        loop {
-            let listener = self.completed_event.listen();
-            {
-                let state = self.state.lock();
-                if state.completed_fsn >= fsn {
-                    return;
-                }
-            }
-            listener.await;
-        }
-    }
-
-    /// Ensure that a flush satisfying the given FSN will be issued.
-    ///
-    /// If the FSN has already been issued (i.e., `issued_fsn >= fsn`), this
-    /// is a no-op — the flush is either in progress or completed. Otherwise,
-    /// it triggers a flush. Combined with [`wait_for_fsn()`](Self::wait_for_fsn),
-    /// this guarantees the FSN will eventually complete.
-    pub async fn require_fsn(&self, file: &impl AsyncFile, fsn: u64) -> Result<(), VhdxError> {
-        {
-            let state = self.state.lock();
-            if state.issued_fsn >= fsn {
-                // A flush has already been issued that covers this FSN.
-                return Ok(());
-            }
-        }
-        // No flush has been issued for this FSN yet — trigger one.
-        self.flush(file).await?;
+    /// This is the safe replacement for the old `require_fsn` + `wait_for_fsn`
+    /// pattern — it both issues and waits in a single call.
+    pub async fn flush_through(
+        &self,
+        file: &impl AsyncFile,
+        fsn: u64,
+    ) -> Result<(), VhdxError> {
+        self.flush_until(file, Some(fsn)).await?;
         Ok(())
     }
 
@@ -144,66 +114,62 @@ impl FlushSequencer {
         state.completed_fsn
     }
 
-    /// Inner loop: keep flushing until `completed_fsn >= target_fsn`.
-    async fn flush_until(&self, file: &impl AsyncFile, target_fsn: u64) -> Result<(), VhdxError> {
-        enum Action {
-            Done,
-            Flush(u64),
-            Wait,
-        }
+    /// Inner workhorse: keep flushing until `completed_fsn >= target_fsn`.
+    ///
+    /// `target_fsn`:
+    /// - `None` — assign the next sequential FSN (used by `flush()`).
+    /// - `Some(fsn)` — ensure completion through that FSN (used by `flush_through()`).
+    ///
+    /// Returns the resolved FSN.
+    async fn flush_until(
+        &self,
+        file: &impl AsyncFile,
+        target_fsn: Option<u64>,
+    ) -> Result<u64, VhdxError> {
+        let mut my_fsn = target_fsn;
 
         loop {
-            // Register a listener BEFORE checking state to avoid races.
             let listener = self.completed_event.listen();
 
-            // Decide what to do under the lock, then drop the lock before
-            // any `.await` (parking_lot guards are !Send).
-            let action = {
+            let flush_fsn = {
                 let mut state = self.state.lock();
-                if state.completed_fsn >= target_fsn {
-                    Action::Done
-                } else if !state.flushing {
+
+                // Resolve the FSN. For None (flush), assign the next
+                // sequential FSN on the first iteration; for Some (flush_through),
+                // use the provided value. get_or_insert_with runs at most once.
+                let resolved = *my_fsn.get_or_insert_with(|| {
+                    state.issued_fsn += 1;
+                    state.issued_fsn
+                });
+
+                // Ensure issued_fsn covers the target.
+                state.issued_fsn = state.issued_fsn.max(resolved);
+
+                if state.completed_fsn >= resolved {
+                    return Ok(resolved);
+                }
+                if !state.flushing {
                     state.flushing = true;
-                    Action::Flush(state.issued_fsn)
+                    Some(state.issued_fsn)
                 } else {
-                    Action::Wait
+                    None
                 }
             };
 
-            match action {
-                Action::Done => return Ok(()),
-                Action::Flush(flush_fsn) => {
-                    // Drop the listener — we are flushing, not waiting.
-                    drop(listener);
-
-                    match file.flush().await {
-                        Ok(()) => {
-                            {
-                                let mut state = self.state.lock();
-                                state.flushing = false;
-                                if flush_fsn > state.completed_fsn {
-                                    state.completed_fsn = flush_fsn;
-                                }
-                            }
-                            self.completed_event.notify(usize::MAX);
-                        }
-                        Err(e) => {
-                            {
-                                let mut state = self.state.lock();
-                                state.flushing = false;
-                            }
-                            // Wake waiters so they can retry.
-                            self.completed_event.notify(usize::MAX);
-                            return Err(VhdxError::Io(e));
-                        }
+            if let Some(flush_fsn) = flush_fsn {
+                drop(listener);
+                let result = file.flush().await;
+                {
+                    let mut state = self.state.lock();
+                    state.flushing = false;
+                    if result.is_ok() && flush_fsn > state.completed_fsn {
+                        state.completed_fsn = flush_fsn;
                     }
-                    // Loop back to check if target_fsn is now satisfied.
                 }
-                Action::Wait => {
-                    // A flush is already in progress — wait for it.
-                    listener.await;
-                    // Loop back and re-check.
-                }
+                self.completed_event.notify(usize::MAX);
+                result.map_err(VhdxError::Io)?;
+            } else {
+                listener.await;
             }
         }
     }
@@ -378,62 +344,52 @@ mod tests {
         assert!(file.flush_count() <= 2);
     }
 
-    /// Call `flush()`, then `wait_for_fsn(1)` → returns immediately.
+    /// Call `flush()`, then `flush_through(fsn)` → returns immediately.
     #[async_test]
-    async fn test_wait_for_fsn_already_completed() {
-        let file = InMemoryFile::new(0);
-        let seq = FlushSequencer::new();
-        seq.flush(&file).await.unwrap();
-        // Should return immediately since FSN 1 is already completed.
-        seq.wait_for_fsn(1).await;
-        assert_eq!(seq.completed_fsn(), 1);
-    }
-
-    /// Spawn a task that calls `wait_for_fsn(1)`, then call `flush()` on
-    /// the main task → `wait_for_fsn` completes after the flush.
-    #[async_test]
-    async fn test_wait_for_fsn_blocks_until_flush() {
-        let file = Arc::new(InMemoryFile::new(0));
-        let seq = Arc::new(FlushSequencer::new());
-
-        let seq_waiter = seq.clone();
-        let waiter = futures::FutureExt::boxed(async move {
-            seq_waiter.wait_for_fsn(1).await;
-        });
-
-        let file_flusher = file.clone();
-        let seq_flusher = seq.clone();
-        let flusher = futures::FutureExt::boxed(async move {
-            seq_flusher.flush(file_flusher.as_ref()).await.unwrap();
-        });
-
-        // Run both concurrently — the waiter should complete once the flusher
-        // issues a flush.
-        futures::join!(waiter, flusher);
-        assert!(seq.completed_fsn() >= 1);
-    }
-
-    /// Call `require_fsn(file, 1)` → should issue a flush, and
-    /// `completed_fsn()` should be >= 1 afterwards.
-    #[async_test]
-    async fn test_require_fsn_triggers_flush() {
+    async fn test_flush_through_already_completed() {
         let file = CountingFile::new();
         let seq = FlushSequencer::new();
-        seq.require_fsn(&file, 1).await.unwrap();
+        let fsn = seq.flush(&file).await.unwrap();
+        let count_before = file.flush_count();
+        // Should return immediately since the FSN is already completed.
+        seq.flush_through(&file, fsn).await.unwrap();
+        assert_eq!(seq.completed_fsn(), fsn);
+        // No additional flush should have been issued.
+        assert_eq!(file.flush_count(), count_before);
+    }
+
+    /// Call `flush_through(fsn)` on an un-issued FSN → triggers a flush
+    /// and completes.
+    #[async_test]
+    async fn test_flush_through_triggers_flush() {
+        let file = CountingFile::new();
+        let seq = FlushSequencer::new();
+        // FSN 1 has not been issued yet.
+        seq.flush_through(&file, 1).await.unwrap();
         assert!(seq.completed_fsn() >= 1);
         assert!(file.flush_count() >= 1);
     }
 
-    /// Call `flush()` to get FSN 1, then `require_fsn(file, 1)` → should
-    /// NOT issue another flush.
+    /// Spawn a concurrent `flush()` and `flush_through()` — both complete.
     #[async_test]
-    async fn test_require_fsn_noop_if_already_issued() {
-        let file = CountingFile::new();
-        let seq = FlushSequencer::new();
-        seq.flush(&file).await.unwrap();
-        let count_before = file.flush_count();
-        seq.require_fsn(&file, 1).await.unwrap();
-        assert_eq!(file.flush_count(), count_before);
+    async fn test_flush_through_waits_for_in_progress() {
+        let file = Arc::new(CountingFile::new());
+        let seq = Arc::new(FlushSequencer::new());
+
+        let file1 = file.clone();
+        let seq1 = seq.clone();
+        let flusher = futures::FutureExt::boxed(async move {
+            seq1.flush(file1.as_ref()).await.unwrap();
+        });
+
+        let file2 = file.clone();
+        let seq2 = seq.clone();
+        let waiter = futures::FutureExt::boxed(async move {
+            seq2.flush_through(file2.as_ref(), 1).await.unwrap();
+        });
+
+        futures::join!(flusher, waiter);
+        assert!(seq.completed_fsn() >= 1);
     }
 
     /// Use a file wrapper that fails on `flush()` → `flush()` returns error,

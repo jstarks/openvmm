@@ -263,11 +263,43 @@ impl<F: AsyncFile> PageCache<F> {
     ) -> Result<WritePageGuard<'_, F>, std::io::Error> {
         let load = mode == WriteMode::Modify;
         let guard = self.acquire_inner(key, load).await?;
+
+        let was_already_dirty = guard.dirty;
+
+        // Eager commit: if this page is not already dirty and we're at
+        // the batch limit, commit the current dirty set before allowing
+        // this page to become dirty.
+        if !was_already_dirty {
+            if let Some(sender) = self.log_sender.get() {
+                let dirty_count = self.pages.lock().dirty_count;
+                if dirty_count >= MAX_COMMIT_PAGES {
+                    // Must drop the page guard before calling commit() to
+                    // avoid deadlock (commit() acquires the pages lock).
+                    drop(guard);
+                    self.commit(sender).await.map_err(|e| match e {
+                        VhdxError::Io(io) => io,
+                        other => std::io::Error::other(other.to_string()),
+                    })?;
+                    // Re-acquire the page guard.
+                    let guard = self.acquire_inner(key, load).await?;
+                    let was_already_dirty = guard.dirty;
+                    return Ok(WritePageGuard {
+                        cache: self,
+                        key,
+                        guard: Some(guard),
+                        dirty: false,
+                        was_already_dirty,
+                    });
+                }
+            }
+        }
+
         Ok(WritePageGuard {
             cache: self,
             key,
             guard: Some(guard),
             dirty: false,
+            was_already_dirty,
         })
     }
 
@@ -317,7 +349,7 @@ impl<F: AsyncFile> PageCache<F> {
     pub async fn commit(&self, log_sender: &mesh::Sender<LogRequest>) -> Result<u64, VhdxError> {
         // Collect dirty pages.
         let dirty_pages = {
-            let pages = self.pages.lock();
+            let mut pages = self.pages.lock();
             let mut dirty = Vec::new();
             for (&key, entry) in pages.map.iter() {
                 let mut page = entry.lock();
@@ -352,12 +384,20 @@ impl<F: AsyncFile> PageCache<F> {
                     });
                 }
             }
+            pages.dirty_count -= dirty.len();
             dirty
         };
 
         if dirty_pages.is_empty() {
             return Ok(0);
         }
+
+        assert!(
+            dirty_pages.len() <= MAX_COMMIT_PAGES,
+            "BUG: {} dirty pages exceeds MAX_COMMIT_PAGES ({}); eager commit logic failed",
+            dirty_pages.len(),
+            MAX_COMMIT_PAGES,
+        );
 
         log_sender
             .call(LogRequest::Flush, dirty_pages)
@@ -385,7 +425,7 @@ impl<F: AsyncFile> PageCache<F> {
     ) -> Result<u64, VhdxError> {
         // Collect dirty pages.
         let dirty_pages = {
-            let pages = self.pages.lock();
+            let mut pages = self.pages.lock();
             let mut dirty = Vec::new();
             for (&key, entry) in pages.map.iter() {
                 let mut page = entry.lock();
@@ -418,12 +458,20 @@ impl<F: AsyncFile> PageCache<F> {
                     });
                 }
             }
+            pages.dirty_count -= dirty.len();
             dirty
         };
 
         if dirty_pages.is_empty() {
             return Ok(0);
         }
+
+        assert!(
+            dirty_pages.len() <= MAX_COMMIT_PAGES,
+            "BUG: {} dirty pages exceeds MAX_COMMIT_PAGES ({}); eager commit logic failed",
+            dirty_pages.len(),
+            MAX_COMMIT_PAGES,
+        );
 
         log_sender
             .call(LogRequest::Flush, dirty_pages)
@@ -467,6 +515,7 @@ pub struct WritePageGuard<'a, F: AsyncFile> {
     key: PageKey,
     guard: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>>,
     dirty: bool,
+    was_already_dirty: bool,
 }
 
 impl<'a, F: AsyncFile> WritePageGuard<'a, F> {
@@ -480,6 +529,10 @@ impl<'a, F: AsyncFile> WritePageGuard<'a, F> {
         let mut guard = self.guard.take().expect("guard already released");
 
         if self.dirty {
+            if !self.was_already_dirty {
+                // Page transitioning clean → dirty: increment dirty_count.
+                self.cache.pages.lock().dirty_count += 1;
+            }
             guard.dirty = true;
         }
         drop(guard);

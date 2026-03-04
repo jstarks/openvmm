@@ -258,10 +258,7 @@ impl<F: AsyncFile> PageCache<F> {
     /// and sends a `LogRequest::Flush` to the log task.
     ///
     /// Returns the FSN after the log entry is durable.
-    pub async fn flush(
-        &self,
-        log_sender: &mesh::Sender<LogRequest>,
-    ) -> Result<u64, VhdxError> {
+    pub async fn flush(&self, log_sender: &mesh::Sender<LogRequest>) -> Result<u64, VhdxError> {
         // Collect dirty pages.
         let dirty_pages = {
             let pages = self.pages.lock();
@@ -820,52 +817,40 @@ mod tests {
 
         // Write "A" and flush → batch 1.
         {
-            let mut g = cache
-                .acquire_write(key, WriteMode::Modify)
-                .await
-                .unwrap();
+            let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xAA);
             g.release().commit().await.unwrap();
         }
-        let (flush1_result, batch1_pages) = futures::future::join(
-            cache.flush(&tx),
-            async {
-                match rx.recv().await.unwrap() {
-                    LogRequest::Flush(rpc) => {
-                        let (pages, response) = rpc.split();
-                        response.complete(Ok(1u64));
-                        pages
-                    }
-                    _ => panic!("expected Flush request"),
+        let (flush1_result, batch1_pages) = futures::future::join(cache.flush(&tx), async {
+            match rx.recv().await.unwrap() {
+                LogRequest::Flush(rpc) => {
+                    let (pages, response) = rpc.split();
+                    response.complete(Ok(1u64));
+                    pages
                 }
-            },
-        )
+                _ => panic!("expected Flush request"),
+            }
+        })
         .await;
         flush1_result.unwrap();
         assert_eq!(batch1_pages.len(), 1, "batch 1 should have one page");
 
         // Write "B" (re-dirty the same page) and flush → batch 2.
         {
-            let mut g = cache
-                .acquire_write(key, WriteMode::Modify)
-                .await
-                .unwrap();
+            let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xBB);
             g.release().commit().await.unwrap();
         }
-        let (flush2_result, batch2_pages) = futures::future::join(
-            cache.flush(&tx),
-            async {
-                match rx.recv().await.unwrap() {
-                    LogRequest::Flush(rpc) => {
-                        let (pages, response) = rpc.split();
-                        response.complete(Ok(2u64));
-                        pages
-                    }
-                    _ => panic!("expected Flush request"),
+        let (flush2_result, batch2_pages) = futures::future::join(cache.flush(&tx), async {
+            match rx.recv().await.unwrap() {
+                LogRequest::Flush(rpc) => {
+                    let (pages, response) = rpc.split();
+                    response.complete(Ok(2u64));
+                    pages
                 }
-            },
-        )
+                _ => panic!("expected Flush request"),
+            }
+        })
         .await;
         flush2_result.unwrap();
         assert_eq!(batch2_pages.len(), 1, "batch 2 should have one page");
@@ -889,9 +874,7 @@ mod tests {
         );
 
         // Simulate applying batch 1 (as apply_batch does).
-        batch1_pages[0]
-            .state
-            .store(LOG_APPLIED, Ordering::Release);
+        batch1_pages[0].state.store(LOG_APPLIED, Ordering::Release);
 
         // CRITICAL INVARIANT: batch 2's state must still be LOG_PENDING.
         assert_eq!(
@@ -900,5 +883,4 @@ mod tests {
             "applying batch 1 must not clobber batch 2's LOG_PENDING state"
         );
     }
-
 }

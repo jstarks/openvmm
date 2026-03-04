@@ -389,12 +389,7 @@ struct RustVhdx {
 }
 
 impl RustVhdx {
-    async fn create(
-        path: &Path,
-        disk_size: u64,
-        block_size: u32,
-        driver: &DefaultDriver,
-    ) -> Self {
+    async fn create(path: &Path, disk_size: u64, block_size: u32, driver: &DefaultDriver) -> Self {
         let file = StdFile::create(path).expect("create backing file");
         let mut params = vhdx::create::CreateParams {
             disk_size,
@@ -410,17 +405,11 @@ impl RustVhdx {
         Self::open(path, false, Some(driver)).await
     }
 
-    async fn open(
-        path: &Path,
-        read_only: bool,
-        driver: Option<&DefaultDriver>,
-    ) -> Self {
+    async fn open(path: &Path, read_only: bool, driver: Option<&DefaultDriver>) -> Self {
         let file = StdFile::open(path, read_only).expect("open backing file");
         let io_file = Arc::new(StdFile::open(path, read_only).expect("open io file"));
         let vhdx = if read_only {
-            vhdx::VhdxFile::open(file, true)
-                .await
-                .expect("vhdx open")
+            vhdx::VhdxFile::open(file, true).await.expect("vhdx open")
         } else {
             let driver = driver.expect("writable open requires a driver/spawner");
             vhdx::VhdxFile::open_with_log(file, driver)
@@ -1498,7 +1487,8 @@ async fn diff_rust_writes_and_trims(driver: DefaultDriver) {
 
     // Step 1: Rust-create parent (to control block size), write blocks 0 and 1.
     {
-        let parent = RustVhdx::create(&parent_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+        let parent =
+            RustVhdx::create(&parent_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
         parent.write_data(0, &test_pattern(0, 512)).await;
         parent
             .write_data(block_size, &test_pattern(block_size, 512))

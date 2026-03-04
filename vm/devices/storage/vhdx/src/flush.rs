@@ -15,12 +15,14 @@
 //! can ensure all data through a specific FSN is flushed via
 //! [`FlushSequencer::flush_through`].
 
-
-
 use crate::AsyncFile;
 use crate::error::VhdxError;
 use event_listener::Event;
 use parking_lot::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Acquire;
+use std::sync::atomic::Ordering::Release;
 
 /// Tracks flush sequence numbers and coalesces concurrent flush requests.
 ///
@@ -36,8 +38,6 @@ use parking_lot::Mutex;
 /// is logged").
 pub(crate) struct FlushSequencer {
     state: Mutex<FlushState>,
-    /// Event notified when `completed_fsn` advances (or a flush error occurs).
-    completed_event: Event,
 }
 
 struct FlushState {
@@ -47,10 +47,13 @@ struct FlushState {
     /// The most recently completed FSN. All FSNs <= this value have been
     /// durably flushed.
     completed_fsn: u64,
-    /// Whether a flush I/O is currently in progress. When true, new flush
-    /// requests wait for the in-progress flush and then check whether
-    /// their FSN was satisfied.
-    flushing: bool,
+    active_flush: Option<Arc<Flush>>,
+}
+
+struct Flush {
+    fsn: u64,
+    done: AtomicBool,
+    event: Event,
 }
 
 impl FlushSequencer {
@@ -60,9 +63,8 @@ impl FlushSequencer {
             state: Mutex::new(FlushState {
                 issued_fsn: 0,
                 completed_fsn: 0,
-                flushing: false,
+                active_flush: None,
             }),
-            completed_event: Event::new(),
         }
     }
 
@@ -99,11 +101,7 @@ impl FlushSequencer {
     ///
     /// This is the safe replacement for the old `require_fsn` + `wait_for_fsn`
     /// pattern — it both issues and waits in a single call.
-    pub async fn flush_through(
-        &self,
-        file: &impl AsyncFile,
-        fsn: u64,
-    ) -> Result<(), VhdxError> {
+    pub async fn flush_through(&self, file: &impl AsyncFile, fsn: u64) -> Result<(), VhdxError> {
         self.flush_until(file, Some(fsn)).await?;
         Ok(())
     }
@@ -124,54 +122,67 @@ impl FlushSequencer {
     async fn flush_until(
         &self,
         file: &impl AsyncFile,
-        target_fsn: Option<u64>,
+        mut requested_fsn: Option<u64>,
     ) -> Result<u64, VhdxError> {
-        let mut my_fsn = target_fsn;
-
-        loop {
-            let listener = self.completed_event.listen();
-
-            let flush_fsn = {
+        let flush = loop {
+            let flush = {
                 let mut state = self.state.lock();
+                let target_fsn = requested_fsn.unwrap_or(state.issued_fsn + 1);
+                requested_fsn = Some(target_fsn);
 
-                // Resolve the FSN. For None (flush), assign the next
-                // sequential FSN on the first iteration; for Some (flush_through),
-                // use the provided value. get_or_insert_with runs at most once.
-                let resolved = *my_fsn.get_or_insert_with(|| {
-                    state.issued_fsn += 1;
-                    state.issued_fsn
-                });
-
-                // Ensure issued_fsn covers the target.
-                state.issued_fsn = state.issued_fsn.max(resolved);
-
-                if state.completed_fsn >= resolved {
-                    return Ok(resolved);
+                if target_fsn <= state.completed_fsn {
+                    return Ok(state.completed_fsn);
                 }
-                if !state.flushing {
-                    state.flushing = true;
-                    Some(state.issued_fsn)
+
+                if let Some(flush) = &state.active_flush
+                    && flush.fsn >= target_fsn
+                {
+                    flush.clone()
                 } else {
-                    None
+                    let fsn = state.issued_fsn + 1;
+                    let flush = Arc::new(Flush {
+                        fsn,
+                        done: false.into(),
+                        event: Default::default(),
+                    });
+                    state.active_flush = Some(flush.clone());
+                    state.issued_fsn = fsn;
+                    break flush;
                 }
             };
-
-            if let Some(flush_fsn) = flush_fsn {
-                drop(listener);
-                let result = file.flush().await;
-                {
-                    let mut state = self.state.lock();
-                    state.flushing = false;
-                    if result.is_ok() && flush_fsn > state.completed_fsn {
-                        state.completed_fsn = flush_fsn;
-                    }
-                }
-                self.completed_event.notify(usize::MAX);
-                result.map_err(VhdxError::Io)?;
-            } else {
-                listener.await;
+            flush.wait_done().await;
+        };
+        let r = file.flush().await;
+        let completed_fsn = {
+            let mut state = self.state.lock();
+            if r.is_ok() {
+                state.completed_fsn = flush.fsn.max(state.completed_fsn);
             }
-        }
+            if state
+                .active_flush
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(p, &flush))
+            {
+                state.active_flush = None;
+            }
+            state.completed_fsn
+        };
+        flush.done.store(true, Release);
+        flush.event.notify(usize::MAX);
+        r.map_err(VhdxError::Io)?;
+        Ok(completed_fsn)
+    }
+}
+
+impl Flush {
+    async fn wait_done(&self) {
+                    loop {
+                        let event = self.event.listen();
+                        if self.done.load(Acquire) {
+                            break;
+                        }
+                        event.await;
+                    }
     }
 }
 

@@ -47,12 +47,21 @@ struct FlushState {
     /// The most recently completed FSN. All FSNs <= this value have been
     /// durably flushed.
     completed_fsn: u64,
+    /// The currently in-progress flush, if any. New callers whose target FSN
+    /// is covered by this flush wait on it rather than issuing a redundant
+    /// flush. If a caller needs a higher FSN, it replaces this with a new
+    /// flush (the old one continues running but is no longer advertised).
     active_flush: Option<Arc<Flush>>,
 }
 
+/// A single in-progress flush operation. Waiters hold an `Arc` clone and
+/// poll [`wait_done`](Flush::wait_done) until the flusher signals completion.
 struct Flush {
+    /// The FSN that this flush will satisfy when it completes.
     fsn: u64,
+    /// Set to `true` by the flusher after the I/O completes (success or failure).
     done: AtomicBool,
+    /// Notified when `done` becomes `true`.
     event: Event,
 }
 
@@ -102,7 +111,15 @@ impl FlushSequencer {
     /// This is the safe replacement for the old `require_fsn` + `wait_for_fsn`
     /// pattern — it both issues and waits in a single call.
     pub async fn flush_through(&self, file: &impl AsyncFile, fsn: u64) -> Result<(), VhdxError> {
-        self.flush_until(file, Some(fsn)).await?;
+        let completed = self.flush_until(file, Some(fsn)).await?;
+        // Safety invariant: callers only pass FSNs from current_fsn(), which is
+        // issued_fsn + 1 at capture time. Since issued_fsn only grows, by the
+        // time we run, issued_fsn + 1 >= fsn, so the flush we create always
+        // covers the target. If this fires, a caller passed a bogus FSN.
+        debug_assert!(
+            completed >= fsn,
+            "flush_through({fsn}) completed only through {completed}"
+        );
         Ok(())
     }
 
@@ -124,8 +141,16 @@ impl FlushSequencer {
         file: &impl AsyncFile,
         mut requested_fsn: Option<u64>,
     ) -> Result<u64, VhdxError> {
-        let flush = loop {
-            let flush = {
+        // Phase 1: find or create the Flush we'll execute.
+        //
+        // If there's an active flush covering our target FSN, wait for it.
+        // When it completes, loop back — if completed_fsn >= target we're
+        // done; otherwise we'll create a new flush ourselves.
+        //
+        // If no active flush covers our target, create one and `break` out
+        // of the loop to proceed to the I/O in phase 2.
+        let my_flush = loop {
+            let active = {
                 let mut state = self.state.lock();
                 let target_fsn = requested_fsn.unwrap_or(state.issued_fsn + 1);
                 requested_fsn = Some(target_fsn);
@@ -134,55 +159,58 @@ impl FlushSequencer {
                     return Ok(state.completed_fsn);
                 }
 
-                if let Some(flush) = &state.active_flush
-                    && flush.fsn >= target_fsn
+                if let Some(active) = &state.active_flush
+                    && active.fsn >= target_fsn
                 {
-                    flush.clone()
+                    active.clone()
                 } else {
                     let fsn = state.issued_fsn + 1;
-                    let flush = Arc::new(Flush {
+                    let new_flush = Arc::new(Flush {
                         fsn,
                         done: false.into(),
                         event: Default::default(),
                     });
-                    state.active_flush = Some(flush.clone());
+                    state.active_flush = Some(new_flush.clone());
                     state.issued_fsn = fsn;
-                    break flush;
+                    break new_flush;
                 }
             };
-            flush.wait_done().await;
+            active.wait_done().await;
         };
+
+        // Phase 2: perform the actual file flush and update state.
         let r = file.flush().await;
         let completed_fsn = {
             let mut state = self.state.lock();
             if r.is_ok() {
-                state.completed_fsn = flush.fsn.max(state.completed_fsn);
+                state.completed_fsn = my_flush.fsn.max(state.completed_fsn);
             }
             if state
                 .active_flush
                 .as_ref()
-                .is_some_and(|p| Arc::ptr_eq(p, &flush))
+                .is_some_and(|p| Arc::ptr_eq(p, &my_flush))
             {
                 state.active_flush = None;
             }
             state.completed_fsn
         };
-        flush.done.store(true, Release);
-        flush.event.notify(usize::MAX);
+        my_flush.done.store(true, Release);
+        my_flush.event.notify(usize::MAX);
         r.map_err(VhdxError::Io)?;
         Ok(completed_fsn)
     }
 }
 
 impl Flush {
+    /// Wait for this flush to complete (success or failure).
     async fn wait_done(&self) {
-                    loop {
-                        let event = self.event.listen();
-                        if self.done.load(Acquire) {
-                            break;
-                        }
-                        event.await;
-                    }
+        loop {
+            let event = self.event.listen();
+            if self.done.load(Acquire) {
+                break;
+            }
+            event.await;
+        }
     }
 }
 
@@ -433,5 +461,67 @@ mod tests {
         let fsn = seq.flush(&file).await.unwrap();
         assert!(fsn >= 1);
         assert!(seq.completed_fsn() >= fsn);
+    }
+
+    /// `flush_through(0)` returns immediately — FSN 0 is always completed
+    /// since the sequencer starts with `completed_fsn = 0`.
+    #[async_test]
+    async fn test_flush_through_zero_is_noop() {
+        let file = CountingFile::new();
+        let seq = FlushSequencer::new();
+        seq.flush_through(&file, 0).await.unwrap();
+        assert_eq!(file.flush_count(), 0);
+        assert_eq!(seq.completed_fsn(), 0);
+    }
+
+    /// `flush_through` on a failing file propagates the error, and a
+    /// subsequent retry with a working file succeeds.
+    #[async_test]
+    async fn test_flush_through_error_recovery() {
+        let file = FailingFile::new(true);
+        let seq = FlushSequencer::new();
+
+        let result = seq.flush_through(&file, 1).await;
+        assert!(result.is_err());
+        assert_eq!(seq.completed_fsn(), 0);
+
+        file.set_fail(false);
+        seq.flush_through(&file, 1).await.unwrap();
+        assert!(seq.completed_fsn() >= 1);
+    }
+
+    /// Two concurrent `flush_through` calls for the same FSN — both
+    /// complete, and the total number of file flushes is reasonable.
+    #[async_test]
+    async fn test_concurrent_flush_through_same_fsn() {
+        let file = Arc::new(CountingFile::new());
+        let seq = Arc::new(FlushSequencer::new());
+
+        let file1 = file.clone();
+        let seq1 = seq.clone();
+        let t1 = futures::FutureExt::boxed(async move {
+            seq1.flush_through(file1.as_ref(), 1).await.unwrap();
+        });
+
+        let file2 = file.clone();
+        let seq2 = seq.clone();
+        let t2 = futures::FutureExt::boxed(async move {
+            seq2.flush_through(file2.as_ref(), 1).await.unwrap();
+        });
+
+        futures::join!(t1, t2);
+        assert!(seq.completed_fsn() >= 1);
+    }
+
+    /// `flush()` returns `completed_fsn`, which may be higher than the
+    /// caller's own FSN if a concurrent flush for a higher FSN completed.
+    #[async_test]
+    async fn test_flush_returns_completed_fsn() {
+        let file = InMemoryFile::new(0);
+        let seq = FlushSequencer::new();
+
+        // Sequential flushes: returned FSN equals completed_fsn.
+        let fsn = seq.flush(&file).await.unwrap();
+        assert_eq!(fsn, seq.completed_fsn());
     }
 }

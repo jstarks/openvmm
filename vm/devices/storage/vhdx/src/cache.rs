@@ -48,6 +48,18 @@ use std::sync::atomic::Ordering;
 /// Page size used by the cache (4 KiB).
 pub const PAGE_SIZE: usize = 4096;
 
+/// Maximum number of dirty pages per commit batch.
+///
+/// Derived from 1/4 of the minimum 1 MiB VHDX log. With 0 zero ranges:
+///   entry_length(N) = ceil((64 + 32*N) / 4096) * 4096 + N * 4096
+///   (N+1)*4096 + 4096 (guard) ≤ 262144  →  N ≤ 62
+///
+/// This is a conservative, fixed limit — no need to thread the actual log
+/// size into the cache. The eager commit logic in [`PageCache::acquire_write()`]
+/// uses this to trigger automatic commits before the dirty set exceeds the
+/// log capacity, preserving write ordering across batch boundaries.
+const MAX_COMMIT_PAGES: usize = 62;
+
 /// Key identifying a cached page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageKey {
@@ -86,6 +98,12 @@ struct PageData {
     pre_log_fsn: Option<u64>,
 }
 
+/// Internal page map wrapping the `HashMap` and a dirty page counter.
+struct PageMap {
+    map: HashMap<PageKey, Arc<Mutex<PageData>>>,
+    dirty_count: usize,
+}
+
 /// Write-back page cache backed by an [`AsyncFile`].
 ///
 /// Pages are loaded on first access and kept in memory indefinitely (no
@@ -96,10 +114,14 @@ struct PageData {
 /// accumulate and are deferred to [`commit()`](Self::commit).
 pub struct PageCache<F: AsyncFile> {
     file: Arc<F>,
-    /// Page map: `PageKey` → shared handle to the cached page mutex.
-    pages: Mutex<HashMap<PageKey, Arc<Mutex<PageData>>>>,
+    /// Page map and dirty count.
+    pages: Mutex<PageMap>,
     /// Tag → base file offset mapping.
     tags: Mutex<HashMap<u8, u64>>,
+    /// Log sender for eager commit support. Set once during
+    /// [`open_with_log()`] via [`set_log_sender()`](Self::set_log_sender).
+    /// Lock-free reads after initialization.
+    log_sender: std::sync::OnceLock<mesh::Sender<LogRequest>>,
 }
 
 impl<F: AsyncFile> PageCache<F> {
@@ -107,8 +129,12 @@ impl<F: AsyncFile> PageCache<F> {
     pub fn new(file: Arc<F>) -> Self {
         Self {
             file,
-            pages: Mutex::new(HashMap::new()),
+            pages: Mutex::new(PageMap {
+                map: HashMap::new(),
+                dirty_count: 0,
+            }),
             tags: Mutex::new(HashMap::new()),
+            log_sender: std::sync::OnceLock::new(),
         }
     }
 
@@ -117,6 +143,16 @@ impl<F: AsyncFile> PageCache<F> {
     /// Must be called before any [`acquire()`](Self::acquire_read) with that tag.
     pub fn register_tag(&mut self, tag: u8, base_offset: u64) {
         self.tags.lock().insert(tag, base_offset);
+    }
+
+    /// Set the log sender for eager commit support.
+    ///
+    /// Must be called exactly once (during `open_with_log`).
+    /// Panics if called more than once.
+    pub fn set_log_sender(&self, sender: mesh::Sender<LogRequest>) {
+        self.log_sender
+            .set(sender)
+            .unwrap_or_else(|_| panic!("log_sender already set"));
     }
 
     /// Update the base file offset for a previously registered tag.
@@ -158,6 +194,7 @@ impl<F: AsyncFile> PageCache<F> {
         let entry = {
             let mut pages = self.pages.lock();
             pages
+                .map
                 .entry(key)
                 .or_insert_with(|| {
                     Arc::new(Mutex::new(PageData {
@@ -242,7 +279,7 @@ impl<F: AsyncFile> PageCache<F> {
     /// and new values is used.
     pub fn set_pre_log_fsn(&self, key: PageKey, fsn: u64) {
         let pages = self.pages.lock();
-        if let Some(entry) = pages.get(&key) {
+        if let Some(entry) = pages.map.get(&key) {
             let mut page = entry.lock();
             page.pre_log_fsn = Some(match page.pre_log_fsn {
                 Some(existing) => existing.max(fsn),
@@ -258,7 +295,7 @@ impl<F: AsyncFile> PageCache<F> {
     #[allow(dead_code)]
     pub fn get_pre_log_fsn(&self, key: PageKey) -> Option<u64> {
         let pages = self.pages.lock();
-        if let Some(entry) = pages.get(&key) {
+        if let Some(entry) = pages.map.get(&key) {
             let page = entry.lock();
             page.pre_log_fsn
         } else {
@@ -282,7 +319,7 @@ impl<F: AsyncFile> PageCache<F> {
         let dirty_pages = {
             let pages = self.pages.lock();
             let mut dirty = Vec::new();
-            for (&key, entry) in pages.iter() {
+            for (&key, entry) in pages.map.iter() {
                 let mut page = entry.lock();
                 // Drain any completed log signal from a previous batch.
                 if let Some(ref completion) = page.log_completion {
@@ -350,7 +387,7 @@ impl<F: AsyncFile> PageCache<F> {
         let dirty_pages = {
             let pages = self.pages.lock();
             let mut dirty = Vec::new();
-            for (&key, entry) in pages.iter() {
+            for (&key, entry) in pages.map.iter() {
                 let mut page = entry.lock();
                 // Drain any completed log signal from a previous batch.
                 if let Some(ref completion) = page.log_completion {

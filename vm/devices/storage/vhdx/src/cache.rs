@@ -943,4 +943,192 @@ mod tests {
             "applying batch 1 must not clobber batch 2's LOG_PENDING state"
         );
     }
+
+    /// Helper: dirty exactly `count` distinct pages in the cache (offsets
+    /// 0, PAGE_SIZE, 2*PAGE_SIZE, …). Does NOT call commit().
+    async fn dirty_pages<F: AsyncFile>(cache: &PageCache<F>, count: usize) {
+        for i in 0..count {
+            let key = PageKey {
+                tag: 0,
+                offset: (i * PAGE_SIZE) as u64,
+            };
+            let mut g = cache.acquire_write(key, WriteMode::Overwrite).await.unwrap();
+            g.fill(i as u8);
+            g.release().commit().await.unwrap();
+        }
+    }
+
+    /// When the dirty count reaches MAX_COMMIT_PAGES and a write targets a
+    /// NEW (clean) page, acquire_write must trigger an eager commit of the
+    /// current dirty set before returning the write guard.
+    #[async_test]
+    async fn eager_commit_on_dirty_overflow() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64 * 200);
+        let mut cache = PageCache::new(Arc::new(file));
+        cache.register_tag(0, 0);
+
+        let (tx, mut rx) = mesh::channel::<LogRequest>();
+        let tx2 = tx.clone();
+        cache.set_log_sender(tx);
+
+        // Dirty exactly MAX_COMMIT_PAGES pages (no eager commit yet —
+        // log_sender won't be consulted because each page is new and the
+        // dirty count hasn't reached the limit until the last one).
+        dirty_pages(&cache, MAX_COMMIT_PAGES).await;
+
+        // Acquire write on a NEW page — this should trigger eager commit.
+        let new_key = PageKey {
+            tag: 0,
+            offset: (MAX_COMMIT_PAGES * PAGE_SIZE) as u64,
+        };
+
+        let (write_result, batch1_pages) =
+            futures::future::join(cache.acquire_write(new_key, WriteMode::Overwrite), async {
+                match rx.recv().await.unwrap() {
+                    LogRequest::Flush(rpc) => {
+                        let (pages, response) = rpc.split();
+                        response.complete(Ok(1u64));
+                        pages
+                    }
+                    _ => panic!("expected Flush request from eager commit"),
+                }
+            })
+            .await;
+
+        assert_eq!(
+            batch1_pages.len(),
+            MAX_COMMIT_PAGES,
+            "eager commit should have sent exactly MAX_COMMIT_PAGES pages"
+        );
+
+        // Complete the write on the new page.
+        let mut guard = write_result.unwrap();
+        guard.fill(0xFF);
+        guard.release().commit().await.unwrap();
+
+        // Explicit commit should contain just the one new page.
+        let (commit_result, batch2_pages) =
+            futures::future::join(cache.commit(&tx2), async {
+                match rx.recv().await.unwrap() {
+                    LogRequest::Flush(rpc) => {
+                        let (pages, response) = rpc.split();
+                        response.complete(Ok(2u64));
+                        pages
+                    }
+                    _ => panic!("expected Flush request from explicit commit"),
+                }
+            })
+            .await;
+        commit_result.unwrap();
+        assert_eq!(
+            batch2_pages.len(),
+            1,
+            "explicit commit after eager commit should have 1 page"
+        );
+    }
+
+    /// Re-dirtying an already-dirty page must NOT trigger an eager commit,
+    /// even when the dirty count is at MAX_COMMIT_PAGES.
+    #[async_test]
+    async fn redirty_does_not_trigger_eager_commit() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64 * 200);
+        let mut cache = PageCache::new(Arc::new(file));
+        cache.register_tag(0, 0);
+
+        let (tx, mut rx) = mesh::channel::<LogRequest>();
+        cache.set_log_sender(tx);
+
+        // Dirty exactly MAX_COMMIT_PAGES pages.
+        dirty_pages(&cache, MAX_COMMIT_PAGES).await;
+
+        // Re-acquire write on an ALREADY-DIRTY page (offset 0).
+        let key = PageKey { tag: 0, offset: 0 };
+        let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
+        g[0] = 0xDD;
+        g.release().commit().await.unwrap();
+
+        // No eager commit should have occurred.
+        assert!(
+            rx.try_recv().is_err(),
+            "re-dirtying an already-dirty page must not trigger eager commit"
+        );
+
+        // Dirty count should still be MAX_COMMIT_PAGES.
+        assert_eq!(cache.pages.lock().dirty_count, MAX_COMMIT_PAGES);
+    }
+
+    /// Verify that write ordering is preserved across batch boundaries:
+    /// batch 1 (eager commit) must arrive before batch 2 (explicit commit).
+    #[async_test]
+    async fn write_ordering_across_batches() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64 * 200);
+        let mut cache = PageCache::new(Arc::new(file));
+        cache.register_tag(0, 0);
+
+        let (tx, mut rx) = mesh::channel::<LogRequest>();
+        let tx2 = tx.clone();
+        cache.set_log_sender(tx);
+
+        // Fill the batch with MAX_COMMIT_PAGES pages (A₀..A₆₁).
+        dirty_pages(&cache, MAX_COMMIT_PAGES).await;
+
+        // Write page B — triggers eager commit of A₀..A₆₁.
+        let key_b = PageKey {
+            tag: 0,
+            offset: (MAX_COMMIT_PAGES * PAGE_SIZE) as u64,
+        };
+        let (write_result, batch1_pages) =
+            futures::future::join(cache.acquire_write(key_b, WriteMode::Overwrite), async {
+                match rx.recv().await.unwrap() {
+                    LogRequest::Flush(rpc) => {
+                        let (pages, response) = rpc.split();
+                        response.complete(Ok(1u64));
+                        pages
+                    }
+                    _ => panic!("expected Flush request"),
+                }
+            })
+            .await;
+        let mut guard = write_result.unwrap();
+        guard.fill(0xBB);
+        guard.release().commit().await.unwrap();
+
+        assert_eq!(batch1_pages.len(), MAX_COMMIT_PAGES, "batch 1 = A pages");
+
+        // Write page C.
+        let key_c = PageKey {
+            tag: 0,
+            offset: ((MAX_COMMIT_PAGES + 1) * PAGE_SIZE) as u64,
+        };
+        {
+            let mut g = cache
+                .acquire_write(key_c, WriteMode::Overwrite)
+                .await
+                .unwrap();
+            g.fill(0xCC);
+            g.release().commit().await.unwrap();
+        }
+
+        // Explicit commit — batch 2 should contain B and C.
+        let (commit_result, batch2_pages) =
+            futures::future::join(cache.commit(&tx2), async {
+                match rx.recv().await.unwrap() {
+                    LogRequest::Flush(rpc) => {
+                        let (pages, response) = rpc.split();
+                        response.complete(Ok(2u64));
+                        pages
+                    }
+                    _ => panic!("expected Flush request"),
+                }
+            })
+            .await;
+        commit_result.unwrap();
+
+        assert_eq!(batch2_pages.len(), 2, "batch 2 = B + C");
+
+        // Ordering guarantee: batch 1 arrived before batch 2 (implicit
+        // from the sequential join/recv pattern above — if batch 1 hadn't
+        // been sent by the eager commit, the first recv() would have
+        // deadlocked).
+    }
 }

@@ -122,54 +122,44 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
 
         match request {
             LogRequest::Flush(rpc) => {
-                let (pages, response) = rpc.split();
-                let mut all_pages = pages;
-                let mut responses = vec![response];
+                // NOTE: Group commit (draining multiple queued Flush requests
+                // and combining them into a single log entry) is intentionally
+                // disabled. Re-enabling it requires solving at least:
+                //
+                // 1. **Duplicate pages**: Two requests may contain pages for the
+                //    same file_offset. Naively extending the page list creates a
+                //    log entry with duplicate descriptors. The entry must be
+                //    deduplicated so that only the *last* version of each offset
+                //    is logged, and earlier duplicates' `state` must be set to
+                //    LOG_APPLIED (they were superseded, not failed).
+                //
+                // 2. **Log overflow**: Each individual flush is sized to fit the
+                //    log, but combining N flushes can exceed the log region
+                //    capacity. The combined size must be checked against
+                //    `LogWriter::free_space()` *before* merging, and requests
+                //    that would overflow must be processed in a separate batch.
+                //
+                // 3. **Close handling**: A Close request arriving during the
+                //    drain loop must not be silently dropped — the Close RPC
+                //    must be re-queued or handled after the current batch so
+                //    the caller gets a response.
 
-                // Group commit: drain queued flush requests without blocking.
-                loop {
-                    match rx.try_recv() {
-                        Ok(LogRequest::Flush(more)) => {
-                            let (p, r) = more.split();
-                            all_pages.extend(p);
-                            responses.push(r);
-                        }
-                        Ok(LogRequest::CleanRange(clean_rpc)) => {
-                            // A CleanRange arrived during group drain — handle it
-                            // after we finish logging this batch.
-                            handle_clean_range(clean_rpc, &file, &mut pending_apply).await;
-                        }
-                        Ok(LogRequest::Close(_close_rpc)) => {
-                            // Close during group drain — finish logging first,
-                            // then we'll handle close on the next loop iteration
-                            // (the sender would have dropped, causing recv to fail).
-                            // This shouldn't normally happen. Log and continue.
-                            tracing::warn!(
-                                "VHDX log task: close received during group commit drain"
-                            );
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
+                let (pages, response) = rpc.split();
 
                 // Ensure pre_log_fsn constraints are met before logging.
                 // flush_through both issues and waits for the flush in a
                 // single call, preventing the deadlock that would occur
                 // if we only waited without issuing.
                 {
-                    let max_fsn = all_pages.iter().filter_map(|p| p.pre_log_fsn).max();
+                    let max_fsn = pages.iter().filter_map(|p| p.pre_log_fsn).max();
                     if let Some(fsn) = max_fsn {
                         if let Err(e) = flush_sequencer.flush_through(file.as_ref(), fsn).await {
-                            for page in &all_pages {
+                            for page in &pages {
                                 page.state.store(LOG_FAILED, Ordering::Release);
                             }
-                            let err_msg = format!("{e}");
-                            for r in responses {
-                                r.complete(Err(VhdxError::Io(std::io::Error::other(
-                                    err_msg.clone(),
-                                ))));
-                            }
+                            response.complete(Err(VhdxError::Io(std::io::Error::other(
+                                format!("{e}"),
+                            ))));
                             continue;
                         }
                     }
@@ -177,34 +167,31 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
 
                 // Write log entry.
                 let result =
-                    write_log_entry(&file, &mut log_writer, &flush_sequencer, &all_pages).await;
+                    write_log_entry(&file, &mut log_writer, &flush_sequencer, &pages).await;
 
                 match &result {
                     Ok(fsn) => {
                         let fsn_val = *fsn;
-                        for r in responses {
-                            r.complete(Ok(fsn_val));
-                        }
+                        response.complete(Ok(fsn_val));
                         pending_apply.push_back(LoggedBatch {
-                            pages: all_pages,
+                            pages,
                             fsn: fsn_val,
                         });
                     }
                     Err(e) => {
                         // On error, signal failure so the cache re-dirties.
-                        for page in &all_pages {
+                        for page in &pages {
                             page.state.store(LOG_FAILED, Ordering::Release);
                         }
-                        let err_msg = format!("{e}");
-                        for r in responses {
-                            r.complete(Err(VhdxError::Io(std::io::Error::other(err_msg.clone()))));
-                        }
+                        response.complete(Err(VhdxError::Io(std::io::Error::other(
+                            format!("{e}"),
+                        ))));
                     }
                 }
 
-                // After responding to flush callers, apply one pending batch.
+                // After responding to the flush caller, apply one pending batch.
                 // This provides interleaved pipelining: apply of batch N
-                // happens after logging batch N+1, so callers are already
+                // happens after logging batch N+1, so the caller is already
                 // unblocked.
                 if let Some(batch) = pending_apply.pop_front() {
                     if let Err(e) = apply_batch(&file, batch).await {
@@ -236,21 +223,34 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
 
 /// Handle a CleanRange request by applying all pending batches that
 /// overlap the given file offset range.
+///
+/// Batches must always be applied in order — we cannot skip a
+/// non-overlapping batch and apply a later one, because the skipped
+/// batch might write to the same offset as the later batch (outside
+/// the requested range), and applying out of order would leave stale
+/// data at that offset.
+///
+/// Algorithm: first scan to find the last batch that overlaps the
+/// range, then apply all batches from the front through that index.
 async fn handle_clean_range<F: AsyncFile>(
     rpc: Rpc<std::ops::Range<u64>, Result<(), VhdxError>>,
     file: &Arc<F>,
     pending_apply: &mut VecDeque<LoggedBatch>,
 ) {
     rpc.handle(async |range| {
-        while let Some(batch) = pending_apply.front() {
-            let overlaps = batch
+        // Pass 1: find the index of the last batch that overlaps the range.
+        let last_overlapping = pending_apply.iter().rposition(|batch| {
+            batch
                 .pages
                 .iter()
-                .any(|p| p.file_offset >= range.start && p.file_offset < range.end);
-            if overlaps {
+                .any(|p| p.file_offset >= range.start && p.file_offset < range.end)
+        });
+
+        // Pass 2: apply all batches from front through last_overlapping (inclusive),
+        // preserving order.
+        if let Some(last) = last_overlapping {
+            for _ in 0..=last {
                 apply_batch(file, pending_apply.pop_front().unwrap()).await?;
-            } else {
-                break;
             }
         }
         Ok(())

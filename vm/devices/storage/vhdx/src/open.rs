@@ -455,6 +455,9 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             // First flush any dirty pages from the cache through the log.
             self.cache.commit(&sender).await?;
 
+            // Clear the cache's clone of the sender so the channel can close.
+            self.cache.clear_log_sender();
+
             // Send Close request and await response.
             let result = sender
                 .call(LogRequest::Close, ())
@@ -486,6 +489,9 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
     pub async fn abort(mut self) {
         // Drop the sender so the log task's recv() returns Err.
         self.log_sender.take();
+
+        // Clear the cache's clone of the sender so the channel fully closes.
+        self.cache.clear_log_sender();
 
         // Wait for the log task to notice the closed channel and exit.
         if let Some(task) = self.log_task.take() {

@@ -119,9 +119,10 @@ pub struct PageCache<F: AsyncFile> {
     /// Tag → base file offset mapping.
     tags: Mutex<HashMap<u8, u64>>,
     /// Log sender for eager commit support. Set once during
-    /// [`open_with_log()`] via [`set_log_sender()`](Self::set_log_sender).
-    /// Lock-free reads after initialization.
-    log_sender: std::sync::OnceLock<mesh::Sender<LogRequest>>,
+    /// [`open_with_log()`] via [`set_log_sender()`](Self::set_log_sender)
+    /// and cleared by [`clear_log_sender()`](Self::clear_log_sender) on
+    /// close/abort so the channel drops and the log task can exit.
+    log_sender: Mutex<Option<mesh::Sender<LogRequest>>>,
 }
 
 impl<F: AsyncFile> PageCache<F> {
@@ -134,7 +135,7 @@ impl<F: AsyncFile> PageCache<F> {
                 dirty_count: 0,
             }),
             tags: Mutex::new(HashMap::new()),
-            log_sender: std::sync::OnceLock::new(),
+            log_sender: Mutex::new(None),
         }
     }
 
@@ -150,9 +151,17 @@ impl<F: AsyncFile> PageCache<F> {
     /// Must be called exactly once (during `open_with_log`).
     /// Panics if called more than once.
     pub fn set_log_sender(&self, sender: mesh::Sender<LogRequest>) {
-        self.log_sender
-            .set(sender)
-            .unwrap_or_else(|_| panic!("log_sender already set"));
+        let mut guard = self.log_sender.lock();
+        assert!(guard.is_none(), "log_sender already set");
+        *guard = Some(sender);
+    }
+
+    /// Clear the log sender, dropping the cache's clone of the channel.
+    ///
+    /// Called during `close()` and `abort()` so that the log task's
+    /// receiver sees a closed channel and can exit.
+    pub fn clear_log_sender(&self) {
+        *self.log_sender.lock() = None;
     }
 
     /// Update the base file offset for a previously registered tag.
@@ -270,13 +279,13 @@ impl<F: AsyncFile> PageCache<F> {
         // the batch limit, commit the current dirty set before allowing
         // this page to become dirty.
         if !was_already_dirty {
-            if let Some(sender) = self.log_sender.get() {
+            if let Some(sender) = self.log_sender.lock().clone() {
                 let dirty_count = self.pages.lock().dirty_count;
                 if dirty_count >= MAX_COMMIT_PAGES {
                     // Must drop the page guard before calling commit() to
                     // avoid deadlock (commit() acquires the pages lock).
                     drop(guard);
-                    self.commit(sender).await.map_err(|e| match e {
+                    self.commit(&sender).await.map_err(|e| match e {
                         VhdxError::Io(io) => io,
                         other => std::io::Error::other(other.to_string()),
                     })?;

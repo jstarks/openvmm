@@ -271,37 +271,34 @@ impl<F: AsyncFile> PageCache<F> {
         mode: WriteMode,
     ) -> Result<WritePageGuard<'_, F>, std::io::Error> {
         let load = mode == WriteMode::Modify;
-        let guard = self.acquire_inner(key, load).await?;
 
-        let was_already_dirty = guard.dirty;
-
-        // Eager commit: if this page is not already dirty and we're at
-        // the batch limit, commit the current dirty set before allowing
-        // this page to become dirty.
-        if !was_already_dirty {
-            if let Some(sender) = self.log_sender.lock().clone() {
-                let dirty_count = self.pages.lock().dirty_count;
-                if dirty_count >= MAX_COMMIT_PAGES {
-                    // Must drop the page guard before calling commit() to
-                    // avoid deadlock (commit() acquires the pages lock).
-                    drop(guard);
-                    self.commit(&sender).await.map_err(|e| match e {
-                        VhdxError::Io(io) => io,
-                        other => std::io::Error::other(other.to_string()),
-                    })?;
-                    // Re-acquire the page guard.
-                    let guard = self.acquire_inner(key, load).await?;
-                    let was_already_dirty = guard.dirty;
-                    return Ok(WritePageGuard {
-                        cache: self,
-                        key,
-                        guard: Some(guard),
-                        dirty: false,
-                        was_already_dirty,
-                    });
+        // Eager commit: if we're at the batch limit and this page won't
+        // merely re-dirty an existing entry, commit before acquiring.
+        // We check dirty_count and the page's dirty flag under the pages
+        // lock (briefly) so we never need to acquire-then-drop the page
+        // guard.
+        {
+            let pages = self.pages.lock();
+            if pages.dirty_count >= MAX_COMMIT_PAGES {
+                let page_already_dirty = pages
+                    .map
+                    .get(&key)
+                    .is_some_and(|entry| entry.lock().dirty);
+                if !page_already_dirty {
+                    if let Some(sender) = self.log_sender.lock().clone() {
+                        // Drop the pages lock before the async commit.
+                        drop(pages);
+                        self.commit(&sender).await.map_err(|e| match e {
+                            VhdxError::Io(io) => io,
+                            other => std::io::Error::other(other.to_string()),
+                        })?;
+                    }
                 }
             }
         }
+
+        let guard = self.acquire_inner(key, load).await?;
+        let was_already_dirty = guard.dirty;
 
         Ok(WritePageGuard {
             cache: self,

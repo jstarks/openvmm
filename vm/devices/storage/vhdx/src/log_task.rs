@@ -85,8 +85,10 @@ pub(crate) struct DirtyPage {
 /// A batch of pages that have been logged but not yet applied.
 struct LoggedBatch {
     pages: Vec<DirtyPage>,
-    #[allow(dead_code)]
     fsn: u64,
+    /// The writer's head offset after this entry was written.
+    /// After applying this batch, tail can advance to this value.
+    new_tail: u32,
 }
 
 /// Run the log task main loop.
@@ -157,9 +159,9 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                             for page in &pages {
                                 page.state.store(LOG_FAILED, Ordering::Release);
                             }
-                            response.complete(Err(VhdxError::Io(std::io::Error::other(
-                                format!("{e}"),
-                            ))));
+                            response.complete(Err(VhdxError::Io(std::io::Error::other(format!(
+                                "{e}"
+                            )))));
                             continue;
                         }
                     }
@@ -173,9 +175,11 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                     Ok(fsn) => {
                         let fsn_val = *fsn;
                         response.complete(Ok(fsn_val));
+                        let new_tail = log_writer.head();
                         pending_apply.push_back(LoggedBatch {
                             pages,
                             fsn: fsn_val,
+                            new_tail,
                         });
                     }
                     Err(e) => {
@@ -183,9 +187,8 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                         for page in &pages {
                             page.state.store(LOG_FAILED, Ordering::Release);
                         }
-                        response.complete(Err(VhdxError::Io(std::io::Error::other(
-                            format!("{e}"),
-                        ))));
+                        response
+                            .complete(Err(VhdxError::Io(std::io::Error::other(format!("{e}")))));
                     }
                 }
 
@@ -194,13 +197,16 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                 // happens after logging batch N+1, so the caller is already
                 // unblocked.
                 if let Some(batch) = pending_apply.pop_front() {
+                    let new_tail = batch.new_tail;
                     if let Err(e) = apply_batch(&file, batch).await {
                         tracing::warn!("VHDX log task: apply error: {e}");
+                    } else {
+                        log_writer.advance_tail(new_tail);
                     }
                 }
             }
             LogRequest::CleanRange(rpc) => {
-                handle_clean_range(rpc, &file, &mut pending_apply).await;
+                handle_clean_range(rpc, &file, &mut pending_apply, &mut log_writer).await;
             }
             LogRequest::Close(rpc) => {
                 rpc.handle(async |()| {
@@ -236,6 +242,7 @@ async fn handle_clean_range<F: AsyncFile>(
     rpc: Rpc<std::ops::Range<u64>, Result<(), VhdxError>>,
     file: &Arc<F>,
     pending_apply: &mut VecDeque<LoggedBatch>,
+    log_writer: &mut LogWriter,
 ) {
     rpc.handle(async |range| {
         // Pass 1: find the index of the last batch that overlaps the range.
@@ -250,7 +257,10 @@ async fn handle_clean_range<F: AsyncFile>(
         // preserving order.
         if let Some(last) = last_overlapping {
             for _ in 0..=last {
-                apply_batch(file, pending_apply.pop_front().unwrap()).await?;
+                let batch = pending_apply.pop_front().unwrap();
+                let new_tail = batch.new_tail;
+                apply_batch(file, batch).await?;
+                log_writer.advance_tail(new_tail);
             }
         }
         Ok(())
@@ -300,7 +310,7 @@ async fn apply_batch<F: AsyncFile>(file: &Arc<F>, batch: LoggedBatch) -> Result<
 /// Graceful close: apply all pending, clear log GUID, flush.
 async fn graceful_close<F: AsyncFile>(
     file: &Arc<F>,
-    _log_writer: &mut LogWriter,
+    log_writer: &mut LogWriter,
     _flush_sequencer: &Arc<FlushSequencer>,
     pending_apply: &mut VecDeque<LoggedBatch>,
     _log_offset: u64,
@@ -308,7 +318,9 @@ async fn graceful_close<F: AsyncFile>(
 ) -> Result<(), VhdxError> {
     // Apply all pending batches.
     while let Some(batch) = pending_apply.pop_front() {
+        let new_tail = batch.new_tail;
         apply_batch(file, batch).await?;
+        log_writer.advance_tail(new_tail);
     }
 
     // Clear log GUID in the header: read both headers, find the current one,

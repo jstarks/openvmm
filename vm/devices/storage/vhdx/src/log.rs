@@ -708,6 +708,19 @@ impl LogWriter {
         self.region.free_space(self.tail, self.head)
     }
 
+    /// Advance the log tail by `len` bytes, reclaiming space.
+    ///
+    /// The caller must ensure that all entries in the range `[old_tail, old_tail + len)`
+    /// have been fully applied and their pages are durable at final file offsets.
+    pub fn advance_tail(&mut self, new_tail: u32) {
+        self.tail = new_tail;
+    }
+
+    /// Returns the current head offset within the log region.
+    pub fn head(&self) -> u32 {
+        self.head
+    }
+
     /// Write a log entry containing the given data pages and zero ranges.
     ///
     /// Returns the sequence number of the written entry.
@@ -1855,5 +1868,359 @@ mod tests {
         // After replay, the file should be at least desired_size.
         let sz = file.file_size().await.unwrap();
         assert!(sz >= desired_size, "expected >= {desired_size}, got {sz}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tail advancement tests (Phase 1)
+    // -----------------------------------------------------------------------
+
+    /// advance_tail reclaims space visible to free_space().
+    #[async_test]
+    async fn advance_tail_reclaims_free_space() {
+        let file = test_file();
+        let region = test_region();
+        let guid = test_guid();
+
+        let mut writer = LogWriter::initialize(&file, region.clone(), guid, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let initial_free = writer.free_space();
+        let page = [0xAAu8; SECTOR as usize];
+
+        // Write an entry — free space decreases.
+        writer
+            .write_entry(
+                &file,
+                &[DataPage {
+                    file_offset: LOGABLE_OFFSET,
+                    data: &page,
+                }],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let after_write = writer.free_space();
+        assert!(after_write < initial_free, "writing should consume space");
+
+        // Advance tail to head — reclaims all space.
+        writer.advance_tail(writer.head);
+
+        // When tail == head, free_space returns 0 (sequence_length returns
+        // length for the full-log case). So instead of checking against
+        // region.length, verify it's more than before the advance.
+        // Actually, when tail == head AND the log is "empty" (we just
+        // advanced past everything), the writer treats it as full.
+        // The write_entry check handles this: if tail == head it uses
+        // the full region. Let's verify we can write another entry.
+        writer
+            .write_entry(
+                &file,
+                &[DataPage {
+                    file_offset: LOGABLE_OFFSET + 4096,
+                    data: &page,
+                }],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // After advancing tail and writing one more, free space should be
+        // close to what it was after just the init entry + one data entry.
+        assert!(
+            writer.free_space() >= after_write,
+            "after advancing tail and writing, free space should be >= previous"
+        );
+    }
+
+    /// Write entries until the log is full, advance tail, write more.
+    ///
+    /// This is the core Phase 1 scenario: without advance_tail, the log
+    /// fills up and returns LogFull. With it, space is reclaimed.
+    #[async_test]
+    async fn write_advance_write_more() {
+        let file = test_file();
+        // Use a small log (16 sectors = 64 KiB) to hit the limit quickly.
+        let small_log = 16 * SECTOR;
+        let region = LogRegion {
+            file_offset: TEST_LOG_OFFSET,
+            length: small_log,
+        };
+        let guid = test_guid();
+
+        let mut writer = LogWriter::initialize(&file, region.clone(), guid, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let page = [0xBBu8; SECTOR as usize];
+        let elen = entry_length(1, 0); // 2 sectors per entry
+
+        // Fill the log until we can't write anymore.
+        let mut entries_written = 0u32;
+        loop {
+            let needed = elen + SECTOR; // entry + 1 reserved
+            if writer.tail == writer.head {
+                if needed > writer.region.length {
+                    break;
+                }
+            } else if needed > writer.free_space() {
+                break;
+            }
+
+            writer
+                .write_entry(
+                    &file,
+                    &[DataPage {
+                        file_offset: LOGABLE_OFFSET + (entries_written as u64) * 4096,
+                        data: &page,
+                    }],
+                    &[],
+                )
+                .await
+                .unwrap();
+            entries_written += 1;
+        }
+
+        assert!(
+            entries_written > 0,
+            "should have written at least one entry"
+        );
+
+        // Confirm the log is now full.
+        let result = writer
+            .write_entry(
+                &file,
+                &[DataPage {
+                    file_offset: LOGABLE_OFFSET,
+                    data: &page,
+                }],
+                &[],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(VhdxError::Corrupt(CorruptionType::LogFull))),
+            "log should be full"
+        );
+
+        // Advance tail past all entries — reclaim everything.
+        writer.advance_tail(writer.head);
+
+        // Now we should be able to write again.
+        let mut more_written = 0u32;
+        loop {
+            let needed = elen + SECTOR;
+            if writer.tail == writer.head {
+                if needed > writer.region.length {
+                    break;
+                }
+            } else if needed > writer.free_space() {
+                break;
+            }
+
+            writer
+                .write_entry(
+                    &file,
+                    &[DataPage {
+                        file_offset: LOGABLE_OFFSET
+                            + ((entries_written + more_written) as u64) * 4096,
+                        data: &page,
+                    }],
+                    &[],
+                )
+                .await
+                .unwrap();
+            more_written += 1;
+        }
+
+        assert!(
+            more_written > 0,
+            "should write more entries after advancing tail"
+        );
+    }
+
+    /// Incremental tail advancement: advance after each entry, write many
+    /// more entries than the log can hold without reclamation.
+    #[async_test]
+    async fn incremental_advance_exceeds_log_capacity() {
+        let file = test_file();
+        // Tiny log: 8 sectors = 32 KiB.
+        let small_log = 8 * SECTOR;
+        let region = LogRegion {
+            file_offset: TEST_LOG_OFFSET,
+            length: small_log,
+        };
+        let guid = test_guid();
+
+        let mut writer = LogWriter::initialize(&file, region.clone(), guid, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let page = [0xCCu8; SECTOR as usize];
+
+        // The log has 8 sectors. Init takes 1. Each data entry takes 2.
+        // Without advancement, we can fit ~3 entries before full.
+        // With incremental advancement, we can write indefinitely.
+        // Write 50 entries — well beyond the log's raw capacity.
+        for i in 0..50u32 {
+            let head_before = writer.head;
+            writer
+                .write_entry(
+                    &file,
+                    &[DataPage {
+                        file_offset: LOGABLE_OFFSET + (i as u64) * 4096,
+                        data: &page,
+                    }],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("entry {i} failed: {e}"));
+            // Advance tail to where head was before this entry.
+            // This simulates "apply completed for the previous entry."
+            writer.advance_tail(head_before);
+        }
+    }
+
+    /// Replay after tail advancement: entries before the advanced tail are
+    /// not part of the valid sequence, so replay only applies entries from
+    /// the new tail onward.
+    #[async_test]
+    async fn replay_after_tail_advance() {
+        let file = test_file();
+        let small_log = 16 * SECTOR;
+        let region = LogRegion {
+            file_offset: TEST_LOG_OFFSET,
+            length: small_log,
+        };
+        let guid = test_guid();
+
+        let mut writer = LogWriter::initialize(&file, region.clone(), guid, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        // Write entry A at LOGABLE_OFFSET.
+        let page_a = [0xAAu8; SECTOR as usize];
+        writer
+            .write_entry(
+                &file,
+                &[DataPage {
+                    file_offset: LOGABLE_OFFSET,
+                    data: &page_a,
+                }],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let head_after_a = writer.head;
+
+        // Write entry B at LOGABLE_OFFSET + 4096.
+        let page_b = [0xBBu8; SECTOR as usize];
+        writer
+            .write_entry(
+                &file,
+                &[DataPage {
+                    file_offset: LOGABLE_OFFSET + 4096,
+                    data: &page_b,
+                }],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // Advance tail past the init entry and entry A.
+        // The next write_entry will embed this new tail in its header.
+        writer.advance_tail(head_after_a);
+
+        // Write entry C to embed the new tail.
+        let page_c = [0xCCu8; SECTOR as usize];
+        writer
+            .write_entry(
+                &file,
+                &[DataPage {
+                    file_offset: LOGABLE_OFFSET + 8192,
+                    data: &page_c,
+                }],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // Zero out the target areas to prove replay writes them.
+        let zeros = [0u8; SECTOR as usize];
+        file.write_at(LOGABLE_OFFSET, &zeros).await.unwrap();
+        file.write_at(LOGABLE_OFFSET + 4096, &zeros).await.unwrap();
+        file.write_at(LOGABLE_OFFSET + 8192, &zeros).await.unwrap();
+
+        // Replay. The scanner should find the sequence starting at the
+        // new tail (head_after_a), which includes entries B and C.
+        // Entry A is before tail — it may or may not be replayed depending
+        // on scanner behavior (it's idempotent either way).
+        let result = replay_log(&file, &region, guid).await.unwrap();
+        assert!(result.replayed);
+
+        // Entries B and C must be replayed.
+        let mut buf = [0u8; SECTOR as usize];
+        file.read_at(LOGABLE_OFFSET + 4096, &mut buf).await.unwrap();
+        assert_eq!(buf, page_b, "entry B should be replayed");
+        file.read_at(LOGABLE_OFFSET + 8192, &mut buf).await.unwrap();
+        assert_eq!(buf, page_c, "entry C should be replayed");
+    }
+
+    /// Wrap-around with incremental tail advancement: write enough entries
+    /// with per-entry advancement to force both head and tail past the
+    /// circular boundary.
+    #[async_test]
+    async fn wrap_around_with_incremental_advance() {
+        let file = test_file();
+        // 8-sector log. Each data entry = 2 sectors. After init (1 sector),
+        // without advancement we'd fit ~3 entries. With advancement we wrap.
+        let small_log = 8 * SECTOR;
+        let region = LogRegion {
+            file_offset: TEST_LOG_OFFSET,
+            length: small_log,
+        };
+        let guid = test_guid();
+
+        let mut writer = LogWriter::initialize(&file, region.clone(), guid, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let page = [0xDDu8; SECTOR as usize];
+
+        // Write 20 entries, advancing tail before each write to keep
+        // only the last entry valid. This forces both head and tail
+        // to wrap multiple times.
+        let mut last_head = writer.head;
+        for i in 0..20u32 {
+            writer.advance_tail(last_head);
+            last_head = writer.head;
+
+            writer
+                .write_entry(
+                    &file,
+                    &[DataPage {
+                        file_offset: LOGABLE_OFFSET + (i as u64) * 4096,
+                        data: &page,
+                    }],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("entry {i} failed during wrap-around: {e}"));
+        }
+
+        // Head and tail should both have wrapped past the log boundary.
+        // With 20 entries of 2 sectors each in an 8-sector log, we've
+        // gone around 5+ times.
+        // Verify replay works with the final state.
+        let result = replay_log(&file, &region, guid).await.unwrap();
+        assert!(result.replayed);
+
+        // The last entry wrote to LOGABLE_OFFSET + 19*4096.
+        let mut buf = [0u8; SECTOR as usize];
+        file.read_at(LOGABLE_OFFSET + 19 * 4096, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, page, "last entry should be replayed correctly");
     }
 }

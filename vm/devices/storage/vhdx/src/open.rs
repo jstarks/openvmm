@@ -361,6 +361,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
 
         // Create mesh channel for log requests.
         let (tx, rx) = mesh::channel::<LogRequest>();
+        vhdx.cache.set_log_sender(tx.clone());
 
         // Create flush sequencer.
         let flush_sequencer = Arc::new(FlushSequencer::new());

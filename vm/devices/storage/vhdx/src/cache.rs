@@ -8,13 +8,28 @@
 //! (u8) and an offset within a tagged region. Tags map to base file offsets,
 //! allowing region relocation without invalidating cached pages.
 //!
-//! Modified pages accumulate as **Dirty** in the cache. On [`flush()`](PageCache::flush),
+//! Modified pages accumulate as **Dirty** in the cache. On [`commit()`](PageCache::commit),
 //! dirty pages are sent to the log task via a mesh channel for WAL persistence.
 //! The log task applies them to their final file offsets in the background.
 //!
-//! Page data is stored as `Arc<[u8; PAGE_SIZE]>` to enable zero-copy flush
+//! Page data is stored as `Arc<[u8; PAGE_SIZE]>` to enable zero-copy commit
 //! (Arc::clone) and implicit COW (Arc::make_mut) when a page is modified while
 //! the log task holds a reference.
+//!
+//! # Write Ordering
+//!
+//! The cache guarantees that writes are **ordered** through the log. If a
+//! caller writes page A, then later writes page B, the only crash-recovery
+//! outcomes are: {neither}, {A only}, or {both A and B}. It is never the case
+//! that B is persisted without A.
+//!
+//! This ordering is maintained by **eager commit**: when the dirty page count
+//! reaches [`MAX_COMMIT_PAGES`] and a new (not-yet-dirty) page is about to
+//! become dirty, the cache automatically commits the current dirty set to the
+//! log before allowing the new page to enter the dirty set.
+//!
+//! Pages that are **already dirty** (being re-modified) don't increase batch
+//! pressure — they're already ordered within the current batch.
 
 use crate::AsyncFile;
 use crate::error::VhdxError;
@@ -53,14 +68,14 @@ pub enum WriteMode {
 
 /// Internal per-page data.
 struct PageData {
-    /// The page contents as `Arc` for zero-copy flush and COW.
+    /// The page contents as `Arc` for zero-copy commit and COW.
     /// `None` if the page has not been loaded yet.
     data: Option<Arc<[u8; PAGE_SIZE]>>,
     /// Cache-local dirty flag. Only accessed under the page mutex.
     dirty: bool,
-    /// Completion signal from the most recent flush that included this
+    /// Completion signal from the most recent commit that included this
     /// page. The log task stores `LOG_APPLIED` or `LOG_FAILED` when it
-    /// finishes processing the batch. Each flush creates a **fresh**
+    /// finishes processing the batch. Each commit creates a **fresh**
     /// `Arc<AtomicU8>` so that applying batch N does not clobber the
     /// state of batch N+1.
     log_completion: Option<Arc<AtomicU8>>,
@@ -75,10 +90,10 @@ struct PageData {
 ///
 /// Pages are loaded on first access and kept in memory indefinitely (no
 /// eviction). Modified pages are marked dirty in the cache and sent to
-/// the log task on [`flush()`](Self::flush).
+/// the log task on [`commit()`](Self::commit).
 ///
-/// When no log sender is configured (read-only mode), dirty pages are
-/// Dirty pages are always deferred to [`flush()`](Self::flush).
+/// When no log sender is configured (read-only mode), dirty pages
+/// accumulate and are deferred to [`commit()`](Self::commit).
 pub struct PageCache<F: AsyncFile> {
     file: Arc<F>,
     /// Page map: `PageKey` → shared handle to the cached page mutex.
@@ -199,6 +214,11 @@ impl<F: AsyncFile> PageCache<F> {
     ///
     /// The caller **must** call [`WritePageGuard::release()`] to produce a
     /// [`PageCommit`], then `.commit().await` to mark the page dirty.
+    ///
+    /// If the page is not already dirty and the dirty count has reached
+    /// [`MAX_COMMIT_PAGES`], this method will automatically commit the
+    /// current dirty set to the log before returning the write guard.
+    /// This ensures write ordering is preserved across batch boundaries.
     pub async fn acquire_write(
         &self,
         key: PageKey,
@@ -246,7 +266,7 @@ impl<F: AsyncFile> PageCache<F> {
         }
     }
 
-    /// Flush all dirty pages through the log task.
+    /// Commit all dirty pages through the log task.
     ///
     /// Collects all dirty pages, clones their data via `Arc::clone`
     /// (cheap refcount bump), transitions them to InLog, and sends
@@ -254,11 +274,10 @@ impl<F: AsyncFile> PageCache<F> {
     ///
     /// Returns the FSN after the log entry is durable.
     ///
-    /// Collects all dirty pages from the cache, transitions them to InLog,
-    /// and sends a `LogRequest::Flush` to the log task.
-    ///
-    /// Returns the FSN after the log entry is durable.
-    pub async fn flush(&self, log_sender: &mesh::Sender<LogRequest>) -> Result<u64, VhdxError> {
+    /// This method must never be called with more than [`MAX_COMMIT_PAGES`]
+    /// dirty pages — the eager commit logic in [`acquire_write()`](Self::acquire_write)
+    /// enforces this invariant. An assertion checks it.
+    pub async fn commit(&self, log_sender: &mesh::Sender<LogRequest>) -> Result<u64, VhdxError> {
         // Collect dirty pages.
         let dirty_pages = {
             let pages = self.pages.lock();
@@ -309,16 +328,20 @@ impl<F: AsyncFile> PageCache<F> {
             .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?
     }
 
-    /// Flush all dirty pages with an optional pre_log_fsn constraint.
+    /// Commit all dirty pages with an optional pre_log_fsn constraint.
     ///
-    /// Like [`flush()`](Self::flush), but attaches the given FSN as a
+    /// Like [`commit()`](Self::commit), but attaches the given FSN as a
     /// pre_log_fsn to all dirty pages. The log task will wait for this
     /// FSN to complete before including the pages in a log entry.
     ///
     /// If a page already has a per-page FSN set, the maximum of the
     /// per-page FSN and the argument FSN is used.
+    ///
+    /// This method must never be called with more than [`MAX_COMMIT_PAGES`]
+    /// dirty pages — the eager commit logic in [`acquire_write()`](Self::acquire_write)
+    /// enforces this invariant. An assertion checks it.
     #[allow(dead_code)]
-    pub async fn flush_with_pre_log_fsn(
+    pub async fn commit_with_pre_log_fsn(
         &self,
         log_sender: &mesh::Sender<LogRequest>,
         pre_log_fsn: Option<u64>,
@@ -475,7 +498,7 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
 ///
 /// `commit()` is a no-op — the page is already marked dirty in the cache
 /// by `release()`. The actual disk write happens through
-/// [`PageCache::flush()`].
+/// [`PageCache::commit()`].
 #[must_use = "call .commit().await to finalize the page write"]
 pub struct PageCommit<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
@@ -488,7 +511,7 @@ impl<F: AsyncFile> PageCommit<'_, F> {
     ///
     /// This is a no-op — the page was already marked dirty by
     /// [`WritePageGuard::release()`]. The actual disk write happens
-    /// through [`PageCache::flush()`].
+    /// through [`PageCache::commit()`].
     pub async fn commit(self) -> Result<(), std::io::Error> {
         // Suppress unused-field warnings.
         let _ = self.cache;
@@ -801,9 +824,9 @@ mod tests {
         drop(guard);
     }
 
-    /// Regression test: when the same cache page is flushed in two
+    /// Regression test: when the same cache page is committed in two
     /// consecutive batches, applying batch 1 (state → APPLIED) must
-    /// not clobber batch 2's PENDING state. Each flush must create a
+    /// not clobber batch 2's PENDING state. Each commit must create a
     /// **fresh** `Arc<AtomicU8>` so that the log task's store on a
     /// completed batch is invisible to newer batches.
     #[async_test]
@@ -815,13 +838,13 @@ mod tests {
 
         let (tx, mut rx) = mesh::channel::<LogRequest>();
 
-        // Write "A" and flush → batch 1.
+        // Write "A" and commit → batch 1.
         {
             let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xAA);
             g.release().commit().await.unwrap();
         }
-        let (flush1_result, batch1_pages) = futures::future::join(cache.flush(&tx), async {
+        let (flush1_result, batch1_pages) = futures::future::join(cache.commit(&tx), async {
             match rx.recv().await.unwrap() {
                 LogRequest::Flush(rpc) => {
                     let (pages, response) = rpc.split();
@@ -835,13 +858,13 @@ mod tests {
         flush1_result.unwrap();
         assert_eq!(batch1_pages.len(), 1, "batch 1 should have one page");
 
-        // Write "B" (re-dirty the same page) and flush → batch 2.
+        // Write "B" (re-dirty the same page) and commit → batch 2.
         {
             let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xBB);
             g.release().commit().await.unwrap();
         }
-        let (flush2_result, batch2_pages) = futures::future::join(cache.flush(&tx), async {
+        let (flush2_result, batch2_pages) = futures::future::join(cache.commit(&tx), async {
             match rx.recv().await.unwrap() {
                 LogRequest::Flush(rpc) => {
                     let (pages, response) = rpc.split();

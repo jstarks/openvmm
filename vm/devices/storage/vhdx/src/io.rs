@@ -944,7 +944,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         self.flush_dirty_bat_pages().await?;
 
         if let Some(sender) = self.log_sender.as_ref() {
-            // Flush the cache (sends dirty pages to log task).
+            // Commit dirty cache pages (sends dirty pages to log task).
             //
             // NOTE: FSN-gated BAT logging (pre_log_fsn) is NOT applied here.
             // The pre_log_fsn mechanism is designed to be set per-page at
@@ -954,14 +954,14 @@ impl<F: AsyncFile> VhdxFile<F> {
             // the current FSN, but that FSN can only complete when the log task
             // calls flush_sequencer.flush() — which happens after it processes
             // the very pages we're sending.
-            let _fsn = self.cache.flush(sender).await?;
+            let _fsn = self.cache.commit(sender).await?;
         }
 
         // Ensure data writes are durable. When there's a flush sequencer,
         // use it to coalesce and track FSNs properly. Without a flush
         // sequencer (no log task), flush the file directly.
         //
-        // This is necessary because cache.flush() only issues a file flush
+        // This is necessary because cache.commit() only issues a file flush
         // through the log task when there are dirty BAT pages. Overwrites
         // to existing blocks don't dirty any BAT pages, so without this
         // explicit flush the data would remain volatile.

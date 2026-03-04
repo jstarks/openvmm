@@ -313,10 +313,10 @@ mod log_task_integration {
         // Write data to dirty some cache pages.
         write_pattern(&vhdx, 0, 4096, 0xEE).await;
 
-        // Flush should return a valid FSN via the cache.
+        // Commit should return a valid FSN via the cache.
         let _fsn = vhdx
             .cache
-            .flush(vhdx.log_sender.as_ref().expect("log sender"))
+            .commit(vhdx.log_sender.as_ref().expect("log sender"))
             .await
             .unwrap();
         // FSN can be 0 if no dirty pages (BAT may or may not be dirty depending

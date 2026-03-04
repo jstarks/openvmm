@@ -452,7 +452,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
 
         if let Some(sender) = self.log_sender.take() {
             // First flush any dirty pages from the cache through the log.
-            self.cache.flush(&sender).await?;
+            self.cache.commit(&sender).await?;
 
             // Send Close request and await response.
             let result = sender

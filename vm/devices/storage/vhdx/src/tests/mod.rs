@@ -352,4 +352,53 @@ mod log_task_integration {
         let buf2 = read_pattern(&vhdx2, 8192, 4096).await;
         assert!(buf2.iter().all(|&b| b == 0x33), "third write mismatch");
     }
+
+    /// Write to 200+ distinct data blocks, flush, close, reopen, and verify.
+    ///
+    /// This exercises the eager commit path: with 200+ distinct block writes
+    /// the cache will accumulate more dirty BAT pages than `MAX_COMMIT_PAGES`,
+    /// triggering automatic intermediate commits before the final flush.
+    #[async_test]
+    async fn large_write_survives_close_reopen(driver: DefaultDriver) {
+        const BLOCK_COUNT: usize = 200;
+        // Default block size is 2 MiB; place one 4 KiB write in each block.
+        const BLOCK_SIZE: u64 = 2 * format::MB1 as u64;
+        const WRITE_LEN: usize = 4096;
+
+        let disk_size = BLOCK_SIZE * (BLOCK_COUNT as u64 + 1);
+        let file = create_test_vhdx_file(disk_size).await;
+
+        // Open with log, write a distinct pattern into each of 200 blocks.
+        let file_arc = {
+            let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+            for i in 0..BLOCK_COUNT {
+                let offset = i as u64 * BLOCK_SIZE;
+                let pattern = (i & 0xFF) as u8;
+                write_pattern(&vhdx, offset, WRITE_LEN, pattern).await;
+            }
+            vhdx.flush().await.unwrap();
+            let file_arc = vhdx.file.clone();
+            vhdx.close().await.unwrap();
+            file_arc
+        };
+
+        // Reopen from snapshot and verify every block.
+        {
+            let vhdx = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+                .await
+                .unwrap();
+            for i in 0..BLOCK_COUNT {
+                let offset = i as u64 * BLOCK_SIZE;
+                let expected = (i & 0xFF) as u8;
+                let buf = read_pattern(&vhdx, offset, WRITE_LEN).await;
+                assert!(
+                    buf.iter().all(|&b| b == expected),
+                    "block {} mismatch: expected 0x{:02X}, got 0x{:02X}",
+                    i,
+                    expected,
+                    buf[0],
+                );
+            }
+        }
+    }
 }

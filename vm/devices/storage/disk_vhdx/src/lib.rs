@@ -305,11 +305,12 @@ mod tests {
     use disk_layered::LayeredDisk;
     use guestmem::GuestMemory;
     use pal_async::async_test;
+    use pal_async::DefaultDriver;
     use scsi_buffers::OwnedRequestBuffers;
     use vhdx::open::VhdxFile;
 
     /// Create a VHDX file at the given path and return a `VhdxLayer`.
-    async fn create_and_open_layer(path: &std::path::Path) -> VhdxLayer {
+    async fn create_and_open_layer(path: &std::path::Path, driver: &DefaultDriver) -> VhdxLayer {
         // Create a 1 MiB VHDX.
         let bf = BlockingFile::open(path, false).unwrap();
         let mut params = vhdx::create::CreateParams {
@@ -321,7 +322,7 @@ mod tests {
         // Re-open and wrap as VhdxLayer.
         let bf = BlockingFile::open(path, false).unwrap();
         let bf2 = bf.clone();
-        let vhdx = VhdxFile::open(bf, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(bf, driver).await.unwrap();
         VhdxLayer::new(vhdx, bf2, false)
     }
 
@@ -340,11 +341,11 @@ mod tests {
     }
 
     #[async_test]
-    async fn read_empty_disk_via_layer() {
+    async fn read_empty_disk_via_layer(driver: DefaultDriver) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.vhdx");
 
-        let layer = create_and_open_layer(&path).await;
+        let layer = create_and_open_layer(&path, &driver).await;
 
         // Verify metadata.
         assert_eq!(layer.sector_size(), 512);
@@ -365,11 +366,11 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_and_read_back() {
+    async fn write_and_read_back(driver: DefaultDriver) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.vhdx");
 
-        let layer = create_and_open_layer(&path).await;
+        let layer = create_and_open_layer(&path, &driver).await;
         let disk = wrap_in_layered_disk(layer).await;
 
         // Write a known pattern to sector 0.
@@ -395,24 +396,24 @@ mod tests {
     }
 
     #[async_test]
-    async fn sync_cache_works() {
+    async fn sync_cache_works(driver: DefaultDriver) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.vhdx");
 
-        let layer = create_and_open_layer(&path).await;
+        let layer = create_and_open_layer(&path, &driver).await;
         let disk = wrap_in_layered_disk(layer).await;
 
         disk.sync_cache().await.unwrap();
     }
 
     #[async_test]
-    async fn write_close_reopen_read() {
+    async fn write_close_reopen_read(driver: DefaultDriver) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.vhdx");
 
         // Create and write data
         {
-            let layer = create_and_open_layer(&path).await;
+            let layer = create_and_open_layer(&path, &driver).await;
             let disk = wrap_in_layered_disk(layer).await;
 
             let mem = GuestMemory::allocate(512);
@@ -431,7 +432,7 @@ mod tests {
         {
             let bf = BlockingFile::open(&path, true).unwrap();
             let bf2 = bf.clone();
-            let vhdx = VhdxFile::open(bf, true).await.unwrap();
+            let vhdx = VhdxFile::open_read_only(bf, true).await.unwrap();
             let layer = VhdxLayer::new(vhdx, bf2, true);
             let disk = LayeredDisk::new(
                 true,
@@ -456,11 +457,11 @@ mod tests {
     }
 
     #[async_test]
-    async fn multi_sector_write_and_read() {
+    async fn multi_sector_write_and_read(driver: DefaultDriver) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.vhdx");
 
-        let layer = create_and_open_layer(&path).await;
+        let layer = create_and_open_layer(&path, &driver).await;
         let disk = wrap_in_layered_disk(layer).await;
 
         // Write 4 KiB (8 sectors) starting at sector 0

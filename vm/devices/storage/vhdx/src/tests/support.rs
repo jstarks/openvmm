@@ -137,7 +137,7 @@ impl InMemoryFile {
 
     /// Create a new `InMemoryFile` with a copy of this file's current data.
     ///
-    /// Useful when a test needs to pass a file to `VhdxFile::open()` (which
+    /// Useful when a test needs to pass a file to `VhdxFile::open_writable()` (which
     /// takes ownership) while keeping a handle for subsequent operations.
     #[allow(dead_code)]
     pub fn clone_file(&self) -> InMemoryFile {

@@ -458,7 +458,7 @@ mod tests {
     /// Helper to create a disk and write a full block, returning the VhdxFile.
     async fn create_and_write_block(disk_size: u64, block_number: u32) -> VhdxFile<InMemoryFile> {
         let (file, _) = InMemoryFile::create_test_vhdx(disk_size).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
         let block_offset = block_number as u64 * vhdx.block_size() as u64;
         let block_size = vhdx.block_size();
 
@@ -674,7 +674,7 @@ mod tests {
     #[async_test]
     async fn trim_undefined_block_file_space_noop() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // Block 0 starts as NotPresent on a fresh non-differencing disk.
         assert_block_state(&vhdx, 0, BatEntryState::NotPresent);
@@ -694,7 +694,7 @@ mod tests {
     #[async_test]
     async fn trim_zero_block_noop() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // First: write and trim to Zero to get a Zero block.
         let block_size = vhdx.block_size();
@@ -741,7 +741,7 @@ mod tests {
     #[async_test]
     async fn trim_cross_block() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
         let bs = vhdx.block_size();
 
         // Write blocks 0, 1, 2.
@@ -792,7 +792,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // Write blocks 0, 1, 2.
         for block in 0..3u32 {
@@ -847,7 +847,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // Write all 4 blocks.
         for block in 0..4u32 {
@@ -900,7 +900,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // Write block 3 (the last, partial block).
         let block3_offset = 3 * MB1;
@@ -1031,7 +1031,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // FileSpace trim on fixed → no-op.
         vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 4 * MB1))
@@ -1057,7 +1057,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // MakeTransparent on fixed → allowed.
         vhdx.trim(TrimRequest::new(TrimMode::MakeTransparent, 0, 4 * MB1))
@@ -1164,7 +1164,7 @@ mod tests {
     #[async_test]
     async fn trim_concurrent_different_block() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
         let bs = vhdx.block_size();
 
         // Write blocks 0 and 1.
@@ -1219,7 +1219,7 @@ mod tests {
     #[async_test]
     async fn trim_read_only_fails() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, true).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let result = vhdx
             .trim(TrimRequest::new(
@@ -1234,7 +1234,7 @@ mod tests {
     #[async_test]
     async fn trim_unaligned_offset_fails() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         let result = vhdx
             .trim(TrimRequest::new(TrimMode::FileSpace, 1, 512))
@@ -1248,7 +1248,7 @@ mod tests {
     #[async_test]
     async fn trim_beyond_disk_fails() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         let result = vhdx
             .trim(TrimRequest::new(
@@ -1266,7 +1266,7 @@ mod tests {
     #[async_test]
     async fn trim_beyond_disk_ok_with_skip() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         // With skip_disk_size_check, goes beyond but computes no included blocks → ok.
         let result = vhdx
@@ -1281,7 +1281,7 @@ mod tests {
     #[async_test]
     async fn trim_zero_length_noop() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
 
         let result = vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 0)).await;
         assert!(result.is_ok());

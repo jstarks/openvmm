@@ -179,9 +179,9 @@ mod log_task_integration {
     }
 
     #[async_test]
-    async fn open_with_log_and_close(driver: DefaultDriver) {
+    async fn open_writable_and_close(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Verify the file is opened in writable mode with a log task.
         assert!(!vhdx.read_only);
@@ -192,9 +192,9 @@ mod log_task_integration {
     }
 
     #[async_test]
-    async fn open_with_log_sets_log_guid(driver: DefaultDriver) {
+    async fn open_writable_sets_log_guid(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // The file should have log_guid set (the header was written during open).
         // We verify by reading the header from the file.
@@ -213,7 +213,7 @@ mod log_task_integration {
 
         let has_log_guid = h1.as_ref().is_some_and(|h| h.log_guid != guid::Guid::ZERO)
             || h2.as_ref().is_some_and(|h| h.log_guid != guid::Guid::ZERO);
-        assert!(has_log_guid, "log_guid should be set after open_with_log");
+        assert!(has_log_guid, "log_guid should be set after open_writable");
 
         vhdx.close().await.unwrap();
     }
@@ -221,7 +221,7 @@ mod log_task_integration {
     #[async_test]
     async fn close_clears_log_guid(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let file_ref = vhdx.file.clone();
 
         // Close the file.
@@ -260,7 +260,7 @@ mod log_task_integration {
 
         // Open with log, write data, flush, close.
         let file_arc = {
-            let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+            let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
             write_pattern(&vhdx, 0, 4096, 0xAB).await;
             vhdx.flush().await.unwrap();
             let file_arc = vhdx.file.clone();
@@ -270,7 +270,7 @@ mod log_task_integration {
 
         // Reopen (no log needed since we closed cleanly) and verify data.
         {
-            let vhdx = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+            let vhdx = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
                 .await
                 .unwrap();
             let read_buf = read_pattern(&vhdx, 0, 4096).await;
@@ -284,23 +284,23 @@ mod log_task_integration {
 
         // Open with log, do nothing, close.
         let file_arc = {
-            let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+            let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
             let file_arc = vhdx.file.clone();
             vhdx.close().await.unwrap();
             file_arc
         };
 
         // Reopen — should succeed without log replay.
-        let vhdx = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+        let vhdx = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
             .await
             .unwrap();
-        assert!(!vhdx.read_only);
+        assert!(vhdx.read_only);
     }
 
     #[async_test]
     async fn open_read_only_no_spawner() {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
         assert!(vhdx.read_only);
         assert!(vhdx.flush_sequencer.is_none());
     }
@@ -308,7 +308,7 @@ mod log_task_integration {
     #[async_test]
     async fn flush_returns_fsn(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write data to dirty some cache pages.
         write_pattern(&vhdx, 0, 4096, 0xEE).await;
@@ -328,7 +328,7 @@ mod log_task_integration {
     #[async_test]
     async fn multiple_writes_single_flush(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Multiple writes at different offsets.
         write_pattern(&vhdx, 0, 4096, 0x11).await;
@@ -341,7 +341,7 @@ mod log_task_integration {
         vhdx.close().await.unwrap();
 
         // Reopen and verify.
-        let vhdx2 = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+        let vhdx2 = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
             .await
             .unwrap();
 
@@ -370,7 +370,7 @@ mod log_task_integration {
 
         // Open with log, write a distinct pattern into each of 200 blocks.
         let file_arc = {
-            let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+            let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
             for i in 0..BLOCK_COUNT {
                 let offset = i as u64 * BLOCK_SIZE;
                 let pattern = (i & 0xFF) as u8;
@@ -384,7 +384,7 @@ mod log_task_integration {
 
         // Reopen from snapshot and verify every block.
         {
-            let vhdx = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+            let vhdx = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
                 .await
                 .unwrap();
             for i in 0..BLOCK_COUNT {

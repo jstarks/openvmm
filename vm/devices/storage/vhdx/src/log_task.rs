@@ -93,7 +93,7 @@ struct LoggedBatch {
 
 /// Run the log task main loop.
 ///
-/// This function is spawned as an async task by `VhdxFile::open()`.
+/// This function is spawned as an async task by `VhdxFile::open_writable()`.
 /// It owns all mutable log state and processes [`LogRequest`] messages.
 ///
 /// After handling each flush request (and responding to callers), the

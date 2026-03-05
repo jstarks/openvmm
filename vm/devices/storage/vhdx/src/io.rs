@@ -996,7 +996,7 @@ mod tests {
     #[async_test]
     async fn read_empty_disk_returns_zero() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
@@ -1014,7 +1014,7 @@ mod tests {
     #[async_test]
     async fn read_zero_length() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_read(0, 0, &mut ranges).await.unwrap();
@@ -1025,7 +1025,7 @@ mod tests {
     #[async_test]
     async fn read_beyond_end_of_disk() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         // Read 512 bytes past the end (both offset and length are sector-aligned).
@@ -1041,7 +1041,7 @@ mod tests {
     #[async_test]
     async fn read_at_disk_end_exact() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx
@@ -1075,7 +1075,7 @@ mod tests {
         let needed = 4 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
         file.set_file_size(needed).await.unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
@@ -1093,7 +1093,7 @@ mod tests {
     #[async_test]
     async fn read_spanning_two_blocks() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let block_size = vhdx.block_size() as u64;
         let mut ranges = Vec::new();
@@ -1131,7 +1131,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         // Read across blocks 0, 1, 2: start at 512 KiB, length = 2 MiB.
@@ -1184,7 +1184,7 @@ mod tests {
         let needed = 4 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
         file.set_file_size(needed).await.unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
         let mut ranges = Vec::new();
         // Read 512 bytes starting at sector 10 (offset 5120).
         let _guard = vhdx.resolve_read(5120, 512, &mut ranges).await.unwrap();
@@ -1209,7 +1209,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
@@ -1237,7 +1237,7 @@ mod tests {
             .await
             .unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
@@ -1264,7 +1264,7 @@ mod tests {
             .await
             .unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
@@ -1291,7 +1291,7 @@ mod tests {
             .await
             .unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
@@ -1310,7 +1310,7 @@ mod tests {
         // Small disk: 4 MiB with 2 MiB blocks = 2 blocks.
         let disk_size = 4 * MB1;
         let (file, _) = InMemoryFile::create_test_vhdx(disk_size).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx
@@ -1346,7 +1346,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         // Read one 4K sector.
@@ -1372,9 +1372,9 @@ mod tests {
     // ---- Write tests ----
 
     #[async_test]
-    async fn write_to_empty_block() {
+    async fn write_to_empty_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_to_fully_present_block() {
+    async fn write_to_fully_present_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
 
@@ -1432,7 +1432,7 @@ mod tests {
         let needed = 4 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
         file.set_file_size(needed).await.unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
@@ -1449,9 +1449,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_spanning_two_blocks() {
+    async fn write_spanning_two_blocks(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let block_size = vhdx.block_size() as u64;
         let mut ranges = Vec::new();
@@ -1495,9 +1495,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_then_read_roundtrip() {
+    async fn write_then_read_roundtrip(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Step 1: resolve_write to get file offsets.
         let mut write_ranges = Vec::new();
@@ -1552,9 +1552,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_partial_block() {
+    async fn write_partial_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write 512 bytes at offset 4096 within block 0.
         let mut ranges = Vec::new();
@@ -1583,9 +1583,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_full_block() {
+    async fn write_full_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write exactly one full block (no padding needed).
         let mut ranges = Vec::new();
@@ -1612,9 +1612,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_zero_length() {
+    async fn write_zero_length(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_write(0, 0, &mut ranges).await.unwrap();
@@ -1622,9 +1622,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_beyond_end_of_disk() {
+    async fn write_beyond_end_of_disk(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let mut ranges = Vec::new();
         let result = vhdx
@@ -1639,7 +1639,7 @@ mod tests {
     #[async_test]
     async fn write_read_only() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, true).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         let mut ranges = Vec::new();
         let result = vhdx.resolve_write(0, 4096, &mut ranges).await;
@@ -1647,7 +1647,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_large_spanning_many_blocks() {
+    async fn write_large_spanning_many_blocks(driver: DefaultDriver) {
         // 4 MiB disk with 1 MiB blocks → 4 blocks.
         let file = InMemoryFile::new(0);
         let mut params = CreateParams {
@@ -1656,7 +1656,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write 3 MiB starting at offset 512 KiB (spans blocks 0,1,2,3).
         let start = MB1 / 2;
@@ -1723,9 +1723,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn first_write_updates_header() {
+    async fn first_write_updates_header(driver: DefaultDriver) {
         let (file, params) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let original_data_guid = params.data_write_guid;
         assert_eq!(vhdx.data_write_guid(), original_data_guid);
@@ -1741,9 +1741,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn second_write_no_header_update() {
+    async fn second_write_no_header_update(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // First write — triggers header update.
         let mut ranges = Vec::new();
@@ -1759,9 +1759,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn file_writable_only_does_not_change_data_guid() {
+    async fn file_writable_only_does_not_change_data_guid(driver: DefaultDriver) {
         let (file, params) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let original_data_guid = params.data_write_guid;
 
@@ -1803,9 +1803,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn resolve_write_sets_tfp_on_full_block() {
+    async fn resolve_write_sets_tfp_on_full_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
@@ -1828,9 +1828,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn resolve_write_no_tfp_on_partial_block() {
+    async fn resolve_write_no_tfp_on_partial_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
@@ -1850,7 +1850,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_read_roundtrip_multi_block() {
+    async fn write_read_roundtrip_multi_block(driver: DefaultDriver) {
         let file = InMemoryFile::new(0);
         let mut params = CreateParams {
             disk_size: 4 * MB1,
@@ -1858,7 +1858,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let block_size = vhdx.block_size() as u64;
         // Write 2 full blocks starting at offset 0.
@@ -1928,7 +1928,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_to_already_allocated_no_growth() {
+    async fn write_to_already_allocated_no_growth(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let regions = region::parse_region_tables(&file).await.unwrap();
 
@@ -1944,7 +1944,7 @@ mod tests {
         let needed_size = 100 * MB1 + format::DEFAULT_BLOCK_SIZE as u64;
         file.set_file_size(needed_size).await.unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let eof_before = vhdx.free_space.file_length();
 
         let mut ranges = Vec::new();
@@ -1970,7 +1970,7 @@ mod tests {
     #[async_test]
     async fn write_flush_persists_bat(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write and complete a full block.
         let block_size = vhdx.block_size();
@@ -1988,7 +1988,7 @@ mod tests {
 
         // Reopen from snapshot (log replay recovers the state).
         let recovered = InMemoryFile::from_snapshot(snapshot);
-        let vhdx2 = VhdxFile::open_with_log(recovered, &driver).await.unwrap();
+        let vhdx2 = VhdxFile::open_writable(recovered, &driver).await.unwrap();
         let bat_state = vhdx2.bat_state.read();
         let mapping = bat_state.get_payload_mapping(0);
         assert_eq!(
@@ -2003,9 +2003,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn complete_write_clears_tfp() {
+    async fn complete_write_clears_tfp(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // resolve_write should set TFP.
@@ -2042,7 +2042,7 @@ mod tests {
     #[async_test]
     async fn complete_write_writes_bat_to_disk(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_with_log(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
@@ -2065,7 +2065,7 @@ mod tests {
 
         // Reopen from snapshot (log replay recovers the state).
         let recovered = InMemoryFile::from_snapshot(snapshot);
-        let vhdx2 = VhdxFile::open_with_log(recovered, &driver).await.unwrap();
+        let vhdx2 = VhdxFile::open_writable(recovered, &driver).await.unwrap();
         let bat_state = vhdx2.bat_state.read();
         let mapping = bat_state.get_payload_mapping(0);
         assert_eq!(
@@ -2081,9 +2081,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn resolve_write_extends_file() {
+    async fn resolve_write_extends_file(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let size_before = vhdx.file.file_size().await.unwrap();
 
@@ -2099,9 +2099,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn dirty_page_after_abort() {
+    async fn dirty_page_after_abort(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // No dirty pages initially.
@@ -2142,9 +2142,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn abort_write_clears_tfp() {
+    async fn abort_write_clears_tfp(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
@@ -2188,9 +2188,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn abort_write_allows_subsequent_write() {
+    async fn abort_write_allows_subsequent_write(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // First write: allocate and abort.
@@ -2217,7 +2217,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn complete_write_notifies_on_cache_failure() {
+    async fn complete_write_notifies_on_cache_failure(driver: DefaultDriver) {
         // With write-back mode (no write-through), cache writes during
         // complete() only mark pages dirty in the cache. The actual disk
         // write happens on flush through the log task. So complete()
@@ -2233,7 +2233,7 @@ mod tests {
         let file = InMemoryFile::with_interceptor(0, interceptor);
         file.write_at(0, &data).await.unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // resolve_write succeeds (writes for header update, set_file_size).
@@ -2281,7 +2281,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn resolve_write_error_reverts_tfp() {
+    async fn resolve_write_error_reverts_tfp(driver: DefaultDriver) {
         // Create VHDX normally, then snapshot to new file with toggleable interceptor.
         let (orig_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let data = orig_file.snapshot();
@@ -2294,7 +2294,7 @@ mod tests {
         let file = InMemoryFile::with_interceptor(0, interceptor);
         file.write_at(0, &data).await.unwrap();
 
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // Enable set_file_size failure.
@@ -2331,9 +2331,9 @@ mod tests {
     /// Verify that a new allocation from near-EOF (safe data) omits zero
     /// padding, while an allocation from the free pool does emit zero padding.
     #[async_test]
-    async fn safe_data_skips_zero_padding() {
+    async fn safe_data_skips_zero_padding(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size() as u64;
 
         // Step 1: Partial write to block 0 at guest_offset=0, len=512.
@@ -2519,9 +2519,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_reads_same_block() {
+    async fn concurrent_reads_same_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Pre-allocate block 0 with known data.
@@ -2562,9 +2562,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_reads_different_blocks() {
+    async fn concurrent_reads_different_blocks(driver: DefaultDriver) {
         let (file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Pre-allocate blocks 0, 1, 2.
@@ -2598,10 +2598,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_writes_different_blocks() {
+    async fn concurrent_writes_different_blocks(driver: DefaultDriver) {
         // 8 MiB disk with 1 MiB blocks → 8 blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Spawn 4 concurrent tasks, each writing to a unique block.
@@ -2627,7 +2627,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_writes_same_block() {
+    async fn concurrent_writes_same_block(driver: DefaultDriver) {
         // This test exercises concurrent writes to the same unallocated block.
         // The correct behavior (matching the C code) is serialization:
         //   1. task_a: resolve_write → acquires allocation lock → allocates
@@ -2649,7 +2649,7 @@ mod tests {
         };
         yielding_file.inner.write_at(0, &data).await.unwrap();
 
-        let vhdx = Arc::new(VhdxFile::open(yielding_file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(yielding_file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Both tasks write to block 0 (offset 0, full block).
@@ -2691,9 +2691,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_flush_requests() {
+    async fn concurrent_flush_requests(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Write to a block, complete.
@@ -2713,10 +2713,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn stress_random_writes_no_corruption() {
+    async fn stress_random_writes_no_corruption(driver: DefaultDriver) {
         // 8 MiB disk with 1 MiB blocks → 8 blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Spawn 8 tasks, each claiming a unique block.
@@ -2743,9 +2743,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_read_and_write_same_block() {
+    async fn concurrent_read_and_write_same_block(driver: DefaultDriver) {
         let (file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Pre-allocate block 0 with known data.
@@ -2784,9 +2784,9 @@ mod tests {
     // ---- IoGuard refcount tracking tests (Phase 10.5 Step 2) ----
 
     #[async_test]
-    async fn read_guard_increments_refcount() {
+    async fn read_guard_increments_refcount(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // Pre-allocate block 0 so it's FullyPresent.
@@ -2811,9 +2811,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn read_guard_drop_decrements_refcount() {
+    async fn read_guard_drop_decrements_refcount(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // Pre-allocate block 0.
@@ -2833,9 +2833,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn read_guard_multiple_blocks() {
+    async fn read_guard_multiple_blocks(driver: DefaultDriver) {
         let (file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // Write 3 blocks.
@@ -2873,7 +2873,7 @@ mod tests {
     #[async_test]
     async fn read_guard_zero_range_has_refcount() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
 
         // Read an unallocated (Zero) block — refcount is still incremented
         // (harmless, since trim won't touch unallocated blocks).
@@ -2889,9 +2889,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_guard_complete_drops_refcount() {
+    async fn write_guard_complete_drops_refcount(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
@@ -2933,9 +2933,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn write_guard_drop_aborts_and_decrements_refcount() {
+    async fn write_guard_drop_aborts_and_decrements_refcount(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         let mut ranges = Vec::new();
@@ -2957,9 +2957,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_read_guards_same_block() {
+    async fn concurrent_read_guards_same_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // Pre-allocate block 0.
@@ -2989,10 +2989,10 @@ mod tests {
     use crate::trim::TrimRequest;
 
     #[async_test]
-    async fn concurrent_write_and_trim_same_block() {
+    async fn concurrent_write_and_trim_same_block(driver: DefaultDriver) {
         // Setup: 8 MiB disk, 1 MiB blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Write block 0 with pattern 0xAA, complete.
@@ -3033,10 +3033,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_trim_then_rewrite() {
+    async fn concurrent_trim_then_rewrite(driver: DefaultDriver) {
         // Setup: 8 MiB disk, 1 MiB blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Write block 0 with pattern 0xAA.
@@ -3094,10 +3094,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn mixed_workload_stress() {
+    async fn mixed_workload_stress(driver: DefaultDriver) {
         // 8 MiB disk with 1 MiB blocks → 8 blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
         let num_blocks: u32 = 8;
 
@@ -3241,10 +3241,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_partial_writes_same_block() {
+    async fn concurrent_partial_writes_same_block(driver: DefaultDriver) {
         // 8 MiB disk, 1 MiB blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Pre-allocate block 0 with pattern 0xAA.
@@ -3341,10 +3341,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn concurrent_write_flush_trim_interleaved() {
+    async fn concurrent_write_flush_trim_interleaved(driver: DefaultDriver) {
         // Setup: 8 MiB disk, 1 MiB blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         // Write block 0 with 0xDD, complete.
@@ -3399,10 +3399,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn stress_write_trim_cycle() {
+    async fn stress_write_trim_cycle(driver: DefaultDriver) {
         // 8 MiB disk with 1 MiB blocks → 8 blocks.
         let (file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
-        let vhdx = Arc::new(VhdxFile::open(file, false).await.unwrap());
+        let vhdx = Arc::new(VhdxFile::open_writable(file, &driver).await.unwrap());
         let block_size = vhdx.block_size();
 
         let num_writer_tasks: u32 = 4;
@@ -3544,7 +3544,7 @@ mod tests {
     // ---- SBM allocation tests ----
 
     #[async_test]
-    async fn partial_write_diff_disk_allocates_sbm() {
+    async fn partial_write_diff_disk_allocates_sbm(driver: DefaultDriver) {
         // A sub-block write to a NotPresent block in a differencing disk
         // should allocate the SBM block and set the payload to PartiallyPresent.
         let file = InMemoryFile::new(0);
@@ -3554,7 +3554,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Partial write: 4096 bytes at offset 0 (sub-block).
         write_block(&vhdx, 0, 4096, 0xAB).await;
@@ -3584,7 +3584,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn partial_write_diff_disk_sbm_bits_set_correctly() {
+    async fn partial_write_diff_disk_sbm_bits_set_correctly(driver: DefaultDriver) {
         // Write 4096 bytes (sectors 0-7 for 512-byte sectors) to a diff disk.
         // Verify that the written sectors read as Data and unwritten ones as Unmapped.
         let file = InMemoryFile::new(0);
@@ -3594,7 +3594,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         write_block(&vhdx, 0, 4096, 0xCD).await;
 
@@ -3628,7 +3628,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn full_block_write_diff_disk_no_sbm() {
+    async fn full_block_write_diff_disk_no_sbm(driver: DefaultDriver) {
         // A full-block write to a diff disk should set FullyPresent, not allocate SBM.
         let file = InMemoryFile::new(0);
         let mut params = CreateParams {
@@ -3637,7 +3637,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
 
         // Full-block write.
@@ -3657,7 +3657,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn second_partial_write_same_chunk_reuses_sbm() {
+    async fn second_partial_write_same_chunk_reuses_sbm(driver: DefaultDriver) {
         // Two partial writes to different blocks in the same chunk should
         // reuse the same SBM block.
         let file = InMemoryFile::new(0);
@@ -3667,7 +3667,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size() as u64;
 
         // First partial write to block 0.
@@ -3704,11 +3704,11 @@ mod tests {
     }
 
     #[async_test]
-    async fn partial_write_non_diff_disk_no_sbm() {
+    async fn partial_write_non_diff_disk_no_sbm(driver: DefaultDriver) {
         // A sub-block write to a non-differencing disk should set FullyPresent
         // and NOT allocate any SBM block.
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Partial write: 4096 bytes at offset 0.
         write_block(&vhdx, 0, 4096, 0x77).await;

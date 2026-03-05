@@ -46,9 +46,16 @@ impl AsyncResolveResource<DiskLayerHandleKind, VhdxDiskLayerHandle> for VhdxDisk
         let read_only = resource.read_only || input.read_only;
         let file = BlockingFile::new(resource.file);
         let file2 = file.clone();
-        let vhdx = VhdxFile::open(file, read_only)
-            .await
-            .map_err(ResolveVhdxError::Open)?;
+        let vhdx = if read_only {
+            VhdxFile::open_read_only(file, true)
+                .await
+                .map_err(ResolveVhdxError::Open)?
+        } else {
+            let driver = input.driver_source.simple();
+            VhdxFile::open_writable(file, &driver)
+                .await
+                .map_err(ResolveVhdxError::Open)?
+        };
         Ok(ResolvedDiskLayer::new(VhdxLayer::new(
             vhdx, file2, read_only,
         )))

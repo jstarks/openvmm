@@ -409,12 +409,12 @@ impl RustVhdx {
         let file = StdFile::open(path, read_only).expect("open backing file");
         let io_file = Arc::new(StdFile::open(path, read_only).expect("open io file"));
         let vhdx = if read_only {
-            vhdx::VhdxFile::open(file, true).await.expect("vhdx open")
+            vhdx::VhdxFile::open_read_only(file, true).await.expect("vhdx open")
         } else {
             let driver = driver.expect("writable open requires a driver/spawner");
-            vhdx::VhdxFile::open_with_log(file, driver)
+            vhdx::VhdxFile::open_writable(file, driver)
                 .await
-                .expect("vhdx open_with_log")
+                .expect("vhdx open_writable")
         };
         RustVhdx { vhdx, io_file }
     }

@@ -137,7 +137,7 @@ pub async fn open_vhdx_chain(
         // The actual read-write open happens later via open_vhdx_chain_explicit.
         let bf = crate::io::BlockingFile::open(&current_path, true)
             .with_context(|| format!("failed to open vhdx file: {}", current_path.display()))?;
-        let vhdx = vhdx::VhdxFile::open(bf, true)
+        let vhdx = vhdx::VhdxFile::open_read_only(bf, false)
             .await
             .with_context(|| format!("failed to parse vhdx file: {}", current_path.display()))?;
 

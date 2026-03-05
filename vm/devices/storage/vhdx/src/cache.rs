@@ -119,7 +119,7 @@ pub struct PageCache<F: AsyncFile> {
     /// Tag → base file offset mapping.
     tags: Mutex<HashMap<u8, u64>>,
     /// Log sender for eager commit support. Set once during
-    /// [`open_with_log()`] via [`set_log_sender()`](Self::set_log_sender)
+    /// [`open_writable()`] via [`set_log_sender()`](Self::set_log_sender)
     /// and cleared by [`clear_log_sender()`](Self::clear_log_sender) on
     /// close/abort so the channel drops and the log task can exit.
     log_sender: Mutex<Option<mesh::Sender<LogRequest>>>,
@@ -148,7 +148,7 @@ impl<F: AsyncFile> PageCache<F> {
 
     /// Set the log sender for eager commit support.
     ///
-    /// Must be called exactly once (during `open_with_log`).
+    /// Must be called exactly once (during `open_writable`).
     /// Panics if called more than once.
     pub fn set_log_sender(&self, sender: mesh::Sender<LogRequest>) {
         let mut guard = self.log_sender.lock();

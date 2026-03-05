@@ -306,7 +306,7 @@ pub(crate) struct AllocateResult {
 impl FreeSpaceTracker {
     /// Create and initialize the free space tracker.
     ///
-    /// Called during `VhdxFile::open()`, before the BAT parse. Sets all file
+    /// Called during `VhdxFile::open_inner()`, before the BAT parse. Sets all file
     /// space as free, then marks the header area, log, BAT, and metadata
     /// regions as in-use.
     ///

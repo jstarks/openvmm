@@ -93,8 +93,6 @@ pub enum TcpError {
     StillConnecting,
     #[error("unacceptable segment number")]
     Unacceptable,
-    #[error("received out of order packet")]
-    OutOfOrder,
     #[error("missing ack bit")]
     MissingAck,
     #[error("ack newer than sequence")]
@@ -155,6 +153,8 @@ struct TcpConnectionInner {
     rx_window_scale: u8,
     #[inspect(with = "inspect_seq")]
     rx_seq: TcpSeqNumber,
+    #[inspect(skip)]
+    rx_assembler: assembler::Assembler,
     needs_ack: bool,
     is_shutdown: bool,
     enable_window_scaling: bool,
@@ -607,6 +607,7 @@ impl TcpConnection {
             rx_window_cap: rx_buffer_size,
             rx_window_scale,
             rx_seq,
+            rx_assembler: assembler::Assembler::new(),
             needs_ack: false,
             is_shutdown: false,
             enable_window_scaling: false,
@@ -1248,13 +1249,6 @@ impl TcpConnectionInner {
             return Err(TcpError::Unacceptable.into());
         }
 
-        // Also ack+drop for out-of-order non-empty segments rather than queueing
-        // them. Our environment makes out-of-order segments unlikely.
-        if tcp.seq_number > self.rx_seq && tcp.segment_len() > 0 {
-            self.ack(sender);
-            return Err(TcpError::OutOfOrder.into());
-        }
-
         // SYN should not be set for in-window segments.
         if tcp.control == TcpControl::Syn {
             if self.state == TcpState::SynReceived {
@@ -1332,13 +1326,43 @@ impl TcpConnectionInner {
         };
         let payload = &tcp.payload[segment_skip..segment_end - tcp.seq_number - fin as usize];
 
+        let mut rx_fin = false;
+
         // Process the payload.
         match self.state {
             TcpState::Connecting | TcpState::SynReceived | TcpState::SynSent => unreachable!(),
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
-                self.rx_buffer.write_at(self.rx_buffer.len(), payload);
-                self.rx_buffer.extend_by(payload.len());
-                self.rx_seq = segment_end;
+                if !payload.is_empty() || fin {
+                    // Stage 1: Compute the byte offset from the contiguous
+                    // frontier and write the payload into the ring.
+                    let seq_offset = if tcp.seq_number >= self.rx_seq {
+                        tcp.seq_number - self.rx_seq
+                    } else {
+                        0
+                    };
+                    let ring_offset = self.rx_buffer.len() + seq_offset;
+                    if !payload.is_empty() {
+                        self.rx_buffer.write_at(ring_offset, payload);
+                    }
+
+                    // Stage 2: Record the range in the assembler.
+                    let (rx_consumed, assembler_fin) = match self.rx_assembler.add(
+                        seq_offset as u32,
+                        payload.len() as u32,
+                        fin,
+                    ) {
+                        Ok(result) => (result.consumed as usize, result.fin),
+                        Err(assembler::TooManyGaps) => (0, false),
+                    };
+
+                    // Stage 3: Advance the contiguous frontier.
+                    self.rx_buffer.extend_by(rx_consumed);
+                    self.rx_seq = self.rx_seq + rx_consumed;
+                    rx_fin = assembler_fin;
+                    if rx_fin {
+                        self.rx_seq = self.rx_seq + 1;
+                    }
+                }
                 if tcp.segment_len() > 0 {
                     self.needs_ack = true;
                 }
@@ -1351,7 +1375,7 @@ impl TcpConnectionInner {
         }
 
         // Process FIN.
-        if fin {
+        if rx_fin {
             match self.state {
                 TcpState::Connecting | TcpState::SynReceived | TcpState::SynSent => unreachable!(),
                 TcpState::Established => {

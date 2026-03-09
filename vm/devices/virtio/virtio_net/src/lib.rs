@@ -35,12 +35,15 @@ use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
 use net_backend_resources::mac_address::MacAddress;
+use pal_async::timer::Instant;
+use pal_async::timer::PolledTimer;
 use pal_async::wait::PolledWait;
 use std::future::pending;
 use std::mem::offset_of;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use task_control::AsyncRun;
 use task_control::InspectTaskMut;
 use task_control::StopTask;
@@ -136,6 +139,14 @@ struct NetStatus {
 }
 
 const DEFAULT_MTU: u16 = 1514;
+
+/// How often to check for stalled virtio rings.
+#[cfg(not(test))]
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STALL_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+/// Number of consecutive stalled intervals before reporting.
+const STALL_THRESHOLD: u32 = 2;
 
 #[expect(dead_code)]
 const VIRTIO_NET_MAX_QUEUES: u16 = 0x8000;
@@ -410,6 +421,7 @@ impl ProcessingData {
 
 #[derive(Inspect, Default)]
 struct QueueStats {
+    stall_detected: Counter,
     tx_stalled: Counter,
     spurious_wakes: Counter,
     rx_packets: Counter,
@@ -427,6 +439,8 @@ struct ActiveState {
     pending_rx_packets: VirtioWorkPool,
     data: ProcessingData,
     stats: QueueStats,
+    /// Monotonically increasing counter bumped on every TX/RX completion.
+    progress_generation: u64,
 }
 
 impl ActiveState {
@@ -436,6 +450,7 @@ impl ActiveState {
             pending_rx_packets: VirtioWorkPool::new(mem.clone(), rx_queue_size),
             data: ProcessingData::new(rx_queue_size, tx_queue_size),
             stats: Default::default(),
+            progress_generation: 0,
             mem,
         }
     }
@@ -552,9 +567,11 @@ impl Device {
             virtio_state.rx_queue_size,
             virtio_state.tx_queue_size,
         );
+        let stall_state = StallDetectionState::new(&driver, idx);
         let worker = Worker {
             virtio_state,
             active_state,
+            stall_state,
         };
         let coordinator = self.coordinator.state_mut().unwrap();
         let worker_task = &mut coordinator.workers[idx];
@@ -751,10 +768,37 @@ enum PacketError {
     Empty,
 }
 
+/// Tracks stall-detection state for a single queue pair.
+#[derive(Inspect)]
+struct StallDetectionState {
+    #[inspect(skip)]
+    timer: PolledTimer,
+    #[inspect(skip)]
+    next_check: Instant,
+    last_progress_generation: u64,
+    consecutive_stalls: u32,
+    stall_dumped: bool,
+    queue_index: usize,
+}
+
+impl StallDetectionState {
+    fn new(driver: &VmTaskDriver, queue_index: usize) -> Self {
+        Self {
+            timer: PolledTimer::new(driver),
+            next_check: Instant::now() + STALL_CHECK_INTERVAL,
+            last_progress_generation: 0,
+            consecutive_stalls: 0,
+            stall_dumped: false,
+            queue_index,
+        }
+    }
+}
+
 #[derive(InspectMut)]
 struct Worker {
     virtio_state: VirtioState,
     active_state: ActiveState,
+    stall_state: StallDetectionState,
 }
 
 impl Worker {
@@ -795,24 +839,38 @@ impl Worker {
             // This should be the only await point waiting on network traffic or
             // guest actions. Wrap it in `stop.until_stopped` to allow
             // cancellation.
-            stop.until_stopped(std::future::poll_fn(|cx| {
-                if let Poll::Ready(()) = epqueue_state.queue.poll_ready(cx) {
-                    return Poll::Ready(());
-                }
+            while {
+                let Worker {
+                    virtio_state,
+                    active_state,
+                    stall_state,
+                } = &mut *self;
+                stop.until_stopped(std::future::poll_fn(|cx| {
+                    if let Poll::Ready(()) = epqueue_state.queue.poll_ready(cx) {
+                        return Poll::Ready(false);
+                    }
 
-                if self.active_state.data.tx_segments.is_empty()
-                    && let Poll::Ready(()) = self.virtio_state.tx_queue.poll_kick(cx)
-                {
-                    return Poll::Ready(());
-                }
+                    if active_state.data.tx_segments.is_empty()
+                        && let Poll::Ready(()) = virtio_state.tx_queue.poll_kick(cx)
+                    {
+                        return Poll::Ready(false);
+                    }
 
-                if let Poll::Ready(()) = self.virtio_state.rx_queue.poll_kick(cx) {
-                    return Poll::Ready(());
-                }
+                    if let Poll::Ready(()) = virtio_state.rx_queue.poll_kick(cx) {
+                        return Poll::Ready(false);
+                    }
 
-                Poll::Pending
-            }))
-            .await?;
+                    if let Poll::Ready(_) = stall_state.timer.poll_until(cx, stall_state.next_check)
+                    {
+                        return Poll::Ready(true);
+                    }
+
+                    Poll::Pending
+                }))
+                .await?
+            } {
+                self.check_for_stall().await;
+            }
         }
     }
 
@@ -1094,6 +1152,7 @@ impl Worker {
         for ready_id in state.data.rx_ready[..n].iter() {
             state.stats.rx_packets.increment();
             state.pending_rx_packets.complete_packet(*ready_id);
+            state.progress_generation += 1;
         }
 
         state.stats.rx_packets_per_wake.add_sample(n as u64);
@@ -1162,6 +1221,85 @@ impl Worker {
         let mut tx_packet = state.pending_tx_packets[id.0 as usize].take().unwrap();
         tx_packet.work.complete(0);
         self.active_state.stats.tx_packets.increment();
+        self.active_state.progress_generation += 1;
         Ok(())
+    }
+
+    /// Check whether the virtio ring appears stalled (pending work with no
+    /// progress across consecutive timer intervals).
+    async fn check_for_stall(&mut self) {
+        self.stall_state.next_check = Instant::now() + STALL_CHECK_INTERVAL;
+
+        let tx_work = self.virtio_state.tx_queue.has_work();
+        let rx_work = self.virtio_state.rx_queue.has_work();
+        let has_pending = tx_work || rx_work;
+        let generation = self.active_state.progress_generation;
+
+        if has_pending && generation == self.stall_state.last_progress_generation {
+            self.stall_state.consecutive_stalls += 1;
+            self.active_state.stats.tx_stalled.increment();
+
+            if self.stall_state.consecutive_stalls >= STALL_THRESHOLD
+                && !self.stall_state.stall_dumped
+            {
+                self.active_state.stats.stall_detected.increment();
+                tracing::warn!(
+                    queue_index = self.stall_state.queue_index,
+                    tx_work,
+                    rx_work,
+                    consecutive_stalls = self.stall_state.consecutive_stalls,
+                    "virtio-net ring stall detected — no progress for {} seconds",
+                    self.stall_state.consecutive_stalls as u64 * STALL_CHECK_INTERVAL.as_secs(),
+                );
+                self.dump_stall_info().await;
+                self.stall_state.stall_dumped = true;
+            }
+        } else {
+            self.stall_state.consecutive_stalls = 0;
+            self.stall_state.stall_dumped = false;
+        }
+
+        self.stall_state.last_progress_generation = generation;
+    }
+
+    /// Dump the worker's inspect state to a file for post-mortem analysis.
+    async fn dump_stall_info(&mut self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "virtio-net-stall-q{}-{}.txt",
+            self.stall_state.queue_index, timestamp
+        ));
+
+        // Collect and fully resolve the inspect tree.
+        let mut inspection = inspect::InspectionBuilder::new("")
+            .depth(Some(10))
+            .inspect(&mut *self);
+        inspection.resolve().await;
+        let node = inspection.results();
+
+        let content = format!(
+            "Virtio-net stall dump\n\
+             Timestamp: {timestamp}\n\
+             Queue index: {}\n\
+             Consecutive stalls: {}\n\n\
+             === Inspect State ===\n\
+             {node:#}\n",
+            self.stall_state.queue_index, self.stall_state.consecutive_stalls,
+        );
+
+        match std::fs::write(&path, &content) {
+            Ok(()) => tracing::warn!(path = %path.display(), "stall dump written"),
+            Err(err) => tracing::error!(
+                error = &err as &dyn std::error::Error,
+                path = %path.display(),
+                "failed to write stall dump"
+            ),
+        }
     }
 }

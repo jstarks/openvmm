@@ -147,6 +147,17 @@ impl QueueCoreGetWork {
         }))
     }
 
+    pub fn has_work(&mut self) -> bool {
+        match &mut self.inner {
+            QueueGetWorkInner::Split(split) => {
+                split
+                    .get_available_index()
+                    .unwrap_or(split.last_avail_index)
+                    != split.last_avail_index
+            }
+        }
+    }
+
     fn reader(&mut self, descriptor_index: u16) -> DescriptorReader<'_> {
         DescriptorReader {
             chain: DescriptorChain::new(

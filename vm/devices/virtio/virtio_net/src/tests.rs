@@ -1553,3 +1553,87 @@ impl Endpoint for MockEndpointWithOffloads {
     }
 >>>>>>> 310214160 (virtio_net: enable checksum and GSO offloads)
 }
+
+/// Post descriptors to the TX ring without signaling the kick event so the
+/// worker never wakes up to consume them.  The stall-detection timer should
+/// notice unconsumed work (`has_work() == true`) with no progress and write a
+/// dump file.
+#[async_test]
+async fn stall_detection_fires_on_hung_tx(driver: DefaultDriver) {
+    use pal_async::timer::PolledTimer;
+
+    let tmp = std::env::temp_dir();
+
+    // Clean up any pre-existing stall dump files so we don't get confused.
+    for entry in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with("virtio-net-stall-q") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let mut harness = TestHarness::new(&driver);
+    let _handle = harness.enable_and_get_handle().await;
+
+    // Post a TX packet into the vring but do NOT signal the kick event.
+    // This simulates a guest that has posted work that we're not picking up.
+    let header_gpa = harness.alloc_data(NET_HEADER_SIZE);
+    let data_gpa = harness.alloc_data(100);
+
+    let header_bytes = vec![0u8; NET_HEADER_SIZE as usize];
+    harness.mem.write_at(header_gpa, &header_bytes).unwrap();
+    let data_bytes = vec![0xABu8; 100];
+    harness.mem.write_at(data_gpa, &data_bytes).unwrap();
+
+    post_tx_packet(
+        &harness.mem,
+        0, // desc_index
+        header_gpa,
+        NET_HEADER_SIZE,
+        &[(data_gpa, 100)],
+    );
+    make_available(&harness.mem, TX_AVAIL_ADDR, 0, &mut harness.tx_avail_idx);
+    // Deliberately no harness.tx_event.signal() — the worker should not wake
+    // for queue work, only for the stall timer.
+
+    // Wait long enough for the stall detection timer to fire at least
+    // STALL_THRESHOLD times.  Under cfg(test) the interval is 200 ms and the
+    // threshold is 2, so ~400 ms is the minimum.  Add generous margin for CI.
+    let mut timer = PolledTimer::new(&driver);
+    timer.sleep(Duration::from_millis(1500)).await;
+
+    // Verify that a stall dump file was created.
+    let found = std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("virtio-net-stall-q"))
+                .unwrap_or(false)
+        });
+
+    assert!(found, "expected a stall dump file in temp dir");
+
+    // Print the dump file contents.
+    for entry in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with("virtio-net-stall-q") {
+                let content = std::fs::read_to_string(entry.path()).unwrap();
+                println!("=== Stall dump file: {name} ===");
+                println!("{content}");
+                println!("=== End of stall dump ===");
+            }
+        }
+    }
+
+    // Clean up.
+    for entry in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with("virtio-net-stall-q") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}

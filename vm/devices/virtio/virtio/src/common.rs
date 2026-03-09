@@ -264,6 +264,10 @@ impl VirtioQueue {
             .map(|work| VirtioQueueCallbackWork::new(work, &self.used_handler)))
     }
 
+    pub fn has_work(&mut self) -> bool {
+        self.core.has_work()
+    }
+
     fn poll_next_buffer(
         &mut self,
         cx: &mut Context<'_>,

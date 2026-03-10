@@ -752,4 +752,67 @@ mod tests {
             };
         })
     }
+
+    /// Regression test: when a port handler `fail`s while a decoded value sits
+    /// in `Sent(BoxedValue)`, the `BoxedValue` must be properly freed.
+    ///
+    /// The bug: `SlotHandler::close_or_fail(_, true)` replaces `Sent(v)` with
+    /// `Done`, implicitly dropping the `BoxedValue`. But `BoxedValue` is just a
+    /// raw `NonNull<()>` with no `Drop` impl, so the underlying `Box<T>`
+    /// allocation (and the `T` value itself) is leaked.
+    #[test]
+    fn test_oneshot_fail_drops_sent_value() {
+        use mesh_protobuf::Protobuf;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        /// A type whose `Drop` we can observe, with protobuf encoding so it
+        /// can travel through the port decode path.
+        #[derive(Debug, Protobuf)]
+        #[mesh(transparent)]
+        struct Tracked(String);
+
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        block_on(async {
+            let (sender, mut receiver) = oneshot::<Tracked>();
+            let sender = Port::from(sender);
+
+            // Poll the receiver so it transitions to the SenderRemote state
+            // and installs the SlotHandler on the port.
+            assert!(futures::poll!(&mut receiver).is_pending());
+
+            // First message: decoded successfully → stored as Sent(BoxedValue).
+            // An empty protobuf message decodes as Tracked("").
+            sender.send(Message::new(()));
+
+            // Second message: triggers HandleMessageError in SlotHandler::message
+            // (state is already Sent). The port infrastructure then calls
+            // SlotHandler::fail → close_or_fail(_, true), which replaces
+            // Sent(v) with Done and drops v — leaking the Box<Tracked>.
+            sender.send(Message::new(()));
+
+            // The receiver sees the error.
+            let RecvError::Error(err) = receiver.await.unwrap_err() else {
+                panic!("expected channel error, got Closed");
+            };
+            tracing::info!(error = &err as &dyn std::error::Error, "expected error");
+        });
+
+        // The decoded Tracked("") should have been dropped exactly once.
+        // Due to the leak bug, DROP_COUNT will be 0.
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            1,
+            "the decoded value in Sent state was leaked (Drop never ran)"
+        );
+    }
 }

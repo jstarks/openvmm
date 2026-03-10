@@ -43,6 +43,7 @@ thiserror = { workspace = true, optional = true }
 expect-test.workspace = true
 futures.workspace = true
 inspect_derive.workspace = true
+mesh_remote.workspace = true
 pal_async.workspace = true
 
 [lints]

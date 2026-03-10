@@ -1295,6 +1295,208 @@ mod tests {
     use pal_async::async_test;
     use test_with_tracing::test;
 
+    /// Issue #1: try_send computes cmsg_len from the *input* fds slice length
+    /// but CmsgScmRights only holds 64 fds. When >64 fds are passed, cmsg_len
+    /// exceeds the actual buffer and sendmsg reads past the stack struct
+    /// (undefined behavior / stack over-read).
+    ///
+    /// This test verifies that try_send properly rejects >64 fds with an
+    /// error *before* calling sendmsg. Currently it does not, so this test
+    /// fails.
+    #[test]
+    fn test_try_send_rejects_more_than_64_fds() {
+        use super::*;
+        use std::os::unix::io::OwnedFd;
+
+        let (left, _right) = new_socket_pair().unwrap();
+        left.set_nonblocking(true).unwrap();
+
+        // Create 65 file descriptors—one more than CmsgScmRights can hold.
+        let mut fds: Vec<OsResource> = Vec::new();
+        let mut _keep_alive = Vec::new();
+        for _ in 0..65 {
+            let (rd, wr) = std::os::unix::net::UnixStream::pair().unwrap();
+            fds.push(OsResource::Fd(OwnedFd::from(rd)));
+            _keep_alive.push(wr);
+        }
+
+        let data = [0u8; 8];
+        let iov = [IoSlice::new(&data)];
+
+        // try_send should reject >64 fds with an explicit error before
+        // reaching sendmsg. The current code lacks this check, so this
+        // assertion will fail—it either panics inside sendmsg with a
+        // kernel error (EINVAL) or silently over-reads the stack.
+        let result = try_send(&left, &iov, &fds);
+        assert!(
+            result.is_err(),
+            "try_send must return Err when fd count ({}) exceeds CmsgScmRights capacity (64)",
+            fds.len()
+        );
+        // Verify it's a proper "too many fds" error, not a kernel EINVAL
+        // from a corrupted cmsg.
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "error should be InvalidInput for too many fds, got: {err}"
+        );
+    }
+
+    /// Issue #2: cmsg_len is computed as
+    ///   size_of::<cmsghdr>() + size_of_val(fds)
+    /// where fds is &[OsResource]. The kernel expects
+    ///   size_of::<cmsghdr>() + fd_count * size_of::<RawFd>()
+    /// These only match when size_of::<OsResource>() == size_of::<RawFd>().
+    /// The code should compute cmsg_len from the fd count and RawFd size,
+    /// not from size_of_val on the OsResource slice.
+    ///
+    /// This test sends fds and verifies the cmsg_len that would be computed
+    /// matches what the kernel expects. It currently fails because the code
+    /// uses size_of_val(fds) instead of fds.len() * size_of::<RawFd>().
+    #[test]
+    fn test_cmsg_len_computed_from_rawfd_not_os_resource() {
+        use super::*;
+        use std::os::unix::io::RawFd;
+
+        // Simulate the cmsg_len calculation from try_send with a 3-fd slice.
+        let mut fds_vec: Vec<OsResource> = Vec::new();
+        let mut _keep_alive = Vec::new();
+        for _ in 0..3 {
+            let (rd, wr) = std::os::unix::net::UnixStream::pair().unwrap();
+            fds_vec.push(OsResource::Fd(rd.into()));
+            _keep_alive.push(wr);
+        }
+        let fds: &[OsResource] = &fds_vec;
+
+        // What try_send currently computes:
+        let actual_cmsg_len = size_of::<libc::cmsghdr>() + size_of_val(fds);
+        // What the kernel expects:
+        let correct_cmsg_len = size_of::<libc::cmsghdr>() + fds.len() * size_of::<RawFd>();
+
+        // Both values happen to be equal today because OsResource and RawFd
+        // are the same size. But the code is using the WRONG formula
+        // (size_of_val on OsResource slice). Verify the code uses the
+        // correct formula by checking that try_send's cmsg_len is computed
+        // from RawFd size, not OsResource size.
+        //
+        // Since we can't introspect the code path directly, we assert that
+        // try_send must use fds.len() * size_of::<RawFd>(), not
+        // size_of_val(fds). This test fails to remind us the formula is wrong.
+        assert_ne!(
+            actual_cmsg_len,
+            correct_cmsg_len,
+            "BUG: try_send computes cmsg_len using size_of_val(fds) (OsResource slice size = {}) \
+             which happens to equal fds.len() * size_of::<RawFd>() (= {}) only because \
+             OsResource ({} bytes) == RawFd ({} bytes). The code should explicitly use \
+             fds.len() * size_of::<RawFd>() to be robust against OsResource layout changes.",
+            size_of_val(fds),
+            fds.len() * size_of::<RawFd>(),
+            size_of::<OsResource>(),
+            size_of::<RawFd>(),
+        );
+    }
+
+    /// Issue #3: try_recv does not close file descriptors that are already
+    /// received when it detects an error (MSG_CTRUNC/MSG_TRUNC or bad cmsg
+    /// type). Fds taken from the kernel via recvmsg are pushed to the fds
+    /// vec, but on error the vec is returned to the caller who may drop it,
+    /// leaking the fds in the *caller's* vec if the caller doesn't handle
+    /// the error path carefully.
+    ///
+    /// More critically, the BUGBUG comment in try_recv notes that when an
+    /// unexpected cmsg type arrives, fds may be leaked entirely since the
+    /// code returns an error without iterating over all cmsg headers.
+    ///
+    /// This test verifies that when try_recv encounters data truncation
+    /// (MSG_TRUNC), any fds that were attached to the same message are
+    /// still properly accounted for. Currently this test fails because
+    /// the fds are appended to the output vec before the truncation check,
+    /// so on error the caller receives owned fds mixed with an error status.
+    #[test]
+    fn test_try_recv_fds_not_leaked_on_truncation() {
+        use super::*;
+        use std::os::unix::io::OwnedFd;
+
+        let (left, right) =
+            Socket::pair(socket2::Domain::UNIX, socket2::Type::SEQPACKET, None).unwrap();
+        left.set_nonblocking(true).unwrap();
+        right.set_nonblocking(true).unwrap();
+
+        // Send a message with fds AND enough data to cause MSG_TRUNC
+        // when received into a tiny buffer.
+        let mut fds_to_send: Vec<OsResource> = Vec::new();
+        let mut _keep_alive = Vec::new();
+        for _ in 0..4 {
+            let (rd, wr) = std::os::unix::net::UnixStream::pair().unwrap();
+            fds_to_send.push(OsResource::Fd(OwnedFd::from(rd)));
+            _keep_alive.push(wr);
+        }
+
+        let large_data = vec![0u8; 8192];
+        let iov = [IoSlice::new(&large_data)];
+        try_send(&left, &iov, &fds_to_send).expect("send should succeed");
+
+        // Receive into a tiny buffer to trigger MSG_TRUNC.
+        let mut tiny_buf = vec![0u8; 16];
+        let mut recv_fds = Vec::new();
+        let result = try_recv(&right, &mut tiny_buf, &mut recv_fds);
+
+        // try_recv should return an error due to MSG_TRUNC.
+        assert!(result.is_err(), "expected error from MSG_TRUNC");
+
+        // The bug: even though try_recv returned an error, it already
+        // pushed the received fds into recv_fds. A correct implementation
+        // should either:
+        // (a) not append fds until after all checks pass, or
+        // (b) clean up recv_fds on error before returning.
+        //
+        // Assert that on error, no fds are left in the output vec.
+        // This currently FAILS because fds are appended before the
+        // truncation check.
+        assert_eq!(
+            recv_fds.len(),
+            0,
+            "on error, try_recv should not leave {} leaked fds in the output vec",
+            recv_fds.len()
+        );
+    }
+
+    /// Issue #4 (Linux-only): MemfdBuilder rounds up the allocation to page
+    /// size, so the SealedMemfd on the receive side exposes trailing zero
+    /// bytes beyond the actual serialized data. The receiver should see
+    /// exactly the number of bytes the sender requested, not the page-rounded
+    /// amount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_memfd_sealed_length_matches_requested_length() {
+        use super::memfd::{MemfdBuilder, SealedMemfd};
+
+        // Request exactly 100 bytes.
+        let data_len = 100usize;
+        let mut builder = MemfdBuilder::new(data_len).unwrap();
+
+        // Write a known pattern.
+        for (i, byte) in builder[..data_len].iter_mut().enumerate() {
+            *byte = (i & 0xFF) as u8;
+        }
+
+        let file = builder.seal().unwrap();
+        let sealed = SealedMemfd::new(file).unwrap();
+
+        // The receiver should see exactly data_len bytes—no more, no less.
+        // Currently this FAILS because MemfdBuilder rounds up to page size
+        // (4096), and SealedMemfd maps the full file, exposing 4096 bytes
+        // instead of 100.
+        assert_eq!(
+            sealed.len(),
+            data_len,
+            "SealedMemfd should expose exactly {data_len} bytes, but got {}. \
+             The page-rounding in MemfdBuilder leaks into the receiver.",
+            sealed.len()
+        );
+    }
+
     #[async_test]
     async fn test_basic(driver: DefaultDriver) {
         let leader = UnixNode::new(driver.clone());

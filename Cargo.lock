@@ -3486,6 +3486,7 @@ dependencies = [
  "futures",
  "inspect_derive",
  "mesh",
+ "mesh_remote",
  "pal_async",
  "parking_lot",
  "thiserror 2.0.16",

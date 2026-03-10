@@ -354,4 +354,103 @@ mod tests {
         }
         drop(deque);
     }
+
+    /// Regression test: `clear()` must not loop infinitely for ZSTs with Drop.
+    ///
+    /// The bug: `clear()` increments its loop counter by `layout.size()`, which
+    /// is 0 for ZSTs, so the loop never terminates.
+    #[test]
+    fn test_zst_with_drop_clear() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        struct ZstWithDrop;
+        impl Drop for ZstWithDrop {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::Relaxed);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut deque = ErasedVecDeque::new(const { &ElementVtable::new::<ZstWithDrop>() });
+            for _ in 0..3 {
+                // SAFETY: providing a valid owned pointer to the element type.
+                unsafe {
+                    deque.push_back(MaybeUninit::new(ZstWithDrop).as_ptr().cast());
+                }
+            }
+            deque.clear();
+            let count = DROP_COUNT.load(Ordering::Relaxed);
+            let _ = tx.send(count);
+        });
+
+        let count = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("clear() appears to loop infinitely for ZSTs with Drop");
+        assert_eq!(count, 3, "each ZST element should be dropped exactly once");
+    }
+
+    /// Regression test: if an element's `Drop` panics during `clear()`, already-
+    /// dropped elements must not be dropped again when the deque itself is
+    /// dropped.
+    ///
+    /// The bug: `clear()` only sets `self.len = 0` *after* the loop, so a panic
+    /// leaves `len` at its original value. The subsequent `Drop` of
+    /// `ErasedVecDeque` calls `clear()` again over the full original range,
+    /// double-dropping elements that were already destroyed.
+    #[test]
+    fn test_clear_panic_no_double_drop() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+        struct PanicOnDrop(u32);
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                let n = DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+                if n == PANIC_AT.load(Ordering::SeqCst) {
+                    panic!("intentional panic in drop");
+                }
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        PANIC_AT.store(2, Ordering::SeqCst); // 3rd element's drop panics
+
+        let mut deque = ErasedVecDeque::new(const { &ElementVtable::new::<PanicOnDrop>() });
+        for i in 0..5u32 {
+            // SAFETY: providing a valid owned pointer to the element type.
+            unsafe {
+                deque.push_back(MaybeUninit::new(PanicOnDrop(i)).as_ptr().cast());
+            }
+        }
+
+        // clear() drops elements in order; element at index 2 panics.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deque.clear();
+        }));
+        assert!(result.is_err(), "should have panicked during drop");
+
+        // 3 drops attempted: elements 0, 1, and the panicking element 2.
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
+
+        // Drop the deque. Only elements 3 and 4 should still need dropping.
+        PANIC_AT.store(usize::MAX, Ordering::SeqCst);
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        drop(deque);
+
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            2,
+            "only the 2 un-dropped elements should be dropped, not all 5"
+        );
+    }
 }

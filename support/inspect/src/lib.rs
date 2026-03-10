@@ -3359,4 +3359,353 @@ mod tests {
         update("", "true", &obj).now_or_never().unwrap().unwrap();
         assert!(*v.get_mut());
     }
+
+    /// Test that exercises the multi-process mesh path for inspect requests.
+    ///
+    /// Creates multiple mesh nodes connected via the Unix backend, then sends
+    /// inspect requests that get deferred across the mesh node boundaries.
+    /// Uses both small and large responses to exercise the inline data path
+    /// and the memfd shared-memory path respectively.
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn test_inspect_across_mesh_nodes(driver: DefaultDriver) {
+        use mesh::channel;
+        use mesh::MeshPayload;
+        use mesh::Receiver;
+        use mesh::Sender;
+        use mesh_remote::unix::UnixNode;
+
+        /// RPC message sent to node workers.
+        #[derive(MeshPayload)]
+        enum WorkerRpc {
+            /// An inspect request deferred over the mesh.
+            Inspect(crate::Deferred),
+        }
+
+        /// A "worker" that lives on a remote mesh node and responds to inspect
+        /// requests. It can optionally forward (chain) the request to another
+        /// node deeper in the tree for multi-hop deferral.
+        struct Worker {
+            name: String,
+            /// Data blob returned as an inspect field. Size controls whether
+            /// the response goes through the memfd path or the inline path.
+            data: Vec<u8>,
+            /// Optional sender to a deeper worker, causing another deferral hop.
+            next: Option<Sender<WorkerRpc>>,
+        }
+
+        impl Inspect for Worker {
+            fn inspect(&self, req: Request<'_>) {
+                let mut resp = req.respond();
+                resp.field("name", &*self.name);
+                // Return the data blob length and contents as hex so we can
+                // verify the data survived the mesh round-trip.
+                resp.field("data_len", self.data.len());
+
+                // Compute a simple checksum so we can verify data integrity
+                // without putting the entire blob in the expected output.
+                let checksum: u64 = self
+                    .data
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |acc, (i, &b)| acc.wrapping_add((b as u64) * (i as u64 + 1)));
+                resp.field("data_checksum", checksum);
+
+                if let Some(next) = &self.next {
+                    resp.child("next", |req| {
+                        req.respond()
+                            .merge(crate::send(next, WorkerRpc::Inspect));
+                    });
+                }
+            }
+        }
+
+        /// Spawn a task that receives `WorkerRpc` messages and handles them.
+        fn spawn_worker(
+            driver: &DefaultDriver,
+            mut recv: Receiver<WorkerRpc>,
+            worker: Worker,
+        ) {
+            let worker = std::sync::Arc::new(worker);
+            pal_async::task::Spawn::spawn(driver, "inspect-worker", async move {
+                while let Ok(msg) = recv.recv().await {
+                    match msg {
+                        WorkerRpc::Inspect(deferred) => {
+                            deferred.inspect(&*worker);
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+
+        /// Generate a deterministic data blob of the given size.
+        fn make_data(size: usize, seed: u8) -> Vec<u8> {
+            (0..size)
+                .map(|i| seed.wrapping_add(i as u8).wrapping_mul(37))
+                .collect()
+        }
+
+        /// Compute the expected checksum for a data blob from `make_data`.
+        fn expected_checksum(size: usize, seed: u8) -> u64 {
+            (0..size).fold(0u64, |acc, i| {
+                let b = seed.wrapping_add(i as u8).wrapping_mul(37);
+                acc.wrapping_add((b as u64) * (i as u64 + 1))
+            })
+        }
+
+        // -- Set up a 3-node mesh: leader, node2, node3 --
+        //
+        // Topology:
+        //   leader
+        //     ├── node2  (worker_a: small data, worker_b: large data)
+        //     └── node3  (worker_c: large data, chains to worker_d: small data on node2)
+        //
+        // This ensures inspect requests are deferred across mesh boundaries
+        // and, in the case of worker_c -> worker_d, traverse two hops across
+        // different nodes.
+
+        // Small data: well under the 16 KiB memfd threshold.
+        let small_size = 100;
+        // Large data: well above the 16 KiB memfd threshold (the threshold
+        // is ~16376 bytes for inline data on Linux).
+        let large_size = 64 * 1024;
+
+        // Create channels for workers on node2.
+        let (send_a, recv_a) = channel::<WorkerRpc>();
+        let (send_b, recv_b) = channel::<WorkerRpc>();
+        // worker_d also lives on node2 but is reached via worker_c on node3.
+        let (send_d, recv_d) = channel::<WorkerRpc>();
+
+        // Create channel for worker_c on node3.
+        let (send_c, recv_c) = channel::<WorkerRpc>();
+
+        // -- Build the mesh nodes --
+        let leader = UnixNode::new(driver.clone());
+
+        // Node2: connects recv_a, recv_b, recv_d ports.
+        // We need to bridge these through the mesh. The invite/join API takes
+        // one port each, so we'll use a multiplexing approach: send a bundle
+        // of receivers through a single port.
+        #[derive(MeshPayload)]
+        struct Node2Init {
+            recv_a: Receiver<WorkerRpc>,
+            recv_b: Receiver<WorkerRpc>,
+            recv_d: Receiver<WorkerRpc>,
+        }
+
+        let (node2_init_send, node2_init_recv) = channel::<Node2Init>();
+        let invitation = leader.invite(node2_init_recv.into()).await.unwrap();
+        let (node2_init_send2, mut node2_init_recv2) = channel::<Node2Init>();
+        let node2 = UnixNode::join(driver.clone(), invitation, node2_init_send2.into())
+            .await
+            .unwrap();
+
+        node2_init_send.send(Node2Init {
+            recv_a,
+            recv_b,
+            recv_d,
+        });
+
+        let Node2Init {
+            recv_a,
+            recv_b,
+            recv_d,
+        } = node2_init_recv2.recv().await.unwrap();
+
+        // Spawn workers on node2.
+        spawn_worker(
+            &driver,
+            recv_a,
+            Worker {
+                name: "worker_a".to_string(),
+                data: make_data(small_size, 0xAA),
+                next: None,
+            },
+        );
+        spawn_worker(
+            &driver,
+            recv_b,
+            Worker {
+                name: "worker_b".to_string(),
+                data: make_data(large_size, 0xBB),
+                next: None,
+            },
+        );
+        spawn_worker(
+            &driver,
+            recv_d,
+            Worker {
+                name: "worker_d".to_string(),
+                data: make_data(small_size, 0xDD),
+                next: None,
+            },
+        );
+
+        // Node3: connects recv_c, with worker_c chaining to worker_d via send_d.
+        #[derive(MeshPayload)]
+        struct Node3Init {
+            recv_c: Receiver<WorkerRpc>,
+            send_d: Sender<WorkerRpc>,
+        }
+
+        let (node3_init_send, node3_init_recv) = channel::<Node3Init>();
+        let invitation = leader.invite(node3_init_recv.into()).await.unwrap();
+        let (node3_init_send2, mut node3_init_recv2) = channel::<Node3Init>();
+        let node3 = UnixNode::join(driver.clone(), invitation, node3_init_send2.into())
+            .await
+            .unwrap();
+
+        node3_init_send.send(Node3Init { recv_c, send_d });
+        let Node3Init { recv_c, send_d } = node3_init_recv2.recv().await.unwrap();
+
+        spawn_worker(
+            &driver,
+            recv_c,
+            Worker {
+                name: "worker_c".to_string(),
+                data: make_data(large_size, 0xCC),
+                next: Some(send_d),
+            },
+        );
+
+        // -- Build the inspect tree on the leader side --
+        // The leader has senders to all top-level workers and constructs
+        // an inspect tree that defers to them.
+        let root = adhoc(|req| {
+            let mut resp = req.respond();
+            // Direct deferral to node2 workers
+            resp.child("worker_a", |req| {
+                req.respond()
+                    .merge(crate::send(&send_a, WorkerRpc::Inspect));
+            });
+            resp.child("worker_b", |req| {
+                req.respond()
+                    .merge(crate::send(&send_b, WorkerRpc::Inspect));
+            });
+            // Deferral to node3 worker, which itself chains to node2
+            resp.child("worker_c", |req| {
+                req.respond()
+                    .merge(crate::send(&send_c, WorkerRpc::Inspect));
+            });
+        });
+
+        let timeout = Duration::from_secs(5);
+
+        // -- Test 1: Full tree inspection --
+        let result = inspect_async(&driver, "", None, timeout, &root).await;
+        match &result {
+            Node::Dir(entries) => {
+                assert_eq!(entries.len(), 3, "expected 3 top-level entries");
+            }
+            other => panic!("expected Dir, got {other:?}"),
+        }
+
+        // -- Test 2: Inspect worker_a (small data, single hop) --
+        let result = inspect_async(&driver, "worker_a", None, timeout, &root).await;
+        match &result {
+            Node::Dir(entries) => {
+                let data_len = entries.iter().find(|e| e.name == "data_len").unwrap();
+                assert!(
+                    matches!(&data_len.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == small_size as u64)),
+                    "worker_a data_len mismatch: {data_len:?}"
+                );
+                let checksum = entries.iter().find(|e| e.name == "data_checksum").unwrap();
+                let expected = expected_checksum(small_size, 0xAA);
+                assert!(
+                    matches!(&checksum.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == expected)),
+                    "worker_a checksum mismatch: {checksum:?}, expected {expected}"
+                );
+            }
+            other => panic!("expected Dir for worker_a, got {other:?}"),
+        }
+
+        // -- Test 3: Inspect worker_b (large data, memfd path, single hop) --
+        let result = inspect_async(&driver, "worker_b", None, timeout, &root).await;
+        match &result {
+            Node::Dir(entries) => {
+                let data_len = entries.iter().find(|e| e.name == "data_len").unwrap();
+                assert!(
+                    matches!(&data_len.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == large_size as u64)),
+                    "worker_b data_len mismatch: {data_len:?}"
+                );
+                let checksum = entries.iter().find(|e| e.name == "data_checksum").unwrap();
+                let expected = expected_checksum(large_size, 0xBB);
+                assert!(
+                    matches!(&checksum.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == expected)),
+                    "worker_b checksum mismatch: {checksum:?}, expected {expected}"
+                );
+            }
+            other => panic!("expected Dir for worker_b, got {other:?}"),
+        }
+
+        // -- Test 4: Inspect worker_c (large data + chains to worker_d, two hops) --
+        let result = inspect_async(&driver, "worker_c", None, timeout, &root).await;
+        match &result {
+            Node::Dir(entries) => {
+                let data_len = entries.iter().find(|e| e.name == "data_len").unwrap();
+                assert!(
+                    matches!(&data_len.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == large_size as u64)),
+                    "worker_c data_len mismatch: {data_len:?}"
+                );
+                let checksum = entries.iter().find(|e| e.name == "data_checksum").unwrap();
+                let expected = expected_checksum(large_size, 0xCC);
+                assert!(
+                    matches!(&checksum.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == expected)),
+                    "worker_c checksum mismatch: {checksum:?}, expected {expected}"
+                );
+                // worker_d should appear as a nested child
+                let next = entries.iter().find(|e| e.name == "next").unwrap();
+                match &next.node {
+                    Node::Dir(inner) => {
+                        let name = inner.iter().find(|e| e.name == "name").unwrap();
+                        assert!(
+                            matches!(&name.node, Node::Value(v) if matches!(&v.kind, ValueKind::String(s) if s == "worker_d")),
+                            "worker_d name mismatch: {name:?}"
+                        );
+                        let data_len = inner.iter().find(|e| e.name == "data_len").unwrap();
+                        assert!(
+                            matches!(&data_len.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == small_size as u64)),
+                            "worker_d data_len mismatch: {data_len:?}"
+                        );
+                        let checksum = inner.iter().find(|e| e.name == "data_checksum").unwrap();
+                        let expected = expected_checksum(small_size, 0xDD);
+                        assert!(
+                            matches!(&checksum.node, Node::Value(v) if matches!(v.kind, ValueKind::Unsigned(n) if n == expected)),
+                            "worker_d checksum mismatch: {checksum:?}, expected {expected}"
+                        );
+                    }
+                    other => panic!("expected Dir for worker_d (next), got {other:?}"),
+                }
+            }
+            other => panic!("expected Dir for worker_c, got {other:?}"),
+        }
+
+        // -- Test 5: Stress test with repeated inspections --
+        // Run many inspections in sequence to increase the chance of catching
+        // corruption bugs, especially around memfd reuse / lifetime issues.
+        for i in 0..50 {
+            let path = match i % 4 {
+                0 => "",
+                1 => "worker_a",
+                2 => "worker_b",
+                3 => "worker_c",
+                _ => unreachable!(),
+            };
+            let result = inspect_async(&driver, path, None, timeout, &root).await;
+            match &result {
+                Node::Dir(_) => {} // success
+                Node::Failed(e) => panic!("iteration {i} path={path} failed: {e:?}"),
+                other => panic!("iteration {i} path={path} unexpected: {other:?}"),
+            }
+        }
+
+        // -- Cleanup --
+        drop(send_a);
+        drop(send_b);
+        drop(send_c);
+        node2.shutdown().await;
+        node3.shutdown().await;
+        leader.shutdown().await;
+    }
 }

@@ -24,6 +24,18 @@ pub struct AgentBootstrap {
     pub requests: mesh::Sender<AgentRequest>,
     /// Closed when the agent exits (crash or shutdown).
     pub watch: mesh::OneshotReceiver<()>,
+    /// Receives VM configuration from the host (networking, etc.).
+    pub config: mesh::OneshotSender<AgentConfig>,
+}
+
+/// Configuration sent from the host shim to the guest agent after bootstrap.
+///
+/// Tells the agent what hardware to expect so it can skip unnecessary
+/// initialization (e.g., don't poll for eth0 if no NIC was attached).
+#[derive(MeshPayload)]
+pub struct AgentConfig {
+    /// Whether a network device (netvsp) was attached to the VM.
+    pub networking: bool,
 }
 
 /// An RPC request from the host shim to the guest agent.

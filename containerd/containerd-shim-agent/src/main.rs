@@ -11,6 +11,7 @@
 use anyhow::Context;
 use containerd_shim_agent_protocol::AGENT_VSOCK_PORT;
 use containerd_shim_agent_protocol::AgentBootstrap;
+use containerd_shim_agent_protocol::AgentConfig;
 use containerd_shim_agent_protocol::AgentRequest;
 use containerd_shim_agent_protocol::CreateContainerRequest;
 use containerd_shim_agent_protocol::CreateContainerResponse;
@@ -74,9 +75,8 @@ fn main() {
     if let Err(e) = init_filesystems() {
         eprintln!("containerd-shim-agent: failed to init filesystems: {e:#}");
     }
-    if let Err(e) = init_networking() {
-        eprintln!("containerd-shim-agent: failed to init networking: {e:#}");
-    }
+    // Networking is initialized after connecting to the host, which tells us
+    // whether a NIC is attached (avoids a 5s polling timeout when it isn't).
     let result = pal_async::DefaultPool::run_with(|driver| async move { run_agent(driver).await });
     if let Err(e) = result {
         eprintln!("containerd-shim-agent: agent error: {e:#}");
@@ -373,11 +373,30 @@ async fn run_agent(driver: DefaultDriver) -> anyhow::Result<()> {
 
     let (request_send, mut request_recv) = mesh::channel();
     let (watch_send, watch_recv) = mesh::oneshot();
+    let (config_send, config_recv) = mesh::oneshot::<AgentConfig>();
 
     bootstrap_send.send(AgentBootstrap {
         requests: request_send,
         watch: watch_recv,
+        config: config_send,
     });
+
+    // Wait for configuration from the host before doing hardware init.
+    let config = config_recv
+        .await
+        .context("failed to receive agent config")?;
+    eprintln!(
+        "containerd-shim-agent: received config from host (networking={})",
+        config.networking
+    );
+
+    if config.networking {
+        if let Err(e) = init_networking() {
+            eprintln!("containerd-shim-agent: failed to init networking: {e:#}");
+        }
+    } else {
+        eprintln!("containerd-shim-agent: skipping network init (no NIC)");
+    }
 
     eprintln!("containerd-shim-agent: connected to host, entering dispatch loop");
 

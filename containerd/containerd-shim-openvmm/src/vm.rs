@@ -9,6 +9,7 @@
 use anyhow::Context as _;
 use containerd_shim_agent_protocol::AGENT_VSOCK_PORT;
 use containerd_shim_agent_protocol::AgentBootstrap;
+use containerd_shim_agent_protocol::AgentConfig;
 use containerd_shim_agent_protocol::AgentRequest;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -21,7 +22,6 @@ use net_backend_resources::mac_address::MacAddress;
 use netvsp_resources::NetvspHandle;
 use openvmm_defs::config::Config;
 use openvmm_defs::config::DEFAULT_MMIO_GAPS_X86;
-use openvmm_defs::config::DEFAULT_PCIE_ECAM_BASE;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
@@ -216,8 +216,9 @@ pub async fn launch_vm(
         memory: MemoryConfig {
             mem_size: config.memory_mb * 1024 * 1024,
             mmio_gaps: DEFAULT_MMIO_GAPS_X86.into(),
+            pci_ecam_gaps: vec![],
+            pci_mmio_gaps: vec![],
             prefetch_memory: false,
-            pcie_ecam_base: DEFAULT_PCIE_ECAM_BASE,
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: config.cpus,
@@ -325,6 +326,11 @@ pub async fn launch_vm(
     let (bootstrap_send, bootstrap_recv) = mesh::oneshot::<AgentBootstrap>();
     let mesh = PointToPointMesh::new(driver, conn, bootstrap_send.into());
     let bootstrap = bootstrap_recv.await.context("agent bootstrap failed")?;
+
+    // Send configuration to the agent so it knows what hardware to expect.
+    bootstrap.config.send(AgentConfig {
+        networking: config.networking,
+    });
 
     tracing::info!("agent bootstrap complete");
 

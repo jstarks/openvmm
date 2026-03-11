@@ -53,6 +53,9 @@ pub struct VmConfig {
     pub kernel_path: PathBuf,
     /// Path to the agent binary (will be wrapped in a cpio initrd).
     pub agent_path: PathBuf,
+    /// Optional path to a pre-built initrd. When set, the agent binary is
+    /// not read and the cpio initrd is not built at runtime (saves ~180ms).
+    pub initrd_path: Option<PathBuf>,
     /// Number of vCPUs.
     pub cpus: u32,
     /// RAM in megabytes.
@@ -99,6 +102,7 @@ impl Drop for RunningVm {
 /// |-----------------------------|-----------------------------|---------|
 /// | `io.openvmm.kernel`         | `OPENVMM_SHIM_KERNEL`       | (required) |
 /// | `io.openvmm.agent`          | `OPENVMM_SHIM_AGENT`        | (required) |
+/// | `io.openvmm.initrd`         | `OPENVMM_SHIM_INITRD`       | (none)  |
 /// | `io.openvmm.cpus`           | `OPENVMM_SHIM_CPUS`         | 1       |
 /// | `io.openvmm.memory_mb`      | `OPENVMM_SHIM_MEMORY_MB`    | 256     |
 /// | `io.openvmm.networking`     | `OPENVMM_SHIM_NETWORKING`   | true    |
@@ -123,9 +127,12 @@ pub fn resolve_config(
         .context("agent path not set (set OPENVMM_SHIM_AGENT or annotation io.openvmm.agent)")?;
     let containers_dir = bundle.join("containers");
     std::fs::create_dir_all(&containers_dir).context("failed to create containers dir")?;
+    let initrd_path = get("io.openvmm.initrd", "OPENVMM_SHIM_INITRD").map(PathBuf::from);
+
     Ok(VmConfig {
         kernel_path: PathBuf::from(kernel_path),
         agent_path: PathBuf::from(agent_path),
+        initrd_path,
         cpus: get("io.openvmm.cpus", "OPENVMM_SHIM_CPUS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
@@ -144,32 +151,45 @@ pub async fn launch_vm(
     driver: &pal_async::DefaultDriver,
     config: &VmConfig,
 ) -> anyhow::Result<RunningVm> {
-    // 1. Read agent binary and build initrd.
-    let mut agent_binary = Vec::new();
-    std::fs::File::open(&config.agent_path)
-        .with_context(|| {
-            format!(
-                "failed to open agent binary: {}",
-                config.agent_path.display()
-            )
-        })?
-        .read_to_end(&mut agent_binary)
-        .context("failed to read agent binary")?;
+    let t0 = std::time::Instant::now();
 
-    let initrd_data = crate::initrd::build_initrd(&agent_binary);
+    // 1. Open or build the initrd.
+    //    If a pre-built initrd is provided, use it directly (saves ~180ms).
+    //    Otherwise, read the agent binary and build a cpio initrd at runtime.
+    let _initrd_tmpfile; // must outlive initrd_file
+    let initrd_file = if let Some(initrd_path) = &config.initrd_path {
+        tracing::info!(path = %initrd_path.display(), "using pre-built initrd");
+        std::fs::File::open(initrd_path)
+            .with_context(|| format!("failed to open initrd: {}", initrd_path.display()))?
+    } else {
+        let mut agent_binary = Vec::new();
+        std::fs::File::open(&config.agent_path)
+            .with_context(|| {
+                format!(
+                    "failed to open agent binary: {}",
+                    config.agent_path.display()
+                )
+            })?
+            .read_to_end(&mut agent_binary)
+            .context("failed to read agent binary")?;
 
-    // 2. Write initrd to a temp file.
-    let mut initrd_tmpfile =
-        tempfile::NamedTempFile::new().context("failed to create initrd temp file")?;
-    initrd_tmpfile
-        .write_all(&initrd_data)
-        .context("failed to write initrd temp file")?;
-    initrd_tmpfile
-        .flush()
-        .context("failed to flush initrd temp file")?;
-    // Reopen as a read-only File for Config.
-    let initrd_file =
-        std::fs::File::open(initrd_tmpfile.path()).context("failed to reopen initrd temp file")?;
+        let initrd_data = crate::initrd::build_initrd(&agent_binary);
+
+        let mut tmpfile =
+            tempfile::NamedTempFile::new().context("failed to create initrd temp file")?;
+        tmpfile
+            .write_all(&initrd_data)
+            .context("failed to write initrd temp file")?;
+        tmpfile
+            .flush()
+            .context("failed to flush initrd temp file")?;
+        let file =
+            std::fs::File::open(tmpfile.path()).context("failed to reopen initrd temp file")?;
+        _initrd_tmpfile = tmpfile; // keep alive
+        file
+    };
+
+    tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "initrd ready");
 
     // 3. Open kernel file.
     let kernel_file = std::fs::File::open(&config.kernel_path)
@@ -199,11 +219,23 @@ pub async fn launch_vm(
     let (vm_rpc_send, vm_rpc_recv) = mesh::channel::<VmRpc>();
     let (halt_send, halt_recv) = mesh::channel::<HaltReason>();
 
+    // Kernel command line tuned for fast boot in a microVM:
+    // - panic=-1: reboot immediately on panic
+    // - quiet loglevel=0: suppress console output (slow)
+    // - 8250.nr_uarts=0: skip serial port probing
+    // - mitigations=off: skip CPU vulnerability mitigations
+    // - tsc=reliable: skip TSC calibration
+    // - random.trust_cpu=on: trust RDRAND for entropy
+    // - no_timer_check: skip timer IRQ routing check
+    // - noreplace-smp: skip SMP alternatives patching
+    let cmdline = "panic=-1 quiet loglevel=0 8250.nr_uarts=0 mitigations=off \
+                   tsc=reliable random.trust_cpu=on no_timer_check noreplace-smp";
+
     let vm_config = Config {
         load_mode: LoadMode::Linux {
             kernel: kernel_file,
             initrd: Some(initrd_file),
-            cmdline: "panic=-1".into(),
+            cmdline: cmdline.into(),
             custom_dsdt: None,
             enable_serial: false,
         },
@@ -300,12 +332,14 @@ pub async fn launch_vm(
         .await
         .context("failed to launch VM worker")?;
 
+    tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "VM worker launched");
+
     // 10. Resume VM.
-    let resumed = vm_rpc_send
+    let _resumed = vm_rpc_send
         .call(VmRpc::Resume, ())
         .await
         .context("failed to resume VM")?;
-    tracing::info!(resumed, "VM resumed");
+    tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "VM resumed");
 
     // 11. Accept agent connection (with 30s timeout).
     let mut timer = PolledTimer::new(driver);
@@ -319,7 +353,7 @@ pub async fn launch_vm(
         _ = timeout => anyhow::bail!("agent connection timed out after 30 seconds"),
     };
 
-    tracing::info!("agent connected");
+    tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "agent connected");
 
     // 12. Set up PointToPointMesh on accepted connection.
     let conn = PolledSocket::new(driver, conn).context("failed to wrap agent connection")?;
@@ -332,7 +366,10 @@ pub async fn launch_vm(
         networking: config.networking,
     });
 
-    tracing::info!("agent bootstrap complete");
+    tracing::info!(
+        elapsed_ms = t0.elapsed().as_millis(),
+        "agent bootstrap complete (config sent)"
+    );
 
     // 13. Return RunningVm with all handles.
     Ok(RunningVm {

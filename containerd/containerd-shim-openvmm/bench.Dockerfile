@@ -37,9 +37,10 @@ RUN apt-get update -qq && \
 COPY containerd-shim-openvmm-v2 /usr/local/bin/containerd-shim-openvmm-v2-real
 COPY containerd-shim-agent      /usr/local/share/containerd-shim-agent
 COPY vmlinux                    /usr/local/share/vmlinux
+COPY initrd.img                 /usr/local/share/initrd.img
 
 # Create a wrapper script that injects the env vars containerd won't pass.
-RUN printf '#!/bin/bash\nexport OPENVMM_SHIM_KERNEL=/usr/local/share/vmlinux\nexport OPENVMM_SHIM_AGENT=/usr/local/share/containerd-shim-agent\nexec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"\n' \
+RUN printf '#!/bin/bash\nexport OPENVMM_SHIM_KERNEL=/usr/local/share/vmlinux\nexport OPENVMM_SHIM_AGENT=/usr/local/share/containerd-shim-agent\nexport OPENVMM_SHIM_INITRD=/usr/local/share/initrd.img\nexec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"\n' \
     > /usr/local/bin/containerd-shim-openvmm-v2 && \
     chmod +x /usr/local/bin/containerd-shim-openvmm-v2
 

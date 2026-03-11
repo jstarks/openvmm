@@ -19,6 +19,7 @@
 #   --openvmm-only  Only benchmark openvmm (skip runc)
 #   --csv       Output results as CSV (machine-readable)
 #   --json      Output results as JSON
+#   --show-log  Dump the shim log after the run (timing analysis)
 #   -h/--help   Show this help
 
 set -euo pipefail
@@ -33,6 +34,7 @@ NETWORKING=true
 OUTPUT_FORMAT="text"  # text | csv | json
 BENCH_RUNC=true
 BENCH_OPENVMM=true
+SHOW_LOG=false
 
 # ---------------------------------------------------------------------------
 # Parse args
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --openvmm-only) BENCH_RUNC=false; shift ;;
         --csv)      OUTPUT_FORMAT="csv"; shift ;;
         --json)     OUTPUT_FORMAT="json"; shift ;;
+        --show-log) SHOW_LOG=true; shift ;;
         -h|--help)
             sed -n '2,/^$/s/^# \?//p' "$0"
             exit 0
@@ -130,6 +133,7 @@ if [[ "$NETWORKING" == "false" ]]; then
 #!/bin/bash
 export OPENVMM_SHIM_KERNEL=/usr/local/share/vmlinux
 export OPENVMM_SHIM_AGENT=/usr/local/share/containerd-shim-agent
+export OPENVMM_SHIM_INITRD=/usr/local/share/initrd.img
 export OPENVMM_SHIM_NETWORKING=false
 exec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"
 EOF
@@ -317,3 +321,26 @@ case "$OUTPUT_FORMAT" in
         echo "}"
         ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Optionally dump shim log for timing analysis.
+# We run one extra detached container so we can grab the log before cleanup.
+# ---------------------------------------------------------------------------
+if [[ "$SHOW_LOG" == "true" && "$BENCH_OPENVMM" == "true" ]]; then
+    echo "" >&2
+    echo "======================================== SHIM LOG ========================================" >&2
+    # Run a detached container so the bundle (and shim.log) persists.
+    /usr/local/bin/ctr run -d \
+        --snapshotter native \
+        --runtime io.containerd.openvmm.v2 \
+        docker.io/library/alpine:latest log-capture $CTR_CMD >/dev/null 2>&1 || true
+    sleep 3  # let the shim finish and write its log
+    find /run/containerd -name "shim.log" 2>/dev/null | while read -r logfile; do
+        cat "$logfile" >&2
+    done
+    # Clean up the detached container.
+    /usr/local/bin/ctr task kill log-capture >/dev/null 2>&1 || true
+    /usr/local/bin/ctr task rm log-capture >/dev/null 2>&1 || true
+    /usr/local/bin/ctr container rm log-capture >/dev/null 2>&1 || true
+    echo "========================================================================================" >&2
+fi

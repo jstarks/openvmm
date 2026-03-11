@@ -148,7 +148,7 @@ fi
 ok "Kernel: $KERNEL_PATH"
 
 # ---------------------------------------------------------------------------
-# Step 4: Assemble staging directory and build Docker image
+# Step 4: Assemble staging directory
 # ---------------------------------------------------------------------------
 info "Assembling Docker build context"
 STAGING="$(mktemp -d /tmp/shim-bench-staging.XXXXXX)"
@@ -159,6 +159,25 @@ cp "$AGENT_BIN"  "$STAGING/containerd-shim-agent"
 cp "$KERNEL_PATH" "$STAGING/vmlinux"
 cp "$SCRIPT_DIR/bench-run.sh"    "$STAGING/bench-run.sh"
 cp "$SCRIPT_DIR/bench.Dockerfile" "$STAGING/Dockerfile"
+
+# ---------------------------------------------------------------------------
+# Step 5: Pre-build initrd (saves ~180ms per container start)
+# ---------------------------------------------------------------------------
+info "Pre-building initrd from agent binary"
+INITRD_TMP="$(mktemp -d)"
+cp "$AGENT_BIN" "$INITRD_TMP/init"
+chmod 755 "$INITRD_TMP/init"
+if (cd "$INITRD_TMP" && echo init | cpio --quiet -o -H newc > "$STAGING/initrd.img" 2>/dev/null); then
+    ok "Initrd: $STAGING/initrd.img ($(stat -c%s "$STAGING/initrd.img" | numfmt --to=iec) bytes)"
+else
+    rm -f "$STAGING/initrd.img"
+    info "Initrd pre-build skipped (cpio not available), will build at runtime"
+fi
+rm -rf "$INITRD_TMP"
+
+# ---------------------------------------------------------------------------
+# Step 6: Build Docker image
+# ---------------------------------------------------------------------------
 
 info "Building Docker image: $IMAGE_TAG"
 docker build -q \
@@ -174,7 +193,7 @@ IMAGE_SIZE_MB=$((IMAGE_SIZE / 1024 / 1024))
 info "Image size: ~${IMAGE_SIZE_MB} MB"
 
 # ---------------------------------------------------------------------------
-# Step 5: Optional export
+# Step 7: Optional export
 # ---------------------------------------------------------------------------
 if [[ -n "$EXPORT_FILE" ]]; then
     info "Exporting image to: $EXPORT_FILE"
@@ -187,7 +206,7 @@ if [[ -n "$EXPORT_FILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Run instructions / immediate run
+# Step 8: Run instructions / immediate run
 # ---------------------------------------------------------------------------
 echo ""
 echo "========================================="

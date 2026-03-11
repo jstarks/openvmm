@@ -15,6 +15,7 @@
 #   -w NUM      Number of warmup iterations (default: 1)
 #   -c CMD      Container command (default: "echo hello")
 #   --no-net    Disable consomme networking (faster boot)
+#   --net-backend TYPE  Network backend: virtio (default) or vmbus
 #   --runc-only Only benchmark runc (skip openvmm)
 #   --openvmm-only  Only benchmark openvmm (skip runc)
 #   --csv       Output results as CSV (machine-readable)
@@ -37,6 +38,7 @@ BENCH_RUNC=true
 BENCH_OPENVMM=true
 SHOW_LOG=false
 SERIAL_LOG=""
+NET_BACKEND="virtio"
 
 # ---------------------------------------------------------------------------
 # Parse args
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         -w)         WARMUP="$2"; shift 2 ;;
         -c)         CTR_CMD="$2"; shift 2 ;;
         --no-net)   NETWORKING=false; shift ;;
+        --net-backend) NET_BACKEND="$2"; shift 2 ;;
         --runc-only)    BENCH_OPENVMM=false; shift ;;
         --openvmm-only) BENCH_RUNC=false; shift ;;
         --csv)      OUTPUT_FORMAT="csv"; shift ;;
@@ -141,6 +144,9 @@ fi
     fi
     if [[ -n "$SERIAL_LOG" ]]; then
         echo "export OPENVMM_SHIM_SERIAL_LOG=$SERIAL_LOG"
+    fi
+    if [[ "$NET_BACKEND" != "virtio" ]]; then
+        echo "export OPENVMM_SHIM_NET_BACKEND=$NET_BACKEND"
     fi
     echo 'exec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"'
 } > /usr/local/bin/containerd-shim-openvmm-v2

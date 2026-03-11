@@ -71,10 +71,22 @@ pub struct VmConfig {
     pub containers_dir: PathBuf,
     /// Whether to attach a network device (consomme userspace NAT).
     pub networking: bool,
+    /// Network backend type: "virtio" (virtio-net over MMIO) or "vmbus"
+    /// (netvsp over VMBus). Virtio-net has faster probe time.
+    pub net_backend: NetBackend,
     /// Optional path to write kernel serial console output. When set, the VM's
     /// serial port is enabled with `console=ttyS0` and all output is written to
     /// this file. When `None`, serial is disabled for performance.
     pub serial_log_path: Option<PathBuf>,
+}
+
+/// Network backend type for the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetBackend {
+    /// virtio-net over MMIO (faster probe).
+    Virtio,
+    /// netvsp over VMBus (traditional Hyper-V synthetic NIC).
+    Vmbus,
 }
 
 /// A running VM with its control channels.
@@ -118,6 +130,7 @@ impl Drop for RunningVm {
 /// | `io.openvmm.cpus`           | `OPENVMM_SHIM_CPUS`         | 1       |
 /// | `io.openvmm.memory_mb`      | `OPENVMM_SHIM_MEMORY_MB`    | 256     |
 /// | `io.openvmm.networking`     | `OPENVMM_SHIM_NETWORKING`   | true    |
+/// | `io.openvmm.net_backend`    | `OPENVMM_SHIM_NET_BACKEND`  | virtio  |
 /// | `io.openvmm.serial_log`     | `OPENVMM_SHIM_SERIAL_LOG`   | (none)  |
 ///
 /// `bundle` is the containerd bundle directory — a `containers/` subdirectory
@@ -158,6 +171,10 @@ pub fn resolve_config(
         networking: get("io.openvmm.networking", "OPENVMM_SHIM_NETWORKING")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true),
+        net_backend: match get("io.openvmm.net_backend", "OPENVMM_SHIM_NET_BACKEND").as_deref() {
+            Some("vmbus") => NetBackend::Vmbus,
+            _ => NetBackend::Virtio,
+        },
         serial_log_path: get("io.openvmm.serial_log", "OPENVMM_SHIM_SERIAL_LOG").map(PathBuf::from),
     })
 }
@@ -342,6 +359,19 @@ pub async fn launch_vm(
         ));
     }
 
+    // Networking: virtio-net over MMIO or netvsp over VMBus.
+    if config.networking && config.net_backend == NetBackend::Virtio {
+        virtio_devices.push((
+            VirtioBus::Mmio,
+            virtio_resources::net::VirtioNetHandle {
+                max_queues: None,
+                mac_address: MacAddress::new([0x00, 0x15, 0x5D, 0xDE, 0xAD, 0x01]),
+                endpoint: ConsommeHandle { cidr: None }.into_resource(),
+            }
+            .into_resource(),
+        ));
+    }
+
     let vm_config = Config {
         load_mode: LoadMode::Linux {
             kernel: kernel_file,
@@ -381,7 +411,7 @@ pub async fn launch_vm(
             vtl2_redirect: false,
         }),
         vtl2_vmbus: None,
-        vmbus_devices: if config.networking {
+        vmbus_devices: if config.networking && config.net_backend == NetBackend::Vmbus {
             vec![(
                 DeviceVtl::Vtl0,
                 NetvspHandle {

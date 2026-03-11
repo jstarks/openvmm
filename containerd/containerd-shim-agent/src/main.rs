@@ -71,10 +71,21 @@ struct RunningProcess {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    eprintln!("containerd-shim-agent: starting as PID 1");
+    // Capture uptime as early as possible for boot profiling.
+    let t_main = read_uptime_ms();
+    eprintln!("containerd-shim-agent: starting as PID 1 (uptime={t_main}ms)");
     if let Err(e) = init_filesystems() {
         eprintln!("containerd-shim-agent: failed to init filesystems: {e:#}");
     }
+    let t_fs = read_uptime_ms();
+    eprintln!(
+        "containerd-shim-agent: filesystems mounted (uptime={t_fs}ms, delta={}ms)",
+        t_fs - t_main
+    );
+
+    // Dump dmesg to virtiofs share for host-side analysis.
+    dump_dmesg("/run/containers/.dmesg");
+
     // Networking is initialized after connecting to the host, which tells us
     // whether a NIC is attached (avoids a 5s polling timeout when it isn't).
     let result = pal_async::DefaultPool::run_with(|driver| async move { run_agent(driver).await });
@@ -90,15 +101,30 @@ fn main() {
 }
 
 fn init_filesystems() -> anyhow::Result<()> {
-    c_mkdir("/proc", 0o755).ok();
-    c_mount("proc", "/proc", "proc", 0, "").context("mount /proc")?;
-    c_mkdir("/sys", 0o755).ok();
-    c_mount("sysfs", "/sys", "sysfs", 0, "").context("mount /sys")?;
-    c_mkdir("/dev", 0o755).ok();
-    c_mount("devtmpfs", "/dev", "devtmpfs", 0, "").context("mount /dev")?;
-    c_mkdir("/tmp", 0o755).ok();
-    c_mount("tmpfs", "/tmp", "tmpfs", 0, "").context("mount /tmp")?;
-    c_mkdir("/run", 0o755).ok();
+    // When booting from a real rootfs (ext4 via virtio-blk), the kernel may
+    // have already mounted some of these.  Ignore EBUSY for pseudo-filesystems
+    // that could legitimately be pre-mounted.
+    let mount_if_needed = |src, target, fstype| {
+        c_mkdir(target, 0o755).ok();
+        match c_mount(src, target, fstype, 0, "") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                // Already mounted by the kernel — that's fine.
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("mount {target}: {e}"));
+            }
+        }
+        Ok(())
+    };
+
+    mount_if_needed("proc", "/proc", "proc").context("mount /proc")?;
+    mount_if_needed("sysfs", "/sys", "sysfs").context("mount /sys")?;
+    mount_if_needed("devtmpfs", "/dev", "devtmpfs").context("mount /dev")?;
+    mount_if_needed("tmpfs", "/tmp", "tmpfs").context("mount /tmp")?;
+
+    // /run must be writable even when root is read-only (virtio-blk ext4).
+    mount_if_needed("tmpfs", "/run", "tmpfs").context("mount /run")?;
     c_mkdir("/run/containers", 0o755).ok();
     c_mount("containers", "/run/containers", "virtiofs", 0, "")
         .context("mount virtiofs at /run/containers")?;
@@ -1067,5 +1093,30 @@ fn c_mkdir(path: &str, mode: u32) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// Read the system uptime in milliseconds from /proc/uptime.
+fn read_uptime_ms() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .map(|secs| (secs * 1000.0) as u64)
+        .unwrap_or(0)
+}
+
+/// Dump kernel dmesg to a file (for host-side profiling via virtiofs).
+fn dump_dmesg(path: &str) {
+    // Use the syslog(2) syscall (SYSLOG_ACTION_READ_ALL = 3) to read the
+    // kernel ring buffer. This works without any external tools.
+    let mut buf = vec![0u8; 256 * 1024];
+    // SAFETY: syslog syscall with action=3 (read all), valid buffer and length.
+    let n = unsafe { libc::klogctl(3, buf.as_mut_ptr() as *mut libc::c_char, buf.len() as i32) };
+    if n > 0 {
+        let _ = std::fs::write(path, &buf[..n as usize]);
     }
 }

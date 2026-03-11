@@ -19,6 +19,7 @@
 #   --openvmm-only  Only benchmark openvmm (skip runc)
 #   --csv       Output results as CSV (machine-readable)
 #   --json      Output results as JSON
+#   --serial-log  Enable kernel serial console log (written to /tmp/serial.log)
 #   --show-log  Dump the shim log after the run (timing analysis)
 #   -h/--help   Show this help
 
@@ -35,6 +36,7 @@ OUTPUT_FORMAT="text"  # text | csv | json
 BENCH_RUNC=true
 BENCH_OPENVMM=true
 SHOW_LOG=false
+SERIAL_LOG=""
 
 # ---------------------------------------------------------------------------
 # Parse args
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --openvmm-only) BENCH_RUNC=false; shift ;;
         --csv)      OUTPUT_FORMAT="csv"; shift ;;
         --json)     OUTPUT_FORMAT="json"; shift ;;
+        --serial-log) SERIAL_LOG="/tmp/serial.log"; shift ;;
         --show-log) SHOW_LOG=true; shift ;;
         -h|--help)
             sed -n '2,/^$/s/^# \?//p' "$0"
@@ -126,19 +129,22 @@ if [[ "$BENCH_OPENVMM" == "true" ]]; then
     fi
 fi
 
-# Configure networking env var for the shim wrapper.
-if [[ "$NETWORKING" == "false" ]]; then
-    # Patch the wrapper to disable networking.
-    cat > /usr/local/bin/containerd-shim-openvmm-v2 << 'EOF'
-#!/bin/bash
-export OPENVMM_SHIM_KERNEL=/usr/local/share/vmlinux
-export OPENVMM_SHIM_AGENT=/usr/local/share/containerd-shim-agent
-export OPENVMM_SHIM_INITRD=/usr/local/share/initrd.img
-export OPENVMM_SHIM_NETWORKING=false
-exec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"
-EOF
-    chmod +x /usr/local/bin/containerd-shim-openvmm-v2
-fi
+# Patch the shim wrapper with the desired configuration.
+# Always rewrite to ensure networking and serial_log settings are applied.
+{
+    echo '#!/bin/bash'
+    echo 'export OPENVMM_SHIM_KERNEL=/usr/local/share/vmlinux'
+    echo 'export OPENVMM_SHIM_AGENT=/usr/local/share/containerd-shim-agent'
+    echo 'export OPENVMM_SHIM_ROOTDISK=/usr/local/share/rootfs.img'
+    if [[ "$NETWORKING" == "false" ]]; then
+        echo 'export OPENVMM_SHIM_NETWORKING=false'
+    fi
+    if [[ -n "$SERIAL_LOG" ]]; then
+        echo "export OPENVMM_SHIM_SERIAL_LOG=$SERIAL_LOG"
+    fi
+    echo 'exec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"'
+} > /usr/local/bin/containerd-shim-openvmm-v2
+chmod +x /usr/local/bin/containerd-shim-openvmm-v2
 
 # ---------------------------------------------------------------------------
 # Start containerd
@@ -191,11 +197,58 @@ run_one() {
     else
         runtime_flag="io.containerd.runc.v2"
     fi
-    local ms
-    ms=$(time_ms /usr/local/bin/ctr run --rm \
+
+    # Capture both output and timing.  Run without --rm so we can inspect
+    # the shim log on failure; clean up manually afterward.
+    local outfile
+    outfile=$(mktemp)
+    local start end ms exit_code
+    start=$(date +%s%N)
+    set +e  # don't abort on ctr failure
+    /usr/local/bin/ctr run \
         --snapshotter native \
         --runtime "$runtime_flag" \
-        docker.io/library/alpine:latest "$cid" "$@")
+        docker.io/library/alpine:latest "$cid" "$@" > "$outfile" 2>&1
+    exit_code=$?
+    set -e
+    end=$(date +%s%N)
+    ms=$(( (end - start) / 1000000 ))
+
+    # Validate: the container must exit 0 and produce expected output.
+    local output
+    output=$(cat "$outfile")
+    rm -f "$outfile"
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "FAIL: container '$cid' exited with code $exit_code" >&2
+        echo "Output: $output" >&2
+        echo "" >&2
+        if [[ -n "$SERIAL_LOG" && -f "$SERIAL_LOG" ]]; then
+            echo "=== kernel serial log ($SERIAL_LOG) ===" >&2
+            cat "$SERIAL_LOG" >&2
+            echo "=== end kernel serial log ===" >&2
+        fi
+        # Clean up the failed container
+        /usr/local/bin/ctr task kill "$cid" 2>/dev/null || true
+        /usr/local/bin/ctr task rm "$cid" 2>/dev/null || true
+        /usr/local/bin/ctr container rm "$cid" 2>/dev/null || true
+        exit 1
+    fi
+
+    # For "echo hello" (the default), verify we got "hello".
+    if [[ "$CTR_CMD" == "echo hello" ]] && ! echo "$output" | grep -q "hello"; then
+        echo "FAIL: container '$cid' did not print 'hello'" >&2
+        echo "Output: $output" >&2
+        /usr/local/bin/ctr task kill "$cid" 2>/dev/null || true
+        /usr/local/bin/ctr task rm "$cid" 2>/dev/null || true
+        /usr/local/bin/ctr container rm "$cid" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Success — clean up the container
+    /usr/local/bin/ctr task rm "$cid" 2>/dev/null || true
+    /usr/local/bin/ctr container rm "$cid" 2>/dev/null || true
+
     echo "$ms"
 }
 
@@ -213,7 +266,7 @@ bench_runtime() {
     if [[ "$WARMUP" -gt 0 ]]; then
         info "Warmup: $WARMUP iteration(s)"
         for i in $(seq 1 "$WARMUP"); do
-            ms=$(run_one "$runtime" "${runtime}-warmup-$i" $CTR_CMD 2>&1 | tail -1)
+            ms=$(run_one "$runtime" "${runtime}-warmup-$i" $CTR_CMD)
             info "  warmup $i: ${ms} ms"
         done
     fi
@@ -222,7 +275,7 @@ bench_runtime() {
     info "Benchmark: $ITERATIONS iteration(s) — cmd: $CTR_CMD"
     local results=()
     for i in $(seq 1 "$ITERATIONS"); do
-        ms=$(run_one "$runtime" "${runtime}-bench-$i" $CTR_CMD 2>&1 | tail -1)
+        ms=$(run_one "$runtime" "${runtime}-bench-$i" $CTR_CMD)
         results+=("$ms")
         info "  run $i: ${ms} ms"
     done
@@ -327,20 +380,13 @@ esac
 # We run one extra detached container so we can grab the log before cleanup.
 # ---------------------------------------------------------------------------
 if [[ "$SHOW_LOG" == "true" && "$BENCH_OPENVMM" == "true" ]]; then
-    echo "" >&2
-    echo "======================================== SHIM LOG ========================================" >&2
-    # Run a detached container so the bundle (and shim.log) persists.
-    /usr/local/bin/ctr run -d \
-        --snapshotter native \
-        --runtime io.containerd.openvmm.v2 \
-        docker.io/library/alpine:latest log-capture $CTR_CMD >/dev/null 2>&1 || true
-    sleep 3  # let the shim finish and write its log
-    find /run/containerd -name "shim.log" 2>/dev/null | while read -r logfile; do
-        cat "$logfile" >&2
-    done
-    # Clean up the detached container.
-    /usr/local/bin/ctr task kill log-capture >/dev/null 2>&1 || true
-    /usr/local/bin/ctr task rm log-capture >/dev/null 2>&1 || true
-    /usr/local/bin/ctr container rm log-capture >/dev/null 2>&1 || true
-    echo "========================================================================================" >&2
+    if [[ -n "$SERIAL_LOG" && -f "$SERIAL_LOG" ]]; then
+        echo "" >&2
+        echo "===================================== KERNEL SERIAL LOG ==================================" >&2
+        cat "$SERIAL_LOG" >&2
+        echo "========================================================================================" >&2
+    else
+        echo "" >&2
+        echo "(no serial log — use --serial-log to enable kernel console output)" >&2
+    fi
 fi

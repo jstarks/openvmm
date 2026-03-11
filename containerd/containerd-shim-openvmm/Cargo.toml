@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 containerd_shim_agent_protocol.workspace = true
 containerd_shim_protos.workspace = true
+disk_backend_resources.workspace = true
 guid.workspace = true
 mesh.workspace = true
 mesh_remote.workspace = true
@@ -32,6 +33,7 @@ prost-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 serial_core.workspace = true
+serial_socket.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -11,6 +11,7 @@ use containerd_shim_agent_protocol::AGENT_VSOCK_PORT;
 use containerd_shim_agent_protocol::AgentBootstrap;
 use containerd_shim_agent_protocol::AgentConfig;
 use containerd_shim_agent_protocol::AgentRequest;
+use disk_backend_resources::FileDiskHandle;
 use futures::FutureExt;
 use futures::StreamExt;
 use guid::Guid;
@@ -35,9 +36,11 @@ use openvmm_defs::worker::VmWorkerParameters;
 use pal_async::socket::PolledSocket;
 use pal_async::task::Spawn;
 use pal_async::timer::PolledTimer;
+use serial_socket::net::OpenSocketSerialConfig;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
+use virtio_resources::blk::VirtioBlkHandle;
 use virtio_resources::fs::VirtioFsBackend;
 use virtio_resources::fs::VirtioFsHandle;
 use vm_manifest_builder::BaseChipsetType;
@@ -56,6 +59,10 @@ pub struct VmConfig {
     /// Optional path to a pre-built initrd. When set, the agent binary is
     /// not read and the cpio initrd is not built at runtime (saves ~180ms).
     pub initrd_path: Option<PathBuf>,
+    /// Optional path to a root filesystem disk image (ext4). When set, the VM
+    /// boots from virtio-blk instead of initrd, enabling demand paging so only
+    /// pages actually used are loaded (saves ~1.2s for a 35MB agent binary).
+    pub rootdisk_path: Option<PathBuf>,
     /// Number of vCPUs.
     pub cpus: u32,
     /// RAM in megabytes.
@@ -64,6 +71,10 @@ pub struct VmConfig {
     pub containers_dir: PathBuf,
     /// Whether to attach a network device (consomme userspace NAT).
     pub networking: bool,
+    /// Optional path to write kernel serial console output. When set, the VM's
+    /// serial port is enabled with `console=ttyS0` and all output is written to
+    /// this file. When `None`, serial is disabled for performance.
+    pub serial_log_path: Option<PathBuf>,
 }
 
 /// A running VM with its control channels.
@@ -103,9 +114,11 @@ impl Drop for RunningVm {
 /// | `io.openvmm.kernel`         | `OPENVMM_SHIM_KERNEL`       | (required) |
 /// | `io.openvmm.agent`          | `OPENVMM_SHIM_AGENT`        | (required) |
 /// | `io.openvmm.initrd`         | `OPENVMM_SHIM_INITRD`       | (none)  |
+/// | `io.openvmm.rootdisk`       | `OPENVMM_SHIM_ROOTDISK`     | (none)  |
 /// | `io.openvmm.cpus`           | `OPENVMM_SHIM_CPUS`         | 1       |
 /// | `io.openvmm.memory_mb`      | `OPENVMM_SHIM_MEMORY_MB`    | 256     |
 /// | `io.openvmm.networking`     | `OPENVMM_SHIM_NETWORKING`   | true    |
+/// | `io.openvmm.serial_log`     | `OPENVMM_SHIM_SERIAL_LOG`   | (none)  |
 ///
 /// `bundle` is the containerd bundle directory — a `containers/` subdirectory
 /// is created under it and shared into the VM via virtiofs.
@@ -128,11 +141,13 @@ pub fn resolve_config(
     let containers_dir = bundle.join("containers");
     std::fs::create_dir_all(&containers_dir).context("failed to create containers dir")?;
     let initrd_path = get("io.openvmm.initrd", "OPENVMM_SHIM_INITRD").map(PathBuf::from);
+    let rootdisk_path = get("io.openvmm.rootdisk", "OPENVMM_SHIM_ROOTDISK").map(PathBuf::from);
 
     Ok(VmConfig {
         kernel_path: PathBuf::from(kernel_path),
         agent_path: PathBuf::from(agent_path),
         initrd_path,
+        rootdisk_path,
         cpus: get("io.openvmm.cpus", "OPENVMM_SHIM_CPUS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
@@ -143,6 +158,7 @@ pub fn resolve_config(
         networking: get("io.openvmm.networking", "OPENVMM_SHIM_NETWORKING")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true),
+        serial_log_path: get("io.openvmm.serial_log", "OPENVMM_SHIM_SERIAL_LOG").map(PathBuf::from),
     })
 }
 
@@ -153,14 +169,30 @@ pub async fn launch_vm(
 ) -> anyhow::Result<RunningVm> {
     let t0 = std::time::Instant::now();
 
-    // 1. Open or build the initrd.
-    //    If a pre-built initrd is provided, use it directly (saves ~180ms).
-    //    Otherwise, read the agent binary and build a cpio initrd at runtime.
+    // 1. Determine boot mode: rootdisk (virtio-blk) or initrd.
+    //    With rootdisk, the kernel mounts ext4 from virtio-blk and demand-pages
+    //    only the binary pages actually needed — saving ~1.2s for a 35MB agent.
     let _initrd_tmpfile; // must outlive initrd_file
-    let initrd_file = if let Some(initrd_path) = &config.initrd_path {
+    let initrd_file;
+    let rootdisk_file;
+
+    if let Some(rootdisk_path) = &config.rootdisk_path {
+        // Rootdisk mode: no initrd needed, kernel boots from virtio-blk.
+        tracing::info!(path = %rootdisk_path.display(), "using rootdisk (virtio-blk)");
+        rootdisk_file =
+            Some(std::fs::File::open(rootdisk_path).with_context(|| {
+                format!("failed to open rootdisk: {}", rootdisk_path.display())
+            })?);
+        initrd_file = None;
+        _initrd_tmpfile = None;
+    } else if let Some(initrd_path) = &config.initrd_path {
         tracing::info!(path = %initrd_path.display(), "using pre-built initrd");
-        std::fs::File::open(initrd_path)
-            .with_context(|| format!("failed to open initrd: {}", initrd_path.display()))?
+        initrd_file = Some(
+            std::fs::File::open(initrd_path)
+                .with_context(|| format!("failed to open initrd: {}", initrd_path.display()))?,
+        );
+        rootdisk_file = None;
+        _initrd_tmpfile = None;
     } else {
         let mut agent_binary = Vec::new();
         std::fs::File::open(&config.agent_path)
@@ -185,11 +217,12 @@ pub async fn launch_vm(
             .context("failed to flush initrd temp file")?;
         let file =
             std::fs::File::open(tmpfile.path()).context("failed to reopen initrd temp file")?;
-        _initrd_tmpfile = tmpfile; // keep alive
-        file
+        _initrd_tmpfile = Some(tmpfile); // keep alive
+        initrd_file = Some(file);
+        rootdisk_file = None;
     };
 
-    tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "initrd ready");
+    tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "boot media ready");
 
     // 3. Open kernel file.
     let kernel_file = std::fs::File::open(&config.kernel_path)
@@ -208,12 +241,55 @@ pub async fn launch_vm(
     let mut agent_listener = PolledSocket::new(driver, agent_listener)
         .context("failed to create polled agent listener")?;
 
-    // 6. Build chipset.
-    let chipset =
-        VmManifestBuilder::new(BaseChipsetType::HyperVGen2LinuxDirect, MachineArch::X86_64)
-            .with_serial([None, None, None, None]) // no serial backends
-            .build()
-            .context("failed to build chipset")?;
+    // 6. Build chipset, optionally with serial console for kernel output.
+    let enable_serial = config.serial_log_path.is_some();
+    let mut chipset_builder =
+        VmManifestBuilder::new(BaseChipsetType::HyperVGen2LinuxDirect, MachineArch::X86_64);
+
+    if let Some(serial_log_path) = &config.serial_log_path {
+        let (serial_host, serial_guest) =
+            unix_socket::UnixStream::pair().context("failed to create serial socket pair")?;
+        let serial_resource = OpenSocketSerialConfig::from(serial_guest).into_resource();
+        chipset_builder = chipset_builder.with_serial([Some(serial_resource), None, None, None]);
+
+        // Open the log file (created/truncated) and spawn a reader task that
+        // writes every byte from the emulated UART into it.
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(serial_log_path)
+            .with_context(|| {
+                format!(
+                    "failed to open serial log file: {}",
+                    serial_log_path.display()
+                )
+            })?;
+        tracing::info!(path = %serial_log_path.display(), "serial console logging enabled");
+
+        let serial_host = PolledSocket::new(driver, serial_host)
+            .context("failed to create polled serial socket")?;
+        driver
+            .spawn("serial-console", async move {
+                use futures::AsyncReadExt;
+                use std::io::Write as _;
+                let mut log_file = log_file;
+                let mut reader = futures::io::BufReader::new(serial_host);
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = log_file.write_all(&buf[..n]);
+                            let _ = log_file.flush();
+                        }
+                    }
+                }
+            })
+            .detach();
+    }
+
+    let chipset = chipset_builder.build().context("failed to build chipset")?;
 
     // 7. Construct Config.
     let (vm_rpc_send, vm_rpc_recv) = mesh::channel::<VmRpc>();
@@ -228,16 +304,51 @@ pub async fn launch_vm(
     // - random.trust_cpu=on: trust RDRAND for entropy
     // - no_timer_check: skip timer IRQ routing check
     // - noreplace-smp: skip SMP alternatives patching
-    let cmdline = "panic=-1 quiet loglevel=0 8250.nr_uarts=0 mitigations=off \
-                   tsc=reliable random.trust_cpu=on no_timer_check noreplace-smp";
+    let mut cmdline = String::from(if enable_serial {
+        "panic=-1 console=ttyS0 mitigations=off \
+         tsc=reliable random.trust_cpu=on no_timer_check noreplace-smp"
+    } else {
+        "panic=-1 quiet loglevel=0 8250.nr_uarts=0 mitigations=off \
+         tsc=reliable random.trust_cpu=on no_timer_check noreplace-smp"
+    });
+
+    // When using rootdisk, tell the kernel to mount the virtio-blk device as root.
+    if rootdisk_file.is_some() {
+        cmdline.push_str(" root=/dev/vda ro rootfstype=ext4 rootwait init=/init");
+    }
+
+    // Build virtio device list: always include virtiofs for container rootfs,
+    // and optionally include virtio-blk for agent rootdisk.
+    let mut virtio_devices = vec![(
+        VirtioBus::Mmio,
+        VirtioFsHandle {
+            tag: "containers".into(),
+            fs: VirtioFsBackend::HostFs {
+                root_path: config.containers_dir.to_string_lossy().into_owned(),
+                mount_options: String::new(),
+            },
+        }
+        .into_resource(),
+    )];
+
+    if let Some(disk_file) = rootdisk_file {
+        virtio_devices.push((
+            VirtioBus::Mmio,
+            VirtioBlkHandle {
+                disk: FileDiskHandle(disk_file).into_resource(),
+                read_only: true,
+            }
+            .into_resource(),
+        ));
+    }
 
     let vm_config = Config {
         load_mode: LoadMode::Linux {
             kernel: kernel_file,
-            initrd: Some(initrd_file),
+            initrd: initrd_file,
             cmdline: cmdline.into(),
             custom_dsdt: None,
-            enable_serial: false,
+            enable_serial,
         },
         floppy_disks: vec![],
         ide_disks: vec![],
@@ -289,17 +400,7 @@ pub async fn launch_vm(
         framebuffer: None,
         vga_firmware: None,
         vtl2_gfx: false,
-        virtio_devices: vec![(
-            VirtioBus::Mmio,
-            VirtioFsHandle {
-                tag: "containers".into(),
-                fs: VirtioFsBackend::HostFs {
-                    root_path: config.containers_dir.to_string_lossy().into_owned(),
-                    mount_options: String::new(),
-                },
-            }
-            .into_resource(),
-        )],
+        virtio_devices,
         vmgs: None,
         secure_boot_enabled: false,
         custom_uefi_vars: Default::default(),

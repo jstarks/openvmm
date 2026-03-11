@@ -161,19 +161,25 @@ cp "$SCRIPT_DIR/bench-run.sh"    "$STAGING/bench-run.sh"
 cp "$SCRIPT_DIR/bench.Dockerfile" "$STAGING/Dockerfile"
 
 # ---------------------------------------------------------------------------
-# Step 5: Pre-build initrd (saves ~180ms per container start)
+# Step 5: Build ext4 rootfs image for virtio-blk boot (demand-paged, no initrd unpack)
 # ---------------------------------------------------------------------------
-info "Pre-building initrd from agent binary"
-INITRD_TMP="$(mktemp -d)"
-cp "$AGENT_BIN" "$INITRD_TMP/init"
-chmod 755 "$INITRD_TMP/init"
-if (cd "$INITRD_TMP" && echo init | cpio --quiet -o -H newc > "$STAGING/initrd.img" 2>/dev/null); then
-    ok "Initrd: $STAGING/initrd.img ($(stat -c%s "$STAGING/initrd.img" | numfmt --to=iec) bytes)"
-else
-    rm -f "$STAGING/initrd.img"
-    info "Initrd pre-build skipped (cpio not available), will build at runtime"
-fi
-rm -rf "$INITRD_TMP"
+info "Building ext4 rootfs image from agent binary"
+ROOTFS_TMP="$(mktemp -d)"
+mkdir -p "$ROOTFS_TMP/rootfs"
+cp "$AGENT_BIN" "$ROOTFS_TMP/rootfs/init"
+chmod 755 "$ROOTFS_TMP/rootfs/init"
+# Create mount points the kernel expects before running init.
+mkdir -p "$ROOTFS_TMP/rootfs/dev" "$ROOTFS_TMP/rootfs/proc" "$ROOTFS_TMP/rootfs/sys" "$ROOTFS_TMP/rootfs/tmp" "$ROOTFS_TMP/rootfs/run"
+
+# Create a sparse ext4 image populated from the directory.
+# 128MB is plenty for the ~35MB agent; sparse file means only used blocks
+# consume actual disk space.
+AGENT_SIZE=$(stat -c%s "$AGENT_BIN")
+IMAGE_SIZE_MB=128
+truncate -s "${IMAGE_SIZE_MB}M" "$STAGING/rootfs.img"
+mkfs.ext4 -q -F -d "$ROOTFS_TMP/rootfs" "$STAGING/rootfs.img"
+ok "Rootfs: $STAGING/rootfs.img (${IMAGE_SIZE_MB}MB ext4, agent=$(numfmt --to=iec $AGENT_SIZE))"
+rm -rf "$ROOTFS_TMP"
 
 # ---------------------------------------------------------------------------
 # Step 6: Build Docker image

@@ -83,7 +83,9 @@ cargo nextest run -p <package-name>
   Add `use test_with_tracing::test;` in test modules so that `tracing`
   is initialized and traces appear in test output.
 - **VMM tests** — integration tests in `vmm_tests/` using the petri
-  framework (requires additional setup).
+  framework. Build and run with `cargo xflowey vmm-tests --dir <dir>
+  --filter 'test(name)'`. See `Guide/src/dev_guide/tests/vmm.md` and
+  `.github/instructions/vmm-tests.instructions.md` for details.
 - **Fuzz tests** — nondeterministic tests ensuring no panics across trust
   boundaries.
 - Mark tests requiring special setup with `#[ignore]`.

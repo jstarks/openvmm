@@ -227,18 +227,18 @@ echo "  -n 20          Run 20 iterations (default: 10)"
 echo "  -w 2           Warmup iterations (default: 1)"
 echo "  --no-net       Disable networking (faster VM boot)"
 echo "  --json         JSON output"
-echo "  --csv          CSV output"
+echo "  docker run --rm --privileged --cgroupns=host --device /dev/kvm $IMAGE_TAG"
 echo ""
 echo "Move to another machine:"
 echo "  docker save $IMAGE_TAG | gzip > shim-bench.tar.gz"
 echo "  # on the other machine:"
 echo "  docker load < shim-bench.tar.gz"
-echo "  docker run --rm --privileged --device /dev/kvm $IMAGE_TAG"
+echo "  docker run --rm --privileged --cgroupns=host --device /dev/kvm $IMAGE_TAG"
 echo ""
 
 if [[ "$RUN_AFTER_BUILD" -eq 1 ]]; then
     info "Running benchmark..."
-    DOCKER_ARGS=(--rm --privileged)
+    DOCKER_ARGS=(--rm --privileged --cgroupns=host)
     if [[ -e /dev/kvm ]]; then
         DOCKER_ARGS+=(--device /dev/kvm)
     fi

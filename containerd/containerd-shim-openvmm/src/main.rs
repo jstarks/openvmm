@@ -387,11 +387,17 @@ struct ContainerState {
     bundle: String,
     status: i32,
     pid: u32,
-    /// Receives exit status from agent. Set by Task.Start, consumed by Task.Wait.
+    /// Sender half of the exit channel. Created at Task.Create time, consumed by
+    /// Task.Start which spawns a background task to forward the agent's exit
+    /// status into this channel.
+    exit_send: Option<mesh::OneshotSender<containerd_shim_agent_protocol::ExitStatus>>,
+    /// Receiver half of the exit channel. Created at Task.Create time, consumed
+    /// by Task.Wait. Because the channel is pre-created, Wait can safely arrive
+    /// before Start (containerd may send them concurrently).
     exit_recv: Option<mesh::OneshotReceiver<containerd_shim_agent_protocol::ExitStatus>>,
-    /// Cached after Wait completes, returned by Delete.
-    exit_code: Option<i32>,
-    exited_at: Option<prost_types::Timestamp>,
+    /// Shared exit result cache. Written by the background wait task so that
+    /// Delete can read it even though Wait ran in a spawned task.
+    exit_result: std::sync::Arc<std::sync::Mutex<Option<(i32, prost_types::Timestamp)>>>,
     /// Host-side overlay mount path for cleanup on Delete.
     rootfs_mount_path: Option<PathBuf>,
     /// FIFO paths for reporting in State response.
@@ -598,16 +604,27 @@ impl ShimState {
                                 }
                             }
                         } else {
+                            let cached = container.exit_result.lock().unwrap().clone();
+                            let (exit_code, exited_at) = cached
+                                .clone()
+                                .unwrap_or((0, prost_types::Timestamp::default()));
+                            // Derive status from exit_result: if the background
+                            // wait task has cached an exit, the container is stopped.
+                            let status = if cached.is_some() {
+                                protos::containerd::v1::types::Status::Stopped as i32
+                            } else {
+                                container.status
+                            };
                             resp.send(Ok(protos::containerd::task::v3::StateResponse {
                                 id: req.id,
                                 bundle: container.bundle.clone(),
                                 pid: container.pid,
-                                status: container.status,
+                                status,
                                 stdin: container.stdin_path.clone(),
                                 stdout: container.stdout_path.clone(),
                                 stderr: container.stderr_path.clone(),
-                                exit_status: container.exit_code.unwrap_or(0) as u32,
-                                exited_at: container.exited_at.clone(),
+                                exit_status: exit_code as u32,
+                                exited_at: Some(exited_at),
                                 ..Default::default()
                             }));
                         }
@@ -630,10 +647,12 @@ impl ShimState {
                     let driver = self.driver.clone();
                     match self.prepare_wait_exec(&req.id, &req.exec_id) {
                         Ok(wait) => {
-                            driver.spawn("exec-wait", async move {
-                                let result = wait.await;
-                                resp.send(Ok(result));
-                            }).detach();
+                            driver
+                                .spawn("exec-wait", async move {
+                                    let result = wait.await;
+                                    resp.send(Ok(result));
+                                })
+                                .detach();
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "task.Wait (exec) failed");
@@ -645,10 +664,18 @@ impl ShimState {
                         }
                     }
                 } else {
-                    // Init wait: blocking is OK — containerd always sends
-                    // Wait after Start for init processes.
-                    match self.do_wait_task(&req.id).await {
-                        Ok(r) => resp.send(Ok(r)),
+                    // Init wait: also spawn as a background task because
+                    // containerd may send Wait before Start completes.
+                    let driver = self.driver.clone();
+                    match self.prepare_wait_init(&req.id) {
+                        Ok(wait) => {
+                            driver
+                                .spawn("init-wait", async move {
+                                    let result = wait.await;
+                                    resp.send(Ok(result));
+                                })
+                                .detach();
+                        }
                         Err(e) => {
                             tracing::error!(error = %e, "task.Wait failed");
                             resp.send(Err(Status {
@@ -885,15 +912,20 @@ impl ShimState {
             .map_err(|e| anyhow::anyhow!("CreateContainer RPC failed: {e}"))?
             .map_err(|e| anyhow::anyhow!("CreateContainer failed: {e}"))?;
 
+        // Create the exit channel pair up front. Wait may arrive before Start
+        // completes (containerd can send them concurrently), so the receiver
+        // must be available immediately.
+        let (exit_send, exit_recv) = mesh::oneshot();
+
         self.containers.insert(
             req.id.clone(),
             ContainerState {
                 bundle: req.bundle,
                 status: protos::containerd::v1::types::Status::Created as i32,
                 pid: 0,
-                exit_recv: None,
-                exit_code: None,
-                exited_at: None,
+                exit_send: Some(exit_send),
+                exit_recv: Some(exit_recv),
+                exit_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 rootfs_mount_path: Some(rootfs_mount),
                 stdin_path: req.stdin,
                 stdout_path: req.stdout,
@@ -930,50 +962,90 @@ impl ShimState {
 
         container.pid = start_resp.pid;
         container.status = protos::containerd::v1::types::Status::Running as i32;
-        container.exit_recv = Some(start_resp.exit_status);
+
+        // Bridge the agent's exit status into our pre-created exit channel.
+        // This runs as a background task so the main loop isn't blocked.
+        if let Some(exit_send) = container.exit_send.take() {
+            let agent_exit = start_resp.exit_status;
+            self.driver
+                .spawn("init-exit-watch", async move {
+                    match agent_exit.await {
+                        Ok(status) => {
+                            exit_send.send(status);
+                        }
+                        Err(_) => {
+                            // Agent channel broken — send a synthetic exit status.
+                            exit_send.send(containerd_shim_agent_protocol::ExitStatus {
+                                code: -1,
+                                exited_at: 0,
+                            });
+                        }
+                    }
+                })
+                .detach();
+        }
 
         Ok(protos::containerd::task::v3::StartResponse {
             pid: start_resp.pid,
         })
     }
 
-    async fn do_wait_task(
+    /// Prepare a non-blocking Wait for an init container.
+    ///
+    /// Returns a future that resolves to the WaitResponse. Like exec Wait,
+    /// this is spawned as a background task so the main loop stays responsive
+    /// even if Wait arrives before Start.
+    fn prepare_wait_init(
         &mut self,
         id: &str,
-    ) -> anyhow::Result<protos::containerd::task::v3::WaitResponse> {
+    ) -> anyhow::Result<
+        impl Future<Output = protos::containerd::task::v3::WaitResponse> + Send + use<>,
+    > {
         let container = self.containers.get_mut(id).context("container not found")?;
 
-        // If we already have cached exit info, return it.
-        if let (Some(code), Some(exited_at)) = (container.exit_code, container.exited_at.clone()) {
-            return Ok(protos::containerd::task::v3::WaitResponse {
-                exit_status: code as u32,
-                exited_at: Some(exited_at),
-            });
+        // If we already have cached exit info, return it immediately.
+        let cached = container.exit_result.lock().unwrap().clone();
+        if let Some((code, exited_at)) = cached {
+            return Ok(futures::future::Either::Left(futures::future::ready(
+                protos::containerd::task::v3::WaitResponse {
+                    exit_status: code as u32,
+                    exited_at: Some(exited_at),
+                },
+            )));
         }
 
-        // Await exit status from agent.
         let exit_recv = container
             .exit_recv
             .take()
-            .context("no exit receiver (not started or already waited)")?;
+            .context("no exit receiver (already waited)")?;
 
-        let exit_status = exit_recv
-            .await
-            .map_err(|_| anyhow::anyhow!("exit status channel broken"))?;
+        let exit_result = container.exit_result.clone();
 
-        let exited_at = prost_types::Timestamp {
-            seconds: (exit_status.exited_at / 1_000_000_000) as i64,
-            nanos: (exit_status.exited_at % 1_000_000_000) as i32,
-        };
+        Ok(futures::future::Either::Right(async move {
+            let exit_status = match exit_recv.await {
+                Ok(status) => status,
+                Err(_) => {
+                    tracing::error!("init exit status channel broken");
+                    containerd_shim_agent_protocol::ExitStatus {
+                        code: -1,
+                        exited_at: 0,
+                    }
+                }
+            };
 
-        container.status = protos::containerd::v1::types::Status::Stopped as i32;
-        container.exit_code = Some(exit_status.code);
-        container.exited_at = Some(exited_at.clone());
+            let exited_at = prost_types::Timestamp {
+                seconds: (exit_status.exited_at / 1_000_000_000) as i64,
+                nanos: (exit_status.exited_at % 1_000_000_000) as i32,
+            };
 
-        Ok(protos::containerd::task::v3::WaitResponse {
-            exit_status: exit_status.code as u32,
-            exited_at: Some(exited_at),
-        })
+            // Cache for Delete to read.
+            *exit_result.lock().unwrap() = Some((exit_status.code, exited_at.clone()));
+
+            protos::containerd::task::v3::WaitResponse {
+                exit_status: exit_status.code as u32,
+                exited_at: Some(exited_at),
+            }
+        }))
     }
 
     async fn do_kill_task(
@@ -1041,14 +1113,16 @@ impl ShimState {
             let _ = std::fs::remove_dir_all(staging);
         }
 
-        let exit_status = container.exit_code.unwrap_or(0) as u32;
-        let exited_at = container
-            .exited_at
-            .unwrap_or(prost_types::Timestamp::default());
+        let (exit_status, exited_at) = container
+            .exit_result
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or((0, prost_types::Timestamp::default()));
 
         Ok(protos::containerd::task::v3::DeleteResponse {
             pid: container.pid,
-            exit_status,
+            exit_status: exit_status as u32,
             exited_at: Some(exited_at),
         })
     }
@@ -1215,20 +1289,22 @@ impl ShimState {
         // This runs as a background task so the main loop isn't blocked.
         if let Some(exit_send) = exec.exit_send.take() {
             let agent_exit = exec_resp.exit_status;
-            self.driver.spawn("exec-exit-watch", async move {
-                match agent_exit.await {
-                    Ok(status) => {
-                        exit_send.send(status);
+            self.driver
+                .spawn("exec-exit-watch", async move {
+                    match agent_exit.await {
+                        Ok(status) => {
+                            exit_send.send(status);
+                        }
+                        Err(_) => {
+                            // Agent channel broken — send a synthetic exit status.
+                            exit_send.send(containerd_shim_agent_protocol::ExitStatus {
+                                code: -1,
+                                exited_at: 0,
+                            });
+                        }
                     }
-                    Err(_) => {
-                        // Agent channel broken — send a synthetic exit status.
-                        exit_send.send(containerd_shim_agent_protocol::ExitStatus {
-                            code: -1,
-                            exited_at: 0,
-                        });
-                    }
-                }
-            }).detach();
+                })
+                .detach();
         }
 
         Ok(protos::containerd::task::v3::StartResponse { pid: exec_resp.pid })

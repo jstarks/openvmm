@@ -180,18 +180,22 @@ fi
 # ---------------------------------------------------------------------------
 HAS_EROFS=0
 if [[ "$BENCH_EROFS" == "true" ]]; then
-    if modprobe erofs 2>/dev/null && command -v mkfs.erofs &>/dev/null; then
-        HAS_EROFS=1
-        info "EROFS snapshotter enabled (module loaded, mkfs.erofs available)"
-        mkdir -p /etc/containerd
-        cat > /etc/containerd/config.toml << 'CTRDCFG'
+    if modprobe erofs 2>/dev/null || grep -qw erofs /proc/filesystems 2>/dev/null; then
+        if command -v mkfs.erofs &>/dev/null; then
+            HAS_EROFS=1
+            info "EROFS snapshotter enabled (kernel support present, mkfs.erofs available)"
+            mkdir -p /etc/containerd
+            cat > /etc/containerd/config.toml << 'CTRDCFG'
 version = 2
 
 [plugins."io.containerd.service.v1.diff-service"]
   default = ["erofs","walking"]
 CTRDCFG
+        else
+            info "WARNING: --erofs requested but mkfs.erofs not found"
+        fi
     else
-        info "WARNING: --erofs requested but EROFS not available (missing module or mkfs.erofs)"
+        info "WARNING: --erofs requested but EROFS kernel support not available"
     fi
 fi
 
@@ -233,11 +237,12 @@ if ! /usr/local/bin/ctr image ls -q 2>/dev/null | grep -q "alpine"; then
 fi
 
 # Unpack for the default (overlay) snapshotter.
-/usr/local/bin/ctr image unpack docker.io/library/alpine:latest >/dev/null 2>&1 || true
+# containerd 2.1 removed 'ctr image unpack'; use 'pull --local' to unpack a local image.
+/usr/local/bin/ctr image pull --snapshotter overlayfs --local docker.io/library/alpine:latest >/dev/null 2>&1 || true
 
 # Unpack for the EROFS snapshotter if enabled.
 if [[ "$HAS_EROFS" -eq 1 ]]; then
-    if /usr/local/bin/ctr image unpack --snapshotter erofs docker.io/library/alpine:latest >/dev/null 2>&1; then
+    if /usr/local/bin/ctr image pull --snapshotter erofs --local docker.io/library/alpine:latest >/dev/null 2>&1; then
         info "Alpine image unpacked for EROFS snapshotter"
     else
         info "Failed to unpack for EROFS snapshotter — disabling EROFS benchmark"

@@ -406,11 +406,11 @@ fi
 # --- Configure EROFS snapshotter (new in containerd 2.1) ---
 # The erofs module must be loaded on the host kernel.
 HAS_EROFS=0
-if modprobe erofs 2>/dev/null; then
+if modprobe erofs 2>/dev/null || grep -qw erofs /proc/filesystems 2>/dev/null; then
     HAS_EROFS=1
-    info "EROFS kernel module loaded"
+    info "EROFS kernel support available"
 else
-    info "EROFS kernel module not available — EROFS tests will be skipped"
+    info "EROFS kernel support not available — EROFS tests will be skipped"
 fi
 
 if [[ "$HAS_EROFS" -eq 1 ]] && command -v mkfs.erofs &>/dev/null; then
@@ -474,11 +474,12 @@ else
 fi
 
 # Unpack for the default (overlay) snapshotter.
-/usr/local/bin/ctr image unpack docker.io/library/alpine:latest >/dev/null 2>&1 || true
+# containerd 2.1 removed 'ctr image unpack'; use 'pull --local' to unpack a local image.
+/usr/local/bin/ctr image pull --snapshotter overlayfs --local docker.io/library/alpine:latest >/dev/null 2>&1 || true
 
 # Unpack for the EROFS snapshotter (if available).
 if [[ "$HAS_EROFS" -eq 1 ]]; then
-    if /usr/local/bin/ctr image unpack --snapshotter erofs docker.io/library/alpine:latest >/dev/null 2>&1; then
+    if /usr/local/bin/ctr image pull --snapshotter erofs --local docker.io/library/alpine:latest >/dev/null 2>&1; then
         pass "Alpine image unpacked for EROFS snapshotter"
     else
         info "Failed to unpack for EROFS snapshotter — EROFS tests will be skipped"

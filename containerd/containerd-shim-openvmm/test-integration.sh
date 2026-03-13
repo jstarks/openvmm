@@ -318,7 +318,7 @@ case "$ARCH" in
     *)       fail "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-CONTAINERD_VERSION="2.0.4"
+CONTAINERD_VERSION="2.1.0"
 DOCKER_IMAGE="shim-integration-test:containerd-${CONTAINERD_VERSION}"
 DOCKERFILE="$REPO_ROOT/containerd/containerd-shim-openvmm/test-integration.Dockerfile"
 BUILD_CONTEXT="$REPO_ROOT/containerd/containerd-shim-openvmm"
@@ -403,6 +403,33 @@ if [[ -d /tmp/containerd-state ]]; then
     rm -rf /tmp/containerd-state
 fi
 
+# --- Configure EROFS snapshotter (new in containerd 2.1) ---
+# The erofs module must be loaded on the host kernel.
+HAS_EROFS=0
+if modprobe erofs 2>/dev/null; then
+    HAS_EROFS=1
+    info "EROFS kernel module loaded"
+else
+    info "EROFS kernel module not available — EROFS tests will be skipped"
+fi
+
+if [[ "$HAS_EROFS" -eq 1 ]] && command -v mkfs.erofs &>/dev/null; then
+    EROFS_VERSION=$(mkfs.erofs --version 2>&1 | head -1 || true)
+    info "erofs-utils: $EROFS_VERSION"
+
+    # Write containerd config to enable the EROFS snapshotter and differ.
+    mkdir -p /etc/containerd
+    cat > /etc/containerd/config.toml << 'CTRDCFG'
+version = 2
+
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["erofs","walking"]
+CTRDCFG
+    info "EROFS snapshotter + differ configured in containerd config.toml"
+else
+    HAS_EROFS=0
+fi
+
 # --- Start containerd ---
 info "Starting containerd"
 /usr/local/bin/containerd &>/var/log/containerd.log &
@@ -448,6 +475,16 @@ fi
 
 # Unpack for the default (overlay) snapshotter.
 /usr/local/bin/ctr image unpack docker.io/library/alpine:latest >/dev/null 2>&1 || true
+
+# Unpack for the EROFS snapshotter (if available).
+if [[ "$HAS_EROFS" -eq 1 ]]; then
+    if /usr/local/bin/ctr image unpack --snapshotter erofs docker.io/library/alpine:latest >/dev/null 2>&1; then
+        pass "Alpine image unpacked for EROFS snapshotter"
+    else
+        info "Failed to unpack for EROFS snapshotter — EROFS tests will be skipped"
+        HAS_EROFS=0
+    fi
+fi
 
 # --- Test 3a: Standalone mode (ctr run triggers Task.Create implicit VM boot) ---
 info "Test 3a: Standalone mode (ctr run)"
@@ -781,6 +818,66 @@ if [[ "$VM_MODE" -eq 1 ]]; then
 
     rm -f /tmp/ctr-3h-1.out /tmp/ctr-3h-2.out
 
+fi
+
+# =======================================================================
+# EROFS Snapshotter Tests — runc and openvmm with --snapshotter erofs
+# =======================================================================
+
+if [[ "$HAS_EROFS" -eq 1 ]]; then
+
+    # --- Test 3i: EROFS snapshotter with runc ---
+    info "Test 3i: EROFS snapshotter with runc"
+    CTR_3I_OUTPUT=""
+    CTR_3I_EXIT=0
+    CTR_3I_OUTPUT=$(timeout 30 /usr/local/bin/ctr run --rm \
+        --snapshotter erofs \
+        --runtime io.containerd.runc.v2 \
+        docker.io/library/alpine:latest test-erofs-runc echo "erofs-hello" 2>&1) || CTR_3I_EXIT=$?
+
+    if echo "$CTR_3I_OUTPUT" | grep -q "erofs-hello"; then
+        pass "Test 3i: runc + EROFS output contains 'erofs-hello'"
+    else
+        fail "Test 3i: runc + EROFS output missing 'erofs-hello'"
+        echo "  Got: $CTR_3I_OUTPUT"
+    fi
+
+    if [[ "$CTR_3I_EXIT" -eq 0 ]]; then
+        pass "Test 3i: runc + EROFS exited with code 0"
+    else
+        fail "Test 3i: runc + EROFS exited with code $CTR_3I_EXIT"
+    fi
+
+    # --- Test 3j: EROFS snapshotter with openvmm (VM mode only) ---
+    if [[ "$VM_MODE" -eq 1 ]]; then
+        info "Test 3j: EROFS snapshotter with openvmm"
+        CTR_3J_OUTPUT=""
+        CTR_3J_EXIT=0
+        CTR_3J_OUTPUT=$(timeout 120 /usr/local/bin/ctr run --rm \
+            --snapshotter erofs \
+            --runtime io.containerd.openvmm.v2 \
+            docker.io/library/alpine:latest test-erofs-openvmm echo "erofs-vm-hello" 2>&1) || CTR_3J_EXIT=$?
+
+        if echo "$CTR_3J_OUTPUT" | grep -q "erofs-vm-hello"; then
+            pass "Test 3j: openvmm + EROFS output contains 'erofs-vm-hello'"
+        else
+            fail "Test 3j: openvmm + EROFS output missing 'erofs-vm-hello'"
+            echo "  Got: $CTR_3J_OUTPUT"
+        fi
+
+        if [[ "$CTR_3J_EXIT" -eq 0 ]]; then
+            pass "Test 3j: openvmm + EROFS exited with code 0"
+        else
+            if [[ "$CTR_3J_EXIT" -eq 124 ]]; then
+                fail "Test 3j: openvmm + EROFS timed out"
+            else
+                fail "Test 3j: openvmm + EROFS exited with code $CTR_3J_EXIT"
+            fi
+        fi
+    fi
+
+else
+    info "Skipping EROFS tests (EROFS not available)"
 fi
 
 echo ""

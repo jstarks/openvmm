@@ -23,6 +23,7 @@
 #   --serial-log  Enable kernel serial console log (written to /tmp/serial.log)
 #   --show-log  Dump the shim log after the run (timing analysis)
 #   --private-memory  Use private (guest_memfd) memory instead of shared
+#   --erofs     Also benchmark with the EROFS snapshotter (vs default overlayfs)
 #   -h/--help   Show this help
 
 set -euo pipefail
@@ -41,6 +42,7 @@ SHOW_LOG=false
 SERIAL_LOG=""
 NET_BACKEND="virtio"
 PRIVATE_MEMORY=false
+BENCH_EROFS=false
 
 # ---------------------------------------------------------------------------
 # Parse args
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --serial-log) SERIAL_LOG="/tmp/serial.log"; shift ;;
         --show-log) SHOW_LOG=true; shift ;;
         --private-memory) PRIVATE_MEMORY=true; shift ;;
+        --erofs)    BENCH_EROFS=true; shift ;;
         -h|--help)
             sed -n '2,/^$/s/^# \?//p' "$0"
             exit 0
@@ -173,6 +176,26 @@ if [[ -d /tmp/containerd-state ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Configure EROFS snapshotter (if --erofs requested)
+# ---------------------------------------------------------------------------
+HAS_EROFS=0
+if [[ "$BENCH_EROFS" == "true" ]]; then
+    if modprobe erofs 2>/dev/null && command -v mkfs.erofs &>/dev/null; then
+        HAS_EROFS=1
+        info "EROFS snapshotter enabled (module loaded, mkfs.erofs available)"
+        mkdir -p /etc/containerd
+        cat > /etc/containerd/config.toml << 'CTRDCFG'
+version = 2
+
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["erofs","walking"]
+CTRDCFG
+    else
+        info "WARNING: --erofs requested but EROFS not available (missing module or mkfs.erofs)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Start containerd
 # ---------------------------------------------------------------------------
 info "Starting containerd"
@@ -211,21 +234,39 @@ fi
 
 # Unpack for the default (overlay) snapshotter.
 /usr/local/bin/ctr image unpack docker.io/library/alpine:latest >/dev/null 2>&1 || true
+
+# Unpack for the EROFS snapshotter if enabled.
+if [[ "$HAS_EROFS" -eq 1 ]]; then
+    if /usr/local/bin/ctr image unpack --snapshotter erofs docker.io/library/alpine:latest >/dev/null 2>&1; then
+        info "Alpine image unpacked for EROFS snapshotter"
+    else
+        info "Failed to unpack for EROFS snapshotter — disabling EROFS benchmark"
+        HAS_EROFS=0
+    fi
+fi
+
 info "alpine image ready"
 
 # ---------------------------------------------------------------------------
 # Run a single container and return its wall-clock time in ms.
-# Args: <runtime> <container-id> <command...>
+# Args: <runtime> <container-id> [--snapshotter <name>] <command...>
 #   runtime: "openvmm" or "runc"
 # ---------------------------------------------------------------------------
 run_one() {
     local runtime="$1"; shift
     local cid="$1"; shift
     local runtime_flag
-    if [[ "$runtime" == "openvmm" ]]; then
+    if [[ "$runtime" == openvmm* ]]; then
         runtime_flag="io.containerd.openvmm.v2"
     else
         runtime_flag="io.containerd.runc.v2"
+    fi
+
+    # Check for optional --snapshotter flag.
+    local snapshotter_args=()
+    if [[ "${1:-}" == "--snapshotter" ]]; then
+        snapshotter_args=(--snapshotter "$2")
+        shift 2
     fi
 
     # Capture both output and timing.  Run without --rm so we can inspect
@@ -237,6 +278,7 @@ run_one() {
     set +e  # don't abort on ctr failure
     /usr/local/bin/ctr run \
         --runtime "$runtime_flag" \
+        "${snapshotter_args[@]}" \
         docker.io/library/alpine:latest "$cid" "$@" > "$outfile" 2>&1
     exit_code=$?
     set -e
@@ -283,11 +325,13 @@ run_one() {
 
 # ---------------------------------------------------------------------------
 # Benchmark a single runtime. Sets RESULTS_* vars.
-# Args: <runtime-name> <label>
+# Args: <runtime-name> <label> [--snapshotter <name>]
 # ---------------------------------------------------------------------------
 bench_runtime() {
     local runtime="$1"
     local label="$2"
+    shift 2
+    local snapshotter_args=("$@")
 
     info "--- $label ---"
 
@@ -295,7 +339,7 @@ bench_runtime() {
     if [[ "$WARMUP" -gt 0 ]]; then
         info "Warmup: $WARMUP iteration(s)"
         for i in $(seq 1 "$WARMUP"); do
-            ms=$(run_one "$runtime" "${runtime}-warmup-$i" $CTR_CMD)
+            ms=$(run_one "$runtime" "${runtime}-warmup-$i" "${snapshotter_args[@]}" $CTR_CMD)
             info "  warmup $i: ${ms} ms"
         done
     fi
@@ -304,7 +348,7 @@ bench_runtime() {
     info "Benchmark: $ITERATIONS iteration(s) — cmd: $CTR_CMD"
     local results=()
     for i in $(seq 1 "$ITERATIONS"); do
-        ms=$(run_one "$runtime" "${runtime}-bench-$i" $CTR_CMD)
+        ms=$(run_one "$runtime" "${runtime}-bench-$i" "${snapshotter_args[@]}" $CTR_CMD)
         results+=("$ms")
         info "  run $i: ${ms} ms"
     done
@@ -342,6 +386,18 @@ if [[ "$BENCH_OPENVMM" == "true" ]]; then
     BENCH_ORDER+=("openvmm")
 fi
 
+# EROFS benchmarks (when --erofs is passed and EROFS is available).
+if [[ "$HAS_EROFS" -eq 1 ]]; then
+    if [[ "$BENCH_RUNC" == "true" ]]; then
+        bench_runtime "runc-erofs" "runc + erofs" --snapshotter erofs
+        BENCH_ORDER+=("runc-erofs")
+    fi
+    if [[ "$BENCH_OPENVMM" == "true" ]]; then
+        bench_runtime "openvmm-erofs" "openvmm + erofs" --snapshotter erofs
+        BENCH_ORDER+=("openvmm-erofs")
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -370,6 +426,15 @@ case "$OUTPUT_FORMAT" in
         if [[ -n "${BENCH_AVG[runc]:-}" && -n "${BENCH_AVG[openvmm]:-}" ]]; then
             RATIO=$(echo "${BENCH_AVG[openvmm]} / ${BENCH_AVG[runc]}" | bc -l 2>/dev/null || echo "?")
             printf "\n  openvmm/runc ratio: %.1fx\n" "$RATIO"
+        fi
+        # Show EROFS comparison ratios.
+        if [[ -n "${BENCH_AVG[runc]:-}" && -n "${BENCH_AVG[runc-erofs]:-}" ]]; then
+            RATIO=$(echo "${BENCH_AVG[runc-erofs]} / ${BENCH_AVG[runc]}" | bc -l 2>/dev/null || echo "?")
+            printf "  runc erofs/overlay ratio: %.2fx\n" "$RATIO"
+        fi
+        if [[ -n "${BENCH_AVG[openvmm]:-}" && -n "${BENCH_AVG[openvmm-erofs]:-}" ]]; then
+            RATIO=$(echo "${BENCH_AVG[openvmm-erofs]} / ${BENCH_AVG[openvmm]}" | bc -l 2>/dev/null || echo "?")
+            printf "  openvmm erofs/overlay ratio: %.2fx\n" "$RATIO"
         fi
         echo "========================================"
         ;;

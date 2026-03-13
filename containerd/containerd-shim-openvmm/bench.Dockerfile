@@ -11,13 +11,13 @@
 
 FROM docker.io/library/ubuntu:24.04
 
-ARG CONTAINERD_VERSION=2.0.4
+ARG CONTAINERD_VERSION=2.1.0
 ARG RUNC_VERSION=1.2.4
 ARG TARGETARCH
 
-# Install containerd + runc + basic tools.
+# Install containerd + runc + erofs-utils + basic tools.
 RUN apt-get update -qq && \
-    apt-get install -y -qq wget bc >/dev/null 2>&1 && \
+    apt-get install -y -qq wget bc erofs-utils >/dev/null 2>&1 && \
     wget -q "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${TARGETARCH}.tar.gz" \
          -O /tmp/containerd.tar.gz && \
     tar -xzf /tmp/containerd.tar.gz -C /usr/local && \

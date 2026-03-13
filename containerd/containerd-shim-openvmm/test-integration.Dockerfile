@@ -2,17 +2,18 @@
 # Licensed under the MIT License.
 #
 # Test image for containerd-shim-openvmm integration tests.
-# Pre-installs containerd 2.0.4 and caches the alpine:latest image
+# Pre-installs containerd 2.1.0 and caches the alpine:latest image
 # so repeated test runs don't re-download everything.
 
 FROM docker.io/library/ubuntu:24.04
 
-ARG CONTAINERD_VERSION=2.0.4
+ARG CONTAINERD_VERSION=2.1.0
 ARG TARGETARCH
 
-# Install containerd from the official binary release.
+# Install containerd from the official binary release, plus erofs-utils
+# for the EROFS snapshotter (new in containerd 2.1).
 RUN apt-get update -qq && \
-    apt-get install -y -qq wget >/dev/null 2>&1 && \
+    apt-get install -y -qq wget erofs-utils >/dev/null 2>&1 && \
     wget -q "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${TARGETARCH}.tar.gz" \
          -O /tmp/containerd.tar.gz && \
     tar -xzf /tmp/containerd.tar.gz -C /usr/local && \

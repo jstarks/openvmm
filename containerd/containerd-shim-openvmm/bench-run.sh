@@ -153,6 +153,20 @@ fi
 chmod +x /usr/local/bin/containerd-shim-openvmm-v2
 
 # ---------------------------------------------------------------------------
+# Move containerd state onto tmpfs to avoid nested-overlay inside Docker
+# ---------------------------------------------------------------------------
+info "Setting up tmpfs for containerd state"
+if [[ -d /var/lib/containerd ]]; then
+    cp -a /var/lib/containerd /tmp/containerd-state
+fi
+mkdir -p /var/lib/containerd
+mount -t tmpfs tmpfs /var/lib/containerd
+if [[ -d /tmp/containerd-state ]]; then
+    cp -a /tmp/containerd-state/* /var/lib/containerd/
+    rm -rf /tmp/containerd-state
+fi
+
+# ---------------------------------------------------------------------------
 # Start containerd
 # ---------------------------------------------------------------------------
 info "Starting containerd"
@@ -185,8 +199,8 @@ if ! /usr/local/bin/ctr image ls -q 2>/dev/null | grep -q "alpine"; then
     }
 fi
 
-# Unpack for native snapshotter (needed inside Docker where overlay isn't available).
-/usr/local/bin/ctr image unpack --snapshotter native docker.io/library/alpine:latest >/dev/null 2>&1 || true
+# Unpack for the default (overlay) snapshotter.
+/usr/local/bin/ctr image unpack docker.io/library/alpine:latest >/dev/null 2>&1 || true
 info "alpine image ready"
 
 # ---------------------------------------------------------------------------
@@ -212,7 +226,6 @@ run_one() {
     start=$(date +%s%N)
     set +e  # don't abort on ctr failure
     /usr/local/bin/ctr run \
-        --snapshotter native \
         --runtime "$runtime_flag" \
         docker.io/library/alpine:latest "$cid" "$@" > "$outfile" 2>&1
     exit_code=$?

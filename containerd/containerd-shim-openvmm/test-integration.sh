@@ -379,6 +379,21 @@ else
     exit 1
 fi
 
+# --- Move containerd state onto tmpfs to avoid nested-overlay ---
+# Docker's root filesystem is overlayfs, so the overlay snapshotter would fail
+# with nested overlayfs.  Putting containerd's state on tmpfs avoids this while
+# preserving the pre-cached alpine image from the Docker build layer.
+info "Setting up tmpfs for containerd state (avoids nested overlayfs)"
+if [[ -d /var/lib/containerd ]]; then
+    cp -a /var/lib/containerd /tmp/containerd-state
+fi
+mkdir -p /var/lib/containerd
+mount -t tmpfs tmpfs /var/lib/containerd
+if [[ -d /tmp/containerd-state ]]; then
+    cp -a /tmp/containerd-state/* /var/lib/containerd/
+    rm -rf /tmp/containerd-state
+fi
+
 # --- Start containerd ---
 info "Starting containerd"
 /usr/local/bin/containerd &>/var/log/containerd.log &
@@ -417,8 +432,8 @@ else
     pass "Image pulled"
 fi
 
-# Unpack for native snapshotter (avoids nested-overlay inside Docker).
-/usr/local/bin/ctr image unpack --snapshotter native docker.io/library/alpine:latest >/dev/null 2>&1 || true
+# Unpack for the default (overlay) snapshotter.
+/usr/local/bin/ctr image unpack docker.io/library/alpine:latest >/dev/null 2>&1 || true
 
 # --- Test 3a: Standalone mode (ctr run triggers Task.Create implicit VM boot) ---
 info "Test 3a: Standalone mode (ctr run)"
@@ -432,7 +447,6 @@ fi
 CTR_OUTPUT=""
 CTR_EXIT=0
 CTR_OUTPUT=$(timeout "$TIMEOUT_SECS" /usr/local/bin/ctr run --rm \
-    --snapshotter native \
     --runtime io.containerd.openvmm.v2 \
     docker.io/library/alpine:latest test-standalone echo hello 2>&1) || CTR_EXIT=$?
 
@@ -564,7 +578,6 @@ if [[ "$VM_MODE" -eq 1 ]]; then
     info "Test 3b: Container with non-zero exit code"
     CTR_3B_EXIT=0
     timeout 60 /usr/local/bin/ctr run --rm \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-exit1 sh -c "exit 42" 2>&1 || CTR_3B_EXIT=$?
 
@@ -579,7 +592,6 @@ if [[ "$VM_MODE" -eq 1 ]]; then
     CTR_3C_OUTPUT=""
     CTR_3C_EXIT=0
     CTR_3C_OUTPUT=$(timeout 60 /usr/local/bin/ctr run --rm --env GREETING=world \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-env sh -c 'echo "hello $GREETING"' 2>&1) || CTR_3C_EXIT=$?
 
@@ -595,7 +607,6 @@ if [[ "$VM_MODE" -eq 1 ]]; then
     CTR_3D_OUTPUT=""
     CTR_3D_EXIT=0
     CTR_3D_OUTPUT=$(timeout 60 /usr/local/bin/ctr run --rm \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-multi sh -c 'echo line1; echo line2; echo line3' 2>&1) || CTR_3D_EXIT=$?
 
@@ -616,7 +627,6 @@ if [[ "$VM_MODE" -eq 1 ]]; then
 
     # Start a long-running detached container.
     timeout 60 /usr/local/bin/ctr run -d \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-exec sleep 300 2>&1 || true
 
@@ -676,7 +686,6 @@ if [[ "$VM_MODE" -eq 1 ]]; then
     CTR_3F_OUTPUT=""
     CTR_3F_EXIT=0
     CTR_3F_OUTPUT=$(timeout 60 /usr/local/bin/ctr run --rm \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-uid id 2>&1) || CTR_3F_EXIT=$?
 
@@ -696,7 +705,6 @@ if [[ "$VM_MODE" -eq 1 ]]; then
     # has its own /etc/resolv.conf that doesn't point to consomme's DNS).
     # nc -z tests TCP connect to Google DNS on port 53.
     CTR_3G_OUTPUT=$(timeout 60 /usr/local/bin/ctr run --rm \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-net \
         sh -c 'nc -z -w5 8.8.8.8 53 2>&1 && echo NET_OK || echo NET_FAIL' 2>&1) || CTR_3G_EXIT=$?
@@ -726,13 +734,11 @@ if [[ "$VM_MODE" -eq 1 ]]; then
 
     # Run two containers concurrently.
     timeout 120 /usr/local/bin/ctr run --rm \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-multi1 echo "container-one" > /tmp/ctr-3h-1.out 2>&1 &
     PID_3H_1=$!
 
     timeout 120 /usr/local/bin/ctr run --rm \
-        --snapshotter native \
         --runtime io.containerd.openvmm.v2 \
         docker.io/library/alpine:latest test-multi2 echo "container-two" > /tmp/ctr-3h-2.out 2>&1 &
     PID_3H_2=$!

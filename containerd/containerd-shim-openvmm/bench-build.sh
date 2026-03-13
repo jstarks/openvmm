@@ -182,7 +182,15 @@ ok "Rootfs: $STAGING/rootfs.img (${IMAGE_SIZE_MB}MB ext4, agent=$(numfmt --to=ie
 rm -rf "$ROOTFS_TMP"
 
 # ---------------------------------------------------------------------------
-# Step 6: Build Docker image
+# Step 6: Save alpine image for the bench container
+# ---------------------------------------------------------------------------
+info "Saving alpine image for offline use"
+docker pull -q docker.io/library/alpine:latest >/dev/null
+docker save docker.io/library/alpine:latest -o "$STAGING/alpine.tar"
+ok "Alpine: $STAGING/alpine.tar ($(numfmt --to=iec $(stat -c%s "$STAGING/alpine.tar")))"
+
+# ---------------------------------------------------------------------------
+# Step 7: Build Docker image
 # ---------------------------------------------------------------------------
 
 info "Building Docker image: $IMAGE_TAG"
@@ -199,7 +207,7 @@ IMAGE_SIZE_MB=$((IMAGE_SIZE / 1024 / 1024))
 info "Image size: ~${IMAGE_SIZE_MB} MB"
 
 # ---------------------------------------------------------------------------
-# Step 7: Optional export
+# Step 8: Optional export
 # ---------------------------------------------------------------------------
 if [[ -n "$EXPORT_FILE" ]]; then
     info "Exporting image to: $EXPORT_FILE"
@@ -212,7 +220,7 @@ if [[ -n "$EXPORT_FILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8: Run instructions / immediate run
+# Step 9: Run instructions / immediate run
 # ---------------------------------------------------------------------------
 echo ""
 echo "========================================="

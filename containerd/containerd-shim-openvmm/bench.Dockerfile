@@ -29,9 +29,9 @@ RUN apt-get update -qq && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
-# NOTE: Alpine image is pulled at runtime (containerd's boltdb metadata
-# doesn't survive layer commits, and ctr pull needs mount which isn't
-# available during unprivileged docker build).
+# Alpine image tar is saved on the host by bench-build.sh and copied in.
+# At runtime, `ctr image import` loads it instantly with no network needed.
+COPY alpine.tar /opt/alpine.tar
 
 # Copy in the shim binary, agent binary, and kernel.
 COPY containerd-shim-openvmm-v2 /usr/local/bin/containerd-shim-openvmm-v2-real

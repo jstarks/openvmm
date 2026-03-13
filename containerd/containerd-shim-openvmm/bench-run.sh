@@ -196,13 +196,17 @@ if [[ "$READY" -ne 1 ]]; then
 fi
 info "containerd ready"
 
-# Pull the alpine image if not already present.
+# Import alpine image from pre-exported OCI tar (no network needed).
 if ! /usr/local/bin/ctr image ls -q 2>/dev/null | grep -q "alpine"; then
-    info "Pulling alpine image..."
-    /usr/local/bin/ctr image pull docker.io/library/alpine:latest >/dev/null 2>&1 || {
-        echo "ERROR: failed to pull alpine image" >&2
-        exit 1
-    }
+    if [[ -f /opt/alpine.tar ]]; then
+        /usr/local/bin/ctr image import /opt/alpine.tar >/dev/null 2>&1
+    else
+        info "No cached image — pulling from network"
+        /usr/local/bin/ctr image pull docker.io/library/alpine:latest >/dev/null 2>&1 || {
+            echo "ERROR: failed to pull alpine image" >&2
+            exit 1
+        }
+    fi
 fi
 
 # Unpack for the default (overlay) snapshotter.

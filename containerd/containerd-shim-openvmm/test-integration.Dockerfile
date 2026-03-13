@@ -21,13 +21,6 @@ RUN apt-get update -qq && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
-# Pre-pull the alpine test image into containerd's content store.
-# We start containerd briefly, pull, then stop it and preserve the state.
-RUN /usr/local/bin/containerd &>/dev/null & \
-    CTRD_PID=$! && \
-    for i in $(seq 1 30); do \
-        /usr/local/bin/ctr version &>/dev/null && break; \
-        sleep 0.5; \
-    done && \
-    /usr/local/bin/ctr image pull docker.io/library/alpine:latest >/dev/null 2>&1 && \
-    kill $CTRD_PID && wait $CTRD_PID 2>/dev/null || true
+# Alpine image tar is saved on the host by the build script and copied in.
+# At runtime, `ctr image import` loads it instantly with no network needed.
+COPY alpine.tar /opt/alpine.tar

@@ -321,6 +321,15 @@ esac
 CONTAINERD_VERSION="2.0.4"
 DOCKER_IMAGE="shim-integration-test:containerd-${CONTAINERD_VERSION}"
 DOCKERFILE="$REPO_ROOT/containerd/containerd-shim-openvmm/test-integration.Dockerfile"
+BUILD_CONTEXT="$REPO_ROOT/containerd/containerd-shim-openvmm"
+
+# Save alpine image into the build context so the Dockerfile can COPY it.
+ALPINE_TAR="$BUILD_CONTEXT/alpine.tar"
+if [[ ! -f "$ALPINE_TAR" ]]; then
+    info "  Saving alpine image for offline use"
+    docker pull -q docker.io/library/alpine:latest >/dev/null
+    docker save docker.io/library/alpine:latest -o "$ALPINE_TAR"
+fi
 
 # Build the test image (Docker layer cache makes repeated runs instant).
 info "  Building test image (cached after first run)"
@@ -329,7 +338,7 @@ docker build -q \
     --build-arg CONTAINERD_VERSION="$CONTAINERD_VERSION" \
     -t "$DOCKER_IMAGE" \
     -f "$DOCKERFILE" \
-    "$REPO_ROOT/containerd/containerd-shim-openvmm" >/dev/null
+    "$BUILD_CONTEXT" >/dev/null
 
 info "  Running containerd ${CONTAINERD_VERSION} inside Docker with shim mounted"
 
@@ -418,18 +427,23 @@ else
     exit 1
 fi
 
-# Verify alpine image is available (pre-pulled during docker build).
+# Import alpine image from pre-exported OCI tar (no network needed).
 if /usr/local/bin/ctr image ls -q | grep -q "alpine"; then
-    pass "Alpine image available (cached)"
+    pass "Alpine image available"
 else
-    info "Alpine image not cached — pulling"
-    /usr/local/bin/ctr image pull docker.io/library/alpine:latest >/dev/null 2>&1 || {
-        fail "Failed to pull alpine image"
-        echo "--- containerd log (last 30 lines) ---"
-        tail -30 /var/log/containerd.log 2>/dev/null || true
-        exit 1
-    }
-    pass "Image pulled"
+    if [[ -f /opt/alpine.tar ]]; then
+        /usr/local/bin/ctr image import /opt/alpine.tar >/dev/null 2>&1
+        pass "Alpine image imported from /opt/alpine.tar"
+    else
+        info "No cached image — pulling from network"
+        /usr/local/bin/ctr image pull docker.io/library/alpine:latest >/dev/null 2>&1 || {
+            fail "Failed to pull alpine image"
+            echo "--- containerd log (last 30 lines) ---"
+            tail -30 /var/log/containerd.log 2>/dev/null || true
+            exit 1
+        }
+        pass "Image pulled"
+    fi
 fi
 
 # Unpack for the default (overlay) snapshotter.

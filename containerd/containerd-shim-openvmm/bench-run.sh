@@ -22,6 +22,7 @@
 #   --json      Output results as JSON
 #   --serial-log  Enable kernel serial console log (written to /tmp/serial.log)
 #   --show-log  Dump the shim log after the run (timing analysis)
+#   --private-memory  Use private (guest_memfd) memory instead of shared
 #   -h/--help   Show this help
 
 set -euo pipefail
@@ -39,6 +40,7 @@ BENCH_OPENVMM=true
 SHOW_LOG=false
 SERIAL_LOG=""
 NET_BACKEND="virtio"
+PRIVATE_MEMORY=false
 
 # ---------------------------------------------------------------------------
 # Parse args
@@ -56,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --json)     OUTPUT_FORMAT="json"; shift ;;
         --serial-log) SERIAL_LOG="/tmp/serial.log"; shift ;;
         --show-log) SHOW_LOG=true; shift ;;
+        --private-memory) PRIVATE_MEMORY=true; shift ;;
         -h|--help)
             sed -n '2,/^$/s/^# \?//p' "$0"
             exit 0
@@ -147,6 +150,9 @@ fi
     fi
     if [[ "$NET_BACKEND" != "virtio" ]]; then
         echo "export OPENVMM_SHIM_NET_BACKEND=$NET_BACKEND"
+    fi
+    if [[ "$PRIVATE_MEMORY" == "true" ]]; then
+        echo 'export OPENVMM_SHIM_PRIVATE_MEMORY=true'
     fi
     echo 'exec /usr/local/bin/containerd-shim-openvmm-v2-real "$@"'
 } > /usr/local/bin/containerd-shim-openvmm-v2

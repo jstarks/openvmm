@@ -78,6 +78,8 @@ pub struct VmConfig {
     /// serial port is enabled with `console=ttyS0` and all output is written to
     /// this file. When `None`, serial is disabled for performance.
     pub serial_log_path: Option<PathBuf>,
+    /// Use private (guest_memfd) memory instead of shared memory.
+    pub private_memory: bool,
 }
 
 /// Network backend type for the VM.
@@ -132,6 +134,7 @@ impl Drop for RunningVm {
 /// | `io.openvmm.networking`     | `OPENVMM_SHIM_NETWORKING`   | true    |
 /// | `io.openvmm.net_backend`    | `OPENVMM_SHIM_NET_BACKEND`  | virtio  |
 /// | `io.openvmm.serial_log`     | `OPENVMM_SHIM_SERIAL_LOG`   | (none)  |
+/// | `io.openvmm.private_memory`  | `OPENVMM_SHIM_PRIVATE_MEMORY`| false  |
 ///
 /// `bundle` is the containerd bundle directory — a `containers/` subdirectory
 /// is created under it and shared into the VM via virtiofs.
@@ -176,6 +179,9 @@ pub fn resolve_config(
             _ => NetBackend::Virtio,
         },
         serial_log_path: get("io.openvmm.serial_log", "OPENVMM_SHIM_SERIAL_LOG").map(PathBuf::from),
+        private_memory: get("io.openvmm.private_memory", "OPENVMM_SHIM_PRIVATE_MEMORY")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
     })
 }
 
@@ -392,7 +398,7 @@ pub async fn launch_vm(
             pci_ecam_gaps: vec![],
             pci_mmio_gaps: vec![],
             prefetch_memory: false,
-            private_memory: false,
+            private_memory: config.private_memory,
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: config.cpus,

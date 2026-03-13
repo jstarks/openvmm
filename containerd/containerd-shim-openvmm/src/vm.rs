@@ -392,6 +392,7 @@ pub async fn launch_vm(
             pci_ecam_gaps: vec![],
             pci_mmio_gaps: vec![],
             prefetch_memory: false,
+            private_memory: false,
         },
         processor_topology: ProcessorTopologyConfig {
             proc_count: config.cpus,

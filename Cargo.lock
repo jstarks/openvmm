@@ -5462,6 +5462,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "openvmm_vhost"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "disk_backend",
+ "disk_file",
+ "guestmem",
+ "pal_async",
+ "tracing-subscriber",
+ "vhost_user_device",
+ "virtio_blk",
+ "vmcore",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8623,6 +8639,30 @@ name = "vhd1_defs"
 version = "0.0.0"
 dependencies = [
  "guid",
+ "zerocopy",
+]
+
+[[package]]
+name = "vhost_user_device"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "guestmem",
+ "inspect",
+ "libc",
+ "open_enum",
+ "pal_async",
+ "pal_event",
+ "parking_lot",
+ "socket2",
+ "test_with_tracing",
+ "thiserror 2.0.16",
+ "tracelimit",
+ "tracing",
+ "unix_socket",
+ "virtio",
+ "vmcore",
  "zerocopy",
 ]
 

@@ -1,0 +1,35 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vhost_user_device"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+guestmem.workspace = true
+open_enum.workspace = true
+pal_async.workspace = true
+pal_event.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracelimit.workspace = true
+unix_socket.workspace = true
+virtio.workspace = true
+vmcore.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+inspect.workspace = true
+pal_async = { workspace = true, features = ["tests"] }
+socket2 = { workspace = true, features = ["all"] }
+test_with_tracing.workspace = true
+
+[lints]
+workspace = true

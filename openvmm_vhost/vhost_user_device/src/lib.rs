@@ -181,9 +181,6 @@ impl VhostUserDeviceServer {
                 pf.insert(VhostUserProtocolFeatures::REPLY_ACK);
                 pf.insert(VhostUserProtocolFeatures::CONFIG);
                 pf.insert(VhostUserProtocolFeatures::RESET_DEVICE);
-                if traits.shared_memory.size > 0 {
-                    pf.insert(VhostUserProtocolFeatures::SHARED_MEMORY_REGIONS);
-                }
                 let reply_payload = VhostUserU64Msg { value: pf.bits() };
                 send_reply(socket, hdr, reply_payload.as_bytes(), &[]).await?;
             }
@@ -389,20 +386,6 @@ impl VhostUserDeviceServer {
                     tracelimit::warn_ratelimited!(idx, "SET_VRING_ENABLE: invalid queue index");
                 }
                 maybe_ack(socket, hdr, state).await?;
-            }
-
-            VhostUserRequestCode::GET_SHARED_MEMORY_REGIONS => {
-                if traits.shared_memory.size > 0 {
-                    let region = VhostUserSharedMemoryRegion {
-                        id: traits.shared_memory.id,
-                        padding: [0; 7],
-                        length: traits.shared_memory.size,
-                        mmap_offset: 0,
-                    };
-                    send_reply(socket, hdr, region.as_bytes(), &[]).await?;
-                } else {
-                    send_reply(socket, hdr, &[], &[]).await?;
-                }
             }
 
             VhostUserRequestCode::RESET_DEVICE => {

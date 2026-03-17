@@ -52,9 +52,12 @@ open_enum! {
         GET_QUEUE_NUM = 17,
         SET_VRING_ENABLE = 18,
         SEND_RARP = 19,
-        NET_SET_BACKEND_REQ_FD = 20,
-        IOTLB_MSG = 21,
-        SET_BACKEND_REQ_FD = 22,
+        NET_SET_MTU = 20,
+        SET_BACKEND_REQ_FD = 21,
+        IOTLB_MSG = 22,
+        SET_VRING_ENDIAN = 23,
+        GET_CONFIG = 24,
+        SET_CONFIG = 25,
         CRYPTO_CREATE_SESS = 26,
         CRYPTO_CLOSE_SESS = 27,
         POSTCOPY_ADVISE = 28,
@@ -70,9 +73,9 @@ open_enum! {
         REM_MEM_REGION = 38,
         SET_STATUS = 39,
         GET_STATUS = 40,
-        GET_SHARED_MEMORY_REGIONS = 41,
-        GET_CONFIG = 42,
-        SET_CONFIG = 43,
+        GET_SHARED_OBJECT = 41,
+        SET_DEVICE_STATE_FD = 42,
+        CHECK_DEVICE_STATE = 43,
     }
 }
 
@@ -163,16 +166,6 @@ pub struct VhostUserU64Msg {
     pub value: u64,
 }
 
-/// Payload for GET_SHARED_MEMORY_REGIONS response.
-#[repr(C)]
-#[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
-pub struct VhostUserSharedMemoryRegion {
-    pub id: u8,
-    pub padding: [u8; 7],
-    pub length: u64,
-    pub mmap_offset: u64,
-}
-
 /// Protocol feature flags negotiated via GET/SET_PROTOCOL_FEATURES.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct VhostUserProtocolFeatures(u64);
@@ -195,7 +188,10 @@ impl VhostUserProtocolFeatures {
     pub const INBAND_NOTIFICATIONS: u64 = 1 << 14;
     pub const CONFIGURE_MEM_SLOTS: u64 = 1 << 15;
     pub const STATUS: u64 = 1 << 16;
-    pub const SHARED_MEMORY_REGIONS: u64 = 1 << 24;
+    pub const XEN_MMAP: u64 = 1 << 17;
+    pub const SHARED_OBJECT: u64 = 1 << 18;
+    pub const DEVICE_STATE: u64 = 1 << 19;
+    pub const GET_VRING_BASE_INFLIGHT: u64 = 1 << 20;
 
     /// Create from raw bits.
     pub fn from_bits(bits: u64) -> Self {
@@ -251,11 +247,6 @@ mod tests {
     #[test]
     fn u64_msg_size() {
         assert_eq!(size_of::<VhostUserU64Msg>(), 8);
-    }
-
-    #[test]
-    fn shared_memory_region_size() {
-        assert_eq!(size_of::<VhostUserSharedMemoryRegion>(), 24);
     }
 
     #[test]

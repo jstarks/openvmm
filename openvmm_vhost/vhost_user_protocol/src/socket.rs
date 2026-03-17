@@ -3,10 +3,6 @@
 
 //! Async Unix domain socket I/O with SCM_RIGHTS fd passing for vhost-user.
 
-#![cfg(unix)]
-// UNSAFETY: Calls to libc sendmsg/recvmsg and handling cmsg ancillary data.
-#![expect(unsafe_code)]
-
 use crate::protocol::VHOST_USER_MAX_FDS;
 use crate::protocol::VhostUserMsgHeader;
 use pal_async::interest::InterestSlot;
@@ -156,9 +152,10 @@ impl VhostUserSocket {
         buf: &mut [u8],
         fds: Option<&mut Vec<OwnedFd>>,
     ) -> Result<usize, SocketError> {
-        // Stash received fds in a Cell so we can extract them from the
-        // poll_io closure (which can't borrow fds directly).
-        let received_fds = std::cell::RefCell::new(Vec::new());
+        // Stash received fds in a Mutex so we can extract them from the
+        // poll_io closure (which can't borrow fds directly). Using
+        // parking_lot::Mutex rather than RefCell so the future is Send.
+        let received_fds = parking_lot::Mutex::new(Vec::new());
         let want_fds = fds.is_some();
 
         let n = poll_fn(|cx| {
@@ -169,7 +166,7 @@ impl VhostUserSocket {
                     let fd_arg = if want_fds { Some(&mut tmp_fds) } else { None };
                     let n = try_recv(socket.get(), buf, fd_arg)?;
                     if want_fds && !tmp_fds.is_empty() {
-                        received_fds.borrow_mut().extend(tmp_fds);
+                        received_fds.lock().extend(tmp_fds);
                     }
                     Ok(n)
                 })

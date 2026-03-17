@@ -10,6 +10,8 @@ members = [
   # openvmm-vhost
   "openvmm_vhost/openvmm_vhost",
   "openvmm_vhost/vhost_user_device",
+  "openvmm_vhost/vhost_user_frontend",
+  "openvmm_vhost/vhost_user_protocol",
   # repo tooling
   "flowey/flowey_hvlite",
   "xtask",
@@ -85,6 +87,7 @@ openvmm_resources = { path = "openvmm/openvmm_resources" }
 openvmm_ttrpc_vmservice = { path = "openvmm/openvmm_ttrpc_vmservice" }
 membacking = { path = "openvmm/membacking" }
 vhost_user_device = { path = "openvmm_vhost/vhost_user_device" }
+vhost_user_protocol = { path = "openvmm_vhost/vhost_user_protocol" }
 
 petri_artifact_resolver_openvmm_known_paths = { path = "vmm_tests/petri_artifact_resolver_openvmm_known_paths" }
 petri_artifacts_vmm_test = { path = "vmm_tests/petri_artifacts_vmm_test" }

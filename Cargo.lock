@@ -8651,7 +8651,6 @@ dependencies = [
  "guestmem",
  "inspect",
  "libc",
- "open_enum",
  "pal_async",
  "pal_event",
  "parking_lot",
@@ -8661,8 +8660,40 @@ dependencies = [
  "tracelimit",
  "tracing",
  "unix_socket",
+ "vhost_user_protocol",
  "virtio",
  "vmcore",
+ "zerocopy",
+]
+
+[[package]]
+name = "vhost_user_frontend"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "guestmem",
+ "inspect",
+ "pal_async",
+ "pal_event",
+ "socket2",
+ "test_with_tracing",
+ "unix_socket",
+ "vhost_user_device",
+ "vhost_user_protocol",
+ "virtio",
+ "zerocopy",
+]
+
+[[package]]
+name = "vhost_user_protocol"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "open_enum",
+ "pal_async",
+ "parking_lot",
+ "thiserror 2.0.16",
+ "unix_socket",
  "zerocopy",
 ]
 

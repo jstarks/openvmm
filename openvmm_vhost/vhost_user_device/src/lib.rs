@@ -12,9 +12,12 @@
 #![expect(missing_docs)]
 
 pub mod memory;
-pub mod protocol;
 pub mod queue_setup;
-pub mod socket;
+
+/// Re-export protocol types from the shared crate.
+pub use vhost_user_protocol::protocol;
+/// Re-export socket types from the shared crate.
+pub use vhost_user_protocol::socket;
 
 use crate::memory::VhostUserMemoryRegions;
 use crate::memory::guest_memory_from_regions;
@@ -26,12 +29,11 @@ use guestmem::GuestMemory;
 use pal_async::driver::SpawnDriver;
 use pal_async::socket::PolledSocket;
 use pal_event::Event;
-use std::future::poll_fn;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use unix_socket::UnixListener;
 use virtio::DeviceTraits;
-use virtio::VirtioDevice;
+use virtio::DynVirtioDevice;
 use virtio::queue::QueueState;
 use virtio::spec::VirtioDeviceFeatures;
 use vmcore::interrupt::Interrupt;
@@ -43,7 +45,7 @@ use zerocopy::IntoBytes;
 /// Owns a `VirtioDevice` and serves the vhost-user protocol over a Unix
 /// domain socket.
 pub struct VhostUserDeviceServer {
-    device: Box<dyn VirtioDevice>,
+    device: Box<dyn DynVirtioDevice>,
     /// Shared memory regions, also referenced by the GuestMemory given to
     /// the device.
     mem_regions: VhostUserMemoryRegions,
@@ -55,7 +57,7 @@ impl VhostUserDeviceServer {
     /// The `device_factory` closure receives a `GuestMemory` that will be
     /// dynamically updated as the frontend sends `SET_MEM_TABLE`. The device
     /// should store this `GuestMemory` for use in its workers.
-    pub fn new(device_factory: impl FnOnce(GuestMemory) -> Box<dyn VirtioDevice>) -> Self {
+    pub fn new(device_factory: impl FnOnce(GuestMemory) -> Box<dyn DynVirtioDevice>) -> Self {
         let mem_regions = VhostUserMemoryRegions::new();
         let guest_memory = guest_memory_from_regions(&mem_regions);
         let device = device_factory(guest_memory);
@@ -104,7 +106,7 @@ impl VhostUserDeviceServer {
 
             // Reset device state for the next connection.
             self.stop_all_queues().await;
-            self.device.reset();
+            self.device.reset().await;
         }
     }
 
@@ -112,7 +114,7 @@ impl VhostUserDeviceServer {
     pub async fn serve_connection(mut self, socket: VhostUserSocket) -> anyhow::Result<()> {
         let result = self.handle_connection(&socket).await;
         self.stop_all_queues().await;
-        self.device.reset();
+        self.device.reset().await;
         result
     }
 
@@ -219,7 +221,7 @@ impl VhostUserDeviceServer {
                 let mut pos = 0u32;
                 while pos < size {
                     let reg_offset = offset + pos;
-                    let val = self.device.read_registers_u32(reg_offset as u16);
+                    let val = self.device.read_registers_u32(reg_offset as u16).await;
                     let remaining = (size - pos) as usize;
                     let bytes = val.to_le_bytes();
                     let copy_len = remaining.min(4);
@@ -252,7 +254,8 @@ impl VhostUserDeviceServer {
                     }
                     let val = u32::from_le_bytes(bytes);
                     self.device
-                        .write_registers_u32((config_hdr.offset + pos) as u16, val);
+                        .write_registers_u32((config_hdr.offset + pos) as u16, val)
+                        .await;
                     pos += 4;
                 }
                 maybe_ack(socket, hdr, state).await?;
@@ -366,12 +369,14 @@ impl VhostUserDeviceServer {
                     if enable {
                         if !q.is_active() {
                             if let Some((resources, queue_state)) = q.try_activate() {
-                                self.device.start_queue(
-                                    idx as u16,
-                                    resources,
-                                    &state.negotiated_features,
-                                    Some(queue_state),
-                                )?;
+                                self.device
+                                    .start_queue(
+                                        idx as u16,
+                                        resources,
+                                        &state.negotiated_features,
+                                        Some(queue_state),
+                                    )
+                                    .await?;
                                 q.set_active();
                             } else {
                                 tracelimit::warn_ratelimited!(
@@ -392,7 +397,7 @@ impl VhostUserDeviceServer {
 
             VhostUserRequestCode::RESET_DEVICE => {
                 self.stop_all_queues().await;
-                self.device.reset();
+                self.device.reset().await;
                 state.reset(&self.device.traits());
                 maybe_ack(socket, hdr, state).await?;
             }
@@ -468,12 +473,14 @@ impl VhostUserDeviceServer {
 
         // Restart any queues that were active before the memory update.
         for (idx, resources, queue_state) in active_queues {
-            self.device.start_queue(
-                idx,
-                resources,
-                &state.negotiated_features,
-                Some(queue_state),
-            )?;
+            self.device
+                .start_queue(
+                    idx,
+                    resources,
+                    &state.negotiated_features,
+                    Some(queue_state),
+                )
+                .await?;
             if let Some(q) = state.queues.get_mut(idx as usize) {
                 q.set_active();
             }
@@ -538,8 +545,8 @@ impl ConnectionState {
 }
 
 /// Stop a queue on the device and return its state.
-async fn stop_queue(device: &mut dyn VirtioDevice, idx: u16) -> Option<QueueState> {
-    poll_fn(|cx| device.poll_stop_queue(cx, idx)).await
+async fn stop_queue(device: &mut dyn DynVirtioDevice, idx: u16) -> Option<QueueState> {
+    device.stop_queue(idx).await
 }
 
 /// Send a reply for a GET_* message.
@@ -610,8 +617,7 @@ mod tests {
     use pal_async::async_test;
     use pal_async::socket::PolledSocket;
     use std::os::fd::AsFd;
-    use std::task::Context;
-    use std::task::Poll;
+
     use test_with_tracing::test;
     use unix_socket::UnixStream;
     use virtio::DeviceTraits;
@@ -654,13 +660,13 @@ mod tests {
             self.traits.clone()
         }
 
-        fn read_registers_u32(&mut self, _offset: u16) -> u32 {
+        async fn read_registers_u32(&mut self, _offset: u16) -> u32 {
             0
         }
 
-        fn write_registers_u32(&mut self, _offset: u16, _val: u32) {}
+        async fn write_registers_u32(&mut self, _offset: u16, _val: u32) {}
 
-        fn start_queue(
+        async fn start_queue(
             &mut self,
             idx: u16,
             _resources: QueueResources,
@@ -671,15 +677,15 @@ mod tests {
             Ok(())
         }
 
-        fn poll_stop_queue(&mut self, _cx: &mut Context<'_>, idx: u16) -> Poll<Option<QueueState>> {
+        async fn stop_queue(&mut self, idx: u16) -> Option<QueueState> {
             self.stopped_queues.push(idx);
-            Poll::Ready(Some(QueueState {
+            Some(QueueState {
                 avail_index: 0,
                 used_index: 0,
-            }))
+            })
         }
 
-        fn reset(&mut self) {
+        async fn reset(&mut self) {
             self.started_queues.clear();
             self.stopped_queues.clear();
         }

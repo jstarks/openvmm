@@ -168,9 +168,11 @@ impl VhostUserDeviceServer {
 
             VhostUserRequestCode::SET_FEATURES => {
                 let msg = parse_payload::<VhostUserU64Msg>(payload)?;
-                if msg.value & VHOST_USER_F_PROTOCOL_FEATURES == 0 {
-                    anyhow::bail!("frontend did not set VHOST_USER_F_PROTOCOL_FEATURES");
-                }
+                // The frontend sends SET_FEATURES multiple times: once
+                // during init (may include VHOST_USER_F_PROTOCOL_FEATURES)
+                // and again with guest-negotiated features (which won't
+                // include bit 30 since it's a vhost-user transport bit,
+                // not a real virtio feature). Both are normal.
                 state.negotiated_features = features_from_u64(msg.value);
                 maybe_ack(socket, hdr, state).await?;
             }

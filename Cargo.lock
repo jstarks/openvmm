@@ -8685,6 +8685,7 @@ dependencies = [
  "virtio",
  "virtio_resources",
  "vm_resource",
+ "vmcore",
  "zerocopy",
 ]
 

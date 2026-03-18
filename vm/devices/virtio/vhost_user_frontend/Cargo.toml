@@ -25,6 +25,7 @@ pal_async = { workspace = true, features = ["tests"] }
 socket2 = { workspace = true, features = ["all"] }
 test_with_tracing.workspace = true
 vhost_user_device.workspace = true
+vmcore.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 

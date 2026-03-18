@@ -230,10 +230,12 @@ options:
     /// The first positional argument is the socket path. Options:
     ///   type=blk|net|rng|console|fs|pmem  — device type (shorthand)
     ///   device_id=N                        — numeric virtio device ID
+    ///   pcie_port=<name>                   — present on PCIe under the specified port
     ///
     /// Examples:
     ///   --vhost-user /tmp/vhost.sock,type=blk
     ///   --vhost-user /tmp/vhost.sock,device_id=2
+    ///   --vhost-user /tmp/vhost.sock,type=blk,pcie_port=port0
     #[cfg(target_os = "linux")]
     #[clap(long = "vhost-user")]
     pub vhost_user: Vec<VhostUserCli>,
@@ -1950,6 +1952,7 @@ impl From<&std::ffi::OsStr> for OptionalPathBuf {
 pub struct VhostUserCli {
     pub socket_path: String,
     pub device_id: u16,
+    pub pcie_port: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1961,6 +1964,7 @@ impl FromStr for VhostUserCli {
         let socket_path = opts.next().context("missing socket path")?.to_string();
 
         let mut device_id: Option<u16> = None;
+        let mut pcie_port: Option<String> = None;
         for opt in opts {
             let (key, val) = opt.split_once('=').context("expected key=value option")?;
             match key {
@@ -1978,6 +1982,9 @@ impl FromStr for VhostUserCli {
                 "device_id" => {
                     device_id = Some(val.parse().context("invalid device_id")?);
                 }
+                "pcie_port" => {
+                    pcie_port = Some(val.to_string());
+                }
                 other => anyhow::bail!("unknown vhost-user option: '{other}'"),
             }
         }
@@ -1987,6 +1994,7 @@ impl FromStr for VhostUserCli {
         Ok(VhostUserCli {
             socket_path,
             device_id,
+            pcie_port,
         })
     }
 }

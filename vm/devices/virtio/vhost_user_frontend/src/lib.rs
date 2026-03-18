@@ -22,6 +22,7 @@ use pal_async::socket::PolledSocket;
 use pal_event::Event;
 use std::os::fd::AsFd;
 use std::os::fd::OwnedFd;
+use std::thread::JoinHandle;
 use unix_socket::UnixStream;
 use vhost_user_protocol::*;
 use virtio::DeviceTraits;
@@ -46,6 +47,19 @@ struct FrontendQueueState {
     active: bool,
     /// Saved queue params for reading used ring index during stop.
     params: Option<virtio::queue::QueueParams>,
+    /// Interrupt proxy thread, if the transport doesn't provide an eventfd.
+    interrupt_proxy: Option<InterruptProxy>,
+}
+
+/// Proxy that bridges a vhost-user SET_VRING_CALL eventfd to an
+/// `Interrupt` that may not be event-backed (e.g., MSI-X callback).
+struct InterruptProxy {
+    /// Event sent to the backend via SET_VRING_CALL.
+    /// Kept alive so the fd remains valid for the backend.
+    #[expect(dead_code)]
+    event: Event,
+    /// Thread that waits on the event and delivers the interrupt.
+    _thread: JoinHandle<()>,
 }
 
 /// A `VirtioDevice` that proxies to a vhost-user backend.
@@ -152,6 +166,7 @@ impl VhostUserFrontend {
             .map(|_| FrontendQueueState {
                 active: false,
                 params: None,
+                interrupt_proxy: None,
             })
             .collect();
 
@@ -235,7 +250,11 @@ impl VirtioDevice for VhostUserFrontend {
         )
         .await?;
 
-        // SET_VRING_CALL — pass the interrupt eventfd to the backend
+        // SET_VRING_CALL — pass the interrupt eventfd to the backend.
+        // If the transport provides a raw event (e.g., ioeventfd), use it
+        // directly. Otherwise, create a proxy event and spawn a thread to
+        // forward signals to the transport's interrupt callback.
+        let mut interrupt_proxy = None;
         if let Some(event) = resources.notify.event() {
             send_vring_fd(
                 &self.socket,
@@ -245,13 +264,29 @@ impl VirtioDevice for VhostUserFrontend {
             )
             .await?;
         } else {
+            let proxy_event = Event::new();
             send_vring_fd(
                 &self.socket,
                 VhostUserRequestCode::SET_VRING_CALL,
                 idx,
-                None::<&Event>,
+                Some(&proxy_event),
             )
             .await?;
+            let notify = resources.notify.clone();
+            let proxy_event_clone = proxy_event.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("vhost-call-{idx}"))
+                .spawn(move || {
+                    loop {
+                        proxy_event_clone.wait();
+                        notify.deliver();
+                    }
+                })
+                .expect("failed to spawn interrupt proxy thread");
+            interrupt_proxy = Some(InterruptProxy {
+                event: proxy_event,
+                _thread: thread,
+            });
         }
 
         // SET_VRING_ENABLE
@@ -260,6 +295,7 @@ impl VirtioDevice for VhostUserFrontend {
         if let Some(q) = self.queues.get_mut(idx as usize) {
             q.active = true;
             q.params = Some(resources.params);
+            q.interrupt_proxy = interrupt_proxy;
         }
         Ok(())
     }
@@ -282,6 +318,7 @@ impl VirtioDevice for VhostUserFrontend {
 
         q.active = false;
         q.params = None;
+        q.interrupt_proxy = None;
         Some(QueueState {
             avail_index,
             used_index,

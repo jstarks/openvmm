@@ -71,6 +71,7 @@ pub struct VhostUserFrontend {
     socket: VhostUserSocket,
     #[expect(dead_code)]
     negotiated_features: VirtioDeviceFeatures,
+    guest_features_sent: bool,
     config_cache: Vec<u8>,
     queues: Vec<FrontendQueueState>,
     guest_memory: GuestMemory,
@@ -175,6 +176,7 @@ impl VhostUserFrontend {
             protocol_features: negotiated_proto,
             socket,
             negotiated_features: features_from_u64(device_features_raw),
+            guest_features_sent: false,
             config_cache,
             queues,
             guest_memory: guest_memory.clone(),
@@ -208,9 +210,18 @@ impl VirtioDevice for VhostUserFrontend {
         &mut self,
         idx: u16,
         resources: QueueResources,
-        _features: &VirtioDeviceFeatures,
+        features: &VirtioDeviceFeatures,
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
+        // Send SET_FEATURES with the guest-negotiated features before the
+        // first queue is started.  The backend needs this to know which
+        // features are active.
+        if !self.guest_features_sent {
+            let guest_bits = features.bank(0) as u64 | ((features.bank(1) as u64) << 32);
+            send_set_u64(&self.socket, VhostUserRequestCode::SET_FEATURES, guest_bits).await?;
+            self.guest_features_sent = true;
+        }
+
         let base = initial_state.map(|s| s.avail_index).unwrap_or(0);
 
         // SET_VRING_NUM
@@ -332,8 +343,10 @@ impl VirtioDevice for VhostUserFrontend {
                 let _ = send_get_vring_base(&self.socket, idx as u16).await;
                 self.queues[idx].active = false;
                 self.queues[idx].params = None;
+                self.queues[idx].interrupt_proxy = None;
             }
         }
+        self.guest_features_sent = false;
         // Send RESET_DEVICE if negotiated.
         if self
             .protocol_features

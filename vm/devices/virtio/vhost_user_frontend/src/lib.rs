@@ -261,44 +261,36 @@ impl VirtioDevice for VhostUserFrontend {
         )
         .await?;
 
-        // SET_VRING_CALL — pass the interrupt eventfd to the backend.
-        // If the transport provides a raw event (e.g., ioeventfd), use it
-        // directly. Otherwise, create a proxy event and spawn a thread to
-        // forward signals to the transport's interrupt callback.
-        let mut interrupt_proxy = None;
-        if let Some(event) = resources.notify.event() {
-            send_vring_fd(
-                &self.socket,
-                VhostUserRequestCode::SET_VRING_CALL,
-                idx,
-                Some(event),
-            )
-            .await?;
-        } else {
-            let proxy_event = Event::new();
-            send_vring_fd(
-                &self.socket,
-                VhostUserRequestCode::SET_VRING_CALL,
-                idx,
-                Some(&proxy_event),
-            )
-            .await?;
-            let notify = resources.notify.clone();
-            let proxy_event_clone = proxy_event.clone();
-            let thread = std::thread::Builder::new()
-                .name(format!("vhost-call-{idx}"))
-                .spawn(move || {
-                    loop {
-                        proxy_event_clone.wait();
-                        notify.deliver();
-                    }
-                })
-                .expect("failed to spawn interrupt proxy thread");
-            interrupt_proxy = Some(InterruptProxy {
-                event: proxy_event,
-                _thread: thread,
-            });
-        }
+        // SET_VRING_CALL — pass an interrupt eventfd to the backend.
+        //
+        // Always create a proxy event rather than passing the transport's
+        // interrupt directly. The transport's Interrupt::deliver() may have
+        // side effects beyond signaling an event (e.g., the PCI transport
+        // updates the ISR register before asserting the interrupt line).
+        // Passing the raw event would bypass those side effects.
+        let proxy_event = Event::new();
+        send_vring_fd(
+            &self.socket,
+            VhostUserRequestCode::SET_VRING_CALL,
+            idx,
+            Some(&proxy_event),
+        )
+        .await?;
+        let notify = resources.notify.clone();
+        let proxy_event_clone = proxy_event.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("vhost-call-{idx}"))
+            .spawn(move || {
+                loop {
+                    proxy_event_clone.wait();
+                    notify.deliver();
+                }
+            })
+            .expect("failed to spawn interrupt proxy thread");
+        let interrupt_proxy = Some(InterruptProxy {
+            event: proxy_event,
+            _thread: thread,
+        });
 
         // SET_VRING_ENABLE
         send_vring_state(&self.socket, VhostUserRequestCode::SET_VRING_ENABLE, idx, 1).await?;
@@ -763,8 +755,9 @@ mod tests {
         backend_task.await;
     }
 
-    /// Test start_queue + stop_queue with an event-backed interrupt (the
-    /// direct eventfd path — no proxy thread).
+    /// Test start_queue + stop_queue with an event-backed interrupt.
+    /// The proxy is always used (even for event-backed interrupts) to
+    /// ensure transport side-effects like ISR updates are preserved.
     #[async_test]
     async fn start_stop_queue_event_interrupt(driver: DefaultDriver) {
         let (mut frontend, backend_task) = setup_frontend_backend(&driver).await;
@@ -772,13 +765,13 @@ mod tests {
         let features = VirtioDeviceFeatures::new();
         let resources = dummy_queue_resources(Interrupt::from_event(Event::new()));
 
-        // Verify the interrupt is event-backed.
-        assert!(resources.notify.event().is_some());
-
         frontend
             .start_queue(0, resources, &features, None)
             .await
             .expect("start_queue failed");
+
+        // Proxy should always be present.
+        assert!(frontend.queues[0].interrupt_proxy.is_some());
 
         // Stop the queue and verify we get state back.
         let state = frontend.stop_queue(0).await;
@@ -792,8 +785,8 @@ mod tests {
         backend_task.await;
     }
 
-    /// Test start_queue + stop_queue with a function-backed interrupt (the
-    /// proxy thread path — exercises the InterruptProxy).
+    /// Test start_queue + stop_queue with a function-backed interrupt.
+    /// Verifies the proxy works with non-event interrupts (e.g., MSI-X).
     #[async_test]
     async fn start_stop_queue_fn_interrupt(driver: DefaultDriver) {
         let (mut frontend, backend_task) = setup_frontend_backend(&driver).await;

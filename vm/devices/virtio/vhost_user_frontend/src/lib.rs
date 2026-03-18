@@ -109,6 +109,7 @@ impl VhostUserFrontend {
     ) -> anyhow::Result<Self> {
         // 1. GET_FEATURES
         let device_features_raw = send_get_u64(&socket, VhostUserRequestCode::GET_FEATURES).await?;
+        tracing::info!(features = %format!("0x{device_features_raw:x}"), "GET_FEATURES");
 
         // 2. SET_FEATURES — include PROTOCOL_FEATURES bit
         send_set_u64(
@@ -140,8 +141,19 @@ impl VhostUserFrontend {
         let max_queues = send_get_u64(&socket, VhostUserRequestCode::GET_QUEUE_NUM)
             .await
             .unwrap_or(1) as u16;
+        tracing::info!(max_queues, "GET_QUEUE_NUM");
 
         // 6. SET_MEM_TABLE
+        tracing::info!(region_count = exported_regions.len(), "SET_MEM_TABLE");
+        for (i, r) in exported_regions.iter().enumerate() {
+            tracing::info!(
+                idx = i,
+                gpa = %format!("0x{:x}", r.guest_phys_addr),
+                size = %format!("0x{:x}", r.size),
+                mmap_offset = %format!("0x{:x}", r.mmap_offset),
+                "  region",
+            );
+        }
         send_set_mem_table(&socket, &exported_regions).await?;
 
         // 7. GET_CONFIG (cache)
@@ -218,11 +230,27 @@ impl VirtioDevice for VhostUserFrontend {
         // features are active.
         if !self.guest_features_sent {
             let guest_bits = features.bank(0) as u64 | ((features.bank(1) as u64) << 32);
+            tracing::info!(
+                idx,
+                features = %format!("0x{guest_bits:x}"),
+                "SET_FEATURES (guest-negotiated)",
+            );
             send_set_u64(&self.socket, VhostUserRequestCode::SET_FEATURES, guest_bits).await?;
             self.guest_features_sent = true;
         }
 
         let base = initial_state.map(|s| s.avail_index).unwrap_or(0);
+
+        tracing::info!(
+            idx,
+            size = resources.params.size,
+            desc = %format!("0x{:x}", resources.params.desc_addr),
+            avail = %format!("0x{:x}", resources.params.avail_addr),
+            used = %format!("0x{:x}", resources.params.used_addr),
+            base,
+            has_event_interrupt = resources.notify.event().is_some(),
+            "start_queue",
+        );
 
         // SET_VRING_NUM
         send_vring_state(

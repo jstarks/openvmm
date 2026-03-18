@@ -11,7 +11,6 @@
 use pal_event::Event;
 use virtio::QueueResources;
 use virtio::queue::QueueParams;
-use virtio::queue::QueueState;
 use vmcore::interrupt::Interrupt;
 
 /// Accumulated vring setup state for a single queue.
@@ -24,8 +23,12 @@ pub struct QueueSetup {
     kick: Option<Event>,
     /// Call interrupt from SET_VRING_CALL.
     call: Option<Interrupt>,
-    /// Initial avail index from SET_VRING_BASE (defaults to 0).
-    base: u16,
+    /// Raw value from SET_VRING_BASE.
+    ///
+    /// For split ring: low 16 bits = avail index.
+    /// For packed ring: bits 0-15 = avail state (index + wrap),
+    ///                  bits 16-31 = used state (index + wrap).
+    base: u32,
     /// Whether this queue is currently active (started).
     active: bool,
 }
@@ -79,8 +82,11 @@ impl QueueSetup {
         self.call = Some(interrupt);
     }
 
-    /// Store the initial avail index (from SET_VRING_BASE).
-    pub fn set_base(&mut self, base: u16) {
+    /// Store the raw SET_VRING_BASE value.
+    ///
+    /// For split ring, only the low 16 bits matter (avail index).
+    /// For packed ring, bits 0-15 = avail state, bits 16-31 = used state.
+    pub fn set_base(&mut self, base: u32) {
         self.base = base;
     }
 
@@ -99,11 +105,14 @@ impl QueueSetup {
         self.active = false;
     }
 
-    /// Try to build `QueueResources` and `QueueState` for activation.
+    /// Try to build `QueueResources` for activation.
     ///
-    /// Returns `Some((resources, state))` if size, addrs, and kick are all set.
+    /// Returns `Some((resources, raw_base))` if size, addrs, and kick are all set.
     /// If call was not set, uses `Interrupt::null()`.
-    pub fn try_activate(&mut self) -> Option<(QueueResources, QueueState)> {
+    ///
+    /// The caller must split `raw_base` into `QueueState` based on the
+    /// negotiated features (split vs packed ring).
+    pub fn try_activate(&mut self) -> Option<(QueueResources, u32)> {
         let size = self.size?;
         let addrs = self.addrs.as_ref()?;
         let kick = self.kick.take()?;
@@ -122,12 +131,7 @@ impl QueueSetup {
             event: kick,
         };
 
-        let state = QueueState {
-            avail_index: self.base,
-            used_index: 0,
-        };
-
-        Some((resources, state))
+        Some((resources, self.base))
     }
 
     /// Reset all state for this queue.
@@ -168,14 +172,13 @@ mod tests {
         q.set_call(Interrupt::from_event(Event::new()));
         q.set_base(42);
 
-        let (resources, state) = q.try_activate().unwrap();
+        let (resources, raw_base) = q.try_activate().unwrap();
         assert_eq!(resources.params.size, 256);
         assert_eq!(resources.params.desc_addr, 0x1000);
         assert_eq!(resources.params.avail_addr, 0x2000);
         assert_eq!(resources.params.used_addr, 0x3000);
         assert!(resources.params.enable);
-        assert_eq!(state.avail_index, 42);
-        assert_eq!(state.used_index, 0);
+        assert_eq!(raw_base, 42);
     }
 
     #[test]
@@ -186,7 +189,7 @@ mod tests {
         q.set_kick(Event::new());
         // No set_call.
 
-        let (resources, _state) = q.try_activate().unwrap();
+        let (resources, _raw_base) = q.try_activate().unwrap();
         assert_eq!(resources.params.size, 128);
     }
 

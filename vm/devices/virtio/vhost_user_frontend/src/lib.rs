@@ -109,7 +109,7 @@ impl VhostUserFrontend {
     ) -> anyhow::Result<Self> {
         // 1. GET_FEATURES
         let device_features_raw = send_get_u64(&socket, VhostUserRequestCode::GET_FEATURES).await?;
-        tracing::info!(features = %format!("0x{device_features_raw:x}"), "GET_FEATURES");
+        tracing::trace!(features = %format!("0x{device_features_raw:x}"), "GET_FEATURES");
 
         // 2. SET_FEATURES — include PROTOCOL_FEATURES bit
         send_set_u64(
@@ -141,12 +141,12 @@ impl VhostUserFrontend {
         let max_queues = send_get_u64(&socket, VhostUserRequestCode::GET_QUEUE_NUM)
             .await
             .unwrap_or(1) as u16;
-        tracing::info!(max_queues, "GET_QUEUE_NUM");
+        tracing::trace!(max_queues, "GET_QUEUE_NUM");
 
         // 6. SET_MEM_TABLE
-        tracing::info!(region_count = exported_regions.len(), "SET_MEM_TABLE");
+        tracing::trace!(region_count = exported_regions.len(), "SET_MEM_TABLE");
         for (i, r) in exported_regions.iter().enumerate() {
-            tracing::info!(
+            tracing::trace!(
                 idx = i,
                 gpa = %format!("0x{:x}", r.guest_phys_addr),
                 size = %format!("0x{:x}", r.size),
@@ -230,7 +230,7 @@ impl VirtioDevice for VhostUserFrontend {
         // features are active.
         if !self.guest_features_sent {
             let guest_bits = features.bank(0) as u64 | ((features.bank(1) as u64) << 32);
-            tracing::info!(
+            tracing::trace!(
                 idx,
                 features = %format!("0x{guest_bits:x}"),
                 "SET_FEATURES (guest-negotiated)",
@@ -239,9 +239,30 @@ impl VirtioDevice for VhostUserFrontend {
             self.guest_features_sent = true;
         }
 
-        let base = initial_state.map(|s| s.avail_index).unwrap_or(0);
+        let base = initial_state.map(|s| s.avail_index).unwrap_or_else(|| {
+            // For packed ring, the initial wrap counter is 1 (encoded in bit 15).
+            if features.bank1().ring_packed() {
+                0x8000
+            } else {
+                0
+            }
+        });
 
-        tracing::info!(
+        // For packed ring, SET_VRING_BASE packs both avail and used state:
+        //   bits 0-14: last avail index
+        //   bit 15: avail wrap counter
+        //   bits 16-30: last used index
+        //   bit 31: used wrap counter
+        // For fresh start, used == avail. For save/restore, used comes from
+        // the saved state.
+        let vring_base = if features.bank1().ring_packed() {
+            let used = initial_state.map(|s| s.used_index).unwrap_or(0x8000);
+            (base as u32) | ((used as u32) << 16)
+        } else {
+            base as u32
+        };
+
+        tracing::trace!(
             idx,
             size = resources.params.size,
             desc = %format!("0x{:x}", resources.params.desc_addr),
@@ -272,11 +293,12 @@ impl VirtioDevice for VhostUserFrontend {
         .await?;
 
         // SET_VRING_BASE
+        tracing::trace!(idx, vring_base = %format!("0x{vring_base:x}"), "SET_VRING_BASE");
         send_vring_state(
             &self.socket,
             VhostUserRequestCode::SET_VRING_BASE,
             idx,
-            base as u32,
+            vring_base,
         )
         .await?;
 
@@ -309,8 +331,10 @@ impl VirtioDevice for VhostUserFrontend {
         let thread = std::thread::Builder::new()
             .name(format!("vhost-call-{idx}"))
             .spawn(move || {
+                tracing::trace!("interrupt proxy thread started");
                 loop {
                     proxy_event_clone.wait();
+                    tracing::trace!("interrupt proxy: forwarding call to transport");
                     notify.deliver();
                 }
             })

@@ -8679,6 +8679,7 @@ dependencies = [
  "pal_event",
  "socket2",
  "test_with_tracing",
+ "tracing",
  "unix_socket",
  "vhost_user_device",
  "vhost_user_protocol",

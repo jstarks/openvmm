@@ -13,6 +13,7 @@ guestmem.workspace = true
 inspect.workspace = true
 pal_async.workspace = true
 pal_event.workspace = true
+tracing.workspace = true
 unix_socket.workspace = true
 vhost_user_protocol.workspace = true
 virtio.workspace = true

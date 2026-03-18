@@ -389,8 +389,10 @@ impl VirtioQueue {
         cx: &mut Context<'_>,
     ) -> Poll<Result<VirtioQueueCallbackWork, Error>> {
         loop {
-            if let Some(work) = self.try_next()? {
-                return Poll::Ready(Ok(work));
+            match self.try_next() {
+                Ok(Some(work)) => return Poll::Ready(Ok(work)),
+                Ok(None) => {}
+                Err(e) => return Poll::Ready(Err(e)),
             }
             ready!(self.poll_kick(cx));
         }

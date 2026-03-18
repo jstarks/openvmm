@@ -170,6 +170,7 @@ impl VhostUserDeviceServer {
 
             VhostUserRequestCode::SET_FEATURES => {
                 let msg = parse_payload::<VhostUserU64Msg>(payload)?;
+                tracing::trace!(features = %format!("0x{:x}", msg.value), "SET_FEATURES");
                 // The frontend sends SET_FEATURES multiple times: once
                 // during init (may include VHOST_USER_F_PROTOCOL_FEATURES)
                 // and again with guest-negotiated features (which won't
@@ -275,6 +276,13 @@ impl VhostUserDeviceServer {
             VhostUserRequestCode::SET_VRING_ADDR => {
                 let msg = parse_payload::<VhostUserVringAddr>(payload)?;
                 let idx = msg.index as usize;
+                tracing::trace!(
+                    idx,
+                    desc = %format!("0x{:x}", msg.desc_user_addr),
+                    avail = %format!("0x{:x}", msg.avail_user_addr),
+                    used = %format!("0x{:x}", msg.used_user_addr),
+                    "SET_VRING_ADDR",
+                );
                 if let Some(q) = state.queues.get_mut(idx) {
                     // Translate userspace VAs to GPAs.
                     let desc_gpa = self
@@ -299,8 +307,9 @@ impl VhostUserDeviceServer {
             VhostUserRequestCode::SET_VRING_BASE => {
                 let msg = parse_payload::<VhostUserVringState>(payload)?;
                 let idx = msg.index as usize;
+                tracing::trace!(idx, base = %format!("0x{:x}", msg.num), "SET_VRING_BASE");
                 if let Some(q) = state.queues.get_mut(idx) {
-                    q.set_base(msg.num as u16);
+                    q.set_base(msg.num);
                 } else {
                     tracelimit::warn_ratelimited!(idx, "SET_VRING_BASE: invalid queue index");
                 }
@@ -333,6 +342,7 @@ impl VhostUserDeviceServer {
                 let msg = parse_payload::<VhostUserU64Msg>(payload)?;
                 let idx = (msg.value & VHOST_USER_VRING_INDEX_MASK) as usize;
                 let nofd = msg.value & VHOST_USER_VRING_NOFD_MASK != 0;
+                tracing::trace!(idx, nofd, fd_count = fds.len(), "SET_VRING_KICK");
                 if !nofd
                     && let Some(fd) = fds.into_iter().next()
                     && let Some(q) = state.queues.get_mut(idx)
@@ -346,6 +356,7 @@ impl VhostUserDeviceServer {
                 let msg = parse_payload::<VhostUserU64Msg>(payload)?;
                 let idx = (msg.value & VHOST_USER_VRING_INDEX_MASK) as usize;
                 let nofd = msg.value & VHOST_USER_VRING_NOFD_MASK != 0;
+                tracing::trace!(idx, nofd, fd_count = fds.len(), "SET_VRING_CALL");
                 if let Some(q) = state.queues.get_mut(idx) {
                     if nofd {
                         q.set_call(Interrupt::null());
@@ -365,10 +376,37 @@ impl VhostUserDeviceServer {
                 let msg = parse_payload::<VhostUserVringState>(payload)?;
                 let idx = msg.index as usize;
                 let enable = msg.num != 0;
+                tracing::trace!(idx, enable, "SET_VRING_ENABLE");
                 if let Some(q) = state.queues.get_mut(idx) {
                     if enable {
                         if !q.is_active() {
-                            if let Some((resources, queue_state)) = q.try_activate() {
+                            if let Some((resources, raw_base)) = q.try_activate() {
+                                // Split raw_base into QueueState based on ring type.
+                                let queue_state = if state.negotiated_features.bank1().ring_packed()
+                                {
+                                    // Packed: low 16 = avail state, high 16 = used state.
+                                    QueueState {
+                                        avail_index: raw_base as u16,
+                                        used_index: (raw_base >> 16) as u16,
+                                    }
+                                } else {
+                                    // Split: only avail index from SET_VRING_BASE.
+                                    // Used index is read from guest memory by the queue.
+                                    QueueState {
+                                        avail_index: raw_base as u16,
+                                        used_index: 0,
+                                    }
+                                };
+                                tracing::trace!(
+                                    idx,
+                                    avail_index = queue_state.avail_index,
+                                    used_index = queue_state.used_index,
+                                    desc_addr = %format!("0x{:x}", resources.params.desc_addr),
+                                    avail_addr = %format!("0x{:x}", resources.params.avail_addr),
+                                    used_addr = %format!("0x{:x}", resources.params.used_addr),
+                                    size = resources.params.size,
+                                    "activating queue",
+                                );
                                 self.device
                                     .start_queue(
                                         idx as u16,
@@ -459,6 +497,13 @@ impl VhostUserDeviceServer {
                     .expect("region_size matches struct size");
 
             let fd = fd_iter.next().unwrap();
+            tracing::trace!(
+                idx = i,
+                gpa = %format!("0x{:x}", region.guest_phys_addr),
+                size = %format!("0x{:x}", region.memory_size),
+                mmap_offset = %format!("0x{:x}", region.mmap_offset),
+                "SET_MEM_TABLE region",
+            );
             regions.push((
                 region.guest_phys_addr,
                 region.memory_size,

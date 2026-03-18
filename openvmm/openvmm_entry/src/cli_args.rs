@@ -225,6 +225,19 @@ options:
     #[clap(long = "virtio-blk")]
     pub virtio_blk: Vec<DiskCli>,
 
+    /// Attach a vhost-user device via a Unix socket.
+    ///
+    /// The first positional argument is the socket path. Options:
+    ///   type=blk|net|rng|console|fs|pmem  — device type (shorthand)
+    ///   device_id=N                        — numeric virtio device ID
+    ///
+    /// Examples:
+    ///   --vhost-user /tmp/vhost.sock,type=blk
+    ///   --vhost-user /tmp/vhost.sock,device_id=2
+    #[cfg(target_os = "linux")]
+    #[clap(long = "vhost-user")]
+    pub vhost_user: Vec<VhostUserCli>,
+
     /// number of sub-channels for the SCSI controller
     #[clap(long, value_name = "COUNT", default_value = "0")]
     pub scsi_sub_channels: u16,
@@ -1929,6 +1942,52 @@ pub struct OptionalPathBuf(pub Option<PathBuf>);
 impl From<&std::ffi::OsStr> for OptionalPathBuf {
     fn from(s: &std::ffi::OsStr) -> Self {
         OptionalPathBuf(if s.is_empty() { None } else { Some(s.into()) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct VhostUserCli {
+    pub socket_path: String,
+    pub device_id: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl FromStr for VhostUserCli {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let mut opts = s.split(',');
+        let socket_path = opts.next().context("missing socket path")?.to_string();
+
+        let mut device_id: Option<u16> = None;
+        for opt in opts {
+            let (key, val) = opt.split_once('=').context("expected key=value option")?;
+            match key {
+                "type" => {
+                    device_id = Some(match val {
+                        "net" => 1,
+                        "blk" => 2,
+                        "console" => 3,
+                        "rng" => 4,
+                        "fs" => 26,
+                        "pmem" => 27,
+                        other => anyhow::bail!("unknown vhost-user device type: '{other}'"),
+                    });
+                }
+                "device_id" => {
+                    device_id = Some(val.parse().context("invalid device_id")?);
+                }
+                other => anyhow::bail!("unknown vhost-user option: '{other}'"),
+            }
+        }
+
+        let device_id = device_id.context("must specify type=<name> or device_id=<N>")?;
+
+        Ok(VhostUserCli {
+            socket_path,
+            device_id,
+        })
     }
 }
 

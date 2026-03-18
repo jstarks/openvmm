@@ -11,5 +11,6 @@ mod va_mapper;
 pub use manager::MappingManager;
 pub use manager::MappingManagerClient;
 pub use mappable::Mappable;
+pub(crate) use va_mapper::SharingInfo;
 pub use va_mapper::VaMapper;
 pub use va_mapper::VaMapperError;

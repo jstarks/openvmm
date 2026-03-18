@@ -5434,6 +5434,7 @@ dependencies = [
  "storvsp",
  "tpm_device",
  "uidevices",
+ "vhost_user_frontend",
  "virtio",
  "virtio_blk",
  "virtio_console",
@@ -8671,6 +8672,7 @@ name = "vhost_user_frontend"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "guestmem",
  "inspect",
  "pal_async",
@@ -8681,6 +8683,8 @@ dependencies = [
  "vhost_user_device",
  "vhost_user_protocol",
  "virtio",
+ "virtio_resources",
+ "vm_resource",
  "zerocopy",
 ]
 

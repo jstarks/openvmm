@@ -12,6 +12,8 @@
 #![cfg(unix)]
 #![expect(missing_docs)]
 
+pub mod resolver;
+
 use anyhow::Context as _;
 use guestmem::GuestMemory;
 use inspect::InspectMut;

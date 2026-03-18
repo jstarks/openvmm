@@ -382,6 +382,27 @@ impl GuestMemoryBuilder {
             start += range.len();
         }
 
+        // Provide sharing info to the VaMapper so that
+        // guest_memory_sharing_control() works for vhost-user and similar
+        // consumers that need the backing fd and region layout.
+        if let Some(ref guest_ram) = memory {
+            let sharing_regions: Vec<(u64, u64, u64)> = {
+                let mut offset = 0u64;
+                ram_ranges
+                    .iter()
+                    .map(|range| {
+                        let entry = (range.start(), range.len(), offset);
+                        offset += range.len();
+                        entry
+                    })
+                    .collect()
+            };
+            va_mapper.set_sharing_info(crate::mapping_manager::SharingInfo {
+                guest_ram: guest_ram.clone(),
+                regions: sharing_regions,
+            });
+        }
+
         let gm = GuestMemoryManager {
             guest_ram: memory,
             _thread: thread,

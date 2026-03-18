@@ -347,6 +347,54 @@ unsafe impl GuestMemoryAccess for AlignedHeapMemory {
 
 impl LinearGuestMemory for AlignedHeapMemory {}
 
+/// A shareable region of guest memory backed by a file (Unix) or
+/// section handle (Windows).
+pub struct ShareableRegion {
+    /// Guest physical address of this region.
+    pub guest_address: u64,
+    /// Size in bytes.
+    pub size: u64,
+    /// Backing file/handle. Clone of the original — caller owns it.
+    pub file: sparse_mmap::Mappable,
+    /// Offset into `file` where this region starts.
+    pub file_offset: u64,
+}
+
+/// Opaque control object for accessing the shareable backing of guest
+/// memory. Not all `GuestMemory` instances support this — those backed
+/// by private memory or heap allocations return `None`.
+///
+/// Future extensions (hotplug notifications, region add/remove) will
+/// be added as methods here.
+pub struct GuestMemorySharingControl {
+    inner: Box<dyn GuestMemorySharingControlInner>,
+}
+
+impl GuestMemorySharingControl {
+    /// Construct from a trait implementation. Called by `GuestMemoryAccess`
+    /// implementations (e.g., `VaMapper` in membacking).
+    pub fn new(inner: impl GuestMemorySharingControlInner + 'static) -> Self {
+        Self {
+            inner: Box::new(inner),
+        }
+    }
+
+    /// Return the current set of shareable backing regions.
+    pub fn regions(&self) -> Vec<ShareableRegion> {
+        self.inner.regions()
+    }
+}
+
+/// Trait for providing shareable region information.
+///
+/// This trait must be public so that crates like `membacking` can implement
+/// it, but callers should interact with [`GuestMemorySharingControl`]'s
+/// methods rather than this trait directly.
+pub trait GuestMemorySharingControlInner: Send + Sync {
+    /// Return the current set of shareable backing regions.
+    fn regions(&self) -> Vec<ShareableRegion>;
+}
+
 /// A trait for a guest memory backing.
 ///
 /// Guest memory may be backed by a virtual memory mapping, in which case this
@@ -536,6 +584,15 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
     fn unlock_gpns(&self, gpns: &[u64]) {
         let _ = gpns;
     }
+
+    /// Return a sharing control object if this memory backing supports
+    /// file-based sharing (e.g., memfd on Linux, section on Windows).
+    ///
+    /// Returns `None` for private memory, heap-backed test memory, or
+    /// other non-shareable backings.
+    fn guest_memory_sharing_control(&self) -> Option<GuestMemorySharingControl> {
+        None
+    }
 }
 
 trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
@@ -586,6 +643,8 @@ trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
     fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError>;
 
     fn unlock_gpns(&self, gpns: &[u64]);
+
+    fn guest_memory_sharing_control(&self) -> Option<GuestMemorySharingControl>;
 }
 
 impl<T: GuestMemoryAccess> DynGuestMemoryAccess for T {
@@ -651,6 +710,10 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for T {
 
     fn unlock_gpns(&self, gpns: &[u64]) {
         self.unlock_gpns(gpns)
+    }
+
+    fn guest_memory_sharing_control(&self) -> Option<GuestMemorySharingControl> {
+        self.guest_memory_sharing_control()
     }
 }
 
@@ -753,6 +816,10 @@ unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for Arc<T> {
 
     fn base_iova(&self) -> Option<u64> {
         self.as_ref().base_iova()
+    }
+
+    fn guest_memory_sharing_control(&self) -> Option<GuestMemorySharingControl> {
+        self.as_ref().guest_memory_sharing_control()
     }
 }
 
@@ -1039,6 +1106,10 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
             let (region, offset_in_region) = self.region(gpn * PAGE_SIZE64, PAGE_SIZE64).unwrap();
             region.unlock_gpns(&[offset_in_region / PAGE_SIZE64]);
         }
+    }
+
+    fn guest_memory_sharing_control(&self) -> Option<GuestMemorySharingControl> {
+        None
     }
 }
 
@@ -1475,6 +1546,12 @@ impl GuestMemory {
     pub fn iova(&self, gpa: u64) -> Option<u64> {
         let (region, offset, _) = self.inner.region(gpa, 1).ok()?;
         Some(region.base_iova? + offset)
+    }
+
+    /// Returns a sharing control object if this memory supports
+    /// file-based sharing. See [`GuestMemorySharingControl`].
+    pub fn guest_memory_sharing_control(&self) -> Option<GuestMemorySharingControl> {
+        self.inner.imp.guest_memory_sharing_control()
     }
 
     /// Gets a pointer to the VA range for `gpa..gpa+len`.

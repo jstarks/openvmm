@@ -760,6 +760,34 @@ async fn vm_config_from_command_line(
         });
     }
 
+    // Handle --vhost-user arguments.
+    #[cfg(target_os = "linux")]
+    for (i, vhost_cli) in opt.vhost_user.iter().enumerate() {
+        let stream =
+            unix_socket::UnixStream::connect(&vhost_cli.socket_path).with_context(|| {
+                format!(
+                    "failed to connect to vhost-user socket: {}",
+                    vhost_cli.socket_path
+                )
+            })?;
+
+        let mut instance_id = guid::guid!("a0b0c0d0-0000-0000-0000-000000000000");
+        instance_id.data1 = i as u32;
+
+        vpci_devices.push(VpciDeviceConfig {
+            vtl: DeviceVtl::Vtl0,
+            instance_id,
+            resource: VirtioPciDeviceHandle(
+                virtio_resources::vhost_user::VhostUserDeviceHandle {
+                    socket: stream.into(),
+                    device_id: vhost_cli.device_id,
+                }
+                .into_resource(),
+            )
+            .into_resource(),
+        });
+    }
+
     // Build initial PCIe devices list from CLI options. Storage devices
     // (e.g., NVMe controllers on PCIe ports) are added later by storage_builder.
     let mut pcie_devices = Vec::new();

@@ -28,10 +28,14 @@ use super::manager::MapperRequest;
 use super::manager::MappingParams;
 use super::manager::MappingRequest;
 use crate::RemoteProcess;
+use crate::mapping_manager::Mappable;
 use futures::executor::block_on;
 use guestmem::GuestMemoryAccess;
+use guestmem::GuestMemorySharingControl;
+use guestmem::GuestMemorySharingControlInner;
 use guestmem::PageFaultAction;
 use guestmem::PageFaultError;
+use guestmem::ShareableRegion;
 use memory_range::MemoryRange;
 use mesh::rpc::RpcError;
 use mesh::rpc::RpcSend;
@@ -39,13 +43,22 @@ use parking_lot::Mutex;
 use sparse_mmap::SparseMapping;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use thiserror::Error;
+
+/// Information needed for `GuestMemorySharingControl`, set on `VaMapper`
+/// after construction by `GuestMemoryManager`.
+pub(crate) struct SharingInfo {
+    pub guest_ram: Mappable,
+    pub regions: Vec<(u64, u64, u64)>, // (gpa, size, file_offset)
+}
 
 pub struct VaMapper {
     inner: Arc<MapperInner>,
     process: Option<RemoteProcess>,
     private_ram: bool,
+    sharing_info: OnceLock<Arc<SharingInfo>>,
     _thread: JoinHandle<()>,
 }
 
@@ -244,8 +257,21 @@ impl VaMapper {
             inner,
             process: remote_process,
             private_ram,
+            sharing_info: OnceLock::new(),
             _thread: thread,
         })
+    }
+
+    /// Sets the sharing info for this mapper, enabling
+    /// `guest_memory_sharing_control()` to return shareable region data.
+    ///
+    /// Must be called at most once (uses `OnceLock`). Called by
+    /// `GuestMemoryManager::build()` after RAM regions are established.
+    pub(crate) fn set_sharing_info(&self, info: SharingInfo) {
+        self.sharing_info
+            .set(Arc::new(info))
+            .ok()
+            .expect("sharing_info already set");
     }
 
     /// Ensures a mapping has been established for the given range.
@@ -369,6 +395,52 @@ unsafe impl GuestMemoryAccess for VaMapper {
             ));
         }
         PageFaultAction::Retry
+    }
+
+    fn guest_memory_sharing_control(&self) -> Option<GuestMemorySharingControl> {
+        let info = self.sharing_info.get()?.clone();
+        Some(GuestMemorySharingControl::new(VaMapperSharingControl {
+            info,
+        }))
+    }
+}
+
+struct VaMapperSharingControl {
+    info: Arc<SharingInfo>,
+}
+
+impl GuestMemorySharingControlInner for VaMapperSharingControl {
+    fn regions(&self) -> Vec<ShareableRegion> {
+        self.info
+            .regions
+            .iter()
+            .map(|&(gpa, size, offset)| {
+                #[cfg(unix)]
+                let file = {
+                    use std::os::fd::AsFd;
+                    self.info
+                        .guest_ram
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .expect("failed to clone backing fd")
+                };
+                #[cfg(windows)]
+                let file = {
+                    use std::os::windows::io::AsHandle;
+                    self.info
+                        .guest_ram
+                        .as_handle()
+                        .try_clone_to_owned()
+                        .expect("failed to clone backing handle")
+                };
+                ShareableRegion {
+                    guest_address: gpa,
+                    size,
+                    file,
+                    file_offset: offset,
+                }
+            })
+            .collect()
     }
 }
 

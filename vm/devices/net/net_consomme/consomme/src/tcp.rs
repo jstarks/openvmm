@@ -1453,7 +1453,7 @@ fn trace_tcp_packet(tcp: &TcpRepr<'_>, payload_len: usize, label: &str) {
         next_seq = (tcp.seq_number.0 as u32).wrapping_add(
             payload_len as u32
                 + match tcp.control {
-                    TcpControl::Syn | TcpControl::Fin | TcpControl::Rst => 1u32,
+                    TcpControl::Syn | TcpControl::Fin => 1u32,
                     _ => 0,
                 },
         ),

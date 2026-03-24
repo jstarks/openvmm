@@ -112,6 +112,7 @@ impl VirtioQueueUsedHandler {
     pub(crate) fn complete_descriptor(&mut self, work: &QueueWork, bytes_written: u32) {
         match self.core.complete_descriptor(work, bytes_written) {
             Ok(true) => {
+                tracing::trace!("signaling guest for completed descriptor");
                 self.notify_guest.deliver();
             }
             Ok(false) => {}
@@ -330,6 +331,7 @@ impl VirtioQueue {
     /// Polls until the queue is kicked by the guest, indicating new work may be available.
     pub fn poll_kick(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         ready!(self.queue_event.wait().poll_unpin(cx)).expect("waits on Event cannot fail");
+        tracing::trace!("queue kicked by guest");
         Poll::Ready(())
     }
 

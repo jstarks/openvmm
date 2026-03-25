@@ -197,6 +197,18 @@ impl PackedQueueCompleteWork {
         context: &PackedQueueCompletionContext,
         bytes_written: u32,
     ) -> Result<bool, QueueError> {
+        self.write_used_entry(context, bytes_written)?;
+        self.should_signal()
+    }
+
+    /// Write a used descriptor entry and advance the ring index, but do not
+    /// check interrupt suppression. Use [`should_signal`](Self::should_signal)
+    /// after one or more writes to determine whether to deliver an interrupt.
+    pub fn write_used_entry(
+        &mut self,
+        context: &PackedQueueCompletionContext,
+        bytes_written: u32,
+    ) -> Result<(), QueueError> {
         let descriptor = PackedDescriptor::new()
             .with_buffer_id(context.buffer_id)
             .with_length(bytes_written)
@@ -211,6 +223,20 @@ impl PackedQueueCompleteWork {
         self.queue_desc
             .write_plain(descriptor_offset(self.next_index), &descriptor)
             .map_err(QueueError::Memory)?;
+        let next_index = (self.next_index + context.descriptor_count) % self.queue_size;
+        if next_index < self.next_index {
+            self.wrapped_bit = !self.wrapped_bit;
+        }
+        self.next_index = next_index;
+        Ok(())
+    }
+
+    /// Check whether the guest wants an interrupt after used ring updates.
+    ///
+    /// Must be called after one or more [`write_used_entry`](Self::write_used_entry)
+    /// calls. Issues a `SeqCst` fence to ensure descriptor updates are
+    /// visible before reading the driver event suppression field.
+    pub fn should_signal(&self) -> Result<bool, QueueError> {
         // Ensure the descriptor update is visible before checking if the guest requires notification.
         atomic::fence(atomic::Ordering::SeqCst);
         let driver_event: PackedEventSuppression = self
@@ -220,15 +246,23 @@ impl PackedQueueCompleteWork {
         let send_signal = match driver_event.flags() {
             EventSuppressionFlags::Disabled => false,
             EventSuppressionFlags::DescriptorIndex if self.use_event_index => {
-                driver_event.offset() == self.next_index && driver_event.wrap() == self.wrapped_bit
+                // Check if we've passed the requested notification index.
+                // After write_used_entry, next_index has already been advanced
+                // past the entry we wrote.
+                let prev_index = if self.next_index == 0 {
+                    self.queue_size - 1
+                } else {
+                    self.next_index - 1
+                };
+                let prev_wrap = if self.next_index == 0 {
+                    !self.wrapped_bit
+                } else {
+                    self.wrapped_bit
+                };
+                driver_event.offset() == prev_index && driver_event.wrap() == prev_wrap
             }
             _ => true,
         };
-        let next_index = (self.next_index + context.descriptor_count) % self.queue_size;
-        if next_index < self.next_index {
-            self.wrapped_bit = !self.wrapped_bit;
-        }
-        self.next_index = next_index;
         Ok(send_signal)
     }
 }

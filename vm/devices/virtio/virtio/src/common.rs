@@ -354,22 +354,27 @@ impl VirtioQueue {
         Ok(PeekedWork::new(self, work))
     }
 
-    /// Complete a descriptor previously obtained from this queue.
+    /// Complete a single descriptor and signal the guest if needed.
     ///
-    /// Writes `bytes_written` to the used ring and delivers an interrupt
-    /// to the guest (unless interrupt suppression is active).
+    /// This is a convenience wrapper around [`complete_batch`](Self::complete_batch).
     pub fn complete(&mut self, work: &mut VirtioQueueCallbackWork, bytes_written: u32) {
-        match self.complete.complete_descriptor(&work.work, bytes_written) {
-            Ok(true) => {
-                self.notify_guest.deliver();
-            }
-            Ok(false) => {}
-            Err(err) => {
-                tracelimit::error_ratelimited!(
-                    error = &err as &dyn std::error::Error,
-                    "failed to complete descriptor"
-                );
-            }
+        let mut batch = self.complete_batch();
+        batch.complete(work, bytes_written);
+        // drop signals
+    }
+
+    /// Start a batch of completions.
+    ///
+    /// Used ring entries are written immediately by each
+    /// [`CompletionBatch::complete`] call, but interrupt suppression is
+    /// checked and the interrupt is delivered only once, when the batch is
+    /// dropped.
+    ///
+    /// If the batch completes zero items, drop is a no-op.
+    pub fn complete_batch(&mut self) -> CompletionBatch<'_> {
+        CompletionBatch {
+            queue: self,
+            dirty: false,
         }
     }
 
@@ -382,6 +387,60 @@ impl VirtioQueue {
                 return Poll::Ready(Ok(work));
             }
             ready!(self.poll_kick(cx));
+        }
+    }
+}
+
+/// A batch of descriptor completions that defers interrupt delivery.
+///
+/// Each [`complete`](Self::complete) call writes a used ring entry
+/// immediately. When the batch is dropped, interrupt suppression is
+/// checked once and the interrupt is delivered if needed. This avoids
+/// a `SeqCst` fence + guest memory read per completion in burst
+/// scenarios.
+///
+/// Created by [`VirtioQueue::complete_batch`].
+pub struct CompletionBatch<'a> {
+    queue: &'a mut VirtioQueue,
+    dirty: bool,
+}
+
+impl CompletionBatch<'_> {
+    /// Complete a single descriptor within this batch.
+    ///
+    /// Writes the used ring entry immediately but defers the interrupt
+    /// suppression check until the batch is dropped.
+    pub fn complete(&mut self, work: &mut VirtioQueueCallbackWork, bytes_written: u32) {
+        if let Err(err) = self
+            .queue
+            .complete
+            .write_used_entry(&work.work, bytes_written)
+        {
+            tracelimit::error_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "failed to write used ring entry"
+            );
+            return;
+        }
+        self.dirty = true;
+    }
+}
+
+impl Drop for CompletionBatch<'_> {
+    fn drop(&mut self) {
+        if self.dirty {
+            match self.queue.complete.should_signal() {
+                Ok(true) => {
+                    self.queue.notify_guest.deliver();
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracelimit::error_ratelimited!(
+                        error = &err as &dyn std::error::Error,
+                        "failed to check interrupt suppression"
+                    );
+                }
+            }
         }
     }
 }

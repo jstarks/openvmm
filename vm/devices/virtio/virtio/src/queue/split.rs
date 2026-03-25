@@ -221,23 +221,44 @@ impl SplitQueueCompleteWork {
         descriptor_index: u16,
         bytes_written: u32,
     ) -> Result<bool, QueueError> {
+        self.write_used_entry(descriptor_index, bytes_written)?;
+        self.should_signal()
+    }
+
+    /// Write a used ring entry and advance the used index, but do not check
+    /// interrupt suppression. Use [`should_signal`](Self::should_signal)
+    /// after one or more writes to determine whether to deliver an interrupt.
+    pub fn write_used_entry(
+        &mut self,
+        descriptor_index: u16,
+        bytes_written: u32,
+    ) -> Result<(), QueueError> {
         self.set_used_descriptor(self.last_used_index, descriptor_index, bytes_written)?;
-        let last_used_index = self.last_used_index;
         self.last_used_index = self.last_used_index.wrapping_add(1);
 
         // Ensure used element writes are ordered before used index write.
         atomic::fence(atomic::Ordering::Release);
         self.set_used_index(self.last_used_index)?;
+        Ok(())
+    }
 
+    /// Check whether the guest wants an interrupt after used ring updates.
+    ///
+    /// Must be called after one or more [`write_used_entry`](Self::write_used_entry)
+    /// calls. Issues a `SeqCst` fence to ensure the used index is visible
+    /// before reading the suppression field.
+    pub fn should_signal(&self) -> Result<bool, QueueError> {
         // Ensure the used index write is visible before reading the field that
         // determines whether to signal.
         atomic::fence(atomic::Ordering::SeqCst);
         let send_signal = if self.use_ring_event_index {
-            last_used_index == self.get_used_event()?
+            // With event index, signal when last_used_index - 1 == used_event.
+            // After write_used_entry, last_used_index has already been advanced,
+            // so the entry we just wrote is at last_used_index - 1.
+            self.last_used_index.wrapping_sub(1) == self.get_used_event()?
         } else {
             !self.get_available_flags()?.no_interrupt()
         };
-
         Ok(send_signal)
     }
 

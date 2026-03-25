@@ -442,6 +442,34 @@ impl QueueCoreCompleteWork {
             }
         }
     }
+
+    /// Write a used ring entry without checking interrupt suppression.
+    /// Call [`should_signal`](Self::should_signal) after one or more writes.
+    pub fn write_used_entry(
+        &mut self,
+        work: &QueueWork,
+        bytes_written: u32,
+    ) -> Result<(), QueueError> {
+        match &mut self.inner {
+            QueueCompleteWorkInner::Split(split) => {
+                split.write_used_entry(work.descriptor_index, bytes_written)
+            }
+            QueueCompleteWorkInner::Packed(packed) => {
+                let QueueCompletionContext::Packed(context) = &work.context else {
+                    panic!("mismatched queue completion context for packed queue");
+                };
+                packed.write_used_entry(context, bytes_written)
+            }
+        }
+    }
+
+    /// Check whether the guest wants an interrupt after used ring updates.
+    pub fn should_signal(&self) -> Result<bool, QueueError> {
+        match &self.inner {
+            QueueCompleteWorkInner::Split(split) => split.should_signal(),
+            QueueCompleteWorkInner::Packed(packed) => packed.should_signal(),
+        }
+    }
 }
 
 pub(crate) fn new_queue(

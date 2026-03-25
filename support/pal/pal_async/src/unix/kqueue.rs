@@ -520,6 +520,14 @@ impl PollTimer for Timer {
     }
 }
 
+impl crate::ready_set::SocketReadySetDriver for KqueueDriver {
+    type ReadySet = crate::ready_set::NestedFdReadySet<FdReady>;
+
+    fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
+        crate::ready_set::NestedFdReadySet::new(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::KqueuePool;
@@ -551,5 +559,10 @@ mod tests {
     #[test]
     fn socket_works() {
         KqueuePool::run_with(executor_tests::socket_tests)
+    }
+
+    #[test]
+    fn ready_set_works() {
+        KqueuePool::run_with(executor_tests::ready_set_tests)
     }
 }

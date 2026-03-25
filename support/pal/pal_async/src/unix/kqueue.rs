@@ -520,8 +520,194 @@ impl PollTimer for Timer {
     }
 }
 
+/// Kqueue-based inner poller for [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
+pub struct KqueueInnerPoller;
+
+impl super::ready_set::InnerPoller for KqueueInnerPoller {
+    fn create() -> io::Result<OwnedFd> {
+        // SAFETY: kqueue creates a new, uniquely owned fd.
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is a newly created, uniquely owned file descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
+        let mut changelist = Vec::new();
+        if events.has_in() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                udata: key as u64,
+                ..empty_event()
+            });
+        }
+        if events.has_out() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_WRITE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                udata: key as u64,
+                ..empty_event()
+            });
+        }
+        if !changelist.is_empty() {
+            kevent64_nowait(inner_fd, &changelist, &mut [])?;
+        }
+        Ok(())
+    }
+
+    fn deregister(inner_fd: &OwnedFd, fd: RawFd, events: PollEvents) -> io::Result<()> {
+        let mut changelist = Vec::new();
+        if events.has_in() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_DELETE,
+                ..empty_event()
+            });
+        }
+        if events.has_out() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_WRITE,
+                flags: libc::EV_DELETE,
+                ..empty_event()
+            });
+        }
+        if !changelist.is_empty() {
+            kevent64_nowait(inner_fd, &changelist, &mut [])?;
+        }
+        Ok(())
+    }
+
+    fn reregister(
+        inner_fd: &OwnedFd,
+        fd: RawFd,
+        key: usize,
+        old_events: PollEvents,
+        new_events: PollEvents,
+    ) -> io::Result<()> {
+        let mut changelist = Vec::new();
+        if old_events.has_in() && !new_events.has_in() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_DELETE,
+                ..empty_event()
+            });
+        }
+        if old_events.has_out() && !new_events.has_out() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_WRITE,
+                flags: libc::EV_DELETE,
+                ..empty_event()
+            });
+        }
+        if new_events.has_in() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                udata: key as u64,
+                ..empty_event()
+            });
+        }
+        if new_events.has_out() {
+            changelist.push(libc::kevent64_s {
+                ident: fd as u64,
+                filter: libc::EVFILT_WRITE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                udata: key as u64,
+                ..empty_event()
+            });
+        }
+        if !changelist.is_empty() {
+            kevent64_nowait(inner_fd, &changelist, &mut [])?;
+        }
+        Ok(())
+    }
+
+    fn drain(
+        inner_fd: &OwnedFd,
+        entries: &std::collections::HashMap<usize, super::ready_set::SocketEntry>,
+        out: &mut Vec<crate::ready_set::ReadyEvent>,
+    ) -> io::Result<()> {
+        let mut events = [empty_event(); 32];
+        loop {
+            let n = kevent64_nowait(inner_fd, &[], &mut events)?;
+            if n == 0 {
+                break;
+            }
+            for event in &events[..n] {
+                let key = event.udata as usize;
+                if entries.contains_key(&key) {
+                    let mut revents = PollEvents::EMPTY;
+                    match event.filter {
+                        libc::EVFILT_READ => {
+                            revents |= PollEvents::IN;
+                            if event.flags & libc::EV_EOF != 0 {
+                                revents |= PollEvents::RDHUP;
+                            }
+                        }
+                        libc::EVFILT_WRITE => {
+                            revents |= PollEvents::OUT;
+                            if event.flags & libc::EV_EOF != 0 {
+                                revents |= PollEvents::HUP;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !revents.is_empty() {
+                        out.push(crate::ready_set::ReadyEvent {
+                            key,
+                            events: revents,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Non-blocking kevent64 wrapper for ready set operations.
+fn kevent64_nowait(
+    fd: &OwnedFd,
+    changelist: &[libc::kevent64_s],
+    eventlist: &mut [libc::kevent64_s],
+) -> io::Result<usize> {
+    let timeout = zero_timespec();
+    loop {
+        // SAFETY: calling kevent64 with valid fd and properly sized buffers.
+        let n = unsafe {
+            libc::kevent64(
+                fd.as_raw_fd(),
+                changelist.as_ptr(),
+                changelist.len() as i32,
+                eventlist.as_mut_ptr(),
+                eventlist.len() as i32,
+                0,
+                &timeout,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(n as usize);
+    }
+}
+
 impl crate::ready_set::SocketReadySetDriver for KqueueDriver {
-    type ReadySet = super::ready_set::NestedFdReadySet<FdReady>;
+    type ReadySet = super::ready_set::NestedFdReadySet<FdReady, KqueueInnerPoller>;
 
     fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
         super::ready_set::NestedFdReadySet::new(self)

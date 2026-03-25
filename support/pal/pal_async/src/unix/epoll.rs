@@ -458,8 +458,137 @@ impl PollTimer for Timer {
     }
 }
 
+/// Epoll-based inner poller for [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
+pub struct EpollInnerPoller;
+
+impl super::ready_set::InnerPoller for EpollInnerPoller {
+    fn create() -> io::Result<OwnedFd> {
+        // SAFETY: epoll_create1 creates a new, uniquely owned fd.
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is a newly created, uniquely owned file descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: poll_events_to_epoll(events),
+            u64: key as u64,
+        };
+        // SAFETY: calling epoll_ctl with valid epoll fd.
+        if unsafe { libc::epoll_ctl(inner_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn deregister(inner_fd: &OwnedFd, fd: RawFd, _events: PollEvents) -> io::Result<()> {
+        // SAFETY: calling epoll_ctl with valid epoll fd.
+        if unsafe {
+            libc::epoll_ctl(
+                inner_fd.as_raw_fd(),
+                libc::EPOLL_CTL_DEL,
+                fd,
+                std::ptr::null_mut(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn reregister(
+        inner_fd: &OwnedFd,
+        fd: RawFd,
+        key: usize,
+        _old_events: PollEvents,
+        new_events: PollEvents,
+    ) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: poll_events_to_epoll(new_events),
+            u64: key as u64,
+        };
+        // SAFETY: calling epoll_ctl with valid epoll fd.
+        if unsafe { libc::epoll_ctl(inner_fd.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, &mut event) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn drain(
+        inner_fd: &OwnedFd,
+        entries: &std::collections::HashMap<usize, super::ready_set::SocketEntry>,
+        out: &mut Vec<crate::ready_set::ReadyEvent>,
+    ) -> io::Result<()> {
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 32];
+        loop {
+            // SAFETY: epoll_wait with valid fd and properly sized buffer.
+            let n = unsafe {
+                libc::epoll_wait(
+                    inner_fd.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    0, // non-blocking
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            let n = n as usize;
+            if n == 0 {
+                break;
+            }
+            for event in &events[..n] {
+                let key = event.u64 as usize;
+                if entries.contains_key(&key) {
+                    let revents = PollEvents::from_epoll_events(event.events);
+                    if !revents.is_empty() {
+                        out.push(crate::ready_set::ReadyEvent {
+                            key,
+                            events: revents,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn poll_events_to_epoll(events: PollEvents) -> u32 {
+    let mut ep = libc::EPOLLET as u32;
+    if events.has_in() {
+        ep |= libc::EPOLLIN as u32;
+    }
+    if events.has_out() {
+        ep |= libc::EPOLLOUT as u32;
+    }
+    if events.has_err() {
+        ep |= libc::EPOLLERR as u32;
+    }
+    if events.has_hup() {
+        ep |= libc::EPOLLHUP as u32;
+    }
+    if events.has_pri() {
+        ep |= libc::EPOLLPRI as u32;
+    }
+    if events.has_rdhup() {
+        ep |= libc::EPOLLRDHUP as u32;
+    }
+    ep
+}
+
 impl crate::ready_set::SocketReadySetDriver for EpollDriver {
-    type ReadySet = super::ready_set::NestedFdReadySet<FdReady>;
+    type ReadySet = super::ready_set::NestedFdReadySet<FdReady, EpollInnerPoller>;
 
     fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
         super::ready_set::NestedFdReadySet::new(self)

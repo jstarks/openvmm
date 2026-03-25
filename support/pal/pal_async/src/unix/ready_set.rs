@@ -1,8 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! [`NestedFdReadySet`] — a [`PollReadySet`] backed by a nested epoll (Linux)
-//! or kqueue (macOS) fd.
+//! [`NestedFdReadySet`] — a [`PollReadySet`] backed by a nested poller fd.
+//!
+//! The platform-specific inner poller operations are provided via the
+//! [`InnerPoller`] trait, implemented in `epoll.rs` (Linux) and `kqueue.rs`
+//! (macOS).
 
 use crate::fd::FdReadyDriver;
 use crate::fd::PollFdReady;
@@ -12,10 +15,41 @@ use crate::ready_set::PollReadySet;
 use crate::ready_set::ReadyEvent;
 use std::collections::HashMap;
 use std::io;
+use std::marker::PhantomData;
 use std::os::unix::prelude::*;
 use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
+
+/// Platform-specific inner poller operations.
+///
+/// Implemented by the epoll backend (Linux) and kqueue backend (macOS).
+pub trait InnerPoller {
+    /// Creates a new inner poller fd.
+    fn create() -> io::Result<OwnedFd>;
+
+    /// Registers a socket fd with the inner poller.
+    fn register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()>;
+
+    /// Deregisters a socket fd from the inner poller.
+    fn deregister(inner_fd: &OwnedFd, fd: RawFd, events: PollEvents) -> io::Result<()>;
+
+    /// Changes the monitored events for a socket in the inner poller.
+    fn reregister(
+        inner_fd: &OwnedFd,
+        fd: RawFd,
+        key: usize,
+        old_events: PollEvents,
+        new_events: PollEvents,
+    ) -> io::Result<()>;
+
+    /// Non-blocking drain of all ready events from the inner poller.
+    fn drain(
+        inner_fd: &OwnedFd,
+        entries: &HashMap<usize, SocketEntry>,
+        out: &mut Vec<ReadyEvent>,
+    ) -> io::Result<()>;
+}
 
 /// A ready set backed by a nested epoll (Linux) or kqueue (macOS) fd.
 ///
@@ -24,37 +58,39 @@ use std::task::ready;
 /// outer driver wakes the set, which performs a non-blocking batch drain
 /// of the inner poller.
 ///
-/// The type parameter `F` is the outer driver's [`PollFdReady`]
-/// implementation.
-pub struct NestedFdReadySet<F> {
+/// `F` is the outer driver's [`PollFdReady`] implementation.
+/// `P` is the platform's [`InnerPoller`] implementation.
+pub struct NestedFdReadySet<F, P> {
     // Drop order matters: outer_ready must be dropped first (deregisters
     // the inner fd from the outer poller), then inner_fd (closes the inner
     // poller fd).
     outer_ready: F,
     inner_fd: OwnedFd,
     entries: HashMap<usize, SocketEntry>,
+    _poller: PhantomData<fn() -> P>,
 }
 
-struct SocketEntry {
-    fd: RawFd,
-    events: PollEvents,
+pub struct SocketEntry {
+    pub fd: RawFd,
+    pub events: PollEvents,
 }
 
-impl<F: PollFdReady> NestedFdReadySet<F> {
+impl<F: PollFdReady, P: InnerPoller> NestedFdReadySet<F, P> {
     /// Creates a new nested-fd ready set, registering the inner poller with
     /// the given driver for wakeup integration.
     pub fn new(driver: &impl FdReadyDriver<FdReady = F>) -> io::Result<Self> {
-        let inner_fd = create_inner()?;
+        let inner_fd = P::create()?;
         let outer_ready = driver.new_fd_ready(inner_fd.as_raw_fd())?;
         Ok(Self {
             outer_ready,
             inner_fd,
             entries: HashMap::new(),
+            _poller: PhantomData,
         })
     }
 }
 
-impl<F: PollFdReady> PollReadySet for NestedFdReadySet<F> {
+impl<F: PollFdReady, P: InnerPoller> PollReadySet for NestedFdReadySet<F, P> {
     fn add(&mut self, key: usize, fd: RawFd, events: PollEvents) -> io::Result<()> {
         if self.entries.contains_key(&key) {
             return Err(io::Error::new(
@@ -62,7 +98,7 @@ impl<F: PollFdReady> PollReadySet for NestedFdReadySet<F> {
                 "key already exists in ready set",
             ));
         }
-        inner_register(&self.inner_fd, fd, key, events)?;
+        P::register(&self.inner_fd, fd, key, events)?;
         self.entries.insert(key, SocketEntry { fd, events });
         Ok(())
     }
@@ -72,7 +108,7 @@ impl<F: PollFdReady> PollReadySet for NestedFdReadySet<F> {
             .entries
             .remove(&key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "key not found in ready set"))?;
-        inner_deregister(&self.inner_fd, entry.fd, entry.events)?;
+        P::deregister(&self.inner_fd, entry.fd, entry.events)?;
         Ok(())
     }
 
@@ -82,7 +118,7 @@ impl<F: PollFdReady> PollReadySet for NestedFdReadySet<F> {
             .get_mut(&key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "key not found in ready set"))?;
         let old_events = entry.events;
-        inner_reregister(&self.inner_fd, entry.fd, key, old_events, events)?;
+        P::reregister(&self.inner_fd, entry.fd, key, old_events, events)?;
         entry.events = events;
         Ok(())
     }
@@ -99,7 +135,7 @@ impl<F: PollFdReady> PollReadySet for NestedFdReadySet<F> {
             );
 
             let start_len = out.len();
-            inner_drain(&self.inner_fd, &self.entries, out)?;
+            P::drain(&self.inner_fd, &self.entries, out)?;
 
             // Clear outer readiness — the inner poller has been fully drained.
             self.outer_ready.clear_fd_ready(InterestSlot::Read);
@@ -109,341 +145,5 @@ impl<F: PollFdReady> PollReadySet for NestedFdReadySet<F> {
             }
             // Spurious wakeup, loop to re-poll.
         }
-    }
-}
-
-// --- Linux: epoll inner poller ---
-
-#[cfg(target_os = "linux")]
-fn create_inner() -> io::Result<OwnedFd> {
-    // SAFETY: epoll_create1 creates a new, uniquely owned fd.
-    let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is a newly created, uniquely owned file descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-#[cfg(target_os = "linux")]
-fn inner_register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
-    let mut event = libc::epoll_event {
-        events: poll_events_to_epoll(events),
-        u64: key as u64,
-    };
-    // SAFETY: calling epoll_ctl with valid epoll fd.
-    if unsafe { libc::epoll_ctl(inner_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn inner_deregister(inner_fd: &OwnedFd, fd: RawFd, _events: PollEvents) -> io::Result<()> {
-    // SAFETY: calling epoll_ctl with valid epoll fd.
-    if unsafe {
-        libc::epoll_ctl(
-            inner_fd.as_raw_fd(),
-            libc::EPOLL_CTL_DEL,
-            fd,
-            std::ptr::null_mut(),
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn inner_reregister(
-    inner_fd: &OwnedFd,
-    fd: RawFd,
-    key: usize,
-    _old_events: PollEvents,
-    new_events: PollEvents,
-) -> io::Result<()> {
-    let mut event = libc::epoll_event {
-        events: poll_events_to_epoll(new_events),
-        u64: key as u64,
-    };
-    // SAFETY: calling epoll_ctl with valid epoll fd.
-    if unsafe { libc::epoll_ctl(inner_fd.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, &mut event) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn inner_drain(
-    inner_fd: &OwnedFd,
-    entries: &HashMap<usize, SocketEntry>,
-    out: &mut Vec<ReadyEvent>,
-) -> io::Result<()> {
-    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 32];
-    loop {
-        // SAFETY: epoll_wait with valid fd and properly sized buffer.
-        let n = unsafe {
-            libc::epoll_wait(
-                inner_fd.as_raw_fd(),
-                events.as_mut_ptr(),
-                events.len() as i32,
-                0, // non-blocking
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(err);
-        }
-        let n = n as usize;
-        if n == 0 {
-            break;
-        }
-        for event in &events[..n] {
-            let key = event.u64 as usize;
-            if entries.contains_key(&key) {
-                let revents = PollEvents::from_epoll_events(event.events);
-                if !revents.is_empty() {
-                    out.push(ReadyEvent {
-                        key,
-                        events: revents,
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn poll_events_to_epoll(events: PollEvents) -> u32 {
-    let mut ep = libc::EPOLLET as u32;
-    if events.has_in() {
-        ep |= libc::EPOLLIN as u32;
-    }
-    if events.has_out() {
-        ep |= libc::EPOLLOUT as u32;
-    }
-    if events.has_err() {
-        ep |= libc::EPOLLERR as u32;
-    }
-    if events.has_hup() {
-        ep |= libc::EPOLLHUP as u32;
-    }
-    if events.has_pri() {
-        ep |= libc::EPOLLPRI as u32;
-    }
-    if events.has_rdhup() {
-        ep |= libc::EPOLLRDHUP as u32;
-    }
-    ep
-}
-
-// --- macOS: kqueue inner poller ---
-
-#[cfg(target_os = "macos")]
-fn create_inner() -> io::Result<OwnedFd> {
-    // SAFETY: kqueue creates a new, uniquely owned fd.
-    let fd = unsafe { libc::kqueue() };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is a newly created, uniquely owned file descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-#[cfg(target_os = "macos")]
-fn inner_register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
-    let mut changelist = Vec::new();
-    if events.has_in() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            udata: key as u64,
-            ..empty_kevent()
-        });
-    }
-    if events.has_out() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_WRITE,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            udata: key as u64,
-            ..empty_kevent()
-        });
-    }
-    if !changelist.is_empty() {
-        kevent64(inner_fd, &changelist, &mut [])?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn inner_deregister(inner_fd: &OwnedFd, fd: RawFd, events: PollEvents) -> io::Result<()> {
-    let mut changelist = Vec::new();
-    if events.has_in() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_DELETE,
-            ..empty_kevent()
-        });
-    }
-    if events.has_out() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_WRITE,
-            flags: libc::EV_DELETE,
-            ..empty_kevent()
-        });
-    }
-    if !changelist.is_empty() {
-        kevent64(inner_fd, &changelist, &mut [])?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn inner_reregister(
-    inner_fd: &OwnedFd,
-    fd: RawFd,
-    key: usize,
-    old_events: PollEvents,
-    new_events: PollEvents,
-) -> io::Result<()> {
-    let mut changelist = Vec::new();
-    // Remove filters no longer needed.
-    if old_events.has_in() && !new_events.has_in() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_DELETE,
-            ..empty_kevent()
-        });
-    }
-    if old_events.has_out() && !new_events.has_out() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_WRITE,
-            flags: libc::EV_DELETE,
-            ..empty_kevent()
-        });
-    }
-    // Add or re-add filters.
-    if new_events.has_in() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            udata: key as u64,
-            ..empty_kevent()
-        });
-    }
-    if new_events.has_out() {
-        changelist.push(libc::kevent64_s {
-            ident: fd as u64,
-            filter: libc::EVFILT_WRITE,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            udata: key as u64,
-            ..empty_kevent()
-        });
-    }
-    if !changelist.is_empty() {
-        kevent64(inner_fd, &changelist, &mut [])?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn inner_drain(
-    inner_fd: &OwnedFd,
-    entries: &HashMap<usize, SocketEntry>,
-    out: &mut Vec<ReadyEvent>,
-) -> io::Result<()> {
-    let mut events = [empty_kevent(); 32];
-    loop {
-        let n = kevent64(inner_fd, &[], &mut events)?;
-        if n == 0 {
-            break;
-        }
-        for event in &events[..n] {
-            let key = event.udata as usize;
-            if entries.contains_key(&key) {
-                let mut revents = PollEvents::EMPTY;
-                match event.filter {
-                    libc::EVFILT_READ => {
-                        revents |= PollEvents::IN;
-                        if event.flags & libc::EV_EOF != 0 {
-                            revents |= PollEvents::RDHUP;
-                        }
-                    }
-                    libc::EVFILT_WRITE => {
-                        revents |= PollEvents::OUT;
-                        if event.flags & libc::EV_EOF != 0 {
-                            revents |= PollEvents::HUP;
-                        }
-                    }
-                    _ => {}
-                }
-                if !revents.is_empty() {
-                    out.push(ReadyEvent {
-                        key,
-                        events: revents,
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn kevent64(
-    fd: &OwnedFd,
-    changelist: &[libc::kevent64_s],
-    eventlist: &mut [libc::kevent64_s],
-) -> io::Result<usize> {
-    let timeout = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    loop {
-        // SAFETY: calling kevent64 with valid fd and properly sized buffers.
-        let n = unsafe {
-            libc::kevent64(
-                fd.as_raw_fd(),
-                changelist.as_ptr(),
-                changelist.len() as i32,
-                eventlist.as_mut_ptr(),
-                eventlist.len() as i32,
-                0,
-                &timeout,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(err);
-        }
-        return Ok(n as usize);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn empty_kevent() -> libc::kevent64_s {
-    libc::kevent64_s {
-        ident: 0,
-        filter: 0,
-        flags: 0,
-        fflags: 0,
-        data: 0,
-        udata: 0,
-        ext: [0; 2],
     }
 }

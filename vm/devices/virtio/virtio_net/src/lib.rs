@@ -1254,9 +1254,16 @@ impl Worker {
             return Ok(false);
         }
 
-        for i in 0..n {
-            let id = self.active_state.data.tx_done[i];
-            self.complete_tx_packet(id)?;
+        {
+            let mut batch = self.virtio_state.tx_queue.complete_batch();
+            for i in 0..n {
+                let id = self.active_state.data.tx_done[i];
+                let mut tx_packet = self.active_state.pending_tx_packets[id.0 as usize]
+                    .take()
+                    .unwrap();
+                batch.complete(&mut tx_packet.work, 0);
+                self.active_state.stats.tx_packets.increment();
+            }
         }
         self.active_state
             .stats
@@ -1283,6 +1290,7 @@ impl Worker {
 
         if sync {
             // Complete the packets now.
+            let mut batch = self.virtio_state.tx_queue.complete_batch();
             let mut i = 0;
             loop {
                 let segments = &self.active_state.data.tx_segments[..segments_sent][i..];
@@ -1294,19 +1302,15 @@ impl Worker {
                 };
                 let id = metadata.id;
                 i += metadata.segment_count as usize;
-                self.complete_tx_packet(id)?;
+                let mut tx_packet = self.active_state.pending_tx_packets[id.0 as usize]
+                    .take()
+                    .unwrap();
+                batch.complete(&mut tx_packet.work, 0);
+                self.active_state.stats.tx_packets.increment();
             }
         }
 
         self.active_state.data.tx_segments.drain(..segments_sent);
         Ok(segments_sent != 0)
-    }
-
-    fn complete_tx_packet(&mut self, id: TxId) -> Result<(), WorkerError> {
-        let state = &mut self.active_state;
-        let mut tx_packet = state.pending_tx_packets[id.0 as usize].take().unwrap();
-        self.virtio_state.tx_queue.complete(&mut tx_packet.work, 0);
-        self.active_state.stats.tx_packets.increment();
-        Ok(())
     }
 }

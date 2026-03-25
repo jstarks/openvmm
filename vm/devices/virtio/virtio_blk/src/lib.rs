@@ -125,16 +125,20 @@ impl BlkWorker {
     /// Complete a descriptor and accumulate stats.
     fn finish_io(&mut self, queue: &mut VirtioQueue, mut completion: IoCompletion) {
         queue.complete(&mut completion.work, completion.bytes_written);
+        Self::accumulate_stats(&mut self.stats, &completion);
+    }
+
+    fn accumulate_stats(stats: &mut WorkerStats, completion: &IoCompletion) {
         match completion.stat {
-            IoStat::Read => self.stats.read_ops.increment(),
-            IoStat::Write => self.stats.write_ops.increment(),
-            IoStat::Flush => self.stats.flush_ops.increment(),
-            IoStat::Discard => self.stats.discard_ops.increment(),
-            IoStat::Error => self.stats.errors.increment(),
+            IoStat::Read => stats.read_ops.increment(),
+            IoStat::Write => stats.write_ops.increment(),
+            IoStat::Flush => stats.flush_ops.increment(),
+            IoStat::Discard => stats.discard_ops.increment(),
+            IoStat::Error => stats.errors.increment(),
             IoStat::None => {}
         }
         if completion.bounced {
-            self.stats.bounce_ops.increment();
+            stats.bounce_ops.increment();
         }
     }
 
@@ -144,10 +148,17 @@ impl BlkWorker {
     /// The `FuturesUnordered` still holds any IOs that were in flight when
     /// `until_stopped` returned. This drains them, ensuring all descriptor
     /// completions are written to the used ring before the queue is dropped.
+    ///
+    /// Uses a [`CompletionBatch`] so that interrupt suppression is checked
+    /// only once after all descriptors are completed.
     fn poll_drain(&mut self, queue: &mut VirtioQueue, cx: &mut Context<'_>) -> Poll<()> {
+        let mut batch = queue.complete_batch();
         loop {
             match self.ios.poll_next_unpin(cx) {
-                Poll::Ready(Some(completion)) => self.finish_io(queue, completion),
+                Poll::Ready(Some(mut completion)) => {
+                    batch.complete(&mut completion.work, completion.bytes_written);
+                    Self::accumulate_stats(&mut self.stats, &completion);
+                }
                 Poll::Ready(None) => return Poll::Ready(()),
                 Poll::Pending => return Poll::Pending,
             }

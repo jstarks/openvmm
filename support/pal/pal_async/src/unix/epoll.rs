@@ -459,10 +459,10 @@ impl PollTimer for Timer {
 }
 
 impl crate::ready_set::SocketReadySetDriver for EpollDriver {
-    type ReadySet = crate::ready_set::NestedFdReadySet<FdReady>;
+    type ReadySet = super::ready_set::NestedFdReadySet<FdReady>;
 
     fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
-        crate::ready_set::NestedFdReadySet::new(self)
+        super::ready_set::NestedFdReadySet::new(self)
     }
 }
 

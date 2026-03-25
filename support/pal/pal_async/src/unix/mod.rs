@@ -11,6 +11,7 @@ use cfg_if::cfg_if;
 
 pub mod local;
 pub mod pipe;
+pub mod ready_set;
 pub mod wait;
 
 cfg_if! {

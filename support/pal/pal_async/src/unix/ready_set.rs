@@ -28,13 +28,13 @@ pub trait InnerPoller {
     /// Creates a new inner poller fd.
     fn create() -> io::Result<OwnedFd>;
 
-    /// Registers a socket fd with the inner poller.
+    /// Registers an fd with the inner poller.
     fn register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()>;
 
-    /// Deregisters a socket fd from the inner poller.
+    /// Deregisters an fd from the inner poller.
     fn deregister(inner_fd: &OwnedFd, fd: RawFd, events: PollEvents) -> io::Result<()>;
 
-    /// Changes the monitored events for a socket in the inner poller.
+    /// Changes the monitored events for an fd in the inner poller.
     fn reregister(
         inner_fd: &OwnedFd,
         fd: RawFd,
@@ -46,7 +46,7 @@ pub trait InnerPoller {
     /// Non-blocking drain of all ready events from the inner poller.
     fn drain(
         inner_fd: &OwnedFd,
-        entries: &HashMap<usize, SocketEntry>,
+        entries: &HashMap<usize, FdEntry>,
         out: &mut Vec<ReadyEvent>,
     ) -> io::Result<()>;
 }
@@ -54,9 +54,9 @@ pub trait InnerPoller {
 /// A ready set backed by a nested epoll (Linux) or kqueue (macOS) fd.
 ///
 /// An inner poller fd is created and registered with the outer driver as a
-/// single file descriptor. When any monitored socket becomes ready, the
-/// outer driver wakes the set, which performs a non-blocking batch drain
-/// of the inner poller.
+/// single file descriptor. When any monitored fd becomes ready, the outer
+/// driver wakes the set, which performs a non-blocking batch drain of the
+/// inner poller.
 ///
 /// `F` is the outer driver's [`PollFdReady`] implementation.
 /// `P` is the platform's [`InnerPoller`] implementation.
@@ -66,11 +66,11 @@ pub struct NestedFdReadySet<F, P> {
     // poller fd).
     outer_ready: F,
     inner_fd: OwnedFd,
-    entries: HashMap<usize, SocketEntry>,
+    entries: HashMap<usize, FdEntry>,
     _poller: PhantomData<fn() -> P>,
 }
 
-pub struct SocketEntry {
+pub struct FdEntry {
     pub fd: RawFd,
     pub events: PollEvents,
 }
@@ -99,7 +99,7 @@ impl<F: PollFdReady, P: InnerPoller> PollReadySet for NestedFdReadySet<F, P> {
             ));
         }
         P::register(&self.inner_fd, fd, key, events)?;
-        self.entries.insert(key, SocketEntry { fd, events });
+        self.entries.insert(key, FdEntry { fd, events });
         Ok(())
     }
 

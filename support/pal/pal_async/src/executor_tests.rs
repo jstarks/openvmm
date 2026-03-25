@@ -202,7 +202,7 @@ pub async fn socket_tests(driver: impl Driver) {
 
 /// Runs ready-set-related tests.
 #[cfg(unix)]
-pub async fn ready_set_tests(driver: impl Driver + crate::ready_set::SocketReadySetDriver) {
+pub async fn ready_set_tests(driver: impl Driver + crate::ready_set::ReadySetDriver) {
     use crate::interest::PollEvents;
     use crate::ready_set::PollReadySet;
 

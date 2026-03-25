@@ -522,7 +522,7 @@ impl super::ready_set::InnerPoller for EpollInnerPoller {
 
     fn drain(
         inner_fd: &OwnedFd,
-        entries: &std::collections::HashMap<usize, super::ready_set::SocketEntry>,
+        entries: &std::collections::HashMap<usize, super::ready_set::FdEntry>,
         out: &mut Vec<crate::ready_set::ReadyEvent>,
     ) -> io::Result<()> {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 32];
@@ -587,7 +587,7 @@ fn poll_events_to_epoll(events: PollEvents) -> u32 {
     ep
 }
 
-impl crate::ready_set::SocketReadySetDriver for EpollDriver {
+impl crate::ready_set::ReadySetDriver for EpollDriver {
     type ReadySet = super::ready_set::NestedFdReadySet<FdReady, EpollInnerPoller>;
 
     fn new_ready_set(&self) -> io::Result<Self::ReadySet> {

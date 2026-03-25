@@ -464,10 +464,14 @@ impl QueueCoreCompleteWork {
     }
 
     /// Check whether the guest wants an interrupt after used ring updates.
-    pub fn should_signal(&self) -> Result<bool, QueueError> {
+    ///
+    /// `old_used_index` is the value of [`used_index`](Self::used_index)
+    /// captured before the batch of [`write_used_entry`](Self::write_used_entry)
+    /// calls began. This is needed for the `F_EVENT_IDX` range check.
+    pub fn should_signal(&self, old_used_index: u16) -> Result<bool, QueueError> {
         match &self.inner {
-            QueueCompleteWorkInner::Split(split) => split.should_signal(),
-            QueueCompleteWorkInner::Packed(packed) => packed.should_signal(),
+            QueueCompleteWorkInner::Split(split) => split.should_signal(old_used_index),
+            QueueCompleteWorkInner::Packed(packed) => packed.should_signal(old_used_index),
         }
     }
 }

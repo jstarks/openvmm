@@ -221,8 +221,9 @@ impl SplitQueueCompleteWork {
         descriptor_index: u16,
         bytes_written: u32,
     ) -> Result<bool, QueueError> {
+        let old_used_index = self.last_used_index;
         self.write_used_entry(descriptor_index, bytes_written)?;
-        self.should_signal()
+        self.should_signal(old_used_index)
     }
 
     /// Write a used ring entry and advance the used index, but do not check
@@ -244,18 +245,21 @@ impl SplitQueueCompleteWork {
 
     /// Check whether the guest wants an interrupt after used ring updates.
     ///
-    /// Must be called after one or more [`write_used_entry`](Self::write_used_entry)
-    /// calls. Issues a `SeqCst` fence to ensure the used index is visible
-    /// before reading the suppression field.
-    pub fn should_signal(&self) -> Result<bool, QueueError> {
+    /// `old_used_index` is the value of `last_used_index` before the batch
+    /// of [`write_used_entry`](Self::write_used_entry) calls began. This is
+    /// needed for the `F_EVENT_IDX` range check: signal if `used_event`
+    /// falls anywhere in `[old_used_index, last_used_index)`.
+    pub fn should_signal(&self, old_used_index: u16) -> Result<bool, QueueError> {
         // Ensure the used index write is visible before reading the field that
         // determines whether to signal.
         atomic::fence(atomic::Ordering::SeqCst);
         let send_signal = if self.use_ring_event_index {
-            // With event index, signal when last_used_index - 1 == used_event.
-            // After write_used_entry, last_used_index has already been advanced,
-            // so the entry we just wrote is at last_used_index - 1.
-            self.last_used_index.wrapping_sub(1) == self.get_used_event()?
+            let event_idx = self.get_used_event()?;
+            let new_idx = self.last_used_index;
+            // vring_need_event: check if event_idx is in [old, new).
+            // Equivalent to: (new - event - 1) < (new - old) using
+            // wrapping u16 arithmetic.
+            new_idx.wrapping_sub(event_idx).wrapping_sub(1) < new_idx.wrapping_sub(old_used_index)
         } else {
             !self.get_available_flags()?.no_interrupt()
         };

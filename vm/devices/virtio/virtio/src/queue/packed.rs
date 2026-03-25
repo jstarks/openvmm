@@ -197,8 +197,9 @@ impl PackedQueueCompleteWork {
         context: &PackedQueueCompletionContext,
         bytes_written: u32,
     ) -> Result<bool, QueueError> {
+        let old_state = self.used_state();
         self.write_used_entry(context, bytes_written)?;
-        self.should_signal()
+        self.should_signal(old_state)
     }
 
     /// Write a used descriptor entry and advance the ring index, but do not
@@ -233,10 +234,12 @@ impl PackedQueueCompleteWork {
 
     /// Check whether the guest wants an interrupt after used ring updates.
     ///
-    /// Must be called after one or more [`write_used_entry`](Self::write_used_entry)
-    /// calls. Issues a `SeqCst` fence to ensure descriptor updates are
-    /// visible before reading the driver event suppression field.
-    pub fn should_signal(&self) -> Result<bool, QueueError> {
+    /// `old_state` is the return value of [`used_state`](Self::used_state)
+    /// captured before the batch of [`write_used_entry`](Self::write_used_entry)
+    /// calls began. This is needed for the event-index range check.
+    pub fn should_signal(&self, old_state: u16) -> Result<bool, QueueError> {
+        let old_index = old_state & 0x7FFF;
+        let old_wrap = (old_state >> 15) != 0;
         // Ensure the descriptor update is visible before checking if the guest requires notification.
         atomic::fence(atomic::Ordering::SeqCst);
         let driver_event: PackedEventSuppression = self
@@ -246,20 +249,17 @@ impl PackedQueueCompleteWork {
         let send_signal = match driver_event.flags() {
             EventSuppressionFlags::Disabled => false,
             EventSuppressionFlags::DescriptorIndex if self.use_event_index => {
-                // Check if we've passed the requested notification index.
-                // After write_used_entry, next_index has already been advanced
-                // past the entry we wrote.
-                let prev_index = if self.next_index == 0 {
-                    self.queue_size - 1
-                } else {
-                    self.next_index - 1
-                };
-                let prev_wrap = if self.next_index == 0 {
-                    !self.wrapped_bit
-                } else {
-                    self.wrapped_bit
-                };
-                driver_event.offset() == prev_index && driver_event.wrap() == prev_wrap
+                // Check if the driver's requested (offset, wrap) falls within
+                // the range of positions [old, new) that we advanced through.
+                // Linearize: wrap=true → [0, queue_size), wrap=false → [queue_size, 2*queue_size).
+                let qs = self.queue_size as u32;
+                let cycle = qs * 2;
+                let linearize = |idx: u16, wrap: bool| idx as u32 + if wrap { 0 } else { qs };
+                let ev = linearize(driver_event.offset(), driver_event.wrap());
+                let new = linearize(self.next_index, self.wrapped_bit);
+                let old = linearize(old_index, old_wrap);
+                // Range check: is ev in [old, new) modulo cycle?
+                (new + cycle - ev - 1) % cycle < (new + cycle - old) % cycle
             }
             _ => true,
         };

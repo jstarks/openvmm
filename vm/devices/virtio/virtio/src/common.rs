@@ -372,8 +372,10 @@ impl VirtioQueue {
     ///
     /// If the batch completes zero items, drop is a no-op.
     pub fn complete_batch(&mut self) -> CompletionBatch<'_> {
+        let batch_start = self.complete.used_index();
         CompletionBatch {
             queue: self,
+            batch_start,
             dirty: false,
         }
     }
@@ -402,6 +404,7 @@ impl VirtioQueue {
 /// Created by [`VirtioQueue::complete_batch`].
 pub struct CompletionBatch<'a> {
     queue: &'a mut VirtioQueue,
+    batch_start: u16,
     dirty: bool,
 }
 
@@ -429,7 +432,7 @@ impl CompletionBatch<'_> {
 impl Drop for CompletionBatch<'_> {
     fn drop(&mut self) {
         if self.dirty {
-            match self.queue.complete.should_signal() {
+            match self.queue.complete.should_signal(self.batch_start) {
                 Ok(true) => {
                     self.queue.notify_guest.deliver();
                 }

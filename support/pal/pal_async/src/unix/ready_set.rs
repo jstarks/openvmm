@@ -15,7 +15,6 @@ use crate::ready_set::PollReadySet;
 use crate::ready_set::ReadyEvent;
 use std::collections::HashMap;
 use std::io;
-use std::marker::PhantomData;
 use std::os::unix::prelude::*;
 use std::task::Context;
 use std::task::Poll;
@@ -23,20 +22,23 @@ use std::task::ready;
 
 /// Platform-specific inner poller operations.
 ///
+/// Implementors are newtypes around `OwnedFd` that implement [`AsFd`].
 /// Implemented by the epoll backend (Linux) and kqueue backend (macOS).
-pub trait InnerPoller {
-    /// Creates a new inner poller fd.
-    fn create() -> io::Result<OwnedFd>;
+pub trait InnerPoller: AsFd + Send + Unpin {
+    /// Creates a new inner poller.
+    fn create() -> io::Result<Self>
+    where
+        Self: Sized;
 
     /// Registers an fd with the inner poller.
-    fn register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()>;
+    fn register(&self, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()>;
 
     /// Deregisters an fd from the inner poller.
-    fn deregister(inner_fd: &OwnedFd, fd: RawFd, events: PollEvents) -> io::Result<()>;
+    fn deregister(&self, fd: RawFd, events: PollEvents) -> io::Result<()>;
 
     /// Changes the monitored events for an fd in the inner poller.
     fn reregister(
-        inner_fd: &OwnedFd,
+        &self,
         fd: RawFd,
         key: usize,
         old_events: PollEvents,
@@ -44,11 +46,8 @@ pub trait InnerPoller {
     ) -> io::Result<()>;
 
     /// Non-blocking drain of all ready events from the inner poller.
-    fn drain(
-        inner_fd: &OwnedFd,
-        entries: &HashMap<usize, FdEntry>,
-        out: &mut Vec<ReadyEvent>,
-    ) -> io::Result<()>;
+    fn drain(&self, entries: &HashMap<usize, FdEntry>, out: &mut Vec<ReadyEvent>)
+    -> io::Result<()>;
 }
 
 /// A ready set backed by a nested epoll (Linux) or kqueue (macOS) fd.
@@ -62,12 +61,11 @@ pub trait InnerPoller {
 /// `P` is the platform's [`InnerPoller`] implementation.
 pub struct NestedFdReadySet<F, P> {
     // Drop order matters: outer_ready must be dropped first (deregisters
-    // the inner fd from the outer poller), then inner_fd (closes the inner
-    // poller fd).
+    // the inner fd from the outer poller), then inner poller (closes the
+    // inner fd).
     outer_ready: F,
-    inner_fd: OwnedFd,
+    inner: P,
     entries: HashMap<usize, FdEntry>,
-    _poller: PhantomData<fn() -> P>,
 }
 
 pub struct FdEntry {
@@ -79,13 +77,12 @@ impl<F: PollFdReady, P: InnerPoller> NestedFdReadySet<F, P> {
     /// Creates a new nested-fd ready set, registering the inner poller with
     /// the given driver for wakeup integration.
     pub fn new(driver: &impl FdReadyDriver<FdReady = F>) -> io::Result<Self> {
-        let inner_fd = P::create()?;
-        let outer_ready = driver.new_fd_ready(inner_fd.as_raw_fd())?;
+        let inner = P::create()?;
+        let outer_ready = driver.new_fd_ready(inner.as_fd().as_raw_fd())?;
         Ok(Self {
             outer_ready,
-            inner_fd,
+            inner,
             entries: HashMap::new(),
-            _poller: PhantomData,
         })
     }
 }
@@ -98,7 +95,7 @@ impl<F: PollFdReady, P: InnerPoller> PollReadySet for NestedFdReadySet<F, P> {
                 "key already exists in ready set",
             ));
         }
-        P::register(&self.inner_fd, fd, key, events)?;
+        self.inner.register(fd, key, events)?;
         self.entries.insert(key, FdEntry { fd, events });
         Ok(())
     }
@@ -108,7 +105,7 @@ impl<F: PollFdReady, P: InnerPoller> PollReadySet for NestedFdReadySet<F, P> {
             .entries
             .remove(&key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "key not found in ready set"))?;
-        P::deregister(&self.inner_fd, entry.fd, entry.events)?;
+        self.inner.deregister(entry.fd, entry.events)?;
         Ok(())
     }
 
@@ -118,7 +115,7 @@ impl<F: PollFdReady, P: InnerPoller> PollReadySet for NestedFdReadySet<F, P> {
             .get_mut(&key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "key not found in ready set"))?;
         let old_events = entry.events;
-        P::reregister(&self.inner_fd, entry.fd, key, old_events, events)?;
+        self.inner.reregister(entry.fd, key, old_events, events)?;
         entry.events = events;
         Ok(())
     }
@@ -135,7 +132,7 @@ impl<F: PollFdReady, P: InnerPoller> PollReadySet for NestedFdReadySet<F, P> {
             );
 
             let start_len = out.len();
-            P::drain(&self.inner_fd, &self.entries, out)?;
+            self.inner.drain(&self.entries, out)?;
 
             // Clear outer readiness — the inner poller has been fully drained.
             self.outer_ready.clear_fd_ready(InterestSlot::Read);

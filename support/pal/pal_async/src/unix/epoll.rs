@@ -459,37 +459,42 @@ impl PollTimer for Timer {
 }
 
 /// Epoll-based inner poller for [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
-pub struct EpollInnerPoller;
+pub struct EpollInnerPoller(OwnedFd);
+
+impl AsFd for EpollInnerPoller {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
 
 impl super::ready_set::InnerPoller for EpollInnerPoller {
-    fn create() -> io::Result<OwnedFd> {
+    fn create() -> io::Result<Self> {
         // SAFETY: epoll_create1 creates a new, uniquely owned fd.
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: fd is a newly created, uniquely owned file descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
-    fn register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
+    fn register(&self, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
         let mut event = libc::epoll_event {
             events: poll_events_to_epoll(events),
             u64: key as u64,
         };
         // SAFETY: calling epoll_ctl with valid epoll fd.
-        if unsafe { libc::epoll_ctl(inner_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) } < 0
-        {
+        if unsafe { libc::epoll_ctl(self.0.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
-    fn deregister(inner_fd: &OwnedFd, fd: RawFd, _events: PollEvents) -> io::Result<()> {
+    fn deregister(&self, fd: RawFd, _events: PollEvents) -> io::Result<()> {
         // SAFETY: calling epoll_ctl with valid epoll fd.
         if unsafe {
             libc::epoll_ctl(
-                inner_fd.as_raw_fd(),
+                self.0.as_raw_fd(),
                 libc::EPOLL_CTL_DEL,
                 fd,
                 std::ptr::null_mut(),
@@ -502,7 +507,7 @@ impl super::ready_set::InnerPoller for EpollInnerPoller {
     }
 
     fn reregister(
-        inner_fd: &OwnedFd,
+        &self,
         fd: RawFd,
         key: usize,
         _old_events: PollEvents,
@@ -513,15 +518,14 @@ impl super::ready_set::InnerPoller for EpollInnerPoller {
             u64: key as u64,
         };
         // SAFETY: calling epoll_ctl with valid epoll fd.
-        if unsafe { libc::epoll_ctl(inner_fd.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, &mut event) } < 0
-        {
+        if unsafe { libc::epoll_ctl(self.0.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, &mut event) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
     fn drain(
-        inner_fd: &OwnedFd,
+        &self,
         entries: &std::collections::HashMap<usize, super::ready_set::FdEntry>,
         out: &mut Vec<crate::ready_set::ReadyEvent>,
     ) -> io::Result<()> {
@@ -530,7 +534,7 @@ impl super::ready_set::InnerPoller for EpollInnerPoller {
             // SAFETY: epoll_wait with valid fd and properly sized buffer.
             let n = unsafe {
                 libc::epoll_wait(
-                    inner_fd.as_raw_fd(),
+                    self.0.as_raw_fd(),
                     events.as_mut_ptr(),
                     events.len() as i32,
                     0, // non-blocking

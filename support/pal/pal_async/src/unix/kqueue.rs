@@ -521,20 +521,26 @@ impl PollTimer for Timer {
 }
 
 /// Kqueue-based inner poller for [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
-pub struct KqueueInnerPoller;
+pub struct KqueueInnerPoller(OwnedFd);
+
+impl AsFd for KqueueInnerPoller {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
 
 impl super::ready_set::InnerPoller for KqueueInnerPoller {
-    fn create() -> io::Result<OwnedFd> {
+    fn create() -> io::Result<Self> {
         // SAFETY: kqueue creates a new, uniquely owned fd.
         let fd = unsafe { libc::kqueue() };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: fd is a newly created, uniquely owned file descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
-    fn register(inner_fd: &OwnedFd, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
+    fn register(&self, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
         let mut changelist = Vec::new();
         if events.has_in() {
             changelist.push(libc::kevent64_s {
@@ -555,12 +561,12 @@ impl super::ready_set::InnerPoller for KqueueInnerPoller {
             });
         }
         if !changelist.is_empty() {
-            kevent64_nowait(inner_fd, &changelist, &mut [])?;
+            kevent64_nowait(&self.0, &changelist, &mut [])?;
         }
         Ok(())
     }
 
-    fn deregister(inner_fd: &OwnedFd, fd: RawFd, events: PollEvents) -> io::Result<()> {
+    fn deregister(&self, fd: RawFd, events: PollEvents) -> io::Result<()> {
         let mut changelist = Vec::new();
         if events.has_in() {
             changelist.push(libc::kevent64_s {
@@ -579,13 +585,13 @@ impl super::ready_set::InnerPoller for KqueueInnerPoller {
             });
         }
         if !changelist.is_empty() {
-            kevent64_nowait(inner_fd, &changelist, &mut [])?;
+            kevent64_nowait(&self.0, &changelist, &mut [])?;
         }
         Ok(())
     }
 
     fn reregister(
-        inner_fd: &OwnedFd,
+        &self,
         fd: RawFd,
         key: usize,
         old_events: PollEvents,
@@ -627,19 +633,19 @@ impl super::ready_set::InnerPoller for KqueueInnerPoller {
             });
         }
         if !changelist.is_empty() {
-            kevent64_nowait(inner_fd, &changelist, &mut [])?;
+            kevent64_nowait(&self.0, &changelist, &mut [])?;
         }
         Ok(())
     }
 
     fn drain(
-        inner_fd: &OwnedFd,
+        &self,
         entries: &std::collections::HashMap<usize, super::ready_set::FdEntry>,
         out: &mut Vec<crate::ready_set::ReadyEvent>,
     ) -> io::Result<()> {
         let mut events = [empty_event(); 32];
         loop {
-            let n = kevent64_nowait(inner_fd, &[], &mut events)?;
+            let n = kevent64_nowait(&self.0, &[], &mut events)?;
             if n == 0 {
                 break;
             }

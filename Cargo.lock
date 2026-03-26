@@ -471,7 +471,7 @@ version = "0.0.0"
 dependencies = [
  "fs-err",
  "thiserror 2.0.16",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -836,7 +836,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -1039,7 +1039,7 @@ dependencies = [
  "smallvec",
  "tracing",
  "tracing-subscriber",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1200,7 +1200,7 @@ dependencies = [
  "thiserror 2.0.16",
  "unix_socket",
  "vmsocket",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1281,7 +1281,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1543,7 +1543,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.16",
  "vm_resource",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1736,7 +1736,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1835,7 +1835,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix 1.0.8",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2909,7 +2909,7 @@ dependencies = [
  "thiserror 2.0.16",
  "win_etw_provider",
  "windows 0.62.0",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -3639,7 +3639,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3985,7 +3985,7 @@ name = "make_imc_hive"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4235,7 +4235,7 @@ dependencies = [
  "tracing_helpers",
  "unicycle",
  "unix_socket",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -4337,7 +4337,7 @@ dependencies = [
  "parking_lot",
  "test_with_tracing",
  "tracelimit",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5375,7 +5375,7 @@ dependencies = [
  "vtl2_settings_proto",
  "whp",
  "win_etw_tracing",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5570,7 +5570,7 @@ dependencies = [
  "winapi",
  "windows 0.62.0",
  "windows-result 0.4.0",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5597,7 +5597,7 @@ dependencies = [
  "unicycle",
  "unix_socket",
  "windows-result 0.4.0",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -5617,7 +5617,7 @@ dependencies = [
  "getrandom 0.3.3",
  "libc",
  "mesh_protobuf",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6023,7 +6023,7 @@ dependencies = [
  "unicycle",
  "vmsocket",
  "windows-service",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6536,7 +6536,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6549,7 +6549,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7153,7 +7153,7 @@ dependencies = [
  "parking_lot",
  "thiserror 2.0.16",
  "trycopy",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -7494,7 +7494,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.8",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7504,7 +7504,7 @@ dependencies = [
  "crossterm",
  "libc",
  "thiserror 2.0.16",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7547,7 +7547,7 @@ dependencies = [
  "test_igvm_agent_lib",
  "tracing",
  "tracing-subscriber",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7988,7 +7988,7 @@ dependencies = [
  "criterion",
  "libc",
  "thiserror 2.0.16",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -8518,7 +8518,7 @@ dependencies = [
  "getrandom 0.3.3",
  "mesh_protobuf",
  "socket2",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8950,7 +8950,7 @@ dependencies = [
  "vmcore",
  "whp",
  "windows-result 0.4.0",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "x86defs",
  "x86emu",
  "zerocopy",
@@ -9171,7 +9171,7 @@ dependencies = [
  "virtio_resources",
  "vm_resource",
  "vmcore",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -9905,7 +9905,7 @@ dependencies = [
  "mesh",
  "pal_async",
  "socket2",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9921,7 +9921,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "widestring",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -10218,7 +10218,7 @@ dependencies = [
  "criterion",
  "guid",
  "pal",
- "windows-sys 0.61.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10284,7 +10284,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0978bf7171b3d90bac376700cb56d606feb40f251a475a5d6634613564460b22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10312,7 +10312,7 @@ dependencies = [
  "windows-collections",
  "windows-core 0.62.0",
  "windows-future",
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
  "windows-numerics",
 ]
 
@@ -10346,7 +10346,7 @@ checksum = "57fe7168f7de578d2d8a05b07fd61870d2e73b4020e9f49aa00da8471723497c"
 dependencies = [
  "windows-implement 0.60.0",
  "windows-interface 0.59.1",
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
  "windows-result 0.4.0",
  "windows-strings 0.5.0",
 ]
@@ -10358,7 +10358,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2194dee901458cb79e1148a4e9aac2b164cc95fa431891e7b296ff0b2f1d8a6"
 dependencies = [
  "windows-core 0.62.0",
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
  "windows-threading",
 ]
 
@@ -10414,9 +10414,9 @@ checksum = "5e6ad25900d524eaabdbbb96d20b4311e1e7ae1699af4fb28c17ae66c80d798a"
 
 [[package]]
 name = "windows-link"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45e46c0661abb7180e7b9c281db115305d49ca1709ab8242adf09666d2173c65"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "windows-numerics"
@@ -10425,7 +10425,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ce3498fe0aba81e62e477408383196b4b0363db5e0c27646f932676283b43d8"
 dependencies = [
  "windows-core 0.62.0",
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -10443,7 +10443,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7084dcc306f89883455a206237404d3eaf961e5bd7e0f312f7c91f57eb44167f"
 dependencies = [
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -10473,7 +10473,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7218c655a553b0bed4426cf54b20d7ba363ef543b52d515b3e48d7fd55318dda"
 dependencies = [
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -10505,11 +10505,11 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.61.0"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e201184e40b2ede64bc2ea34968b28e33622acdbbf37104f0e4a33f7abe657aa"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -10551,7 +10551,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab47f085ad6932defa48855254c758cdd0e2f2d48e62a34118a268d8f345e118"
 dependencies = [
- "windows-link 0.2.0",
+ "windows-link 0.2.1",
 ]
 
 [[package]]

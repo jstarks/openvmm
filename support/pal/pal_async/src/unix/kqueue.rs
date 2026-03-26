@@ -520,17 +520,18 @@ impl PollTimer for Timer {
     }
 }
 
-/// Kqueue-based inner poller for [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
-pub struct KqueueInnerPoller(OwnedFd);
+/// Kqueue-based [`FdPoller`](super::ready_set::FdPoller) for
+/// [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
+pub struct KqueuePoller(OwnedFd);
 
-impl AsFd for KqueueInnerPoller {
+impl AsFd for KqueuePoller {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
 }
 
-impl super::ready_set::InnerPoller for KqueueInnerPoller {
-    fn create() -> io::Result<Self> {
+impl super::ready_set::FdPoller for KqueuePoller {
+    fn new() -> io::Result<Self> {
         // SAFETY: kqueue creates a new, uniquely owned fd.
         let fd = unsafe { libc::kqueue() };
         if fd < 0 {
@@ -713,7 +714,7 @@ fn kevent64_nowait(
 }
 
 impl crate::ready_set::ReadySetDriver for KqueueDriver {
-    type ReadySet = super::ready_set::NestedFdReadySet<FdReady, KqueueInnerPoller>;
+    type ReadySet = super::ready_set::NestedFdReadySet<FdReady, KqueuePoller>;
 
     fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
         super::ready_set::NestedFdReadySet::new(self)

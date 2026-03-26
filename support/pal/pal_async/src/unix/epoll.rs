@@ -458,17 +458,18 @@ impl PollTimer for Timer {
     }
 }
 
-/// Epoll-based inner poller for [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
-pub struct EpollInnerPoller(OwnedFd);
+/// Epoll-based [`FdPoller`](super::ready_set::FdPoller) for
+/// [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
+pub struct EpollPoller(OwnedFd);
 
-impl AsFd for EpollInnerPoller {
+impl AsFd for EpollPoller {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
 }
 
-impl super::ready_set::InnerPoller for EpollInnerPoller {
-    fn create() -> io::Result<Self> {
+impl super::ready_set::FdPoller for EpollPoller {
+    fn new() -> io::Result<Self> {
         // SAFETY: epoll_create1 creates a new, uniquely owned fd.
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if fd < 0 {
@@ -592,7 +593,7 @@ fn poll_events_to_epoll(events: PollEvents) -> u32 {
 }
 
 impl crate::ready_set::ReadySetDriver for EpollDriver {
-    type ReadySet = super::ready_set::NestedFdReadySet<FdReady, EpollInnerPoller>;
+    type ReadySet = super::ready_set::NestedFdReadySet<FdReady, EpollPoller>;
 
     fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
         super::ready_set::NestedFdReadySet::new(self)

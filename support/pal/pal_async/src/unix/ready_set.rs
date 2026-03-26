@@ -3,8 +3,8 @@
 
 //! [`NestedFdReadySet`] — a [`PollReadySet`] backed by a nested poller fd.
 //!
-//! The platform-specific inner poller operations are provided via the
-//! [`InnerPoller`] trait, implemented in `epoll.rs` (Linux) and `kqueue.rs`
+//! The platform-specific poller operations are provided via the
+//! [`FdPoller`] trait, implemented in `epoll.rs` (Linux) and `kqueue.rs`
 //! (macOS).
 
 use crate::fd::FdReadyDriver;
@@ -20,23 +20,23 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
 
-/// Platform-specific inner poller operations.
+/// A batch fd poller.
 ///
 /// Implementors are newtypes around `OwnedFd` that implement [`AsFd`].
 /// Implemented by the epoll backend (Linux) and kqueue backend (macOS).
-pub trait InnerPoller: AsFd + Send + Unpin {
-    /// Creates a new inner poller.
-    fn create() -> io::Result<Self>
+pub trait FdPoller: AsFd + Send + Unpin {
+    /// Creates a new poller.
+    fn new() -> io::Result<Self>
     where
         Self: Sized;
 
-    /// Registers an fd with the inner poller.
+    /// Registers an fd with the poller.
     fn register(&self, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()>;
 
-    /// Deregisters an fd from the inner poller.
+    /// Deregisters an fd from the poller.
     fn deregister(&self, fd: RawFd, events: PollEvents) -> io::Result<()>;
 
-    /// Changes the monitored events for an fd in the inner poller.
+    /// Changes the monitored events for an fd.
     fn reregister(
         &self,
         fd: RawFd,
@@ -45,7 +45,7 @@ pub trait InnerPoller: AsFd + Send + Unpin {
         new_events: PollEvents,
     ) -> io::Result<()>;
 
-    /// Non-blocking drain of all ready events from the inner poller.
+    /// Non-blocking drain of all ready events from the poller.
     fn drain(&self, entries: &HashMap<usize, FdEntry>, out: &mut Vec<ReadyEvent>)
     -> io::Result<()>;
 }
@@ -55,10 +55,10 @@ pub trait InnerPoller: AsFd + Send + Unpin {
 /// An inner poller fd is created and registered with the outer driver as a
 /// single file descriptor. When any monitored fd becomes ready, the outer
 /// driver wakes the set, which performs a non-blocking batch drain of the
-/// inner poller.
+/// poller.
 ///
 /// `F` is the outer driver's [`PollFdReady`] implementation.
-/// `P` is the platform's [`InnerPoller`] implementation.
+/// `P` is the platform's [`FdPoller`] implementation.
 pub struct NestedFdReadySet<F, P> {
     // Drop order matters: outer_ready must be dropped first (deregisters
     // the inner fd from the outer poller), then inner poller (closes the
@@ -73,11 +73,11 @@ pub struct FdEntry {
     pub events: PollEvents,
 }
 
-impl<F: PollFdReady, P: InnerPoller> NestedFdReadySet<F, P> {
+impl<F: PollFdReady, P: FdPoller> NestedFdReadySet<F, P> {
     /// Creates a new nested-fd ready set, registering the inner poller with
     /// the given driver for wakeup integration.
     pub fn new(driver: &impl FdReadyDriver<FdReady = F>) -> io::Result<Self> {
-        let inner = P::create()?;
+        let inner = P::new()?;
         let outer_ready = driver.new_fd_ready(inner.as_fd().as_raw_fd())?;
         Ok(Self {
             outer_ready,
@@ -87,7 +87,7 @@ impl<F: PollFdReady, P: InnerPoller> NestedFdReadySet<F, P> {
     }
 }
 
-impl<F: PollFdReady, P: InnerPoller> PollReadySet for NestedFdReadySet<F, P> {
+impl<F: PollFdReady, P: FdPoller> PollReadySet for NestedFdReadySet<F, P> {
     fn add(&mut self, key: usize, fd: RawFd, events: PollEvents) -> io::Result<()> {
         if self.entries.contains_key(&key) {
             return Err(io::Error::new(

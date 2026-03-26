@@ -217,7 +217,7 @@ impl IoBackend for IocpBackend {
                             overlapped_io_done(entry.lpOverlapped, &mut wakers);
                         },
                         KEY_READY_SET => unsafe {
-                            super::ready_set::iocp_ready_set_io_complete(
+                            super::ready_set::ready_set_io_complete(
                                 entry.lpOverlapped,
                                 &mut wakers,
                             );

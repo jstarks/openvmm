@@ -512,9 +512,11 @@ impl IoOverlapped for OverlappedIo {
     }
 }
 
-/// Owns the AFD file and inner IOCP for ready set operations on LocalDriver.
+/// Owns the AFD file for ready set operations on LocalDriver.
+///
+/// The inner IOCP is owned separately by [`LocalReadySet`] so it
+/// can be drained after the [`AfdReadySet`] is dropped.
 pub(super) struct OwnedLocalReadySetAfd {
-    iocp: pal::windows::IoCompletionPort,
     afd_file: File,
 }
 
@@ -535,26 +537,26 @@ impl AfdHandle for OwnedLocalReadySetAfd {
 /// Ready set for LocalDriver using a nested IOCP in the WFMO set.
 ///
 /// The inner IOCP handle is waitable. When an AFD poll completes to it,
-/// `WaitForMultipleObjectsEx` returns. `poll_ready` drains the inner IOCP
-/// inline and processes completions into the shared buffer.
+/// `WaitForMultipleObjectsEx` returns. `poll_ready` drains the inner
+/// IOCP inline and processes completions into the shared buffer.
 pub struct LocalReadySet {
-    // Wrapped in Option so Drop can take ownership to control order.
-    // `inner` must be dropped before draining the IOCP via `shared`.
-    inner: Option<super::ready_set::AfdReadySet<OwnedLocalReadySetAfd>>,
-    shared: Arc<super::ready_set::ReadySetShared<OwnedLocalReadySetAfd>>,
+    // ManuallyDrop so our Drop impl can tear down ops before draining
+    // the IOCP. During the struct's useful lifetime this is always valid.
+    inner: std::mem::ManuallyDrop<super::ready_set::AfdReadySet<OwnedLocalReadySetAfd>>,
+    iocp: pal::windows::IoCompletionPort,
     wait: Wait,
 }
 
 impl LocalReadySet {
-    fn drain_iocp(&mut self) {
-        Self::drain_iocp_shared(&self.shared);
+    fn drain_iocp(&self) {
+        Self::drain_iocp_from(&self.iocp);
     }
 
-    fn drain_iocp_shared(shared: &super::ready_set::ReadySetShared<OwnedLocalReadySetAfd>) {
+    fn drain_iocp_from(iocp: &pal::windows::IoCompletionPort) {
         let mut wakers = WakerList::default();
         let mut entries = [Default::default(); 16];
         loop {
-            let n = shared.afd.iocp.get(&mut entries, Some(Duration::ZERO));
+            let n = iocp.get(&mut entries, Some(Duration::ZERO));
             if n == 0 {
                 break;
             }
@@ -563,7 +565,7 @@ impl LocalReadySet {
                     LOCAL_KEY_READY_SET => {
                         // SAFETY: the overlapped IO is complete.
                         unsafe {
-                            super::ready_set::local_ready_set_io_complete(
+                            super::ready_set::ready_set_io_complete(
                                 entry.lpOverlapped,
                                 &mut wakers,
                             );
@@ -579,28 +581,27 @@ impl LocalReadySet {
 
 impl Drop for LocalReadySet {
     fn drop(&mut self) {
-        // Drop the AfdReadySet first — this calls teardown() which
-        // cancels in-flight ops via CancelIoEx.
-        drop(self.inner.take());
-
-        // Now drain the inner IOCP to reclaim Arc refs from cancelled
-        // completions. The shared state (and its IOCP) is still alive
-        // via self.shared.
-        Self::drain_iocp_shared(&self.shared);
+        // Drop the AfdReadySet first — teardown cancels in-flight ops.
+        // SAFETY: inner is valid and will not be accessed again.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.inner) };
+        // Drain the inner IOCP to reclaim Arc refs from cancelled
+        // completions. The IOCP is still alive (owned by self).
+        Self::drain_iocp_from(&self.iocp);
+        // iocp and wait drop normally after this.
     }
 }
 
 impl crate::ready_set::PollReadySet for LocalReadySet {
     fn add(&mut self, key: usize, socket: RawSocket, events: PollEvents) -> io::Result<()> {
-        self.inner.as_mut().unwrap().add(key, socket, events)
+        self.inner.add(key, socket, events)
     }
 
     fn remove(&mut self, key: usize) -> io::Result<()> {
-        self.inner.as_mut().unwrap().remove(key)
+        self.inner.remove(key)
     }
 
     fn modify(&mut self, key: usize, events: PollEvents) -> io::Result<()> {
-        self.inner.as_mut().unwrap().modify(key, events)
+        self.inner.modify(key, events)
     }
 
     fn poll_ready(
@@ -611,10 +612,8 @@ impl crate::ready_set::PollReadySet for LocalReadySet {
         // Drain the inner IOCP for any completed AFD polls.
         self.drain_iocp();
 
-        let inner = self.inner.as_mut().unwrap();
-
         // Check if the inner AfdReadySet has buffered events.
-        match inner.poll_ready(cx, out) {
+        match self.inner.poll_ready(cx, out) {
             Poll::Ready(r) => return Poll::Ready(r),
             Poll::Pending => {}
         }
@@ -625,8 +624,7 @@ impl crate::ready_set::PollReadySet for LocalReadySet {
                 Poll::Ready(Ok(())) => {
                     // IOCP handle was signaled — drain completions.
                     self.drain_iocp();
-                    let inner = self.inner.as_mut().unwrap();
-                    match inner.poll_ready(cx, out) {
+                    match self.inner.poll_ready(cx, out) {
                         Poll::Ready(r) => return Poll::Ready(r),
                         Poll::Pending => {
                             // Spurious wakeup, re-wait.
@@ -662,12 +660,10 @@ impl crate::ready_set::ReadySetDriver for LocalDriver {
         let iocp_handle = iocp.as_handle().as_raw_handle();
         let wait = self.new_wait(iocp_handle)?;
 
-        let afd = OwnedLocalReadySetAfd { iocp, afd_file };
-        let inner = super::ready_set::AfdReadySet::new(afd);
-        let shared = inner.shared_arc();
+        let afd = OwnedLocalReadySetAfd { afd_file };
         Ok(LocalReadySet {
-            inner: Some(inner),
-            shared,
+            inner: std::mem::ManuallyDrop::new(super::ready_set::AfdReadySet::new(afd)),
+            iocp,
             wait,
         })
     }

@@ -579,7 +579,7 @@ unsafe extern "system" fn tp_ready_set_io_complete(
     let mut wakers = WakerList::default();
     // SAFETY: the overlapped IO is complete.
     unsafe {
-        super::ready_set::tp_ready_set_io_complete(overlapped.cast(), &mut wakers);
+        super::ready_set::ready_set_io_complete(overlapped.cast(), &mut wakers);
     }
     wake_locally(|| wakers.wake());
 }

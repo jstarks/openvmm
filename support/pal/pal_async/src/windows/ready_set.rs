@@ -10,6 +10,13 @@
 //!
 //! There is no `PollSocketReady` involved — the AFD IOCTLs are issued
 //! directly, bypassing the per-socket waker overhead.
+//!
+//! The [`ReadySetOp`] type is not parameterized by the backend — it
+//! stores a raw AFD handle and never reissues polls from completion
+//! callbacks. Instead, cancelled polls push to a `needs_rearm` list
+//! that `poll_ready` processes on the next call. This keeps the op
+//! type-erased and gives a single [`ready_set_io_complete`] dispatch
+//! function shared by all backends.
 
 // UNSAFETY: Issues AFD poll IOCTLs with overlapped IO and handles raw
 // pointers to overlapped structures in completion callbacks.
@@ -40,24 +47,25 @@ use super::socket::AfdHandle;
 use super::socket::make_poll_handle_info;
 use super::socket::parse_poll_handle_info;
 
-/// Shared state for a ready set: the event buffer, the task waker, and
-/// the AFD handle used by completion callbacks to reissue polls.
-pub(super) struct ReadySetShared<A> {
-    pub(super) afd: A,
+/// Shared buffer between completion callbacks and `poll_ready`.
+///
+/// Not parameterized by the backend — all backends share the same type.
+struct ReadySetShared {
     inner: Mutex<ReadySetInner>,
 }
 
 struct ReadySetInner {
     events: Vec<ReadyEvent>,
+    needs_rearm: Vec<usize>,
     waker: Option<Waker>,
 }
 
-impl<A: AfdHandle> ReadySetShared<A> {
-    fn new(afd: A) -> Self {
+impl ReadySetShared {
+    fn new() -> Self {
         Self {
-            afd,
             inner: Mutex::new(ReadySetInner {
                 events: Vec::new(),
+                needs_rearm: Vec::new(),
                 waker: None,
             }),
         }
@@ -72,7 +80,16 @@ impl<A: AfdHandle> ReadySetShared<A> {
         }
     }
 
-    /// Sets or updates the task-level waker.
+    /// Called by completion callbacks when a cancelled poll needs
+    /// re-arming (events are still wanted).
+    fn push_needs_rearm(&self, key: usize, wakers: &mut WakerList) {
+        let mut inner = self.inner.lock();
+        inner.needs_rearm.push(key);
+        if let Some(waker) = inner.waker.take() {
+            wakers.push(waker);
+        }
+    }
+
     fn set_waker(&self, waker: &Waker) {
         let mut inner = self.inner.lock();
         if !inner.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
@@ -80,7 +97,7 @@ impl<A: AfdHandle> ReadySetShared<A> {
         }
     }
 
-    /// Drains all buffered events into `out`. Returns `true` if any.
+    /// Drains buffered events into `out`. Returns `true` if any.
     fn drain(&self, out: &mut Vec<ReadyEvent>) -> bool {
         let mut inner = self.inner.lock();
         if inner.events.is_empty() {
@@ -90,30 +107,42 @@ impl<A: AfdHandle> ReadySetShared<A> {
         true
     }
 
-    /// Removes any buffered events for a given key.
+    /// Takes the needs-rearm list.
+    fn take_needs_rearm(&self) -> Vec<usize> {
+        let mut inner = self.inner.lock();
+        std::mem::take(&mut inner.needs_rearm)
+    }
+
     fn remove_key(&self, key: usize) {
         let mut inner = self.inner.lock();
         inner.events.retain(|e| e.key != key);
+        inner.needs_rearm.retain(|&k| k != key);
     }
 }
 
-/// Per-socket AFD poll operation. The `overlapped` field must be first
-/// so that a `*mut OVERLAPPED` can be cast to `*mut ReadySetOp<A>`.
+/// Per-socket AFD poll operation.
+///
+/// Not parameterized by the backend. Stores a raw AFD handle for
+/// `CancelIoEx` and never reissues polls from completion callbacks.
+/// The `overlapped` field must be first so that a `*mut OVERLAPPED`
+/// can be cast to `*mut ReadySetOp`.
 #[repr(C)]
-struct ReadySetOp<A> {
+struct ReadySetOp {
     overlapped: Overlapped,
     key: usize,
     socket: RawSocket,
+    afd_handle: RawHandle,
     poll_info: UnsafeCell<PollInfoInput>,
     state: Mutex<OpState>,
-    shared: Arc<ReadySetShared<A>>,
+    shared: Arc<ReadySetShared>,
 }
 
 // SAFETY: The UnsafeCell<PollInfoInput> is only accessed when no IO is
-// in flight (synchronized by OpState::in_flight).
-unsafe impl<A: Send> Send for ReadySetOp<A> {}
+// in flight (synchronized by OpState::in_flight). RawHandle is just a
+// pointer-sized value.
+unsafe impl Send for ReadySetOp {}
 // SAFETY: See above.
-unsafe impl<A: Sync> Sync for ReadySetOp<A> {}
+unsafe impl Sync for ReadySetOp {}
 
 #[repr(C)]
 #[derive(Default)]
@@ -128,17 +157,19 @@ struct OpState {
     cancelled: bool,
 }
 
-impl<A: AfdHandle> ReadySetOp<A> {
+impl ReadySetOp {
     fn new(
         key: usize,
         socket: RawSocket,
+        afd_handle: RawHandle,
         events: PollEvents,
-        shared: Arc<ReadySetShared<A>>,
+        shared: Arc<ReadySetShared>,
     ) -> Arc<Self> {
         Arc::new(Self {
             overlapped: Overlapped::new(),
             key,
             socket,
+            afd_handle,
             poll_info: UnsafeCell::new(PollInfoInput::default()),
             state: Mutex::new(OpState {
                 events,
@@ -149,9 +180,13 @@ impl<A: AfdHandle> ReadySetOp<A> {
         })
     }
 
-    /// Issues the AFD poll. Returns `true` if it completed synchronously.
+    /// Issues the AFD poll using `io_handle` (the return value of
+    /// `AfdHandle::ref_io`). Returns `true` on sync completion.
+    ///
+    /// The caller is responsible for calling `ref_io` before and
+    /// `deref_io` after (on sync completion).
     #[must_use]
-    fn issue_io(self: &Arc<Self>, state: &mut OpState) -> bool {
+    fn issue_io(self: &Arc<Self>, state: &mut OpState, io_handle: RawHandle) -> bool {
         state.in_flight = true;
         // SAFETY: No IO is in flight, so we have exclusive access.
         let poll_info = unsafe { &mut *self.poll_info.get() };
@@ -168,7 +203,7 @@ impl<A: AfdHandle> ReadySetOp<A> {
         // SAFETY: Buffers are valid for the lifetime of the operation.
         let done = unsafe {
             afd::poll(
-                self.shared.afd.ref_io(),
+                io_handle,
                 &mut poll_info.header,
                 len,
                 self.overlapped.as_ptr(),
@@ -176,8 +211,6 @@ impl<A: AfdHandle> ReadySetOp<A> {
         };
 
         if done {
-            // SAFETY: IO completed synchronously.
-            unsafe { self.shared.afd.deref_io() };
             true
         } else {
             // The IO completion will reclaim this reference.
@@ -190,91 +223,47 @@ impl<A: AfdHandle> ReadySetOp<A> {
     fn cancel_io(&self) {
         // SAFETY: no safety requirements.
         unsafe {
-            CancelIoEx(self.shared.afd.handle(), self.overlapped.as_ptr());
+            CancelIoEx(self.afd_handle, self.overlapped.as_ptr());
         }
     }
 
-    /// Starts monitoring. Called by `add` and after readiness is consumed.
-    fn start(self: &Arc<Self>) {
-        let mut wakers = WakerList::default();
-        let mut state = self.state.lock();
-        if state.in_flight {
-            return;
-        }
-        if self.issue_io(&mut state) {
-            self.handle_completion(&mut state, STATUS_SUCCESS, &mut wakers);
-        }
-        drop(state);
-        wakers.wake();
-    }
+    /// Processes a completion. Never reissues — pushes to
+    /// `needs_rearm` if events are still wanted after cancellation.
+    fn handle_completion(&self, state: &mut OpState, status: NTSTATUS, wakers: &mut WakerList) {
+        let revents = if windows_result::HRESULT::from_nt(status).is_ok() {
+            // SAFETY: No IO is in flight.
+            let poll_info = unsafe { &*self.poll_info.get() };
+            assert_eq!(poll_info.header.number_of_handles, 1);
+            parse_poll_handle_info(&poll_info.data)
+        } else {
+            assert_eq!(
+                status,
+                STATUS_CANCELLED,
+                "unexpected afd poll failure: {}",
+                pal::windows::status_to_error(status)
+            );
+            PollEvents::EMPTY
+        };
 
-    fn handle_completion(
-        self: &Arc<Self>,
-        state: &mut OpState,
-        mut status: NTSTATUS,
-        wakers: &mut WakerList,
-    ) {
-        loop {
-            let revents = if windows_result::HRESULT::from_nt(status).is_ok() {
-                // SAFETY: No IO is in flight.
-                let poll_info = unsafe { &*self.poll_info.get() };
-                assert_eq!(poll_info.header.number_of_handles, 1);
-                parse_poll_handle_info(&poll_info.data)
-            } else {
-                assert_eq!(
-                    status,
-                    STATUS_CANCELLED,
-                    "unexpected afd poll failure: {}",
-                    pal::windows::status_to_error(status)
-                );
-                PollEvents::EMPTY
-            };
+        state.in_flight = false;
+        state.cancelled = false;
 
-            state.in_flight = false;
-            state.cancelled = false;
-
-            if !revents.is_empty() {
-                self.shared.push_event(
-                    ReadyEvent {
-                        key: self.key,
-                        events: revents,
-                    },
-                    wakers,
-                );
-                // Don't reissue — wait for poll_ready to drain and re-arm.
-                break;
-            }
-
-            // Cancelled or spurious — reissue if events are still wanted.
-            if state.events.is_empty() {
-                break;
-            }
-            if self.issue_io(state) {
-                status = STATUS_SUCCESS;
-            } else {
-                break;
-            }
+        if !revents.is_empty() {
+            self.shared.push_event(
+                ReadyEvent {
+                    key: self.key,
+                    events: revents,
+                },
+                wakers,
+            );
+        } else if !state.events.is_empty() {
+            // Cancelled but still interested — request re-arm from poll_ready.
+            self.shared.push_needs_rearm(self.key, wakers);
         }
     }
 
-    /// Called from the completion callback.
-    ///
-    /// # Safety
-    /// `overlapped` must point to a `ReadySetOp<A>` whose IO has completed.
-    unsafe fn io_complete(overlapped: *mut OVERLAPPED, wakers: &mut WakerList) {
-        let op_ptr = overlapped.cast::<ReadySetOp<A>>();
-        // SAFETY: caller ensures overlapped points to a ReadySetOp.
-        let op = unsafe { &*op_ptr };
-        let (status, _) = op.overlapped.io_status().expect("io should be done");
-        let mut state = op.state.lock();
-        // SAFETY: Reclaim the Arc reference acquired in issue_io.
-        let op = unsafe { Arc::from_raw(op_ptr) };
-        op.handle_completion(&mut state, status, wakers);
-        drop(state);
-    }
-
-    /// Cancels any in-flight IO and marks the op as dead so that
-    /// the completion handler will not reissue.
+    /// Cancels any in-flight IO and clears events so the completion
+    /// handler will not request re-arm.
     fn teardown(&self) {
         let mut state = self.state.lock();
         state.events = PollEvents::EMPTY;
@@ -284,7 +273,6 @@ impl<A: AfdHandle> ReadySetOp<A> {
         }
     }
 
-    /// Updates the monitored events. Cancels in-flight IO if needed.
     fn modify_events(&self, events: PollEvents) {
         let mut state = self.state.lock();
         state.events = events;
@@ -298,26 +286,40 @@ impl<A: AfdHandle> ReadySetOp<A> {
 /// A [`PollReadySet`] backed by direct AFD polls against a backend's
 /// completion mechanism.
 ///
-/// `A` is the `AfdHandle` implementation that owns the AFD file and
-/// routes completions. Each backend provides its own `A`.
+/// `A` is the [`AfdHandle`] implementation that owns the AFD file and
+/// manages IO lifecycle (`ref_io`/`deref_io`). The per-socket
+/// [`ReadySetOp`]s are not parameterized by `A`.
 pub struct AfdReadySet<A: AfdHandle> {
-    ops: HashMap<usize, Arc<ReadySetOp<A>>>,
-    shared: Arc<ReadySetShared<A>>,
+    afd: A,
+    ops: HashMap<usize, Arc<ReadySetOp>>,
+    shared: Arc<ReadySetShared>,
 }
 
 impl<A: AfdHandle> AfdReadySet<A> {
     pub fn new(afd: A) -> Self {
-        let shared = Arc::new(ReadySetShared::new(afd));
         Self {
+            afd,
             ops: HashMap::new(),
-            shared,
+            shared: Arc::new(ReadySetShared::new()),
         }
     }
 
-    /// Returns an Arc clone of the shared state (used by LocalReadySet
-    /// to drain the inner IOCP after the AfdReadySet is dropped).
-    pub(super) fn shared_arc(&self) -> Arc<ReadySetShared<A>> {
-        self.shared.clone()
+    /// Arms an op: calls `ref_io`, issues the AFD poll, handles sync
+    /// completion with `deref_io`.
+    fn arm_op(&self, op: &Arc<ReadySetOp>) {
+        let mut wakers = WakerList::default();
+        let mut state = op.state.lock();
+        if state.in_flight {
+            return;
+        }
+        let io_handle = self.afd.ref_io();
+        if op.issue_io(&mut state, io_handle) {
+            // SAFETY: IO completed synchronously.
+            unsafe { self.afd.deref_io() };
+            op.handle_completion(&mut state, STATUS_SUCCESS, &mut wakers);
+        }
+        drop(state);
+        wakers.wake();
     }
 }
 
@@ -329,8 +331,8 @@ impl<A: AfdHandle + Unpin + Send + Sync + 'static> PollReadySet for AfdReadySet<
                 "key already exists in ready set",
             ));
         }
-        let op = ReadySetOp::new(key, socket, events, self.shared.clone());
-        op.start();
+        let op = ReadySetOp::new(key, socket, self.afd.handle(), events, self.shared.clone());
+        self.arm_op(&op);
         self.ops.insert(key, op);
         Ok(())
     }
@@ -360,12 +362,20 @@ impl<A: AfdHandle + Unpin + Send + Sync + 'static> PollReadySet for AfdReadySet<
         out: &mut Vec<ReadyEvent>,
     ) -> Poll<io::Result<()>> {
         self.shared.set_waker(cx.waker());
+
+        // Re-arm ops that were cancelled (from modify) and need reissuing.
+        for key in self.shared.take_needs_rearm() {
+            if let Some(op) = self.ops.get(&key) {
+                self.arm_op(op);
+            }
+        }
+
         let start_len = out.len();
         if self.shared.drain(out) {
             // Re-arm the drained sockets.
             for event in &out[start_len..] {
                 if let Some(op) = self.ops.get(&event.key) {
-                    op.start();
+                    self.arm_op(op);
                 }
             }
             Poll::Ready(Ok(()))
@@ -383,44 +393,21 @@ impl<A: AfdHandle> Drop for AfdReadySet<A> {
     }
 }
 
-/// Dispatches a ready set AFD poll completion for the IOCP backend.
+/// Dispatches a ready set AFD poll completion.
+///
+/// All backends use the same [`ReadySetOp`] type, so there is one
+/// dispatch function shared by IOCP, TpPool, and LocalDriver.
 ///
 /// # Safety
-/// `overlapped` must point to a `ReadySetOp<super::iocp::OwnedIocpReadySetAfd>`
-/// whose IO has completed.
-pub(super) unsafe fn iocp_ready_set_io_complete(
-    overlapped: *mut OVERLAPPED,
-    wakers: &mut WakerList,
-) {
-    // SAFETY: caller ensures overlapped is valid and the type matches.
-    unsafe {
-        ReadySetOp::<super::iocp::OwnedIocpReadySetAfd>::io_complete(overlapped, wakers);
-    }
-}
-
-/// Dispatches a ready set AFD poll completion for the TpPool backend.
-///
-/// # Safety
-/// `overlapped` must point to a `ReadySetOp<super::tp::OwnedTpReadySetAfd>`
-/// whose IO has completed.
-pub(super) unsafe fn tp_ready_set_io_complete(overlapped: *mut OVERLAPPED, wakers: &mut WakerList) {
-    // SAFETY: caller ensures overlapped is valid and the type matches.
-    unsafe {
-        ReadySetOp::<super::tp::OwnedTpReadySetAfd>::io_complete(overlapped, wakers);
-    }
-}
-
-/// Dispatches a ready set AFD poll completion for the LocalDriver backend.
-///
-/// # Safety
-/// `overlapped` must point to a `ReadySetOp<super::local::OwnedLocalReadySetAfd>`
-/// whose IO has completed.
-pub(super) unsafe fn local_ready_set_io_complete(
-    overlapped: *mut OVERLAPPED,
-    wakers: &mut WakerList,
-) {
-    // SAFETY: caller ensures overlapped is valid and the type matches.
-    unsafe {
-        ReadySetOp::<super::local::OwnedLocalReadySetAfd>::io_complete(overlapped, wakers);
-    }
+/// `overlapped` must point to a [`ReadySetOp`] whose IO has completed.
+pub(super) unsafe fn ready_set_io_complete(overlapped: *mut OVERLAPPED, wakers: &mut WakerList) {
+    let op_ptr = overlapped.cast::<ReadySetOp>();
+    // SAFETY: caller ensures overlapped points to a ReadySetOp.
+    let op = unsafe { &*op_ptr };
+    let (status, _) = op.overlapped.io_status().expect("io should be done");
+    let mut state = op.state.lock();
+    // SAFETY: Reclaim the Arc reference acquired in issue_io.
+    let op = unsafe { Arc::from_raw(op_ptr) };
+    op.handle_completion(&mut state, status, wakers);
+    drop(state);
 }

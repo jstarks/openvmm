@@ -18,7 +18,20 @@ use std::path::PathBuf;
 
 pub(crate) fn run_vmm_mesh_host() -> anyhow::Result<()> {
     try_run_mesh_host("openvmm", async |params: MeshHostParams| {
-        params.runner.run(RegisteredWorkers).await;
+        match params {
+            MeshHostParams::WorkerHost(runner) => {
+                runner.run(RegisteredWorkers).await;
+            }
+            MeshHostParams::Gui(gui_params) => {
+                #[cfg(feature = "gui")]
+                openvmm_gui::run(gui_params.framebuffer, gui_params.input_send)?;
+                #[cfg(not(feature = "gui"))]
+                {
+                    let _ = gui_params;
+                    anyhow::bail!("GUI support not compiled in");
+                }
+            }
+        }
         Ok(())
     })
 }
@@ -67,7 +80,7 @@ impl VmmMesh {
             let (host, runner) = mesh_worker::worker_host();
             mesh.launch_host(
                 ProcessConfig::new(name).stderr(log_file),
-                MeshHostParams { runner },
+                MeshHostParams::WorkerHost(runner),
             )
             .await?;
             host
@@ -75,6 +88,18 @@ impl VmmMesh {
             self.local_host.clone()
         };
         Ok(host)
+    }
+
+    /// Launch the GUI in a child process, sending parameters directly.
+    #[cfg(feature = "gui")]
+    pub async fn launch_gui(&self, params: openvmm_gui::GuiParameters) -> anyhow::Result<()> {
+        let mesh = self
+            .mesh
+            .as_ref()
+            .context("GUI requires multi-process mode (no --single-process)")?;
+        mesh.launch_host(ProcessConfig::new("gui"), MeshHostParams::Gui(params))
+            .await?;
+        Ok(())
     }
 
     pub async fn shutdown(self) {

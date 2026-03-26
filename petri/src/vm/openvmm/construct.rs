@@ -1031,7 +1031,7 @@ impl PetriVmConfigSetupCore<'_> {
         self.mesh
             .launch_host(
                 mesh_process::ProcessConfig::new(name).process_name(self.openvmm_path),
-                openvmm_defs::entrypoint::MeshHostParams { runner },
+                openvmm_defs::entrypoint::MeshHostParams::WorkerHost(runner),
             )
             .await?;
         Ok(host)

@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "openvmm_gui"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+framebuffer.workspace = true
+input_core.workspace = true
+
+mesh.workspace = true
+
+anyhow.workspace = true
+iced.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

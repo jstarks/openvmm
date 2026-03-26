@@ -79,6 +79,7 @@ schema_ado_yaml = { path = "flowey/schema_ado_yaml" }
 openvmm_core = { path = "openvmm/openvmm_core" }
 openvmm_defs = { path = "openvmm/openvmm_defs" }
 openvmm_entry = { path = "openvmm/openvmm_entry" }
+openvmm_gui = { path = "openvmm/openvmm_gui" }
 openvmm_helpers = { path = "openvmm/openvmm_helpers" }
 openvmm_pcat_locator = { path = "openvmm/openvmm_pcat_locator" }
 openvmm_resources = { path = "openvmm/openvmm_resources" }
@@ -480,6 +481,7 @@ hyper = "1.4"
 hyper-tls = "0.6"
 hyper-util = "0.1"
 home = "0.5.9"
+iced = { version = "0.14", default-features = false, features = ["image", "tiny-skia", "tokio", "wayland", "x11"] }
 # iced has negative features, which aren't how features are supposed to work, but disable them here along with default features.
 iced-x86 = { version = "1.17", default-features = false, features = [
   "no_vex",

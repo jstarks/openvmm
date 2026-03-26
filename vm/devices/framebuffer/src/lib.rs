@@ -29,6 +29,8 @@ use guestmem::MemoryMapper;
 use inspect::Inspect;
 use inspect::InspectMut;
 use memory_range::MemoryRange;
+use mesh::Cell;
+use mesh::CellUpdater;
 use mesh::MeshPayload;
 use mesh::payload::Protobuf;
 use parking_lot::Mutex;
@@ -84,17 +86,17 @@ pub fn framebuffer(
         "no framebuffer size flexibility for now"
     );
 
-    let (send, recv) = mesh::channel();
+    let (updater, cell) = mesh::cell(default_framebuffer_format());
 
     let fb = Framebuffer {
         vram: vram.try_clone()?,
         len,
-        format_send: send,
+        format_updater: updater,
     };
     let access = FramebufferAccess {
         vram,
         len,
-        format_recv: recv,
+        format: cell,
         offset,
     };
     Ok((fb, access))
@@ -105,7 +107,7 @@ pub fn framebuffer(
 pub struct Framebuffer {
     vram: Mappable,
     len: usize,
-    format_send: mesh::Sender<FramebufferFormat>,
+    format_updater: CellUpdater<FramebufferFormat>,
 }
 
 impl Framebuffer {
@@ -114,9 +116,9 @@ impl Framebuffer {
         self.len
     }
 
-    /// Extract format sender, consuming the framebuffer
-    pub fn format_send(self) -> mesh::Sender<FramebufferFormat> {
-        self.format_send
+    /// Extract format updater, consuming the framebuffer.
+    pub fn format_updater(self) -> CellUpdater<FramebufferFormat> {
+        self.format_updater
     }
 }
 
@@ -125,7 +127,7 @@ impl Framebuffer {
 pub struct FramebufferAccess {
     vram: Mappable,
     len: usize,
-    format_recv: mesh::Receiver<FramebufferFormat>,
+    format: Cell<FramebufferFormat>,
     offset: u64,
 }
 
@@ -136,10 +138,23 @@ impl FramebufferAccess {
         mapping.map_file(0, self.len, &self.vram, self.offset, false)?;
         Ok(View {
             mapping,
-            format_recv: self.format_recv,
-            format: None,
+            format: self.format,
             vram: self.vram,
             len: self.len,
+            offset: self.offset,
+        })
+    }
+
+    /// Creates a clone of this framebuffer access.
+    ///
+    /// This clones the underlying vram file descriptor and the format cell,
+    /// allowing multiple consumers (e.g., VNC and GUI) to independently
+    /// access the same framebuffer.
+    pub fn try_clone(&self) -> io::Result<FramebufferAccess> {
+        Ok(FramebufferAccess {
+            vram: self.vram.try_clone()?,
+            len: self.len,
+            format: self.format.clone(),
             offset: self.offset,
         })
     }
@@ -149,8 +164,7 @@ impl FramebufferAccess {
 #[derive(Debug)]
 pub struct View {
     mapping: SparseMapping,
-    format_recv: mesh::Receiver<FramebufferFormat>,
-    format: Option<FramebufferFormat>,
+    format: Cell<FramebufferFormat>,
     vram: Mappable,
     len: usize,
     offset: u64,
@@ -159,47 +173,30 @@ pub struct View {
 impl View {
     /// Reads a line within the framebuffer.
     pub fn read_line(&mut self, line: u16, data: &mut [u8]) {
-        if let Some(format) = &self.format {
-            if let Some(offset) = (line as usize)
-                .checked_mul(format.bytes_per_line)
-                .and_then(|x| x.checked_add(format.offset))
-            {
-                let len = std::cmp::min(data.len(), format.width * 4);
-                let _ = self.mapping.read_at(offset, &mut data[..len]);
-                return;
-            }
+        let format = self.format.get();
+        if let Some(offset) = (line as usize)
+            .checked_mul(format.bytes_per_line)
+            .and_then(|x| x.checked_add(format.offset))
+        {
+            let len = std::cmp::min(data.len(), format.width * 4);
+            let _ = self.mapping.read_at(offset, &mut data[..len]);
+            return;
         }
         data.fill(0);
     }
 
     /// Returns the current resolution.
     pub fn resolution(&mut self) -> (u16, u16) {
-        // Get any framebuffer updates.
-        //
-        // FUTURE-use a channel/port type that throws away all but the last
-        // message to avoid possible high memory use.
-        while let Ok(format) = self.format_recv.try_recv() {
-            self.format = Some(format);
-        }
-        if let Some(format) = &self.format {
-            (format.width as u16, format.height as u16)
-        } else {
-            (1, 1)
-        }
+        let format = self.format.get();
+        (format.width as u16, format.height as u16)
     }
 
     /// Gets the framebuffer access back.
     pub fn access(self) -> FramebufferAccess {
-        // Put the current format at the head of the channel.
-        let (send, recv) = mesh::channel();
-        if let Some(format) = self.format {
-            send.send(format);
-        }
-        send.bridge(self.format_recv);
         FramebufferAccess {
             vram: self.vram,
             len: self.len,
-            format_recv: recv,
+            format: self.format,
             offset: self.offset,
         }
     }
@@ -289,9 +286,8 @@ impl FramebufferDevice {
             None
         };
 
-        // Send the initial framebuffer format.
+        // The cell is already initialized with the default format.
         let format = default_framebuffer_format();
-        framebuffer.format_send.send(format);
 
         Ok(Self {
             inner: Arc::new(Mutex::new(FramebufferInner {
@@ -370,12 +366,14 @@ impl SaveRestore for FramebufferDevice {
                 .map_err(RestoreError::Other)?;
         }
 
-        inner
-            .framebuffer
-            .as_mut()
-            .unwrap()
-            .format_send
-            .send(inner.format);
+        drop(
+            inner
+                .framebuffer
+                .as_mut()
+                .unwrap()
+                .format_updater
+                .set(inner.format),
+        );
         Ok(())
     }
 }
@@ -457,7 +455,7 @@ impl FramebufferLocalControl {
         if inner.format != format {
             inner.format = format;
             if let Some(framebuffer) = &mut inner.framebuffer {
-                framebuffer.format_send.send(inner.format);
+                drop(framebuffer.format_updater.set(inner.format));
             }
         }
     }

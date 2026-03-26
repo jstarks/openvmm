@@ -3463,7 +3463,7 @@ async fn new_underhill_vm(
     if let Some(framebuffer) = remote_console_cfg.framebuffer {
         resolver.add_resolver(FramebufferRemoteControl {
             get: get_client.clone(),
-            format_send: framebuffer.format_send(),
+            format_updater: Arc::new(Mutex::new(framebuffer.format_updater())),
         });
 
         vmbus_device_handles.push(

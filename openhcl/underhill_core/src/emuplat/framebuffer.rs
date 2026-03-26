@@ -1,8 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use mesh::MeshPayload;
+use mesh::CellUpdater;
+use parking_lot::Mutex;
 use std::convert::Infallible;
+use std::sync::Arc;
 use video_core::FramebufferControl;
 use video_core::FramebufferFormat;
 use video_core::ResolvedFramebuffer;
@@ -10,10 +12,10 @@ use video_core::SharedFramebufferHandle;
 use vm_resource::ResolveResource;
 use vm_resource::kind::FramebufferHandleKind;
 
-#[derive(Clone, MeshPayload)]
+#[derive(Clone)]
 pub struct FramebufferRemoteControl {
     pub get: guest_emulation_transport::GuestEmulationTransportClient,
-    pub format_send: mesh::Sender<FramebufferFormat>,
+    pub format_updater: Arc<Mutex<CellUpdater<FramebufferFormat>>>,
 }
 
 #[async_trait::async_trait]
@@ -37,7 +39,7 @@ impl FramebufferControl for FramebufferRemoteControl {
     }
 
     async fn set_format(&mut self, format: FramebufferFormat) {
-        self.format_send.send(format);
+        drop(self.format_updater.lock().set(format));
     }
 }
 

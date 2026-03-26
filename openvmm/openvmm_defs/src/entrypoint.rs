@@ -18,6 +18,8 @@ pub struct GuiParameters {
     pub framebuffer: FramebufferAccess,
     /// A channel to send input to.
     pub input_send: mesh::Sender<input_core::InputData>,
+    /// Held by the child to indicate liveness. Dropped when the child exits.
+    pub alive_send: mesh::Sender<()>,
 }
 
 /// The initial message to send when launching a mesh child process.

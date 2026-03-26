@@ -24,7 +24,11 @@ pub(crate) fn run_vmm_mesh_host() -> anyhow::Result<()> {
             }
             MeshHostParams::Gui(gui_params) => {
                 #[cfg(feature = "gui")]
-                openvmm_gui::run(gui_params.framebuffer, gui_params.input_send)?;
+                openvmm_gui::run(
+                    gui_params.framebuffer,
+                    gui_params.input_send,
+                    gui_params.alive_send,
+                )?;
                 #[cfg(not(feature = "gui"))]
                 {
                     let _ = gui_params;
@@ -91,15 +95,17 @@ impl VmmMesh {
     }
 
     /// Launch the GUI in a child process, sending parameters directly.
-    #[cfg(feature = "gui")]
-    pub async fn launch_gui(&self, params: openvmm_gui::GuiParameters) -> anyhow::Result<()> {
+    /// Returns the child process ID.
+    pub async fn launch_gui(
+        &self,
+        params: openvmm_defs::entrypoint::GuiParameters,
+    ) -> anyhow::Result<i32> {
         let mesh = self
             .mesh
             .as_ref()
             .context("GUI requires multi-process mode (no --single-process)")?;
         mesh.launch_host(ProcessConfig::new("gui"), MeshHostParams::Gui(params))
-            .await?;
-        Ok(())
+            .await
     }
 
     pub async fn shutdown(self) {

@@ -19,20 +19,23 @@ use parking_lot::Mutex;
 pub fn run(
     framebuffer: FramebufferAccess,
     input_send: mesh::Sender<input_core::InputData>,
+    alive_send: mesh::Sender<()>,
 ) -> anyhow::Result<()> {
     tracing::info!("GUI starting");
 
     // Wrap in Mutex so the boot closure can be Fn (iced requires this).
     // The closure will only be called once in practice.
-    let params = Mutex::new(Some((framebuffer, input_send)));
+    let params = Mutex::new(Some((framebuffer, input_send, alive_send)));
 
     iced::application(
         move || {
-            let (framebuffer, input_send) = params.lock().take().expect("boot called once");
+            let (framebuffer, input_send, alive_send) =
+                params.lock().take().expect("boot called once");
             (
                 App {
                     _framebuffer: framebuffer,
                     _input_send: input_send,
+                    _alive_send: alive_send,
                 },
                 Task::none(),
             )
@@ -52,6 +55,7 @@ pub fn run(
 struct App {
     _framebuffer: FramebufferAccess,
     _input_send: mesh::Sender<input_core::InputData>,
+    _alive_send: mesh::Sender<()>,
 }
 
 #[derive(Debug, Clone)]

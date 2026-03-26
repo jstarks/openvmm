@@ -2358,6 +2358,10 @@ enum InteractiveCommand {
     #[clap(visible_alias = "V")]
     RestartVnc,
 
+    /// Open the GUI window. Launches a child process with the framebuffer viewer.
+    #[clap(visible_alias = "g")]
+    Gui,
+
     /// Start an hvsocket terminal window.
     #[clap(visible_alias = "v")]
     Hvsock {
@@ -2542,6 +2546,7 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
     let (mut vm_config, mut resources) = vm_config_from_command_line(driver, mesh, &opt).await?;
 
     let mut vnc_worker = None;
+    let mut gui_alive_recv: Option<mesh::Receiver<()>> = None;
     if opt.gfx || opt.vnc {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", opt.vnc_port))
             .with_context(|| format!("binding to VNC port {}", opt.vnc_port))?;
@@ -2549,8 +2554,10 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
         let input_send = vm_config.input.sender();
         let framebuffer = resources
             .framebuffer_access
-            .take()
-            .expect("synth video enabled");
+            .as_ref()
+            .expect("synth video enabled")
+            .try_clone()
+            .context("cloning framebuffer access")?;
 
         let vnc_host = mesh
             .make_host("vnc", None)
@@ -3534,6 +3541,42 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                     }
                 } else {
                     eprintln!("ERROR: no VNC server running");
+                }
+            }
+            InteractiveCommand::Gui => {
+                // Check if a previous GUI is still alive.
+                if let Some(recv) = &mut gui_alive_recv {
+                    if recv.try_recv().is_err() {
+                        // Channel closed — child exited.
+                        gui_alive_recv = None;
+                    }
+                }
+                if gui_alive_recv.is_some() {
+                    eprintln!("GUI already running");
+                } else if let Some(fb) = &resources.framebuffer_access {
+                    let action = async {
+                        let framebuffer = fb.try_clone().context("cloning framebuffer access")?;
+                        let (input_send, _input_recv) = mesh::channel();
+                        let (alive_send, alive_recv) = mesh::channel::<()>();
+                        let pid = mesh
+                            .launch_gui(openvmm_defs::entrypoint::GuiParameters {
+                                framebuffer,
+                                input_send,
+                                alive_send,
+                            })
+                            .await
+                            .context("launching GUI process")?;
+                        anyhow::Result::<_>::Ok((pid, alive_recv))
+                    };
+                    match action.await {
+                        Ok((pid, alive_recv)) => {
+                            println!("GUI launched (pid {})", pid);
+                            gui_alive_recv = Some(alive_recv);
+                        }
+                        Err(error) => eprintln!("error: {}", error),
+                    }
+                } else {
+                    eprintln!("ERROR: no framebuffer available (synth video not enabled)");
                 }
             }
             InteractiveCommand::Hvsock { term, port } => {

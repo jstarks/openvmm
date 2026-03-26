@@ -481,7 +481,7 @@ hyper = "1.4"
 hyper-tls = "0.6"
 hyper-util = "0.1"
 home = "0.5.9"
-iced = { version = "0.14", default-features = false, features = ["image", "tiny-skia", "tokio", "wayland", "x11"] }
+iced = { version = "0.14", default-features = false, features = ["image", "tiny-skia", "tokio", "x11"] }
 # iced has negative features, which aren't how features are supposed to work, but disable them here along with default features.
 iced-x86 = { version = "1.17", default-features = false, features = [
   "no_vex",

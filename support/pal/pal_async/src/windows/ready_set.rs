@@ -273,10 +273,13 @@ impl<A: AfdHandle> ReadySetOp<A> {
         drop(state);
     }
 
-    /// Cancels any in-flight IO.
+    /// Cancels any in-flight IO and marks the op as dead so that
+    /// the completion handler will not reissue.
     fn teardown(&self) {
-        let state = self.state.lock();
-        if state.in_flight {
+        let mut state = self.state.lock();
+        state.events = PollEvents::EMPTY;
+        if state.in_flight && !state.cancelled {
+            state.cancelled = true;
             self.cancel_io();
         }
     }
@@ -311,10 +314,10 @@ impl<A: AfdHandle> AfdReadySet<A> {
         }
     }
 
-    /// Returns a reference to the shared state (used by LocalReadySet
-    /// to access the inner IOCP).
-    pub(super) fn shared(&self) -> &ReadySetShared<A> {
-        &self.shared
+    /// Returns an Arc clone of the shared state (used by LocalReadySet
+    /// to drain the inner IOCP after the AfdReadySet is dropped).
+    pub(super) fn shared_arc(&self) -> Arc<ReadySetShared<A>> {
+        self.shared.clone()
     }
 }
 

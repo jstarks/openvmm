@@ -524,13 +524,7 @@ impl PollTimer for Timer {
 /// [`NestedFdReadySet`](super::ready_set::NestedFdReadySet).
 pub struct KqueuePoller(OwnedFd);
 
-impl AsFd for KqueuePoller {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-
-impl super::ready_set::FdPoller for KqueuePoller {
+impl KqueuePoller {
     fn new() -> io::Result<Self> {
         // SAFETY: kqueue creates a new, uniquely owned fd.
         let fd = unsafe { libc::kqueue() };
@@ -540,7 +534,15 @@ impl super::ready_set::FdPoller for KqueuePoller {
         // SAFETY: fd is a newly created, uniquely owned file descriptor.
         Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
+}
 
+impl AsFd for KqueuePoller {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl super::ready_set::FdPoller for KqueuePoller {
     fn register(&self, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()> {
         let mut changelist = Vec::new();
         if events.has_in() {
@@ -717,7 +719,7 @@ impl crate::ready_set::ReadySetDriver for KqueueDriver {
     type ReadySet = super::ready_set::NestedFdReadySet<FdReady, KqueuePoller>;
 
     fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
-        super::ready_set::NestedFdReadySet::new(self)
+        super::ready_set::NestedFdReadySet::new(self, KqueuePoller::new()?)
     }
 }
 

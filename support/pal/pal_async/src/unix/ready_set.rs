@@ -25,11 +25,6 @@ use std::task::ready;
 /// Implementors are newtypes around `OwnedFd` that implement [`AsFd`].
 /// Implemented by the epoll backend (Linux) and kqueue backend (macOS).
 pub trait FdPoller: AsFd + Send + Unpin {
-    /// Creates a new poller.
-    fn new() -> io::Result<Self>
-    where
-        Self: Sized;
-
     /// Registers an fd with the poller.
     fn register(&self, fd: RawFd, key: usize, events: PollEvents) -> io::Result<()>;
 
@@ -76,8 +71,7 @@ pub struct FdEntry {
 impl<F: PollFdReady, P: FdPoller> NestedFdReadySet<F, P> {
     /// Creates a new nested-fd ready set, registering the inner poller with
     /// the given driver for wakeup integration.
-    pub fn new(driver: &impl FdReadyDriver<FdReady = F>) -> io::Result<Self> {
-        let inner = P::new()?;
+    pub fn new(driver: &impl FdReadyDriver<FdReady = F>, inner: P) -> io::Result<Self> {
         let outer_ready = driver.new_fd_ready(inner.as_fd().as_raw_fd())?;
         Ok(Self {
             outer_ready,

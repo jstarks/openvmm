@@ -247,6 +247,58 @@ pub async fn ready_set_tests(driver: impl Driver + crate::ready_set::ReadySetDri
     assert!(rs.remove(99).is_err());
 }
 
+/// Runs ready-set-related tests.
+#[cfg(windows)]
+pub async fn ready_set_tests(driver: impl Driver + crate::ready_set::ReadySetDriver) {
+    use crate::interest::PollEvents;
+    use crate::ready_set::PollReadySet;
+
+    let (a1, a2) = UnixStream::pair().unwrap();
+    let (b1, _b2) = UnixStream::pair().unwrap();
+
+    let mut rs = driver.new_ready_set().unwrap();
+
+    // Add two sockets for read readiness.
+    rs.add(1, a1.as_socket().as_raw_socket(), PollEvents::IN)
+        .unwrap();
+    rs.add(2, b1.as_socket().as_raw_socket(), PollEvents::IN)
+        .unwrap();
+
+    // Make a1 readable by writing to a2.
+    std::io::Write::write_all(&mut &a2, b"hello").unwrap();
+
+    // Poll — should report key 1 as IN-ready.
+    let mut events = Vec::new();
+    poll_fn(|cx| rs.poll_ready(cx, &mut events)).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.key == 1 && e.events.has_in()),
+        "expected key 1 IN, got: {events:?}",
+    );
+
+    // Remove key 1.
+    rs.remove(1).unwrap();
+
+    // Modify key 2 to also watch for write readiness.
+    rs.modify(2, PollEvents::IN | PollEvents::OUT).unwrap();
+
+    // b1 should be writable (empty write buffer).
+    events.clear();
+    poll_fn(|cx| rs.poll_ready(cx, &mut events)).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.key == 2 && e.events.has_out()),
+        "expected key 2 OUT, got: {events:?}",
+    );
+
+    // Duplicate key should fail.
+    assert!(
+        rs.add(2, a1.as_socket().as_raw_socket(), PollEvents::IN)
+            .is_err()
+    );
+
+    // Nonexistent key removal should fail.
+    assert!(rs.remove(99).is_err());
+}
+
 #[cfg(windows)]
 pub mod windows {
     // UNSAFETY: needed to use `OverlappedFile`.

@@ -8,6 +8,7 @@
 use super::overlapped::IoOverlapped;
 use super::overlapped::OverlappedIoDriver;
 use super::overlapped::overlapped_io_done;
+use super::socket::AfdHandle;
 use super::socket::make_poll_handle_info;
 use super::socket::parse_poll_handle_info;
 use crate::interest::InterestSlot;
@@ -15,6 +16,7 @@ use crate::interest::PollEvents;
 use crate::interest::PollInterestSet;
 use crate::local::LocalDriver;
 use crate::local::LocalInner;
+use crate::ready_set::ReadyEvent;
 use crate::socket::PollSocketReady;
 use crate::socket::SocketReadyDriver;
 use crate::sparsevec::SparseVec;
@@ -47,6 +49,8 @@ use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::QueueUserAPC;
 use windows_sys::Win32::System::Threading::WaitForMultipleObjectsEx;
 use windows_sys::Win32::System::Threading::WaitForSingleObjectEx;
+use windows_sys::Win32::System::WindowsProgramming::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+use windows_sys::Win32::System::WindowsProgramming::FILE_SKIP_SET_EVENT_ON_HANDLE;
 
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -505,5 +509,145 @@ impl IoOverlapped for OverlappedIo {
         {
             panic!("caller bug: no pending IO should be in flight");
         }
+    }
+}
+
+/// Owns the AFD file and inner IOCP for ready set operations on LocalDriver.
+pub(super) struct OwnedLocalReadySetAfd {
+    iocp: pal::windows::IoCompletionPort,
+    afd_file: File,
+}
+
+const LOCAL_KEY_READY_SET: usize = 0;
+
+impl AfdHandle for OwnedLocalReadySetAfd {
+    fn handle(&self) -> RawHandle {
+        self.afd_file.as_raw_handle()
+    }
+
+    fn ref_io(&self) -> RawHandle {
+        self.afd_file.as_raw_handle()
+    }
+
+    unsafe fn deref_io(&self) {}
+}
+
+/// Ready set for LocalDriver using a nested IOCP in the WFMO set.
+///
+/// The inner IOCP handle is waitable. When an AFD poll completes to it,
+/// `WaitForMultipleObjectsEx` returns. `poll_ready` drains the inner IOCP
+/// inline and processes completions into the shared buffer.
+pub struct LocalReadySet {
+    inner: super::ready_set::AfdReadySet<OwnedLocalReadySetAfd>,
+    wait: Wait,
+}
+
+impl LocalReadySet {
+    fn drain_iocp(&mut self) {
+        let mut wakers = WakerList::default();
+        let mut entries = [Default::default(); 16];
+        loop {
+            let n = self
+                .inner
+                .shared()
+                .afd
+                .iocp
+                .get(&mut entries, Some(Duration::ZERO));
+            if n == 0 {
+                break;
+            }
+            for entry in &entries[..n] {
+                match entry.lpCompletionKey {
+                    LOCAL_KEY_READY_SET => {
+                        // SAFETY: the overlapped IO is complete.
+                        unsafe {
+                            super::ready_set::local_ready_set_io_complete(
+                                entry.lpOverlapped,
+                                &mut wakers,
+                            );
+                        }
+                    }
+                    key => panic!("unknown ready set iocp key {:#x}", key),
+                }
+            }
+        }
+        wakers.wake();
+    }
+}
+
+impl crate::ready_set::PollReadySet for LocalReadySet {
+    fn add(&mut self, key: usize, socket: RawSocket, events: PollEvents) -> io::Result<()> {
+        self.inner.add(key, socket, events)
+    }
+
+    fn remove(&mut self, key: usize) -> io::Result<()> {
+        self.inner.remove(key)
+    }
+
+    fn modify(&mut self, key: usize, events: PollEvents) -> io::Result<()> {
+        self.inner.modify(key, events)
+    }
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<ReadyEvent>,
+    ) -> Poll<io::Result<()>> {
+        // Drain the inner IOCP for any completed AFD polls.
+        self.drain_iocp();
+
+        // Check if the inner AfdReadySet has buffered events.
+        match self.inner.poll_ready(cx, out) {
+            Poll::Ready(r) => return Poll::Ready(r),
+            Poll::Pending => {}
+        }
+
+        // Wait for the inner IOCP handle to become signaled.
+        loop {
+            match self.wait.poll_wait(cx) {
+                Poll::Ready(Ok(())) => {
+                    // IOCP handle was signaled — drain completions.
+                    self.drain_iocp();
+                    match self.inner.poll_ready(cx, out) {
+                        Poll::Ready(r) => return Poll::Ready(r),
+                        Poll::Pending => {
+                            // Spurious wakeup, re-wait.
+                            continue;
+                        }
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl crate::ready_set::ReadySetDriver for LocalDriver {
+    type ReadySet = LocalReadySet;
+
+    fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
+        let iocp = pal::windows::IoCompletionPort::new();
+        let afd_file = afd::open_afd()?;
+        // SAFETY: handle is valid.
+        unsafe {
+            iocp.associate(afd_file.as_raw_handle(), LOCAL_KEY_READY_SET)?;
+        }
+        // SAFETY: file is owned.
+        unsafe {
+            set_file_completion_notification_modes(
+                afd_file.as_raw_handle(),
+                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+            )?;
+        }
+
+        let iocp_handle = iocp.as_handle().as_raw_handle();
+        let wait = self.new_wait(iocp_handle)?;
+
+        let afd = OwnedLocalReadySetAfd { iocp, afd_file };
+        Ok(LocalReadySet {
+            inner: super::ready_set::AfdReadySet::new(afd),
+            wait,
+        })
     }
 }

@@ -150,6 +150,7 @@ const KEY_WAKEUP: usize = 0;
 const KEY_WAIT_COMPLETE: usize = 1;
 const KEY_AFD: usize = 2;
 const KEY_FILE: usize = 3;
+const KEY_READY_SET: usize = 4;
 
 impl IoBackend for IocpBackend {
     fn name() -> &'static str {
@@ -214,6 +215,12 @@ impl IoBackend for IocpBackend {
                         },
                         KEY_FILE => unsafe {
                             overlapped_io_done(entry.lpOverlapped, &mut wakers);
+                        },
+                        KEY_READY_SET => unsafe {
+                            super::ready_set::iocp_ready_set_io_complete(
+                                entry.lpOverlapped,
+                                &mut wakers,
+                            );
                         },
                         key => panic!("unknown key {:#x}", key),
                     }
@@ -577,6 +584,51 @@ impl IoOverlapped for OverlappedIo {
     }
 }
 
+/// An [`AfdHandle`] for ready set AFD polls on an IOCP backend.
+///
+/// Opens a separate AFD file associated with `KEY_READY_SET` on the
+/// same completion port, so completions route to the ready set handler
+/// in the run loop.
+pub struct OwnedIocpReadySetAfd {
+    afd_file: File,
+}
+
+impl AfdHandle for OwnedIocpReadySetAfd {
+    fn handle(&self) -> RawHandle {
+        self.afd_file.as_raw_handle()
+    }
+
+    fn ref_io(&self) -> RawHandle {
+        self.afd_file.as_raw_handle()
+    }
+
+    unsafe fn deref_io(&self) {}
+}
+
+impl crate::ready_set::ReadySetDriver for IocpDriver {
+    type ReadySet = super::ready_set::AfdReadySet<OwnedIocpReadySetAfd>;
+
+    fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
+        let afd_file = afd::open_afd()?;
+        // SAFETY: handle is valid.
+        unsafe {
+            self.inner
+                .port
+                .associate(afd_file.as_raw_handle(), KEY_READY_SET)?;
+        }
+        // SAFETY: file is owned, skip completion port on sync completion.
+        unsafe {
+            set_file_completion_notification_modes(
+                afd_file.as_raw_handle(),
+                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+            )?;
+        }
+        Ok(super::ready_set::AfdReadySet::new(OwnedIocpReadySetAfd {
+            afd_file,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::IocpPool;
@@ -613,5 +665,10 @@ mod tests {
     #[test]
     fn overlapped_file_works() {
         IocpPool::run_with(executor_tests::windows::overlapped_file_tests)
+    }
+
+    #[test]
+    fn ready_set_works() {
+        IocpPool::run_with(executor_tests::ready_set_tests)
     }
 }

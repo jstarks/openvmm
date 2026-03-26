@@ -541,6 +541,76 @@ impl IoOverlapped for OverlappedIo {
     }
 }
 
+/// Owns the AFD file and TpIo for ready set operations on the thread pool.
+pub struct OwnedTpReadySetAfd {
+    tp_io: TpIo,
+    afd_file: File,
+}
+
+// SAFETY: The TpIo and File are thread-safe.
+unsafe impl Send for OwnedTpReadySetAfd {}
+// SAFETY: See above.
+unsafe impl Sync for OwnedTpReadySetAfd {}
+
+impl AfdHandle for OwnedTpReadySetAfd {
+    fn handle(&self) -> RawHandle {
+        self.afd_file.as_raw_handle()
+    }
+
+    fn ref_io(&self) -> RawHandle {
+        self.tp_io.start_io();
+        self.afd_file.as_raw_handle()
+    }
+
+    unsafe fn deref_io(&self) {
+        // SAFETY: caller ensures no async IO will complete.
+        unsafe { self.tp_io.cancel_io() };
+    }
+}
+
+unsafe extern "system" fn tp_ready_set_io_complete(
+    _: PTP_CALLBACK_INSTANCE,
+    _: *mut c_void,
+    overlapped: *mut c_void,
+    _: u32,
+    _: usize,
+    _: PTP_IO,
+) {
+    let mut wakers = WakerList::default();
+    // SAFETY: the overlapped IO is complete.
+    unsafe {
+        super::ready_set::tp_ready_set_io_complete(overlapped.cast(), &mut wakers);
+    }
+    wake_locally(|| wakers.wake());
+}
+
+impl crate::ready_set::ReadySetDriver for TpPool {
+    type ReadySet = super::ready_set::AfdReadySet<OwnedTpReadySetAfd>;
+
+    fn new_ready_set(&self) -> io::Result<Self::ReadySet> {
+        let afd_file = afd::open_afd()?;
+        // SAFETY: the handle is valid and we will call start_io before each IO.
+        let tp_io = unsafe {
+            TpIo::new(
+                afd_file.as_raw_handle(),
+                Some(tp_ready_set_io_complete),
+                null_mut(),
+            )?
+        };
+        // SAFETY: file is owned.
+        unsafe {
+            set_file_completion_notification_modes(
+                afd_file.as_raw_handle(),
+                FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS,
+            )?;
+        }
+        Ok(super::ready_set::AfdReadySet::new(OwnedTpReadySetAfd {
+            tp_io,
+            afd_file,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::TpPool;
@@ -579,5 +649,10 @@ mod tests {
             "test",
             executor_tests::windows::overlapped_file_tests(TpPool::system()),
         ))
+    }
+
+    #[test]
+    fn ready_set_works() {
+        block_on(TpPool::system().spawn("test", executor_tests::ready_set_tests(TpPool::system())))
     }
 }

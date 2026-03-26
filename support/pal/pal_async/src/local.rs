@@ -285,4 +285,10 @@ mod tests {
     fn overlapped_file_works() {
         block_with_io(executor_tests::windows::overlapped_file_tests)
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn ready_set_works() {
+        block_with_io(executor_tests::ready_set_tests)
+    }
 }

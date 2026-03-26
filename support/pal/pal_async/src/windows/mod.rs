@@ -11,6 +11,7 @@ pub mod iocp;
 pub mod local;
 pub mod overlapped;
 pub mod pipe;
+pub(crate) mod ready_set;
 mod socket;
 pub mod tp;
 

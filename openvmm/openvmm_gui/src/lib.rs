@@ -10,10 +10,20 @@
 #![forbid(unsafe_code)]
 
 use framebuffer::FramebufferAccess;
+use framebuffer::View;
 use iced::Element;
+use iced::Length;
+use iced::Subscription;
 use iced::Task;
 use iced::Theme;
+use iced::widget::column;
+use iced::widget::container;
+use iced::widget::image;
+use iced::widget::row;
+use iced::widget::text;
 use parking_lot::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 /// Run the GUI. This blocks until the window is closed.
 pub fn run(
@@ -23,19 +33,30 @@ pub fn run(
 ) -> anyhow::Result<()> {
     tracing::info!("GUI starting");
 
+    let view = framebuffer
+        .view()
+        .map_err(|e| anyhow::anyhow!("failed to map framebuffer: {e}"))?;
+
     // Wrap in Mutex so the boot closure can be Fn (iced requires this).
     // The closure will only be called once in practice.
-    let params = Mutex::new(Some((framebuffer, input_send, alive_send)));
+    let params = Mutex::new(Some((view, input_send, alive_send)));
 
     iced::application(
         move || {
-            let (framebuffer, input_send, alive_send) =
-                params.lock().take().expect("boot called once");
+            let (view, input_send, alive_send) = params.lock().take().expect("boot called once");
+            let (w, h) = (1024, 768); // initial size, updated on first tick
             (
                 App {
-                    _framebuffer: framebuffer,
+                    view,
                     _input_send: input_send,
                     _alive_send: alive_send,
+                    rgba_buf: vec![0u8; w * h * 4],
+                    line_buf: vec![0u8; w * 4],
+                    display_handle: None,
+                    width: w as u32,
+                    height: h as u32,
+                    frame_count: 0,
+                    last_stats: Instant::now(),
                 },
                 Task::none(),
             )
@@ -43,8 +64,10 @@ pub fn run(
         App::update,
         App::view,
     )
+    .subscription(App::subscription)
     .theme(App::theme)
-    .window_size((800.0, 600.0))
+    .title("OpenVMM")
+    .window_size((1024.0, 768.0))
     .run()
     .map_err(|e| anyhow::anyhow!("iced application error: {e}"))?;
 
@@ -53,21 +76,101 @@ pub fn run(
 }
 
 struct App {
-    _framebuffer: FramebufferAccess,
+    view: View,
     _input_send: mesh::Sender<input_core::InputData>,
     _alive_send: mesh::Sender<()>,
+    rgba_buf: Vec<u8>,
+    line_buf: Vec<u8>,
+    display_handle: Option<image::Handle>,
+    width: u32,
+    height: u32,
+    frame_count: u64,
+    last_stats: Instant,
 }
 
 #[derive(Debug, Clone)]
-enum Message {}
+enum Message {
+    Tick,
+}
 
 impl App {
-    fn update(&mut self, _message: Message) -> Task<Message> {
-        Task::none()
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Tick => {
+                // Check for resolution changes.
+                let (w, h) = self.view.resolution();
+                let (w, h) = (w as u32, h as u32);
+                if w != self.width || h != self.height {
+                    self.width = w;
+                    self.height = h;
+                    self.rgba_buf.resize((w * h * 4) as usize, 0);
+                    self.line_buf.resize((w * 4) as usize, 0);
+                    tracing::info!(w, h, "resolution changed");
+                }
+
+                // Read framebuffer line by line, converting BGRX -> RGBA.
+                for y in 0..self.height as u16 {
+                    self.view.read_line(y, &mut self.line_buf);
+                    let row_offset = y as usize * self.width as usize * 4;
+                    for x in 0..self.width as usize {
+                        let src = x * 4;
+                        let dst = row_offset + x * 4;
+                        self.rgba_buf[dst] = self.line_buf[src + 2]; // R <- B
+                        self.rgba_buf[dst + 1] = self.line_buf[src + 1]; // G
+                        self.rgba_buf[dst + 2] = self.line_buf[src]; // B <- R
+                        self.rgba_buf[dst + 3] = 0xFF; // A
+                    }
+                }
+
+                self.display_handle = Some(image::Handle::from_rgba(
+                    self.width,
+                    self.height,
+                    self.rgba_buf.clone(),
+                ));
+
+                self.frame_count += 1;
+                let elapsed = self.last_stats.elapsed().as_secs_f64();
+                if elapsed >= 5.0 {
+                    let fps = self.frame_count as f64 / elapsed;
+                    tracing::info!(fps = format!("{fps:.1}"), "GUI stats");
+                    self.frame_count = 0;
+                    self.last_stats = Instant::now();
+                }
+
+                Task::none()
+            }
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
-        iced::widget::text("OpenVMM GUI - Connected").into()
+        let status = text(format!("{}x{}", self.width, self.height)).size(14);
+
+        let content: Element<'_, Message> = if let Some(handle) = &self.display_handle {
+            container(
+                image(handle.clone())
+                    .content_fit(iced::ContentFit::Contain)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .center(Length::Fill)
+            .into()
+        } else {
+            container(text("Waiting for framebuffer...").size(24))
+                .center(Length::Fill)
+                .into()
+        };
+
+        column![
+            row![text("OpenVMM").size(14), status]
+                .spacing(20)
+                .padding(5),
+            content,
+        ]
+        .into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
     }
 
     fn theme(&self) -> Theme {

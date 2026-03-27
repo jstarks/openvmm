@@ -2616,6 +2616,9 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
     // spin up the VM
     let (vm_rpc, rpc_recv) = mesh::channel();
     let (notify_send, notify_recv) = mesh::channel();
+    // Create an input sender for the GUI before vm_config is consumed.
+    let gui_input_send = vm_config.input.sender();
+
     let mut vm_worker = {
         let vm_host = mesh.make_host("vm", opt.log_file.clone()).await?;
 
@@ -3556,7 +3559,7 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                 } else if let Some(fb) = &resources.framebuffer_access {
                     let action = async {
                         let framebuffer = fb.try_clone().context("cloning framebuffer access")?;
-                        let (input_send, _input_recv) = mesh::channel();
+                        let input_send = gui_input_send.clone();
                         let (alive_send, alive_recv) = mesh::channel::<()>();
                         let pid = mesh
                             .launch_gui(openvmm_defs::entrypoint::GuiParameters {

@@ -16,6 +16,7 @@ use iced::Length;
 use iced::Subscription;
 use iced::Task;
 use iced::Theme;
+use iced::exit;
 use iced::widget::column;
 use iced::widget::container;
 use iced::widget::image;
@@ -43,18 +44,31 @@ pub fn run(
 
     iced::application(
         move || {
-            let (view, input_send, alive_send) = params.lock().take().expect("boot called once");
-            let (w, h) = (1024, 768); // initial size, updated on first tick
+            let (mut view, input_send, alive_send) =
+                params.lock().take().expect("boot called once");
+
+            // Read the first frame eagerly so the display is immediately
+            // populated instead of showing "Waiting for framebuffer".
+            let (w, h) = view.resolution();
+            let (w, h) = (w as u32, h as u32);
+            let mut rgba_buf = vec![0u8; (w * h * 4) as usize];
+            let mut line_buf = vec![0u8; (w * 4) as usize];
+            let display_handle = if w > 0 && h > 0 {
+                read_framebuffer(&mut view, w, h, &mut rgba_buf, &mut line_buf);
+                Some(image::Handle::from_rgba(w, h, rgba_buf.clone()))
+            } else {
+                None
+            };
             (
                 App {
                     view,
                     _input_send: input_send,
-                    _alive_send: alive_send,
-                    rgba_buf: vec![0u8; w * h * 4],
-                    line_buf: vec![0u8; w * 4],
-                    display_handle: None,
-                    width: w as u32,
-                    height: h as u32,
+                    alive_send,
+                    rgba_buf,
+                    line_buf,
+                    display_handle,
+                    width: w,
+                    height: h,
                     frame_count: 0,
                     last_stats: Instant::now(),
                 },
@@ -78,7 +92,7 @@ pub fn run(
 struct App {
     view: View,
     _input_send: mesh::Sender<input_core::InputData>,
-    _alive_send: mesh::Sender<()>,
+    alive_send: mesh::Sender<()>,
     rgba_buf: Vec<u8>,
     line_buf: Vec<u8>,
     display_handle: Option<image::Handle>,
@@ -93,10 +107,37 @@ enum Message {
     Tick,
 }
 
+/// Read the framebuffer into `rgba_buf`, converting BGRX -> RGBA.
+fn read_framebuffer(
+    view: &mut View,
+    width: u32,
+    height: u32,
+    rgba_buf: &mut [u8],
+    line_buf: &mut [u8],
+) {
+    for y in 0..height as u16 {
+        view.read_line(y, line_buf);
+        let row_offset = y as usize * width as usize * 4;
+        for x in 0..width as usize {
+            let src = x * 4;
+            let dst = row_offset + x * 4;
+            rgba_buf[dst] = line_buf[src + 2]; // R <- B
+            rgba_buf[dst + 1] = line_buf[src + 1]; // G
+            rgba_buf[dst + 2] = line_buf[src]; // B <- R
+            rgba_buf[dst + 3] = 0xFF; // A
+        }
+    }
+}
+
 impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                // Exit if the VM process has closed our channel.
+                if self.alive_send.is_closed() {
+                    return exit();
+                }
+
                 // Check for resolution changes.
                 let (w, h) = self.view.resolution();
                 let (w, h) = (w as u32, h as u32);
@@ -108,19 +149,13 @@ impl App {
                     tracing::info!(w, h, "resolution changed");
                 }
 
-                // Read framebuffer line by line, converting BGRX -> RGBA.
-                for y in 0..self.height as u16 {
-                    self.view.read_line(y, &mut self.line_buf);
-                    let row_offset = y as usize * self.width as usize * 4;
-                    for x in 0..self.width as usize {
-                        let src = x * 4;
-                        let dst = row_offset + x * 4;
-                        self.rgba_buf[dst] = self.line_buf[src + 2]; // R <- B
-                        self.rgba_buf[dst + 1] = self.line_buf[src + 1]; // G
-                        self.rgba_buf[dst + 2] = self.line_buf[src]; // B <- R
-                        self.rgba_buf[dst + 3] = 0xFF; // A
-                    }
-                }
+                read_framebuffer(
+                    &mut self.view,
+                    self.width,
+                    self.height,
+                    &mut self.rgba_buf,
+                    &mut self.line_buf,
+                );
 
                 self.display_handle = Some(image::Handle::from_rgba(
                     self.width,

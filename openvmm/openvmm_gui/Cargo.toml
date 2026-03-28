@@ -13,9 +13,27 @@ input_core.workspace = true
 mesh.workspace = true
 
 anyhow.workspace = true
-iced.workspace = true
-parking_lot.workspace = true
+eframe.workspace = true
+wgpu.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { workspace = true, features = ["dx12"] }
+egui_software_backend.workspace = true
+egui-winit.workspace = true
+winit.workspace = true
+bytemuck.workspace = true
+raw-window-handle.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { workspace = true, features = ["vulkan"] }
 
 [lints]
 workspace = true

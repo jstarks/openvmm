@@ -961,6 +961,13 @@ pub enum DiskCliKind {
         kind: BlobKind,
         url: String,
     },
+    // blob-resolver:<resolver_path>:<key=val,key=val,...>
+    BlobResolver {
+        /// Path to the resolver binary.
+        resolver: String,
+        /// Key=value parameters to pass to the resolver.
+        params: Vec<(String, String)>,
+    },
     // crypt:<cipher>:<key_file>:<kind>
     Crypt {
         cipher: DiskCipher,
@@ -1074,6 +1081,24 @@ impl FromStr for DiskCliKind {
                     DiskCliKind::Blob {
                         kind: blob_kind,
                         url: url.to_string(),
+                    }
+                }
+                "blob-resolver" => {
+                    let (resolver, params_str) =
+                        arg.split_once(':').context("expected resolver_path:key=val,...")?;
+                    let params = params_str
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|kv| {
+                            let (k, v) = kv
+                                .split_once('=')
+                                .with_context(|| format!("expected key=value, got '{kv}'"))?;
+                            Ok((k.to_string(), v.to_string()))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    DiskCliKind::BlobResolver {
+                        resolver: resolver.to_string(),
+                        params,
                     }
                 }
                 "crypt" => {

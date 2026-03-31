@@ -7,6 +7,7 @@
 #![expect(missing_docs)]
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+mod blob_resolver;
 mod cli_args;
 mod crash_dump;
 mod kvp;
@@ -1925,6 +1926,24 @@ fn disk_open_inner(
                     cli_args::BlobKind::Vhd1 => disk_backend_resources::BlobDiskFormat::FixedVhd1,
                 },
                 url_updater: None,
+            }))
+        }
+        DiskCliKind::BlobResolver { resolver, params } => {
+            let (url, expires, token, child) =
+                blob_resolver::initial_resolve(resolver, params)
+                    .context("failed to resolve blob URL")?;
+
+            let mut updater = CellUpdater::new(url.clone());
+            let cell = updater.cell();
+
+            // Spawn a thread to refresh the URL before expiry.
+            // The thread owns the CellUpdater and the resolver child process.
+            blob_resolver::spawn_refresh_task(updater, token, expires, child);
+
+            layers.push(disk(disk_backend_resources::BlobDiskHandle {
+                url,
+                format: disk_backend_resources::BlobDiskFormat::FixedVhd1,
+                url_updater: Some(cell),
             }))
         }
         DiskCliKind::MemoryDiff(inner) => {

@@ -97,6 +97,9 @@ openssl = { optional = true, workspace = true }
 parking_lot.workspace = true
 prost.workspace = true
 rustyline = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+jiff.workspace = true
 shell-words.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

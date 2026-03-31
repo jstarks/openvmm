@@ -425,10 +425,12 @@ dependencies = [
  "openvmm_helpers",
  "pal_async",
  "petri",
+ "petri_artifact_resolver_ch",
  "petri_artifact_resolver_openvmm_known_paths",
  "petri_artifacts_common",
  "petri_artifacts_core",
  "petri_artifacts_vmm_test",
+ "petri_backend_ch",
  "serde",
  "serde_json",
  "tempfile",
@@ -5996,6 +5998,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "petri_artifact_resolver_ch"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "petri_artifacts_core",
+ "petri_backend_ch",
+]
+
+[[package]]
 name = "petri_artifact_resolver_openvmm_known_paths"
 version = "0.0.0"
 dependencies = [
@@ -6028,6 +6039,28 @@ version = "0.0.0"
 dependencies = [
  "petri_artifacts_common",
  "petri_artifacts_core",
+]
+
+[[package]]
+name = "petri_backend_ch"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "fatfs",
+ "get_resources",
+ "guid",
+ "mesh",
+ "pal_async",
+ "petri",
+ "petri_artifacts_common",
+ "petri_artifacts_core",
+ "pipette_client",
+ "pipette_protocol",
+ "tempfile",
+ "tracing",
+ "unix_socket",
+ "vtl2_settings_proto",
 ]
 
 [[package]]

@@ -36,6 +36,15 @@ use tests::boot_time::BootProfile;
 use tests::disk_io::DiskBackend;
 use tests::network::NicBackend;
 
+/// Which VMM backend to test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Backend {
+    /// OpenVMM (default).
+    Openvmm,
+    /// Cloud-hypervisor.
+    Ch,
+}
+
 /// Available performance tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum TestName {
@@ -110,6 +119,10 @@ struct RunArgs {
     /// diagnostics. Does not affect measurements.
     #[arg(long)]
     diag: bool,
+
+    /// VMM backend to test.
+    #[arg(long, default_value = "openvmm")]
+    backend: Backend,
 
     /// Number of concurrent VMs for scale_boot (e.g. "32" for single point,
     /// or "1,2,4,8,16" for explicit sweep). Omit for default geometric sweep.
@@ -187,8 +200,9 @@ fn main() -> anyhow::Result<()> {
 /// used to create a resolver for actual test execution.
 fn resolve_artifacts(
     register: impl Fn(&petri::ArtifactResolver<'_>),
+    backend: Backend,
 ) -> anyhow::Result<petri::TestArtifacts> {
-    let resolver =
+    let openvmm_resolver =
         petri_artifact_resolver_openvmm_known_paths::OpenvmmKnownPathsTestArtifactResolver::new("");
     let mut requirements = petri::TestArtifactRequirements::new();
 
@@ -196,9 +210,18 @@ fn resolve_artifacts(
     register(&petri::ArtifactResolver::collector(&mut requirements));
 
     // Pass 2: resolve to actual paths.
-    let artifacts = requirements
-        .resolve(&resolver)
-        .context("failed to resolve test artifacts")?;
+    let artifacts = match backend {
+        Backend::Openvmm => requirements
+            .resolve(&openvmm_resolver)
+            .context("failed to resolve test artifacts (openvmm)")?,
+        Backend::Ch => {
+            let ch_resolver =
+                petri_artifact_resolver_ch::ChKnownPathsResolver::new(openvmm_resolver);
+            requirements
+                .resolve(&ch_resolver)
+                .context("failed to resolve test artifacts (ch)")?
+        }
+    };
 
     // Touch all artifacts so they're fully resolved.
     register(&petri::ArtifactResolver::resolver(&artifacts));
@@ -242,8 +265,24 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
 
     for test_name in &tests_to_run {
         match test_name {
+            TestName::BootTime if args.backend == Backend::Ch => {
+                let artifacts =
+                    resolve_artifacts(tests::boot_time_ch::register_artifacts, args.backend)?;
+                let resolver = petri::ArtifactResolver::resolver(&artifacts);
+
+                let test =
+                    tests::boot_time_ch::ChBootTimeTest::new(args.mem_mb, args.diag, &resolver)
+                        .context("ch boot_time prep")?;
+
+                let stats = pal_async::DefaultPool::run_with(async |driver| {
+                    harness::run_cold_test(&test, &resolver, &driver, args.iterations).await
+                })
+                .context("ch boot_time test failed")?;
+                all_stats.extend(stats);
+            }
             TestName::BootTime => {
-                let artifacts = resolve_artifacts(tests::boot_time::register_artifacts)?;
+                let artifacts =
+                    resolve_artifacts(tests::boot_time::register_artifacts, args.backend)?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
                 let test = tests::boot_time::BootTimeTest::new(
@@ -261,7 +300,12 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 all_stats.extend(stats);
             }
             TestName::ScaleBoot => {
-                let artifacts = resolve_artifacts(tests::scale_boot::register_artifacts)?;
+                if args.backend == Backend::Ch {
+                    tracing::warn!("scale_boot is not yet supported with the CH backend, skipping");
+                    continue;
+                }
+                let artifacts =
+                    resolve_artifacts(tests::scale_boot::register_artifacts, args.backend)?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
                 let test = tests::scale_boot::ScaleBootTest::new(
@@ -280,7 +324,11 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 all_stats.extend(stats);
             }
             TestName::Memory => {
-                let artifacts = resolve_artifacts(tests::memory::register_artifacts)?;
+                if args.backend == Backend::Ch {
+                    tracing::warn!("memory is not yet supported with the CH backend, skipping");
+                    continue;
+                }
+                let artifacts = resolve_artifacts(tests::memory::register_artifacts, args.backend)?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
                 let test = tests::memory::MemoryTest::new(args.profile, args.mem_mb, &resolver)
@@ -293,13 +341,18 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 all_stats.extend(stats);
             }
             TestName::Network => {
+                if args.backend == Backend::Ch {
+                    tracing::warn!("network is not yet supported with the CH backend, skipping");
+                    continue;
+                }
                 let test = tests::network::NetworkTest {
                     diag: args.diag,
                     nic: args.nic,
                     perf_dir: args.perf_dir.clone(),
                 };
 
-                let artifacts = resolve_artifacts(tests::network::register_artifacts)?;
+                let artifacts =
+                    resolve_artifacts(tests::network::register_artifacts, args.backend)?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
                 let stats = pal_async::DefaultPool::run_with(async |driver| {

@@ -1,0 +1,32 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "petri_backend_ch"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+petri.workspace = true
+petri_artifacts_common.workspace = true
+petri_artifacts_core.workspace = true
+
+pipette_client.workspace = true
+pipette_protocol.workspace = true
+
+get_resources.workspace = true
+guid.workspace = true
+mesh.workspace = true
+vtl2_settings_proto.workspace = true
+
+pal_async.workspace = true
+unix_socket.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+fatfs = { workspace = true, features = ["std", "alloc"] }
+tempfile.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

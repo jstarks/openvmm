@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "petri_artifact_resolver_ch"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+petri_backend_ch.workspace = true
+petri_artifacts_core.workspace = true
+
+anyhow.workspace = true
+
+[lints]
+workspace = true

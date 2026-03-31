@@ -272,6 +272,18 @@ pub struct PetriVmResources {
     log_source: PetriLogSource,
 }
 
+impl PetriVmResources {
+    /// Get the async driver.
+    pub fn driver(&self) -> &DefaultDriver {
+        &self.driver
+    }
+
+    /// Get the output directory for log files and artifacts.
+    pub fn output_dir(&self) -> &Path {
+        self.log_source.output_dir()
+    }
+}
+
 /// Trait for VMM-specific contruction and runtime resources
 #[async_trait]
 pub trait PetriVmmBackend: Debug {
@@ -2443,7 +2455,8 @@ impl Firmware {
         }
     }
 
-    fn is_openhcl(&self) -> bool {
+    /// Whether this firmware configuration uses OpenHCL.
+    pub fn is_openhcl(&self) -> bool {
         match self {
             Firmware::OpenhclLinuxDirect { .. }
             | Firmware::OpenhclUefi { .. }
@@ -2463,7 +2476,8 @@ impl Firmware {
         }
     }
 
-    fn is_linux_direct(&self) -> bool {
+    /// Whether this firmware configuration is Linux direct boot.
+    pub fn is_linux_direct(&self) -> bool {
         match self {
             Firmware::LinuxDirect { .. } | Firmware::OpenhclLinuxDirect { .. } => true,
             Firmware::Pcat { .. }
@@ -2599,7 +2613,8 @@ impl Firmware {
         }
     }
 
-    fn into_runtime_config(
+    /// Convert firmware configuration into runtime config.
+    pub fn into_runtime_config(
         self,
         vmbus_storage_controllers: HashMap<Guid, VmbusStorageController>,
     ) -> PetriVmRuntimeConfig {

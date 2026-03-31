@@ -13,6 +13,7 @@ scsi_buffers.workspace = true
 vhd1_defs.workspace = true
 
 guestmem.workspace = true
+mesh.workspace = true
 vm_resource.workspace = true
 
 inspect = { workspace = true, features = ["filepath"] }

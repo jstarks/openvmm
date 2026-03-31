@@ -1323,6 +1323,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "inspect",
+ "mesh",
  "once_cell",
  "scsi_buffers",
  "thiserror 2.0.16",

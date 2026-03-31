@@ -22,6 +22,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use inspect::Inspect;
+use mesh::Cell;
 use once_cell::sync::OnceCell;
 use std::fmt::Debug;
 use std::io;
@@ -35,6 +36,10 @@ pub struct HttpBlob {
     version: http::Version,
     #[inspect(display)]
     uri: Uri,
+    /// If set, the URL is refreshed from this cell on each read.
+    /// Used for URLs with expiring credentials (e.g., SAS tokens).
+    #[inspect(skip)]
+    url_cell: Option<Cell<String>>,
     len: u64,
     #[inspect(skip)]
     tokio_handle: tokio::runtime::Handle,
@@ -118,21 +123,40 @@ impl HttpBlob {
             client,
             version,
             uri,
+            url_cell: None,
             len,
             tokio_handle: handle,
         })
+    }
+
+    /// Set a cell that will be polled for URL updates.
+    /// When set, the URL from the cell is used instead of the initial URL.
+    pub fn set_url_cell(&mut self, cell: Cell<String>) {
+        self.url_cell = Some(cell);
+    }
+
+    /// Returns the current URI, preferring the cell value if available.
+    fn current_uri(&self) -> Uri {
+        if let Some(cell) = &self.url_cell {
+            // If the cell has a value, parse and use it.
+            // Fall back to the initial URI on parse failure.
+            cell.get().parse().unwrap_or_else(|_| self.uri.clone())
+        } else {
+            self.uri.clone()
+        }
     }
 }
 
 #[async_trait]
 impl Blob for HttpBlob {
     async fn read(&self, mut buf: &mut [u8], offset: u64) -> io::Result<()> {
+        let uri = self.current_uri();
         let mut response = self
             .tokio_handle
             .spawn(
                 self.client.request(
                     Request::builder()
-                        .uri(&self.uri)
+                        .uri(&uri)
                         .header(
                             hyper::header::RANGE,
                             format!("bytes={}-{}", offset, offset + buf.len() as u64 - 1,),

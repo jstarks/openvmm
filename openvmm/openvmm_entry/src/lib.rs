@@ -1924,6 +1924,7 @@ fn disk_open_inner(
                     cli_args::BlobKind::Flat => disk_backend_resources::BlobDiskFormat::Flat,
                     cli_args::BlobKind::Vhd1 => disk_backend_resources::BlobDiskFormat::FixedVhd1,
                 },
+                url_updater: None,
             }))
         }
         DiskCliKind::MemoryDiff(inner) => {

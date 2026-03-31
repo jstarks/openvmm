@@ -100,6 +100,9 @@ pub struct BlobDiskHandle {
     pub url: String,
     /// The format of the blob.
     pub format: BlobDiskFormat,
+    /// If set, the URL will be updated periodically via this cell.
+    /// This is used for URLs with expiring credentials (e.g., SAS tokens).
+    pub url_updater: Option<Cell<String>>,
 }
 
 impl ResourceId<DiskHandleKind> for BlobDiskHandle {

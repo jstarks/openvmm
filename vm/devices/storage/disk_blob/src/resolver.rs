@@ -35,7 +35,10 @@ impl AsyncResolveResource<DiskHandleKind, BlobDiskHandle> for BlobDiskResolver {
             anyhow::bail!("writable blob disks not supported");
         }
 
-        let blob = HttpBlob::new(&rsrc.url).await?;
+        let mut blob = HttpBlob::new(&rsrc.url).await?;
+        if let Some(cell) = rsrc.url_updater {
+            blob.set_url_cell(cell);
+        }
         let disk = match rsrc.format {
             BlobDiskFormat::Flat => BlobDisk::new(blob),
             BlobDiskFormat::FixedVhd1 => BlobDisk::new_fixed_vhd1(blob).await?,

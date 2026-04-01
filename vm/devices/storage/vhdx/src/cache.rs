@@ -122,7 +122,7 @@ pub struct PageCache<F: AsyncFile> {
     /// [`open_writable()`] via [`set_log_sender()`](Self::set_log_sender)
     /// and cleared by [`clear_log_sender()`](Self::clear_log_sender) on
     /// close/abort so the channel drops and the log task can exit.
-    log_sender: Mutex<Option<mesh::Sender<LogRequest>>>,
+    log_sender: Option<mesh::Sender<LogRequest>>,
 }
 
 impl<F: AsyncFile> PageCache<F> {
@@ -135,7 +135,7 @@ impl<F: AsyncFile> PageCache<F> {
                 dirty_count: 0,
             }),
             tags: Mutex::new(HashMap::new()),
-            log_sender: Mutex::new(None),
+            log_sender,
         }
     }
 
@@ -144,24 +144,6 @@ impl<F: AsyncFile> PageCache<F> {
     /// Must be called before any [`acquire()`](Self::acquire_read) with that tag.
     pub fn register_tag(&mut self, tag: u8, base_offset: u64) {
         self.tags.lock().insert(tag, base_offset);
-    }
-
-    /// Set the log sender for eager commit support.
-    ///
-    /// Must be called exactly once (during `open_writable`).
-    /// Panics if called more than once.
-    pub fn set_log_sender(&self, sender: mesh::Sender<LogRequest>) {
-        let mut guard = self.log_sender.lock();
-        assert!(guard.is_none(), "log_sender already set");
-        *guard = Some(sender);
-    }
-
-    /// Clear the log sender, dropping the cache's clone of the channel.
-    ///
-    /// Called during `close()` and `abort()` so that the log task's
-    /// receiver sees a closed channel and can exit.
-    pub fn clear_log_sender(&self) {
-        *self.log_sender.lock() = None;
     }
 
     /// Update the base file offset for a previously registered tag.
@@ -633,7 +615,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| (i & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file));
+        let mut cache = PageCache::new(Arc::new(file), None);
         cache.register_tag(0, 0);
 
         let guard = cache

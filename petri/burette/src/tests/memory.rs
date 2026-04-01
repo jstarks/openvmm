@@ -29,7 +29,7 @@ impl MemoryTest {
         mem_mb: u64,
         resolver: &petri::ArtifactResolver<'_>,
     ) -> anyhow::Result<Self> {
-        let initrd = profile.prepare_initrd(resolver)?;
+        let initrd = boot_time::prepare_openvmm_initrd(&profile, resolver)?;
         Ok(Self {
             profile,
             mem_mb,
@@ -40,7 +40,7 @@ impl MemoryTest {
 
 /// Register artifacts needed by the memory test.
 pub fn register_artifacts(resolver: &petri::ArtifactResolver<'_>) {
-    boot_time::register_artifacts(resolver);
+    boot_time::register_artifacts::<petri::openvmm::OpenVmmPetriBackend>(resolver);
 }
 
 impl crate::harness::ColdPerfTest for MemoryTest {
@@ -61,7 +61,8 @@ impl crate::harness::ColdPerfTest for MemoryTest {
         resolver: &petri::ArtifactResolver<'_>,
         driver: &pal_async::DefaultDriver,
     ) -> anyhow::Result<Vec<MetricResult>> {
-        let artifacts = boot_time::build_artifacts(resolver)?;
+        let artifacts =
+            boot_time::build_artifacts::<petri::openvmm::OpenVmmPetriBackend>(resolver)?;
 
         let mut post_test_hooks = Vec::new();
         let log_source = crate::log_source();
@@ -73,7 +74,7 @@ impl crate::harness::ColdPerfTest for MemoryTest {
 
         let mut builder = self
             .profile
-            .create_builder(params, artifacts, driver)?
+            .create_openvmm(params, artifacts, driver)?
             .with_processor_topology(petri::ProcessorTopology {
                 vp_count: 1,
                 ..Default::default()

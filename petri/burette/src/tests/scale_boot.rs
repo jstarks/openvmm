@@ -36,7 +36,7 @@ impl ScaleBootTest {
         max_vms: u32,
         resolver: &petri::ArtifactResolver<'_>,
     ) -> anyhow::Result<Self> {
-        let initrd = profile.prepare_initrd(resolver)?;
+        let initrd = boot_time::prepare_openvmm_initrd(&profile, resolver)?;
         Ok(Self {
             profile,
             mem_mb,
@@ -53,7 +53,7 @@ impl ScaleBootTest {
 
 /// Register artifacts needed by the scale boot test.
 pub fn register_artifacts(resolver: &petri::ArtifactResolver<'_>) {
-    boot_time::register_artifacts(resolver);
+    boot_time::register_artifacts::<petri::openvmm::OpenVmmPetriBackend>(resolver);
 }
 
 /// Compute the N values for the sweep.
@@ -250,7 +250,7 @@ fn make_builder(
     resolver: &petri::ArtifactResolver<'_>,
     driver: &pal_async::DefaultDriver,
 ) -> anyhow::Result<petri::PetriVmBuilder<petri::openvmm::OpenVmmPetriBackend>> {
-    let artifacts = boot_time::build_artifacts(resolver)?;
+    let artifacts = boot_time::build_artifacts::<petri::openvmm::OpenVmmPetriBackend>(resolver)?;
 
     let mut post_test_hooks = Vec::new();
     let log_source = crate::log_source();
@@ -262,7 +262,7 @@ fn make_builder(
 
     Ok(test
         .profile
-        .create_builder(params, artifacts, driver)?
+        .create_openvmm(params, artifacts, driver)?
         .with_processor_topology(petri::ProcessorTopology {
             vp_count: 1,
             ..Default::default()

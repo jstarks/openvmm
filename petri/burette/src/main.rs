@@ -270,13 +270,19 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     for test_name in &tests_to_run {
         match test_name {
             TestName::BootTime if args.backend == Backend::Ch => {
-                let artifacts =
-                    resolve_artifacts(tests::boot_time_ch::register_artifacts, args.backend)?;
+                let artifacts = resolve_artifacts(
+                    tests::boot_time::register_artifacts::<petri_backend_ch::ChPetriBackend>,
+                    args.backend,
+                )?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
-                let test =
-                    tests::boot_time_ch::ChBootTimeTest::new(args.mem_mb, args.diag, &resolver)
-                        .context("ch boot_time prep")?;
+                let test = tests::boot_time::BootTimeTest::<petri_backend_ch::ChPetriBackend>::new(
+                    args.profile,
+                    args.diag,
+                    args.mem_mb,
+                    &resolver,
+                )
+                .context("ch boot_time prep")?;
 
                 let stats = pal_async::DefaultPool::run_with(async |driver| {
                     harness::run_cold_test(&test, &resolver, &driver, args.iterations).await
@@ -285,11 +291,13 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 all_stats.extend(stats);
             }
             TestName::BootTime => {
-                let artifacts =
-                    resolve_artifacts(tests::boot_time::register_artifacts, args.backend)?;
+                let artifacts = resolve_artifacts(
+                    tests::boot_time::register_artifacts::<petri::openvmm::OpenVmmPetriBackend>,
+                    args.backend,
+                )?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
-                let test = tests::boot_time::BootTimeTest::new(
+                let test = tests::boot_time::BootTimeTest::new_openvmm(
                     args.profile,
                     args.diag,
                     args.mem_mb,
@@ -409,14 +417,14 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
     // duplicating artifact lists and automatically adapts to the host arch.
     let all_registers: Vec<fn(&petri::ArtifactResolver<'_>)> = match args.backend {
         Backend::Openvmm => vec![
-            tests::boot_time::register_artifacts,
+            tests::boot_time::register_artifacts::<petri::openvmm::OpenVmmPetriBackend>,
             tests::scale_boot::register_artifacts,
             tests::memory::register_artifacts,
             tests::network::register_artifacts,
             tests::disk_io::register_artifacts,
         ],
         Backend::Ch => vec![
-            tests::boot_time_ch::register_artifacts,
+            tests::boot_time::register_artifacts::<petri_backend_ch::ChPetriBackend>,
         ],
     };
 

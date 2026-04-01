@@ -181,6 +181,10 @@ struct PackageArgs {
     /// enables `perf report` symbol resolution).
     #[arg(long)]
     no_strip: bool,
+
+    /// Which VMM backend to package artifacts for.
+    #[arg(long, value_enum, default_value_t = Backend::Openvmm)]
+    backend: Backend,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -395,7 +399,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
 }
 
 fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
-    let resolver =
+    let openvmm_resolver =
         petri_artifact_resolver_openvmm_known_paths::OpenvmmKnownPathsTestArtifactResolver::new("");
 
     let bundle_name = petri_artifact_resolver_openvmm_known_paths::resolve_bundle_name;
@@ -403,16 +407,21 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
     // Collect the union of all artifacts needed by every test, using the
     // same register_artifacts functions that cmd_run uses. This avoids
     // duplicating artifact lists and automatically adapts to the host arch.
-    let all_registers: &[fn(&petri::ArtifactResolver<'_>)] = &[
-        tests::boot_time::register_artifacts,
-        tests::scale_boot::register_artifacts,
-        tests::memory::register_artifacts,
-        tests::network::register_artifacts,
-        tests::disk_io::register_artifacts,
-    ];
+    let all_registers: Vec<fn(&petri::ArtifactResolver<'_>)> = match args.backend {
+        Backend::Openvmm => vec![
+            tests::boot_time::register_artifacts,
+            tests::scale_boot::register_artifacts,
+            tests::memory::register_artifacts,
+            tests::network::register_artifacts,
+            tests::disk_io::register_artifacts,
+        ],
+        Backend::Ch => vec![
+            tests::boot_time_ch::register_artifacts,
+        ],
+    };
 
     let mut requirements = petri::TestArtifactRequirements::new();
-    for register in all_registers {
+    for register in &all_registers {
         register(&petri::ArtifactResolver::collector(&mut requirements));
     }
 
@@ -427,9 +436,18 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
 
     // Resolve all artifacts at once — reports every missing artifact in
     // a single error rather than failing on the first one.
-    let artifacts = requirements
-        .resolve(&resolver)
-        .context("failed to resolve test artifacts")?;
+    let artifacts = match args.backend {
+        Backend::Openvmm => requirements
+            .resolve(&openvmm_resolver)
+            .context("failed to resolve test artifacts (openvmm)")?,
+        Backend::Ch => {
+            let ch_resolver =
+                petri_artifact_resolver_ch::ChKnownPathsResolver::new(openvmm_resolver);
+            requirements
+                .resolve(&ch_resolver)
+                .context("failed to resolve test artifacts (ch)")?
+        }
+    };
 
     let mut files: Vec<(PathBuf, String)> = Vec::new();
 
@@ -438,6 +456,18 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
         petri_artifact_resolver_openvmm_known_paths::get_output_executable_path("burette")
             .context("failed to find burette binary")?;
     files.push((burette_path, "burette".into()));
+
+    // Binaries to strip (name -> true if should be stripped).
+    let mut strip_names: Vec<&str> = vec!["burette", "pipette"];
+
+    match args.backend {
+        Backend::Openvmm => {
+            strip_names.push("openvmm");
+        }
+        Backend::Ch => {
+            strip_names.push("cloud-hypervisor");
+        }
+    }
 
     // Build the file list from resolved artifacts.
     for id in artifact_ids {
@@ -450,6 +480,7 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
                 .unwrap_or_else(|| format!("{:?}", id))
         };
         files.push((path, dest));
+    }
     }
 
     // Stage files into a temporary directory.
@@ -467,7 +498,7 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
         std::fs::copy(src, &dest).with_context(|| format!("failed to copy {name}"))?;
 
         // Strip debug symbols from ELF executables to reduce tarball size.
-        if !args.no_strip && matches!(name.as_str(), "burette" | "openvmm" | "pipette") {
+        if !args.no_strip && strip_names.contains(&name.as_str()) {
             let _ = std::process::Command::new("strip").arg(&dest).status();
         }
 
@@ -496,7 +527,16 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
         args.output.file_name().unwrap().to_string_lossy()
     );
     println!("  cd burette_bundle");
-    println!("  VMM_TESTS_CONTENT_DIR=$PWD ./burette run -o report.json");
+    match args.backend {
+        Backend::Openvmm => {
+            println!("  VMM_TESTS_CONTENT_DIR=$PWD ./burette run -o report.json");
+        }
+        Backend::Ch => {
+            println!(
+                "  CH_PATH=$PWD/cloud-hypervisor VMM_TESTS_CONTENT_DIR=$PWD ./burette run --backend ch -o report.json"
+            );
+        }
+    }
 
     Ok(())
 }

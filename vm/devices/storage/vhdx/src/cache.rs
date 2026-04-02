@@ -118,8 +118,8 @@ pub struct PageCache<F: AsyncFile> {
     pages: Mutex<PageMap>,
     /// Tag → base file offset mapping.
     tags: Mutex<HashMap<u8, u64>>,
-    /// Log sender for eager commit support. Set once during
-    /// [`open_writable()`] via [`set_log_sender()`](Self::set_log_sender)
+    /// Log sender for eager commit support. Set via
+    /// [`set_log_sender()`](Self::set_log_sender) during `open_writable()`
     /// and cleared by [`clear_log_sender()`](Self::clear_log_sender) on
     /// close/abort so the channel drops and the log task can exit.
     log_sender: Option<mesh::Sender<LogRequest>>,
@@ -135,8 +135,25 @@ impl<F: AsyncFile> PageCache<F> {
                 dirty_count: 0,
             }),
             tags: Mutex::new(HashMap::new()),
-            log_sender,
+            log_sender: None,
         }
+    }
+
+    /// Set the log sender for eager commit support.
+    ///
+    /// Must be called exactly once (during `open_writable`).
+    /// Panics if called more than once.
+    pub fn set_log_sender(&mut self, sender: mesh::Sender<LogRequest>) {
+        assert!(self.log_sender.is_none(), "log_sender already set");
+        self.log_sender = Some(sender);
+    }
+
+    /// Clear the log sender, dropping the cache's clone of the channel.
+    ///
+    /// Called during `close()` and `abort()` so that the log task's
+    /// receiver sees a closed channel and can exit.
+    pub fn clear_log_sender(&mut self) {
+        self.log_sender = None;
     }
 
     /// Register a tag with its base file offset.
@@ -210,7 +227,7 @@ impl<F: AsyncFile> PageCache<F> {
             if eager_commit && pages.dirty_count >= MAX_COMMIT_PAGES {
                 let page_already_dirty = entry.lock().dirty;
                 if !page_already_dirty {
-                    if let Some(sender) = self.log_sender.lock().clone() {
+                    if let Some(sender) = self.log_sender.clone() {
                         // Drop the pages lock before the async commit,
                         // then loop to re-check atomically.
                         drop(pages);
@@ -615,7 +632,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| (i & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None);
+        let mut cache = PageCache::new(Arc::new(file));
         cache.register_tag(0, 0);
 
         let guard = cache
@@ -995,7 +1012,10 @@ mod tests {
                 tag: 0,
                 offset: (i * PAGE_SIZE) as u64,
             };
-            let mut g = cache.acquire_write(key, WriteMode::Overwrite).await.unwrap();
+            let mut g = cache
+                .acquire_write(key, WriteMode::Overwrite)
+                .await
+                .unwrap();
             g.fill(i as u8);
             g.release().commit().await.unwrap();
         }
@@ -1050,18 +1070,17 @@ mod tests {
         guard.release().commit().await.unwrap();
 
         // Explicit commit should contain just the one new page.
-        let (commit_result, batch2_pages) =
-            futures::future::join(cache.commit(&tx2), async {
-                match rx.recv().await.unwrap() {
-                    LogRequest::Flush(rpc) => {
-                        let (pages, response) = rpc.split();
-                        response.complete(Ok(2u64));
-                        pages
-                    }
-                    _ => panic!("expected Flush request from explicit commit"),
+        let (commit_result, batch2_pages) = futures::future::join(cache.commit(&tx2), async {
+            match rx.recv().await.unwrap() {
+                LogRequest::Flush(rpc) => {
+                    let (pages, response) = rpc.split();
+                    response.complete(Ok(2u64));
+                    pages
                 }
-            })
-            .await;
+                _ => panic!("expected Flush request from explicit commit"),
+            }
+        })
+        .await;
         commit_result.unwrap();
         assert_eq!(
             batch2_pages.len(),
@@ -1153,18 +1172,17 @@ mod tests {
         }
 
         // Explicit commit — batch 2 should contain B and C.
-        let (commit_result, batch2_pages) =
-            futures::future::join(cache.commit(&tx2), async {
-                match rx.recv().await.unwrap() {
-                    LogRequest::Flush(rpc) => {
-                        let (pages, response) = rpc.split();
-                        response.complete(Ok(2u64));
-                        pages
-                    }
-                    _ => panic!("expected Flush request"),
+        let (commit_result, batch2_pages) = futures::future::join(cache.commit(&tx2), async {
+            match rx.recv().await.unwrap() {
+                LogRequest::Flush(rpc) => {
+                    let (pages, response) = rpc.split();
+                    response.complete(Ok(2u64));
+                    pages
                 }
-            })
-            .await;
+                _ => panic!("expected Flush request"),
+            }
+        })
+        .await;
         commit_result.unwrap();
 
         assert_eq!(batch2_pages.len(), 2, "batch 2 = B + C");

@@ -374,15 +374,17 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 all_stats.extend(stats);
             }
             TestName::DiskIo if args.backend == Backend::Ch => {
-                let test = tests::disk_io::ChDiskIoTest {
-                    diag: args.diag,
-                    data_disk: args.data_disk.clone(),
-                    data_disk_size_gib: args.data_disk_size_gib,
-                    perf_dir: args.perf_dir.clone(),
-                };
+                let test = tests::disk_io::ch_test(
+                    args.diag,
+                    args.data_disk.clone(),
+                    args.data_disk_size_gib,
+                    args.perf_dir.clone(),
+                );
 
-                let artifacts =
-                    resolve_artifacts(tests::disk_io::register_artifacts_ch, args.backend)?;
+                let artifacts = resolve_artifacts(
+                    tests::disk_io::register_artifacts::<petri_backend_ch::ChPetriBackend>,
+                    args.backend,
+                )?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
                 let stats = pal_async::DefaultPool::run_with(async |driver| {
@@ -392,16 +394,18 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 all_stats.extend(stats);
             }
             TestName::DiskIo => {
-                let test = tests::disk_io::DiskIoTest {
-                    diag: args.diag,
-                    backend: args.disk_backend,
-                    data_disk: args.data_disk.clone(),
-                    data_disk_size_gib: args.data_disk_size_gib,
-                    perf_dir: args.perf_dir.clone(),
-                };
+                let test = tests::disk_io::openvmm_test(
+                    args.diag,
+                    args.disk_backend,
+                    args.data_disk.clone(),
+                    args.data_disk_size_gib,
+                    args.perf_dir.clone(),
+                );
 
-                let artifacts =
-                    resolve_artifacts(tests::disk_io::register_artifacts, args.backend)?;
+                let artifacts = resolve_artifacts(
+                    tests::disk_io::register_artifacts::<petri::openvmm::OpenVmmPetriBackend>,
+                    args.backend,
+                )?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
                 let stats = pal_async::DefaultPool::run_with(async |driver| {
@@ -440,11 +444,11 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
             tests::scale_boot::register_artifacts,
             tests::memory::register_artifacts,
             tests::network::register_artifacts,
-            tests::disk_io::register_artifacts,
+            tests::disk_io::register_artifacts::<petri::openvmm::OpenVmmPetriBackend>,
         ],
         Backend::Ch => vec![
             tests::boot_time::register_artifacts::<petri_backend_ch::ChPetriBackend>,
-            tests::disk_io::register_artifacts_ch,
+            tests::disk_io::register_artifacts::<petri_backend_ch::ChPetriBackend>,
         ],
     };
 

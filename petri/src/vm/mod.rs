@@ -282,6 +282,11 @@ impl PetriVmResources {
     pub fn output_dir(&self) -> &Path {
         self.log_source.output_dir()
     }
+
+    /// Get the log source for creating log files.
+    pub fn log_source(&self) -> &PetriLogSource {
+        &self.log_source
+    }
 }
 
 /// Trait for VMM-specific contruction and runtime resources

@@ -11,11 +11,13 @@ use petri::NoPetriVmFramebufferAccess;
 use petri::NoPetriVmInspector;
 use petri::OpenHclServicingFlags;
 use petri::PetriHaltReason;
+use petri::PetriLogFile;
 use petri::PetriVmProperties;
 use petri::PetriVmRuntime;
 use petri::ShutdownKind;
 use petri_artifacts_core::ResolvedArtifact;
 use pipette_client::PipetteClient;
+use std::io::BufRead;
 use std::path::PathBuf;
 use unix_socket::UnixListener;
 use vtl2_settings_proto::Vtl2Settings;
@@ -31,6 +33,36 @@ pub struct ChVmRuntime {
     _temp_dir: tempfile::TempDir,
     properties: PetriVmProperties,
     cidata_mounted: bool,
+    // Handles for the log-forwarding threads.
+    _stdout_thread: Option<std::thread::JoinHandle<()>>,
+    _stderr_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Spawn a thread that reads lines from `reader` and writes them to a petri log file.
+fn spawn_log_thread(
+    name: &str,
+    reader: impl std::io::Read + Send + 'static,
+    log_file: PetriLogFile,
+) -> std::thread::JoinHandle<()> {
+    let name = name.to_string();
+    std::thread::Builder::new()
+        .name(format!("ch-{name}"))
+        .spawn(move || {
+            let buf = std::io::BufReader::new(reader);
+            for line in buf.lines() {
+                match line {
+                    Ok(line) if !line.is_empty() => {
+                        log_file.write_entry(&line);
+                    }
+                    Err(e) => {
+                        tracing::debug!(stream = %name, "read error: {e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .expect("failed to spawn log thread")
 }
 
 impl ChVmRuntime {
@@ -42,7 +74,13 @@ impl ChVmRuntime {
         output_dir: PathBuf,
         temp_dir: tempfile::TempDir,
         properties: PetriVmProperties,
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
+        log_file: PetriLogFile,
     ) -> Self {
+        let stdout_thread = stdout.map(|s| spawn_log_thread("stdout", s, log_file.clone()));
+        let stderr_thread = stderr.map(|s| spawn_log_thread("stderr", s, log_file));
+
         Self {
             child: Some(child),
             pipette_listener,
@@ -52,6 +90,8 @@ impl ChVmRuntime {
             _temp_dir: temp_dir,
             properties,
             cidata_mounted: false,
+            _stdout_thread: stdout_thread,
+            _stderr_thread: stderr_thread,
         }
     }
 

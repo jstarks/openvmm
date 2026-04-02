@@ -211,7 +211,12 @@ impl PetriVmmBackend for ChPetriBackend {
             "launching cloud-hypervisor"
         );
 
-        let child = cmd.spawn().context("failed to spawn cloud-hypervisor")?;
+        let mut child = cmd.spawn().context("failed to spawn cloud-hypervisor")?;
+
+        // Take stdout/stderr so we can log CH output to petri log files.
+        let ch_stdout = child.stdout.take();
+        let ch_stderr = child.stderr.take();
+        let ch_log = resources.log_source().log_file("cloud-hypervisor")?;
 
         let driver = resources.driver().clone();
         let output_dir = resources.output_dir().to_path_buf();
@@ -231,6 +236,9 @@ impl PetriVmmBackend for ChPetriBackend {
             output_dir,
             temp_dir,
             properties,
+            ch_stdout,
+            ch_stderr,
+            ch_log,
         );
 
         Ok((runtime, runtime_config))

@@ -351,7 +351,7 @@ impl PetriVmConfigOpenVmm {
                 pci_mmio_gaps: vec![],
                 prefetch_memory: false,
                 private_memory: false,
-                transparent_hugepages: true,
+                transparent_hugepages: false,
             }
         };
 

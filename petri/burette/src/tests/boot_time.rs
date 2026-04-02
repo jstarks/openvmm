@@ -93,6 +93,7 @@ impl BootProfile {
             builder = builder.modify_backend(|c| {
                 c.with_custom_config(|c| {
                     c.memory.private_memory = true;
+                    c.memory.transparent_hugepages = true;
                 })
             });
         }
@@ -221,6 +222,7 @@ impl BootTimeTest<petri::openvmm::OpenVmmPetriBackend> {
                     builder = builder.modify_backend(|c| {
                         c.with_custom_config(|c| {
                             c.memory.private_memory = true;
+                            c.memory.transparent_hugepages = true;
                         })
                     });
                 }

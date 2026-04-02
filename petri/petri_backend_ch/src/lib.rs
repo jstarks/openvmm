@@ -50,9 +50,27 @@ pub struct ChPetriBackend {
     ch_path: ResolvedArtifact,
 }
 
+/// Configuration for the cloud-hypervisor VMM, passed via `modify_backend`.
+#[derive(Default)]
+pub struct ChVmmConfig {
+    /// Additional disks to attach as virtio-blk devices.
+    /// Each entry is `(path, readonly)`.
+    pub disks: Vec<ChDiskConfig>,
+}
+
+/// A disk to attach to the cloud-hypervisor VM.
+pub struct ChDiskConfig {
+    /// Path to the disk image file on the host.
+    pub path: PathBuf,
+    /// Whether the disk should be read-only.
+    pub readonly: bool,
+    /// Whether to use O_DIRECT for the disk.
+    pub direct: bool,
+}
+
 #[async_trait]
 impl PetriVmmBackend for ChPetriBackend {
-    type VmmConfig = ();
+    type VmmConfig = ChVmmConfig;
     type VmRuntime = ChVmRuntime;
 
     fn check_compat(firmware: &Firmware, arch: MachineArch) -> bool {
@@ -91,10 +109,14 @@ impl PetriVmmBackend for ChPetriBackend {
     async fn run(
         self,
         config: PetriVmConfig,
-        _modify_vmm_config: Option<petri::ModifyFn<Self::VmmConfig>>,
+        modify_vmm_config: Option<petri::ModifyFn<Self::VmmConfig>>,
         resources: &PetriVmResources,
         properties: PetriVmProperties,
     ) -> anyhow::Result<(Self::VmRuntime, PetriVmRuntimeConfig)> {
+        let mut ch_config = ChVmmConfig::default();
+        if let Some(modify) = modify_vmm_config {
+            ch_config = modify.0(ch_config);
+        }
         // Extract Linux direct boot parameters.
         let (kernel_path, initrd_path) = match &config.firmware {
             Firmware::LinuxDirect { kernel, initrd } => {
@@ -164,6 +186,21 @@ impl PetriVmmBackend for ChPetriBackend {
             .args(["--console", "off"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
+        // Attach additional disks as virtio-blk devices.
+        for disk in &ch_config.disks {
+            let readonly = if disk.readonly { "on" } else { "off" };
+            let direct = if disk.direct { "on" } else { "off" };
+            cmd.args([
+                "--disk",
+                &format!(
+                    "path={},readonly={},direct={}",
+                    disk.path.display(),
+                    readonly,
+                    direct,
+                ),
+            ]);
+        }
 
         tracing::info!(
             ch_binary = %self.ch_path.get().display(),

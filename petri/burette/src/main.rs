@@ -373,6 +373,24 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                 .context("network test failed")?;
                 all_stats.extend(stats);
             }
+            TestName::DiskIo if args.backend == Backend::Ch => {
+                let test = tests::disk_io::ChDiskIoTest {
+                    diag: args.diag,
+                    data_disk: args.data_disk.clone(),
+                    data_disk_size_gib: args.data_disk_size_gib,
+                    perf_dir: args.perf_dir.clone(),
+                };
+
+                let artifacts =
+                    resolve_artifacts(tests::disk_io::register_artifacts_ch, args.backend)?;
+                let resolver = petri::ArtifactResolver::resolver(&artifacts);
+
+                let stats = pal_async::DefaultPool::run_with(async |driver| {
+                    harness::run_warm_test(&test, &resolver, &driver, args.iterations).await
+                })
+                .context("disk_io (ch) test failed")?;
+                all_stats.extend(stats);
+            }
             TestName::DiskIo => {
                 let test = tests::disk_io::DiskIoTest {
                     diag: args.diag,
@@ -382,7 +400,8 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     perf_dir: args.perf_dir.clone(),
                 };
 
-                let artifacts = resolve_artifacts(tests::disk_io::register_artifacts)?;
+                let artifacts =
+                    resolve_artifacts(tests::disk_io::register_artifacts, args.backend)?;
                 let resolver = petri::ArtifactResolver::resolver(&artifacts);
 
                 let stats = pal_async::DefaultPool::run_with(async |driver| {
@@ -425,6 +444,7 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
         ],
         Backend::Ch => vec![
             tests::boot_time::register_artifacts::<petri_backend_ch::ChPetriBackend>,
+            tests::disk_io::register_artifacts_ch,
         ],
     };
 
@@ -488,7 +508,6 @@ fn cmd_package(args: PackageArgs) -> anyhow::Result<()> {
                 .unwrap_or_else(|| format!("{:?}", id))
         };
         files.push((path, dest));
-    }
     }
 
     // Stage files into a temporary directory.

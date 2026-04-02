@@ -54,6 +54,11 @@ impl ChVmRuntime {
             cidata_mounted: false,
         }
     }
+
+    /// Return the PID of the cloud-hypervisor process, or -1 if already consumed.
+    pub fn pid(&self) -> i32 {
+        self.child.as_ref().map(|c| c.id() as i32).unwrap_or(-1)
+    }
 }
 
 #[async_trait]

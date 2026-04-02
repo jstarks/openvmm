@@ -452,3 +452,225 @@ fn parse_fio_iops(json: &str, metric_name: &str, field: &str) -> anyhow::Result<
         value: iops,
     })
 }
+
+// ── Cloud-hypervisor disk I/O test ──────────────────────────────────────
+
+/// Register artifacts needed by the CH disk I/O test.
+pub fn register_artifacts_ch(resolver: &petri::ArtifactResolver<'_>) {
+    let firmware = build_firmware(resolver);
+    petri::PetriVmArtifacts::<petri_backend_ch::ChPetriBackend>::new(
+        resolver,
+        firmware,
+        MachineArch::host(),
+        true,
+    );
+    require_petritools_erofs(resolver);
+}
+
+/// Block I/O test via fio on cloud-hypervisor.
+///
+/// Only supports virtio-blk (CH does not support storvsc). Disks are
+/// passed to the CH process via `--disk` CLI arguments.
+pub struct ChDiskIoTest {
+    /// Print guest diagnostics.
+    pub diag: bool,
+    /// Path to a raw data disk file on the host, or `None` for a
+    /// temporary file-backed disk (CH requires file-backed disks).
+    pub data_disk: Option<PathBuf>,
+    /// Data disk size in GiB.
+    pub data_disk_size_gib: u64,
+    /// If set, record per-phase perf traces in this directory.
+    pub perf_dir: Option<PathBuf>,
+}
+
+/// State kept across warm iterations for the CH disk I/O test.
+pub struct ChDiskIoTestState {
+    vm: petri::PetriVm<petri_backend_ch::ChPetriBackend>,
+    agent: petri::pipette::PipetteClient,
+    /// Guest device path for the data disk (e.g. "/dev/vdb").
+    disk_device: String,
+    /// Temp file for the data disk if no explicit path was given.
+    _temp_disk: Option<tempfile::NamedTempFile>,
+}
+
+impl crate::harness::WarmPerfTest for ChDiskIoTest {
+    type State = ChDiskIoTestState;
+
+    fn name(&self) -> &str {
+        "disk_io_ch_virtioblk"
+    }
+
+    fn warmup_iterations(&self) -> u32 {
+        1
+    }
+
+    async fn setup(
+        &self,
+        resolver: &petri::ArtifactResolver<'_>,
+        driver: &pal_async::DefaultDriver,
+    ) -> anyhow::Result<ChDiskIoTestState> {
+        anyhow::ensure!(
+            self.data_disk_size_gib > 0,
+            "data_disk_size_gib must be greater than 0"
+        );
+        let disk_size_bytes = self.data_disk_size_gib * 1024 * 1024 * 1024;
+
+        // CH requires file-backed disks. If the user didn't specify a path,
+        // create a temporary file.
+        let (data_disk_path, temp_disk) = if let Some(path) = &self.data_disk {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .with_context(|| format!("failed to create data disk at {}", path.display()))?;
+            file.set_len(disk_size_bytes).with_context(|| {
+                format!(
+                    "failed to set data disk size to {} GiB",
+                    self.data_disk_size_gib
+                )
+            })?;
+            drop(file);
+            (path.clone(), None)
+        } else {
+            tracing::info!(
+                size_gib = self.data_disk_size_gib,
+                "using temp-file-backed data disk (CH requires file-backed disks)"
+            );
+            let tmp =
+                tempfile::NamedTempFile::new().context("failed to create temp data disk file")?;
+            tmp.as_file()
+                .set_len(disk_size_bytes)
+                .context("failed to set temp data disk size")?;
+            let path = tmp.path().to_path_buf();
+            (path, Some(tmp))
+        };
+
+        let firmware = build_firmware(resolver);
+
+        let artifacts = petri::PetriVmArtifacts::<petri_backend_ch::ChPetriBackend>::new(
+            resolver,
+            firmware,
+            MachineArch::host(),
+            true,
+        )
+        .context("firmware/arch not compatible with CH backend")?;
+
+        let mut post_test_hooks = Vec::new();
+        let log_source = crate::log_source();
+        let params = petri::PetriTestParams {
+            test_name: "disk_io_ch",
+            logger: &log_source,
+            post_test_hooks: &mut post_test_hooks,
+        };
+
+        // Get the erofs image path for the read-only virtio-blk device.
+        let erofs_path = require_petritools_erofs(resolver);
+
+        let builder = petri::PetriVmBuilder::minimal(params, artifacts, driver)?
+            .with_processor_topology(petri::ProcessorTopology {
+                vp_count: 2,
+                ..Default::default()
+            })
+            .with_memory(petri::MemoryConfig {
+                startup_bytes: 1024 * 1024 * 1024, // 1 GB
+                ..Default::default()
+            })
+            .modify_backend(move |mut c: petri_backend_ch::ChVmmConfig| {
+                // erofs image (read-only)
+                c.disks.push(petri_backend_ch::ChDiskConfig {
+                    path: erofs_path.get().to_path_buf(),
+                    readonly: true,
+                    direct: false,
+                });
+                // data disk (read-write, direct I/O)
+                c.disks.push(petri_backend_ch::ChDiskConfig {
+                    path: data_disk_path.clone(),
+                    readonly: false,
+                    direct: true,
+                });
+                c
+            });
+
+        let builder = if !self.diag {
+            builder.without_screenshots()
+        } else {
+            builder.with_serial_output()
+        };
+
+        let (vm, agent) = builder.run().await.context("failed to boot CH VM")?;
+
+        // Mount the erofs image and prepare chroot (fio is pre-installed).
+        agent
+            .mount("/dev/vda", "/perf", "erofs", 1 /* MS_RDONLY */, true)
+            .await
+            .context("failed to mount erofs on /dev/vda")?;
+        agent
+            .prepare_chroot("/perf")
+            .await
+            .context("failed to prepare chroot at /perf")?;
+
+        // Discover the data disk (/dev/vdb — second virtio-blk device).
+        let disk_device = discover_data_disk(&agent, DiskBackend::VirtioBlk)
+            .await
+            .context("failed to discover data disk device")?;
+        tracing::info!(disk_device = %disk_device, "discovered CH data disk");
+
+        Ok(ChDiskIoTestState {
+            vm,
+            agent,
+            disk_device,
+            _temp_disk: temp_disk,
+        })
+    }
+
+    async fn run_once(&self, state: &mut ChDiskIoTestState) -> anyhow::Result<Vec<MetricResult>> {
+        let mut metrics = Vec::new();
+        let label = "ch_virtioblk";
+        let pid = state.vm.backend().pid();
+        let mut recorder = crate::harness::PerfRecorder::new(self.perf_dir.as_deref(), pid)?;
+        let dev = &state.disk_device;
+
+        let fio_jobs: &[(&str, &str)] = &[
+            ("read", "read"),
+            ("write", "write"),
+            ("randread", "read"),
+            ("randwrite", "write"),
+        ];
+
+        for &(rw_mode, field) in fio_jobs {
+            let is_random = rw_mode.starts_with("rand");
+            let phase = if is_random {
+                rw_mode.strip_prefix("rand").unwrap()
+            } else {
+                rw_mode
+            };
+            let prefix = if is_random { "rand" } else { "seq" };
+
+            let perf_label = format!("fio_{label}_{prefix}_{phase}");
+            recorder.start(&perf_label)?;
+
+            let json = run_fio_job(&state.agent, dev, rw_mode)
+                .await
+                .with_context(|| format!("fio {rw_mode} failed"))?;
+
+            recorder.stop()?;
+
+            let bw_name = format!("fio_{label}_{prefix}_{phase}_bw");
+            metrics.push(parse_fio_bw(&json, &bw_name, field)?);
+
+            if is_random {
+                let iops_name = format!("fio_{label}_{prefix}_{phase}_iops");
+                metrics.push(parse_fio_iops(&json, &iops_name, field)?);
+            }
+        }
+
+        Ok(metrics)
+    }
+
+    async fn teardown(&self, state: ChDiskIoTestState) -> anyhow::Result<()> {
+        state.agent.power_off().await?;
+        state.vm.wait_for_clean_teardown().await?;
+        Ok(())
+    }
+}

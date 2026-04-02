@@ -943,28 +943,15 @@ impl<F: AsyncFile> VhdxFile<F> {
     pub async fn flush(&self) -> Result<(), VhdxError> {
         self.flush_dirty_bat_pages().await?;
 
-        if let Some(sender) = self.log_sender.as_ref() {
-            // Commit dirty cache pages (sends dirty pages to log task).
-            //
-            // NOTE: FSN-gated BAT logging (pre_log_fsn) is NOT applied here.
-            // The pre_log_fsn mechanism is designed to be set per-page at
-            // block-allocation time (during resolve_write), so that BAT updates
-            // referencing newly allocated blocks are not logged until the user
-            // data is durable. Setting it here would deadlock: we'd capture
-            // the current FSN, but that FSN can only complete when the log task
-            // calls flush_sequencer.flush() — which happens after it processes
-            // the very pages we're sending.
-            let _fsn = self.cache.commit(sender).await?;
+        if self.log_sender.is_some() {
+            // Ship dirty cache pages to the log task (fire-and-forget).
+            let lsn = self.cache.commit().await?;
+
+            // Wait for the log task to have durably written this batch.
+            self.cache.wait_for_lsn(lsn).await;
         }
 
-        // Ensure data writes are durable. When there's a flush sequencer,
-        // use it to coalesce and track FSNs properly. Without a flush
-        // sequencer (no log task), flush the file directly.
-        //
-        // This is necessary because cache.commit() only issues a file flush
-        // through the log task when there are dirty BAT pages. Overwrites
-        // to existing blocks don't dirty any BAT pages, so without this
-        // explicit flush the data would remain volatile.
+        // Ensure user data writes are durable.
         if let Some(seq) = &self.flush_sequencer {
             seq.flush(self.file.as_ref()).await?;
         } else {
@@ -2649,7 +2636,11 @@ mod tests {
         };
         yielding_file.inner.write_at(0, &data).await.unwrap();
 
-        let vhdx = Arc::new(VhdxFile::open_writable(yielding_file, &driver).await.unwrap());
+        let vhdx = Arc::new(
+            VhdxFile::open_writable(yielding_file, &driver)
+                .await
+                .unwrap(),
+        );
         let block_size = vhdx.block_size();
 
         // Both tasks write to block 0 (offset 0, full block).

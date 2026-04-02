@@ -163,6 +163,10 @@ pub struct VhdxFile<F: AsyncFile> {
     log_task: Option<pal_async::task::Task<()>>,
     /// Flush sequencer for FSN-gated ordering. `None` for read-only files.
     pub(crate) flush_sequencer: Option<Arc<FlushSequencer>>,
+    /// Failable semaphore for log backpressure. Shared with log task.
+    log_permits: Option<Arc<crate::log_permits::LogPermits>>,
+    /// LSN watermark published by the log task. `flush()` waits on this.
+    logged_lsn: Option<Arc<crate::lsn_watermark::LsnWatermark>>,
 }
 
 impl<F: AsyncFile> VhdxFile<F> {
@@ -173,7 +177,11 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// If the log GUID is non-zero (indicating a dirty log), replays the
     /// log to recover the file. Read-only opens with a dirty log return
     /// [`CorruptionType::LogReplayRequired`].
-    async fn open_inner(file: F, read_only: bool) -> Result<Self, VhdxError> {
+    async fn open_inner(
+        file: F,
+        read_only: bool,
+        log_sender: Option<mesh::Sender<LogRequest>>,
+    ) -> Result<Self, VhdxError> {
         // 1. Validate minimum file size.
         let file_length = file.file_size().await.map_err(VhdxError::Io)?;
         if file_length < format::HEADER_AREA_SIZE {
@@ -270,7 +278,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         let file = Arc::new(file);
 
         // 12. Create PageCache and register tags.
-        let mut cache = PageCache::new(file.clone());
+        let mut cache = PageCache::new(file.clone(), log_sender, None, None);
         cache.register_tag(BAT_TAG, regions.bat_offset);
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
         cache.register_tag(SBM_TAG, 0);
@@ -333,6 +341,8 @@ impl<F: AsyncFile> VhdxFile<F> {
             log_sender: None,
             log_task: None,
             flush_sequencer: None,
+            log_permits: None,
+            logged_lsn: None,
         })
     }
 
@@ -344,11 +354,11 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// the replay I/O), but the resulting `VhdxFile` is still read-only.
     pub async fn open_read_only(file: F, allow_replay: bool) -> Result<Self, VhdxError> {
         if allow_replay {
-            let mut vhdx = Self::open_inner(file, false).await?;
+            let mut vhdx = Self::open_inner(file, false, None).await?;
             vhdx.read_only = true;
             Ok(vhdx)
         } else {
-            Self::open_inner(file, true).await
+            Self::open_inner(file, true, None).await
         }
     }
 }
@@ -369,14 +379,17 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         file: F,
         spawner: &impl pal_async::task::Spawn,
     ) -> Result<Self, VhdxError> {
-        let mut vhdx = Self::open_inner(file, false).await?;
-
-        // Create mesh channel for log requests.
+        // Create mesh channel before open_inner so the cache gets the
+        // sender at construction time.
         let (tx, rx) = mesh::channel::<LogRequest>();
-        vhdx.cache.set_log_sender(tx.clone());
+        let mut vhdx = Self::open_inner(file, false, Some(tx.clone())).await?;
 
-        // Create flush sequencer.
+        // Create shared state for log task communication.
         let flush_sequencer = Arc::new(FlushSequencer::new());
+        let log_permits = Arc::new(crate::log_permits::LogPermits::new(
+            crate::cache::MAX_COMMIT_PAGES,
+        ));
+        let logged_lsn = Arc::new(crate::lsn_watermark::LsnWatermark::new());
 
         // Initialize the log writer.
         let log_guid = Guid::new_random();
@@ -437,18 +450,33 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         // Spawn the log task.
         let file_clone = vhdx.file.clone();
         let fsn_clone = flush_sequencer.clone();
+        let permits_clone = log_permits.clone();
+        let lsn_clone = logged_lsn.clone();
         let log_offset = vhdx.log_offset;
         let log_length = vhdx.log_length;
         let task = spawner.spawn(
             "vhdx-log-task",
             crate::log_task::run_log_task(
-                rx, file_clone, log_writer, fsn_clone, log_offset, log_length,
+                rx,
+                file_clone,
+                log_writer,
+                fsn_clone,
+                permits_clone,
+                lsn_clone,
+                log_offset,
+                log_length,
             ),
         );
+
+        // Set log permits and LSN watermark on the cache.
+        vhdx.cache.set_log_permits(log_permits.clone());
+        vhdx.cache.set_logged_lsn(logged_lsn.clone());
 
         vhdx.log_sender = Some(tx);
         vhdx.log_task = Some(task);
         vhdx.flush_sequencer = Some(flush_sequencer);
+        vhdx.log_permits = Some(log_permits);
+        vhdx.logged_lsn = Some(logged_lsn);
 
         Ok(vhdx)
     }
@@ -466,24 +494,29 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
     pub async fn close(mut self) -> Result<(), VhdxError> {
         use mesh::rpc::RpcSend;
 
-        if let Some(sender) = self.log_sender.take() {
-            // First flush any dirty pages from the cache through the log.
-            self.cache.commit(&sender).await?;
+        if self.log_sender.is_some() {
+            // Ship any remaining dirty pages to the log task.
+            // This is fire-and-forget — the Close RPC below will
+            // process after this batch due to channel ordering.
+            self.cache.commit().await?;
 
-            // Clear the cache's clone of the sender so the channel can close.
-            self.cache.clear_log_sender();
+            // Take the sender out of the cache so the channel can close.
+            let sender = self
+                .cache
+                .take_log_sender()
+                .expect("log_sender disappeared");
+            self.log_sender.take();
 
-            // Send Close request and await response.
+            // Send Close RPC — the log task will log+apply all pending
+            // batches, clear the log GUID, then respond.
             let result = sender
                 .call(LogRequest::Close, ())
                 .await
                 .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?;
             result?;
 
-            // Drop the sender to close the channel.
             drop(sender);
 
-            // Await the log task to exit.
             if let Some(task) = self.log_task.take() {
                 task.await;
             }
@@ -502,11 +535,9 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
     /// the log task (including its `Arc<F>`) is released, but no new I/O
     /// is issued.
     pub async fn abort(mut self) {
-        // Drop the sender so the log task's recv() returns Err.
+        // Drop both senders so the log task's recv() returns Err.
         self.log_sender.take();
-
-        // Clear the cache's clone of the sender so the channel fully closes.
-        self.cache.clear_log_sender();
+        self.cache.take_log_sender();
 
         // Wait for the log task to notice the closed channel and exit.
         if let Some(task) = self.log_task.take() {
@@ -842,21 +873,17 @@ impl<F: AsyncFile> VhdxFile<F> {
                 buf
             };
 
-            let commit = {
-                let mut guard = self
-                    .cache
-                    .acquire_write(
-                        PageKey {
-                            tag: BAT_TAG,
-                            offset: page_offset,
-                        },
-                        crate::cache::WriteMode::Overwrite,
-                    )
-                    .await?;
-                guard.copy_from_slice(&page_buf);
-                guard.release()
-            };
-            commit.commit().await?;
+            let mut guard = self
+                .cache
+                .acquire_write(
+                    PageKey {
+                        tag: BAT_TAG,
+                        offset: page_offset,
+                    },
+                    crate::cache::WriteMode::Overwrite,
+                )
+                .await?;
+            guard.copy_from_slice(&page_buf);
         }
 
         Ok(())
@@ -885,21 +912,17 @@ impl<F: AsyncFile> VhdxFile<F> {
         // LOCK AUDIT: bat_state write-lock dropped (end of block above). No sync locks held.
         for (page_index, page_buf) in pages_to_write {
             let page_offset = page_index as u64 * CACHE_PAGE_SIZE;
-            let commit = {
-                let mut guard = self
-                    .cache
-                    .acquire_write(
-                        PageKey {
-                            tag: BAT_TAG,
-                            offset: page_offset,
-                        },
-                        crate::cache::WriteMode::Overwrite,
-                    )
-                    .await?;
-                guard.copy_from_slice(&page_buf);
-                guard.release()
-            };
-            commit.commit().await?;
+            let mut guard = self
+                .cache
+                .acquire_write(
+                    PageKey {
+                        tag: BAT_TAG,
+                        offset: page_offset,
+                    },
+                    crate::cache::WriteMode::Overwrite,
+                )
+                .await?;
+            guard.copy_from_slice(&page_buf);
         }
 
         Ok(())
@@ -1272,7 +1295,7 @@ mod tests {
     #[async_test]
     async fn eof_counter_no_overlap() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false, None).await.unwrap();
         let a = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
         let b = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
         // Two allocations must not overlap.
@@ -1283,7 +1306,7 @@ mod tests {
     #[async_test]
     async fn eof_counter_mb_aligned() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_inner(file, false, None).await.unwrap();
         let result = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
         assert_eq!(result.file_offset % MB1, 0, "offset must be MB1-aligned");
     }

@@ -208,31 +208,27 @@ pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
             std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
 
         let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
-        let commit = {
-            let mut guard = cache
-                .acquire_write(
-                    PageKey {
-                        tag: SBM_TAG,
-                        offset: page_file_offset,
-                    },
-                    WriteMode::Modify,
-                )
-                .await?;
+        let mut guard = cache
+            .acquire_write(
+                PageKey {
+                    tag: SBM_TAG,
+                    offset: page_file_offset,
+                },
+                WriteMode::Modify,
+            )
+            .await?;
 
-            // Set or clear each bit in the range.
-            for bit_index in start_bit..bits_in_this_page {
-                let byte_index = (bit_index / 8) as usize;
-                let bit_position = (bit_index % 8) as u32;
-                if set {
-                    guard[byte_index] |= 1 << bit_position;
-                } else {
-                    guard[byte_index] &= !(1 << bit_position);
-                }
+        // Set or clear each bit in the range.
+        for bit_index in start_bit..bits_in_this_page {
+            let byte_index = (bit_index / 8) as usize;
+            let bit_position = (bit_index % 8) as u32;
+            if set {
+                guard[byte_index] |= 1 << bit_position;
+            } else {
+                guard[byte_index] &= !(1 << bit_position);
             }
+        }
 
-            guard.release()
-        };
-        commit.commit().await?;
         let sectors_processed = bits_in_this_page - start_bit;
         remaining_sectors -= sectors_processed;
         current_virtual_offset += sectors_processed * logical_sector_size as u64;
@@ -252,20 +248,16 @@ pub(crate) async fn zero_sector_bitmap_block<F: AsyncFile>(
     let page_count = crate::bat::SECTOR_BITMAP_BLOCK_SIZE as u64 / CACHE_PAGE_SIZE;
     for page in 0..page_count {
         let page_offset = sbm_file_offset + page * CACHE_PAGE_SIZE;
-        let commit = {
-            let mut guard = cache
-                .acquire_write(
-                    PageKey {
-                        tag: SBM_TAG,
-                        offset: page_offset,
-                    },
-                    WriteMode::Modify,
-                )
-                .await?;
-            guard.fill(0);
-            guard.release()
-        };
-        commit.commit().await?;
+        let mut guard = cache
+            .acquire_write(
+                PageKey {
+                    tag: SBM_TAG,
+                    offset: page_offset,
+                },
+                WriteMode::Modify,
+            )
+            .await?;
+        guard.fill(0);
     }
     Ok(())
 }
@@ -281,6 +273,7 @@ mod tests {
     use crate::open::VhdxFile;
     use crate::region;
     use crate::tests::support::InMemoryFile;
+    use pal_async::DefaultDriver;
     use pal_async::async_test;
     use zerocopy::IntoBytes;
 
@@ -639,10 +632,45 @@ mod tests {
     }
 
     #[async_test]
-    async fn set_sector_bitmap_bits_roundtrip() {
+    async fn set_sector_bitmap_bits_roundtrip(driver: DefaultDriver) {
         // Create a differencing VHDX with all-zero bitmap (all transparent).
+        // This test writes SBM bits, so it needs a writable VhdxFile.
         let bitmap = [0x00u8; 4096];
-        let (_, vhdx, data_offset, _) = create_partial_block_vhdx(&bitmap).await;
+        let (_, _, data_offset, _) = create_partial_block_vhdx(&bitmap).await;
+
+        // Re-create the same setup but open writable.
+        let file = InMemoryFile::new(0);
+        let mut params = CreateParams {
+            disk_size: format::GB1,
+            has_parent: true,
+            ..Default::default()
+        };
+        create::create(&file, &mut params).await.unwrap();
+        let regions = region::parse_region_tables(&file).await.unwrap();
+        let bat_offset = regions.bat_offset;
+        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+        let payload_index = bat.payload_entry_index(0);
+        let sbm_index = bat.sector_bitmap_entry_index(0);
+
+        let data_block_offset = 8 * format::MB1;
+        let data_entry = BatEntry::new()
+            .with_state(BatEntryState::PartiallyPresent as u8)
+            .with_file_offset_mb(data_block_offset >> 20);
+        file.write_at(bat_offset + payload_index as u64 * 8, data_entry.as_bytes())
+            .await
+            .unwrap();
+
+        let sbm_block_offset = 10 * format::MB1;
+        let sbm_entry = BatEntry::new()
+            .with_state(BatEntryState::FullyPresent as u8)
+            .with_file_offset_mb(sbm_block_offset >> 20);
+        file.write_at(bat_offset + sbm_index as u64 * 8, sbm_entry.as_bytes())
+            .await
+            .unwrap();
+
+        file.write_at(sbm_block_offset, &bitmap).await.unwrap();
+
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Verify initial state: sectors 0-7 are transparent.
         let mut ranges = Vec::new();

@@ -463,24 +463,19 @@ impl Bat {
         let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
         let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
 
-        let commit = {
-            let mut guard = cache
-                .acquire_write(
-                    PageKey {
-                        tag: BAT_TAG,
-                        offset: page_offset,
-                    },
-                    WriteMode::Modify,
-                )
-                .await?;
+        let mut guard = cache
+            .acquire_write(
+                PageKey {
+                    tag: BAT_TAG,
+                    offset: page_offset,
+                },
+                WriteMode::Modify,
+            )
+            .await?;
 
-            let byte_offset = entry_within_page * size_of::<BatEntry>();
-            guard[byte_offset..byte_offset + size_of::<BatEntry>()]
-                .copy_from_slice(entry.as_bytes());
+        let byte_offset = entry_within_page * size_of::<BatEntry>();
+        guard[byte_offset..byte_offset + size_of::<BatEntry>()].copy_from_slice(entry.as_bytes());
 
-            guard.release()
-        };
-        commit.commit().await?;
         Ok(())
     }
 }

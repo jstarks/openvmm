@@ -270,9 +270,10 @@ mod log_task_integration {
 
         // Reopen (no log needed since we closed cleanly) and verify data.
         {
-            let vhdx = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
-                .await
-                .unwrap();
+            let vhdx =
+                VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+                    .await
+                    .unwrap();
             let read_buf = read_pattern(&vhdx, 0, 4096).await;
             assert!(read_buf.iter().all(|&b| b == 0xAB));
         }
@@ -291,9 +292,10 @@ mod log_task_integration {
         };
 
         // Reopen — should succeed without log replay.
-        let vhdx = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
-            .await
-            .unwrap();
+        let vhdx =
+            VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+                .await
+                .unwrap();
         assert!(vhdx.read_only);
     }
 
@@ -314,11 +316,7 @@ mod log_task_integration {
         write_pattern(&vhdx, 0, 4096, 0xEE).await;
 
         // Commit should return a valid FSN via the cache.
-        let _fsn = vhdx
-            .cache
-            .commit(vhdx.log_sender.as_ref().expect("log sender"))
-            .await
-            .unwrap();
+        let _fsn = vhdx.cache.commit().await.unwrap();
         // FSN can be 0 if no dirty pages (BAT may or may not be dirty depending
         // on cache state). Just verify no errors.
 
@@ -341,9 +339,10 @@ mod log_task_integration {
         vhdx.close().await.unwrap();
 
         // Reopen and verify.
-        let vhdx2 = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
-            .await
-            .unwrap();
+        let vhdx2 =
+            VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+                .await
+                .unwrap();
 
         let buf0 = read_pattern(&vhdx2, 0, 4096).await;
         assert!(buf0.iter().all(|&b| b == 0x11), "first write mismatch");
@@ -384,9 +383,10 @@ mod log_task_integration {
 
         // Reopen from snapshot and verify every block.
         {
-            let vhdx = VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
-                .await
-                .unwrap();
+            let vhdx =
+                VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+                    .await
+                    .unwrap();
             for i in 0..BLOCK_COUNT {
                 let offset = i as u64 * BLOCK_SIZE;
                 let expected = (i & 0xFF) as u8;

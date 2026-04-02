@@ -188,18 +188,19 @@ impl PetriVmmBackend for ChPetriBackend {
             .stderr(std::process::Stdio::piped());
 
         // Attach additional disks as virtio-blk devices.
-        for disk in &ch_config.disks {
-            let readonly = if disk.readonly { "on" } else { "off" };
-            let direct = if disk.direct { "on" } else { "off" };
-            cmd.args([
-                "--disk",
-                &format!(
+        // CH expects a single --disk flag with all disk specs as separate args.
+        if !ch_config.disks.is_empty() {
+            cmd.arg("--disk");
+            for disk in &ch_config.disks {
+                let readonly = if disk.readonly { "on" } else { "off" };
+                let direct = if disk.direct { "on" } else { "off" };
+                cmd.arg(format!(
                     "path={},readonly={},direct={}",
                     disk.path.display(),
                     readonly,
                     direct,
-                ),
-            ]);
+                ));
+            }
         }
 
         tracing::info!(

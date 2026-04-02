@@ -373,6 +373,10 @@ pub struct PetriVm<T: PetriVmmBackend> {
     uses_pipette_as_init: bool,
 
     config: PetriVmRuntimeConfig,
+    // Keep the prepared initrd alive for the lifetime of the VM.
+    // Backends that read the initrd path asynchronously (e.g. CH)
+    // need the file to exist beyond PetriVmBuilder::run().
+    _prepared_initrd: Option<TempPath>,
 }
 
 impl<T: PetriVmmBackend> PetriVmBuilder<T> {
@@ -916,13 +920,13 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         // Auto-prepare the initrd with pipette injected if needed.
         // This centralizes the injection logic so backends only ever
         // receive a prebuilt_initrd path.
-        let _prepared_initrd_guard;
+        let prepared_initrd;
         if self.uses_pipette_as_init() && self.prebuilt_initrd.is_none() {
             let tmp = self.prepare_initrd()?;
             self.prebuilt_initrd = Some(tmp.to_path_buf());
-            _prepared_initrd_guard = Some(tmp);
+            prepared_initrd = Some(tmp);
         } else {
-            _prepared_initrd_guard = None;
+            prepared_initrd = None;
         }
 
         tracing::debug!(builder = ?self);
@@ -958,6 +962,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             uses_pipette_as_init,
 
             config,
+            _prepared_initrd: prepared_initrd,
         };
 
         if expect_reset {

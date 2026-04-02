@@ -453,12 +453,17 @@ mod tests {
     use crate::io::ReadRange;
     use crate::open::VhdxFile;
     use crate::tests::support::InMemoryFile;
+    use pal_async::DefaultDriver;
     use pal_async::async_test;
 
     /// Helper to create a disk and write a full block, returning the VhdxFile.
-    async fn create_and_write_block(disk_size: u64, block_number: u32) -> VhdxFile<InMemoryFile> {
+    async fn create_and_write_block(
+        disk_size: u64,
+        block_number: u32,
+        driver: &DefaultDriver,
+    ) -> VhdxFile<InMemoryFile> {
         let (file, _) = InMemoryFile::create_test_vhdx(disk_size).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, driver).await.unwrap();
         let block_offset = block_number as u64 * vhdx.block_size() as u64;
         let block_size = vhdx.block_size();
 
@@ -553,8 +558,8 @@ mod tests {
     // ---- Basic Trim Tests ----
 
     #[async_test]
-    async fn trim_full_block_file_space() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_full_block_file_space(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
         assert_block_state(&vhdx, 0, BatEntryState::FullyPresent);
         assert!(block_has_file_offset(&vhdx, 0));
 
@@ -572,8 +577,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_full_block_free_space() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_full_block_free_space(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         vhdx.trim(TrimRequest::new(
             TrimMode::FreeSpace,
@@ -589,8 +594,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_full_block_zero() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_full_block_zero(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         vhdx.trim(TrimRequest::new(
             TrimMode::Zero,
@@ -605,8 +610,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_full_block_make_transparent() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_full_block_make_transparent(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         vhdx.trim(TrimRequest::new(
             TrimMode::MakeTransparent,
@@ -621,8 +626,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_remove_soft_anchors() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_remove_soft_anchors(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         // First trim with FileSpace to create a soft anchor.
         vhdx.trim(TrimRequest::new(
@@ -648,8 +653,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_already_trimmed_idempotent() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_already_trimmed_idempotent(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         vhdx.trim(TrimRequest::new(
             TrimMode::FileSpace,
@@ -672,9 +677,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_undefined_block_file_space_noop() {
+    async fn trim_undefined_block_file_space_noop(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Block 0 starts as NotPresent on a fresh non-differencing disk.
         assert_block_state(&vhdx, 0, BatEntryState::NotPresent);
@@ -692,9 +697,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_zero_block_noop() {
+    async fn trim_zero_block_noop(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // First: write and trim to Zero to get a Zero block.
         let block_size = vhdx.block_size();
@@ -739,9 +744,9 @@ mod tests {
     // ---- Range Tests ----
 
     #[async_test]
-    async fn trim_cross_block() {
+    async fn trim_cross_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let bs = vhdx.block_size();
 
         // Write blocks 0, 1, 2.
@@ -783,7 +788,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_partial_range_skips_edges() {
+    async fn trim_partial_range_skips_edges(driver: DefaultDriver) {
         let file = InMemoryFile::new(0);
         let bs = MB1 as u32; // Use 1 MiB blocks for easier testing.
         let mut params = CreateParams {
@@ -792,7 +797,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write blocks 0, 1, 2.
         for block in 0..3u32 {
@@ -838,7 +843,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_entire_disk() {
+    async fn trim_entire_disk(driver: DefaultDriver) {
         let file = InMemoryFile::new(0);
         let bs = MB1 as u32;
         let mut params = CreateParams {
@@ -847,7 +852,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write all 4 blocks.
         for block in 0..4u32 {
@@ -887,7 +892,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_at_disk_end_rounds_up() {
+    async fn trim_at_disk_end_rounds_up(driver: DefaultDriver) {
         // The disk size may not be an exact multiple of block size.
         // If trim range ends exactly at disk_size, we round up.
         let file = InMemoryFile::new(0);
@@ -900,7 +905,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // Write block 3 (the last, partial block).
         let block3_offset = 3 * MB1;
@@ -948,8 +953,8 @@ mod tests {
     // ---- Read-After-Trim Tests ----
 
     #[async_test]
-    async fn read_after_trim_returns_zeros() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn read_after_trim_returns_zeros(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         // Verify data is present.
         let mut ranges = Vec::new();
@@ -978,8 +983,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_then_write_reallocates() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_then_write_reallocates(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         // Trim with FileSpace (soft anchor).
         vhdx.trim(TrimRequest::new(
@@ -1022,7 +1027,7 @@ mod tests {
     // ---- Fully-Allocated Disk Tests ----
 
     #[async_test]
-    async fn trim_fixed_disk_file_space_noop() {
+    async fn trim_fixed_disk_file_space_noop(driver: DefaultDriver) {
         let file = InMemoryFile::new(0);
         let mut params = CreateParams {
             disk_size: 4 * MB1,
@@ -1031,7 +1036,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // FileSpace trim on fixed → no-op.
         vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 4 * MB1))
@@ -1048,7 +1053,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_fixed_disk_make_transparent_allowed() {
+    async fn trim_fixed_disk_make_transparent_allowed(driver: DefaultDriver) {
         let file = InMemoryFile::new(0);
         let mut params = CreateParams {
             disk_size: 4 * MB1,
@@ -1057,7 +1062,7 @@ mod tests {
             ..Default::default()
         };
         create::create(&file, &mut params).await.unwrap();
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // MakeTransparent on fixed → allowed.
         vhdx.trim(TrimRequest::new(TrimMode::MakeTransparent, 0, 4 * MB1))
@@ -1071,8 +1076,8 @@ mod tests {
     // ---- Concurrent Safety Tests ----
 
     #[async_test]
-    async fn trim_waits_for_in_flight_read() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_waits_for_in_flight_read(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         // Acquire a read guard on block 0 to hold its refcount.
         let mut ranges = Vec::new();
@@ -1116,8 +1121,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_waits_for_in_flight_write() {
-        let vhdx = create_and_write_block(format::GB1, 0).await;
+    async fn trim_waits_for_in_flight_write(driver: DefaultDriver) {
+        let vhdx = create_and_write_block(format::GB1, 0, &driver).await;
 
         // Acquire a write guard on block 0.
         let mut ranges = Vec::new();
@@ -1162,9 +1167,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_concurrent_different_block() {
+    async fn trim_concurrent_different_block(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let bs = vhdx.block_size();
 
         // Write blocks 0 and 1.
@@ -1232,9 +1237,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_unaligned_offset_fails() {
+    async fn trim_unaligned_offset_fails(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let result = vhdx
             .trim(TrimRequest::new(TrimMode::FileSpace, 1, 512))
@@ -1246,9 +1251,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_beyond_disk_fails() {
+    async fn trim_beyond_disk_fails(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let result = vhdx
             .trim(TrimRequest::new(
@@ -1264,9 +1269,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_beyond_disk_ok_with_skip() {
+    async fn trim_beyond_disk_ok_with_skip(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         // With skip_disk_size_check, goes beyond but computes no included blocks → ok.
         let result = vhdx
@@ -1279,9 +1284,9 @@ mod tests {
     }
 
     #[async_test]
-    async fn trim_zero_length_noop() {
+    async fn trim_zero_length_noop(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_inner(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
         let result = vhdx.trim(TrimRequest::new(TrimMode::FileSpace, 0, 0)).await;
         assert!(result.is_ok());

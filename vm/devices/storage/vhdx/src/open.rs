@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!(vhdx.physical_sector_size(), 512);
         assert!(!vhdx.has_parent());
         assert!(!vhdx.is_fully_allocated());
-        assert!(!vhdx.is_read_only());
+        assert!(vhdx.is_read_only());
         assert_ne!(vhdx.data_write_guid(), Guid::ZERO);
         assert_eq!(vhdx.data_write_guid(), params.data_write_guid);
     }

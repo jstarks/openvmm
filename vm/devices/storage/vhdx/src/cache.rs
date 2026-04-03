@@ -75,7 +75,9 @@ pub enum WriteMode {
 /// to prevent invalid combinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageState {
-    /// Page is clean. No permit held, not dirty.
+    /// Page is clean. Data is loaded and unmodified.
+    ///
+    /// Invariant: `data.is_some()` when `state == Clean`.
     Clean,
     /// Page data is being loaded from disk by another task.
     /// Other acquirers wait on `state_event`.
@@ -96,7 +98,9 @@ enum PageState {
 /// Internal per-page data.
 struct PageData {
     /// The page contents as `Arc` for zero-copy commit and COW.
-    /// `None` if the page has not been loaded yet.
+    /// Always `Some` when `state` is `Clean`, `HasPermit`, or `Dirty`.
+    /// `None` only when the page entry is freshly created (before loading)
+    /// or in `Loading`/`AcquiringPermit` state.
     data: Option<Arc<[u8; PAGE_SIZE]>>,
     /// Page lifecycle state.
     state: PageState,
@@ -110,6 +114,28 @@ struct PageData {
 /// Internal page map wrapping the `HashMap`.
 struct PageMap {
     map: HashMap<PageKey, Arc<Mutex<PageData>>>,
+}
+
+/// Action to perform when a page isn't ready (returned by sync helpers).
+/// This enum is `Send` — it never contains `ArcMutexGuard`.
+enum PendingAction {
+    /// Wait for another task to finish loading/acquiring.
+    Wait(event_listener::EventListener),
+    /// Load page data from disk at this file offset.
+    Load(u64),
+}
+
+/// Action for acquire_write when the page isn't ready.
+/// This enum is `Send` — it never contains `ArcMutexGuard`.
+enum WritePendingAction {
+    /// Wait for another task to finish loading/acquiring.
+    Wait(event_listener::EventListener),
+    /// Load page data from disk at this file offset.
+    Load(u64),
+    /// Acquire a log permit. If `eager_commit`, commit dirty pages first.
+    AcquirePermit { eager_commit: bool },
+    /// No log configured — fail.
+    NoLog,
 }
 
 /// Write-back page cache backed by an [`AsyncFile`].
@@ -212,6 +238,7 @@ impl<F: AsyncFile> PageCache<F> {
         (
             u64,
             parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>,
+            bool, // true if newly created
         ),
         std::io::Error,
     > {
@@ -229,27 +256,24 @@ impl<F: AsyncFile> PageCache<F> {
             self.try_evict_under_lock(&mut pages, Some(key));
         }
 
-        let entry = pages
-            .map
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(PageData {
+        let (entry, created) = match pages.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), false),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let entry = Arc::new(Mutex::new(PageData {
                     data: None,
-                    state: PageState::Clean,
+                    state: PageState::Loading,
                     pre_log_fsn: None,
                     committed_lsn: None,
-                }))
-            })
-            .clone();
+                }));
+                e.insert(entry.clone());
+                (entry, true)
+            }
+        };
 
-        // Acquire page lock while still holding map lock.
-        // This prevents eviction from removing this entry between
-        // the map lookup and the page lock acquisition.
         let guard = Mutex::lock_arc(&entry);
-        // Map lock released here (end of function).
         drop(pages);
 
-        Ok((file_offset, guard))
+        Ok((file_offset, guard, created))
     }
 
     /// Try to evict one clean, applied page to make room.
@@ -285,48 +309,86 @@ impl<F: AsyncFile> PageCache<F> {
 
     /// Acquire read access to a page.
     pub async fn acquire_read(&self, key: PageKey) -> Result<ReadPageGuard, std::io::Error> {
-        let guard = loop {
-            let (file_offset, mut guard) = self.get_or_create_locked(key)?;
-            match guard.state {
-                PageState::Loading | PageState::AcquiringPermit => {
-                    let listener = self.state_event.listen();
-                    drop(guard);
-                    listener.await;
-                    continue;
-                }
-                _ => {
-                    if guard.data.is_some() {
-                        break guard;
-                    }
-                    guard.state = PageState::Loading;
-                    drop(guard);
-
+        loop {
+            let action = match self.try_acquire_read(key) {
+                Ok(guard) => return Ok(guard),
+                Err(action) => action,
+            };
+            match action {
+                PendingAction::Wait(listener) => listener.await,
+                PendingAction::Load(file_offset) => {
                     let mut buf = [0u8; PAGE_SIZE];
-                    let result = self.file.read_at(file_offset, &mut buf).await;
-
-                    // Re-acquire via dual-lock to update state.
-                    let (_, mut page) = self.get_or_create_locked(key)?;
-                    if page.data.is_none() {
-                        match result {
-                            Ok(()) => page.data = Some(Arc::new(buf)),
-                            Err(e) => {
-                                page.state = PageState::Clean;
-                                self.state_event.notify(usize::MAX);
-                                return Err(e);
-                            }
+                    match self.file.read_at(file_offset, &mut buf).await {
+                        Ok(()) => self.complete_load(key, Some(buf)),
+                        Err(e) => {
+                            self.complete_load(key, None);
+                            return Err(e);
                         }
                     }
-                    if page.state == PageState::Loading {
-                        page.state = PageState::Clean;
-                    }
-                    drop(page);
-                    self.state_event.notify(usize::MAX);
-                    continue;
                 }
             }
-        };
+        }
+    }
 
-        Ok(ReadPageGuard { guard })
+    /// Sync helper: try to acquire read access.
+    fn try_acquire_read(&self, key: PageKey) -> Result<ReadPageGuard, PendingAction> {
+        let (file_offset, guard, created) = self
+            .get_or_create_locked(key)
+            .map_err(|_| PendingAction::Load(0))?;
+
+        if created {
+            // We created this entry in Loading state. Load it.
+            drop(guard);
+            return Err(PendingAction::Load(file_offset));
+        }
+
+        match guard.state {
+            PageState::Loading | PageState::AcquiringPermit => {
+                let listener = self.state_event.listen();
+                drop(guard);
+                Err(PendingAction::Wait(listener))
+            }
+            PageState::Clean | PageState::HasPermit | PageState::Dirty => {
+                assert!(
+                    guard.data.is_some(),
+                    "page in {:?} has no data",
+                    guard.state
+                );
+                Ok(ReadPageGuard { guard })
+            }
+        }
+    }
+
+    /// Complete a page load: store data and transition out of Loading.
+    ///
+    /// On success (`data` is `Some`): stores data, transitions `Loading → Clean`.
+    /// On failure (`data` is `None`): removes the entry from the cache so the
+    /// next acquirer creates a fresh entry and retries.
+    fn complete_load(&self, key: PageKey, data: Option<[u8; PAGE_SIZE]>) {
+        let mut pages = self.pages.lock();
+        if let Some(entry) = pages.map.get(&key) {
+            let mut page = entry.lock();
+            assert!(
+                page.state == PageState::Loading,
+                "complete_load called but page state is {:?}, expected Loading",
+                page.state
+            );
+            if let Some(buf) = data {
+                assert!(
+                    page.data.is_none(),
+                    "complete_load called but page already has data"
+                );
+                page.data = Some(Arc::new(buf));
+                page.state = PageState::Clean;
+            } else {
+                // Load failed. Remove the entry so the next acquirer
+                // starts fresh. Don't leave a Clean entry with no data.
+                drop(page);
+                pages.map.remove(&key);
+            }
+        }
+        drop(pages);
+        self.state_event.notify(usize::MAX);
     }
 
     /// Acquire write access to a page.
@@ -340,120 +402,115 @@ impl<F: AsyncFile> PageCache<F> {
     ) -> Result<WritePageGuard<'_, F>, std::io::Error> {
         let load = mode == WriteMode::Modify;
 
-        let guard = loop {
-            let (file_offset, mut guard) = self.get_or_create_locked(key)?;
-
-            match guard.state {
-                PageState::Loading | PageState::AcquiringPermit => {
-                    let listener = self.state_event.listen();
-                    drop(guard);
-                    listener.await;
-                    continue;
-                }
-
-                PageState::Dirty | PageState::HasPermit => {
-                    assert!(
-                        guard.data.is_some(),
-                        "page in state {:?} has no data",
-                        guard.state
-                    );
-                    break guard;
-                }
-
-                PageState::Clean => {
-                    // Ensure data loaded.
-                    if guard.data.is_none() {
-                        if load {
-                            guard.state = PageState::Loading;
-                            drop(guard);
-                            let mut buf = [0u8; PAGE_SIZE];
-                            self.file.read_at(file_offset, &mut buf).await?;
-                            let (_, mut page) = self.get_or_create_locked(key)?;
-                            if page.data.is_none() {
-                                page.data = Some(Arc::new(buf));
-                            }
-                            if page.state == PageState::Loading {
-                                page.state = PageState::Clean;
-                            }
-                            self.state_event.notify(usize::MAX);
-                            continue;
-                        } else {
-                            guard.data = Some(Arc::new([0u8; PAGE_SIZE]));
+        loop {
+            let action = match self.try_acquire_write(key, load) {
+                Ok(guard) => return Ok(guard),
+                Err(action) => action,
+            };
+            match action {
+                WritePendingAction::Wait(listener) => listener.await,
+                WritePendingAction::Load(file_offset) => {
+                    let mut buf = [0u8; PAGE_SIZE];
+                    match self.file.read_at(file_offset, &mut buf).await {
+                        Ok(()) => self.complete_load(key, Some(buf)),
+                        Err(e) => {
+                            self.complete_load(key, None);
+                            return Err(e);
                         }
                     }
-
-                    // Log is required for writes.
-                    let permits = self.log_permits.as_ref().ok_or_else(|| {
-                        std::io::Error::other(
-                            "acquire_write requires a log task (use open_writable)",
-                        )
-                    })?;
-
-                    // Eager commit: ship accumulated dirty pages first.
-                    let should_commit = {
-                        let dirty_count =
-                            self.dirty_count.load(std::sync::atomic::Ordering::Relaxed);
-                        dirty_count >= MAX_COMMIT_PAGES && self.log_sender.is_some()
-                    };
-                    if should_commit {
-                        guard.state = PageState::AcquiringPermit;
-                        drop(guard);
-                        self.commit().await.map_err(|e| match e {
+                }
+                WritePendingAction::AcquirePermit { eager_commit } => {
+                    if eager_commit {
+                        self.commit().map_err(|e| match e {
                             VhdxError::Io(io) => io,
                             other => std::io::Error::other(other.to_string()),
                         })?;
-                        let (_, mut page) = self.get_or_create_locked(key)?;
-                        if page.state != PageState::AcquiringPermit {
-                            self.state_event.notify(usize::MAX);
-                            continue;
-                        }
-                        drop(page);
-
-                        let result = permits.acquire(1).await;
-                        {
-                            let (_, mut page) = self.get_or_create_locked(key)?;
-                            if result.is_ok() {
-                                page.state = PageState::HasPermit;
-                            } else {
-                                page.state = PageState::Clean;
-                            }
-                        }
-                        self.state_event.notify(usize::MAX);
-                        result.map_err(|e| match e {
-                            VhdxError::Io(io) => io,
-                            other => std::io::Error::other(other.to_string()),
-                        })?;
-                        continue;
                     }
-
-                    // No eager commit needed. Acquire permit directly.
-                    guard.state = PageState::AcquiringPermit;
-                    drop(guard);
-
+                    let permits = self.log_permits.as_ref().unwrap();
                     let result = permits.acquire(1).await;
-                    {
-                        let (_, mut page) = self.get_or_create_locked(key)?;
-                        if result.is_ok() {
-                            page.state = PageState::HasPermit;
-                        } else {
-                            page.state = PageState::Clean;
-                        }
-                    }
-                    self.state_event.notify(usize::MAX);
+                    self.finalize_permit(key, result.is_ok());
                     result.map_err(|e| match e {
                         VhdxError::Io(io) => io,
                         other => std::io::Error::other(other.to_string()),
                     })?;
-                    continue;
+                }
+                WritePendingAction::NoLog => {
+                    return Err(std::io::Error::other(
+                        "acquire_write requires a log task (use open_writable)",
+                    ));
                 }
             }
-        };
+        }
+    }
 
-        Ok(WritePageGuard {
-            cache: self,
-            guard: Some(guard),
-            mutated: false,
-        })
+    /// Sync helper: try to acquire write access.
+    fn try_acquire_write(
+        &self,
+        key: PageKey,
+        load: bool,
+    ) -> Result<WritePageGuard<'_, F>, WritePendingAction> {
+        let (file_offset, mut guard, created) = self
+            .get_or_create_locked(key)
+            .map_err(|_| WritePendingAction::NoLog)?;
+
+        if created {
+            // Freshly created entry in Loading state.
+            if load {
+                // Need to load from disk.
+                drop(guard);
+                return Err(WritePendingAction::Load(file_offset));
+            } else {
+                // Overwrite mode — fill with zeros, transition to Clean.
+                guard.data = Some(Arc::new([0u8; PAGE_SIZE]));
+                guard.state = PageState::Clean;
+            }
+        }
+
+        match guard.state {
+            PageState::Loading | PageState::AcquiringPermit => {
+                let listener = self.state_event.listen();
+                drop(guard);
+                Err(WritePendingAction::Wait(listener))
+            }
+            PageState::Dirty | PageState::HasPermit => {
+                assert!(
+                    guard.data.is_some(),
+                    "page in {:?} has no data",
+                    guard.state
+                );
+                Ok(WritePageGuard {
+                    cache: self,
+                    guard: Some(guard),
+                    mutated: false,
+                })
+            }
+            PageState::Clean => {
+                assert!(guard.data.is_some(), "Clean page has no data");
+                if self.log_permits.is_none() {
+                    drop(guard);
+                    return Err(WritePendingAction::NoLog);
+                }
+                let dirty_count = self.dirty_count.load(std::sync::atomic::Ordering::Relaxed);
+                let eager_commit = dirty_count >= MAX_COMMIT_PAGES && self.log_sender.is_some();
+                guard.state = PageState::AcquiringPermit;
+                drop(guard);
+                Err(WritePendingAction::AcquirePermit { eager_commit })
+            }
+        }
+    }
+
+    /// Finalize a permit acquisition: transition page to HasPermit or Clean.
+    fn finalize_permit(&self, key: PageKey, success: bool) {
+        if let Ok((_, mut page, _)) = self.get_or_create_locked(key) {
+            if page.state == PageState::AcquiringPermit {
+                page.state = if success {
+                    PageState::HasPermit
+                } else {
+                    PageState::Clean
+                };
+            }
+        }
+        self.state_event.notify(usize::MAX);
     }
 
     /// Set the pre-log FSN on a specific page.
@@ -483,7 +540,7 @@ impl<F: AsyncFile> PageCache<F> {
     /// Commit all dirty pages to the log task (fire-and-forget).
     ///
     /// Returns the assigned LSN, or 0 if there were no dirty pages.
-    pub async fn commit(&self) -> Result<u64, VhdxError> {
+    pub fn commit(&self) -> Result<u64, VhdxError> {
         let log_sender = self
             .log_sender
             .as_ref()
@@ -949,7 +1006,7 @@ mod tests {
             let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xAA);
         }
-        let lsn = cache.commit().await.unwrap();
+        let lsn = cache.commit().unwrap();
         assert!(lsn > 0);
 
         match rx.recv().await.unwrap() {
@@ -981,13 +1038,13 @@ mod tests {
             let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xAA);
         }
-        let lsn1 = cache.commit().await.unwrap();
+        let lsn1 = cache.commit().unwrap();
 
         {
             let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xBB);
         }
-        let lsn2 = cache.commit().await.unwrap();
+        let lsn2 = cache.commit().unwrap();
 
         assert!(lsn2 > lsn1);
 
@@ -1020,7 +1077,7 @@ mod tests {
             let mut g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
             g.fill(0xAA);
         }
-        let lsn = cache.commit().await.unwrap();
+        let lsn = cache.commit().unwrap();
 
         let pages = cache.pages.lock();
         let entry = pages.map.get(&key).unwrap();
@@ -1077,7 +1134,7 @@ mod tests {
             _ => panic!("expected Commit from eager commit"),
         }
 
-        cache.commit().await.unwrap();
+        cache.commit().unwrap();
         match rx.recv().await.unwrap() {
             LogRequest::Commit(txn) => {
                 assert_eq!(txn.pages.len(), 1);
@@ -1163,7 +1220,7 @@ mod tests {
             g.fill(0xCC);
         }
 
-        cache.commit().await.unwrap();
+        cache.commit().unwrap();
         let batch2 = match rx.recv().await.unwrap() {
             LogRequest::Commit(txn) => txn,
             _ => panic!("expected Commit"),
@@ -1324,7 +1381,7 @@ mod tests {
                 .unwrap();
             g.fill(0xAA);
         }
-        cache.commit().await.unwrap();
+        cache.commit().unwrap();
 
         // Page A is Clean with committed_lsn=1. applied_lsn=0.
         // Eviction should skip it (not yet applied).

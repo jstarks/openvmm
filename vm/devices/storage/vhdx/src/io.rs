@@ -945,7 +945,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         if self.log_sender.is_some() {
             // Ship dirty cache pages to the log task (fire-and-forget).
-            let lsn = self.cache.commit().await?;
+            let lsn = self.cache.commit()?;
 
             // Wait for the log task to have durably written this batch.
             self.cache.wait_for_lsn(lsn).await?;

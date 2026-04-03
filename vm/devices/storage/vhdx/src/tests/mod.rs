@@ -316,7 +316,7 @@ mod log_task_integration {
         write_pattern(&vhdx, 0, 4096, 0xEE).await;
 
         // Commit should return a valid FSN via the cache.
-        let _fsn = vhdx.cache.commit().await.unwrap();
+        let _fsn = vhdx.cache.commit().unwrap();
         // FSN can be 0 if no dirty pages (BAT may or may not be dirty depending
         // on cache state). Just verify no errors.
 

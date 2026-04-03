@@ -519,7 +519,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             // Ship any remaining dirty pages to the log task.
             // This is fire-and-forget — the Close RPC below will
             // process after this batch due to channel ordering.
-            self.cache.commit().await?;
+            self.cache.commit()?;
 
             // Take the sender out of the cache so the channel can close.
             let sender = self

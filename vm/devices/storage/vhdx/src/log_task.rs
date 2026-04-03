@@ -1,29 +1,27 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Log task — a single async task that owns all log state, provides
-//! crash-consistent metadata persistence, and applies logged pages to
-//! their final file offsets.
+//! Log task — a single async task that owns all log state and provides
+//! crash-consistent metadata persistence.
 //!
 //! The log task receives [`LogRequest`] messages via a `mesh` channel.
 //! [`LogRequest::Commit`] is fire-and-forget: the cache sends a batch
 //! of dirty pages and moves on. The log task writes WAL entries,
-//! releases permits, and publishes `logged_through_lsn`. Callers that
-//! need durability (e.g., `flush()`) wait on the LSN watermark.
+//! releases permits, and publishes `logged_through_lsn`.
+//!
+//! After logging a batch, the log task sends it to the apply task for
+//! writing to final file offsets. The apply task publishes
+//! `applied_through_lsn`, which the log task reads to advance its tail.
 //!
 //! # Crash Consistency
 //!
 //! Metadata changes (BAT entries, sector bitmap bits) are journaled before
 //! being committed to their final locations. On crash, `replay_log()` restores
 //! them.
-//!
-//! # Interleaved Apply
-//!
-//! After logging a batch, the log task applies a previously-logged batch
-//! before waiting for the next request. Apply writes pages to their final
-//! file offsets and advances the log tail to reclaim space.
 
 use crate::AsyncFile;
+use crate::apply_task::ApplyBatch;
+use crate::apply_task::ApplyPage;
 use crate::cache::PAGE_SIZE;
 use crate::error::VhdxError;
 use crate::flush::FlushSequencer;
@@ -34,7 +32,6 @@ use crate::log_permits::LogPermits;
 use crate::lsn_watermark::LsnWatermark;
 use guid::Guid;
 use mesh::rpc::Rpc;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -43,13 +40,9 @@ use zerocopy::IntoBytes;
 /// A request to the log task.
 pub(crate) enum LogRequest {
     /// Log a batch of dirty pages (fire-and-forget).
-    ///
-    /// The cache sends this after collecting dirty pages. No response
-    /// is sent — the cache learns about completion via `LogPermits`
-    /// (backpressure) and `LsnWatermark` (durability).
     Commit(Transaction),
 
-    /// Graceful shutdown: log and apply all pending batches, clear log GUID.
+    /// Graceful shutdown: log all pending, wait for apply, clear log GUID.
     Close(Rpc<(), Result<(), VhdxError>>),
 }
 
@@ -68,23 +61,21 @@ pub(crate) struct Transaction {
     /// The pages in this batch.
     pub pages: Vec<CommittedPage>,
     /// If set, the log task must wait for this FSN to complete before
-    /// writing the WAL entry. Ensures user data is flushed before the
-    /// BAT update that references it.
+    /// writing the WAL entry.
     pub pre_log_fsn: Option<u64>,
 }
 
-/// A batch of pages that have been logged but not yet applied.
-struct LoggedBatch {
-    pages: Vec<CommittedPage>,
-    /// The writer's head offset after this entry was written.
-    /// After applying this batch, tail can advance to this value.
+/// Tracks a batch that has been sent to the applier but whose tail
+/// hasn't been advanced yet.
+struct PendingTail {
+    /// The LSN of the batch. Once `applied_lsn >= lsn`, the tail
+    /// can advance to `new_tail`.
+    lsn: u64,
+    /// The log-region offset to advance the tail to.
     new_tail: u32,
 }
 
 /// Run the log task main loop.
-///
-/// This function is spawned as an async task by `VhdxFile::open_writable()`.
-/// It owns all mutable log state and processes [`LogRequest`] messages.
 pub(crate) async fn run_log_task<F: AsyncFile>(
     mut rx: mesh::Receiver<LogRequest>,
     file: Arc<F>,
@@ -92,12 +83,18 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
     flush_sequencer: Arc<FlushSequencer>,
     log_permits: Arc<LogPermits>,
     logged_lsn: Arc<LsnWatermark>,
+    applied_lsn: Arc<LsnWatermark>,
+    apply_tx: mesh::Sender<ApplyBatch>,
     log_offset: u64,
     log_length: u32,
 ) {
-    let mut pending_apply: VecDeque<LoggedBatch> = VecDeque::new();
+    let mut pending_tails: Vec<PendingTail> = Vec::new();
 
     loop {
+        // Before processing the next request, advance the tail for
+        // any batches the applier has completed.
+        advance_tails(&mut pending_tails, &applied_lsn, &mut log_writer);
+
         let request = match rx.recv().await {
             Ok(req) => req,
             Err(_) => {
@@ -115,7 +112,8 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                     &flush_sequencer,
                     &log_permits,
                     &logged_lsn,
-                    &mut pending_apply,
+                    &apply_tx,
+                    &mut pending_tails,
                 )
                 .await;
             }
@@ -125,9 +123,8 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                         &file,
                         &mut log_writer,
                         &flush_sequencer,
-                        &log_permits,
-                        &logged_lsn,
-                        &mut pending_apply,
+                        &applied_lsn,
+                        &mut pending_tails,
                         log_offset,
                         log_length,
                     )
@@ -140,7 +137,26 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
     }
 }
 
-/// Handle a Commit request: write WAL entry, release permits, publish LSN.
+/// Advance the log tail for all batches whose LSN has been applied.
+fn advance_tails(
+    pending_tails: &mut Vec<PendingTail>,
+    applied_lsn: &LsnWatermark,
+    log_writer: &mut LogWriter,
+) {
+    let applied = applied_lsn.get();
+    // Pending tails are in LSN order. Advance all that are <= applied.
+    while let Some(front) = pending_tails.first() {
+        if front.lsn <= applied {
+            log_writer.advance_tail(front.new_tail);
+            pending_tails.remove(0);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Handle a Commit request: write WAL entry, release permits, publish LSN,
+/// send batch to applier.
 async fn handle_commit<F: AsyncFile>(
     txn: Transaction,
     file: &Arc<F>,
@@ -148,7 +164,8 @@ async fn handle_commit<F: AsyncFile>(
     flush_sequencer: &Arc<FlushSequencer>,
     log_permits: &LogPermits,
     logged_lsn: &LsnWatermark,
-    pending_apply: &mut VecDeque<LoggedBatch>,
+    apply_tx: &mesh::Sender<ApplyBatch>,
+    pending_tails: &mut Vec<PendingTail>,
 ) {
     let page_count = txn.pages.len();
     let lsn = txn.lsn;
@@ -171,25 +188,28 @@ async fn handle_commit<F: AsyncFile>(
             logged_lsn.advance(lsn);
 
             let new_tail = log_writer.head();
-            pending_apply.push_back(LoggedBatch {
-                pages: txn.pages,
+
+            // Send to applier for background apply.
+            let apply_pages = txn
+                .pages
+                .into_iter()
+                .map(|p| ApplyPage {
+                    file_offset: p.file_offset,
+                    data: p.data,
+                })
+                .collect();
+
+            apply_tx.send(ApplyBatch {
+                pages: apply_pages,
+                lsn,
                 new_tail,
             });
+
+            pending_tails.push(PendingTail { lsn, new_tail });
         }
         Err(e) => {
             tracing::error!("VHDX log task: WAL write failed: {e}");
             log_permits.fail(format!("WAL write failed: {e}"));
-            return;
-        }
-    }
-
-    // Interleaved apply: apply one previously-logged batch.
-    if let Some(batch) = pending_apply.pop_front() {
-        let new_tail = batch.new_tail;
-        if let Err(e) = apply_batch(file, flush_sequencer, batch).await {
-            tracing::warn!("VHDX log task: apply error: {e}");
-        } else {
-            log_writer.advance_tail(new_tail);
         }
     }
 }
@@ -213,42 +233,30 @@ async fn write_log_entry<F: AsyncFile>(
         .write_entry(file.as_ref(), &data_pages, &[])
         .await?;
 
-    // Flush to make the log entry durable.
     flush_sequencer.flush(file.as_ref()).await?;
 
     Ok(())
 }
 
-/// Apply a logged batch by writing pages to their final file offsets.
-async fn apply_batch<F: AsyncFile>(
-    file: &Arc<F>,
-    flush_sequencer: &FlushSequencer,
-    batch: LoggedBatch,
-) -> Result<(), VhdxError> {
-    for page in &batch.pages {
-        file.write_at(page.file_offset, page.data.as_slice())
-            .await?;
-    }
-    flush_sequencer.flush(file.as_ref()).await?;
-    Ok(())
-}
-
-/// Graceful close: log + apply all pending, clear log GUID, flush.
+/// Graceful close: wait for all applies, clear log GUID, flush.
 async fn graceful_close<F: AsyncFile>(
     file: &Arc<F>,
     log_writer: &mut LogWriter,
     flush_sequencer: &Arc<FlushSequencer>,
-    log_permits: &LogPermits,
-    logged_lsn: &LsnWatermark,
-    pending_apply: &mut VecDeque<LoggedBatch>,
+    applied_lsn: &LsnWatermark,
+    pending_tails: &mut Vec<PendingTail>,
     _log_offset: u64,
     _log_length: u32,
 ) -> Result<(), VhdxError> {
-    // Apply all pending batches.
-    while let Some(batch) = pending_apply.pop_front() {
-        let new_tail = batch.new_tail;
-        apply_batch(file, flush_sequencer, batch).await?;
-        log_writer.advance_tail(new_tail);
+    // Wait for all pending applies to complete.
+    if let Some(last) = pending_tails.last() {
+        let target_lsn = last.lsn;
+        applied_lsn.wait_for(target_lsn).await?;
+    }
+
+    // Now advance all tails.
+    for pt in pending_tails.drain(..) {
+        log_writer.advance_tail(pt.new_tail);
     }
 
     // Clear log GUID in the header.

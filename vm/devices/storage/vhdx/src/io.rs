@@ -948,7 +948,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let lsn = self.cache.commit().await?;
 
             // Wait for the log task to have durably written this batch.
-            self.cache.wait_for_lsn(lsn).await;
+            self.cache.wait_for_lsn(lsn).await?;
         }
 
         // Ensure user data writes are durable.

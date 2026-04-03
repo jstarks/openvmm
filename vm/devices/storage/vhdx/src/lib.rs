@@ -18,6 +18,7 @@
 
 use std::future::Future;
 
+pub(crate) mod apply_task;
 pub(crate) mod bat;
 pub(crate) mod cache;
 pub mod create;

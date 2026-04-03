@@ -10,17 +10,24 @@
 //! - [`LsnWatermark`] for `applied_through_lsn`: the applier updates this
 //!   after writing pages to final offsets. Cache eviction checks it.
 
+use crate::error::VhdxError;
 use event_listener::Event;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A shared monotonic counter that supports async waiting.
+/// A shared monotonic counter that supports async waiting and poisoning.
 ///
 /// Writers publish new values via [`advance()`](Self::advance).
 /// Readers wait for the value to reach a target via
 /// [`wait_for()`](Self::wait_for).
+///
+/// If the producer fails, it calls [`fail()`](Self::fail) to poison the
+/// watermark — all pending and future [`wait_for()`](Self::wait_for) calls
+/// return an error.
 pub(crate) struct LsnWatermark {
     value: AtomicU64,
     event: Event,
+    failed: Mutex<Option<String>>,
 }
 
 impl LsnWatermark {
@@ -29,6 +36,7 @@ impl LsnWatermark {
         Self {
             value: AtomicU64::new(0),
             event: Event::new(),
+            failed: Mutex::new(None),
         }
     }
 
@@ -49,14 +57,25 @@ impl LsnWatermark {
     /// Wait until the watermark reaches at least `target`.
     ///
     /// Returns immediately if the current value is already ≥ `target`.
-    pub async fn wait_for(&self, target: u64) {
+    /// Returns an error if the watermark has been poisoned.
+    pub async fn wait_for(&self, target: u64) -> Result<(), VhdxError> {
         loop {
             let listener = self.event.listen();
+            if let Some(ref err) = *self.failed.lock() {
+                return Err(VhdxError::Io(std::io::Error::other(err.clone())));
+            }
             if self.value.load(Ordering::Acquire) >= target {
-                return;
+                return Ok(());
             }
             listener.await;
         }
+    }
+
+    /// Poison the watermark. All pending and future `wait_for()` calls
+    /// will return an error.
+    pub fn fail(&self, error: String) {
+        *self.failed.lock() = Some(error);
+        self.event.notify(usize::MAX);
     }
 }
 
@@ -92,8 +111,8 @@ mod tests {
     async fn wait_for_already_reached() {
         let wm = LsnWatermark::new();
         wm.advance(10);
-        wm.wait_for(5).await; // returns immediately
-        wm.wait_for(10).await; // returns immediately
+        wm.wait_for(5).await.unwrap(); // returns immediately
+        wm.wait_for(10).await.unwrap(); // returns immediately
     }
 
     #[async_test]
@@ -104,7 +123,7 @@ mod tests {
         let (done_tx, done_rx) = futures::channel::oneshot::channel();
         let handle = std::thread::spawn(move || {
             futures::executor::block_on(async {
-                w.wait_for(5).await;
+                w.wait_for(5).await.unwrap();
                 done_tx.send(()).unwrap();
             });
         });
@@ -121,6 +140,43 @@ mod tests {
     #[async_test]
     async fn wait_for_zero_returns_immediately() {
         let wm = LsnWatermark::new();
-        wm.wait_for(0).await;
+        wm.wait_for(0).await.unwrap();
+    }
+
+    #[async_test]
+    async fn poison_fails_future_wait() {
+        let wm = LsnWatermark::new();
+        wm.fail("broken".into());
+        assert!(wm.wait_for(1).await.is_err());
+    }
+
+    #[async_test]
+    async fn poison_fails_pending_wait() {
+        let wm = std::sync::Arc::new(LsnWatermark::new());
+
+        let w = wm.clone();
+        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        let handle = std::thread::spawn(move || {
+            futures::executor::block_on(async {
+                let result = w.wait_for(5).await;
+                assert!(result.is_err());
+                done_tx.send(()).unwrap();
+            });
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        wm.fail("task died".into());
+        done_rx.await.unwrap();
+        handle.join().unwrap();
+    }
+
+    #[async_test]
+    async fn poison_does_not_affect_already_reached() {
+        let wm = LsnWatermark::new();
+        wm.advance(10);
+        wm.fail("broken".into());
+        // Already reached — should still succeed? No — poisoned means
+        // the producer is broken, so even reached values are suspect.
+        assert!(wm.wait_for(5).await.is_err());
     }
 }

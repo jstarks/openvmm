@@ -468,13 +468,14 @@ impl<F: AsyncFile> PageCache<F> {
     }
 
     /// Wait for the log task to durably write everything through `lsn`.
-    pub async fn wait_for_lsn(&self, lsn: u64) {
+    pub async fn wait_for_lsn(&self, lsn: u64) -> Result<(), VhdxError> {
         if lsn == 0 {
-            return;
+            return Ok(());
         }
         if let Some(ref logged_lsn) = self.logged_lsn {
-            logged_lsn.wait_for(lsn).await;
+            logged_lsn.wait_for(lsn).await?;
         }
+        Ok(())
     }
 
     /// Returns `true` if the cache has a log sender configured.

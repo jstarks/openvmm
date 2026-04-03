@@ -167,6 +167,8 @@ pub struct VhdxFile<F: AsyncFile> {
     log_permits: Option<Arc<crate::log_permits::LogPermits>>,
     /// LSN watermark published by the log task. `flush()` waits on this.
     logged_lsn: Option<Arc<crate::lsn_watermark::LsnWatermark>>,
+    /// Handle to the spawned apply task. `None` if no apply task is running.
+    apply_task: Option<pal_async::task::Task<()>>,
 }
 
 impl<F: AsyncFile> VhdxFile<F> {
@@ -343,6 +345,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             flush_sequencer: None,
             log_permits: None,
             logged_lsn: None,
+            apply_task: None,
         })
     }
 
@@ -447,11 +450,25 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             state.log_guid = log_guid;
         }
 
+        // Spawn the apply task.
+        let applied_lsn = Arc::new(crate::lsn_watermark::LsnWatermark::new());
+        let (apply_tx, apply_rx) = mesh::channel::<crate::apply_task::ApplyBatch>();
+        let apply_task = spawner.spawn(
+            "vhdx-apply-task",
+            crate::apply_task::run_apply_task(
+                apply_rx,
+                vhdx.file.clone(),
+                flush_sequencer.clone(),
+                applied_lsn.clone(),
+            ),
+        );
+
         // Spawn the log task.
         let file_clone = vhdx.file.clone();
         let fsn_clone = flush_sequencer.clone();
         let permits_clone = log_permits.clone();
         let lsn_clone = logged_lsn.clone();
+        let applied_clone = applied_lsn.clone();
         let log_offset = vhdx.log_offset;
         let log_length = vhdx.log_length;
         let task = spawner.spawn(
@@ -463,6 +480,8 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
                 fsn_clone,
                 permits_clone,
                 lsn_clone,
+                applied_clone,
+                apply_tx,
                 log_offset,
                 log_length,
             ),
@@ -474,6 +493,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
 
         vhdx.log_sender = Some(tx);
         vhdx.log_task = Some(task);
+        vhdx.apply_task = Some(apply_task);
         vhdx.flush_sequencer = Some(flush_sequencer);
         vhdx.log_permits = Some(log_permits);
         vhdx.logged_lsn = Some(logged_lsn);
@@ -520,6 +540,11 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             if let Some(task) = self.log_task.take() {
                 task.await;
             }
+            // The log task dropping its apply_tx closes the apply channel,
+            // causing the apply task to exit.
+            if let Some(task) = self.apply_task.take() {
+                task.await;
+            }
         }
         Ok(())
     }
@@ -540,7 +565,11 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         self.cache.take_log_sender();
 
         // Wait for the log task to notice the closed channel and exit.
+        // The log task dropping its apply_tx closes the apply channel too.
         if let Some(task) = self.log_task.take() {
+            task.await;
+        }
+        if let Some(task) = self.apply_task.take() {
             task.await;
         }
     }

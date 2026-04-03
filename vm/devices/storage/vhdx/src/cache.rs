@@ -107,10 +107,9 @@ struct PageData {
     committed_lsn: Option<u64>,
 }
 
-/// Internal page map wrapping the `HashMap` and a dirty page counter.
+/// Internal page map wrapping the `HashMap`.
 struct PageMap {
     map: HashMap<PageKey, Arc<Mutex<PageData>>>,
-    dirty_count: usize,
 }
 
 /// Write-back page cache backed by an [`AsyncFile`].
@@ -123,6 +122,9 @@ pub struct PageCache<F: AsyncFile> {
     logged_lsn: Option<Arc<LsnWatermark>>,
     applied_lsn: Option<Arc<LsnWatermark>>,
     lsn_counter: std::sync::atomic::AtomicU64,
+    /// Number of pages in `Dirty` state. Atomic so it can be
+    /// read/incremented without taking the map lock.
+    dirty_count: std::sync::atomic::AtomicUsize,
     /// Notified when a page transitions out of `Loading` or `AcquiringPermit`.
     state_event: event_listener::Event,
     /// Maximum number of pages to keep in the cache. 0 = unlimited.
@@ -143,7 +145,6 @@ impl<F: AsyncFile> PageCache<F> {
             file,
             pages: Mutex::new(PageMap {
                 map: HashMap::new(),
-                dirty_count: 0,
             }),
             tags: Mutex::new(HashMap::new()),
             log_sender,
@@ -151,6 +152,7 @@ impl<F: AsyncFile> PageCache<F> {
             logged_lsn,
             applied_lsn,
             lsn_counter: std::sync::atomic::AtomicU64::new(0),
+            dirty_count: std::sync::atomic::AtomicUsize::new(0),
             state_event: event_listener::Event::new(),
             quota,
         }
@@ -222,9 +224,9 @@ impl<F: AsyncFile> PageCache<F> {
         let file_offset = self.resolve_offset(key)?;
         let mut pages = self.pages.lock();
 
-        // Evict if over quota.
+        // Evict if over quota (but not the page we're about to acquire).
         if self.quota > 0 && pages.map.len() >= self.quota {
-            self.try_evict_under_lock(&mut pages);
+            self.try_evict_under_lock(&mut pages, Some(key));
         }
 
         let entry = pages
@@ -252,11 +254,15 @@ impl<F: AsyncFile> PageCache<F> {
 
     /// Try to evict one clean, applied page to make room.
     /// Must be called with the pages map lock held.
-    fn try_evict_under_lock(&self, pages: &mut PageMap) {
+    /// `skip_key` is the page being acquired — never evict it.
+    fn try_evict_under_lock(&self, pages: &mut PageMap, skip_key: Option<PageKey>) {
         let applied = self.applied_lsn.as_ref().map(|w| w.get()).unwrap_or(0);
 
         // Find first evictable page.
         let evict_key = pages.map.iter().find_map(|(&key, entry)| {
+            if skip_key == Some(key) {
+                return None;
+            }
             // Try to lock the page. If contended, skip (someone is using it).
             if let Some(page) = entry.try_lock() {
                 if page.state == PageState::Clean
@@ -385,7 +391,8 @@ impl<F: AsyncFile> PageCache<F> {
 
                     // Eager commit: ship accumulated dirty pages first.
                     let should_commit = {
-                        let dirty_count = self.pages.lock().dirty_count;
+                        let dirty_count =
+                            self.dirty_count.load(std::sync::atomic::Ordering::Relaxed);
                         dirty_count >= MAX_COMMIT_PAGES && self.log_sender.is_some()
                     };
                     if should_commit {
@@ -512,9 +519,11 @@ impl<F: AsyncFile> PageCache<F> {
                 return Ok(0);
             }
 
-            pages.dirty_count -= committed.len();
             (committed, max_pre_log_fsn, lsn)
         };
+
+        self.dirty_count
+            .fetch_sub(committed_pages.len(), std::sync::atomic::Ordering::Relaxed);
 
         log_sender.send(LogRequest::Commit(Transaction {
             lsn,
@@ -590,7 +599,9 @@ impl<F: AsyncFile> std::ops::DerefMut for WritePageGuard<'_, F> {
             self.mutated = true;
             if guard.state == PageState::HasPermit {
                 guard.state = PageState::Dirty;
-                self.cache.pages.lock().dirty_count += 1;
+                self.cache
+                    .dirty_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             // If state is Dirty (re-acquire on already-dirty page), no-op.
             // If state is Clean (no log configured), no-op.
@@ -1100,7 +1111,10 @@ mod tests {
             "re-dirtying an already-dirty page must not trigger eager commit"
         );
 
-        assert_eq!(cache.pages.lock().dirty_count, MAX_COMMIT_PAGES);
+        assert_eq!(
+            cache.dirty_count.load(std::sync::atomic::Ordering::Relaxed),
+            MAX_COMMIT_PAGES
+        );
     }
 
     #[async_test]
@@ -1156,5 +1170,233 @@ mod tests {
         };
         assert_eq!(batch2.pages.len(), 2);
         assert!(batch1.lsn < batch2.lsn);
+    }
+
+    // ---- Eviction tests ----
+
+    #[async_test]
+    async fn eviction_removes_clean_page() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64 * 4);
+        let pattern_a = [0xAA; PAGE_SIZE];
+        let pattern_b = [0xBB; PAGE_SIZE];
+        file.write_at(0, &pattern_a).await.unwrap();
+        file.write_at(PAGE_SIZE as u64, &pattern_b).await.unwrap();
+
+        // Quota of 1 page.
+        let mut cache = PageCache::new(Arc::new(file), None, None, None, None, 1);
+        cache.register_tag(0, 0);
+
+        // Load page A.
+        let g = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xAA);
+        drop(g);
+
+        // Cache has 1 page (at quota). Loading page B should evict page A.
+        let g = cache
+            .acquire_read(PageKey {
+                tag: 0,
+                offset: PAGE_SIZE as u64,
+            })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xBB);
+        drop(g);
+
+        // Page A was evicted — cache should have 1 entry.
+        assert_eq!(cache.pages.lock().map.len(), 1);
+    }
+
+    #[async_test]
+    async fn eviction_reloads_from_disk() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64 * 4);
+        let pattern_a = [0xAA; PAGE_SIZE];
+        let pattern_b = [0xBB; PAGE_SIZE];
+        file.write_at(0, &pattern_a).await.unwrap();
+        file.write_at(PAGE_SIZE as u64, &pattern_b).await.unwrap();
+
+        let mut cache = PageCache::new(Arc::new(file), None, None, None, None, 1);
+        cache.register_tag(0, 0);
+
+        // Load page A.
+        let g = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xAA);
+        drop(g);
+
+        // Load page B (evicts A).
+        let g = cache
+            .acquire_read(PageKey {
+                tag: 0,
+                offset: PAGE_SIZE as u64,
+            })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xBB);
+        drop(g);
+
+        // Re-load page A (evicts B, reloads from disk).
+        let g = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xAA);
+        drop(g);
+    }
+
+    #[async_test]
+    async fn eviction_skips_dirty_pages() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64 * 4);
+        file.write_at(PAGE_SIZE as u64, &[0xBB; PAGE_SIZE])
+            .await
+            .unwrap();
+
+        let (tx, _rx) = mesh::channel::<LogRequest>();
+        let permits = Arc::new(LogPermits::new(1000));
+        // Quota of 1, but page 0 will be dirty.
+        let mut cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, None, 1);
+        cache.register_tag(0, 0);
+
+        // Write page A (makes it Dirty).
+        {
+            let mut g = cache
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Overwrite)
+                .await
+                .unwrap();
+            g.fill(0xAA);
+        }
+
+        // Try to load page B. Eviction should skip dirty page A.
+        // Cache will have 2 entries (over quota but nothing evictable).
+        let g = cache
+            .acquire_read(PageKey {
+                tag: 0,
+                offset: PAGE_SIZE as u64,
+            })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xBB);
+        drop(g);
+
+        // Both pages present.
+        assert_eq!(cache.pages.lock().map.len(), 2);
+
+        // Verify page A is still readable (not evicted).
+        let g = cache
+            .acquire_read(PageKey { tag: 0, offset: 0 })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xAA);
+    }
+
+    #[async_test]
+    async fn eviction_skips_uncommitted_page() {
+        let file = InMemoryFile::new(PAGE_SIZE as u64 * 4);
+        file.write_at(0, &[0xAA; PAGE_SIZE]).await.unwrap();
+        file.write_at(PAGE_SIZE as u64, &[0xBB; PAGE_SIZE])
+            .await
+            .unwrap();
+
+        let applied = Arc::new(crate::lsn_watermark::LsnWatermark::new());
+        // applied_lsn = 0, so committed pages with lsn > 0 are not evictable.
+
+        let (tx, _rx) = mesh::channel::<LogRequest>();
+        let permits = Arc::new(LogPermits::new(1000));
+        let mut cache = PageCache::new(
+            Arc::new(file),
+            Some(tx),
+            Some(permits),
+            None,
+            Some(applied.clone()),
+            1,
+        );
+        cache.register_tag(0, 0);
+
+        // Write and commit page A (committed_lsn = 1, applied_lsn = 0).
+        {
+            let mut g = cache
+                .acquire_write(PageKey { tag: 0, offset: 0 }, WriteMode::Overwrite)
+                .await
+                .unwrap();
+            g.fill(0xAA);
+        }
+        cache.commit().await.unwrap();
+
+        // Page A is Clean with committed_lsn=1. applied_lsn=0.
+        // Eviction should skip it (not yet applied).
+        let g = cache
+            .acquire_read(PageKey {
+                tag: 0,
+                offset: PAGE_SIZE as u64,
+            })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xBB);
+        drop(g);
+
+        // Both pages present (A is not evictable).
+        assert_eq!(cache.pages.lock().map.len(), 2);
+
+        // Now advance applied_lsn past the committed_lsn.
+        applied.advance(1);
+
+        // Load another page — now A is evictable.
+        let file_size = PAGE_SIZE as u64 * 4;
+        // Load page at offset 2*PAGE_SIZE (need data there).
+        cache
+            .file
+            .write_at(PAGE_SIZE as u64 * 2, &[0xCC; PAGE_SIZE])
+            .await
+            .unwrap();
+        let g = cache
+            .acquire_read(PageKey {
+                tag: 0,
+                offset: PAGE_SIZE as u64 * 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(g[0], 0xCC);
+        drop(g);
+
+        // Should have evicted one of the old pages (A or B).
+        assert!(cache.pages.lock().map.len() <= 2);
+    }
+
+    #[async_test]
+    async fn no_deadlock_with_quota() {
+        // Regression test: verify that acquiring pages with a small quota
+        // doesn't deadlock. The dual-lock pattern + atomic dirty_count
+        // should prevent lock-order issues.
+        let (tx, _rx) = mesh::channel::<LogRequest>();
+        let permits = Arc::new(LogPermits::new(1000));
+        let mut cache = PageCache::new(
+            Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 10)),
+            Some(tx),
+            Some(permits),
+            None,
+            None,
+            2,
+        );
+        cache.register_tag(0, 0);
+
+        // Rapidly acquire and drop pages, cycling through more than the quota.
+        for i in 0..5u64 {
+            let mut g = cache
+                .acquire_write(
+                    PageKey {
+                        tag: 0,
+                        offset: i * PAGE_SIZE as u64,
+                    },
+                    WriteMode::Overwrite,
+                )
+                .await
+                .unwrap();
+            g.fill(i as u8);
+        }
+        // If we get here without hanging, no deadlock.
     }
 }

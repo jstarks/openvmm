@@ -121,9 +121,12 @@ pub struct PageCache<F: AsyncFile> {
     log_sender: Option<mesh::Sender<LogRequest>>,
     log_permits: Option<Arc<LogPermits>>,
     logged_lsn: Option<Arc<LsnWatermark>>,
+    applied_lsn: Option<Arc<LsnWatermark>>,
     lsn_counter: std::sync::atomic::AtomicU64,
     /// Notified when a page transitions out of `Loading` or `AcquiringPermit`.
     state_event: event_listener::Event,
+    /// Maximum number of pages to keep in the cache. 0 = unlimited.
+    quota: usize,
 }
 
 impl<F: AsyncFile> PageCache<F> {
@@ -133,6 +136,8 @@ impl<F: AsyncFile> PageCache<F> {
         log_sender: Option<mesh::Sender<LogRequest>>,
         log_permits: Option<Arc<LogPermits>>,
         logged_lsn: Option<Arc<LsnWatermark>>,
+        applied_lsn: Option<Arc<LsnWatermark>>,
+        quota: usize,
     ) -> Self {
         Self {
             file,
@@ -144,8 +149,10 @@ impl<F: AsyncFile> PageCache<F> {
             log_sender,
             log_permits,
             logged_lsn,
+            applied_lsn,
             lsn_counter: std::sync::atomic::AtomicU64::new(0),
             state_event: event_listener::Event::new(),
+            quota,
         }
     }
 
@@ -162,6 +169,11 @@ impl<F: AsyncFile> PageCache<F> {
     /// Set the logged LSN watermark (for late initialization after log task spawn).
     pub fn set_logged_lsn(&mut self, lsn: Arc<LsnWatermark>) {
         self.logged_lsn = Some(lsn);
+    }
+
+    /// Set the applied LSN watermark (for late initialization after apply task spawn).
+    pub fn set_applied_lsn(&mut self, lsn: Arc<LsnWatermark>) {
+        self.applied_lsn = Some(lsn);
     }
 
     /// Register a tag with its base file offset.
@@ -184,11 +196,23 @@ impl<F: AsyncFile> PageCache<F> {
         Ok(base + key.offset)
     }
 
-    /// Get or create the page entry in the map.
-    fn get_or_create_entry(
+    /// Get or create the page entry in the map, returning the entry with
+    /// the page lock held (via `lock_arc`).
+    ///
+    /// The map lock is held while acquiring the page lock, preventing
+    /// races with eviction. The map lock is released before returning.
+    ///
+    /// If the cache is over quota, attempts eviction first.
+    fn get_or_create_locked(
         &self,
         key: PageKey,
-    ) -> Result<(u64, Arc<Mutex<PageData>>), std::io::Error> {
+    ) -> Result<
+        (
+            u64,
+            parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>,
+        ),
+        std::io::Error,
+    > {
         if !key.offset.is_multiple_of(PAGE_SIZE as u64) {
             return Err(std::io::Error::other(format!(
                 "page offset {:#x} is not {PAGE_SIZE}-byte aligned",
@@ -196,30 +220,67 @@ impl<F: AsyncFile> PageCache<F> {
             )));
         }
         let file_offset = self.resolve_offset(key)?;
-        let entry = {
-            let mut pages = self.pages.lock();
-            pages
-                .map
-                .entry(key)
-                .or_insert_with(|| {
-                    Arc::new(Mutex::new(PageData {
-                        data: None,
-                        state: PageState::Clean,
-                        pre_log_fsn: None,
-                        committed_lsn: None,
-                    }))
-                })
-                .clone()
-        };
-        Ok((file_offset, entry))
+        let mut pages = self.pages.lock();
+
+        // Evict if over quota.
+        if self.quota > 0 && pages.map.len() >= self.quota {
+            self.try_evict_under_lock(&mut pages);
+        }
+
+        let entry = pages
+            .map
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(PageData {
+                    data: None,
+                    state: PageState::Clean,
+                    pre_log_fsn: None,
+                    committed_lsn: None,
+                }))
+            })
+            .clone();
+
+        // Acquire page lock while still holding map lock.
+        // This prevents eviction from removing this entry between
+        // the map lookup and the page lock acquisition.
+        let guard = Mutex::lock_arc(&entry);
+        // Map lock released here (end of function).
+        drop(pages);
+
+        Ok((file_offset, guard))
+    }
+
+    /// Try to evict one clean, applied page to make room.
+    /// Must be called with the pages map lock held.
+    fn try_evict_under_lock(&self, pages: &mut PageMap) {
+        let applied = self.applied_lsn.as_ref().map(|w| w.get()).unwrap_or(0);
+
+        // Find first evictable page.
+        let evict_key = pages.map.iter().find_map(|(&key, entry)| {
+            // Try to lock the page. If contended, skip (someone is using it).
+            if let Some(page) = entry.try_lock() {
+                if page.state == PageState::Clean
+                    && page.data.is_some()
+                    && match page.committed_lsn {
+                        None => true,
+                        Some(lsn) => lsn <= applied,
+                    }
+                {
+                    return Some(key);
+                }
+            }
+            None
+        });
+
+        if let Some(key) = evict_key {
+            pages.map.remove(&key);
+        }
     }
 
     /// Acquire read access to a page.
     pub async fn acquire_read(&self, key: PageKey) -> Result<ReadPageGuard, std::io::Error> {
-        let (file_offset, entry) = self.get_or_create_entry(key)?;
-
         let guard = loop {
-            let mut guard = Mutex::lock_arc(&entry);
+            let (file_offset, mut guard) = self.get_or_create_locked(key)?;
             match guard.state {
                 PageState::Loading | PageState::AcquiringPermit => {
                     let listener = self.state_event.listen();
@@ -231,14 +292,14 @@ impl<F: AsyncFile> PageCache<F> {
                     if guard.data.is_some() {
                         break guard;
                     }
-                    // Need to load data from disk.
                     guard.state = PageState::Loading;
                     drop(guard);
 
                     let mut buf = [0u8; PAGE_SIZE];
                     let result = self.file.read_at(file_offset, &mut buf).await;
 
-                    let mut page = entry.lock();
+                    // Re-acquire via dual-lock to update state.
+                    let (_, mut page) = self.get_or_create_locked(key)?;
                     if page.data.is_none() {
                         match result {
                             Ok(()) => page.data = Some(Arc::new(buf)),
@@ -272,14 +333,12 @@ impl<F: AsyncFile> PageCache<F> {
         mode: WriteMode,
     ) -> Result<WritePageGuard<'_, F>, std::io::Error> {
         let load = mode == WriteMode::Modify;
-        let (file_offset, entry) = self.get_or_create_entry(key)?;
 
         let guard = loop {
-            let mut guard = Mutex::lock_arc(&entry);
+            let (file_offset, mut guard) = self.get_or_create_locked(key)?;
 
             match guard.state {
                 PageState::Loading | PageState::AcquiringPermit => {
-                    // Another task is doing async work on this page. Wait.
                     let listener = self.state_event.listen();
                     drop(guard);
                     listener.await;
@@ -287,7 +346,6 @@ impl<F: AsyncFile> PageCache<F> {
                 }
 
                 PageState::Dirty | PageState::HasPermit => {
-                    // Already has a permit. Data must be loaded already.
                     assert!(
                         guard.data.is_some(),
                         "page in state {:?} has no data",
@@ -304,7 +362,7 @@ impl<F: AsyncFile> PageCache<F> {
                             drop(guard);
                             let mut buf = [0u8; PAGE_SIZE];
                             self.file.read_at(file_offset, &mut buf).await?;
-                            let mut page = entry.lock();
+                            let (_, mut page) = self.get_or_create_locked(key)?;
                             if page.data.is_none() {
                                 page.data = Some(Arc::new(buf));
                             }
@@ -337,7 +395,7 @@ impl<F: AsyncFile> PageCache<F> {
                             VhdxError::Io(io) => io,
                             other => std::io::Error::other(other.to_string()),
                         })?;
-                        let mut page = entry.lock();
+                        let (_, mut page) = self.get_or_create_locked(key)?;
                         if page.state != PageState::AcquiringPermit {
                             self.state_event.notify(usize::MAX);
                             continue;
@@ -346,7 +404,7 @@ impl<F: AsyncFile> PageCache<F> {
 
                         let result = permits.acquire(1).await;
                         {
-                            let mut page = entry.lock();
+                            let (_, mut page) = self.get_or_create_locked(key)?;
                             if result.is_ok() {
                                 page.state = PageState::HasPermit;
                             } else {
@@ -367,7 +425,7 @@ impl<F: AsyncFile> PageCache<F> {
 
                     let result = permits.acquire(1).await;
                     {
-                        let mut page = entry.lock();
+                        let (_, mut page) = self.get_or_create_locked(key)?;
                         if result.is_ok() {
                             page.state = PageState::HasPermit;
                         } else {
@@ -570,7 +628,7 @@ mod tests {
     fn writable_cache(file: InMemoryFile) -> (PageCache<InMemoryFile>, mesh::Receiver<LogRequest>) {
         let (tx, rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
-        let cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None);
+        let cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, None, 0);
         (cache, rx)
     }
 
@@ -580,7 +638,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| (i & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None);
+        let mut cache = PageCache::new(Arc::new(file), None, None, None, None, 0);
         cache.register_tag(0, 0);
 
         let guard = cache
@@ -602,7 +660,7 @@ mod tests {
         file.write_at(0, &pattern).await.unwrap();
         let (tx, _rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
-        cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None);
+        cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, None, 0);
         cache.register_tag(0, 0);
 
         {
@@ -639,7 +697,7 @@ mod tests {
 
         let (tx, _rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
-        let mut cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None);
+        let mut cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, None, 0);
         cache.register_tag(0, 0);
 
         {
@@ -663,7 +721,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| ((i * 3) & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None);
+        let mut cache = PageCache::new(Arc::new(file), None, None, None, None, 0);
         cache.register_tag(0, 0);
 
         let g1 = cache
@@ -689,6 +747,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
 
@@ -725,6 +785,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
 
@@ -762,6 +824,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
 
@@ -812,7 +876,7 @@ mod tests {
         let pattern = [0xDE; PAGE_SIZE];
         file.write_at(base + page_offset, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None);
+        let mut cache = PageCache::new(Arc::new(file), None, None, None, None, 0);
         cache.register_tag(0, base);
 
         let guard = cache
@@ -833,7 +897,7 @@ mod tests {
         file.write_at(old_base, &[0xAA; PAGE_SIZE]).await.unwrap();
         file.write_at(new_base, &[0xBB; PAGE_SIZE]).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None);
+        let mut cache = PageCache::new(Arc::new(file), None, None, None, None, 0);
         cache.register_tag(0, old_base);
 
         {
@@ -844,7 +908,7 @@ mod tests {
             assert_eq!(guard[0], 0xAA);
         }
 
-        let mut cache = PageCache::new(cache.file.clone(), None, None, None);
+        let mut cache = PageCache::new(cache.file.clone(), None, None, None, None, 0);
         cache.register_tag(0, old_base);
         cache.update_tag_offset(0, new_base);
 
@@ -864,6 +928,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
         let key = PageKey { tag: 0, offset: 0 };
@@ -894,6 +960,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
         let key = PageKey { tag: 0, offset: 0 };
@@ -931,6 +999,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
         let key = PageKey { tag: 0, offset: 0 };
@@ -970,6 +1040,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
 
@@ -1012,6 +1084,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
 
@@ -1038,6 +1112,8 @@ mod tests {
             Some(tx),
             Some(permits),
             None,
+            None,
+            0,
         );
         cache.register_tag(0, 0);
 

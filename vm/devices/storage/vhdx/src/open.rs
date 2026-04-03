@@ -280,7 +280,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         let file = Arc::new(file);
 
         // 12. Create PageCache and register tags.
-        let mut cache = PageCache::new(file.clone(), log_sender, None, None);
+        let mut cache = PageCache::new(file.clone(), log_sender, None, None, None, 0);
         cache.register_tag(BAT_TAG, regions.bat_offset);
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
         cache.register_tag(SBM_TAG, 0);
@@ -490,6 +490,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         // Set log permits and LSN watermark on the cache.
         vhdx.cache.set_log_permits(log_permits.clone());
         vhdx.cache.set_logged_lsn(logged_lsn.clone());
+        vhdx.cache.set_applied_lsn(applied_lsn.clone());
 
         vhdx.log_sender = Some(tx);
         vhdx.log_task = Some(task);

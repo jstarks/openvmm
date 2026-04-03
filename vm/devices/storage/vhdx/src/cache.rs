@@ -543,30 +543,15 @@ impl<F: AsyncFile> std::ops::DerefMut for WritePageGuard<'_, F> {
 
 impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
     fn drop(&mut self) {
-        if let Some(guard) = self.guard.take() {
+        if let Some(mut guard) = self.guard.take() {
             if guard.state == PageState::HasPermit {
                 // Guard dropped without mutation. Refund the permit.
-                // We need a mutable borrow, so re-lock briefly.
+                guard.state = PageState::Clean;
                 drop(guard);
-                let mut page = {
-                    // The entry is still in the map — we just dropped the arc guard.
-                    // We can't easily re-acquire it here. Instead, the arc guard
-                    // was the last reference to the lock... actually no, the map
-                    // holds an Arc clone. The ArcMutexGuard dropping releases the
-                    // lock, but the Arc<Mutex<PageData>> is still in the map.
-                    //
-                    // We need the entry to lock it again. But we don't have the
-                    // key here. Store it in the guard.
-                    //
-                    // FIXME: We dropped the guard already and can't re-lock without
-                    // the entry. For now, skip the refund in Drop. The permit leak
-                    // only happens if someone acquires_write, gets HasPermit, and
-                    // drops without DerefMut — which is an unusual pattern.
-                    //
-                    // The proper fix is to store the Arc<Mutex<PageData>> in the
-                    // WritePageGuard separately from the ArcMutexGuard.
-                    return;
-                };
+                if let Some(ref permits) = self.cache.log_permits {
+                    permits.release(1);
+                }
+                self.cache.state_event.notify(usize::MAX);
             }
             // Dirty or Clean: nothing to do. Guard drops, releasing the lock.
         }

@@ -125,9 +125,6 @@ pub(crate) struct BatState {
     pub sector_bitmap_mappings: Vec<InternalBlockMapping>,
     /// Running count of allocated (FullyPresent or PartiallyPresent) blocks.
     pub allocated_block_count: u32,
-    /// Tracks which BAT pages have been modified and need writeback to disk.
-    /// Indexed by BAT page number (entry_index / ENTRIES_PER_BAT_PAGE).
-    pub dirty_bat_pages: Vec<bool>,
     /// Per-payload-block I/O refcounts. While a block's refcount is > 0,
     /// trim must not free that block's file space. One entry per payload
     /// block, parallel to `payload_mappings`.
@@ -153,7 +150,6 @@ impl BatState {
     /// Update the in-memory mapping for a payload block.
     ///
     /// Adjusts `allocated_block_count` based on the old and new states.
-    /// Does NOT mark the BAT page dirty — callers decide when to mark dirty.
     pub fn set_payload_mapping(
         &mut self,
         bat: &Bat,
@@ -173,44 +169,9 @@ impl BatState {
     }
 
     /// Update the in-memory mapping for a sector bitmap block.
-    ///
-    /// Does NOT mark the BAT page dirty — callers decide when to mark dirty.
     pub fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: InternalBlockMapping) {
         let _ = bat;
         self.sector_bitmap_mappings[chunk_number as usize] = mapping;
-    }
-
-    /// Mark the BAT page containing the given block's entry as dirty.
-    pub fn mark_bat_page_dirty(&mut self, bat: &Bat, block_type: BlockType, block_number: u32) {
-        let entry_index = match block_type {
-            BlockType::Payload => bat.payload_entry_index(block_number),
-            BlockType::SectorBitmap => bat.sector_bitmap_entry_index(block_number),
-        };
-        let page_index = entry_index as usize / ENTRIES_PER_BAT_PAGE as usize;
-        if page_index < self.dirty_bat_pages.len() {
-            self.dirty_bat_pages[page_index] = true;
-        }
-    }
-
-    /// Yields indices of dirty BAT pages.
-    pub fn dirty_page_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.dirty_bat_pages
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &dirty)| dirty.then_some(i))
-    }
-
-    /// Clear the dirty flag for a BAT page.
-    pub fn clear_dirty(&mut self, page_index: usize) {
-        if page_index < self.dirty_bat_pages.len() {
-            self.dirty_bat_pages[page_index] = false;
-        }
-    }
-
-    /// Total number of BAT pages.
-    #[allow(dead_code)] // will be used by BAT write-back in a later phase
-    pub fn total_bat_pages(&self) -> usize {
-        self.dirty_bat_pages.len()
     }
 
     /// Increment the I/O refcount for a payload block.
@@ -478,6 +439,30 @@ impl Bat {
 
         Ok(())
     }
+
+    /// Write a block mapping to the cache, converting from in-memory
+    /// representation to on-disk BAT entry format.
+    ///
+    /// This is the primary BAT writeback mechanism, matching the C code's
+    /// `Vhd2iUpdateBlockStateWithNode` pattern.
+    pub async fn write_block_mapping<F: AsyncFile>(
+        &self,
+        cache: &PageCache<F>,
+        block_type: BlockType,
+        block_number: u32,
+        mapping: InternalBlockMapping,
+    ) -> Result<(), VhdxError> {
+        let entry_number = match block_type {
+            BlockType::Payload => self.payload_entry_index(block_number),
+            BlockType::SectorBitmap => self.sector_bitmap_entry_index(block_number),
+        };
+
+        let bat_entry = BatEntry::new()
+            .with_state(mapping.state())
+            .with_file_offset_mb(mapping.file_megabyte() as u64);
+
+        self.write_bat_entry(cache, entry_number, bat_entry).await
+    }
 }
 
 #[cfg(test)]
@@ -733,7 +718,6 @@ mod tests {
             payload_mappings: vec![InternalBlockMapping::new(); bat.data_block_count as usize],
             sector_bitmap_mappings: vec![],
             allocated_block_count: 0,
-            dirty_bat_pages: vec![false; bat.total_bat_pages()],
             io_refcounts: vec![0u32; bat.data_block_count as usize],
         };
 
@@ -755,29 +739,5 @@ mod tests {
         let dealloc = InternalBlockMapping::new().with_state(BatEntryState::NotPresent as u8);
         state.set_payload_mapping(&bat, 0, dealloc);
         assert_eq!(state.allocated_block_count, 1);
-    }
-
-    #[test]
-    fn bat_state_dirty_tracking() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
-        let mut state = BatState {
-            payload_mappings: vec![InternalBlockMapping::new(); bat.data_block_count as usize],
-            sector_bitmap_mappings: vec![],
-            allocated_block_count: 0,
-            dirty_bat_pages: vec![false; bat.total_bat_pages()],
-            io_refcounts: vec![0u32; bat.data_block_count as usize],
-        };
-
-        // No pages dirty initially.
-        assert_eq!(state.dirty_page_indices().count(), 0);
-
-        // Mark block 0's BAT page dirty.
-        state.mark_bat_page_dirty(&bat, BlockType::Payload, 0);
-        let dirty: Vec<_> = state.dirty_page_indices().collect();
-        assert_eq!(dirty, vec![0]);
-
-        // Clear it.
-        state.clear_dirty(0);
-        assert_eq!(state.dirty_page_indices().count(), 0);
     }
 }

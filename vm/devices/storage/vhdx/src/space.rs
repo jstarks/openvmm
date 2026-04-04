@@ -1229,7 +1229,6 @@ mod tests {
             payload_mappings,
             sector_bitmap_mappings: Vec::new(),
             allocated_block_count: 0,
-            dirty_bat_pages: vec![false; 1],
             io_refcounts: vec![0u32; data_block_count as usize],
         }
     }
@@ -1650,7 +1649,6 @@ mod tests {
             payload_mappings,
             sector_bitmap_mappings: Vec::new(),
             allocated_block_count: 0,
-            dirty_bat_pages: vec![false; 1],
             io_refcounts: vec![0u32; 16],
         };
 

@@ -592,12 +592,14 @@ impl<F: AsyncFile> VhdxFile<F> {
                                     }
 
                                     // Persist SBM BAT entry to disk.
-                                    self.write_bat_entry_to_cache(
-                                        BlockType::SectorBitmap,
-                                        chunk_number,
-                                        new_sbm,
-                                    )
-                                    .await?;
+                                    self.bat
+                                        .write_block_mapping(
+                                            &self.cache,
+                                            BlockType::SectorBitmap,
+                                            chunk_number,
+                                            new_sbm,
+                                        )
+                                        .await?;
                                 }
                             }
 
@@ -623,12 +625,14 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                             // Per-entry cache write (write-through to disk).
                             // LOCK AUDIT: bat_state write-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
-                            self.write_bat_entry_to_cache(
-                                BlockType::Payload,
-                                block_info.block_number,
-                                new_mapping,
-                            )
-                            .await?;
+                            self.bat
+                                .write_block_mapping(
+                                    &self.cache,
+                                    BlockType::Payload,
+                                    block_info.block_number,
+                                    new_mapping,
+                                )
+                                .await?;
 
                             // For non-TFP path: set per-page FSN when
                             // !is_safe. The FSN is captured now (before
@@ -787,7 +791,13 @@ impl<F: AsyncFile> VhdxFile<F> {
                 // LOCK AUDIT: bat_state write-lock dropped (end of prior block). No sync locks held.
                 if bat_write_error.is_none() {
                     if let Err(e) = self
-                        .write_bat_entry_to_cache(BlockType::Payload, block_number, final_mapping)
+                        .bat
+                        .write_block_mapping(
+                            &self.cache,
+                            BlockType::Payload,
+                            block_number,
+                            final_mapping,
+                        )
                         .await
                     {
                         bat_write_error = Some(e);
@@ -874,7 +884,6 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                 let mut bat_state = self.bat_state.write();
                 bat_state.set_payload_mapping(&self.bat, block_number, reverted);
-                bat_state.mark_bat_page_dirty(&self.bat, BlockType::Payload, block_number);
             }
 
             current_offset += block_length;
@@ -894,8 +903,6 @@ impl<F: AsyncFile> VhdxFile<F> {
         if self.read_only {
             return Err(VhdxError::ReadOnly);
         }
-
-        self.flush_dirty_bat_pages().await?;
 
         let lsn = self.cache.commit()?;
 
@@ -2044,19 +2051,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn dirty_page_after_abort(driver: DefaultDriver) {
+    async fn abort_write_reverts_bat(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
         let block_size = vhdx.block_size();
-
-        // No dirty pages initially.
-        {
-            let state = vhdx.bat_state.read();
-            assert!(
-                state.dirty_page_indices().next().is_none(),
-                "should have no dirty pages initially"
-            );
-        }
 
         // resolve_write for a full block → sets TFP.
         let mut ranges = Vec::new();
@@ -2065,25 +2063,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Abort (drop guard without complete) → marks the BAT page dirty.
+        // Abort (drop guard without complete) → reverts in-memory BAT.
         drop(guard);
 
-        {
-            let state = vhdx.bat_state.read();
-            let dirty_count = state.dirty_page_indices().count();
-            assert!(dirty_count > 0, "BAT page should be dirty after abort");
-        }
+        // Block should be back to NotPresent with zero offset.
+        let mapping = vhdx.get_block_mapping(0);
+        assert_eq!(mapping.state, BatEntryState::NotPresent);
+        assert_eq!(mapping.file_offset, 0);
 
-        // Flushing should write the dirty page and clear the flag.
-        vhdx.flush().await.unwrap();
-
-        {
-            let state = vhdx.bat_state.read();
-            assert!(
-                state.dirty_page_indices().next().is_none(),
-                "dirty pages should be cleared after flush"
-            );
-        }
+        vhdx.close().await.unwrap();
     }
 
     #[async_test]

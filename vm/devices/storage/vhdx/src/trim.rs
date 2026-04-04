@@ -393,12 +393,12 @@ impl<F: AsyncFile> VhdxFile<F> {
             {
                 let mut bat_state = self.bat_state.write();
                 bat_state.set_payload_mapping(&self.bat, block_number, new_mapping);
-                bat_state.mark_bat_page_dirty(&self.bat, BlockType::Payload, block_number);
             }
 
             // 9d. Write BAT entry to cache (async).
             // LOCK AUDIT: bat_state write-lock dropped in step 9d block. No sync locks held.
-            self.write_bat_entry_to_cache(BlockType::Payload, block_number, new_mapping)
+            self.bat
+                .write_block_mapping(&self.cache, BlockType::Payload, block_number, new_mapping)
                 .await?;
 
             // 9e. Handle space management based on old→new transition.

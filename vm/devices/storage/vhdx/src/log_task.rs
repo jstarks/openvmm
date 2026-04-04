@@ -26,17 +26,12 @@ use crate::cache::PAGE_SIZE;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::flush::FlushSequencer;
-use crate::format;
 use crate::log::DataPage;
 use crate::log::LogWriter;
 use crate::log_permits::LogPermits;
 use crate::lsn_watermark::LsnWatermark;
-use guid::Guid;
 use mesh::rpc::Rpc;
 use std::sync::Arc;
-use zerocopy::FromBytes;
-use zerocopy::FromZeros;
-use zerocopy::IntoBytes;
 
 /// A request to the log task.
 pub(crate) enum LogRequest {
@@ -76,293 +71,203 @@ struct PendingTail {
     new_tail: u32,
 }
 
-/// Run the log task main loop.
-pub(crate) async fn run_log_task<F: AsyncFile>(
-    mut rx: mesh::Receiver<LogRequest>,
+/// All mutable state owned by the log task.
+pub(crate) struct LogTask<F: AsyncFile> {
     file: Arc<F>,
-    mut log_writer: LogWriter,
+    log_writer: LogWriter,
     flush_sequencer: Arc<FlushSequencer>,
     log_permits: Arc<LogPermits>,
     logged_lsn: Arc<LsnWatermark>,
     applied_lsn: Arc<LsnWatermark>,
     apply_tx: mesh::Sender<ApplyBatch>,
-) {
-    let mut pending_tails: Vec<PendingTail> = Vec::new();
-
-    loop {
-        // Before processing the next request, opportunistically advance
-        // the tail for any batches whose applied data is already flushed
-        // (e.g., by a prior VhdxFile::flush() or LogFull flush).
-        let flushed_fsn = flush_sequencer.completed_fsn();
-        advance_tails(
-            &mut pending_tails,
-            flushed_fsn,
-            &applied_lsn,
-            &mut log_writer,
-        );
-
-        let request = match rx.recv().await {
-            Ok(req) => req,
-            Err(_) => {
-                tracing::warn!("VHDX log task: channel closed without close() — file is dirty");
-                break;
-            }
-        };
-
-        match request {
-            LogRequest::Commit(txn) => {
-                handle_commit(
-                    txn,
-                    &file,
-                    &mut log_writer,
-                    &flush_sequencer,
-                    &log_permits,
-                    &logged_lsn,
-                    &applied_lsn,
-                    &apply_tx,
-                    &mut pending_tails,
-                )
-                .await;
-            }
-            LogRequest::Close(rpc) => {
-                rpc.handle(async |()| {
-                    graceful_close(
-                        &file,
-                        &mut log_writer,
-                        &flush_sequencer,
-                        &applied_lsn,
-                        &mut pending_tails,
-                    )
-                    .await
-                })
-                .await;
-                break;
-            }
-        }
-    }
+    pending_tails: Vec<PendingTail>,
 }
 
-/// Advance the log tail for all batches whose applied data has been
-/// flushed. `flushed_fsn` is the highest FSN known to be durable.
-fn advance_tails(
-    pending_tails: &mut Vec<PendingTail>,
-    flushed_fsn: u64,
-    applied_lsn: &LsnWatermark,
-    log_writer: &mut LogWriter,
-) {
-    let (applied, applied_fsn) = applied_lsn.get_with_fsn();
-    // Pending tails are in LSN order. Advance all where:
-    // 1. The apply task has written the pages (applied >= lsn), AND
-    // 2. Those writes are durable (applied_fsn <= flushed_fsn).
-    while let Some(front) = pending_tails.first() {
-        if front.lsn <= applied && applied_fsn <= flushed_fsn {
-            log_writer.advance_tail(front.new_tail);
-            pending_tails.remove(0);
-        } else {
-            break;
-        }
-    }
-}
-
-/// Handle a Commit request: write WAL entry, publish LSN, send batch to applier.
-/// If the log is full, waits for the applier to drain, flushes, and retries.
-async fn handle_commit<F: AsyncFile>(
-    txn: Transaction,
-    file: &Arc<F>,
-    log_writer: &mut LogWriter,
-    flush_sequencer: &Arc<FlushSequencer>,
-    log_permits: &LogPermits,
-    logged_lsn: &LsnWatermark,
-    applied_lsn: &LsnWatermark,
-    apply_tx: &mesh::Sender<ApplyBatch>,
-    pending_tails: &mut Vec<PendingTail>,
-) {
-    let lsn = txn.lsn;
-
-    // Ensure pre_log_fsn constraint is met before logging.
-    if let Some(fsn) = txn.pre_log_fsn {
-        if let Err(e) = flush_sequencer.flush_through(file.as_ref(), fsn).await {
-            tracing::error!("VHDX log task: pre_log_fsn flush failed: {e}");
-            log_permits.fail(format!("pre_log_fsn flush failed: {e}"));
-            return;
+impl<F: AsyncFile> LogTask<F> {
+    /// Create a new log task with the given dependencies.
+    pub(crate) fn new(
+        file: Arc<F>,
+        log_writer: LogWriter,
+        flush_sequencer: Arc<FlushSequencer>,
+        log_permits: Arc<LogPermits>,
+        logged_lsn: Arc<LsnWatermark>,
+        applied_lsn: Arc<LsnWatermark>,
+        apply_tx: mesh::Sender<ApplyBatch>,
+    ) -> Self {
+        Self {
+            file,
+            log_writer,
+            flush_sequencer,
+            log_permits,
+            logged_lsn,
+            applied_lsn,
+            apply_tx,
+            pending_tails: Vec::new(),
         }
     }
 
-    // Write WAL entry, retrying if the log is full.
-    loop {
-        match write_log_entry(file, log_writer, &txn.pages).await {
-            Ok(()) => break,
-            Err(VhdxError::Corrupt(CorruptionType::LogFull)) => {
-                // Wait for the oldest pending batch to be applied so we
-                // can flush and advance the tail to free log space.
-                if let Some(front) = pending_tails.first() {
-                    let target = front.lsn;
-                    let applied_fsn = match applied_lsn.wait_for(target).await {
-                        Ok(fsn) => fsn,
-                        Err(e) => {
-                            tracing::error!(
-                                "VHDX log task: wait for apply failed while log full: {e}"
-                            );
-                            log_permits.fail(format!("wait for apply failed: {e}"));
-                            return;
-                        }
-                    };
-                    // Flush to make the applied data durable so we can
-                    // safely advance the tail.
-                    if let Err(e) = flush_sequencer
-                        .flush_through(file.as_ref(), applied_fsn)
-                        .await
-                    {
-                        tracing::error!("VHDX log task: flush for tail advance failed: {e}");
-                        log_permits.fail(format!("flush for tail advance failed: {e}"));
-                        return;
+    /// Run the log task main loop.
+    ///
+    /// Consumes requests from `rx` until a `Close` request is received
+    /// or the channel is dropped.
+    pub async fn run(mut self, mut rx: mesh::Receiver<LogRequest>) {
+        loop {
+            self.advance_tails();
+
+            let request = match rx.recv().await {
+                Ok(req) => req,
+                Err(_) => {
+                    tracing::warn!("VHDX log task: channel closed without close() — file is dirty");
+                    break;
+                }
+            };
+
+            match request {
+                LogRequest::Commit(txn) => {
+                    if let Err(e) = self.handle_commit(txn).await {
+                        tracing::error!("VHDX log task fatal error: {e}");
+                        self.log_permits.fail(e.to_string());
+                        self.logged_lsn.fail(e.to_string());
+                        break;
                     }
-                    let flushed_fsn = flush_sequencer.current_fsn();
-                    advance_tails(pending_tails, flushed_fsn, applied_lsn, log_writer);
-                } else {
-                    tracing::error!(
-                        "VHDX log task: log too small for batch of {} pages",
-                        txn.pages.len()
-                    );
-                    log_permits.fail(format!(
-                        "log too small for batch of {} pages",
-                        txn.pages.len()
-                    ));
-                    return;
+                }
+                LogRequest::Close(rpc) => {
+                    rpc.handle(async |()| self.graceful_close().await).await;
+                    break;
                 }
             }
-            Err(e) => {
-                tracing::error!("VHDX log task: WAL write failed: {e}");
-                log_permits.fail(format!("WAL write failed: {e}"));
-                return;
-            }
         }
     }
 
-    // Capture FSN after the WAL write. Flushing through this FSN makes
-    // the WAL entry durable. We don't flush here — VhdxFile::flush()
-    // will do it, or the LogFull path above will if space is needed.
-    let wal_fsn = flush_sequencer.current_fsn();
-    logged_lsn.advance(lsn, wal_fsn);
-
-    let new_tail = log_writer.head();
-
-    // Send to applier for background apply.
-    let apply_pages = txn
-        .pages
-        .into_iter()
-        .map(|p| ApplyPage {
-            file_offset: p.file_offset,
-            data: p.data,
-        })
-        .collect();
-
-    apply_tx.send(ApplyBatch {
-        pages: apply_pages,
-        lsn,
-        new_tail,
-    });
-
-    pending_tails.push(PendingTail { lsn, new_tail });
-}
-
-/// Write a log entry for the given pages (no flush).
-async fn write_log_entry<F: AsyncFile>(
-    file: &Arc<F>,
-    log_writer: &mut LogWriter,
-    pages: &[CommittedPage],
-) -> Result<(), VhdxError> {
-    let data_pages: Vec<DataPage<'_>> = pages
-        .iter()
-        .map(|p| DataPage {
-            file_offset: p.file_offset,
-            data: &p.data,
-        })
-        .collect();
-
-    log_writer
-        .write_entry(file.as_ref(), &data_pages, &[])
-        .await?;
-
-    Ok(())
-}
-
-/// Graceful close: wait for all applies, flush, clear log GUID, flush again.
-async fn graceful_close<F: AsyncFile>(
-    file: &Arc<F>,
-    log_writer: &mut LogWriter,
-    flush_sequencer: &Arc<FlushSequencer>,
-    applied_lsn: &LsnWatermark,
-    pending_tails: &mut Vec<PendingTail>,
-) -> Result<(), VhdxError> {
-    // Wait for all pending applies to complete.
-    if let Some(last) = pending_tails.last() {
-        let target_lsn = last.lsn;
-        let applied_fsn = applied_lsn.wait_for(target_lsn).await?;
-        // Flush to make all applied data durable so tails can advance.
-        flush_sequencer
-            .flush_through(file.as_ref(), applied_fsn)
-            .await?;
-    }
-
-    // Now advance all tails — data is durable at final offsets.
-    for pt in pending_tails.drain(..) {
-        log_writer.advance_tail(pt.new_tail);
-    }
-
-    // Clear log GUID in the header.
-    let mut buf1 = vec![0u8; format::HEADER_SIZE as usize];
-    file.read_at(format::HEADER_OFFSET_1, &mut buf1).await?;
-    let header1 = format::Header::read_from_prefix(&buf1).ok().map(|(h, _)| h);
-
-    let mut buf2 = vec![0u8; format::HEADER_SIZE as usize];
-    file.read_at(format::HEADER_OFFSET_2, &mut buf2).await?;
-    let header2 = format::Header::read_from_prefix(&buf2).ok().map(|(h, _)| h);
-
-    let (current_header, first_header_current) = match (&header1, &header2) {
-        (Some(h1), Some(h2)) => {
-            if h2.sequence_number >= h1.sequence_number {
-                (h2.clone(), false)
+    /// Advance the log tail for all batches whose applied data has
+    /// been flushed (i.e., `applied_fsn <= completed_fsn`).
+    fn advance_tails(&mut self) {
+        let flushed_fsn = self.flush_sequencer.completed_fsn();
+        let (applied, applied_fsn) = self.applied_lsn.get_with_fsn();
+        while let Some(front) = self.pending_tails.first() {
+            if front.lsn <= applied && applied_fsn <= flushed_fsn {
+                self.log_writer.advance_tail(front.new_tail);
+                self.pending_tails.remove(0);
             } else {
-                (h1.clone(), true)
+                break;
             }
         }
-        (Some(h1), None) => (h1.clone(), true),
-        (None, Some(h2)) => (h2.clone(), false),
-        (None, None) => {
-            return Err(VhdxError::Io(std::io::Error::other(
-                "no valid header found during close",
-            )));
+    }
+
+    /// Flush applied data and advance tails. Used when the log is full
+    /// and we need to reclaim space.
+    async fn flush_and_advance_tails(&mut self) -> Result<(), VhdxError> {
+        if let Some(front) = self.pending_tails.first() {
+            let target = front.lsn;
+            let applied_fsn = self.applied_lsn.wait_for(target).await?;
+            self.flush_sequencer
+                .flush_through(self.file.as_ref(), applied_fsn)
+                .await?;
+            self.advance_tails();
         }
-    };
+        Ok(())
+    }
 
-    let mut clean_header = format::Header::new_zeroed();
-    clean_header.signature = format::HEADER_SIGNATURE;
-    clean_header.sequence_number = current_header.sequence_number + 1;
-    clean_header.file_write_guid = current_header.file_write_guid;
-    clean_header.data_write_guid = current_header.data_write_guid;
-    clean_header.log_guid = Guid::ZERO;
-    clean_header.log_version = format::LOG_VERSION;
-    clean_header.version = format::VERSION_1;
-    clean_header.log_length = current_header.log_length;
-    clean_header.log_offset = current_header.log_offset;
-    clean_header.checksum = 0;
+    /// Write a WAL entry for the given pages (no flush).
+    ///
+    /// Returns `Ok(true)` if the entry was written, `Ok(false)` if the
+    /// log is full (caller should drain and retry), or `Err` on I/O error.
+    async fn write_log_entry(&mut self, pages: &[CommittedPage]) -> Result<bool, VhdxError> {
+        let data_pages: Vec<DataPage<'_>> = pages
+            .iter()
+            .map(|p| DataPage {
+                file_offset: p.file_offset,
+                data: &p.data,
+            })
+            .collect();
 
-    let mut buf = vec![0u8; format::HEADER_SIZE as usize];
-    let hdr_bytes = clean_header.as_bytes();
-    buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
-    let crc = format::compute_checksum(&buf, 4);
-    buf[4..8].copy_from_slice(&crc.to_le_bytes());
+        match self
+            .log_writer
+            .write_entry(self.file.as_ref(), &data_pages, &[])
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(VhdxError::Corrupt(CorruptionType::LogFull)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 
-    let write_offset = if first_header_current {
-        format::HEADER_OFFSET_2
-    } else {
-        format::HEADER_OFFSET_1
-    };
-    file.write_at(write_offset, &buf).await?;
-    flush_sequencer.flush(file.as_ref()).await?;
+    /// Handle a Commit request: write WAL entry, publish LSN, send batch
+    /// to applier. If the log is full, flushes applied data and retries.
+    ///
+    /// Returns `Err` on any fatal error. The caller (`run`) poisons
+    /// the permits and watermarks — individual methods don't.
+    async fn handle_commit(&mut self, txn: Transaction) -> Result<(), VhdxError> {
+        let lsn = txn.lsn;
 
-    Ok(())
+        // Ensure pre_log_fsn constraint is met before logging.
+        if let Some(fsn) = txn.pre_log_fsn {
+            self.flush_sequencer
+                .flush_through(self.file.as_ref(), fsn)
+                .await?;
+        }
+
+        // Write WAL entry, retrying if the log is full.
+        while !self.write_log_entry(&txn.pages).await? {
+            if self.pending_tails.is_empty() {
+                return Err(VhdxError::Io(std::io::Error::other(format!(
+                    "log too small for batch of {} pages",
+                    txn.pages.len()
+                ))));
+            }
+            self.flush_and_advance_tails().await?;
+        }
+
+        // Capture FSN after the WAL write. Flushing through this FSN
+        // makes the WAL entry durable. We don't flush here —
+        // VhdxFile::flush() will do it, or the LogFull path will if
+        // space is needed.
+        let wal_fsn = self.flush_sequencer.current_fsn();
+        self.logged_lsn.advance(lsn, wal_fsn);
+
+        let new_tail = self.log_writer.head();
+
+        // Send to applier for background apply.
+        let apply_pages = txn
+            .pages
+            .into_iter()
+            .map(|p| ApplyPage {
+                file_offset: p.file_offset,
+                data: p.data,
+            })
+            .collect();
+
+        self.apply_tx.send(ApplyBatch {
+            pages: apply_pages,
+            lsn,
+            new_tail,
+        });
+
+        self.pending_tails.push(PendingTail { lsn, new_tail });
+        Ok(())
+    }
+
+    /// Graceful close: wait for all applies, flush, advance tails.
+    ///
+    /// After this returns, the log region is fully drained. The caller
+    /// is responsible for clearing the log GUID in the header.
+    async fn graceful_close(&mut self) -> Result<(), VhdxError> {
+        // Wait for all pending applies and flush.
+        if let Some(last) = self.pending_tails.last() {
+            let target_lsn = last.lsn;
+            let applied_fsn = self.applied_lsn.wait_for(target_lsn).await?;
+            self.flush_sequencer
+                .flush_through(self.file.as_ref(), applied_fsn)
+                .await?;
+        }
+
+        // Advance all tails — data is durable at final offsets.
+        for pt in self.pending_tails.drain(..) {
+            self.log_writer.advance_tail(pt.new_tail);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -446,8 +351,7 @@ mod tests {
         // Spawn log task.
         let log_task = driver.spawn(
             "test-log",
-            run_log_task(
-                log_rx,
+            LogTask::new(
                 file.clone(),
                 log_writer,
                 flush_sequencer,
@@ -455,7 +359,8 @@ mod tests {
                 logged_lsn.clone(),
                 applied_lsn.clone(),
                 apply_tx,
-            ),
+            )
+            .run(log_rx),
         );
 
         (

@@ -166,7 +166,7 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Failable semaphore for log backpressure. Shared with log task.
     log_permits: Option<Arc<crate::log_permits::LogPermits>>,
     /// LSN watermark published by the log task. `flush()` waits on this.
-    logged_lsn: Option<Arc<crate::lsn_watermark::LsnWatermark>>,
+    pub(crate) logged_lsn: Option<Arc<crate::lsn_watermark::LsnWatermark>>,
     /// Handle to the spawned apply task. `None` if no apply task is running.
     apply_task: Option<pal_async::task::Task<()>>,
 }
@@ -280,7 +280,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         let file = Arc::new(file);
 
         // 12. Create PageCache and register tags.
-        let mut cache = PageCache::new(file.clone(), log_sender, None, None, None, 0);
+        let mut cache = PageCache::new(file.clone(), log_sender, None, None, 0);
         cache.register_tag(BAT_TAG, regions.bat_offset);
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
         cache.register_tag(SBM_TAG, 0);
@@ -469,28 +469,22 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         );
 
         // Spawn the log task.
-        let file_clone = vhdx.file.clone();
-        let fsn_clone = flush_sequencer.clone();
-        let permits_clone = log_permits.clone();
-        let lsn_clone = logged_lsn.clone();
-        let applied_clone = applied_lsn.clone();
         let task = spawner.spawn(
             "vhdx-log-task",
-            crate::log_task::run_log_task(
-                rx,
-                file_clone,
+            crate::log_task::LogTask::new(
+                vhdx.file.clone(),
                 log_writer,
-                fsn_clone,
-                permits_clone,
-                lsn_clone,
-                applied_clone,
+                flush_sequencer.clone(),
+                log_permits.clone(),
+                logged_lsn.clone(),
+                applied_lsn.clone(),
                 apply_tx,
-            ),
+            )
+            .run(rx),
         );
 
         // Set log permits and LSN watermark on the cache.
         vhdx.cache.set_log_permits(log_permits.clone());
-        vhdx.cache.set_logged_lsn(logged_lsn.clone());
         vhdx.cache.set_applied_lsn(applied_lsn.clone());
 
         vhdx.log_sender = Some(tx);
@@ -530,7 +524,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             self.log_sender.take();
 
             // Send Close RPC — the log task will log+apply all pending
-            // batches, clear the log GUID, then respond.
+            // batches, then respond.
             let result = sender
                 .call(LogRequest::Close, ())
                 .await
@@ -547,6 +541,9 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
             if let Some(task) = self.apply_task.take() {
                 task.await;
             }
+
+            // Clear log GUID in the header now that the log is fully drained.
+            self.write_clean_header().await?;
         }
         Ok(())
     }
@@ -954,6 +951,59 @@ impl<F: AsyncFile> VhdxFile<F> {
                 )
                 .await?;
             guard.copy_from_slice(&page_buf);
+        }
+
+        Ok(())
+    }
+
+    /// Write a header with `log_guid = ZERO` to mark the file as clean.
+    ///
+    /// Uses the write state to determine the current sequence number and
+    /// header slot, then writes to the non-current slot and flushes.
+    async fn write_clean_header(&self) -> Result<(), VhdxError> {
+        let (header_buf, header_offset) = {
+            let mut state = self.write_state.lock();
+            state.sequence_number += 1;
+            state.log_guid = Guid::ZERO;
+
+            let mut header = Header::new_zeroed();
+            header.signature = format::HEADER_SIGNATURE;
+            header.sequence_number = state.sequence_number;
+            header.file_write_guid = state.file_write_guid;
+            header.data_write_guid = state.data_write_guid;
+            header.log_guid = Guid::ZERO;
+            header.log_version = format::LOG_VERSION;
+            header.version = format::VERSION_1;
+            header.log_length = self.log_length;
+            header.log_offset = self.log_offset;
+            header.checksum = 0;
+
+            let mut buf = vec![0u8; format::HEADER_SIZE as usize];
+            let hdr_bytes = header.as_bytes();
+            buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
+            let crc = format::compute_checksum(&buf, 4);
+            buf[4..8].copy_from_slice(&crc.to_le_bytes());
+
+            let offset = if state.first_header_current {
+                format::HEADER_OFFSET_2
+            } else {
+                format::HEADER_OFFSET_1
+            };
+
+            (buf, offset)
+        };
+
+        self.file.write_at(header_offset, &header_buf).await?;
+
+        if let Some(seq) = &self.flush_sequencer {
+            seq.flush(self.file.as_ref()).await?;
+        } else {
+            self.file.flush().await?;
+        }
+
+        {
+            let mut state = self.write_state.lock();
+            state.first_header_current = !state.first_header_current;
         }
 
         Ok(())

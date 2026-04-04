@@ -933,40 +933,30 @@ impl<F: AsyncFile> VhdxFile<F> {
 
     /// Flush all writes to stable storage.
     ///
-    /// Writes any dirty BAT pages to disk via the page cache, then sends
-    /// all dirty pages to the log task for WAL persistence. Finally issues
-    /// a file-level flush for durability.
-    ///
-    /// When a log task is configured (writable mode with log), dirty pages
-    /// are flushed through the log. Otherwise, falls back to direct
-    /// file flush.
+    /// Commits dirty cache pages to the log task, waits for the WAL
+    /// entry to be written, then flushes to make everything durable:
+    /// user data writes, WAL entries, and apply-task writes.
     pub async fn flush(&self) -> Result<(), VhdxError> {
         self.flush_dirty_bat_pages().await?;
 
-        if self.log_sender.is_some() {
-            // Ship dirty cache pages to the log task (fire-and-forget).
-            let lsn = self.cache.commit()?;
+        let lsn = self.cache.commit()?;
 
-            // Wait for the log task to have written this WAL entry.
-            // Returns the FSN needed to make it durable.
-            let wal_fsn = self.cache.wait_for_lsn(lsn).await?;
+        // Wait for the log task to write WAL entries through this LSN.
+        // Even if this commit had no dirty pages, we wait for the most
+        // recent LSN to ensure a concurrent flush's WAL write completes.
+        self.logged_lsn
+            .as_ref()
+            .expect("writable file has logged_lsn")
+            .wait_for(lsn)
+            .await?;
 
-            // Flush through the WAL FSN — this makes the WAL entry
-            // durable AND coalesces with any user data flushes and
-            // apply-task writes that happened before this FSN.
-            if let Some(seq) = &self.flush_sequencer {
-                seq.flush_through(self.file.as_ref(), wal_fsn).await?;
-            }
-        } else {
-            // No log — direct file flush.
-            self.file.flush().await.map_err(VhdxError::Io)?;
-        }
+        // Flush everything: user data, WAL entries, applied pages.
+        self.flush_sequencer
+            .as_ref()
+            .expect("writable file has flush_sequencer")
+            .flush(self.file.as_ref())
+            .await?;
 
-        // Also flush user data writes (their FSNs may be beyond the
-        // WAL FSN if writes happened after commit).
-        if let Some(seq) = &self.flush_sequencer {
-            seq.flush(self.file.as_ref()).await?;
-        }
         Ok(())
     }
 }

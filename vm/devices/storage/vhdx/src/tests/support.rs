@@ -5,6 +5,7 @@
 
 use crate::AsyncFile;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Trait for intercepting I/O operations in tests.
 ///
@@ -96,13 +97,45 @@ impl IoInterceptor for DiscardWritesInterceptor {
     }
 }
 
+/// An interceptor with runtime-togglable write failures.
+///
+/// Starts with writes succeeding. Call [`fail_writes()`](Self::fail_writes)
+/// to make all subsequent writes return errors.
+pub struct TogglableFailInterceptor {
+    writes_fail: std::sync::atomic::AtomicBool,
+}
+
+impl TogglableFailInterceptor {
+    /// Create a new interceptor with writes initially succeeding.
+    pub fn new() -> Self {
+        Self {
+            writes_fail: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Make all subsequent writes fail.
+    pub fn fail_writes(&self) {
+        self.writes_fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl IoInterceptor for TogglableFailInterceptor {
+    fn before_write(&self, _offset: u64, _data: &[u8]) -> Result<(), std::io::Error> {
+        if self.writes_fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        Ok(())
+    }
+}
+
 /// In-memory file backing store for tests.
 ///
 /// Supports optional I/O interception for failure injection and write
 /// discarding (used in crash tests).
 pub struct InMemoryFile {
     inner: Mutex<InMemoryFileInner>,
-    interceptor: Option<Box<dyn IoInterceptor>>,
+    interceptor: Option<Arc<dyn IoInterceptor>>,
 }
 
 struct InMemoryFileInner {
@@ -121,7 +154,7 @@ impl InMemoryFile {
     }
 
     /// Creates a zero-filled file with an I/O interceptor.
-    pub fn with_interceptor(size: u64, interceptor: Box<dyn IoInterceptor>) -> Self {
+    pub fn with_interceptor(size: u64, interceptor: Arc<dyn IoInterceptor>) -> Self {
         Self {
             inner: Mutex::new(InMemoryFileInner {
                 data: vec![0u8; size as usize],
@@ -515,7 +548,7 @@ mod tests {
     async fn failing_interceptor_read() {
         let file = InMemoryFile::with_interceptor(
             64,
-            Box::new(FailingInterceptor {
+            Arc::new(FailingInterceptor {
                 fail_reads: true,
                 fail_writes: false,
                 fail_flushes: false,
@@ -532,7 +565,7 @@ mod tests {
     async fn failing_interceptor_write() {
         let file = InMemoryFile::with_interceptor(
             64,
-            Box::new(FailingInterceptor {
+            Arc::new(FailingInterceptor {
                 fail_reads: false,
                 fail_writes: true,
                 fail_flushes: false,
@@ -552,7 +585,7 @@ mod tests {
     async fn failing_interceptor_flush() {
         let file = InMemoryFile::with_interceptor(
             64,
-            Box::new(FailingInterceptor {
+            Arc::new(FailingInterceptor {
                 fail_reads: false,
                 fail_writes: false,
                 fail_flushes: true,
@@ -566,7 +599,7 @@ mod tests {
 
     #[async_test]
     async fn discard_writes_interceptor() {
-        let file = InMemoryFile::with_interceptor(8, Box::new(DiscardWritesInterceptor));
+        let file = InMemoryFile::with_interceptor(8, Arc::new(DiscardWritesInterceptor));
 
         // Write should appear to succeed.
         file.write_at(0, &[1, 2, 3, 4]).await.unwrap();

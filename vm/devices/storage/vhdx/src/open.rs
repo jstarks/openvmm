@@ -474,8 +474,6 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         let permits_clone = log_permits.clone();
         let lsn_clone = logged_lsn.clone();
         let applied_clone = applied_lsn.clone();
-        let log_offset = vhdx.log_offset;
-        let log_length = vhdx.log_length;
         let task = spawner.spawn(
             "vhdx-log-task",
             crate::log_task::run_log_task(
@@ -487,8 +485,6 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
                 lsn_clone,
                 applied_clone,
                 apply_tx,
-                log_offset,
-                log_length,
             ),
         );
 

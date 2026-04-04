@@ -2213,7 +2213,7 @@ mod tests {
         let data = orig_file.snapshot();
 
         let fail_writes = Arc::new(AtomicBool::new(false));
-        let interceptor = Box::new(ToggleableInterceptor {
+        let interceptor = Arc::new(ToggleableInterceptor {
             fail_writes: fail_writes.clone(),
             fail_set_file_size: Arc::new(AtomicBool::new(false)),
         });
@@ -2274,7 +2274,7 @@ mod tests {
         let data = orig_file.snapshot();
 
         let fail_set_file_size = Arc::new(AtomicBool::new(false));
-        let interceptor = Box::new(ToggleableInterceptor {
+        let interceptor = Arc::new(ToggleableInterceptor {
             fail_writes: Arc::new(AtomicBool::new(false)),
             fail_set_file_size: fail_set_file_size.clone(),
         });

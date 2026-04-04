@@ -788,7 +788,7 @@ mod tests {
     async fn acquire_overwrite_skips_read() {
         let file = InMemoryFile::with_interceptor(
             PAGE_SIZE as u64,
-            Box::new(FailingInterceptor {
+            Arc::new(FailingInterceptor {
                 fail_reads: true,
                 fail_writes: false,
                 fail_flushes: false,

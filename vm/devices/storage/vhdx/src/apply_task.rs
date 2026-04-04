@@ -65,37 +65,40 @@ pub(crate) async fn run_apply_task<F: AsyncFile>(
         let page_count = batch.pages.len();
 
         // Write each page to its final file offset.
-        let mut write_failed = false;
         for page in &batch.pages {
             if let Err(e) = file.write_at(page.file_offset, page.data.as_slice()).await {
-                tracing::warn!(
+                tracing::error!(
                     "VHDX apply task: write error at offset {:#x}: {e}",
                     page.file_offset
                 );
-                write_failed = true;
-                break;
+                drop(batch);
+                log_permits.release(page_count);
+                log_permits.fail(format!("apply write failed: {e}"));
+                applied_lsn.fail(format!("apply write failed: {e}"));
+                return;
             }
         }
 
-        if write_failed {
-            // Don't advance applied_lsn — the data isn't durable.
-            // The log entry is still valid, so replay on next open will
-            // re-apply these pages.
-            continue;
-        }
+        // Drop the batch to free the Arc page data BEFORE releasing
+        // permits. Permits bound memory — they must not be released
+        // while the data is still held.
+        drop(batch);
+
+        // Release permits now — writes are complete and Arcs are freed.
+        // We don't wait for the flush: permits bound memory, not
+        // durability. The flush below is about making the data durable
+        // at final offsets so the log tail can advance.
+        log_permits.release(page_count);
 
         // Flush to make the applied writes durable at their final offsets.
         if let Err(e) = flush_sequencer.flush(file.as_ref()).await {
-            tracing::warn!("VHDX apply task: flush error: {e}");
-            continue;
+            tracing::error!("VHDX apply task: flush error: {e}");
+            log_permits.fail(format!("apply flush failed: {e}"));
+            applied_lsn.fail(format!("apply flush failed: {e}"));
+            return;
         }
 
         // Publish that everything through this LSN has been applied.
         applied_lsn.advance(lsn);
-
-        // Release permits — the Arc page data can now be freed.
-        // This is the ONLY place permits are released during normal
-        // operation. See log_permits.rs for the full permit lifecycle.
-        log_permits.release(page_count);
     }
 }

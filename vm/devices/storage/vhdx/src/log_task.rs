@@ -86,8 +86,6 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
     logged_lsn: Arc<LsnWatermark>,
     applied_lsn: Arc<LsnWatermark>,
     apply_tx: mesh::Sender<ApplyBatch>,
-    log_offset: u64,
-    log_length: u32,
 ) {
     let mut pending_tails: Vec<PendingTail> = Vec::new();
 
@@ -127,8 +125,6 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                         &flush_sequencer,
                         &applied_lsn,
                         &mut pending_tails,
-                        log_offset,
-                        log_length,
                     )
                     .await
                 })
@@ -273,8 +269,6 @@ async fn graceful_close<F: AsyncFile>(
     flush_sequencer: &Arc<FlushSequencer>,
     applied_lsn: &LsnWatermark,
     pending_tails: &mut Vec<PendingTail>,
-    _log_offset: u64,
-    _log_length: u32,
 ) -> Result<(), VhdxError> {
     // Wait for all pending applies to complete.
     if let Some(last) = pending_tails.last() {
@@ -337,7 +331,7 @@ async fn graceful_close<F: AsyncFile>(
         format::HEADER_OFFSET_1
     };
     file.write_at(write_offset, &buf).await?;
-    file.flush().await?;
+    flush_sequencer.flush(file.as_ref()).await?;
 
     Ok(())
 }
@@ -372,6 +366,24 @@ mod tests {
         pal_async::task::Task<()>,
     ) {
         let file = Arc::new(InMemoryFile::new(4 * 1024 * 1024));
+        setup_pipeline_with_file(driver, file, log_size, permit_count).await
+    }
+
+    /// Like `setup_pipeline`, but with a caller-provided file.
+    async fn setup_pipeline_with_file(
+        driver: &pal_async::DefaultDriver,
+        file: Arc<InMemoryFile>,
+        log_size: u32,
+        permit_count: usize,
+    ) -> (
+        mesh::Sender<LogRequest>,
+        Arc<InMemoryFile>,
+        Arc<LogPermits>,
+        Arc<LsnWatermark>,
+        Arc<LsnWatermark>,
+        pal_async::task::Task<()>,
+        pal_async::task::Task<()>,
+    ) {
         let region = LogRegion {
             file_offset: LOG_OFFSET,
             length: log_size,
@@ -414,8 +426,6 @@ mod tests {
                 logged_lsn.clone(),
                 applied_lsn.clone(),
                 apply_tx,
-                LOG_OFFSET,
-                log_size,
             ),
         );
 
@@ -574,5 +584,56 @@ mod tests {
         let mut buf = [0u8; PAGE_SIZE];
         file.read_at(target_offset, &mut buf).await.unwrap();
         assert!(buf.iter().all(|&b| b == 0xAB));
+    }
+
+    #[async_test]
+    async fn apply_write_failure_poisons_pipeline(driver: pal_async::DefaultDriver) {
+        use crate::tests::support::IoInterceptor;
+
+        // Interceptor that fails writes only outside the log region
+        // (i.e., apply writes to final offsets), not WAL writes.
+        struct FailApplyInterceptor {
+            fail: std::sync::atomic::AtomicBool,
+        }
+        impl IoInterceptor for FailApplyInterceptor {
+            fn before_write(&self, offset: u64, _data: &[u8]) -> Result<(), std::io::Error> {
+                // Log region is at LOG_OFFSET (1 MiB). Apply writes go
+                // to 2 MiB+. Only fail writes outside the log region.
+                if self.fail.load(std::sync::atomic::Ordering::Relaxed) && offset >= 2 * 1024 * 1024
+                {
+                    return Err(std::io::Error::other("injected apply write failure"));
+                }
+                Ok(())
+            }
+        }
+
+        let interceptor = Arc::new(FailApplyInterceptor {
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let file = Arc::new(InMemoryFile::with_interceptor(
+            4 * 1024 * 1024,
+            interceptor.clone() as Arc<dyn IoInterceptor>,
+        ));
+
+        let (tx, _file, permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+            setup_pipeline_with_file(&driver, file, LOG_SIZE, 100).await;
+
+        // First commit succeeds end-to-end.
+        send_commit(&tx, &permits, 1, 1).await;
+        logged_lsn.wait_for(1).await.unwrap();
+
+        // Now fail apply writes (but not WAL writes).
+        interceptor
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Second commit: WAL write succeeds, but apply write will fail.
+        send_commit(&tx, &permits, 2, 1).await;
+        logged_lsn.wait_for(2).await.unwrap();
+
+        // The apply task should have poisoned permits after the write failure.
+        // Future permit acquires must fail.
+        let result = permits.acquire(1).await;
+        assert!(result.is_err(), "acquire should fail after apply error");
     }
 }

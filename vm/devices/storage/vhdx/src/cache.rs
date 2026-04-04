@@ -625,15 +625,20 @@ impl<F: AsyncFile> PageCache<F> {
         Ok(lsn)
     }
 
-    /// Wait for the log task to durably write everything through `lsn`.
-    pub async fn wait_for_lsn(&self, lsn: u64) -> Result<(), VhdxError> {
+    /// Wait for the log task to write a WAL entry through `lsn`.
+    ///
+    /// Returns the flush sequence number (FSN) that the caller must
+    /// [`flush_through()`](crate::flush::FlushSequencer::flush_through)
+    /// to make the WAL entry durable. Returns 0 if `lsn` is 0 (no-op).
+    pub async fn wait_for_lsn(&self, lsn: u64) -> Result<u64, VhdxError> {
         if lsn == 0 {
-            return Ok(());
+            return Ok(0);
         }
         if let Some(ref logged_lsn) = self.logged_lsn {
-            logged_lsn.wait_for(lsn).await?;
+            logged_lsn.wait_for(lsn).await
+        } else {
+            Ok(0)
         }
-        Ok(())
     }
 
     /// Returns `true` if the cache has a log sender configured.
@@ -1429,7 +1434,7 @@ mod tests {
         assert_eq!(cache.pages.lock().map.len(), 2);
 
         // Now advance applied_lsn past the committed_lsn.
-        applied.advance(1);
+        applied.advance(1, 0);
 
         // Load another page — now A is evictable.
         let file_size = PAGE_SIZE as u64 * 4;

@@ -947,15 +947,25 @@ impl<F: AsyncFile> VhdxFile<F> {
             // Ship dirty cache pages to the log task (fire-and-forget).
             let lsn = self.cache.commit()?;
 
-            // Wait for the log task to have durably written this batch.
-            self.cache.wait_for_lsn(lsn).await?;
+            // Wait for the log task to have written this WAL entry.
+            // Returns the FSN needed to make it durable.
+            let wal_fsn = self.cache.wait_for_lsn(lsn).await?;
+
+            // Flush through the WAL FSN — this makes the WAL entry
+            // durable AND coalesces with any user data flushes and
+            // apply-task writes that happened before this FSN.
+            if let Some(seq) = &self.flush_sequencer {
+                seq.flush_through(self.file.as_ref(), wal_fsn).await?;
+            }
+        } else {
+            // No log — direct file flush.
+            self.file.flush().await.map_err(VhdxError::Io)?;
         }
 
-        // Ensure user data writes are durable.
+        // Also flush user data writes (their FSNs may be beyond the
+        // WAL FSN if writes happened after commit).
         if let Some(seq) = &self.flush_sequencer {
             seq.flush(self.file.as_ref()).await?;
-        } else {
-            self.file.flush().await.map_err(VhdxError::Io)?;
         }
         Ok(())
     }

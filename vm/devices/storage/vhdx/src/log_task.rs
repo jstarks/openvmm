@@ -90,9 +90,16 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
     let mut pending_tails: Vec<PendingTail> = Vec::new();
 
     loop {
-        // Before processing the next request, advance the tail for
-        // any batches the applier has completed.
-        advance_tails(&mut pending_tails, &applied_lsn, &mut log_writer);
+        // Before processing the next request, opportunistically advance
+        // the tail for any batches whose applied data is already flushed
+        // (e.g., by a prior VhdxFile::flush() or LogFull flush).
+        let flushed_fsn = flush_sequencer.completed_fsn();
+        advance_tails(
+            &mut pending_tails,
+            flushed_fsn,
+            &applied_lsn,
+            &mut log_writer,
+        );
 
         let request = match rx.recv().await {
             Ok(req) => req,
@@ -135,16 +142,20 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
     }
 }
 
-/// Advance the log tail for all batches whose LSN has been applied.
+/// Advance the log tail for all batches whose applied data has been
+/// flushed. `flushed_fsn` is the highest FSN known to be durable.
 fn advance_tails(
     pending_tails: &mut Vec<PendingTail>,
+    flushed_fsn: u64,
     applied_lsn: &LsnWatermark,
     log_writer: &mut LogWriter,
 ) {
-    let applied = applied_lsn.get();
-    // Pending tails are in LSN order. Advance all that are <= applied.
+    let (applied, applied_fsn) = applied_lsn.get_with_fsn();
+    // Pending tails are in LSN order. Advance all where:
+    // 1. The apply task has written the pages (applied >= lsn), AND
+    // 2. Those writes are durable (applied_fsn <= flushed_fsn).
     while let Some(front) = pending_tails.first() {
-        if front.lsn <= applied {
+        if front.lsn <= applied && applied_fsn <= flushed_fsn {
             log_writer.advance_tail(front.new_tail);
             pending_tails.remove(0);
         } else {
@@ -154,7 +165,7 @@ fn advance_tails(
 }
 
 /// Handle a Commit request: write WAL entry, publish LSN, send batch to applier.
-/// If the log is full, waits for the applier to drain space and retries.
+/// If the log is full, waits for the applier to drain, flushes, and retries.
 async fn handle_commit<F: AsyncFile>(
     txn: Transaction,
     file: &Arc<F>,
@@ -179,22 +190,36 @@ async fn handle_commit<F: AsyncFile>(
 
     // Write WAL entry, retrying if the log is full.
     loop {
-        match write_log_entry(file, log_writer, flush_sequencer, &txn.pages).await {
+        match write_log_entry(file, log_writer, &txn.pages).await {
             Ok(()) => break,
             Err(VhdxError::Corrupt(CorruptionType::LogFull)) => {
                 // Wait for the oldest pending batch to be applied so we
-                // can advance the tail and free log space.
+                // can flush and advance the tail to free log space.
                 if let Some(front) = pending_tails.first() {
                     let target = front.lsn;
-                    if let Err(e) = applied_lsn.wait_for(target).await {
-                        tracing::error!("VHDX log task: wait for apply failed while log full: {e}");
-                        log_permits.fail(format!("wait for apply failed: {e}"));
+                    let applied_fsn = match applied_lsn.wait_for(target).await {
+                        Ok(fsn) => fsn,
+                        Err(e) => {
+                            tracing::error!(
+                                "VHDX log task: wait for apply failed while log full: {e}"
+                            );
+                            log_permits.fail(format!("wait for apply failed: {e}"));
+                            return;
+                        }
+                    };
+                    // Flush to make the applied data durable so we can
+                    // safely advance the tail.
+                    if let Err(e) = flush_sequencer
+                        .flush_through(file.as_ref(), applied_fsn)
+                        .await
+                    {
+                        tracing::error!("VHDX log task: flush for tail advance failed: {e}");
+                        log_permits.fail(format!("flush for tail advance failed: {e}"));
                         return;
                     }
-                    advance_tails(pending_tails, applied_lsn, log_writer);
+                    let flushed_fsn = flush_sequencer.current_fsn();
+                    advance_tails(pending_tails, flushed_fsn, applied_lsn, log_writer);
                 } else {
-                    // No pending tails — log is genuinely too small for
-                    // this single batch. This is a fatal configuration error.
                     tracing::error!(
                         "VHDX log task: log too small for batch of {} pages",
                         txn.pages.len()
@@ -214,8 +239,11 @@ async fn handle_commit<F: AsyncFile>(
         }
     }
 
-    // Publish that this LSN is durable in the log.
-    logged_lsn.advance(lsn);
+    // Capture FSN after the WAL write. Flushing through this FSN makes
+    // the WAL entry durable. We don't flush here — VhdxFile::flush()
+    // will do it, or the LogFull path above will if space is needed.
+    let wal_fsn = flush_sequencer.current_fsn();
+    logged_lsn.advance(lsn, wal_fsn);
 
     let new_tail = log_writer.head();
 
@@ -238,11 +266,10 @@ async fn handle_commit<F: AsyncFile>(
     pending_tails.push(PendingTail { lsn, new_tail });
 }
 
-/// Write a log entry for the given pages.
+/// Write a log entry for the given pages (no flush).
 async fn write_log_entry<F: AsyncFile>(
     file: &Arc<F>,
     log_writer: &mut LogWriter,
-    flush_sequencer: &Arc<FlushSequencer>,
     pages: &[CommittedPage],
 ) -> Result<(), VhdxError> {
     let data_pages: Vec<DataPage<'_>> = pages
@@ -253,16 +280,14 @@ async fn write_log_entry<F: AsyncFile>(
         })
         .collect();
 
-    let _seq = log_writer
+    log_writer
         .write_entry(file.as_ref(), &data_pages, &[])
         .await?;
-
-    flush_sequencer.flush(file.as_ref()).await?;
 
     Ok(())
 }
 
-/// Graceful close: wait for all applies, clear log GUID, flush.
+/// Graceful close: wait for all applies, flush, clear log GUID, flush again.
 async fn graceful_close<F: AsyncFile>(
     file: &Arc<F>,
     log_writer: &mut LogWriter,
@@ -273,10 +298,14 @@ async fn graceful_close<F: AsyncFile>(
     // Wait for all pending applies to complete.
     if let Some(last) = pending_tails.last() {
         let target_lsn = last.lsn;
-        applied_lsn.wait_for(target_lsn).await?;
+        let applied_fsn = applied_lsn.wait_for(target_lsn).await?;
+        // Flush to make all applied data durable so tails can advance.
+        flush_sequencer
+            .flush_through(file.as_ref(), applied_fsn)
+            .await?;
     }
 
-    // Now advance all tails.
+    // Now advance all tails — data is durable at final offsets.
     for pt in pending_tails.drain(..) {
         log_writer.advance_tail(pt.new_tail);
     }

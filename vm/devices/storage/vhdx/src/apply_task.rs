@@ -5,13 +5,17 @@
 //!
 //! The apply task receives [`ApplyBatch`] items from the log task via a
 //! mesh channel. For each batch, it writes all pages to their final file
-//! offsets, flushes, publishes [`applied_lsn`](crate::lsn_watermark::LsnWatermark),
-//! and **releases log permits**.
+//! offsets, **releases log permits**, and publishes `applied_lsn` with
+//! the flush sequence number (FSN) needed to make the writes durable.
 //!
-//! Permits are released here — not at commit time and not by the log
-//! task — because the apply task is where the `Arc<[u8; PAGE_SIZE]>`
-//! data is finally consumed and can be freed. This bounds memory
-//! usage in the cache → log → apply pipeline.
+//! The apply task does **not** flush. Flushing is driven by consumers
+//! who need durability:
+//! - The log task flushes when it needs to advance the log tail
+//!   (on `LogFull` or graceful close).
+//! - `VhdxFile::flush()` flushes for crash safety.
+//!
+//! Both callers use `flush_sequencer.flush_through(fsn)` with the FSN
+//! from the watermark, which coalesces naturally.
 
 use crate::AsyncFile;
 use crate::cache::PAGE_SIZE;
@@ -43,8 +47,8 @@ pub(crate) struct ApplyPage {
 /// Run the apply task main loop.
 ///
 /// Receives batches from the log task, writes pages to their final
-/// file offsets, flushes, publishes `applied_lsn`, and releases
-/// log permits.
+/// file offsets, releases log permits, and publishes `applied_lsn`
+/// with the FSN needed for durability.
 pub(crate) async fn run_apply_task<F: AsyncFile>(
     mut rx: mesh::Receiver<ApplyBatch>,
     file: Arc<F>,
@@ -83,22 +87,15 @@ pub(crate) async fn run_apply_task<F: AsyncFile>(
         // permits. Permits bound memory — they must not be released
         // while the data is still held.
         drop(batch);
-
-        // Release permits now — writes are complete and Arcs are freed.
-        // We don't wait for the flush: permits bound memory, not
-        // durability. The flush below is about making the data durable
-        // at final offsets so the log tail can advance.
         log_permits.release(page_count);
 
-        // Flush to make the applied writes durable at their final offsets.
-        if let Err(e) = flush_sequencer.flush(file.as_ref()).await {
-            tracing::error!("VHDX apply task: flush error: {e}");
-            log_permits.fail(format!("apply flush failed: {e}"));
-            applied_lsn.fail(format!("apply flush failed: {e}"));
-            return;
-        }
+        // Capture the FSN *after* the writes. Flushing through this FSN
+        // will make all the writes above durable. We don't flush here —
+        // the log task or VhdxFile::flush() will do it when needed.
+        let fsn = flush_sequencer.current_fsn();
 
-        // Publish that everything through this LSN has been applied.
-        applied_lsn.advance(lsn);
+        // Publish (lsn, fsn): "pages through this LSN are at their final
+        // offsets; flush through this FSN to make them durable."
+        applied_lsn.advance(lsn, fsn);
     }
 }

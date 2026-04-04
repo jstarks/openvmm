@@ -1,24 +1,37 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Failable semaphore for log backpressure.
+//! Failable semaphore for log pipeline backpressure.
 //!
-//! [`LogPermits`] limits how many dirty/in-flight pages the cache can have
-//! outstanding to the log task. It provides:
+//! [`LogPermits`] limits how many pages can be in-flight in the
+//! cache → log → apply pipeline at once. This bounds memory
+//! consumption: each in-flight page holds an `Arc<[u8; 4096]>`
+//! that cannot be freed until the apply task writes it to its
+//! final file offset.
 //!
-//! - **Backpressure**: callers block when the log task is saturated.
-//! - **Error propagation**: if the log task fails, the semaphore is poisoned
-//!   and all pending/future acquires return an error.
+//! **Lifecycle of a permit:**
+//! 1. Cache acquires a permit before transitioning a page to
+//!    `HasPermit` / `Dirty`.
+//! 2. The permit stays consumed through commit → log → apply.
+//! 3. The apply task releases the permit after writing the page
+//!    to its final offset and flushing.
+//!
+//! If the log task fails, the semaphore is **poisoned** — all
+//! pending and future acquires return an error.
 
 use crate::error::VhdxError;
 use event_listener::Event;
 use parking_lot::Mutex;
 
-/// Failable semaphore shared between the cache and the log task.
+/// Failable semaphore shared between the cache and the apply task.
 ///
-/// The cache acquires permits before dirtying pages. The log task
-/// releases permits after writing WAL entries. If the log task fails,
-/// it poisons the semaphore — all waiters and future callers get errors.
+/// The cache acquires permits before dirtying pages. The **apply task**
+/// releases permits after writing pages to their final file offsets.
+/// Do NOT release permits at commit time — that defeats backpressure
+/// and allows unbounded in-flight allocations.
+///
+/// If the log task fails, it poisons the semaphore — all waiters and
+/// future callers get errors.
 pub(crate) struct LogPermits {
     state: Mutex<PermitState>,
     event: Event,

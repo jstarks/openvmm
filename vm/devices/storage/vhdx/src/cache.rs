@@ -48,7 +48,9 @@ pub const PAGE_SIZE: usize = 4096;
 ///   entry_length(N) = ceil((64 + 32*N) / 4096) * 4096 + N * 4096
 ///   (N+1)*4096 + 4096 (guard) ≤ 262144  →  N ≤ 62
 ///
-/// Used as the initial permit count for [`LogPermits`].
+/// Note: the permit count is a *multiple* of this value (see `open.rs`)
+/// to allow pipelining — multiple batches can be in-flight in the
+/// log/apply pipeline simultaneously.
 pub const MAX_COMMIT_PAGES: usize = 62;
 
 /// Key identifying a cached page.
@@ -615,13 +617,10 @@ impl<F: AsyncFile> PageCache<F> {
             pre_log_fsn: max_pre_log_fsn,
         }));
 
-        // Release permits now — permits bound dirty page count, not log
-        // space. The pages are no longer dirty (transitioned to Clean
-        // above), so the permits are available for the next batch. The
-        // log task handles its own space management via LogFull retry.
-        if let Some(ref permits) = self.log_permits {
-            permits.release(committed_count);
-        }
+        // Do NOT release permits here. Permits stay consumed until the
+        // apply task writes pages to their final offsets and releases
+        // them. This bounds the total in-flight page data (Arc clones)
+        // in the log/apply pipeline, preventing unbounded memory growth.
 
         Ok(lsn)
     }

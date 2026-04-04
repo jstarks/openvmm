@@ -5,14 +5,18 @@
 //!
 //! The apply task receives [`ApplyBatch`] items from the log task via a
 //! mesh channel. For each batch, it writes all pages to their final file
-//! offsets, flushes, and publishes [`applied_lsn`](crate::lsn_watermark::LsnWatermark).
-//! The log task reads `applied_lsn` to know when it can advance the
-//! log tail.
+//! offsets, flushes, publishes [`applied_lsn`](crate::lsn_watermark::LsnWatermark),
+//! and **releases log permits**.
+//!
+//! Permits are released here — not at commit time and not by the log
+//! task — because the apply task is where the `Arc<[u8; PAGE_SIZE]>`
+//! data is finally consumed and can be freed. This bounds memory
+//! usage in the cache → log → apply pipeline.
 
 use crate::AsyncFile;
 use crate::cache::PAGE_SIZE;
-use crate::error::VhdxError;
 use crate::flush::FlushSequencer;
+use crate::log_permits::LogPermits;
 use crate::lsn_watermark::LsnWatermark;
 use std::sync::Arc;
 
@@ -39,12 +43,14 @@ pub(crate) struct ApplyPage {
 /// Run the apply task main loop.
 ///
 /// Receives batches from the log task, writes pages to their final
-/// file offsets, flushes, and publishes `applied_lsn`.
+/// file offsets, flushes, publishes `applied_lsn`, and releases
+/// log permits.
 pub(crate) async fn run_apply_task<F: AsyncFile>(
     mut rx: mesh::Receiver<ApplyBatch>,
     file: Arc<F>,
     flush_sequencer: Arc<FlushSequencer>,
     applied_lsn: Arc<LsnWatermark>,
+    log_permits: Arc<LogPermits>,
 ) {
     loop {
         let batch = match rx.recv().await {
@@ -56,6 +62,7 @@ pub(crate) async fn run_apply_task<F: AsyncFile>(
         };
 
         let lsn = batch.lsn;
+        let page_count = batch.pages.len();
 
         // Write each page to its final file offset.
         let mut write_failed = false;
@@ -85,5 +92,10 @@ pub(crate) async fn run_apply_task<F: AsyncFile>(
 
         // Publish that everything through this LSN has been applied.
         applied_lsn.advance(lsn);
+
+        // Release permits — the Arc page data can now be freed.
+        // This is the ONLY place permits are released during normal
+        // operation. See log_permits.rs for the full permit lifecycle.
+        log_permits.release(page_count);
     }
 }

@@ -341,3 +341,230 @@ async fn graceful_close<F: AsyncFile>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apply_task;
+    use crate::cache::PAGE_SIZE;
+    use crate::log::LogRegion;
+    use crate::tests::support::InMemoryFile;
+    use pal_async::async_test;
+    use pal_async::task::Spawn;
+
+    const LOG_SIZE: u32 = 64 * 4096; // 256 KiB — deliberately small
+    const LOG_OFFSET: u64 = 1024 * 1024; // 1 MiB into the file
+
+    /// Set up a log task + apply task connected via channels.
+    /// Returns (log_tx, file, permits, logged_lsn, applied_lsn,
+    /// log_task_handle, apply_task_handle).
+    async fn setup_pipeline(
+        driver: &pal_async::DefaultDriver,
+        log_size: u32,
+        permit_count: usize,
+    ) -> (
+        mesh::Sender<LogRequest>,
+        Arc<InMemoryFile>,
+        Arc<LogPermits>,
+        Arc<LsnWatermark>,
+        Arc<LsnWatermark>,
+        pal_async::task::Task<()>,
+        pal_async::task::Task<()>,
+    ) {
+        let file = Arc::new(InMemoryFile::new(4 * 1024 * 1024));
+        let region = LogRegion {
+            file_offset: LOG_OFFSET,
+            length: log_size,
+        };
+        let guid = guid::Guid::new_random();
+        let log_writer =
+            crate::log::LogWriter::initialize(file.as_ref(), region, guid, 4 * 1024 * 1024)
+                .await
+                .unwrap();
+
+        let flush_sequencer = Arc::new(FlushSequencer::new());
+        let log_permits = Arc::new(LogPermits::new(permit_count));
+        let logged_lsn = Arc::new(LsnWatermark::new());
+        let applied_lsn = Arc::new(LsnWatermark::new());
+
+        let (apply_tx, apply_rx) = mesh::channel::<ApplyBatch>();
+        let (log_tx, log_rx) = mesh::channel::<LogRequest>();
+
+        // Spawn apply task.
+        let apply_task = driver.spawn(
+            "test-apply",
+            apply_task::run_apply_task(
+                apply_rx,
+                file.clone(),
+                flush_sequencer.clone(),
+                applied_lsn.clone(),
+                log_permits.clone(),
+            ),
+        );
+
+        // Spawn log task.
+        let log_task = driver.spawn(
+            "test-log",
+            run_log_task(
+                log_rx,
+                file.clone(),
+                log_writer,
+                flush_sequencer,
+                log_permits.clone(),
+                logged_lsn.clone(),
+                applied_lsn.clone(),
+                apply_tx,
+                LOG_OFFSET,
+                log_size,
+            ),
+        );
+
+        (
+            log_tx,
+            file,
+            log_permits,
+            logged_lsn,
+            applied_lsn,
+            log_task,
+            apply_task,
+        )
+    }
+
+    /// Build a Transaction with `n` fake pages.
+    fn make_txn(lsn: u64, n: usize) -> Transaction {
+        let pages = (0..n)
+            .map(|i| CommittedPage {
+                file_offset: (2 * 1024 * 1024 + i * PAGE_SIZE) as u64,
+                data: Arc::new([lsn as u8; PAGE_SIZE]),
+            })
+            .collect();
+        Transaction {
+            lsn,
+            pages,
+            pre_log_fsn: None,
+        }
+    }
+
+    #[async_test]
+    async fn single_commit_publishes_lsn(driver: pal_async::DefaultDriver) {
+        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+            setup_pipeline(&driver, LOG_SIZE, 100).await;
+
+        tx.send(LogRequest::Commit(make_txn(1, 1)));
+        logged_lsn.wait_for(1).await.unwrap();
+    }
+
+    #[async_test]
+    async fn permits_return_after_apply(driver: pal_async::DefaultDriver) {
+        let permit_count = 10;
+        let (tx, _file, permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+            setup_pipeline(&driver, LOG_SIZE, permit_count).await;
+
+        // Consume all permits by acquiring them.
+        permits.acquire(permit_count).await.unwrap();
+
+        // Send a commit of 5 pages (the log task doesn't acquire permits,
+        // but the apply task will release 5 after applying).
+        tx.send(LogRequest::Commit(make_txn(1, 5)));
+
+        // Wait for the commit to be logged.
+        logged_lsn.wait_for(1).await.unwrap();
+
+        // The apply task should release 5 permits. Acquiring 5 should
+        // succeed (it would block forever if permits weren't released).
+        permits.acquire(5).await.unwrap();
+
+        // Clean up: release the permits we acquired so shutdown is clean.
+        permits.release(permit_count);
+    }
+
+    #[async_test]
+    async fn multiple_commits_sequential(driver: pal_async::DefaultDriver) {
+        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+            setup_pipeline(&driver, LOG_SIZE, 100).await;
+
+        for lsn in 1..=10u64 {
+            tx.send(LogRequest::Commit(make_txn(lsn, 1)));
+        }
+
+        // All 10 should be logged.
+        logged_lsn.wait_for(10).await.unwrap();
+    }
+
+    #[async_test]
+    async fn log_full_retry_makes_progress(driver: pal_async::DefaultDriver) {
+        // Use a small log (256 KiB). Each page + entry overhead ~ 8 KiB.
+        // With ~30 entries the log will fill up, forcing the retry path.
+        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+            setup_pipeline(&driver, LOG_SIZE, 500).await;
+
+        // Send 50 single-page commits. This will exceed the 256 KiB log
+        // and force LogFull → wait for apply → advance tail → retry.
+        for lsn in 1..=50u64 {
+            tx.send(LogRequest::Commit(make_txn(lsn, 1)));
+        }
+
+        // If LogFull retry works, all 50 will eventually be logged.
+        logged_lsn.wait_for(50).await.unwrap();
+    }
+
+    #[async_test]
+    async fn large_batches_through_small_log(driver: pal_async::DefaultDriver) {
+        // Each batch has 5 pages (~24 KiB with overhead). 256 KiB log
+        // fits maybe 10 batches. Send 30 — forces multiple cycles of
+        // LogFull → drain → retry.
+        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+            setup_pipeline(&driver, LOG_SIZE, 500).await;
+
+        for lsn in 1..=30u64 {
+            tx.send(LogRequest::Commit(make_txn(lsn, 5)));
+        }
+
+        logged_lsn.wait_for(30).await.unwrap();
+    }
+
+    #[async_test]
+    async fn close_after_commits(driver: pal_async::DefaultDriver) {
+        use mesh::rpc::RpcSend;
+
+        let (tx, _file, _permits, logged_lsn, applied_lsn, _log_task, _apply_task) =
+            setup_pipeline(&driver, LOG_SIZE, 100).await;
+
+        for lsn in 1..=5u64 {
+            tx.send(LogRequest::Commit(make_txn(lsn, 1)));
+        }
+        logged_lsn.wait_for(5).await.unwrap();
+
+        // Graceful close should wait for all applies and succeed.
+        let result = tx.call(LogRequest::Close, ()).await.unwrap();
+        result.unwrap();
+
+        // All commits should be applied.
+        assert!(applied_lsn.get() >= 5);
+    }
+
+    #[async_test]
+    async fn applied_data_is_at_final_offset(driver: pal_async::DefaultDriver) {
+        let (tx, file, _permits, logged_lsn, applied_lsn, _log_task, _apply_task) =
+            setup_pipeline(&driver, LOG_SIZE, 100).await;
+
+        let target_offset: u64 = 2 * 1024 * 1024; // 2 MiB
+        let data = Arc::new([0xAB_u8; PAGE_SIZE]);
+        tx.send(LogRequest::Commit(Transaction {
+            lsn: 1,
+            pages: vec![CommittedPage {
+                file_offset: target_offset,
+                data: data.clone(),
+            }],
+            pre_log_fsn: None,
+        }));
+
+        logged_lsn.wait_for(1).await.unwrap();
+        applied_lsn.wait_for(1).await.unwrap();
+
+        // Read back from the final offset — should match.
+        let mut buf = [0u8; PAGE_SIZE];
+        file.read_at(target_offset, &mut buf).await.unwrap();
+        assert!(buf.iter().all(|&b| b == 0xAB));
+    }
+}

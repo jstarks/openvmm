@@ -390,7 +390,11 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         // Create shared state for log task communication.
         let flush_sequencer = Arc::new(FlushSequencer::new());
         let log_permits = Arc::new(crate::log_permits::LogPermits::new(
-            crate::cache::MAX_COMMIT_PAGES,
+            // Permit count is a multiple of MAX_COMMIT_PAGES to allow
+            // pipelining: multiple batches can be in-flight (committed
+            // but not yet applied) simultaneously. Permits are released
+            // by the apply task, not at commit time.
+            crate::cache::MAX_COMMIT_PAGES * 4,
         ));
         let logged_lsn = Arc::new(crate::lsn_watermark::LsnWatermark::new());
 
@@ -460,6 +464,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
                 vhdx.file.clone(),
                 flush_sequencer.clone(),
                 applied_lsn.clone(),
+                log_permits.clone(),
             ),
         );
 

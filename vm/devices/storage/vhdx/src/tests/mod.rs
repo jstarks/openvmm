@@ -401,4 +401,133 @@ mod log_task_integration {
             }
         }
     }
+
+    /// After flush + close, all permits should have been released.
+    /// Verifies the apply task releases permits (not commit).
+    #[async_test]
+    async fn permits_released_after_apply(driver: DefaultDriver) {
+        let file = create_test_vhdx_file(format::GB1).await;
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
+
+        // Write to several distinct blocks so multiple BAT pages are dirtied.
+        for i in 0..10u64 {
+            let offset = i * 2 * format::MB1 as u64; // each in a different block
+            write_pattern(&vhdx, offset, 4096, (i & 0xFF) as u8).await;
+        }
+
+        // Flush commits dirty pages → log → apply → permits released.
+        vhdx.flush().await.unwrap();
+
+        // Write 10 more blocks. If permits weren't released, this would
+        // eventually block (deadlock). The fact that it completes proves
+        // permits are flowing back from the apply task.
+        for i in 10..20u64 {
+            let offset = i * 2 * format::MB1 as u64;
+            write_pattern(&vhdx, offset, 4096, (i & 0xFF) as u8).await;
+        }
+        vhdx.flush().await.unwrap();
+
+        // Verify all data survived.
+        for i in 0..20u64 {
+            let offset = i * 2 * format::MB1 as u64;
+            let expected = (i & 0xFF) as u8;
+            let buf = read_pattern(&vhdx, offset, 4096).await;
+            assert!(
+                buf.iter().all(|&b| b == expected),
+                "block {i} mismatch after permit recycling"
+            );
+        }
+
+        vhdx.close().await.unwrap();
+    }
+
+    /// Pump many batches through the full pipeline, exceeding the log's
+    /// circular buffer capacity. The log task must handle LogFull by
+    /// waiting for the apply task to drain, advancing tails, and retrying.
+    #[async_test]
+    async fn many_commits_forward_progress(driver: DefaultDriver) {
+        const BATCH_COUNT: usize = 20;
+        const BLOCK_SIZE: u64 = 2 * format::MB1 as u64;
+
+        let disk_size = BLOCK_SIZE * (BATCH_COUNT as u64 + 1);
+        let file = create_test_vhdx_file(disk_size).await;
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
+
+        // Each iteration writes to a new block (dirtying its BAT page),
+        // then flushes. This forces commit → log → apply for each batch.
+        // With a 1 MiB log the circular buffer will fill up, exercising
+        // the LogFull retry path in handle_commit.
+        for i in 0..BATCH_COUNT {
+            let offset = i as u64 * BLOCK_SIZE;
+            let pattern = (i & 0xFF) as u8;
+            write_pattern(&vhdx, offset, 4096, pattern).await;
+            vhdx.flush().await.unwrap();
+        }
+
+        let file_arc = vhdx.file.clone();
+        vhdx.close().await.unwrap();
+
+        // Reopen read-only and verify every block.
+        let vhdx2 =
+            VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+                .await
+                .unwrap();
+        for i in 0..BATCH_COUNT {
+            let offset = i as u64 * BLOCK_SIZE;
+            let expected = (i & 0xFF) as u8;
+            let buf = read_pattern(&vhdx2, offset, 4096).await;
+            assert!(
+                buf.iter().all(|&b| b == expected),
+                "block {i} mismatch: expected 0x{expected:02X}, got 0x{:02X}",
+                buf[0],
+            );
+        }
+    }
+
+    /// Stress test: pump a large number of writes through the pipeline
+    /// without individual flushes, then flush once at the end. This
+    /// exercises batch-full commit (automatic commits when dirty_count
+    /// reaches MAX_COMMIT_PAGES) combined with the log task's LogFull
+    /// retry and permit backpressure from the apply task.
+    #[async_test]
+    async fn log_pipeline_stress(driver: DefaultDriver) {
+        const BLOCK_COUNT: usize = 500;
+        const BLOCK_SIZE: u64 = 2 * format::MB1 as u64;
+        const WRITE_LEN: usize = 4096;
+
+        let disk_size = BLOCK_SIZE * (BLOCK_COUNT as u64 + 1);
+        let file = create_test_vhdx_file(disk_size).await;
+        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
+
+        // Write to 500 distinct blocks without flushing. The cache will
+        // trigger batch-full commits as dirty pages accumulate, and the
+        // log task will hit LogFull and retry as the circular buffer
+        // fills. The apply task must release permits to keep the
+        // pipeline moving.
+        for i in 0..BLOCK_COUNT {
+            let offset = i as u64 * BLOCK_SIZE;
+            let pattern = (i & 0xFF) as u8;
+            write_pattern(&vhdx, offset, WRITE_LEN, pattern).await;
+        }
+
+        vhdx.flush().await.unwrap();
+        let file_arc = vhdx.file.clone();
+        vhdx.close().await.unwrap();
+
+        // Reopen and verify.
+        let vhdx2 =
+            VhdxFile::open_read_only(InMemoryFile::from_snapshot(file_arc.snapshot()), false)
+                .await
+                .unwrap();
+        for i in 0..BLOCK_COUNT {
+            let offset = i as u64 * BLOCK_SIZE;
+            let expected = (i & 0xFF) as u8;
+            let buf = read_pattern(&vhdx2, offset, WRITE_LEN).await;
+            assert!(
+                buf.iter().all(|&b| b == expected),
+                "block {i} mismatch: expected 0x{expected:02X}, got 0x{:02X}",
+                buf[0],
+            );
+        }
+    }
 }

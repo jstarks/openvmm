@@ -23,6 +23,7 @@ use crate::AsyncFile;
 use crate::apply_task::ApplyBatch;
 use crate::apply_task::ApplyPage;
 use crate::cache::PAGE_SIZE;
+use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::flush::FlushSequencer;
 use crate::format;
@@ -112,6 +113,7 @@ pub(crate) async fn run_log_task<F: AsyncFile>(
                     &flush_sequencer,
                     &log_permits,
                     &logged_lsn,
+                    &applied_lsn,
                     &apply_tx,
                     &mut pending_tails,
                 )
@@ -155,8 +157,8 @@ fn advance_tails(
     }
 }
 
-/// Handle a Commit request: write WAL entry, release permits, publish LSN,
-/// send batch to applier.
+/// Handle a Commit request: write WAL entry, publish LSN, send batch to applier.
+/// If the log is full, waits for the applier to drain space and retries.
 async fn handle_commit<F: AsyncFile>(
     txn: Transaction,
     file: &Arc<F>,
@@ -164,10 +166,10 @@ async fn handle_commit<F: AsyncFile>(
     flush_sequencer: &Arc<FlushSequencer>,
     log_permits: &LogPermits,
     logged_lsn: &LsnWatermark,
+    applied_lsn: &LsnWatermark,
     apply_tx: &mesh::Sender<ApplyBatch>,
     pending_tails: &mut Vec<PendingTail>,
 ) {
-    let page_count = txn.pages.len();
     let lsn = txn.lsn;
 
     // Ensure pre_log_fsn constraint is met before logging.
@@ -179,38 +181,65 @@ async fn handle_commit<F: AsyncFile>(
         }
     }
 
-    // Write WAL entry.
-    match write_log_entry(file, log_writer, flush_sequencer, &txn.pages).await {
-        Ok(()) => {
-            // Permits were already released by the cache at commit time.
-            // Publish that this LSN is durable in the log.
-            logged_lsn.advance(lsn);
-
-            let new_tail = log_writer.head();
-
-            // Send to applier for background apply.
-            let apply_pages = txn
-                .pages
-                .into_iter()
-                .map(|p| ApplyPage {
-                    file_offset: p.file_offset,
-                    data: p.data,
-                })
-                .collect();
-
-            apply_tx.send(ApplyBatch {
-                pages: apply_pages,
-                lsn,
-                new_tail,
-            });
-
-            pending_tails.push(PendingTail { lsn, new_tail });
-        }
-        Err(e) => {
-            tracing::error!("VHDX log task: WAL write failed: {e}");
-            log_permits.fail(format!("WAL write failed: {e}"));
+    // Write WAL entry, retrying if the log is full.
+    loop {
+        match write_log_entry(file, log_writer, flush_sequencer, &txn.pages).await {
+            Ok(()) => break,
+            Err(VhdxError::Corrupt(CorruptionType::LogFull)) => {
+                // Wait for the oldest pending batch to be applied so we
+                // can advance the tail and free log space.
+                if let Some(front) = pending_tails.first() {
+                    let target = front.lsn;
+                    if let Err(e) = applied_lsn.wait_for(target).await {
+                        tracing::error!("VHDX log task: wait for apply failed while log full: {e}");
+                        log_permits.fail(format!("wait for apply failed: {e}"));
+                        return;
+                    }
+                    advance_tails(pending_tails, applied_lsn, log_writer);
+                } else {
+                    // No pending tails — log is genuinely too small for
+                    // this single batch. This is a fatal configuration error.
+                    tracing::error!(
+                        "VHDX log task: log too small for batch of {} pages",
+                        txn.pages.len()
+                    );
+                    log_permits.fail(format!(
+                        "log too small for batch of {} pages",
+                        txn.pages.len()
+                    ));
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::error!("VHDX log task: WAL write failed: {e}");
+                log_permits.fail(format!("WAL write failed: {e}"));
+                return;
+            }
         }
     }
+
+    // Publish that this LSN is durable in the log.
+    logged_lsn.advance(lsn);
+
+    let new_tail = log_writer.head();
+
+    // Send to applier for background apply.
+    let apply_pages = txn
+        .pages
+        .into_iter()
+        .map(|p| ApplyPage {
+            file_offset: p.file_offset,
+            data: p.data,
+        })
+        .collect();
+
+    apply_tx.send(ApplyBatch {
+        pages: apply_pages,
+        lsn,
+        new_tail,
+    });
+
+    pending_tails.push(PendingTail { lsn, new_tail });
 }
 
 /// Write a log entry for the given pages.

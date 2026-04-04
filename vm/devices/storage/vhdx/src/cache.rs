@@ -124,8 +124,9 @@ struct PageMap {
 enum PendingAction {
     /// Wait for another task to finish loading/acquiring.
     Wait(event_listener::EventListener),
-    /// Load page data from disk at this file offset.
-    Load(u64),
+    /// Load page data from disk at this file offset. Carries the page
+    /// entry Arc so `complete_load` can skip the map re-lookup.
+    Load(u64, Arc<Mutex<PageData>>),
 }
 
 /// Action for acquire_write when the page isn't ready.
@@ -133,10 +134,12 @@ enum PendingAction {
 enum WritePendingAction {
     /// Wait for another task to finish loading/acquiring.
     Wait(event_listener::EventListener),
-    /// Load page data from disk at this file offset.
-    Load(u64),
-    /// Acquire a log permit.
-    AcquirePermit,
+    /// Load page data from disk at this file offset. Carries the page
+    /// entry Arc so `complete_load` can skip the map re-lookup.
+    Load(u64, Arc<Mutex<PageData>>),
+    /// Acquire a log permit. Carries the page entry Arc so
+    /// `finalize_permit` can skip the map re-lookup.
+    AcquirePermit(Arc<Mutex<PageData>>),
     /// Dirty batch was full and has been committed. Retry from the top.
     Retry,
 }
@@ -268,12 +271,12 @@ impl<F: AsyncFile> PageCache<F> {
             };
             match action {
                 PendingAction::Wait(listener) => listener.await,
-                PendingAction::Load(file_offset) => {
+                PendingAction::Load(file_offset, entry) => {
                     let mut buf = [0u8; PAGE_SIZE];
                     match self.file.read_at(file_offset, &mut buf).await {
-                        Ok(()) => self.complete_load(key, Some(buf)),
+                        Ok(()) => self.complete_load(key, entry, Some(buf)),
                         Err(e) => {
-                            self.complete_load(key, None);
+                            self.complete_load(key, entry, None);
                             return Err(e);
                         }
                     }
@@ -317,7 +320,7 @@ impl<F: AsyncFile> PageCache<F> {
         if created {
             // We created this entry in Loading state. Load it.
             drop(guard);
-            return Err(PendingAction::Load(file_offset));
+            return Err(PendingAction::Load(file_offset, entry));
         }
 
         match guard.state {
@@ -340,32 +343,35 @@ impl<F: AsyncFile> PageCache<F> {
     /// Complete a page load: store data and transition out of Loading.
     ///
     /// On success (`data` is `Some`): stores data, transitions `Loading → Clean`.
+    /// Uses the `entry` Arc directly — no map re-lookup needed.
+    ///
     /// On failure (`data` is `None`): removes the entry from the cache so the
     /// next acquirer creates a fresh entry and retries.
-    fn complete_load(&self, key: PageKey, data: Option<[u8; PAGE_SIZE]>) {
-        let mut pages = self.pages.lock();
-        if let Some(entry) = pages.map.get(&key) {
-            let mut page = entry.lock();
+    fn complete_load(
+        &self,
+        key: PageKey,
+        entry: Arc<Mutex<PageData>>,
+        data: Option<[u8; PAGE_SIZE]>,
+    ) {
+        let mut page = entry.lock();
+        assert!(
+            page.state == PageState::Loading,
+            "complete_load called but page state is {:?}, expected Loading",
+            page.state
+        );
+        if let Some(buf) = data {
             assert!(
-                page.state == PageState::Loading,
-                "complete_load called but page state is {:?}, expected Loading",
-                page.state
+                page.data.is_none(),
+                "complete_load called but page already has data"
             );
-            if let Some(buf) = data {
-                assert!(
-                    page.data.is_none(),
-                    "complete_load called but page already has data"
-                );
-                page.data = Some(Arc::new(buf));
-                page.state = PageState::Clean;
-            } else {
-                // Load failed. Remove the entry so the next acquirer
-                // starts fresh. Don't leave a Clean entry with no data.
-                drop(page);
-                pages.map.remove(&key);
-            }
+            page.data = Some(Arc::new(buf));
+            page.state = PageState::Clean;
+        } else {
+            // Load failed. Remove the entry so the next acquirer
+            // starts fresh. Don't leave a Clean entry with no data.
+            drop(page);
+            self.pages.lock().map.remove(&key);
         }
-        drop(pages);
         self.state_event.notify(usize::MAX);
     }
 
@@ -387,20 +393,20 @@ impl<F: AsyncFile> PageCache<F> {
             };
             match action {
                 WritePendingAction::Wait(listener) => listener.await,
-                WritePendingAction::Load(file_offset) => {
+                WritePendingAction::Load(file_offset, entry) => {
                     let mut buf = [0u8; PAGE_SIZE];
                     match self.file.read_at(file_offset, &mut buf).await {
-                        Ok(()) => self.complete_load(key, Some(buf)),
+                        Ok(()) => self.complete_load(key, entry, Some(buf)),
                         Err(e) => {
-                            self.complete_load(key, None);
+                            self.complete_load(key, entry, None);
                             return Err(e);
                         }
                     }
                 }
-                WritePendingAction::AcquirePermit => {
+                WritePendingAction::AcquirePermit(entry) => {
                     let permits = self.log_permits.as_ref().unwrap();
                     let result = permits.acquire(1).await;
-                    self.finalize_permit(key, result.is_ok())?;
+                    self.finalize_permit(entry, result.is_ok());
                     result.map_err(|e| match e {
                         VhdxError::Io(io) => io,
                         other => std::io::Error::other(other.to_string()),
@@ -458,7 +464,7 @@ impl<F: AsyncFile> PageCache<F> {
             if load {
                 drop(guard);
                 drop(pages);
-                return Err(WritePendingAction::Load(file_offset));
+                return Err(WritePendingAction::Load(file_offset, entry));
             } else {
                 guard.data = Some(Arc::new([0u8; PAGE_SIZE]));
                 guard.state = PageState::Clean;
@@ -506,7 +512,7 @@ impl<F: AsyncFile> PageCache<F> {
                 guard.state = PageState::AcquiringPermit;
                 drop(guard);
                 drop(pages);
-                Err(WritePendingAction::AcquirePermit)
+                Err(WritePendingAction::AcquirePermit(entry))
             }
         }
     }
@@ -514,23 +520,20 @@ impl<F: AsyncFile> PageCache<F> {
     /// Finalize a permit acquisition: transition page to HasPermit or Clean.
     /// The dirty_count increment is under the map lock, synchronized with
     /// commit_locked which also holds the map lock when collecting dirty pages.
-    fn finalize_permit(&self, key: PageKey, success: bool) -> Result<(), std::io::Error> {
+    fn finalize_permit(&self, entry: Arc<Mutex<PageData>>, success: bool) {
         let mut pages = self.pages.lock();
-
-        if let Some(entry) = pages.map.get(&key).cloned() {
-            let mut page = entry.lock();
-            if page.state == PageState::AcquiringPermit {
-                if success {
-                    page.state = PageState::HasPermit;
-                    pages.dirty_count += 1;
-                } else {
-                    page.state = PageState::Clean;
-                }
+        let mut page = entry.lock();
+        if page.state == PageState::AcquiringPermit {
+            if success {
+                page.state = PageState::HasPermit;
+                pages.dirty_count += 1;
+            } else {
+                page.state = PageState::Clean;
             }
         }
+        drop(page);
         drop(pages);
         self.state_event.notify(usize::MAX);
-        Ok(())
     }
 
     /// Set the pre-log FSN on a specific page.
@@ -612,10 +615,10 @@ impl<F: AsyncFile> PageCache<F> {
             pre_log_fsn: max_pre_log_fsn,
         }));
 
-        // Release permits now — the batch has been sent. This allows
-        // the next acquire_write to proceed immediately rather than
-        // blocking on the log task (which may not run until we yield
-        // on a single-threaded executor).
+        // Release permits now — permits bound dirty page count, not log
+        // space. The pages are no longer dirty (transitioned to Clean
+        // above), so the permits are available for the next batch. The
+        // log task handles its own space management via LogFull retry.
         if let Some(ref permits) = self.log_permits {
             permits.release(committed_count);
         }

@@ -60,7 +60,82 @@ pub(crate) struct Transaction {
     /// writing the WAL entry.
     pub pre_log_fsn: Option<u64>,
 }
+/// Client-side handle for sending transactions to the log task.
+///
+/// Couples the `Sender<LogRequest>` with the LSN counter so that
+/// LSN assignment and channel send are always atomic. All methods
+/// take `&mut self` — the caller (cache's `PageMap` lock) provides
+/// exclusivity.
+pub(crate) struct LogClient {
+    sender: mesh::Sender<LogRequest>,
+    current_lsn: u64,
+}
 
+impl LogClient {
+    /// Create a new log client wrapping the given sender.
+    pub fn new(sender: mesh::Sender<LogRequest>) -> Self {
+        Self {
+            sender,
+            current_lsn: 0,
+        }
+    }
+
+    /// Returns the most recently committed LSN (0 if none).
+    pub fn current_lsn(&self) -> u64 {
+        self.current_lsn
+    }
+
+    /// Begin a new transaction. The returned [`LogTransaction`] borrows
+    /// `self` mutably, preventing interleaved transactions.
+    ///
+    /// The LSN is not assigned until [`LogTransaction::commit()`] is
+    /// called. Dropping the transaction without committing is a no-op.
+    pub fn begin(&mut self) -> LogTransaction<'_> {
+        LogTransaction { client: self }
+    }
+
+    /// Send a graceful close request to the log task and wait for
+    /// it to finish processing all pending batches.
+    ///
+    /// Consumes the client (drops the sender after the RPC completes).
+    pub async fn close(self) -> Result<(), VhdxError> {
+        use mesh::rpc::RpcSend;
+        self.sender
+            .call(LogRequest::Close, ())
+            .await
+            .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?
+    }
+}
+
+/// An in-progress log transaction. Borrows the [`LogClient`] mutably
+/// to prevent interleaved sends.
+///
+/// Call [`commit()`](Self::commit) to assign an LSN and send the
+/// transaction to the log task. Dropping without committing is safe
+/// and does not advance the LSN.
+pub(crate) struct LogTransaction<'a> {
+    client: &'a mut LogClient,
+}
+
+impl LogTransaction<'_> {
+    /// The LSN that will be assigned if this transaction is committed.
+    pub fn lsn(&self) -> u64 {
+        self.client.current_lsn + 1
+    }
+
+    /// Commit the transaction: assign the next LSN and send it to the
+    /// log task. Consumes the transaction.
+    pub fn commit(self, pages: Vec<CommittedPage>, pre_log_fsn: Option<u64>) -> u64 {
+        self.client.current_lsn += 1;
+        let lsn = self.client.current_lsn;
+        self.client.sender.send(LogRequest::Commit(Transaction {
+            lsn,
+            pages,
+            pre_log_fsn,
+        }));
+        lsn
+    }
+}
 /// Tracks a batch that has been sent to the applier but whose tail
 /// hasn't been advanced yet.
 struct PendingTail {

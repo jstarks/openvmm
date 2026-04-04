@@ -25,8 +25,9 @@ pub(crate) struct ParsedRegions {
     pub metadata_offset: u64,
     /// Length of the metadata region in bytes.
     pub metadata_length: u32,
-    /// True if the two region tables don't match and should be rewritten.
-    pub needs_rewrite: bool,
+    /// The validated region table bytes. Present only when the two on-disk
+    /// copies don't match and need rewriting.
+    pub rewrite_data: Option<Vec<u8>>,
 }
 
 /// Read and validate a single 64 KiB region table from the file.
@@ -161,8 +162,35 @@ pub(crate) async fn parse_region_tables(file: &impl AsyncFile) -> Result<ParsedR
         bat_length,
         metadata_offset,
         metadata_length,
-        needs_rewrite,
+        rewrite_data: if needs_rewrite {
+            Some(table_buf.clone())
+        } else {
+            None
+        },
     })
+}
+
+/// Write the region table to both on-disk slots and flush.
+///
+/// Called during `open_writable` when one region table was corrupt or
+/// the two copies didn't match. Writes the validated table to both
+/// offsets so that a subsequent single-table corruption doesn't lose
+/// the file.
+pub(crate) async fn rewrite_region_tables(
+    file: &impl AsyncFile,
+    table: &[u8],
+) -> Result<(), VhdxError> {
+    assert_eq!(
+        table.len(),
+        format::REGION_TABLE_SIZE as usize,
+        "region table must be exactly {} bytes",
+        format::REGION_TABLE_SIZE
+    );
+    file.write_at(format::REGION_TABLE_OFFSET, table).await?;
+    file.write_at(format::ALT_REGION_TABLE_OFFSET, table)
+        .await?;
+    file.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -184,7 +212,7 @@ mod tests {
             format::DEFAULT_METADATA_REGION_SIZE
         );
         assert_eq!(regions.bat_offset, 3 * format::MB1);
-        assert!(!regions.needs_rewrite);
+        assert!(regions.rewrite_data.is_none());
     }
 
     #[async_test]
@@ -202,7 +230,7 @@ mod tests {
             .unwrap();
 
         let regions = parse_region_tables(&file).await.unwrap();
-        assert!(regions.needs_rewrite);
+        assert!(regions.rewrite_data.is_some());
         // Should still parse successfully using table 2.
         assert_eq!(regions.metadata_offset, 2 * format::MB1);
     }
@@ -330,5 +358,51 @@ mod tests {
                 CorruptionType::OffsetOrLengthInRegionTable
             ))
         ));
+    }
+
+    #[async_test]
+    async fn rewrite_repairs_corrupt_table() {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+
+        // Save the good table contents.
+        let mut good_table = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        file.read_at(format::REGION_TABLE_OFFSET, &mut good_table)
+            .await
+            .unwrap();
+
+        // Corrupt the first region table.
+        let mut buf = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        file.read_at(format::REGION_TABLE_OFFSET, &mut buf)
+            .await
+            .unwrap();
+        buf[10] ^= 0xFF;
+        file.write_at(format::REGION_TABLE_OFFSET, &buf)
+            .await
+            .unwrap();
+
+        // Parse — should detect mismatch and return rewrite_data.
+        let regions = parse_region_tables(&file).await.unwrap();
+        let rewrite_data = regions.rewrite_data.expect("should need rewrite");
+
+        // Rewrite both tables.
+        rewrite_region_tables(&file, &rewrite_data).await.unwrap();
+
+        // Parse again — both should match now.
+        let regions2 = parse_region_tables(&file).await.unwrap();
+        assert!(
+            regions2.rewrite_data.is_none(),
+            "tables should match after rewrite"
+        );
+
+        // Verify both on-disk copies are identical.
+        let mut t1 = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        let mut t2 = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        file.read_at(format::REGION_TABLE_OFFSET, &mut t1)
+            .await
+            .unwrap();
+        file.read_at(format::ALT_REGION_TABLE_OFFSET, &mut t2)
+            .await
+            .unwrap();
+        assert_eq!(t1, t2, "both region tables should be identical");
     }
 }

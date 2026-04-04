@@ -303,19 +303,16 @@ impl<F: AsyncFile> VhdxFile<F> {
             return Ok(());
         }
 
-        // 6. Enable write mode (unless skip_write_guid_change AND mode
-        //    skips write guid).
-        // LOCK AUDIT: No synchronous locks held. enable_write_mode acquires/drops write_state internally.
+        // 6. Enable write mode.
+        // All trim modes modify the file (BAT entries), so FileWritable
+        // is always needed. DataWritable is additionally needed when the
+        // mode changes user-visible data (everything except
+        // RemoveSoftAnchors) and the caller hasn't opted out.
         if !skip_write_guid_change && !mode_skips_write_guid(mode) {
             self.enable_write_mode(WriteMode::DataWritable).await?;
-        } else if !mode_skips_write_guid(mode) {
-            // Mode changes data but caller asked to skip guid — still need
-            // file-writable mode.
+        } else {
             self.enable_write_mode(WriteMode::FileWritable).await?;
         }
-        // RemoveSoftAnchors is metadata-only; FileWritable is needed if
-        // we actually modify any BAT entries. We'll enable lazily below
-        // only if we find a block to change.
 
         // 7. Compute effective length: if trim extends to exactly disk_size,
         //    round up to cover the full last block.
@@ -392,25 +389,19 @@ impl<F: AsyncFile> VhdxFile<F> {
                 }
             };
 
-            // 9c. Enable write mode lazily for RemoveSoftAnchors.
-            // LOCK AUDIT: No synchronous locks held (bat_state read-lock from scan_result dropped).
-            if mode_skips_write_guid(mode) {
-                self.enable_write_mode(WriteMode::FileWritable).await?;
-            }
-
-            // 9d. Update in-memory BAT under write lock.
+            // 9c. Update in-memory BAT under write lock.
             {
                 let mut bat_state = self.bat_state.write();
                 bat_state.set_payload_mapping(&self.bat, block_number, new_mapping);
                 bat_state.mark_bat_page_dirty(&self.bat, BlockType::Payload, block_number);
             }
 
-            // 9e. Write BAT entry to cache (async).
+            // 9d. Write BAT entry to cache (async).
             // LOCK AUDIT: bat_state write-lock dropped in step 9d block. No sync locks held.
             self.write_bat_entry_to_cache(BlockType::Payload, block_number, new_mapping)
                 .await?;
 
-            // 9f. Handle space management based on old→new transition.
+            // 9e. Handle space management based on old→new transition.
             let old_anchored = is_soft_anchored(old_mapping);
             let new_anchored = is_soft_anchored(new_mapping);
             let old_file_mb = old_mapping.file_megabyte();

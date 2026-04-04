@@ -32,8 +32,7 @@ use crate::AsyncFile;
 use crate::error::VhdxError;
 use crate::log_permits::LogPermits;
 use crate::log_task::CommittedPage;
-use crate::log_task::LogRequest;
-use crate::log_task::Transaction;
+use crate::log_task::LogClient;
 use crate::lsn_watermark::LsnWatermark;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -119,7 +118,8 @@ struct PageMap {
     /// Number of pages in `HasPermit` or `Dirty` state.
     /// Maintained under the map lock to prevent races.
     dirty_count: usize,
-    current_lsn: u64,
+    /// Log client for sending transactions. `None` for read-only caches.
+    log_client: Option<LogClient>,
 }
 
 /// Action to perform when a page isn't ready (returned by sync helpers).
@@ -152,7 +152,6 @@ pub struct PageCache<F: AsyncFile> {
     pub(crate) file: Arc<F>,
     pages: Mutex<PageMap>,
     tags: Mutex<HashMap<u8, u64>>,
-    log_sender: Option<mesh::Sender<LogRequest>>,
     log_permits: Option<Arc<LogPermits>>,
     applied_lsn: Option<Arc<LsnWatermark>>,
     /// Notified when a page transitions out of `Loading` or `AcquiringPermit`.
@@ -165,7 +164,7 @@ impl<F: AsyncFile> PageCache<F> {
     /// Create a new cache backed by the given file.
     pub fn new(
         file: Arc<F>,
-        log_sender: Option<mesh::Sender<LogRequest>>,
+        log_client: Option<LogClient>,
         log_permits: Option<Arc<LogPermits>>,
         applied_lsn: Option<Arc<LsnWatermark>>,
         quota: usize,
@@ -175,10 +174,9 @@ impl<F: AsyncFile> PageCache<F> {
             pages: Mutex::new(PageMap {
                 map: HashMap::new(),
                 dirty_count: 0,
-                current_lsn: 0,
+                log_client,
             }),
             tags: Mutex::new(HashMap::new()),
-            log_sender,
             log_permits,
             applied_lsn,
             state_event: event_listener::Event::new(),
@@ -186,9 +184,9 @@ impl<F: AsyncFile> PageCache<F> {
         }
     }
 
-    /// Take the log sender out of the cache, returning it.
-    pub fn take_log_sender(&mut self) -> Option<mesh::Sender<LogRequest>> {
-        self.log_sender.take()
+    /// Take the log client out of the cache, returning it.
+    pub fn take_log_client(&mut self) -> Option<LogClient> {
+        self.pages.lock().log_client.take()
     }
 
     /// Set the log permits (for late initialization after log task spawn).
@@ -566,20 +564,36 @@ impl<F: AsyncFile> PageCache<F> {
         self.commit_locked(&mut pages)
     }
 
+    /// Send pre-built pages through the log, bypassing the cache's
+    /// dirty-page tracking. Used for non-cache metadata writes
+    /// (e.g., region table repair).
+    ///
+    /// Returns the assigned LSN.
+    pub fn commit_raw(&self, raw_pages: Vec<CommittedPage>, pre_log_fsn: Option<u64>) -> u64 {
+        let mut map = self.pages.lock();
+        let client = map
+            .log_client
+            .as_mut()
+            .expect("commit_raw requires a log client (use open_writable)");
+        let txn = client.begin();
+        txn.commit(raw_pages, pre_log_fsn)
+    }
+
     /// Inner commit implementation that takes an already-held map lock.
     ///
     /// This allows `finalize_permit` to check dirty_count and commit
     /// atomically under the same lock — no TOCTOU gap.
     fn commit_locked(&self, pages: &mut PageMap) -> Result<u64, VhdxError> {
-        let log_sender = self
-            .log_sender
-            .as_ref()
-            .expect("commit requires a log sender (use open_writable)");
-
-        let lsn = pages.current_lsn + 1;
+        let client = pages
+            .log_client
+            .as_mut()
+            .expect("commit requires a log client (use open_writable)");
 
         let mut committed = Vec::new();
         let mut max_pre_log_fsn: Option<u64> = None;
+
+        let txn = client.begin();
+        let lsn = txn.lsn();
 
         for (&key, entry) in pages.map.iter() {
             let mut page = entry.lock();
@@ -598,18 +612,14 @@ impl<F: AsyncFile> PageCache<F> {
         }
 
         if committed.is_empty() {
-            return Ok(pages.current_lsn);
+            drop(txn);
+            return Ok(client.current_lsn());
         }
 
         let committed_count = committed.len();
         pages.dirty_count -= committed_count;
-        pages.current_lsn = lsn;
 
-        log_sender.send(LogRequest::Commit(Transaction {
-            lsn,
-            pages: committed,
-            pre_log_fsn: max_pre_log_fsn,
-        }));
+        txn.commit(committed, max_pre_log_fsn);
 
         // Do NOT release permits here. Permits stay consumed until the
         // apply task writes pages to their final offsets and releases
@@ -699,6 +709,7 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_task::LogRequest;
     use crate::tests::support::{FailingInterceptor, InMemoryFile};
     use pal_async::async_test;
     use std::sync::Arc;
@@ -707,7 +718,13 @@ mod tests {
     fn writable_cache(file: InMemoryFile) -> (PageCache<InMemoryFile>, mesh::Receiver<LogRequest>) {
         let (tx, rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
-        let cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, 0);
+        let cache = PageCache::new(
+            Arc::new(file),
+            Some(LogClient::new(tx)),
+            Some(permits),
+            None,
+            0,
+        );
         (cache, rx)
     }
 
@@ -739,7 +756,13 @@ mod tests {
         file.write_at(0, &pattern).await.unwrap();
         let (tx, _rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
-        cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, 0);
+        cache = PageCache::new(
+            Arc::new(file),
+            Some(LogClient::new(tx)),
+            Some(permits),
+            None,
+            0,
+        );
         cache.register_tag(0, 0);
 
         {
@@ -776,7 +799,13 @@ mod tests {
 
         let (tx, _rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
-        let mut cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, 0);
+        let mut cache = PageCache::new(
+            Arc::new(file),
+            Some(LogClient::new(tx)),
+            Some(permits),
+            None,
+            0,
+        );
         cache.register_tag(0, 0);
 
         {
@@ -823,7 +852,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -860,7 +889,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -898,7 +927,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 4)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -1001,7 +1030,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -1032,7 +1061,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -1070,7 +1099,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -1110,7 +1139,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 200)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -1153,7 +1182,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 200)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -1180,7 +1209,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 200)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             0,
@@ -1314,7 +1343,13 @@ mod tests {
         let (tx, _rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
         // Quota of 1, but page 0 will be dirty.
-        let mut cache = PageCache::new(Arc::new(file), Some(tx), Some(permits), None, 1);
+        let mut cache = PageCache::new(
+            Arc::new(file),
+            Some(LogClient::new(tx)),
+            Some(permits),
+            None,
+            1,
+        );
         cache.register_tag(0, 0);
 
         // Write page A (makes it Dirty).
@@ -1364,7 +1399,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(file),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             Some(applied.clone()),
             1,
@@ -1430,7 +1465,7 @@ mod tests {
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 10)),
-            Some(tx),
+            Some(LogClient::new(tx)),
             Some(permits),
             None,
             2,

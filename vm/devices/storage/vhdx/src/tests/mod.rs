@@ -42,7 +42,7 @@ mod integration {
 
         // 2. Parse region tables.
         let regions = region::parse_region_tables(&file).await.unwrap();
-        assert!(!regions.needs_rewrite);
+        assert!(regions.rewrite_data.is_none());
         assert!(regions.bat_offset > 0);
         assert!(regions.metadata_offset > 0);
 

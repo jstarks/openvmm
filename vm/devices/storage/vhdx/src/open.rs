@@ -151,14 +151,15 @@ pub struct VhdxFile<F: AsyncFile> {
     // Mode
     pub(crate) read_only: bool,
 
+    /// Region table bytes to rewrite (set when the two on-disk copies
+    /// don't match). Consumed by `open_writable`.
+    region_rewrite_data: Option<Vec<u8>>,
+
     // Error state: once set, all operations fail.
     #[allow(dead_code)] // Phase 7+: used for error propagation on I/O path
     failed: Option<VhdxError>,
 
     // Log task state (set when opened writable via open_writable).
-    /// Sender for log requests. `None` for read-only files or files opened
-    /// without a log task.
-    pub(crate) log_sender: Option<mesh::Sender<LogRequest>>,
     /// Handle to the spawned log task. `None` if no log task is running.
     log_task: Option<pal_async::task::Task<()>>,
     /// Flush sequencer for FSN-gated ordering. `None` for read-only files.
@@ -280,7 +281,13 @@ impl<F: AsyncFile> VhdxFile<F> {
         let file = Arc::new(file);
 
         // 12. Create PageCache and register tags.
-        let mut cache = PageCache::new(file.clone(), log_sender, None, None, 0);
+        let mut cache = PageCache::new(
+            file.clone(),
+            log_sender.map(crate::log_task::LogClient::new),
+            None,
+            None,
+            0,
+        );
         cache.register_tag(BAT_TAG, regions.bat_offset);
         cache.register_tag(METADATA_TAG, regions.metadata_offset);
         cache.register_tag(SBM_TAG, 0);
@@ -338,9 +345,9 @@ impl<F: AsyncFile> VhdxFile<F> {
             log_offset: header.log_offset,
             log_length: header.log_length,
             read_only,
+            region_rewrite_data: regions.rewrite_data,
             failed: None,
 
-            log_sender: None,
             log_task: None,
             flush_sequencer: None,
             log_permits: None,
@@ -386,6 +393,11 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         // sender at construction time.
         let (tx, rx) = mesh::channel::<LogRequest>();
         let mut vhdx = Self::open_inner(file, false, Some(tx.clone())).await?;
+
+        // Repair mismatched region tables before any writes.
+        if let Some(table_data) = vhdx.region_rewrite_data.take() {
+            crate::region::rewrite_region_tables(&*vhdx.file, &table_data).await?;
+        }
 
         // Create shared state for log task communication.
         let flush_sequencer = Arc::new(FlushSequencer::new());
@@ -487,7 +499,6 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
         vhdx.cache.set_log_permits(log_permits.clone());
         vhdx.cache.set_applied_lsn(applied_lsn.clone());
 
-        vhdx.log_sender = Some(tx);
         vhdx.log_task = Some(task);
         vhdx.apply_task = Some(apply_task);
         vhdx.flush_sequencer = Some(flush_sequencer);
@@ -510,28 +521,21 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
     pub async fn close(mut self) -> Result<(), VhdxError> {
         use mesh::rpc::RpcSend;
 
-        if self.log_sender.is_some() {
+        if self.log_task.is_some() {
             // Ship any remaining dirty pages to the log task.
             // This is fire-and-forget — the Close RPC below will
             // process after this batch due to channel ordering.
             self.cache.commit()?;
 
-            // Take the sender out of the cache so the channel can close.
-            let sender = self
+            // Take the log client out of the cache to get the sender.
+            let client = self
                 .cache
-                .take_log_sender()
-                .expect("log_sender disappeared");
-            self.log_sender.take();
+                .take_log_client()
+                .expect("log client disappeared");
 
             // Send Close RPC — the log task will log+apply all pending
             // batches, then respond.
-            let result = sender
-                .call(LogRequest::Close, ())
-                .await
-                .map_err(|_| VhdxError::Io(std::io::Error::other("log task closed")))?;
-            result?;
-
-            drop(sender);
+            client.close().await?;
 
             if let Some(task) = self.log_task.take() {
                 task.await;
@@ -559,9 +563,8 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
     /// the log task (including its `Arc<F>`) is released, but no new I/O
     /// is issued.
     pub async fn abort(mut self) {
-        // Drop both senders so the log task's recv() returns Err.
-        self.log_sender.take();
-        self.cache.take_log_sender();
+        // Drop the log client so the log task's recv() returns Err.
+        self.cache.take_log_client();
 
         // Wait for the log task to notice the closed channel and exit.
         // The log task dropping its apply_tx closes the apply channel too.
@@ -960,40 +963,36 @@ impl<F: AsyncFile> VhdxFile<F> {
     ///
     /// Uses the write state to determine the current sequence number and
     /// header slot, then writes to the non-current slot and flushes.
-    async fn write_clean_header(&self) -> Result<(), VhdxError> {
-        let (header_buf, header_offset) = {
-            let mut state = self.write_state.lock();
-            state.sequence_number += 1;
-            state.log_guid = Guid::ZERO;
+    async fn write_clean_header(&mut self) -> Result<(), VhdxError> {
+        let state = self.write_state.get_mut();
+        state.sequence_number += 1;
+        state.log_guid = Guid::ZERO;
 
-            let mut header = Header::new_zeroed();
-            header.signature = format::HEADER_SIGNATURE;
-            header.sequence_number = state.sequence_number;
-            header.file_write_guid = state.file_write_guid;
-            header.data_write_guid = state.data_write_guid;
-            header.log_guid = Guid::ZERO;
-            header.log_version = format::LOG_VERSION;
-            header.version = format::VERSION_1;
-            header.log_length = self.log_length;
-            header.log_offset = self.log_offset;
-            header.checksum = 0;
+        let mut header = Header::new_zeroed();
+        header.signature = format::HEADER_SIGNATURE;
+        header.sequence_number = state.sequence_number;
+        header.file_write_guid = state.file_write_guid;
+        header.data_write_guid = state.data_write_guid;
+        header.log_guid = Guid::ZERO;
+        header.log_version = format::LOG_VERSION;
+        header.version = format::VERSION_1;
+        header.log_length = self.log_length;
+        header.log_offset = self.log_offset;
+        header.checksum = 0;
 
-            let mut buf = vec![0u8; format::HEADER_SIZE as usize];
-            let hdr_bytes = header.as_bytes();
-            buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
-            let crc = format::compute_checksum(&buf, 4);
-            buf[4..8].copy_from_slice(&crc.to_le_bytes());
+        let mut buf = vec![0u8; format::HEADER_SIZE as usize];
+        let hdr_bytes = header.as_bytes();
+        buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
+        let crc = format::compute_checksum(&buf, 4);
+        buf[4..8].copy_from_slice(&crc.to_le_bytes());
 
-            let offset = if state.first_header_current {
-                format::HEADER_OFFSET_2
-            } else {
-                format::HEADER_OFFSET_1
-            };
-
-            (buf, offset)
+        let header_offset = if state.first_header_current {
+            format::HEADER_OFFSET_2
+        } else {
+            format::HEADER_OFFSET_1
         };
 
-        self.file.write_at(header_offset, &header_buf).await?;
+        self.file.write_at(header_offset, &buf).await?;
 
         if let Some(seq) = &self.flush_sequencer {
             seq.flush(self.file.as_ref()).await?;
@@ -1001,10 +1000,8 @@ impl<F: AsyncFile> VhdxFile<F> {
             self.file.flush().await?;
         }
 
-        {
-            let mut state = self.write_state.lock();
-            state.first_header_current = !state.first_header_current;
-        }
+        self.write_state.get_mut().first_header_current =
+            !self.write_state.get_mut().first_header_current;
 
         Ok(())
     }

@@ -136,7 +136,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     pub async fn complete(mut self) -> Result<(), VhdxError> {
         self.completed = true;
         self.vhdx
-            .complete_write_inner(self.offset, self.len, true, self.needs_flush_before_log)
+            .complete_write_inner(self.offset, self.len, self.needs_flush_before_log)
             .await
     }
 }

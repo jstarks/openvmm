@@ -18,7 +18,7 @@ use crate::io_guard::ReadIoGuard;
 use crate::io_guard::WriteIoGuard;
 use crate::open::VhdxFile;
 use crate::open::WriteMode;
-use crate::sector_bitmap;
+use crate::space::AllocateFlags;
 
 /// Resolved range from a read operation.
 ///
@@ -134,12 +134,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                     });
                 }
                 BatEntryState::PartiallyPresent => {
-                    sector_bitmap::resolve_partial_block_read(
-                        &self.cache,
-                        self,
+                    self.resolve_partial_block_read(
                         mapping.file_offset,
-                        self.block_size,
-                        self.logical_sector_size,
                         virtual_offset,
                         block_length,
                         ranges,
@@ -485,14 +481,13 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // If the block is currently soft-anchored (trimmed
                         // with file space preserved), try to reclaim its own
                         // space first — matching `Vhd2iAllocateDataBlock` in
-                        // the C code. This is `is_safe_data = true` because
+                        // the C code. This is `SpaceState::OwnStale` because
                         // the space still contains this block's own old
                         // data, so a power failure after BAT commit but
                         // before data write would only expose the block's
                         // own stale data — no cross-block leak.
                         let original = internal;
-                        let (new_offset, is_safe_data) = if crate::trim::is_soft_anchored(internal)
-                        {
+                        let (new_offset, space_state) = if crate::trim::is_soft_anchored(internal) {
                             let old_file_offset = internal.file_megabyte() as u64 * MB1;
                             if self
                                 .free_space
@@ -504,18 +499,22 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 .is_ok()
                             {
                                 // Reusing the soft-anchored block's own space.
-                                (old_file_offset, true)
+                                (old_file_offset, crate::space::SpaceState::OwnStale)
                             } else {
                                 // Unmark failed (race) — fall through to
                                 // normal allocation.
                                 // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
-                                let r = self.allocate_space(self.block_size, false).await?;
-                                (r.file_offset, r.is_safe_data)
+                                let r = self
+                                    .allocate_space(self.block_size, AllocateFlags::new())
+                                    .await?;
+                                (r.file_offset, r.state)
                             }
                         } else {
                             // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
-                            let r = self.allocate_space(self.block_size, false).await?;
-                            (r.file_offset, r.is_safe_data)
+                            let r = self
+                                .allocate_space(self.block_size, AllocateFlags::new())
+                                .await?;
+                            (r.file_offset, r.state)
                         };
 
                         if is_full_block {
@@ -541,7 +540,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             });
 
                             // Track unsafe allocations for flush barrier.
-                            if !is_safe_data {
+                            if !space_state.is_safe() {
                                 needs_flush_before_log = true;
                             }
 
@@ -573,16 +572,14 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                                 if sbm_mapping.state != BatEntryState::FullyPresent {
                                     // Allocate 1 MiB for the SBM block.
+                                    // Zero flag ensures stale data is cleared
+                                    // (near-EOF space is already zero).
                                     let sbm_alloc = self
-                                        .allocate_space(crate::bat::SECTOR_BITMAP_BLOCK_SIZE, false)
+                                        .allocate_space(
+                                            crate::bat::SECTOR_BITMAP_BLOCK_SIZE,
+                                            AllocateFlags::new().with_zero(true),
+                                        )
                                         .await?;
-
-                                    // Zero the SBM block — all bits clear = all sectors transparent.
-                                    sector_bitmap::zero_sector_bitmap_block(
-                                        &self.cache,
-                                        sbm_alloc.file_offset,
-                                    )
-                                    .await?;
 
                                     // Update in-memory SBM BAT entry.
                                     let new_sbm = InternalBlockMapping::new()
@@ -634,10 +631,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                             .await?;
 
                             // For non-TFP path: set per-page FSN when
-                            // !is_safe_data. The FSN is captured now (before
+                            // !is_safe. The FSN is captured now (before
                             // the caller writes data), matching the C code's
                             // FreeSpace.RequiredFsn timing.
-                            if !is_safe_data {
+                            if !space_state.is_safe() {
                                 if let Some(fs) = &self.flush_sequencer {
                                     let fsn = fs.current_fsn();
                                     let page_key =
@@ -652,7 +649,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                             // (the sector bitmap tracks presence).
                             // For FullyPresent blocks, zero-fill surround
                             // unless the space is already safe.
-                            if !is_partial_present && block_info.block_offset > 0 && !is_safe_data {
+                            if !is_partial_present
+                                && block_info.block_offset > 0
+                                && !space_state.is_zero()
+                            {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset,
                                     length: block_info.block_offset,
@@ -666,7 +666,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                             });
 
                             let end_offset = block_info.block_offset + block_info.block_length;
-                            if !is_partial_present && end_offset < self.block_size && !is_safe_data
+                            if !is_partial_present
+                                && end_offset < self.block_size
+                                && !space_state.is_zero()
                             {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset + end_offset as u64,
@@ -729,22 +731,19 @@ impl<F: AsyncFile> VhdxFile<F> {
 
     /// Finalize a write operation (internal implementation).
     ///
-    /// Must be called after every successful [`resolve_write()`], regardless
-    /// of whether the data I/O succeeded. Pass `success: false` if the data
-    /// writes failed to revert TFP blocks and unblock concurrent writers.
+    /// Called by [`WriteIoGuard::complete()`] after the caller has written
+    /// data to the resolved ranges.
     ///
-    /// **Success path**: Clears TFP flags, sets state to FullyPresent, writes
-    /// per-entry BAT to cache, notifies waiters. For PartiallyPresent blocks
-    /// (non-TFP, i.e. partial writes to differencing disks), updates sector
-    /// bitmaps.
+    /// Clears TFP flags, sets state to FullyPresent, writes per-entry BAT
+    /// to cache, and notifies waiters. For PartiallyPresent blocks (non-TFP,
+    /// i.e. partial writes to differencing disks), updates sector bitmaps.
     ///
-    /// **Failure path**: Reverts TFP blocks to their original state and
-    /// notifies waiters. Does not write BAT entries to cache.
+    /// The abort path (write failure / guard dropped without `complete()`)
+    /// is handled synchronously by [`abort_write_sync()`].
     pub(crate) async fn complete_write_inner(
         &self,
         offset: u64,
         len: u32,
-        success: bool,
         needs_flush_before_log: bool,
     ) -> Result<(), VhdxError> {
         // Zero-length — nothing to do.
@@ -772,88 +771,43 @@ impl<F: AsyncFile> VhdxFile<F> {
             if internal.transitioning_to_fully_present() {
                 had_tfp = true;
 
-                if success {
-                    // Success: clear TFP, set FullyPresent.
-                    let final_mapping = InternalBlockMapping::new()
-                        .with_state(BatEntryState::FullyPresent as u8)
-                        .with_transitioning_to_fully_present(false)
-                        .with_file_megabyte(internal.file_megabyte());
+                // Clear TFP, set FullyPresent.
+                let final_mapping = InternalBlockMapping::new()
+                    .with_state(BatEntryState::FullyPresent as u8)
+                    .with_transitioning_to_fully_present(false)
+                    .with_file_megabyte(internal.file_megabyte());
 
+                {
+                    let mut bat_state = self.bat_state.write();
+                    bat_state.set_payload_mapping(&self.bat, block_number, final_mapping);
+                }
+
+                // Write per-entry to cache. Errors are deferred so we
+                // can still notify waiters.
+                // LOCK AUDIT: bat_state write-lock dropped (end of prior block). No sync locks held.
+                if bat_write_error.is_none() {
+                    if let Err(e) = self
+                        .write_bat_entry_to_cache(BlockType::Payload, block_number, final_mapping)
+                        .await
                     {
-                        let mut bat_state = self.bat_state.write();
-                        bat_state.set_payload_mapping(&self.bat, block_number, final_mapping);
-                    }
-
-                    // Write per-entry to cache. Errors are deferred so we
-                    // can still notify waiters.
-                    // LOCK AUDIT: bat_state write-lock dropped (end of prior block). No sync locks held.
-                    if bat_write_error.is_none() {
-                        if let Err(e) = self
-                            .write_bat_entry_to_cache(
-                                BlockType::Payload,
-                                block_number,
-                                final_mapping,
-                            )
-                            .await
-                        {
-                            bat_write_error = Some(e);
-                        } else if needs_flush_before_log {
-                            // Capture FSN NOW (after caller's data writes,
-                            // matching C's Vhd2iDereferenceReadWrite →
-                            // Vhd2iGetCurrentFsn timing).
-                            if let Some(fs) = &self.flush_sequencer {
-                                let fsn = fs.current_fsn();
-                                let page_key = self.bat_page_key_for_block(block_number);
-                                self.cache.set_pre_log_fsn(page_key, fsn);
-                            }
+                        bat_write_error = Some(e);
+                    } else if needs_flush_before_log {
+                        // Capture FSN NOW (after caller's data writes,
+                        // matching C's Vhd2iDereferenceReadWrite →
+                        // Vhd2iGetCurrentFsn timing).
+                        if let Some(fs) = &self.flush_sequencer {
+                            let fsn = fs.current_fsn();
+                            let page_key = self.bat_page_key_for_block(block_number);
+                            self.cache.set_pre_log_fsn(page_key, fsn);
                         }
-                    }
-                } else {
-                    // Failure: revert to original state.
-                    // If the original state was PartiallyPresent (block was
-                    // already allocated), keep the file_megabyte.
-                    // Otherwise, restore zero offset.
-                    let original_state = BatEntryState::from_raw(internal.state())
-                        .unwrap_or(BatEntryState::NotPresent);
-                    let reverted = match original_state {
-                        BatEntryState::PartiallyPresent => InternalBlockMapping::new()
-                            .with_state(internal.state())
-                            .with_transitioning_to_fully_present(false)
-                            .with_file_megabyte(internal.file_megabyte()),
-                        _ => {
-                            // Freshly allocated — revert to original state
-                            // with zero offset. Release space back to free pool.
-                            let file_offset = internal.file_megabyte() as u64 * MB1;
-                            if file_offset != 0 {
-                                self.free_space.release(file_offset, self.block_size);
-                            }
-                            InternalBlockMapping::new()
-                                .with_state(internal.state())
-                                .with_transitioning_to_fully_present(false)
-                                .with_file_megabyte(0)
-                        }
-                    };
-
-                    {
-                        let mut bat_state = self.bat_state.write();
-                        bat_state.set_payload_mapping(&self.bat, block_number, reverted);
-                        bat_state.mark_bat_page_dirty(&self.bat, BlockType::Payload, block_number);
                     }
                 }
-            } else if success && self.has_parent {
+            } else if self.has_parent {
                 // Non-TFP PartiallyPresent blocks: update sector bitmaps.
                 let mapping = self.get_block_mapping(block_number);
                 if mapping.state == BatEntryState::PartiallyPresent {
-                    sector_bitmap::set_sector_bitmap_bits(
-                        &self.cache,
-                        self,
-                        virtual_offset,
-                        block_length,
-                        self.logical_sector_size,
-                        self.block_size,
-                        true,
-                    )
-                    .await?;
+                    self.set_sector_bitmap_bits(virtual_offset, block_length, true)
+                        .await?;
                 }
             }
 
@@ -1370,7 +1324,7 @@ mod tests {
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
-        // Should allocate a new block. With is_safe_data (near-EOF or
+        // Should allocate a new block. With SpaceState::Zero (near-EOF
         // extension space), zero padding is skipped — only Data emitted.
         // Writing 4096 bytes at offset 0 in block:
         //   Data(0, 4096, file_offset)
@@ -2328,7 +2282,7 @@ mod tests {
         let block_size = vhdx.block_size() as u64;
 
         // Step 1: Partial write to block 0 at guest_offset=0, len=512.
-        // Allocation comes from near-EOF → is_safe_data = true → no zero ranges.
+        // Allocation comes from near-EOF → SpaceState::Zero → no zero ranges.
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
 

@@ -20,6 +20,7 @@ use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
 use crate::format::MB1;
+use bitfield_struct::bitfield;
 use parking_lot::Mutex;
 
 /// Default EOF extension length: 32 MiB.
@@ -281,26 +282,54 @@ pub(crate) struct FreeSpaceTracker {
     inner: Mutex<FreeSpaceInner>,
 }
 
+/// Flags for [`VhdxFile::allocate_space()`].
+#[bitfield(u8)]
+#[derive(PartialEq, Eq)]
+pub(crate) struct AllocateFlags {
+    /// Align the allocation to `block_alignment`.
+    #[bits(1)]
+    pub aligned: bool,
+    /// Zero the allocated region if not already zeroed on disk.
+    #[bits(1)]
+    pub zero: bool,
+    #[bits(6)]
+    _reserved: u8,
+}
+
+/// Describes the state of newly allocated space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpaceState {
+    /// Fresh space from file extension — zeroed on disk. Safe to commit
+    /// BAT before flushing the data write (no data leak possible).
+    Zero,
+    /// Recycled space containing the same block's own old data. Safe to
+    /// commit BAT before flushing (a power failure only exposes the
+    /// block's own stale data, not another block's). NOT zero.
+    OwnStale,
+    /// Recycled space that may contain another block's data. Must flush
+    /// data writes before committing BAT to prevent cross-block data
+    /// leaks on power failure. NOT zero.
+    CrossStale,
+}
+
+impl SpaceState {
+    /// Safe to commit BAT entry before data flush completes?
+    pub fn is_safe(self) -> bool {
+        matches!(self, Self::Zero | Self::OwnStale)
+    }
+
+    /// Guaranteed zeroed on disk?
+    pub fn is_zero(self) -> bool {
+        matches!(self, Self::Zero)
+    }
+}
+
 /// Result from a successful space allocation.
 pub(crate) struct AllocateResult {
     /// File byte offset of the allocated region.
     pub file_offset: u64,
-    /// If true, the allocated space is safe to commit before flushing
-    /// the data write. This is true when:
-    ///
-    /// - The space came from beyond `ZeroOffset` (priority 2) — the
-    ///   region is guaranteed zeroed on disk, so a power failure after
-    ///   BAT commit but before data write just reads zeros, not stale
-    ///   data from another block.
-    /// - The space was reclaimed from the *same* block's soft anchor
-    ///   (see `io.rs` reclaim path) — the space still holds the block's
-    ///   own old data, so no cross-block data leak is possible.
-    ///
-    /// When false, the caller must flush (persist the data write)
-    /// *before* committing the BAT entry, to prevent a power-failure
-    /// scenario where block B's BAT entry points to space that still
-    /// contains block A's data.
-    pub is_safe_data: bool,
+    /// State of the allocated space.
+    pub state: SpaceState,
 }
 
 impl FreeSpaceTracker {
@@ -794,7 +823,7 @@ fn try_allocate_inner(
     if let Some(offset) = free_space_pool_alloc(inner, size) {
         return Some(AllocateResult {
             file_offset: offset,
-            is_safe_data: false,
+            state: SpaceState::CrossStale,
         });
     }
 
@@ -811,20 +840,20 @@ fn try_allocate_inner(
         inner.last_file_offset = inner.zero_offset;
         return Some(AllocateResult {
             file_offset: offset,
-            is_safe_data: true,
+            state: SpaceState::Zero,
         });
     }
 
     // Priority 3: soft-anchored space from trimmed blocks (in-memory only).
     //
-    // Reclaim space held by a *different* trimmed block. This is NOT
-    // is_safe_data because the space contains that other block's old
+    // Reclaim space held by a *different* trimmed block. This is
+    // CrossStale because the space contains that other block's old
     // data — a flush is required before the BAT entry for the new
     // block can be committed, to prevent cross-block data leaks on
     // power failure.
     //
     // (When a block reclaims its *own* soft-anchored space, the io.rs
-    // write path handles that directly and marks it is_safe_data=true,
+    // write path handles that directly and marks it OwnStale,
     // since leaking a block's old data back to itself is harmless.)
     if size <= inner.block_size {
         if let Some(bat_state) = bat_state {
@@ -840,7 +869,7 @@ fn try_allocate_inner(
                 let _ = block_number;
                 return Some(AllocateResult {
                     file_offset,
-                    is_safe_data: false,
+                    state: SpaceState::CrossStale,
                 });
             }
         }
@@ -1106,7 +1135,7 @@ mod tests {
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.file_offset, 4 * MB1);
-        assert!(!r.is_safe_data);
+        assert!(!r.state.is_safe());
     }
 
     #[test]
@@ -1120,7 +1149,7 @@ mod tests {
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.file_offset, 4 * MB1);
-        assert!(r.is_safe_data); // Beyond old zero_offset.
+        assert!(r.state.is_safe()); // Beyond old zero_offset.
     }
 
     #[test]
@@ -1142,7 +1171,7 @@ mod tests {
         // Now retry — should succeed from near-EOF.
         let result = tracker.try_allocate(MB1 as u32, false);
         assert!(result.is_some());
-        assert!(result.unwrap().is_safe_data);
+        assert!(result.unwrap().state.is_safe());
     }
 
     #[test]
@@ -1366,21 +1395,21 @@ mod tests {
             .try_allocate_with_bat(MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r1.file_offset, 4 * MB1);
-        assert!(!r1.is_safe_data);
+        assert!(!r1.state.is_safe());
 
         // Pool now empty. Priority 2: near-EOF (offset 8 MB).
         let r2 = tracker
             .try_allocate_with_bat(MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r2.file_offset, 8 * MB1);
-        assert!(r2.is_safe_data);
+        assert!(r2.state.is_safe());
 
         // Take the second EOF MB too.
         let r3 = tracker
             .try_allocate_with_bat(MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r3.file_offset, 9 * MB1);
-        assert!(r3.is_safe_data);
+        assert!(r3.state.is_safe());
 
         // Pool and EOF exhausted. Priority 3: soft-anchored (offset 5 MB).
         // The block is 2 MB but we only need 1 MB — excess goes to pool.
@@ -1388,14 +1417,14 @@ mod tests {
             .try_allocate_with_bat(MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r4.file_offset, 5 * MB1);
-        assert!(!r4.is_safe_data);
+        assert!(!r4.state.is_safe());
 
         // The excess 1 MB from the anchored block should now be in pool.
         let r5 = tracker
             .try_allocate_with_bat(MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r5.file_offset, 6 * MB1);
-        assert!(!r5.is_safe_data);
+        assert!(!r5.state.is_safe());
 
         // Everything exhausted. Priority 4: returns None.
         let r6 = tracker.try_allocate_with_bat(MB1 as u32, false, &bat_state);
@@ -1407,7 +1436,7 @@ mod tests {
         let r7 = tracker
             .try_allocate_with_bat(MB1 as u32, false, &bat_state)
             .unwrap();
-        assert!(r7.is_safe_data);
+        assert!(r7.state.is_safe());
         assert_eq!(r7.file_offset, 10 * MB1);
     }
 
@@ -1427,7 +1456,7 @@ mod tests {
         // Pool allocation ignores alignment (alignment only applies to near-EOF).
         let result = tracker.try_allocate(4 * MB1 as u32, true).unwrap();
         assert_eq!(result.file_offset, 4 * MB1);
-        assert!(!result.is_safe_data);
+        assert!(!result.state.is_safe());
     }
 
     // -- Unaligned EOF skip test --
@@ -1446,7 +1475,7 @@ mod tests {
 
         let result = tracker.try_allocate(4 * MB1 as u32, true).unwrap();
         assert_eq!(result.file_offset, 8 * MB1);
-        assert!(result.is_safe_data);
+        assert!(result.state.is_safe());
     }
 
     // -- Bitmap resize on file extend --
@@ -1475,7 +1504,7 @@ mod tests {
 
         // Near-EOF space should now be available.
         let result = tracker.try_allocate(MB1 as u32, false).unwrap();
-        assert!(result.is_safe_data);
+        assert!(result.state.is_safe());
     }
 
     // -- no_free_blocks flag reset on release --
@@ -1508,7 +1537,7 @@ mod tests {
         // Should be able to allocate again.
         let result = tracker.try_allocate(MB1 as u32, false).unwrap();
         assert_eq!(result.file_offset, 4 * MB1);
-        assert!(!result.is_safe_data);
+        assert!(!result.state.is_safe());
     }
 
     // -- Fragmented pool test --
@@ -1544,7 +1573,7 @@ mod tests {
         // Pool exhausted — next allocation comes from near-EOF.
         let r5 = tracker.try_allocate(MB1 as u32, false).unwrap();
         assert_eq!(r5.file_offset, 11 * MB1);
-        assert!(r5.is_safe_data);
+        assert!(r5.state.is_safe());
     }
 
     // -- Multi-MB allocation from pool --
@@ -1560,7 +1589,7 @@ mod tests {
         // Now request a 3 MB allocation from pool — should find the 4MB hole.
         let result = tracker.try_allocate(3 * MB1 as u32, false).unwrap();
         assert_eq!(result.file_offset, 4 * MB1);
-        assert!(!result.is_safe_data);
+        assert!(!result.state.is_safe());
 
         // 1 MB of the hole (bit 7) is still in pool.
         let r2 = tracker.try_allocate(MB1 as u32, false).unwrap();
@@ -1630,14 +1659,14 @@ mod tests {
             .try_allocate_with_bat(2 * MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r1.file_offset, 6 * MB1);
-        assert!(!r1.is_safe_data);
+        assert!(!r1.state.is_safe());
 
         // Second allocate gets block 5.
         let r2 = tracker
             .try_allocate_with_bat(2 * MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r2.file_offset, 10 * MB1);
-        assert!(!r2.is_safe_data);
+        assert!(!r2.state.is_safe());
 
         // No more anchored blocks.
         assert!(
@@ -1671,7 +1700,7 @@ mod tests {
         // The excess 1 MB (at offset 5 MB) should now be in the free pool.
         let r2 = tracker.try_allocate(MB1 as u32, false).unwrap();
         assert_eq!(r2.file_offset, 5 * MB1);
-        assert!(!r2.is_safe_data);
+        assert!(!r2.state.is_safe());
     }
 
     // -- required_file_length respects alignment --

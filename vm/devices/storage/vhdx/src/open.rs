@@ -38,6 +38,7 @@ use crate::log_task::LogRequest;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use crate::sector_bitmap::SBM_TAG;
+use crate::space::AllocateFlags;
 use crate::space::AllocateResult;
 use crate::space::FreeSpaceTracker;
 use guid::Guid;
@@ -762,11 +763,19 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Called under `allocation_lock` (the `FreeSpaceWorkerLock` equivalent).
     /// Tries pool → near-EOF → anchored, extends file and retries if needed.
     ///
+    /// When `flags` includes [`AllocateFlags::ZERO`], the allocated region
+    /// is guaranteed to be zeroed on disk before returning. Near-EOF
+    /// allocations are inherently zero; pool/anchor allocations get an
+    /// explicit zero-write.
+    ///
+    /// When `flags` includes [`AllocateFlags::ALIGNED`], the allocation is
+    /// aligned to `block_alignment`.
+    ///
     /// Corresponds to `Vhd2iContinueAllocateSpace`.
     pub(crate) async fn allocate_space(
         &self,
         size: u32,
-        aligned: bool,
+        flags: AllocateFlags,
     ) -> Result<AllocateResult, VhdxError> {
         debug_assert!(
             (size as u64).is_multiple_of(MB1),
@@ -779,15 +788,23 @@ impl<F: AsyncFile> VhdxFile<F> {
             let result = {
                 let bat_state = self.bat_state.read();
                 self.free_space
-                    .try_allocate_with_bat(size, aligned, &bat_state)
+                    .try_allocate_with_bat(size, flags.aligned(), &bat_state)
             };
 
             if let Some(alloc) = result {
+                if flags.zero() && !alloc.state.is_zero() {
+                    // Space from pool/anchor may contain stale data — zero it.
+                    let zeros = vec![0u8; size as usize];
+                    self.file
+                        .write_at(alloc.file_offset, &zeros)
+                        .await
+                        .map_err(VhdxError::Io)?;
+                }
                 return Ok(alloc);
             }
 
             // Priority 4: extend EOF.
-            let target = self.free_space.required_file_length(size, aligned);
+            let target = self.free_space.required_file_length(size, flags.aligned());
             // LOCK AUDIT: bat_state read-lock dropped (end of block above). allocation_lock held (async Mutex — OK across .await).
             self.file
                 .set_file_size(target)
@@ -1374,8 +1391,14 @@ mod tests {
     async fn eof_counter_no_overlap() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open_inner(file, false, None).await.unwrap();
-        let a = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
-        let b = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
+        let a = vhdx
+            .allocate_space(MB1 as u32, AllocateFlags::new())
+            .await
+            .unwrap();
+        let b = vhdx
+            .allocate_space(MB1 as u32, AllocateFlags::new())
+            .await
+            .unwrap();
         // Two allocations must not overlap.
         assert_ne!(a.file_offset, b.file_offset);
         assert!(b.file_offset >= a.file_offset + MB1);
@@ -1385,7 +1408,10 @@ mod tests {
     async fn eof_counter_mb_aligned() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open_inner(file, false, None).await.unwrap();
-        let result = vhdx.allocate_space(MB1 as u32, false).await.unwrap();
+        let result = vhdx
+            .allocate_space(MB1 as u32, AllocateFlags::new())
+            .await
+            .unwrap();
         assert_eq!(result.file_offset % MB1, 0, "offset must be MB1-aligned");
     }
 

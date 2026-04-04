@@ -90,7 +90,7 @@ async fn read_pattern<F: AsyncFile>(vhdx: &VhdxFile<F>, offset: u64, len: usize)
 // Structural tests: verify pre_log_fsn values on BAT pages
 // =============================================================================
 
-/// Near-EOF allocation: is_safe_data=true → no pre_log_fsn on BAT page.
+/// Near-EOF allocation: SpaceState::Zero → no pre_log_fsn on BAT page.
 ///
 /// First write to a new VHDX allocates from near-EOF space, which is
 /// already zeroed (durable zeros). No flush barrier is needed.
@@ -108,13 +108,13 @@ async fn bat_page_no_fsn_safe_near_eof(driver: DefaultDriver) {
     let fsn = vhdx.cache.get_pre_log_fsn(page_key);
     assert_eq!(
         fsn, None,
-        "near-EOF allocation should NOT set pre_log_fsn (is_safe_data=true)"
+        "near-EOF allocation should NOT set pre_log_fsn (SpaceState::Zero)"
     );
 
     vhdx.close().await.unwrap();
 }
 
-/// Free-pool reuse: is_safe_data=false → pre_log_fsn set.
+/// Free-pool reuse: SpaceState::CrossStale → pre_log_fsn set.
 ///
 /// Allocate a block, trim it (release to free pool), then allocate again.
 /// The second allocation reuses free-pool space, which is NOT safe (contains
@@ -139,13 +139,13 @@ async fn bat_page_has_fsn_unsafe_free_pool(driver: DefaultDriver) {
     write_pattern(&vhdx, block_size, block_size as usize, 0xBB).await;
 
     // The BAT page for block 1 should have a pre_log_fsn set because
-    // the allocation reused free-pool space (is_safe_data = false).
+    // the allocation reused free-pool space (SpaceState::CrossStale (unsafe)).
     let page_key = vhdx.bat_page_key_for_block(1);
     let fsn = vhdx.cache.get_pre_log_fsn(page_key);
 
     assert!(
         fsn.is_some(),
-        "free-pool reuse should set pre_log_fsn (is_safe_data=false)"
+        "free-pool reuse should set pre_log_fsn (SpaceState::CrossStale)"
     );
 
     vhdx.close().await.unwrap();
@@ -179,11 +179,11 @@ async fn bat_page_no_fsn_existing_block(driver: DefaultDriver) {
     vhdx.close().await.unwrap();
 }
 
-/// Soft-anchor reclaim: is_safe_data=true → no pre_log_fsn.
+/// Soft-anchor reclaim: SpaceState::Zero → no pre_log_fsn.
 ///
 /// Trim a block with FileSpace mode (creates soft anchor), then write the
 /// same block again. The allocation reclaims the soft-anchored space, which
-/// is the block's own old data — is_safe_data = true.
+/// is the block's own old data — SpaceState::OwnStale (safe).
 #[async_test]
 async fn bat_page_no_fsn_safe_soft_anchor(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
@@ -204,12 +204,12 @@ async fn bat_page_no_fsn_safe_soft_anchor(driver: DefaultDriver) {
     write_pattern(&vhdx, 0, block_size as usize, 0xBB).await;
 
     // The BAT page for block 0 should have NO pre_log_fsn because the
-    // allocation reused the block's own old space (is_safe_data = true).
+    // allocation reused the block's own old space (SpaceState::OwnStale (safe)).
     let page_key = vhdx.bat_page_key_for_block(0);
     let fsn = vhdx.cache.get_pre_log_fsn(page_key);
     assert_eq!(
         fsn, None,
-        "soft-anchor reclaim should NOT set pre_log_fsn (is_safe_data=true)"
+        "soft-anchor reclaim should NOT set pre_log_fsn (SpaceState::Zero)"
     );
 
     vhdx.close().await.unwrap();
@@ -220,7 +220,7 @@ async fn bat_page_no_fsn_safe_soft_anchor(driver: DefaultDriver) {
 ///
 /// Write a partial block (less than full block) where the allocation
 /// comes from the free pool. Since the space contains stale data from
-/// another block, is_safe_data = false → the non-TFP path sets pre_log_fsn.
+/// another block, SpaceState::CrossStale (unsafe) → the non-TFP path sets pre_log_fsn.
 #[async_test]
 async fn bat_page_has_fsn_partial_unsafe(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
@@ -239,7 +239,7 @@ async fn bat_page_has_fsn_partial_unsafe(driver: DefaultDriver) {
 
     // Write a partial block at block 1 (less than full block_size). This
     // triggers the non-TFP allocation path. Space comes from free pool →
-    // is_safe_data = false.
+    // SpaceState::CrossStale (unsafe).
     let partial_size = 4096;
     write_pattern(&vhdx, block_size, partial_size, 0xCC).await;
 
@@ -264,7 +264,7 @@ async fn bat_page_no_fsn_partial_safe(driver: DefaultDriver) {
     let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
 
     // Partial write to block 0 (less than full block). Space comes from
-    // near-EOF → is_safe_data = true.
+    // near-EOF → SpaceState::OwnStale (safe).
     let partial_size = 4096;
     write_pattern(&vhdx, 0, partial_size, 0xDD).await;
 
@@ -701,7 +701,7 @@ async fn flush_between_data_and_wal_unsafe(driver: DefaultDriver) {
 
 /// Safe allocation → no extra flush barrier needed.
 ///
-/// Near-EOF allocations produce is_safe_data=true, so no pre_log_fsn
+/// Near-EOF allocations produce SpaceState::Zero, so no pre_log_fsn
 /// is set. The number of flushes should be minimal.
 #[async_test]
 async fn no_extra_flush_safe_allocation(driver: DefaultDriver) {

@@ -12,7 +12,6 @@
 //! covers `4096 * 8 = 32768` sectors.
 
 use crate::AsyncFile;
-use crate::cache::PageCache;
 use crate::cache::PageKey;
 use crate::cache::WriteMode;
 use crate::error::CorruptionType;
@@ -50,216 +49,181 @@ fn find_bit(page: &[u8], start: u64, end: u64, set: bool) -> u64 {
     end
 }
 
-/// Resolve a read for a partially-present block by reading the sector bitmap.
-///
-/// For each sector in the range, checks the corresponding bit in the sector
-/// bitmap. Emits runs of [`ReadRange::Data`] (bit=1, sector present in file)
-/// and [`ReadRange::Unmapped`] (bit=0, sector transparent to parent).
-///
-/// # Arguments
-///
-/// * `cache` - The page cache for reading SBM pages.
-/// * `vhdx` - The open VhdxFile (for synchronous SBM mapping lookup).
-/// * `data_file_offset` - The file offset of the data block (from the
-///   payload BAT entry). Used to compute file offsets for present sectors.
-/// * `block_size` - The block size in bytes.
-/// * `logical_sector_size` - The logical sector size in bytes.
-/// * `virtual_offset` - The virtual disk byte offset of the start of this
-///   sub-request (already clamped to a single block).
-/// * `length` - The length in bytes (already clamped to a single block).
-/// * `ranges` - Output vector to append ranges to.
-pub(crate) async fn resolve_partial_block_read<F: AsyncFile>(
-    cache: &PageCache<F>,
-    vhdx: &VhdxFile<F>,
-    data_file_offset: u64,
-    block_size: u32,
-    logical_sector_size: u32,
-    virtual_offset: u64,
-    length: u32,
-    ranges: &mut Vec<ReadRange>,
-) -> Result<(), VhdxError> {
-    // 1. Compute sector coordinates.
-    let sector_number = virtual_offset / logical_sector_size as u64;
-    let chunk_number = (sector_number / SECTORS_PER_CHUNK) as u32;
-    let sector_count = length as u64 / logical_sector_size as u64;
+impl<F: AsyncFile> VhdxFile<F> {
+    /// Resolve a read for a partially-present block by reading the sector bitmap.
+    ///
+    /// For each sector in the range, checks the corresponding bit in the sector
+    /// bitmap. Emits runs of [`ReadRange::Data`] (bit=1, sector present in file)
+    /// and [`ReadRange::Unmapped`] (bit=0, sector transparent to parent).
+    ///
+    /// # Arguments
+    ///
+    /// * `data_file_offset` - The file offset of the data block (from the
+    ///   payload BAT entry). Used to compute file offsets for present sectors.
+    /// * `virtual_offset` - The virtual disk byte offset of the start of this
+    ///   sub-request (already clamped to a single block).
+    /// * `length` - The length in bytes (already clamped to a single block).
+    /// * `ranges` - Output vector to append ranges to.
+    pub(crate) async fn resolve_partial_block_read(
+        &self,
+        data_file_offset: u64,
+        virtual_offset: u64,
+        length: u32,
+        ranges: &mut Vec<ReadRange>,
+    ) -> Result<(), VhdxError> {
+        // 1. Compute sector coordinates.
+        let sector_number = virtual_offset / self.logical_sector_size as u64;
+        let chunk_number = (sector_number / SECTORS_PER_CHUNK) as u32;
+        let sector_count = length as u64 / self.logical_sector_size as u64;
 
-    // 2. Get sector bitmap block mapping (synchronous).
-    let sbm_mapping = vhdx.get_sector_bitmap_mapping(chunk_number);
-    if sbm_mapping.state != BatEntryState::FullyPresent {
-        return Err(VhdxError::Corrupt(
-            CorruptionType::UnallocatedSectorBitmapBlock,
-        ));
+        // 2. Get sector bitmap block mapping (synchronous).
+        let sbm_mapping = self.get_sector_bitmap_mapping(chunk_number);
+        if sbm_mapping.state != BatEntryState::FullyPresent {
+            return Err(VhdxError::Corrupt(
+                CorruptionType::UnallocatedSectorBitmapBlock,
+            ));
+        }
+
+        // 3. Iterate over bitmap pages (outer loop for multi-page support).
+        let mut remaining_sectors = sector_count;
+        let mut current_virtual_offset = virtual_offset;
+
+        while remaining_sectors > 0 {
+            // Recompute bitmap page coordinates for current position.
+            let cur_sector = current_virtual_offset / self.logical_sector_size as u64;
+            let cur_chunk_sector = cur_sector % SECTORS_PER_CHUNK;
+            let cur_page_number = cur_chunk_sector / SECTORS_PER_BITMAP_PAGE;
+            let start_bit = cur_chunk_sector % SECTORS_PER_BITMAP_PAGE;
+            let bits_in_this_page =
+                std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
+
+            // Acquire the bitmap page for this portion.
+            let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
+            {
+                let guard = self
+                    .cache
+                    .acquire_read(PageKey {
+                        tag: SBM_TAG,
+                        offset: page_file_offset,
+                    })
+                    .await?;
+
+                // Scan bits within this page.
+                let page_data: &[u8] = &*guard;
+                let mut zero = start_bit;
+                while zero < bits_in_this_page {
+                    // Find first set bit (data present).
+                    let one = find_bit(page_data, zero, bits_in_this_page, true);
+                    if one > zero {
+                        // Emit Unmapped range for the run of 0 bits.
+                        let unmapped_sectors = one - zero;
+                        let unmapped_bytes = unmapped_sectors * self.logical_sector_size as u64;
+                        ranges.push(ReadRange::Unmapped {
+                            guest_offset: current_virtual_offset,
+                            length: unmapped_bytes as u32,
+                        });
+                        current_virtual_offset += unmapped_bytes;
+                    }
+
+                    if one < bits_in_this_page {
+                        // Find first clear bit (end of data run).
+                        let next_zero = find_bit(page_data, one, bits_in_this_page, false);
+                        let data_sectors = next_zero - one;
+                        let data_bytes = data_sectors * self.logical_sector_size as u64;
+                        // File offset = data block offset + position within block.
+                        let block_offset = (current_virtual_offset % self.block_size as u64) as u32;
+                        let file_offset = data_file_offset + block_offset as u64;
+                        ranges.push(ReadRange::Data {
+                            guest_offset: current_virtual_offset,
+                            length: data_bytes as u32,
+                            file_offset,
+                        });
+                        current_virtual_offset += data_bytes;
+                        zero = next_zero;
+                    } else {
+                        zero = bits_in_this_page;
+                    }
+                }
+            }
+
+            // Advance to next page.
+            let sectors_processed = bits_in_this_page - start_bit;
+            remaining_sectors -= sectors_processed;
+        }
+
+        Ok(())
     }
 
-    // 3. Iterate over bitmap pages (outer loop for multi-page support).
-    let mut remaining_sectors = sector_count;
-    let mut current_virtual_offset = virtual_offset;
+    /// Set or clear sector bitmap bits for a range of sectors.
+    ///
+    /// For each sector in the virtual range, sets (or clears) the corresponding
+    /// bit in the sector bitmap. The bitmap page is acquired in Modify mode
+    /// and written through to disk on release.
+    ///
+    /// # Arguments
+    ///
+    /// * `virtual_offset` - Virtual disk byte offset of the start of the range.
+    /// * `length` - Length in bytes.
+    /// * `set` - If true, set bits (mark sectors present); if false, clear bits.
+    pub(crate) async fn set_sector_bitmap_bits(
+        &self,
+        virtual_offset: u64,
+        length: u32,
+        set: bool,
+    ) -> Result<(), VhdxError> {
+        let sector_number = virtual_offset / self.logical_sector_size as u64;
+        let chunk_number = (sector_number / SECTORS_PER_CHUNK) as u32;
+        let sector_count = length as u64 / self.logical_sector_size as u64;
 
-    while remaining_sectors > 0 {
-        // Recompute bitmap page coordinates for current position.
-        let cur_sector = current_virtual_offset / logical_sector_size as u64;
-        let cur_chunk_sector = cur_sector % SECTORS_PER_CHUNK;
-        let cur_page_number = cur_chunk_sector / SECTORS_PER_BITMAP_PAGE;
-        let start_bit = cur_chunk_sector % SECTORS_PER_BITMAP_PAGE;
-        let bits_in_this_page =
-            std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
+        // Get sector bitmap block mapping (synchronous).
+        let sbm_mapping = self.get_sector_bitmap_mapping(chunk_number);
+        if sbm_mapping.state != BatEntryState::FullyPresent {
+            return Err(VhdxError::Corrupt(
+                CorruptionType::UnallocatedSectorBitmapBlock,
+            ));
+        }
 
-        // Acquire the bitmap page for this portion.
-        let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
-        {
-            let guard = cache
-                .acquire_read(PageKey {
-                    tag: SBM_TAG,
-                    offset: page_file_offset,
-                })
+        let mut remaining_sectors = sector_count;
+        let mut current_virtual_offset = virtual_offset;
+
+        while remaining_sectors > 0 {
+            let cur_sector = current_virtual_offset / self.logical_sector_size as u64;
+            let cur_chunk_sector = cur_sector % SECTORS_PER_CHUNK;
+            let cur_page_number = cur_chunk_sector / SECTORS_PER_BITMAP_PAGE;
+            let start_bit = cur_chunk_sector % SECTORS_PER_BITMAP_PAGE;
+            let bits_in_this_page =
+                std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
+
+            let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
+            let mut guard = self
+                .cache
+                .acquire_write(
+                    PageKey {
+                        tag: SBM_TAG,
+                        offset: page_file_offset,
+                    },
+                    WriteMode::Modify,
+                )
                 .await?;
 
-            // Scan bits within this page.
-            let page_data: &[u8] = &*guard;
-            let mut zero = start_bit;
-            while zero < bits_in_this_page {
-                // Find first set bit (data present).
-                let one = find_bit(page_data, zero, bits_in_this_page, true);
-                if one > zero {
-                    // Emit Unmapped range for the run of 0 bits.
-                    let unmapped_sectors = one - zero;
-                    let unmapped_bytes = unmapped_sectors * logical_sector_size as u64;
-                    ranges.push(ReadRange::Unmapped {
-                        guest_offset: current_virtual_offset,
-                        length: unmapped_bytes as u32,
-                    });
-                    current_virtual_offset += unmapped_bytes;
-                }
-
-                if one < bits_in_this_page {
-                    // Find first clear bit (end of data run).
-                    let next_zero = find_bit(page_data, one, bits_in_this_page, false);
-                    let data_sectors = next_zero - one;
-                    let data_bytes = data_sectors * logical_sector_size as u64;
-                    // File offset = data block offset + position within block.
-                    let block_offset = (current_virtual_offset % block_size as u64) as u32;
-                    let file_offset = data_file_offset + block_offset as u64;
-                    ranges.push(ReadRange::Data {
-                        guest_offset: current_virtual_offset,
-                        length: data_bytes as u32,
-                        file_offset,
-                    });
-                    current_virtual_offset += data_bytes;
-                    zero = next_zero;
+            // Set or clear each bit in the range.
+            for bit_index in start_bit..bits_in_this_page {
+                let byte_index = (bit_index / 8) as usize;
+                let bit_position = (bit_index % 8) as u32;
+                if set {
+                    guard[byte_index] |= 1 << bit_position;
                 } else {
-                    zero = bits_in_this_page;
+                    guard[byte_index] &= !(1 << bit_position);
                 }
             }
+
+            let sectors_processed = bits_in_this_page - start_bit;
+            remaining_sectors -= sectors_processed;
+            current_virtual_offset += sectors_processed * self.logical_sector_size as u64;
         }
 
-        // Advance to next page.
-        let sectors_processed = bits_in_this_page - start_bit;
-        remaining_sectors -= sectors_processed;
+        Ok(())
     }
-
-    Ok(())
-}
-
-/// Set or clear sector bitmap bits for a range of sectors.
-///
-/// For each sector in the virtual range, sets (or clears) the corresponding
-/// bit in the sector bitmap. The bitmap page is acquired in Modify mode
-/// and written through to disk on release.
-///
-/// # Arguments
-///
-/// * `cache` - The page cache for reading/writing SBM pages.
-/// * `vhdx` - The open VhdxFile (for synchronous SBM mapping lookup).
-/// * `virtual_offset` - Virtual disk byte offset of the start of the range.
-/// * `length` - Length in bytes.
-/// * `logical_sector_size` - Logical sector size in bytes.
-/// * `block_size` - Block size in bytes.
-/// * `set` - If true, set bits (mark sectors present); if false, clear bits.
-pub(crate) async fn set_sector_bitmap_bits<F: AsyncFile>(
-    cache: &PageCache<F>,
-    vhdx: &VhdxFile<F>,
-    virtual_offset: u64,
-    length: u32,
-    logical_sector_size: u32,
-    _block_size: u32,
-    set: bool,
-) -> Result<(), VhdxError> {
-    let sector_number = virtual_offset / logical_sector_size as u64;
-    let chunk_number = (sector_number / SECTORS_PER_CHUNK) as u32;
-    let sector_count = length as u64 / logical_sector_size as u64;
-
-    // Get sector bitmap block mapping (synchronous).
-    let sbm_mapping = vhdx.get_sector_bitmap_mapping(chunk_number);
-    if sbm_mapping.state != BatEntryState::FullyPresent {
-        return Err(VhdxError::Corrupt(
-            CorruptionType::UnallocatedSectorBitmapBlock,
-        ));
-    }
-
-    let mut remaining_sectors = sector_count;
-    let mut current_virtual_offset = virtual_offset;
-
-    while remaining_sectors > 0 {
-        let cur_sector = current_virtual_offset / logical_sector_size as u64;
-        let cur_chunk_sector = cur_sector % SECTORS_PER_CHUNK;
-        let cur_page_number = cur_chunk_sector / SECTORS_PER_BITMAP_PAGE;
-        let start_bit = cur_chunk_sector % SECTORS_PER_BITMAP_PAGE;
-        let bits_in_this_page =
-            std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
-
-        let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
-        let mut guard = cache
-            .acquire_write(
-                PageKey {
-                    tag: SBM_TAG,
-                    offset: page_file_offset,
-                },
-                WriteMode::Modify,
-            )
-            .await?;
-
-        // Set or clear each bit in the range.
-        for bit_index in start_bit..bits_in_this_page {
-            let byte_index = (bit_index / 8) as usize;
-            let bit_position = (bit_index % 8) as u32;
-            if set {
-                guard[byte_index] |= 1 << bit_position;
-            } else {
-                guard[byte_index] &= !(1 << bit_position);
-            }
-        }
-
-        let sectors_processed = bits_in_this_page - start_bit;
-        remaining_sectors -= sectors_processed;
-        current_virtual_offset += sectors_processed * logical_sector_size as u64;
-    }
-
-    Ok(())
-}
-
-/// Zero all pages of a sector bitmap block at the given file offset.
-///
-/// This sets all SBM bits to 0, meaning all sectors are transparent to
-/// parent. Called when allocating a new SBM block for a differencing disk.
-pub(crate) async fn zero_sector_bitmap_block<F: AsyncFile>(
-    cache: &PageCache<F>,
-    sbm_file_offset: u64,
-) -> Result<(), VhdxError> {
-    let page_count = crate::bat::SECTOR_BITMAP_BLOCK_SIZE as u64 / CACHE_PAGE_SIZE;
-    for page in 0..page_count {
-        let page_offset = sbm_file_offset + page * CACHE_PAGE_SIZE;
-        let mut guard = cache
-            .acquire_write(
-                PageKey {
-                    tag: SBM_TAG,
-                    offset: page_offset,
-                },
-                WriteMode::Modify,
-            )
-            .await?;
-        guard.fill(0);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -685,14 +649,10 @@ mod tests {
         );
 
         // Set bits for sectors 0-3 (first 2048 bytes).
-        set_sector_bitmap_bits(
-            &vhdx.cache,
-            &vhdx,
-            0,                          // virtual_offset
-            2048,                       // length (4 sectors * 512)
-            512,                        // logical_sector_size
-            format::DEFAULT_BLOCK_SIZE, // block_size
-            true,                       // set
+        vhdx.set_sector_bitmap_bits(
+            0,    // virtual_offset
+            2048, // length (4 sectors * 512)
+            true, // set
         )
         .await
         .unwrap();

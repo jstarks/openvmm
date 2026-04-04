@@ -937,6 +937,10 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// entry to be written, then flushes to make everything durable:
     /// user data writes, WAL entries, and apply-task writes.
     pub async fn flush(&self) -> Result<(), VhdxError> {
+        if self.read_only {
+            return Err(VhdxError::ReadOnly);
+        }
+
         self.flush_dirty_bat_pages().await?;
 
         let lsn = self.cache.commit()?;

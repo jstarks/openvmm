@@ -97,38 +97,6 @@ impl IoInterceptor for DiscardWritesInterceptor {
     }
 }
 
-/// An interceptor with runtime-togglable write failures.
-///
-/// Starts with writes succeeding. Call [`fail_writes()`](Self::fail_writes)
-/// to make all subsequent writes return errors.
-pub struct TogglableFailInterceptor {
-    writes_fail: std::sync::atomic::AtomicBool,
-}
-
-impl TogglableFailInterceptor {
-    /// Create a new interceptor with writes initially succeeding.
-    pub fn new() -> Self {
-        Self {
-            writes_fail: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    /// Make all subsequent writes fail.
-    pub fn fail_writes(&self) {
-        self.writes_fail
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl IoInterceptor for TogglableFailInterceptor {
-    fn before_write(&self, _offset: u64, _data: &[u8]) -> Result<(), std::io::Error> {
-        if self.writes_fail.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(std::io::Error::other("injected write failure"));
-        }
-        Ok(())
-    }
-}
-
 /// In-memory file backing store for tests.
 ///
 /// Supports optional I/O interception for failure injection and write

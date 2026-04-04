@@ -240,7 +240,6 @@ impl<F: AsyncFile> LogTask<F> {
         self.apply_tx.send(ApplyBatch {
             pages: apply_pages,
             lsn,
-            new_tail,
         });
 
         self.pending_tails.push(PendingTail { lsn, new_tail });

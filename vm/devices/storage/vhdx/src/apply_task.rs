@@ -31,9 +31,6 @@ pub(crate) struct ApplyBatch {
     pub pages: Vec<ApplyPage>,
     /// The LSN of the log entry that contains these pages.
     pub lsn: u64,
-    /// The log-region-relative offset after this entry was written.
-    /// The log task can advance its tail to this value once applied.
-    pub new_tail: u32,
 }
 
 /// A single page to apply.

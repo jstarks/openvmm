@@ -618,11 +618,6 @@ impl<F: AsyncFile> PageCache<F> {
 
         Ok(lsn)
     }
-
-    /// Returns `true` if the cache has a log sender configured.
-    pub fn has_log_sender(&self) -> bool {
-        self.log_sender.is_some()
-    }
 }
 
 /// RAII guard providing read-only access to a cached page.

@@ -119,6 +119,7 @@ struct PageMap {
     /// Number of pages in `HasPermit` or `Dirty` state.
     /// Maintained under the map lock to prevent races.
     dirty_count: usize,
+    current_lsn: u64,
 }
 
 /// Action to perform when a page isn't ready (returned by sync helpers).
@@ -154,7 +155,6 @@ pub struct PageCache<F: AsyncFile> {
     log_sender: Option<mesh::Sender<LogRequest>>,
     log_permits: Option<Arc<LogPermits>>,
     applied_lsn: Option<Arc<LsnWatermark>>,
-    lsn_counter: std::sync::atomic::AtomicU64,
     /// Notified when a page transitions out of `Loading` or `AcquiringPermit`.
     state_event: event_listener::Event,
     /// Maximum number of pages to keep in the cache. 0 = unlimited.
@@ -175,12 +175,12 @@ impl<F: AsyncFile> PageCache<F> {
             pages: Mutex::new(PageMap {
                 map: HashMap::new(),
                 dirty_count: 0,
+                current_lsn: 0,
             }),
             tags: Mutex::new(HashMap::new()),
             log_sender,
             log_permits,
             applied_lsn,
-            lsn_counter: std::sync::atomic::AtomicU64::new(0),
             state_event: event_listener::Event::new(),
             quota,
         }
@@ -576,10 +576,7 @@ impl<F: AsyncFile> PageCache<F> {
             .as_ref()
             .expect("commit requires a log sender (use open_writable)");
 
-        let lsn = self
-            .lsn_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+        let lsn = pages.current_lsn + 1;
 
         let mut committed = Vec::new();
         let mut max_pre_log_fsn: Option<u64> = None;
@@ -601,11 +598,12 @@ impl<F: AsyncFile> PageCache<F> {
         }
 
         if committed.is_empty() {
-            return Ok(self.lsn_counter.load(std::sync::atomic::Ordering::Relaxed));
+            return Ok(pages.current_lsn);
         }
 
         let committed_count = committed.len();
         pages.dirty_count -= committed_count;
+        pages.current_lsn = lsn;
 
         log_sender.send(LogRequest::Commit(Transaction {
             lsn,

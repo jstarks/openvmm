@@ -23,9 +23,9 @@
 //! outcomes are: {neither}, {A only}, or {both A and B}. It is never the case
 //! that B is persisted without A.
 //!
-//! This ordering is maintained by **eager commit**: when the dirty page count
-//! reaches [`MAX_COMMIT_PAGES`] and a new page is about to become dirty, the
-//! cache automatically commits the current dirty set to the log before
+//! This ordering is maintained by **batch-full commit**: when the dirty page
+//! count reaches [`MAX_COMMIT_PAGES`] and a new page is about to become dirty,
+//! the cache automatically commits the current dirty set to the log before
 //! allowing the new page to enter the dirty set.
 
 use crate::AsyncFile;
@@ -111,9 +111,12 @@ struct PageData {
     committed_lsn: Option<u64>,
 }
 
-/// Internal page map wrapping the `HashMap`.
+/// Internal page map wrapping the `HashMap` and dirty page counter.
 struct PageMap {
     map: HashMap<PageKey, Arc<Mutex<PageData>>>,
+    /// Number of pages in `HasPermit` or `Dirty` state.
+    /// Maintained under the map lock to prevent races.
+    dirty_count: usize,
 }
 
 /// Action to perform when a page isn't ready (returned by sync helpers).
@@ -132,10 +135,10 @@ enum WritePendingAction {
     Wait(event_listener::EventListener),
     /// Load page data from disk at this file offset.
     Load(u64),
-    /// Acquire a log permit. If `eager_commit`, commit dirty pages first.
-    AcquirePermit { eager_commit: bool },
-    /// No log configured — fail.
-    NoLog,
+    /// Acquire a log permit.
+    AcquirePermit,
+    /// Dirty batch was full and has been committed. Retry from the top.
+    Retry,
 }
 
 /// Write-back page cache backed by an [`AsyncFile`].
@@ -148,9 +151,6 @@ pub struct PageCache<F: AsyncFile> {
     logged_lsn: Option<Arc<LsnWatermark>>,
     applied_lsn: Option<Arc<LsnWatermark>>,
     lsn_counter: std::sync::atomic::AtomicU64,
-    /// Number of pages in `Dirty` state. Atomic so it can be
-    /// read/incremented without taking the map lock.
-    dirty_count: std::sync::atomic::AtomicUsize,
     /// Notified when a page transitions out of `Loading` or `AcquiringPermit`.
     state_event: event_listener::Event,
     /// Maximum number of pages to keep in the cache. 0 = unlimited.
@@ -171,6 +171,7 @@ impl<F: AsyncFile> PageCache<F> {
             file,
             pages: Mutex::new(PageMap {
                 map: HashMap::new(),
+                dirty_count: 0,
             }),
             tags: Mutex::new(HashMap::new()),
             log_sender,
@@ -178,7 +179,6 @@ impl<F: AsyncFile> PageCache<F> {
             logged_lsn,
             applied_lsn,
             lsn_counter: std::sync::atomic::AtomicU64::new(0),
-            dirty_count: std::sync::atomic::AtomicUsize::new(0),
             state_event: event_listener::Event::new(),
             quota,
         }
@@ -216,64 +216,16 @@ impl<F: AsyncFile> PageCache<F> {
     }
 
     /// Resolve a [`PageKey`] to an absolute file offset.
-    pub(crate) fn resolve_offset(&self, key: PageKey) -> Result<u64, std::io::Error> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key.tag` has not been registered via [`register_tag`](Self::register_tag).
+    pub(crate) fn resolve_offset(&self, key: PageKey) -> u64 {
         let tags = self.tags.lock();
-        let base = tags.get(&key.tag).ok_or_else(|| {
-            std::io::Error::other(format!("cache tag {} not registered", key.tag))
-        })?;
-        Ok(base + key.offset)
-    }
-
-    /// Get or create the page entry in the map, returning the entry with
-    /// the page lock held (via `lock_arc`).
-    ///
-    /// The map lock is held while acquiring the page lock, preventing
-    /// races with eviction. The map lock is released before returning.
-    ///
-    /// If the cache is over quota, attempts eviction first.
-    fn get_or_create_locked(
-        &self,
-        key: PageKey,
-    ) -> Result<
-        (
-            u64,
-            parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>,
-            bool, // true if newly created
-        ),
-        std::io::Error,
-    > {
-        if !key.offset.is_multiple_of(PAGE_SIZE as u64) {
-            return Err(std::io::Error::other(format!(
-                "page offset {:#x} is not {PAGE_SIZE}-byte aligned",
-                key.offset
-            )));
-        }
-        let file_offset = self.resolve_offset(key)?;
-        let mut pages = self.pages.lock();
-
-        // Evict if over quota (but not the page we're about to acquire).
-        if self.quota > 0 && pages.map.len() >= self.quota {
-            self.try_evict_under_lock(&mut pages, Some(key));
-        }
-
-        let (entry, created) = match pages.map.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), false),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let entry = Arc::new(Mutex::new(PageData {
-                    data: None,
-                    state: PageState::Loading,
-                    pre_log_fsn: None,
-                    committed_lsn: None,
-                }));
-                e.insert(entry.clone());
-                (entry, true)
-            }
-        };
-
-        let guard = Mutex::lock_arc(&entry);
-        drop(pages);
-
-        Ok((file_offset, guard, created))
+        let base = tags
+            .get(&key.tag)
+            .unwrap_or_else(|| panic!("cache tag {} not registered", key.tag));
+        base + key.offset
     }
 
     /// Try to evict one clean, applied page to make room.
@@ -332,9 +284,35 @@ impl<F: AsyncFile> PageCache<F> {
 
     /// Sync helper: try to acquire read access.
     fn try_acquire_read(&self, key: PageKey) -> Result<ReadPageGuard, PendingAction> {
-        let (file_offset, guard, created) = self
-            .get_or_create_locked(key)
-            .map_err(|_| PendingAction::Load(0))?;
+        assert!(
+            key.offset.is_multiple_of(PAGE_SIZE as u64),
+            "page offset {:#x} is not {PAGE_SIZE}-byte aligned",
+            key.offset
+        );
+        let file_offset = self.resolve_offset(key);
+        let mut pages = self.pages.lock();
+
+        // Evict if over quota (but not the page we're about to acquire).
+        if self.quota > 0 && pages.map.len() >= self.quota {
+            self.try_evict_under_lock(&mut pages, Some(key));
+        }
+
+        let (entry, created) = match pages.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), false),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let entry = Arc::new(Mutex::new(PageData {
+                    data: None,
+                    state: PageState::Loading,
+                    pre_log_fsn: None,
+                    committed_lsn: None,
+                }));
+                e.insert(entry.clone());
+                (entry, true)
+            }
+        };
+
+        let guard = Mutex::lock_arc(&entry);
+        drop(pages);
 
         if created {
             // We created this entry in Loading state. Load it.
@@ -393,8 +371,8 @@ impl<F: AsyncFile> PageCache<F> {
 
     /// Acquire write access to a page.
     ///
-    /// If a log is configured, acquires a permit (backpressure). If dirty
-    /// pages have accumulated, triggers an eager commit first.
+    /// If a log is configured, acquires a permit (backpressure). If the
+    /// dirty batch is full, commits it first (batch-full commit).
     pub async fn acquire_write(
         &self,
         key: PageKey,
@@ -419,48 +397,69 @@ impl<F: AsyncFile> PageCache<F> {
                         }
                     }
                 }
-                WritePendingAction::AcquirePermit { eager_commit } => {
-                    if eager_commit {
-                        self.commit().map_err(|e| match e {
-                            VhdxError::Io(io) => io,
-                            other => std::io::Error::other(other.to_string()),
-                        })?;
-                    }
+                WritePendingAction::AcquirePermit => {
                     let permits = self.log_permits.as_ref().unwrap();
                     let result = permits.acquire(1).await;
-                    self.finalize_permit(key, result.is_ok());
+                    self.finalize_permit(key, result.is_ok())?;
                     result.map_err(|e| match e {
                         VhdxError::Io(io) => io,
                         other => std::io::Error::other(other.to_string()),
                     })?;
                 }
-                WritePendingAction::NoLog => {
-                    return Err(std::io::Error::other(
-                        "acquire_write requires a log task (use open_writable)",
-                    ));
+                WritePendingAction::Retry => {
+                    // Batch-full commit was done; loop to re-acquire page.
+                    continue;
                 }
             }
         }
     }
 
     /// Sync helper: try to acquire write access.
+    ///
+    /// Owns the map lock for the entire operation. If the dirty batch is
+    /// full, commits it under the same lock (batch-full commit) before
+    /// transitioning the page to AcquiringPermit. No TOCTOU gap.
     fn try_acquire_write(
         &self,
         key: PageKey,
         load: bool,
     ) -> Result<WritePageGuard<'_, F>, WritePendingAction> {
-        let (file_offset, mut guard, created) = self
-            .get_or_create_locked(key)
-            .map_err(|_| WritePendingAction::NoLog)?;
+        assert!(
+            key.offset.is_multiple_of(PAGE_SIZE as u64),
+            "page offset {:#x} is not {PAGE_SIZE}-byte aligned",
+            key.offset
+        );
+        let file_offset = self.resolve_offset(key);
+
+        let mut pages = self.pages.lock();
+
+        // Evict if over quota.
+        if self.quota > 0 && pages.map.len() >= self.quota {
+            self.try_evict_under_lock(&mut pages, Some(key));
+        }
+
+        let (entry, created) = match pages.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), false),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let entry = Arc::new(Mutex::new(PageData {
+                    data: None,
+                    state: PageState::Loading,
+                    pre_log_fsn: None,
+                    committed_lsn: None,
+                }));
+                e.insert(entry.clone());
+                (entry, true)
+            }
+        };
+
+        let mut guard = Mutex::lock_arc(&entry);
 
         if created {
-            // Freshly created entry in Loading state.
             if load {
-                // Need to load from disk.
                 drop(guard);
+                drop(pages);
                 return Err(WritePendingAction::Load(file_offset));
             } else {
-                // Overwrite mode — fill with zeros, transition to Clean.
                 guard.data = Some(Arc::new([0u8; PAGE_SIZE]));
                 guard.state = PageState::Clean;
             }
@@ -470,6 +469,7 @@ impl<F: AsyncFile> PageCache<F> {
             PageState::Loading | PageState::AcquiringPermit => {
                 let listener = self.state_event.listen();
                 drop(guard);
+                drop(pages);
                 Err(WritePendingAction::Wait(listener))
             }
             PageState::Dirty | PageState::HasPermit => {
@@ -478,6 +478,7 @@ impl<F: AsyncFile> PageCache<F> {
                     "page in {:?} has no data",
                     guard.state
                 );
+                drop(pages);
                 Ok(WritePageGuard {
                     cache: self,
                     guard: Some(guard),
@@ -486,31 +487,50 @@ impl<F: AsyncFile> PageCache<F> {
             }
             PageState::Clean => {
                 assert!(guard.data.is_some(), "Clean page has no data");
-                if self.log_permits.is_none() {
+                assert!(
+                    self.log_permits.is_some(),
+                    "acquire_write requires a log (use open_writable)"
+                );
+
+                // Batch-full commit: if the dirty batch has reached
+                // MAX_COMMIT_PAGES, commit it now under the same map lock.
+                // Drop the page guard first — commit_locked iterates all
+                // pages and would deadlock on this one.
+                if pages.dirty_count >= MAX_COMMIT_PAGES {
                     drop(guard);
-                    return Err(WritePendingAction::NoLog);
+                    let _ = self.commit_locked(&mut pages);
+                    drop(pages);
+                    return Err(WritePendingAction::Retry);
                 }
-                let dirty_count = self.dirty_count.load(std::sync::atomic::Ordering::Relaxed);
-                let eager_commit = dirty_count >= MAX_COMMIT_PAGES && self.log_sender.is_some();
+
                 guard.state = PageState::AcquiringPermit;
                 drop(guard);
-                Err(WritePendingAction::AcquirePermit { eager_commit })
+                drop(pages);
+                Err(WritePendingAction::AcquirePermit)
             }
         }
     }
 
     /// Finalize a permit acquisition: transition page to HasPermit or Clean.
-    fn finalize_permit(&self, key: PageKey, success: bool) {
-        if let Ok((_, mut page, _)) = self.get_or_create_locked(key) {
+    /// The dirty_count increment is under the map lock, synchronized with
+    /// commit_locked which also holds the map lock when collecting dirty pages.
+    fn finalize_permit(&self, key: PageKey, success: bool) -> Result<(), std::io::Error> {
+        let mut pages = self.pages.lock();
+
+        if let Some(entry) = pages.map.get(&key).cloned() {
+            let mut page = entry.lock();
             if page.state == PageState::AcquiringPermit {
-                page.state = if success {
-                    PageState::HasPermit
+                if success {
+                    page.state = PageState::HasPermit;
+                    pages.dirty_count += 1;
                 } else {
-                    PageState::Clean
-                };
+                    page.state = PageState::Clean;
+                }
             }
         }
+        drop(pages);
         self.state_event.notify(usize::MAX);
+        Ok(())
     }
 
     /// Set the pre-log FSN on a specific page.
@@ -541,52 +561,64 @@ impl<F: AsyncFile> PageCache<F> {
     ///
     /// Returns the assigned LSN, or 0 if there were no dirty pages.
     pub fn commit(&self) -> Result<u64, VhdxError> {
+        let mut pages = self.pages.lock();
+        self.commit_locked(&mut pages)
+    }
+
+    /// Inner commit implementation that takes an already-held map lock.
+    ///
+    /// This allows `finalize_permit` to check dirty_count and commit
+    /// atomically under the same lock — no TOCTOU gap.
+    fn commit_locked(&self, pages: &mut PageMap) -> Result<u64, VhdxError> {
         let log_sender = self
             .log_sender
             .as_ref()
-            .ok_or_else(|| VhdxError::Io(std::io::Error::other("no log sender configured")))?;
+            .expect("commit requires a log sender (use open_writable)");
 
-        let (committed_pages, pre_log_fsn, lsn) = {
-            let lsn = self
-                .lsn_counter
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
+        let lsn = self
+            .lsn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
 
-            let mut pages = self.pages.lock();
-            let mut committed = Vec::new();
-            let mut max_pre_log_fsn: Option<u64> = None;
+        let mut committed = Vec::new();
+        let mut max_pre_log_fsn: Option<u64> = None;
 
-            for (&key, entry) in pages.map.iter() {
-                let mut page = entry.lock();
-                if page.state == PageState::Dirty {
-                    let file_offset = self.resolve_offset(key).map_err(VhdxError::Io)?;
-                    let data = page.data.as_ref().expect("dirty page has no data").clone();
+        for (&key, entry) in pages.map.iter() {
+            let mut page = entry.lock();
+            if page.state == PageState::Dirty {
+                let file_offset = self.resolve_offset(key);
+                let data = page.data.as_ref().expect("dirty page has no data").clone();
 
-                    if let Some(fsn) = page.pre_log_fsn.take() {
-                        max_pre_log_fsn = Some(max_pre_log_fsn.map_or(fsn, |m: u64| m.max(fsn)));
-                    }
-
-                    page.state = PageState::Clean;
-                    page.committed_lsn = Some(lsn);
-                    committed.push(CommittedPage { file_offset, data });
+                if let Some(fsn) = page.pre_log_fsn.take() {
+                    max_pre_log_fsn = Some(max_pre_log_fsn.map_or(fsn, |m: u64| m.max(fsn)));
                 }
+
+                page.state = PageState::Clean;
+                page.committed_lsn = Some(lsn);
+                committed.push(CommittedPage { file_offset, data });
             }
+        }
 
-            if committed.is_empty() {
-                return Ok(0);
-            }
+        if committed.is_empty() {
+            return Ok(0);
+        }
 
-            (committed, max_pre_log_fsn, lsn)
-        };
-
-        self.dirty_count
-            .fetch_sub(committed_pages.len(), std::sync::atomic::Ordering::Relaxed);
+        let committed_count = committed.len();
+        pages.dirty_count -= committed_count;
 
         log_sender.send(LogRequest::Commit(Transaction {
             lsn,
-            pages: committed_pages,
-            pre_log_fsn,
+            pages: committed,
+            pre_log_fsn: max_pre_log_fsn,
         }));
+
+        // Release permits now — the batch has been sent. This allows
+        // the next acquire_write to proceed immediately rather than
+        // blocking on the log task (which may not run until we yield
+        // on a single-threaded executor).
+        if let Some(ref permits) = self.log_permits {
+            permits.release(committed_count);
+        }
 
         Ok(lsn)
     }
@@ -652,16 +684,13 @@ impl<F: AsyncFile> std::ops::DerefMut for WritePageGuard<'_, F> {
         let guard = self.guard.as_mut().expect("guard consumed");
 
         // Transition HasPermit → Dirty on first mutation.
+        // dirty_count was already incremented at permit finalization time,
+        // so no counter update needed here.
         if !self.mutated {
             self.mutated = true;
             if guard.state == PageState::HasPermit {
                 guard.state = PageState::Dirty;
-                self.cache
-                    .dirty_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            // If state is Dirty (re-acquire on already-dirty page), no-op.
-            // If state is Clean (no log configured), no-op.
         }
 
         Arc::make_mut(guard.data.as_mut().expect("page data missing"))
@@ -672,9 +701,11 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
     fn drop(&mut self) {
         if let Some(mut guard) = self.guard.take() {
             if guard.state == PageState::HasPermit {
-                // Guard dropped without mutation. Refund the permit.
+                // Guard dropped without mutation. Refund the permit
+                // and decrement dirty_count.
                 guard.state = PageState::Clean;
                 drop(guard);
+                self.cache.pages.lock().dirty_count -= 1;
                 if let Some(ref permits) = self.cache.log_permits {
                     permits.release(1);
                 }
@@ -1100,7 +1131,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn eager_commit_on_dirty_overflow() {
+    async fn batch_full_commit_on_dirty_overflow() {
         let (tx, mut rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
@@ -1131,7 +1162,7 @@ mod tests {
             LogRequest::Commit(txn) => {
                 assert_eq!(txn.pages.len(), MAX_COMMIT_PAGES);
             }
-            _ => panic!("expected Commit from eager commit"),
+            _ => panic!("expected Commit from batch-full commit"),
         }
 
         cache.commit().unwrap();
@@ -1144,7 +1175,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn redirty_does_not_trigger_eager_commit() {
+    async fn redirty_does_not_trigger_batch_full_commit() {
         let (tx, mut rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
         let mut cache = PageCache::new(
@@ -1165,13 +1196,10 @@ mod tests {
 
         assert!(
             rx.try_recv().is_err(),
-            "re-dirtying an already-dirty page must not trigger eager commit"
+            "re-dirtying an already-dirty page must not trigger batch-full commit"
         );
 
-        assert_eq!(
-            cache.dirty_count.load(std::sync::atomic::Ordering::Relaxed),
-            MAX_COMMIT_PAGES
-        );
+        assert_eq!(cache.pages.lock().dirty_count, MAX_COMMIT_PAGES);
     }
 
     #[async_test]
@@ -1426,7 +1454,7 @@ mod tests {
     #[async_test]
     async fn no_deadlock_with_quota() {
         // Regression test: verify that acquiring pages with a small quota
-        // doesn't deadlock. The dual-lock pattern + atomic dirty_count
+        // doesn't deadlock. The dual-lock pattern
         // should prevent lock-order issues.
         let (tx, _rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));

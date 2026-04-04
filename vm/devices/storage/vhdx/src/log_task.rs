@@ -182,8 +182,7 @@ async fn handle_commit<F: AsyncFile>(
     // Write WAL entry.
     match write_log_entry(file, log_writer, flush_sequencer, &txn.pages).await {
         Ok(()) => {
-            // Release permits — the pages are now in the WAL.
-            log_permits.release(page_count);
+            // Permits were already released by the cache at commit time.
             // Publish that this LSN is durable in the log.
             logged_lsn.advance(lsn);
 

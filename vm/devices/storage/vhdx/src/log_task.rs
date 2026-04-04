@@ -445,46 +445,53 @@ mod tests {
         }
     }
 
+    /// Acquire permits and send a commit. Mirrors what the cache does:
+    /// acquire permits for each page, then commit (which sends the
+    /// transaction to the log task).
+    async fn send_commit(
+        tx: &mesh::Sender<LogRequest>,
+        permits: &LogPermits,
+        lsn: u64,
+        page_count: usize,
+    ) {
+        permits.acquire(page_count).await.unwrap();
+        tx.send(LogRequest::Commit(make_txn(lsn, page_count)));
+    }
+
     #[async_test]
     async fn single_commit_publishes_lsn(driver: pal_async::DefaultDriver) {
-        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+        let (tx, _file, permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
             setup_pipeline(&driver, LOG_SIZE, 100).await;
 
-        tx.send(LogRequest::Commit(make_txn(1, 1)));
+        send_commit(&tx, &permits, 1, 1).await;
         logged_lsn.wait_for(1).await.unwrap();
     }
 
     #[async_test]
     async fn permits_return_after_apply(driver: pal_async::DefaultDriver) {
         let permit_count = 10;
-        let (tx, _file, permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+        let (tx, _file, permits, logged_lsn, applied_lsn, _log_task, _apply_task) =
             setup_pipeline(&driver, LOG_SIZE, permit_count).await;
 
-        // Consume all permits by acquiring them.
-        permits.acquire(permit_count).await.unwrap();
+        // Send a commit of 5 pages (acquires 5 permits).
+        send_commit(&tx, &permits, 1, 5).await;
 
-        // Send a commit of 5 pages (the log task doesn't acquire permits,
-        // but the apply task will release 5 after applying).
-        tx.send(LogRequest::Commit(make_txn(1, 5)));
-
-        // Wait for the commit to be logged.
+        // Wait for the apply task to finish.
         logged_lsn.wait_for(1).await.unwrap();
+        applied_lsn.wait_for(1).await.unwrap();
 
-        // The apply task should release 5 permits. Acquiring 5 should
-        // succeed (it would block forever if permits weren't released).
-        permits.acquire(5).await.unwrap();
-
-        // Clean up: release the permits we acquired so shutdown is clean.
-        permits.release(permit_count);
+        // The apply task should have released 5 permits.
+        // All 10 should be available again.
+        assert_eq!(permits.available(), permit_count);
     }
 
     #[async_test]
     async fn multiple_commits_sequential(driver: pal_async::DefaultDriver) {
-        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+        let (tx, _file, permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
             setup_pipeline(&driver, LOG_SIZE, 100).await;
 
         for lsn in 1..=10u64 {
-            tx.send(LogRequest::Commit(make_txn(lsn, 1)));
+            send_commit(&tx, &permits, lsn, 1).await;
         }
 
         // All 10 should be logged.
@@ -495,13 +502,13 @@ mod tests {
     async fn log_full_retry_makes_progress(driver: pal_async::DefaultDriver) {
         // Use a small log (256 KiB). Each page + entry overhead ~ 8 KiB.
         // With ~30 entries the log will fill up, forcing the retry path.
-        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+        let (tx, _file, permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
             setup_pipeline(&driver, LOG_SIZE, 500).await;
 
         // Send 50 single-page commits. This will exceed the 256 KiB log
         // and force LogFull → wait for apply → advance tail → retry.
         for lsn in 1..=50u64 {
-            tx.send(LogRequest::Commit(make_txn(lsn, 1)));
+            send_commit(&tx, &permits, lsn, 1).await;
         }
 
         // If LogFull retry works, all 50 will eventually be logged.
@@ -513,11 +520,11 @@ mod tests {
         // Each batch has 5 pages (~24 KiB with overhead). 256 KiB log
         // fits maybe 10 batches. Send 30 — forces multiple cycles of
         // LogFull → drain → retry.
-        let (tx, _file, _permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
+        let (tx, _file, permits, logged_lsn, _applied_lsn, _log_task, _apply_task) =
             setup_pipeline(&driver, LOG_SIZE, 500).await;
 
         for lsn in 1..=30u64 {
-            tx.send(LogRequest::Commit(make_txn(lsn, 5)));
+            send_commit(&tx, &permits, lsn, 5).await;
         }
 
         logged_lsn.wait_for(30).await.unwrap();
@@ -527,11 +534,11 @@ mod tests {
     async fn close_after_commits(driver: pal_async::DefaultDriver) {
         use mesh::rpc::RpcSend;
 
-        let (tx, _file, _permits, logged_lsn, applied_lsn, _log_task, _apply_task) =
+        let (tx, _file, permits, logged_lsn, applied_lsn, _log_task, _apply_task) =
             setup_pipeline(&driver, LOG_SIZE, 100).await;
 
         for lsn in 1..=5u64 {
-            tx.send(LogRequest::Commit(make_txn(lsn, 1)));
+            send_commit(&tx, &permits, lsn, 1).await;
         }
         logged_lsn.wait_for(5).await.unwrap();
 
@@ -545,11 +552,12 @@ mod tests {
 
     #[async_test]
     async fn applied_data_is_at_final_offset(driver: pal_async::DefaultDriver) {
-        let (tx, file, _permits, logged_lsn, applied_lsn, _log_task, _apply_task) =
+        let (tx, file, permits, logged_lsn, applied_lsn, _log_task, _apply_task) =
             setup_pipeline(&driver, LOG_SIZE, 100).await;
 
         let target_offset: u64 = 2 * 1024 * 1024; // 2 MiB
         let data = Arc::new([0xAB_u8; PAGE_SIZE]);
+        permits.acquire(1).await.unwrap();
         tx.send(LogRequest::Commit(Transaction {
             lsn: 1,
             pages: vec![CommittedPage {

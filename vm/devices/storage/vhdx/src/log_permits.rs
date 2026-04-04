@@ -35,6 +35,7 @@ use parking_lot::Mutex;
 pub(crate) struct LogPermits {
     state: Mutex<PermitState>,
     event: Event,
+    max_permits: usize,
 }
 
 struct PermitState {
@@ -51,6 +52,7 @@ impl LogPermits {
                 failed: None,
             }),
             event: Event::new(),
+            max_permits: max_in_flight,
         }
     }
 
@@ -77,11 +79,17 @@ impl LogPermits {
 
     /// Release `count` permits back to the pool.
     ///
-    /// Called by the log task after writing a WAL entry.
+    /// Called by the apply task after writing pages to their final offsets.
     pub fn release(&self, count: usize) {
         {
             let mut state = self.state.lock();
             state.available += count;
+            assert!(
+                state.available <= self.max_permits,
+                "released more permits than were acquired: available {} > max {}",
+                state.available,
+                self.max_permits,
+            );
         }
         self.event.notify(usize::MAX);
     }

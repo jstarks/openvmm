@@ -73,13 +73,13 @@ pub enum WriteMode {
 
 /// Per-page lifecycle state.
 ///
-/// Encodes both the dirty flag and the permit state as a single enum
-/// to prevent invalid combinations.
+/// Encodes the dirty flag, permit state, and data provenance as a single
+/// enum to prevent invalid combinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageState {
-    /// Page is clean. Data is loaded and unmodified.
-    ///
-    /// Invariant: `data.is_some()` when `state == Clean`.
+    /// Page is not dirty. Data may or may not be loaded (`data` can be
+    /// `None` for a freshly created entry that hasn't been loaded or
+    /// written yet).
     Clean,
     /// Page data is being loaded from disk by another task.
     /// Other acquirers wait on `state_event`.
@@ -87,11 +87,16 @@ enum PageState {
     /// A log permit is being acquired for this page.
     /// Other acquirers wait on `state_event`.
     AcquiringPermit,
-    /// A log permit has been acquired but the page has not been mutated yet.
-    /// The `WritePageGuard` holds the page lock. On drop:
-    /// - If mutated → transitions to `Dirty`.
+    /// A log permit has been acquired and the page has existing data
+    /// (loaded from disk or previously written). The `WritePageGuard`
+    /// holds the page lock. On drop:
+    /// - If mutated → already transitioned to `Dirty` by `DerefMut`.
     /// - If not mutated → transitions to `Clean` (permit refunded).
     HasPermit,
+    /// A log permit has been acquired but the page data is zeroed (first
+    /// touch via `Overwrite` mode). The caller must write the full page
+    /// content. `is_populated()` returns `false` in this state.
+    /// Transitions to `Dirty` on first `DerefMut`.
     Overwritten,
     /// Page has been modified. A permit is consumed (transfers to the log
     /// task on commit).
@@ -101,9 +106,10 @@ enum PageState {
 /// Internal per-page data.
 struct PageData {
     /// The page contents as `Arc` for zero-copy commit and COW.
-    /// Always `Some` when `state` is `Clean`, `HasPermit`, or `Dirty`.
-    /// `None` only when the page entry is freshly created (before loading)
-    /// or in `Loading`/`AcquiringPermit` state.
+    /// `Some` when `state` is `HasPermit`, `Overwritten`, or `Dirty`,
+    /// and when `Clean` after a successful load or write.
+    /// `None` when `Clean` (freshly created, not yet loaded),
+    /// `Loading`, or `AcquiringPermit`.
     data: Option<Arc<[u8; PAGE_SIZE]>>,
     /// Page lifecycle state.
     state: PageState,
@@ -117,7 +123,7 @@ struct PageData {
 /// Internal page map wrapping the `HashMap` and dirty page counter.
 struct PageMap {
     map: HashMap<PageKey, Arc<Mutex<PageData>>>,
-    /// Number of pages in `HasPermit` or `Dirty` state.
+    /// Number of pages in `HasPermit`, `Overwritten`, or `Dirty` state.
     /// Maintained under the map lock to prevent races.
     dirty_count: usize,
     /// Log client for sending transactions. `None` for read-only caches.
@@ -620,7 +626,7 @@ impl<F: AsyncFile> PageCache<F> {
 /// RAII guard providing read-only access to a cached page.
 #[must_use = "page guard holds a lock; drop it when done reading"]
 pub struct ReadPageGuard {
-    guard: parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>,
+    guard: ArcMutexGuard<parking_lot::RawMutex, PageData>,
 }
 
 impl std::ops::Deref for ReadPageGuard {
@@ -633,9 +639,13 @@ impl std::ops::Deref for ReadPageGuard {
 
 /// RAII guard providing write access to a cached page.
 ///
-/// Mutating via `DerefMut` transitions the page to `Dirty` (if it has
-/// a permit via `HasPermit`). Arc COW ensures the writer gets a private
-/// copy if the log task holds a reference.
+/// Mutating via `DerefMut` transitions the page to `Dirty`. Arc COW
+/// ensures the writer gets a private copy if the log task holds a
+/// reference.
+///
+/// Use [`is_populated()`](Self::is_populated) to check whether the page
+/// has existing data (can be patched in-place) or is freshly zeroed
+/// (must be fully written).
 pub struct WritePageGuard<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
     guard: Option<ArcMutexGuard<parking_lot::RawMutex, PageData>>,
@@ -688,7 +698,7 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
                 }
                 self.cache.state_event.notify(usize::MAX);
             }
-            // Dirty or Clean: nothing to do. Guard drops, releasing the lock.
+            // Dirty, Overwritten, or Clean: nothing to do. Guard drops, releasing the lock.
         }
     }
 }

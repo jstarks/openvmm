@@ -151,8 +151,6 @@ enum WritePendingAction {
     /// Acquire a log permit. Carries the page entry Arc so
     /// `finalize_permit` can skip the map re-lookup.
     AcquirePermit(Arc<Mutex<PageData>>),
-    /// Dirty batch was full and has been committed. Retry from the top.
-    Retry,
 }
 
 /// Write-back page cache backed by an [`AsyncFile`].
@@ -404,19 +402,14 @@ impl<F: AsyncFile> PageCache<F> {
                         other => std::io::Error::other(other.to_string()),
                     })?;
                 }
-                WritePendingAction::Retry => {
-                    // Batch-full commit was done; loop to re-acquire page.
-                    continue;
-                }
             }
         }
     }
 
     /// Sync helper: try to acquire write access.
     ///
-    /// Owns the map lock for the entire operation. If the dirty batch is
-    /// full, commits it under the same lock (batch-full commit) before
-    /// transitioning the page to AcquiringPermit. No TOCTOU gap.
+    /// Returns the guard on success, or an action to perform before
+    /// retrying. Batch-full commit is handled in [`finalize_permit`].
     fn try_acquire_write(
         &self,
         key: PageKey,
@@ -475,17 +468,6 @@ impl<F: AsyncFile> PageCache<F> {
                 ))
             }
             PageState::Clean => {
-                // Batch-full commit: if the dirty batch has reached
-                // MAX_COMMIT_PAGES, commit it now under the same map lock.
-                // Drop the page guard first — commit_locked iterates all
-                // pages and would deadlock on this one.
-                if pages.dirty_count >= MAX_COMMIT_PAGES {
-                    drop(guard);
-                    let _ = self.commit_locked(&mut pages);
-                    drop(pages);
-                    return Err(WritePendingAction::Retry);
-                }
-
                 guard.state = PageState::AcquiringPermit;
                 Err(WritePendingAction::AcquirePermit(ArcMutexGuard::into_arc(
                     guard,
@@ -495,28 +477,35 @@ impl<F: AsyncFile> PageCache<F> {
     }
 
     /// Finalize a permit acquisition: transition page to HasPermit or Clean.
-    /// The dirty_count increment is under the map lock, synchronized with
-    /// commit_locked which also holds the map lock when collecting dirty pages.
+    ///
+    /// The dirty_count check, batch-full commit, and dirty_count increment
+    /// are all performed atomically under the map lock — no TOCTOU gap.
     fn finalize_permit(&self, entry: Arc<Mutex<PageData>>, success: bool) {
         {
             let mut pages = self.pages.lock();
             let mut page = entry.lock();
-            // TODO: this seems broken, TOCTOU
-            if success {
-                pages.dirty_count += 1;
-            }
-            drop(pages);
             assert!(page.state == PageState::AcquiringPermit);
-            page.state = if success {
-                if page.data.is_some() {
+            if success {
+                // Batch-full commit: if the dirty batch has reached
+                // MAX_COMMIT_PAGES, commit before adding this page.
+                // Drop the page guard first — commit_locked iterates
+                // all pages and would deadlock on this one.
+                if pages.dirty_count >= MAX_COMMIT_PAGES {
+                    drop(page);
+                    let _ = self.commit_locked(&mut pages);
+                    page = entry.lock();
+                }
+                pages.dirty_count += 1;
+                drop(pages);
+                page.state = if page.data.is_some() {
                     PageState::HasPermit
                 } else {
                     page.data = Some(Arc::new([0u8; PAGE_SIZE]));
                     PageState::Overwritten
-                }
+                };
             } else {
-                PageState::Clean
-            };
+                page.state = PageState::Clean;
+            }
         }
         self.state_event.notify(usize::MAX);
     }

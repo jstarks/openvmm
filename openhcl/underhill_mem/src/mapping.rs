@@ -266,18 +266,35 @@ unsafe impl GuestMemoryAccess for GuestMemoryView {
         }
     }
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
+    fn lock_gpns(
+        &self,
+        gpns: &[u64],
+    ) -> Result<guestmem::LockedPagesInfo, GuestMemoryBackingError> {
         if let Some(protector) = self.protector.as_ref() {
-            protector.lock_gpns(self.vtl, gpns)?;
-            Ok(true)
+            let vtl = self.vtl;
+            protector.lock_gpns(vtl, gpns)?;
+            let protector = protector.clone();
+            let gpns = gpns.to_vec().into_boxed_slice();
+            struct PinGuard {
+                protector: Arc<dyn ProtectIsolatedMemory>,
+                vtl: GuestVtl,
+                gpns: Box<[u64]>,
+            }
+            impl Drop for PinGuard {
+                fn drop(&mut self) {
+                    self.protector.unlock_gpns(self.vtl, &self.gpns);
+                }
+            }
+            Ok(guestmem::LockedPagesInfo {
+                page_vas: None,
+                guard: Some(Box::new(PinGuard {
+                    protector,
+                    vtl,
+                    gpns,
+                })),
+            })
         } else {
-            Ok(false)
-        }
-    }
-
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        if let Some(protector) = self.protector.as_ref() {
-            protector.unlock_gpns(self.vtl, gpns)
+            Ok(guestmem::LockedPagesInfo::default())
         }
     }
 }

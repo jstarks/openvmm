@@ -225,6 +225,24 @@ struct NotMapped;
 #[error("page inaccessible in bitmap")]
 struct BitmapFailure;
 
+/// Result of locking guest physical pages via [`GuestMemoryAccess::lock_gpns`].
+pub struct LockedPagesInfo {
+    /// Per-page VAs. When `Some`, these are used instead of deriving
+    /// VAs from `mapping()`. Must have one entry per GPN.
+    pub page_vas: Option<Box<[*const AtomicU8]>>,
+    /// Backend-specific cleanup guard. Dropped when the lock is released.
+    pub guard: Option<Box<dyn Send + Sync>>,
+}
+
+impl Default for LockedPagesInfo {
+    fn default() -> Self {
+        Self {
+            page_vas: None,
+            guard: None,
+        }
+    }
+}
+
 /// A trait for a guest memory backing that is fully available via a virtual
 /// address mapping, as opposed to the fallback functions such as
 /// [`GuestMemoryAccess::read_fallback`].
@@ -615,19 +633,14 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
     /// Locks the specified guest physical pages (GPNs), preventing any mapping
     /// or permission changes until they are unlocked.
     ///
-    /// Returns a boolean indicating whether unlocking is required.
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
+    /// Returns a [`LockedPagesInfo`] describing the lock:
+    /// - `page_vas`: backend-provided VAs (one per GPN), used instead of
+    ///   `mapping()`. `None` to use the standard mapping path.
+    /// - `guard`: backend-specific cleanup guard, dropped when the lock
+    ///   is released.
+    fn lock_gpns(&self, gpns: &[u64]) -> Result<LockedPagesInfo, GuestMemoryBackingError> {
         let _ = gpns;
-        Ok(false)
-    }
-
-    /// Unlocks the specified guest physical pages (GPNs) after exclusive access.
-    ///
-    /// Panics if asked to unlock a page that was not previously locked. The
-    /// caller must ensure that the given slice has the same ordering as the
-    /// one passed to `lock_gpns`.
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        let _ = gpns;
+        Ok(LockedPagesInfo::default())
     }
 
     /// Return a sharing control object if this memory backing supports
@@ -685,9 +698,7 @@ trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
 
     fn expose_va(&self, address: u64, len: u64) -> Result<(), GuestMemoryBackingError>;
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError>;
-
-    fn unlock_gpns(&self, gpns: &[u64]);
+    fn lock_gpns(&self, gpns: &[u64]) -> Result<LockedPagesInfo, GuestMemoryBackingError>;
 
     fn sharing(&self) -> Option<GuestMemorySharing>;
 }
@@ -749,12 +760,8 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for T {
         self.expose_va(address, len)
     }
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
+    fn lock_gpns(&self, gpns: &[u64]) -> Result<LockedPagesInfo, GuestMemoryBackingError> {
         self.lock_gpns(gpns)
-    }
-
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        self.unlock_gpns(gpns)
     }
 
     fn sharing(&self) -> Option<GuestMemorySharing> {
@@ -1137,20 +1144,24 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
         }
     }
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
-        let mut ret = false;
+    fn lock_gpns(&self, gpns: &[u64]) -> Result<LockedPagesInfo, GuestMemoryBackingError> {
+        let mut all_guards: Vec<Box<dyn Send + Sync>> = Vec::new();
         for gpn in gpns {
             let (region, offset_in_region) = self.region(gpn * PAGE_SIZE64, PAGE_SIZE64)?;
-            ret |= region.lock_gpns(&[offset_in_region / PAGE_SIZE64])?;
+            let info = region.lock_gpns(&[offset_in_region / PAGE_SIZE64])?;
+            if let Some(guard) = info.guard {
+                all_guards.push(guard);
+            }
         }
-        Ok(ret)
-    }
-
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        for gpn in gpns {
-            let (region, offset_in_region) = self.region(gpn * PAGE_SIZE64, PAGE_SIZE64).unwrap();
-            region.unlock_gpns(&[offset_in_region / PAGE_SIZE64]);
-        }
+        let guard: Option<Box<dyn Send + Sync>> = if all_guards.is_empty() {
+            None
+        } else {
+            Some(Box::new(all_guards))
+        };
+        Ok(LockedPagesInfo {
+            page_vas: None,
+            guard,
+        })
     }
 
     fn sharing(&self) -> Option<GuestMemorySharing> {
@@ -2030,17 +2041,25 @@ impl GuestMemory {
         gpns: &[u64],
     ) -> Result<LockedPages, GuestMemoryError> {
         self.with_op(None, GuestMemoryOperation::Lock, || {
-            let mut pages = Vec::with_capacity(gpns.len());
-            for &gpn in gpns {
-                let gpa = gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?;
-                let page = self.probe_page_for_lock(with_kernel_access, gpa)?;
-                pages.push(PagePtr(page));
-            }
-            let store_gpns = self.inner.imp.lock_gpns(gpns)?;
+            let info = self.inner.imp.lock_gpns(gpns)?;
+            let pages = if let Some(page_vas) = &info.page_vas {
+                // Backend provided VAs directly.
+                assert_eq!(page_vas.len(), gpns.len());
+                page_vas.iter().map(|&p| PagePtr(p)).collect()
+            } else {
+                // Derive VAs from the top-level mapping.
+                let mut pages = Vec::with_capacity(gpns.len());
+                for &gpn in gpns {
+                    let gpa = gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?;
+                    let page = self.probe_page_for_lock(with_kernel_access, gpa)?;
+                    pages.push(PagePtr(page));
+                }
+                pages
+            };
             Ok(LockedPages {
                 pages: pages.into_boxed_slice(),
-                gpns: store_gpns.then(|| gpns.to_vec().into_boxed_slice()),
-                mem: self.inner.clone(),
+                _mem: self.inner.clone(),
+                _guard: info.guard,
             })
         })
     }
@@ -2231,10 +2250,10 @@ impl GuestMemory {
                     self.dangerous_access_pre_locked_memory(range.start, range.len() as usize),
                 );
             }
-            let store_gpns = self.inner.imp.lock_gpns(paged_range.gpns())?;
+            let info = self.inner.imp.lock_gpns(paged_range.gpns())?;
             Ok(LockedRangeImpl {
-                mem: &self.inner,
-                gpns: store_gpns.then(|| paged_range.gpns().to_vec().into_boxed_slice()),
+                _mem: &self.inner,
+                _guard: info.guard,
                 inner: locked_range,
             })
         })
@@ -2299,17 +2318,9 @@ impl GuestMemoryInner {
 
 pub struct LockedPages {
     pages: Box<[PagePtr]>,
-    gpns: Option<Box<[u64]>>,
     // maintain a reference to the backing memory
-    mem: Arc<GuestMemoryInner>,
-}
-
-impl Drop for LockedPages {
-    fn drop(&mut self) {
-        if let Some(gpns) = &self.gpns {
-            self.mem.imp.unlock_gpns(gpns);
-        }
-    }
+    _mem: Arc<GuestMemoryInner>,
+    _guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl Debug for LockedPages {
@@ -2358,8 +2369,8 @@ pub trait LockedRange<'a> {
 }
 
 pub struct LockedRangeImpl<'a, T: LockedRange<'a>> {
-    mem: &'a GuestMemoryInner,
-    gpns: Option<Box<[u64]>>,
+    _mem: &'a GuestMemoryInner,
+    _guard: Option<Box<dyn Send + Sync>>,
     inner: T,
 }
 
@@ -2370,14 +2381,6 @@ impl<'a, T: LockedRange<'a>> LockedRangeImpl<'a, T> {
 
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
-    }
-}
-
-impl<'a, T: LockedRange<'a>> Drop for LockedRangeImpl<'a, T> {
-    fn drop(&mut self) {
-        if let Some(gpns) = &self.gpns {
-            self.mem.imp.unlock_gpns(gpns);
-        }
     }
 }
 

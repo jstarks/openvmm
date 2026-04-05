@@ -595,6 +595,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                     self.bat
                                         .write_block_mapping(
                                             &self.cache,
+                                            &self.bat_state,
                                             BlockType::SectorBitmap,
                                             chunk_number,
                                             new_sbm,
@@ -628,6 +629,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             self.bat
                                 .write_block_mapping(
                                     &self.cache,
+                                    &self.bat_state,
                                     BlockType::Payload,
                                     block_info.block_number,
                                     new_mapping,
@@ -794,6 +796,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         .bat
                         .write_block_mapping(
                             &self.cache,
+                            &self.bat_state,
                             BlockType::Payload,
                             block_number,
                             final_mapping,

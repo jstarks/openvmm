@@ -411,43 +411,62 @@ impl Bat {
         }
     }
 
-    /// Write a raw BAT entry to the cache at the given entry index.
+    /// Serialize a BAT page from in-memory state.
     ///
-    /// Acquires the page in Modify mode, writes the entry at the correct
-    /// offset, and releases the guard (write-through to disk).
-    pub async fn write_bat_entry<F: AsyncFile>(
+    /// Produces all entries for the given page, with TFP blocks having
+    /// their `file_offset_mb` masked to zero (allocation not committed
+    /// yet). Matches the C code's `Vhd2iProduceBatPageLocked` +
+    /// `Vhd2iGenerateBatEntry` behavior.
+    pub fn produce_page(
         &self,
-        cache: &PageCache<F>,
-        entry_index: u32,
-        entry: BatEntry,
-    ) -> Result<(), VhdxError> {
-        let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
-        let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
-
-        let mut guard = cache
-            .acquire_write(
-                PageKey {
-                    tag: BAT_TAG,
-                    offset: page_offset,
-                },
-                WriteMode::Modify,
-            )
-            .await?;
-
-        let byte_offset = entry_within_page * size_of::<BatEntry>();
-        guard[byte_offset..byte_offset + size_of::<BatEntry>()].copy_from_slice(entry.as_bytes());
-
-        Ok(())
+        bat_state: &BatState,
+        page_index: usize,
+    ) -> [u8; CACHE_PAGE_SIZE as usize] {
+        let mut buf = [0u8; CACHE_PAGE_SIZE as usize];
+        let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
+        for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
+            let entry_number = base_entry + i;
+            let bat_entry = match self.entry_number_to_block_id(entry_number) {
+                Some((BlockType::Payload, block_number)) => {
+                    let mapping = bat_state.get_payload_mapping(block_number);
+                    let file_mb = if mapping.transitioning_to_fully_present() {
+                        0
+                    } else {
+                        mapping.file_megabyte() as u64
+                    };
+                    BatEntry::new()
+                        .with_state(mapping.state())
+                        .with_file_offset_mb(file_mb)
+                }
+                Some((BlockType::SectorBitmap, chunk_number)) => {
+                    let mapping = bat_state.get_sbm_mapping(chunk_number);
+                    BatEntry::new()
+                        .with_state(mapping.state())
+                        .with_file_offset_mb(mapping.file_megabyte() as u64)
+                }
+                None => BatEntry::new(),
+            };
+            let offset = i as usize * size_of::<BatEntry>();
+            buf[offset..offset + size_of::<BatEntry>()].copy_from_slice(bat_entry.as_bytes());
+        }
+        buf
     }
 
     /// Write a block mapping to the cache, converting from in-memory
     /// representation to on-disk BAT entry format.
     ///
-    /// This is the primary BAT writeback mechanism, matching the C code's
-    /// `Vhd2iUpdateBlockStateWithNode` pattern.
+    /// Uses `Overwrite` mode to avoid unnecessary disk reads. If the
+    /// page is already cached, patches only the single entry. If not
+    /// cached, builds the full page from in-memory state (no disk read).
+    ///
+    /// The `bat_state` lock is only acquired in the rare uncached path,
+    /// after the async cache acquire completes — no lock held across await.
+    ///
+    /// Matches the C code's `Vhd2iUpdateBlockStateWithNode` pattern.
     pub async fn write_block_mapping<F: AsyncFile>(
         &self,
         cache: &PageCache<F>,
+        bat_state: &parking_lot::RwLock<BatState>,
         block_type: BlockType,
         block_number: u32,
         mapping: InternalBlockMapping,
@@ -456,12 +475,39 @@ impl Bat {
             BlockType::Payload => self.payload_entry_index(block_number),
             BlockType::SectorBitmap => self.sector_bitmap_entry_index(block_number),
         };
+        let page_number = entry_number as usize / ENTRIES_PER_BAT_PAGE as usize;
+        let page_offset = page_number as u64 * CACHE_PAGE_SIZE;
+        let entry_within_page = entry_number as usize % ENTRIES_PER_BAT_PAGE as usize;
 
-        let bat_entry = BatEntry::new()
-            .with_state(mapping.state())
-            .with_file_offset_mb(mapping.file_megabyte() as u64);
+        let mut guard = cache
+            .acquire_write(
+                PageKey {
+                    tag: BAT_TAG,
+                    offset: page_offset,
+                },
+                WriteMode::Overwrite,
+            )
+            .await?;
 
-        self.write_bat_entry(cache, entry_number, bat_entry).await
+        if guard.is_populated() {
+            // Fast path: page is cached — patch just the one entry.
+            let bat_entry = BatEntry::new()
+                .with_state(mapping.state())
+                .with_file_offset_mb(mapping.file_megabyte() as u64);
+            let byte_offset = entry_within_page * size_of::<BatEntry>();
+            guard[byte_offset..byte_offset + size_of::<BatEntry>()]
+                .copy_from_slice(bat_entry.as_bytes());
+        } else {
+            // Slow path: page not cached — build from in-memory state.
+            // Sync lock only, no await point.
+            let page_buf = {
+                let bs = bat_state.read();
+                self.produce_page(&bs, page_number)
+            };
+            guard.copy_from_slice(&page_buf);
+        }
+
+        Ok(())
     }
 }
 

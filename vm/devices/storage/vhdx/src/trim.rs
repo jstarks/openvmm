@@ -398,7 +398,13 @@ impl<F: AsyncFile> VhdxFile<F> {
             // 9d. Write BAT entry to cache (async).
             // LOCK AUDIT: bat_state write-lock dropped in step 9d block. No sync locks held.
             self.bat
-                .write_block_mapping(&self.cache, BlockType::Payload, block_number, new_mapping)
+                .write_block_mapping(
+                    &self.cache,
+                    &self.bat_state,
+                    BlockType::Payload,
+                    block_number,
+                    new_mapping,
+                )
                 .await?;
 
             // 9e. Handle space management based on old→new transition.

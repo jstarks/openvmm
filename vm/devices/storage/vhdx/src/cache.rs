@@ -34,6 +34,7 @@ use crate::log_permits::LogPermits;
 use crate::log_task::CommittedPage;
 use crate::log_task::LogClient;
 use crate::lsn_watermark::LsnWatermark;
+use parking_lot::ArcMutexGuard;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,6 +92,7 @@ enum PageState {
     /// - If mutated → transitions to `Dirty`.
     /// - If not mutated → transitions to `Clean` (permit refunded).
     HasPermit,
+    Overwritten,
     /// Page has been modified. A permit is consumed (transfers to the log
     /// task on commit).
     Dirty,
@@ -264,11 +266,15 @@ impl<F: AsyncFile> PageCache<F> {
             match action {
                 PendingAction::Wait(listener) => listener.await,
                 PendingAction::Load(file_offset, entry) => {
-                    let mut buf = [0u8; PAGE_SIZE];
-                    match self.file.read_at(file_offset, &mut buf).await {
-                        Ok(()) => self.complete_load(key, entry, Some(buf)),
+                    let mut buf = Arc::new([0u8; PAGE_SIZE]);
+                    match self
+                        .file
+                        .read_at(file_offset, Arc::get_mut(&mut buf).unwrap())
+                        .await
+                    {
+                        Ok(()) => self.complete_load(entry, Some(buf)),
                         Err(e) => {
-                            self.complete_load(key, entry, None);
+                            self.complete_load(entry, None);
                             return Err(e);
                         }
                     }
@@ -292,28 +298,17 @@ impl<F: AsyncFile> PageCache<F> {
             self.try_evict_under_lock(&mut pages, Some(key));
         }
 
-        let (entry, created) = match pages.map.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), false),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let entry = Arc::new(Mutex::new(PageData {
-                    data: None,
-                    state: PageState::Loading,
-                    pre_log_fsn: None,
-                    committed_lsn: None,
-                }));
-                e.insert(entry.clone());
-                (entry, true)
-            }
-        };
+        let entry = pages.map.entry(key).or_insert_with(|| {
+            Arc::new(Mutex::new(PageData {
+                data: None,
+                state: PageState::Clean,
+                pre_log_fsn: None,
+                committed_lsn: None,
+            }))
+        });
 
-        let guard = Mutex::lock_arc(&entry);
+        let mut guard = Mutex::lock_arc(entry);
         drop(pages);
-
-        if created {
-            // We created this entry in Loading state. Load it.
-            drop(guard);
-            return Err(PendingAction::Load(file_offset, entry));
-        }
 
         match guard.state {
             PageState::Loading | PageState::AcquiringPermit => {
@@ -321,7 +316,14 @@ impl<F: AsyncFile> PageCache<F> {
                 drop(guard);
                 Err(PendingAction::Wait(listener))
             }
-            PageState::Clean | PageState::HasPermit | PageState::Dirty => {
+            PageState::Clean if guard.data.is_none() => {
+                guard.state = PageState::Loading;
+                Err(PendingAction::Load(
+                    file_offset,
+                    ArcMutexGuard::into_arc(guard),
+                ))
+            }
+            PageState::Clean | PageState::HasPermit | PageState::Overwritten | PageState::Dirty => {
                 assert!(
                     guard.data.is_some(),
                     "page in {:?} has no data",
@@ -339,31 +341,19 @@ impl<F: AsyncFile> PageCache<F> {
     ///
     /// On failure (`data` is `None`): removes the entry from the cache so the
     /// next acquirer creates a fresh entry and retries.
-    fn complete_load(
-        &self,
-        key: PageKey,
-        entry: Arc<Mutex<PageData>>,
-        data: Option<[u8; PAGE_SIZE]>,
-    ) {
+    fn complete_load(&self, entry: Arc<Mutex<PageData>>, data: Option<Arc<[u8; PAGE_SIZE]>>) {
         let mut page = entry.lock();
         assert!(
             page.state == PageState::Loading,
             "complete_load called but page state is {:?}, expected Loading",
             page.state
         );
-        if let Some(buf) = data {
-            assert!(
-                page.data.is_none(),
-                "complete_load called but page already has data"
-            );
-            page.data = Some(Arc::new(buf));
-            page.state = PageState::Clean;
-        } else {
-            // Load failed. Remove the entry so the next acquirer
-            // starts fresh. Don't leave a Clean entry with no data.
-            drop(page);
-            self.pages.lock().map.remove(&key);
-        }
+        assert!(
+            page.data.is_none(),
+            "complete_load called but page already has data"
+        );
+        page.state = PageState::Clean;
+        page.data = data;
         self.state_event.notify(usize::MAX);
     }
 
@@ -386,11 +376,15 @@ impl<F: AsyncFile> PageCache<F> {
             match action {
                 WritePendingAction::Wait(listener) => listener.await,
                 WritePendingAction::Load(file_offset, entry) => {
-                    let mut buf = [0u8; PAGE_SIZE];
-                    match self.file.read_at(file_offset, &mut buf).await {
-                        Ok(()) => self.complete_load(key, entry, Some(buf)),
+                    let mut buf = Arc::new([0u8; PAGE_SIZE]);
+                    match self
+                        .file
+                        .read_at(file_offset, Arc::get_mut(&mut buf).unwrap())
+                        .await
+                    {
+                        Ok(()) => self.complete_load(entry, Some(buf)),
                         Err(e) => {
-                            self.complete_load(key, entry, None);
+                            self.complete_load(entry, None);
                             return Err(e);
                         }
                     }
@@ -423,6 +417,11 @@ impl<F: AsyncFile> PageCache<F> {
         load: bool,
     ) -> Result<WritePageGuard<'_, F>, WritePendingAction> {
         assert!(
+            self.log_permits.is_some(),
+            "acquire_write requires a log (use open_writable)"
+        );
+
+        assert!(
             key.offset.is_multiple_of(PAGE_SIZE as u64),
             "page offset {:#x} is not {PAGE_SIZE}-byte aligned",
             key.offset
@@ -436,60 +435,40 @@ impl<F: AsyncFile> PageCache<F> {
             self.try_evict_under_lock(&mut pages, Some(key));
         }
 
-        let (entry, created) = match pages.map.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), false),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let entry = Arc::new(Mutex::new(PageData {
-                    data: None,
-                    state: PageState::Loading,
-                    pre_log_fsn: None,
-                    committed_lsn: None,
-                }));
-                e.insert(entry.clone());
-                (entry, true)
-            }
-        };
+        let entry = pages.map.entry(key).or_insert_with(|| {
+            Arc::new(Mutex::new(PageData {
+                data: None,
+                state: PageState::Clean,
+                pre_log_fsn: None,
+                committed_lsn: None,
+            }))
+        });
 
-        let mut guard = Mutex::lock_arc(&entry);
-
-        if created {
-            if load {
-                drop(guard);
-                drop(pages);
-                return Err(WritePendingAction::Load(file_offset, entry));
-            } else {
-                guard.data = Some(Arc::new([0u8; PAGE_SIZE]));
-                guard.state = PageState::Clean;
-            }
-        }
+        let mut guard = Mutex::lock_arc(entry);
 
         match guard.state {
             PageState::Loading | PageState::AcquiringPermit => {
-                let listener = self.state_event.listen();
-                drop(guard);
-                drop(pages);
-                Err(WritePendingAction::Wait(listener))
+                Err(WritePendingAction::Wait(self.state_event.listen()))
             }
-            PageState::Dirty | PageState::HasPermit => {
+            PageState::Dirty | PageState::Overwritten | PageState::HasPermit => {
                 assert!(
                     guard.data.is_some(),
                     "page in {:?} has no data",
                     guard.state
                 );
-                drop(pages);
                 Ok(WritePageGuard {
                     cache: self,
                     guard: Some(guard),
-                    mutated: false,
                 })
             }
+            PageState::Clean if load && guard.data.is_none() => {
+                guard.state = PageState::Loading;
+                Err(WritePendingAction::Load(
+                    file_offset,
+                    ArcMutexGuard::into_arc(guard),
+                ))
+            }
             PageState::Clean => {
-                assert!(guard.data.is_some(), "Clean page has no data");
-                assert!(
-                    self.log_permits.is_some(),
-                    "acquire_write requires a log (use open_writable)"
-                );
-
                 // Batch-full commit: if the dirty batch has reached
                 // MAX_COMMIT_PAGES, commit it now under the same map lock.
                 // Drop the page guard first — commit_locked iterates all
@@ -502,9 +481,9 @@ impl<F: AsyncFile> PageCache<F> {
                 }
 
                 guard.state = PageState::AcquiringPermit;
-                drop(guard);
-                drop(pages);
-                Err(WritePendingAction::AcquirePermit(entry))
+                Err(WritePendingAction::AcquirePermit(ArcMutexGuard::into_arc(
+                    guard,
+                )))
             }
         }
     }
@@ -513,18 +492,26 @@ impl<F: AsyncFile> PageCache<F> {
     /// The dirty_count increment is under the map lock, synchronized with
     /// commit_locked which also holds the map lock when collecting dirty pages.
     fn finalize_permit(&self, entry: Arc<Mutex<PageData>>, success: bool) {
-        let mut pages = self.pages.lock();
-        let mut page = entry.lock();
-        if page.state == PageState::AcquiringPermit {
+        {
+            let mut pages = self.pages.lock();
+            let mut page = entry.lock();
+            // TODO: this seems broken, TOCTOU
             if success {
-                page.state = PageState::HasPermit;
                 pages.dirty_count += 1;
-            } else {
-                page.state = PageState::Clean;
             }
+            drop(pages);
+            assert!(page.state == PageState::AcquiringPermit);
+            page.state = if success {
+                if page.data.is_some() {
+                    PageState::HasPermit
+                } else {
+                    page.data = Some(Arc::new([0u8; PAGE_SIZE]));
+                    PageState::Overwritten
+                }
+            } else {
+                PageState::Clean
+            };
         }
-        drop(page);
-        drop(pages);
         self.state_event.notify(usize::MAX);
     }
 
@@ -597,7 +584,7 @@ impl<F: AsyncFile> PageCache<F> {
 
         for (&key, entry) in pages.map.iter() {
             let mut page = entry.lock();
-            if page.state == PageState::Dirty {
+            if matches!(page.state, PageState::Dirty | PageState::Overwritten) {
                 let file_offset = self.resolve_offset(key);
                 let data = page.data.as_ref().expect("dirty page has no data").clone();
 
@@ -651,9 +638,19 @@ impl std::ops::Deref for ReadPageGuard {
 /// copy if the log task holds a reference.
 pub struct WritePageGuard<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
-    guard: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, PageData>>,
-    /// Set to true by `DerefMut`.
-    mutated: bool,
+    guard: Option<ArcMutexGuard<parking_lot::RawMutex, PageData>>,
+}
+
+impl<F: AsyncFile> WritePageGuard<'_, F> {
+    /// Whether the page data was already in the cache when acquired.
+    ///
+    /// - `true`: page was already cached — the guard contains valid data
+    ///   that can be patched in-place.
+    /// - `false`: page was freshly created (zeroed) — the caller must
+    ///   populate the entire page before dropping the guard.
+    pub fn is_populated(&self) -> bool {
+        self.guard.as_ref().unwrap().state != PageState::Overwritten
+    }
 }
 
 impl<F: AsyncFile> std::ops::Deref for WritePageGuard<'_, F> {
@@ -672,17 +669,7 @@ impl<F: AsyncFile> std::ops::Deref for WritePageGuard<'_, F> {
 impl<F: AsyncFile> std::ops::DerefMut for WritePageGuard<'_, F> {
     fn deref_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         let guard = self.guard.as_mut().expect("guard consumed");
-
-        // Transition HasPermit → Dirty on first mutation.
-        // dirty_count was already incremented at permit finalization time,
-        // so no counter update needed here.
-        if !self.mutated {
-            self.mutated = true;
-            if guard.state == PageState::HasPermit {
-                guard.state = PageState::Dirty;
-            }
-        }
-
+        guard.state = PageState::Dirty;
         Arc::make_mut(guard.data.as_mut().expect("page data missing"))
     }
 }
@@ -1487,5 +1474,96 @@ mod tests {
             g.fill(i as u8);
         }
         // If we get here without hanging, no deadlock.
+    }
+
+    #[async_test]
+    async fn overwrite_uncached_reports_not_cached() {
+        let (tx, _rx) = mesh::channel::<LogRequest>();
+        let permits = Arc::new(LogPermits::new(1000));
+        let mut cache = PageCache::new(
+            Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
+            Some(LogClient::new(tx)),
+            Some(permits),
+            None,
+            0,
+        );
+        cache.register_tag(0, 0);
+
+        let key = PageKey { tag: 0, offset: 0 };
+        let g = cache
+            .acquire_write(key, WriteMode::Overwrite)
+            .await
+            .unwrap();
+        assert!(
+            !g.is_populated(),
+            "first Overwrite acquire should report not cached"
+        );
+    }
+
+    #[async_test]
+    async fn overwrite_cached_reports_cached() {
+        let (tx, _rx) = mesh::channel::<LogRequest>();
+        let permits = Arc::new(LogPermits::new(1000));
+        let mut cache = PageCache::new(
+            Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
+            Some(LogClient::new(tx)),
+            Some(permits),
+            None,
+            0,
+        );
+        cache.register_tag(0, 0);
+
+        let key = PageKey { tag: 0, offset: 0 };
+
+        // First write populates the cache.
+        {
+            let mut g = cache
+                .acquire_write(key, WriteMode::Overwrite)
+                .await
+                .unwrap();
+            g.fill(0xAA);
+        }
+
+        // Second write should find it cached.
+        let g = cache
+            .acquire_write(key, WriteMode::Overwrite)
+            .await
+            .unwrap();
+        assert!(
+            g.is_populated(),
+            "second Overwrite acquire should report cached"
+        );
+        // Data should still be 0xAA (not zeroed).
+        assert_eq!(g[0], 0xAA);
+        assert_eq!(g[PAGE_SIZE - 1], 0xAA);
+    }
+
+    #[async_test]
+    async fn modify_always_reports_cached() {
+        // Modify loads from disk if not cached, so populated reflects
+        // map presence after load — always true since load populates it.
+        let file = InMemoryFile::new(PAGE_SIZE as u64);
+        file.write_at(0, &[0xBB; PAGE_SIZE]).await.unwrap();
+
+        let (tx, _rx) = mesh::channel::<LogRequest>();
+        let permits = Arc::new(LogPermits::new(1000));
+        let mut cache = PageCache::new(
+            Arc::new(file),
+            Some(LogClient::new(tx)),
+            Some(permits),
+            None,
+            0,
+        );
+        cache.register_tag(0, 0);
+
+        let key = PageKey { tag: 0, offset: 0 };
+
+        // Modify loads from disk then retries — page is in map on retry.
+        let g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
+        assert!(
+            g.is_populated(),
+            "Modify always reports cached (loaded before permit)"
+        );
+        assert_eq!(g[0], 0xBB);
     }
 }

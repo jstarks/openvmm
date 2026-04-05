@@ -186,6 +186,7 @@ pub(crate) async fn rewrite_region_tables(
         "region table must be exactly {} bytes",
         format::REGION_TABLE_SIZE
     );
+    // THIS IS FUCKING BROKEN
     file.write_at(format::REGION_TABLE_OFFSET, table).await?;
     file.write_at(format::ALT_REGION_TABLE_OFFSET, table)
         .await?;

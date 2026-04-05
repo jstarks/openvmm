@@ -818,52 +818,6 @@ impl<F: AsyncFile> VhdxFile<F> {
         self.free_space.set_block_alignment(alignment)
     }
 
-    /// Serialize a single BAT page from in-memory state into a raw byte buffer.
-    ///
-    /// For each of the 512 entries on the page, reverse-maps the flat entry
-    /// number to (BlockType, block_number) and reads the in-memory mapping.
-    /// Entries beyond the disk end are written as zero.
-    ///
-    /// TFP blocks have their `file_offset_mb` masked to zero — the allocated
-    /// offset is not committed until `complete_write_inner` clears TFP.
-    /// This matches the C code's `Vhd2iGenerateBatEntry` behavior.
-    fn produce_bat_page(
-        &self,
-        bat_state: &BatState,
-        page_index: usize,
-    ) -> [u8; CACHE_PAGE_SIZE as usize] {
-        let mut buf = [0u8; CACHE_PAGE_SIZE as usize];
-        let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
-        for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
-            let entry_number = base_entry + i;
-            let bat_entry = match self.bat.entry_number_to_block_id(entry_number) {
-                Some((BlockType::Payload, block_number)) => {
-                    let mapping = bat_state.get_payload_mapping(block_number);
-                    // Mask file offset for TFP blocks — the allocation
-                    // is not committed yet.
-                    let file_mb = if mapping.transitioning_to_fully_present() {
-                        0
-                    } else {
-                        mapping.file_megabyte() as u64
-                    };
-                    BatEntry::new()
-                        .with_state(mapping.state())
-                        .with_file_offset_mb(file_mb)
-                }
-                Some((BlockType::SectorBitmap, chunk_number)) => {
-                    let mapping = bat_state.get_sbm_mapping(chunk_number);
-                    BatEntry::new()
-                        .with_state(mapping.state())
-                        .with_file_offset_mb(mapping.file_megabyte() as u64)
-                }
-                None => BatEntry::new(),
-            };
-            let offset = i as usize * size_of::<BatEntry>();
-            buf[offset..offset + size_of::<BatEntry>()].copy_from_slice(bat_entry.as_bytes());
-        }
-        buf
-    }
-
     /// Compute the cache [`PageKey`] for the BAT page containing the given
     /// payload block's entry.
     ///

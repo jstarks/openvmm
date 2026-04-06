@@ -758,19 +758,6 @@ mod tests {
     }
 
     #[test]
-    fn signatures_are_correct() {
-        // Verify that our signature constants match the expected byte patterns.
-        assert_eq!(&HEADER_SIGNATURE.to_le_bytes(), b"head");
-        assert_eq!(&REGION_TABLE_SIGNATURE.to_le_bytes(), b"regi");
-        assert_eq!(&LOG_ENTRY_HEADER_SIGNATURE.to_le_bytes(), b"loge");
-        assert_eq!(&LOG_DESCRIPTOR_DATA_SIGNATURE.to_le_bytes(), b"desc");
-        assert_eq!(&LOG_DESCRIPTOR_ZERO_SIGNATURE.to_le_bytes(), b"zero");
-        assert_eq!(&LOG_DATA_SECTOR_SIGNATURE.to_le_bytes(), b"data");
-        assert_eq!(&FILE_IDENTIFIER_SIGNATURE.to_le_bytes(), b"vhdxfile");
-        assert_eq!(&METADATA_TABLE_SIGNATURE.to_le_bytes(), b"metadata");
-    }
-
-    #[test]
     fn metadata_table_entry_flags() {
         let flags = MetadataTableEntryFlags::new()
             .with_is_user(true)

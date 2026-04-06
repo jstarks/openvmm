@@ -507,6 +507,10 @@ impl Bat {
                 .copy_from_slice(bat_entry.as_bytes());
         }
 
+        // BAT pages are always rebuildable from in-memory BatState,
+        // so prefer evicting them over sector bitmap pages.
+        guard.demote();
+
         Ok(())
     }
 }

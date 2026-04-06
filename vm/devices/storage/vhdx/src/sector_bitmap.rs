@@ -21,6 +21,7 @@ use crate::format::CACHE_PAGE_SIZE;
 use crate::format::SECTORS_PER_CHUNK;
 use crate::io::ReadRange;
 use crate::open::VhdxFile;
+use bitvec::prelude::*;
 
 /// Cache tag for sector bitmap pages.
 ///
@@ -30,24 +31,6 @@ pub(crate) const SBM_TAG: u8 = 2;
 
 /// Number of sectors tracked per bitmap cache page (4 KiB * 8 bits = 32768).
 const SECTORS_PER_BITMAP_PAGE: u64 = CACHE_PAGE_SIZE * 8;
-
-/// Find the first bit with the given value starting at `start` up to (but not
-/// including) `end`. Returns `end` if no matching bit is found.
-///
-/// Bits are stored LSB-first: bit `n` is at byte `n / 8`, position `n % 8`.
-fn find_bit(page: &[u8], start: u64, end: u64, set: bool) -> u64 {
-    let mut index = start;
-    while index < end {
-        let byte_index = (index / 8) as usize;
-        let bit_position = (index % 8) as u32;
-        let bit_set = (page[byte_index] >> bit_position) & 1 == 1;
-        if bit_set == set {
-            return index;
-        }
-        index += 1;
-    }
-    end
-}
 
 impl<F: AsyncFile> VhdxFile<F> {
     /// Resolve a read for a partially-present block by reading the sector bitmap.
@@ -108,15 +91,16 @@ impl<F: AsyncFile> VhdxFile<F> {
                     })
                     .await?;
 
-                // Scan bits within this page.
-                let page_data: &[u8] = &*guard;
-                let mut zero = start_bit;
-                while zero < bits_in_this_page {
+                // Scan bits within this page using BitSlice for word-level acceleration.
+                let bits = BitSlice::<u8, Lsb0>::from_slice(&*guard);
+                let window = &bits[start_bit as usize..bits_in_this_page as usize];
+                let mut pos = 0usize;
+                let len = window.len();
+                while pos < len {
                     // Find first set bit (data present).
-                    let one = find_bit(page_data, zero, bits_in_this_page, true);
-                    if one > zero {
-                        // Emit Unmapped range for the run of 0 bits.
-                        let unmapped_sectors = one - zero;
+                    let one = window[pos..].first_one().map_or(len, |i| pos + i);
+                    if one > pos {
+                        let unmapped_sectors = (one - pos) as u64;
                         let unmapped_bytes = unmapped_sectors * self.logical_sector_size as u64;
                         ranges.push(ReadRange::Unmapped {
                             guest_offset: current_virtual_offset,
@@ -125,12 +109,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                         current_virtual_offset += unmapped_bytes;
                     }
 
-                    if one < bits_in_this_page {
+                    if one < len {
                         // Find first clear bit (end of data run).
-                        let next_zero = find_bit(page_data, one, bits_in_this_page, false);
-                        let data_sectors = next_zero - one;
+                        let next_zero = window[one..].first_zero().map_or(len, |i| one + i);
+                        let data_sectors = (next_zero - one) as u64;
                         let data_bytes = data_sectors * self.logical_sector_size as u64;
-                        // File offset = data block offset + position within block.
                         let block_offset = (current_virtual_offset % self.block_size as u64) as u32;
                         let file_offset = data_file_offset + block_offset as u64;
                         ranges.push(ReadRange::Data {
@@ -139,9 +122,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                             file_offset,
                         });
                         current_virtual_offset += data_bytes;
-                        zero = next_zero;
+                        pos = next_zero;
                     } else {
-                        zero = bits_in_this_page;
+                        pos = len;
                     }
                 }
             }
@@ -217,28 +200,21 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             if full_page {
                 // Overwrite entire page without reading existing data.
-                guard.fill(if set { 0xFF } else { 0x00 });
+                // Overwriting pages are zero-initialized by the cache.
+                if set || !guard.is_overwriting() {
+                    guard.fill(if set { 0xFF } else { 0x00 });
+                }
             } else {
                 // Check via read-only Deref whether any bits actually differ.
                 // If not, DerefMut is never called, the page stays clean,
                 // and no write-back occurs.
-                let needs_change = (start_bit..bits_in_this_page).any(|bit_index| {
-                    let byte_index = (bit_index / 8) as usize;
-                    let bit_position = (bit_index % 8) as u32;
-                    let current_set = (guard[byte_index] >> bit_position) & 1 == 1;
-                    current_set != set
-                });
+                let bits = BitSlice::<u8, Lsb0>::from_slice(&*guard);
+                let window = &bits[start_bit as usize..bits_in_this_page as usize];
+                let needs_change = if set { !window.all() } else { window.any() };
 
                 if needs_change {
-                    for bit_index in start_bit..bits_in_this_page {
-                        let byte_index = (bit_index / 8) as usize;
-                        let bit_position = (bit_index % 8) as u32;
-                        if set {
-                            guard[byte_index] |= 1 << bit_position;
-                        } else {
-                            guard[byte_index] &= !(1 << bit_position);
-                        }
-                    }
+                    let bits_mut = BitSlice::<u8, Lsb0>::from_slice_mut(&mut *guard);
+                    bits_mut[start_bit as usize..bits_in_this_page as usize].fill(set);
                 }
             }
 

@@ -388,15 +388,9 @@ impl<F: AsyncFile> PageCache<F> {
                     let result = permits.acquire(1).await;
                     match result {
                         Ok(()) => {
-                            let (guard, populated) =
-                                self.finalize_permit(entry).map_err(|e| match e {
-                                    VhdxError::Io(io) => io,
-                                    other => std::io::Error::other(other.to_string()),
-                                })?;
-                            return Ok(WritePageGuard {
-                                cache: self,
-                                guard: Some(guard),
-                                populated,
+                            return self.finalize_permit(entry).map_err(|e| match e {
+                                VhdxError::Io(io) => io,
+                                other => std::io::Error::other(other.to_string()),
                             });
                         }
                         Err(e) => {
@@ -464,7 +458,7 @@ impl<F: AsyncFile> PageCache<F> {
                 Ok(WritePageGuard {
                     cache: self,
                     guard: Some(guard),
-                    populated: true,
+                    overwriting: false,
                 })
             }
             PageState::Clean if load && guard.data.is_none() => {
@@ -495,7 +489,7 @@ impl<F: AsyncFile> PageCache<F> {
     fn finalize_permit(
         &self,
         entry: Arc<Mutex<PageData>>,
-    ) -> Result<(ArcMutexGuard<parking_lot::RawMutex, PageData>, bool), VhdxError> {
+    ) -> Result<WritePageGuard<'_, F>, VhdxError> {
         let mut pages = self.pages.lock();
 
         // Batch-full commit: if the dirty batch has reached
@@ -523,23 +517,25 @@ impl<F: AsyncFile> PageCache<F> {
 
         let mut page = Mutex::lock_arc(&entry);
         assert!(page.state == PageState::AcquiringPermit);
-        let populated = page.data.is_some();
-        if !populated {
+        let overwriting = page.data.is_none();
+        if overwriting {
             page.data = Some(Arc::new([0u8; PAGE_SIZE]));
         }
-        // For populated pages (data loaded from disk or previously written),
-        // leave Clean — if the caller doesn't mutate, the permit is refunded.
-        // For unpopulated pages (fresh zeros for Overwrite), set Dirty —
+        // For overwriting pages (fresh zeros for Overwrite), set Dirty —
         // the zeros are synthetic, not real disk data, so they must be
         // committed even if the caller doesn't call DerefMut.
-        page.state = if populated {
-            PageState::Clean
-        } else {
+        page.state = if overwriting {
             PageState::Dirty
+        } else {
+            PageState::Clean
         };
 
         self.state_event.notify(usize::MAX);
-        Ok((page, populated))
+        Ok(WritePageGuard {
+            cache: self,
+            guard: Some(page),
+            overwriting,
+        })
     }
 
     /// Finalize a failed permit acquisition: revert to Clean.
@@ -672,27 +668,21 @@ impl std::ops::Deref for ReadPageGuard {
 /// Mutating via `DerefMut` transitions the page to `Dirty`. Arc COW
 /// ensures the writer gets a private copy if the log task holds a
 /// reference.
-///
-/// Use [`is_populated()`](Self::is_populated) to check whether the page
-/// has existing data (can be patched in-place) or is freshly zeroed
-/// (must be fully written).
 pub struct WritePageGuard<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
     guard: Option<ArcMutexGuard<parking_lot::RawMutex, PageData>>,
     /// Data existed before this acquire (loaded or previously written).
     /// False for first-touch Overwrite (zeroed data).
-    populated: bool,
+    overwriting: bool,
 }
 
 impl<F: AsyncFile> WritePageGuard<'_, F> {
-    /// Whether the page data was already in the cache when acquired.
+    /// Returns true if the page is being overwritten rather than modified.
     ///
-    /// - `true`: page was already cached — the guard contains valid data
-    ///   that can be patched in-place.
-    /// - `false`: page was freshly created (zeroed) — the caller must
-    ///   populate the entire page before dropping the guard.
-    pub fn is_populated(&self) -> bool {
-        self.populated
+    /// If true, the page data is freshly zeroed and must be fully written by
+    /// the caller (unless the caller just wants to commit a zero page).
+    pub fn is_overwriting(&self) -> bool {
+        self.overwriting
     }
 }
 
@@ -1548,8 +1538,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !g.is_populated(),
-            "first Overwrite acquire should report not cached"
+            g.is_overwriting(),
+            "first Overwrite acquire should report overwriting (not cached)"
         );
     }
 
@@ -1583,10 +1573,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            g.is_populated(),
-            "second Overwrite acquire should report cached"
+            !g.is_overwriting(),
+            "second Overwrite acquire should report cached (not overwriting)"
         );
-        // Data should still be 0xAA (not zeroed).
         assert_eq!(g[0], 0xAA);
         assert_eq!(g[PAGE_SIZE - 1], 0xAA);
     }
@@ -1614,8 +1603,8 @@ mod tests {
         // Modify loads from disk then retries — page is in map on retry.
         let g = cache.acquire_write(key, WriteMode::Modify).await.unwrap();
         assert!(
-            g.is_populated(),
-            "Modify always reports cached (loaded before permit)"
+            !g.is_overwriting(),
+            "Modify always reports cached (not overwriting)"
         );
         assert_eq!(g[0], 0xBB);
     }

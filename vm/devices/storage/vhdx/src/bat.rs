@@ -489,15 +489,7 @@ impl Bat {
             )
             .await?;
 
-        if guard.is_populated() {
-            // Fast path: page is cached — patch just the one entry.
-            let bat_entry = BatEntry::new()
-                .with_state(mapping.state())
-                .with_file_offset_mb(mapping.file_megabyte() as u64);
-            let byte_offset = entry_within_page * size_of::<BatEntry>();
-            guard[byte_offset..byte_offset + size_of::<BatEntry>()]
-                .copy_from_slice(bat_entry.as_bytes());
-        } else {
+        if guard.is_overwriting() {
             // Slow path: page not cached — build from in-memory state.
             // Sync lock only, no await point.
             let page_buf = {
@@ -505,6 +497,14 @@ impl Bat {
                 self.produce_page(&bs, page_number)
             };
             guard.copy_from_slice(&page_buf);
+        } else {
+            // Fast path: page is cached — patch just the one entry.
+            let bat_entry = BatEntry::new()
+                .with_state(mapping.state())
+                .with_file_offset_mb(mapping.file_megabyte() as u64);
+            let byte_offset = entry_within_page * size_of::<BatEntry>();
+            guard[byte_offset..byte_offset + size_of::<BatEntry>()]
+                .copy_from_slice(bat_entry.as_bytes());
         }
 
         Ok(())

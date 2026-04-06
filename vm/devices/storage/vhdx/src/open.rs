@@ -49,6 +49,11 @@ use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
+pub struct VhdxBuilder<F> {
+    file: F,
+    options: OpenOptions,
+}
+
 /// Options for opening a VHDX file.
 ///
 /// Provides host-environment hints that affect allocation behavior.
@@ -61,7 +66,7 @@ use zerocopy::IntoBytes;
 /// let vhdx = VhdxFile::open_writable(file, &driver, &opts).await?;
 /// ```
 #[derive(Debug, Clone)]
-pub struct OpenOptions {
+struct OpenOptions {
     /// Block data alignment in bytes. Must be 0 or a power of 2.
     ///
     /// When non-zero and ≤ the VHDX block size, new data block allocations
@@ -84,27 +89,13 @@ pub struct OpenOptions {
     allow_replay: bool,
 }
 
-impl Default for OpenOptions {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OpenOptions {
-    /// Create default open options.
-    pub fn new() -> Self {
-        Self {
-            block_alignment: 0,
-            allow_replay: false,
-        }
-    }
-
+impl<F: 'static + AsyncFile> VhdxBuilder<F> {
     /// Set the block data alignment in bytes.
     ///
     /// Must be 0 or a power of 2. If larger than the VHDX block size,
     /// it is silently ignored (set to 0) at open time.
     pub fn block_alignment(mut self, alignment: u32) -> Self {
-        self.block_alignment = alignment;
+        self.options.block_alignment = alignment;
         self
     }
 
@@ -112,8 +103,25 @@ impl OpenOptions {
     ///
     /// See [`OpenOptions::allow_replay`] for details.
     pub fn allow_replay(mut self, allow: bool) -> Self {
-        self.allow_replay = allow;
+        self.options.allow_replay = allow;
         self
+    }
+
+    pub async fn read_only(self) -> Result<VhdxFile<F>, VhdxError>
+    where
+        F: AsyncFile,
+    {
+        VhdxFile::open_read_only(self.file, &self.options).await
+    }
+
+    pub async fn writable(
+        self,
+        spawner: &impl pal_async::task::Spawn,
+    ) -> Result<VhdxFile<F>, VhdxError>
+    where
+        F: AsyncFile,
+    {
+        VhdxFile::open_writable(self.file, spawner, &self.options).await
     }
 }
 
@@ -241,7 +249,17 @@ pub struct VhdxFile<F: AsyncFile> {
     apply_task: Option<pal_async::task::Task<()>>,
 }
 
-impl<F: AsyncFile> VhdxFile<F> {
+impl<F: 'static + AsyncFile> VhdxFile<F> {
+    pub fn open(file: F) -> VhdxBuilder<F> {
+        VhdxBuilder {
+            file,
+            options: OpenOptions {
+                block_alignment: 0,
+                allow_replay: false,
+            },
+        }
+    }
+
     /// Internal open logic shared by [`open_read_only`](Self::open_read_only)
     /// and [`open_writable`](Self::open_writable).
     ///
@@ -437,7 +455,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// (requires the file handle to support writes for the replay I/O),
     /// but the resulting `VhdxFile` is still read-only. If false, a dirty
     /// log returns [`CorruptionType::LogReplayRequired`].
-    pub async fn open_read_only(file: F, options: &OpenOptions) -> Result<Self, VhdxError> {
+    async fn open_read_only(file: F, options: &OpenOptions) -> Result<Self, VhdxError> {
         if options.allow_replay {
             let mut vhdx = Self::open_inner(file, false, None, options).await?;
             vhdx.read_only = true;
@@ -446,9 +464,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             Self::open_inner(file, true, None, options).await
         }
     }
-}
 
-impl<F: AsyncFile + 'static> VhdxFile<F> {
     /// Open an existing VHDX file in writable mode with a log task.
     ///
     /// Replays a dirty log if needed, then spawns a log task for
@@ -460,7 +476,7 @@ impl<F: AsyncFile + 'static> VhdxFile<F> {
     ///
     /// Call [`close()`](Self::close) for a clean shutdown. Dropping without
     /// close leaves the VHDX file dirty (log will be replayed on next open).
-    pub async fn open_writable(
+    async fn open_writable(
         file: F,
         spawner: &impl pal_async::task::Spawn,
         options: &OpenOptions,
@@ -1063,9 +1079,7 @@ mod tests {
     #[async_test]
     async fn open_default_vhdx() {
         let (file, params) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
         assert_eq!(vhdx.disk_size(), format::GB1);
         assert_eq!(vhdx.block_size(), format::DEFAULT_BLOCK_SIZE);
@@ -1089,9 +1103,7 @@ mod tests {
         };
         create::create(&file, &mut params).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert_eq!(vhdx.logical_sector_size(), 4096);
         assert_eq!(vhdx.physical_sector_size(), 4096);
     }
@@ -1107,9 +1119,7 @@ mod tests {
         };
         create::create(&file, &mut params).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert_eq!(vhdx.logical_sector_size(), 512);
         assert_eq!(vhdx.physical_sector_size(), 512);
     }
@@ -1130,9 +1140,7 @@ mod tests {
             };
             create::create(&file, &mut params).await.unwrap();
 
-            let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-                .await
-                .unwrap();
+            let vhdx = VhdxFile::open(file).read_only().await.unwrap();
             assert_eq!(vhdx.block_size(), block_size);
         }
     }
@@ -1147,9 +1155,7 @@ mod tests {
         };
         create::create(&file, &mut params).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(vhdx.has_parent());
     }
 
@@ -1163,9 +1169,7 @@ mod tests {
         };
         create::create(&file, &mut params).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(vhdx.is_fully_allocated());
     }
 
@@ -1191,7 +1195,7 @@ mod tests {
         buf[4..8].copy_from_slice(&crc.to_le_bytes());
         file.write_at(format::HEADER_OFFSET_2, &buf).await.unwrap();
 
-        let result = VhdxFile::open_read_only(file, &OpenOptions::new().allow_replay(true)).await;
+        let result = VhdxFile::open(file).allow_replay(true).read_only().await;
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::NoValidLogEntries))
@@ -1205,7 +1209,7 @@ mod tests {
         // Corrupt the file identifier signature.
         file.write_at(0, b"BADMAGIC").await.unwrap();
 
-        let result = VhdxFile::open_read_only(file, &OpenOptions::new()).await;
+        let result = VhdxFile::open(file).read_only().await;
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::InvalidFileIdentifier))
@@ -1216,7 +1220,7 @@ mod tests {
     async fn open_empty_file() {
         // File smaller than HEADER_AREA_SIZE (1 MiB).
         let file = InMemoryFile::new(512);
-        let result = VhdxFile::open_read_only(file, &OpenOptions::new()).await;
+        let result = VhdxFile::open(file).read_only().await;
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::EmptyFile))
@@ -1226,9 +1230,7 @@ mod tests {
     #[async_test]
     async fn open_bat_block_lookup() {
         let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
         // A newly created dynamic disk has all blocks as NotPresent.
         let mapping = vhdx.get_block_mapping(0);
@@ -1246,9 +1248,7 @@ mod tests {
         };
         create::create(&file, &mut params).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         let block_count = (disk_size / vhdx.block_size() as u64) as u32;
 
         for block in 0..block_count {
@@ -1261,18 +1261,14 @@ mod tests {
     #[async_test]
     async fn open_read_only_flag() {
         let (file, _params) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(vhdx.is_read_only());
     }
 
     #[async_test]
     async fn open_populates_in_memory_bat() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
         let bat_state = vhdx.bat_state.read();
         // All payload entries should be NotPresent.
@@ -1311,9 +1307,7 @@ mod tests {
             .await
             .unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         let bat_state = vhdx.bat_state.read();
         assert_eq!(
             bat_state.payload_mappings[0].state(),
@@ -1328,9 +1322,7 @@ mod tests {
         // Compile-time verification: get_block_mapping() is a regular fn,
         // not an async fn. We call it without .await.
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         let mapping: BlockMapping = vhdx.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::NotPresent);
     }
@@ -1382,9 +1374,7 @@ mod tests {
             .await
             .unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
         // The free space tracker should have offset 4*MB marked as in-use.
         assert!(vhdx.free_space.is_range_in_use(4 * MB1, vhdx.block_size()));
@@ -1393,9 +1383,7 @@ mod tests {
     #[async_test]
     async fn non_differencing_no_locator() {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(!vhdx.has_parent());
         assert!(vhdx.parent_locator().await.unwrap().is_none());
     }
@@ -1502,9 +1490,7 @@ mod tests {
         inject_parent_locator(&file, &locator_blob).await;
 
         // Open and verify.
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(vhdx.has_parent());
 
         let loc = vhdx
@@ -1544,9 +1530,7 @@ mod tests {
         );
         inject_parent_locator(&file, &locator_blob).await;
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         let loc = vhdx
             .parent_locator()
             .await
@@ -1575,9 +1559,7 @@ mod tests {
         };
         create::create(&file, &mut params).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(vhdx.has_parent());
         let result = vhdx.parent_locator().await;
         assert!(result.is_err());
@@ -1662,7 +1644,9 @@ mod tests {
         inject_dirty_log(&file, &[data_page], &[]).await;
 
         // Open should replay the log and succeed.
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new().allow_replay(true))
+        let vhdx = VhdxFile::open(file)
+            .allow_replay(true)
+            .read_only()
             .await
             .unwrap();
         assert_eq!(vhdx.disk_size(), format::GB1);
@@ -1695,7 +1679,9 @@ mod tests {
         inject_dirty_log(&file, &[], &[zero_range]).await;
 
         // Open should replay the log and succeed.
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new().allow_replay(true))
+        let vhdx = VhdxFile::open(file)
+            .allow_replay(true)
+            .read_only()
             .await
             .unwrap();
         assert_eq!(vhdx.disk_size(), format::GB1);
@@ -1723,7 +1709,9 @@ mod tests {
         inject_dirty_log(&file, &[data_page], &[]).await;
 
         // First open triggers replay.
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new().allow_replay(true))
+        let vhdx = VhdxFile::open(file)
+            .allow_replay(true)
+            .read_only()
             .await
             .unwrap();
         // The clean header was written to the file inside vhdx.
@@ -1773,7 +1761,7 @@ mod tests {
             .unwrap();
 
         // Open should fail because there are no valid log entries for this GUID.
-        let result = VhdxFile::open_read_only(file, &OpenOptions::new().allow_replay(true)).await;
+        let result = VhdxFile::open(file).allow_replay(true).read_only().await;
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::NoValidLogEntries))
@@ -1794,7 +1782,7 @@ mod tests {
         inject_dirty_log(&file, &[data_page], &[]).await;
 
         // Read-only open with a dirty log should return LogReplayRequired.
-        let result = VhdxFile::open_read_only(file, &OpenOptions::new()).await;
+        let result = VhdxFile::open(file).read_only().await;
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::LogReplayRequired))

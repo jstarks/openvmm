@@ -235,7 +235,6 @@ mod tests {
     use crate::format;
     use crate::format::BatEntry;
     use crate::io::ReadRange;
-    use crate::open::OpenOptions;
     use crate::open::VhdxFile;
     use crate::region;
     use crate::tests::support::InMemoryFile;
@@ -294,7 +293,7 @@ mod tests {
         file.write_at(sbm_block_offset, bitmap_data).await.unwrap();
 
         // Open the VHDX.
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
+        let vhdx = VhdxFile::open(file).read_only()
             .await
             .unwrap();
 
@@ -588,7 +587,7 @@ mod tests {
         let needed = data_block_offset + format::DEFAULT_BLOCK_SIZE as u64;
         file.set_file_size(needed).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
+        let vhdx = VhdxFile::open(file).read_only()
             .await
             .unwrap();
         let mut ranges = Vec::new();
@@ -640,7 +639,7 @@ mod tests {
 
         file.write_at(sbm_block_offset, &bitmap).await.unwrap();
 
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
+        let vhdx = VhdxFile::open(file).writable(&driver)
             .await
             .unwrap();
 

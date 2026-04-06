@@ -414,7 +414,8 @@ impl RustVhdx {
                 .expect("vhdx open")
         } else {
             let driver = driver.expect("writable open requires a driver/spawner");
-            vhdx::VhdxFile::open_writable(file, driver)
+            vhdx::VhdxFile::open(file)
+                .writable(driver)
                 .await
                 .expect("vhdx open_writable")
         };

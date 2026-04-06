@@ -322,9 +322,7 @@ mod tests {
         // Re-open and wrap as VhdxLayer.
         let bf = BlockingFile::open(path, false).unwrap();
         let bf2 = bf.clone();
-        let vhdx = VhdxFile::open_writable(bf, driver, &vhdx::OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(bf).writable(&driver).await.unwrap();
         VhdxLayer::new(vhdx, bf2, false)
     }
 
@@ -434,7 +432,9 @@ mod tests {
         {
             let bf = BlockingFile::open(&path, true).unwrap();
             let bf2 = bf.clone();
-            let vhdx = VhdxFile::open_read_only(bf, &vhdx::OpenOptions::new().allow_replay(true))
+            let vhdx = VhdxFile::open(bf)
+                .allow_replay(true)
+                .read_only()
                 .await
                 .unwrap();
             let layer = VhdxLayer::new(vhdx, bf2, true);

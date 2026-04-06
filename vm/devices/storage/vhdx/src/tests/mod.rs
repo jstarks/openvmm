@@ -98,7 +98,6 @@ mod integration {
 mod log_task_integration {
     use crate::AsyncFile;
     use crate::format;
-    use crate::open::OpenOptions;
     use crate::open::VhdxFile;
     use crate::tests::support::InMemoryFile;
     use pal_async::DefaultDriver;
@@ -182,9 +181,7 @@ mod log_task_integration {
     #[async_test]
     async fn open_writable_and_close(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
         // Verify the file is opened in writable mode with a log task.
         assert!(!vhdx.read_only);
@@ -197,9 +194,7 @@ mod log_task_integration {
     #[async_test]
     async fn open_writable_sets_log_guid(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
         // The file should have log_guid set (the header was written during open).
         // We verify by reading the header from the file.
@@ -226,9 +221,7 @@ mod log_task_integration {
     #[async_test]
     async fn close_clears_log_guid(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
         let file_ref = vhdx.file.clone();
 
         // Close the file.
@@ -267,9 +260,7 @@ mod log_task_integration {
 
         // Open with log, write data, flush, close.
         let file_arc = {
-            let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-                .await
-                .unwrap();
+            let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
             write_pattern(&vhdx, 0, 4096, 0xAB).await;
             vhdx.flush().await.unwrap();
             let file_arc = vhdx.file.clone();
@@ -279,12 +270,10 @@ mod log_task_integration {
 
         // Reopen (no log needed since we closed cleanly) and verify data.
         {
-            let vhdx = VhdxFile::open_read_only(
-                InMemoryFile::from_snapshot(file_arc.snapshot()),
-                &OpenOptions::new(),
-            )
-            .await
-            .unwrap();
+            let vhdx = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()))
+                .read_only()
+                .await
+                .unwrap();
             let read_buf = read_pattern(&vhdx, 0, 4096).await;
             assert!(read_buf.iter().all(|&b| b == 0xAB));
         }
@@ -296,30 +285,24 @@ mod log_task_integration {
 
         // Open with log, do nothing, close.
         let file_arc = {
-            let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-                .await
-                .unwrap();
+            let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
             let file_arc = vhdx.file.clone();
             vhdx.close().await.unwrap();
             file_arc
         };
 
         // Reopen — should succeed without log replay.
-        let vhdx = VhdxFile::open_read_only(
-            InMemoryFile::from_snapshot(file_arc.snapshot()),
-            &OpenOptions::new(),
-        )
-        .await
-        .unwrap();
+        let vhdx = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()))
+            .read_only()
+            .await
+            .unwrap();
         assert!(vhdx.read_only);
     }
 
     #[async_test]
     async fn open_read_only_no_spawner() {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(vhdx.read_only);
         assert!(vhdx.flush_sequencer.is_none());
     }
@@ -327,9 +310,7 @@ mod log_task_integration {
     #[async_test]
     async fn flush_returns_fsn(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
         // Write data to dirty some cache pages.
         write_pattern(&vhdx, 0, 4096, 0xEE).await;
@@ -345,9 +326,7 @@ mod log_task_integration {
     #[async_test]
     async fn multiple_writes_single_flush(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
         // Multiple writes at different offsets.
         write_pattern(&vhdx, 0, 4096, 0x11).await;
@@ -360,12 +339,10 @@ mod log_task_integration {
         vhdx.close().await.unwrap();
 
         // Reopen and verify.
-        let vhdx2 = VhdxFile::open_read_only(
-            InMemoryFile::from_snapshot(file_arc.snapshot()),
-            &OpenOptions::new(),
-        )
-        .await
-        .unwrap();
+        let vhdx2 = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()))
+            .read_only()
+            .await
+            .unwrap();
 
         let buf0 = read_pattern(&vhdx2, 0, 4096).await;
         assert!(buf0.iter().all(|&b| b == 0x11), "first write mismatch");
@@ -392,9 +369,7 @@ mod log_task_integration {
 
         // Open with log, write a distinct pattern into each of 200 blocks.
         let file_arc = {
-            let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-                .await
-                .unwrap();
+            let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
             for i in 0..BLOCK_COUNT {
                 let offset = i as u64 * BLOCK_SIZE;
                 let pattern = (i & 0xFF) as u8;
@@ -408,12 +383,10 @@ mod log_task_integration {
 
         // Reopen from snapshot and verify every block.
         {
-            let vhdx = VhdxFile::open_read_only(
-                InMemoryFile::from_snapshot(file_arc.snapshot()),
-                &OpenOptions::new(),
-            )
-            .await
-            .unwrap();
+            let vhdx = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()))
+                .read_only()
+                .await
+                .unwrap();
             for i in 0..BLOCK_COUNT {
                 let offset = i as u64 * BLOCK_SIZE;
                 let expected = (i & 0xFF) as u8;
@@ -434,9 +407,7 @@ mod log_task_integration {
     #[async_test]
     async fn permits_released_after_apply(driver: DefaultDriver) {
         let file = create_test_vhdx_file(format::GB1).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
         // Write to several distinct blocks so multiple BAT pages are dirtied.
         for i in 0..10u64 {
@@ -480,9 +451,7 @@ mod log_task_integration {
 
         let disk_size = BLOCK_SIZE * (BATCH_COUNT as u64 + 1);
         let file = create_test_vhdx_file(disk_size).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
         // Each iteration writes to a new block (dirtying its BAT page),
         // then flushes. This forces commit → log → apply for each batch.
@@ -499,12 +468,10 @@ mod log_task_integration {
         vhdx.close().await.unwrap();
 
         // Reopen read-only and verify every block.
-        let vhdx2 = VhdxFile::open_read_only(
-            InMemoryFile::from_snapshot(file_arc.snapshot()),
-            &OpenOptions::new(),
-        )
-        .await
-        .unwrap();
+        let vhdx2 = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()))
+            .read_only()
+            .await
+            .unwrap();
         for i in 0..BATCH_COUNT {
             let offset = i as u64 * BLOCK_SIZE;
             let expected = (i & 0xFF) as u8;
@@ -530,9 +497,7 @@ mod log_task_integration {
 
         let disk_size = BLOCK_SIZE * (BLOCK_COUNT as u64 + 1);
         let file = create_test_vhdx_file(disk_size).await;
-        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
         // Write to 500 distinct blocks without flushing. The cache will
         // trigger batch-full commits as dirty pages accumulate, and the
@@ -550,12 +515,10 @@ mod log_task_integration {
         vhdx.close().await.unwrap();
 
         // Reopen and verify.
-        let vhdx2 = VhdxFile::open_read_only(
-            InMemoryFile::from_snapshot(file_arc.snapshot()),
-            &OpenOptions::new(),
-        )
-        .await
-        .unwrap();
+        let vhdx2 = VhdxFile::open(InMemoryFile::from_snapshot(file_arc.snapshot()))
+            .read_only()
+            .await
+            .unwrap();
         for i in 0..BLOCK_COUNT {
             let offset = i as u64 * BLOCK_SIZE;
             let expected = (i & 0xFF) as u8;

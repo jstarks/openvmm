@@ -13,7 +13,6 @@
 
 use crate::AsyncFile;
 use crate::format;
-use crate::open::OpenOptions;
 use crate::open::VhdxFile;
 use crate::tests::support::{CrashTestFile, InMemoryFile};
 use pal_async::DefaultDriver;
@@ -98,9 +97,7 @@ async fn read_pattern<F: AsyncFile>(vhdx: &VhdxFile<F>, offset: u64, len: usize)
 #[async_test]
 async fn bat_page_no_fsn_safe_near_eof(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
     // Write one full block (block_size is 1 MiB by default).
     let block_size = vhdx.block_size as usize;
@@ -125,9 +122,7 @@ async fn bat_page_no_fsn_safe_near_eof(driver: DefaultDriver) {
 #[async_test]
 async fn bat_page_has_fsn_unsafe_free_pool(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Allocate block 0 with data.
@@ -163,9 +158,7 @@ async fn bat_page_has_fsn_unsafe_free_pool(driver: DefaultDriver) {
 #[async_test]
 async fn bat_page_no_fsn_existing_block(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as usize;
 
     // First write allocates the block.
@@ -194,9 +187,7 @@ async fn bat_page_no_fsn_existing_block(driver: DefaultDriver) {
 #[async_test]
 async fn bat_page_no_fsn_safe_soft_anchor(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Allocate block 0 with data.
@@ -233,9 +224,7 @@ async fn bat_page_no_fsn_safe_soft_anchor(driver: DefaultDriver) {
 #[async_test]
 async fn bat_page_has_fsn_partial_unsafe(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Allocate block 0 with data.
@@ -272,9 +261,7 @@ async fn bat_page_has_fsn_partial_unsafe(driver: DefaultDriver) {
 #[async_test]
 async fn bat_page_no_fsn_partial_safe(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
     // Partial write to block 0 (less than full block). Space comes from
     // near-EOF → SpaceState::OwnStale (safe).
@@ -304,9 +291,7 @@ async fn crash_after_flush_data_survives(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
 
     // Write one block of data.
     let block_size = vhdx.block_size as usize;
@@ -321,7 +306,9 @@ async fn crash_after_flush_data_survives(driver: DefaultDriver) {
 
     // Reopen from durable state (log replay will happen).
     let recovered_file = InMemoryFile::from_snapshot(durable);
-    let vhdx2 = VhdxFile::open_read_only(recovered_file, &OpenOptions::new().allow_replay(true))
+    let vhdx2 = VhdxFile::open(recovered_file)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -340,9 +327,7 @@ async fn crash_no_flush_data_lost(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as usize;
 
     // Write but do NOT flush.
@@ -354,7 +339,9 @@ async fn crash_no_flush_data_lost(driver: DefaultDriver) {
 
     // Reopen from durable state.
     let recovered_file = InMemoryFile::from_snapshot(durable);
-    let vhdx2 = VhdxFile::open_read_only(recovered_file, &OpenOptions::new().allow_replay(true))
+    let vhdx2 = VhdxFile::open(recovered_file)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -373,9 +360,7 @@ async fn clean_close_no_replay(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as usize;
 
     write_pattern(&vhdx, 0, block_size, 0xEE).await;
@@ -388,7 +373,9 @@ async fn clean_close_no_replay(driver: DefaultDriver) {
 
     // Reopen — should NOT need log replay.
     let recovered_file = InMemoryFile::from_snapshot(durable);
-    let vhdx2 = VhdxFile::open_read_only(recovered_file, &OpenOptions::new().allow_replay(true))
+    let vhdx2 = VhdxFile::open(recovered_file)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -410,9 +397,7 @@ async fn crash_recovery_then_more_writes(driver: DefaultDriver) {
     // Round 1: write, flush, crash.
     let durable1 = {
         let crash_file = CrashTestFile::from_durable(snapshot);
-        let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
         block_size = vhdx.block_size as u64;
 
         write_pattern(&vhdx, 0, block_size as usize, 0x11).await;
@@ -426,9 +411,7 @@ async fn crash_recovery_then_more_writes(driver: DefaultDriver) {
     // Round 2: recover, write more, flush, crash again.
     let durable2 = {
         let crash_file = CrashTestFile::from_durable(durable1);
-        let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
 
         write_pattern(&vhdx, block_size, block_size as usize, 0x22).await;
         vhdx.flush().await.unwrap();
@@ -440,7 +423,9 @@ async fn crash_recovery_then_more_writes(driver: DefaultDriver) {
 
     // Verify both rounds of data survive.
     let recovered_file = InMemoryFile::from_snapshot(durable2);
-    let vhdx = VhdxFile::open_read_only(recovered_file, &OpenOptions::new().allow_replay(true))
+    let vhdx = VhdxFile::open(recovered_file)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -464,9 +449,7 @@ async fn crash_multi_block_all_survive(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Write three blocks with different patterns.
@@ -482,7 +465,9 @@ async fn crash_multi_block_all_survive(driver: DefaultDriver) {
 
     // Verify all three blocks survived.
     let recovered = InMemoryFile::from_snapshot(durable);
-    let vhdx = VhdxFile::open_read_only(recovered, &OpenOptions::new().allow_replay(true))
+    let vhdx = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -502,9 +487,7 @@ async fn crash_interleaved_flush_partial(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Write block 0, flush.
@@ -523,7 +506,9 @@ async fn crash_interleaved_flush_partial(driver: DefaultDriver) {
     vhdx.abort().await;
 
     let recovered = InMemoryFile::from_snapshot(durable);
-    let vhdx = VhdxFile::open_read_only(recovered, &OpenOptions::new().allow_replay(true))
+    let vhdx = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -548,9 +533,7 @@ async fn crash_spanning_write_survives(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Write 3 blocks at once (spanning write).
@@ -563,7 +546,9 @@ async fn crash_spanning_write_survives(driver: DefaultDriver) {
     vhdx.abort().await;
 
     let recovered = InMemoryFile::from_snapshot(durable);
-    let vhdx = VhdxFile::open_read_only(recovered, &OpenOptions::new().allow_replay(true))
+    let vhdx = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -587,9 +572,7 @@ async fn crash_after_apply_replay_idempotent(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as usize;
 
     // Write two blocks with distinct patterns.
@@ -603,7 +586,9 @@ async fn crash_after_apply_replay_idempotent(driver: DefaultDriver) {
 
     // First replay — should succeed.
     let recovered1 = InMemoryFile::from_snapshot(durable.clone());
-    let vhdx1 = VhdxFile::open_read_only(recovered1, &OpenOptions::new().allow_replay(true))
+    let vhdx1 = VhdxFile::open(recovered1)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
     let buf0 = read_pattern(&vhdx1, 0, block_size).await;
@@ -619,7 +604,9 @@ async fn crash_after_apply_replay_idempotent(driver: DefaultDriver) {
 
     // Second replay from the same durable snapshot — should be idempotent.
     let recovered2 = InMemoryFile::from_snapshot(durable);
-    let vhdx2 = VhdxFile::open_read_only(recovered2, &OpenOptions::new().allow_replay(true))
+    let vhdx2 = VhdxFile::open(recovered2)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
     let buf0b = read_pattern(&vhdx2, 0, block_size).await;
@@ -641,9 +628,7 @@ async fn crash_overwrite_latest_wins(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as usize;
 
     // Write block 0 with 0xAA, flush.
@@ -659,7 +644,9 @@ async fn crash_overwrite_latest_wins(driver: DefaultDriver) {
     vhdx.abort().await;
 
     let recovered = InMemoryFile::from_snapshot(durable);
-    let vhdx = VhdxFile::open_read_only(recovered, &OpenOptions::new().allow_replay(true))
+    let vhdx = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
 
@@ -677,9 +664,7 @@ async fn drop_without_close_triggers_replay(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as usize;
 
     write_pattern(&vhdx, 0, block_size, 0xEE).await;
@@ -692,15 +677,15 @@ async fn drop_without_close_triggers_replay(driver: DefaultDriver) {
     // Verify the header still has log_guid set (dirty file).
     let recovered = InMemoryFile::from_snapshot(durable.clone());
     // Opening read-only when dirty should fail with LogReplayRequired.
-    let result = VhdxFile::open_read_only(
-        InMemoryFile::from_snapshot(durable.clone()),
-        &OpenOptions::new(),
-    )
-    .await;
+    let result = VhdxFile::open(InMemoryFile::from_snapshot(durable.clone()))
+        .read_only()
+        .await;
     assert!(result.is_err(), "read-only open of dirty file should fail");
 
     // Open writable — log replay should happen.
-    let vhdx2 = VhdxFile::open_read_only(recovered, &OpenOptions::new().allow_replay(true))
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
         .await
         .unwrap();
     let read_buf = read_pattern(&vhdx2, 0, block_size).await;
@@ -726,9 +711,7 @@ async fn flush_between_data_and_wal_unsafe(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Allocate block 0 (near-EOF, safe).
@@ -772,9 +755,7 @@ async fn no_extra_flush_safe_allocation(driver: DefaultDriver) {
     let snapshot = mem_file.snapshot();
 
     let crash_file = CrashTestFile::from_durable(snapshot);
-    let vhdx = VhdxFile::open_writable(crash_file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // All allocations are near-EOF (safe). No extra flushes needed.
@@ -800,9 +781,7 @@ async fn no_extra_flush_safe_allocation(driver: DefaultDriver) {
 #[async_test]
 async fn mixed_safe_unsafe_has_barrier(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
     let block_size = vhdx.block_size as u64;
 
     // Allocate block 0.
@@ -849,9 +828,7 @@ async fn mixed_safe_unsafe_has_barrier(driver: DefaultDriver) {
 #[async_test]
 async fn flush_advances_header_sequence(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
     let seq_before = {
         let state = vhdx.write_state.lock();
@@ -882,9 +859,7 @@ async fn close_header_is_clean(driver: DefaultDriver) {
     use zerocopy::FromBytes;
 
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
     let file_ref = vhdx.file.clone();
 
     write_pattern(&vhdx, 0, vhdx.block_size as usize, 0xBB).await;
@@ -945,9 +920,7 @@ async fn headers_alternate_between_slots(driver: DefaultDriver) {
     let seq1_init = h1_init.as_ref().map_or(0, |h| h.sequence_number);
     let seq2_init = h2_init.as_ref().map_or(0, |h| h.sequence_number);
 
-    let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
-        .await
-        .unwrap();
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
     let file_ref = vhdx.file.clone();
 
     // After open_writable, one header slot was updated with log_guid.

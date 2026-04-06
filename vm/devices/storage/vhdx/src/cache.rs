@@ -87,27 +87,16 @@ enum PageState {
     /// A log permit is being acquired for this page.
     /// Other acquirers wait on `state_event`.
     AcquiringPermit,
-    /// A log permit has been acquired and the page has existing data
-    /// (loaded from disk or previously written). The `WritePageGuard`
-    /// holds the page lock. On drop:
-    /// - If mutated → already transitioned to `Dirty` by `DerefMut`.
-    /// - If not mutated → transitions to `Clean` (permit refunded).
-    HasPermit,
-    /// A log permit has been acquired but the page data is zeroed (first
-    /// touch via `Overwrite` mode). The caller must write the full page
-    /// content. `is_populated()` returns `false` in this state.
-    /// Transitions to `Dirty` on first `DerefMut`.
-    Overwritten,
-    /// Page has been modified. A permit is consumed (transfers to the log
-    /// task on commit).
+    /// Page has been modified (or a permit has been acquired for it).
+    /// A permit is consumed (transfers to the log task on commit).
     Dirty,
 }
 
 /// Internal per-page data.
 struct PageData {
     /// The page contents as `Arc` for zero-copy commit and COW.
-    /// `Some` when `state` is `HasPermit`, `Overwritten`, or `Dirty`,
-    /// and when `Clean` after a successful load or write.
+    /// `Some` when `state` is `Dirty`, and when `Clean` after a
+    /// successful load or write.
     /// `None` when `Clean` (freshly created, not yet loaded),
     /// `Loading`, or `AcquiringPermit`.
     data: Option<Arc<[u8; PAGE_SIZE]>>,
@@ -123,7 +112,8 @@ struct PageData {
 /// Internal page map wrapping the `HashMap` and dirty page counter.
 struct PageMap {
     map: HashMap<PageKey, Arc<Mutex<PageData>>>,
-    /// Number of pages in `HasPermit`, `Overwritten`, or `Dirty` state.
+    /// Number of pages with a consumed permit (Dirty, or Clean with
+    /// an active `WritePageGuard` that hasn't called `DerefMut` yet).
     /// Maintained under the map lock to prevent races.
     dirty_count: usize,
     /// Log client for sending transactions. `None` for read-only caches.
@@ -327,7 +317,7 @@ impl<F: AsyncFile> PageCache<F> {
                     ArcMutexGuard::into_arc(guard),
                 ))
             }
-            PageState::Clean | PageState::HasPermit | PageState::Overwritten | PageState::Dirty => {
+            PageState::Clean | PageState::Dirty => {
                 assert!(
                     guard.data.is_some(),
                     "page in {:?} has no data",
@@ -396,11 +386,27 @@ impl<F: AsyncFile> PageCache<F> {
                 WritePendingAction::AcquirePermit(entry) => {
                     let permits = self.log_permits.as_ref().unwrap();
                     let result = permits.acquire(1).await;
-                    self.finalize_permit(entry, result.is_ok());
-                    result.map_err(|e| match e {
-                        VhdxError::Io(io) => io,
-                        other => std::io::Error::other(other.to_string()),
-                    })?;
+                    match result {
+                        Ok(()) => {
+                            let (guard, populated) =
+                                self.finalize_permit(entry).map_err(|e| match e {
+                                    VhdxError::Io(io) => io,
+                                    other => std::io::Error::other(other.to_string()),
+                                })?;
+                            return Ok(WritePageGuard {
+                                cache: self,
+                                guard: Some(guard),
+                                populated,
+                            });
+                        }
+                        Err(e) => {
+                            self.finalize_permit_failed(entry);
+                            return Err(match e {
+                                VhdxError::Io(io) => io,
+                                other => std::io::Error::other(other.to_string()),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -449,7 +455,7 @@ impl<F: AsyncFile> PageCache<F> {
             PageState::Loading | PageState::AcquiringPermit => {
                 Err(WritePendingAction::Wait(self.state_event.listen()))
             }
-            PageState::Dirty | PageState::Overwritten | PageState::HasPermit => {
+            PageState::Dirty => {
                 assert!(
                     guard.data.is_some(),
                     "page in {:?} has no data",
@@ -458,6 +464,7 @@ impl<F: AsyncFile> PageCache<F> {
                 Ok(WritePageGuard {
                     cache: self,
                     guard: Some(guard),
+                    populated: true,
                 })
             }
             PageState::Clean if load && guard.data.is_none() => {
@@ -476,37 +483,65 @@ impl<F: AsyncFile> PageCache<F> {
         }
     }
 
-    /// Finalize a permit acquisition: transition page to HasPermit or Clean.
+    /// Finalize a successful permit acquisition.
+    ///
+    /// Returns the page guard directly — the caller wraps it in a
+    /// `WritePageGuard` without re-entering `try_acquire_write`.
+    /// This eliminates the window where the page is in HasPermit/Overwritten
+    /// state without an active writer.
     ///
     /// The dirty_count check, batch-full commit, and dirty_count increment
     /// are all performed atomically under the map lock — no TOCTOU gap.
-    fn finalize_permit(&self, entry: Arc<Mutex<PageData>>, success: bool) {
-        {
-            let mut pages = self.pages.lock();
-            let mut page = entry.lock();
-            assert!(page.state == PageState::AcquiringPermit);
-            if success {
-                // Batch-full commit: if the dirty batch has reached
-                // MAX_COMMIT_PAGES, commit before adding this page.
-                // Drop the page guard first — commit_locked iterates
-                // all pages and would deadlock on this one.
-                if pages.dirty_count >= MAX_COMMIT_PAGES {
-                    drop(page);
-                    let _ = self.commit_locked(&mut pages);
-                    page = entry.lock();
-                }
-                pages.dirty_count += 1;
+    fn finalize_permit(
+        &self,
+        entry: Arc<Mutex<PageData>>,
+    ) -> Result<(ArcMutexGuard<parking_lot::RawMutex, PageData>, bool), VhdxError> {
+        let mut pages = self.pages.lock();
+
+        // Batch-full commit: if the dirty batch has reached
+        // MAX_COMMIT_PAGES, commit before adding this page.
+        if pages.dirty_count >= MAX_COMMIT_PAGES {
+            if let Err(e) = self.commit_locked(&mut pages) {
+                // Commit failed — refund the permit and revert the page.
                 drop(pages);
-                page.state = if page.data.is_some() {
-                    PageState::HasPermit
-                } else {
-                    page.data = Some(Arc::new([0u8; PAGE_SIZE]));
-                    PageState::Overwritten
-                };
-            } else {
+                let mut page = entry.lock();
+                assert!(page.state == PageState::AcquiringPermit);
                 page.state = PageState::Clean;
+                drop(page);
+                if let Some(ref permits) = self.log_permits {
+                    permits.release(1);
+                }
+                self.state_event.notify(usize::MAX);
+                return Err(e);
             }
         }
+        // Note that this may actually put us over MAX_COMMIT_PAGES, but only due to
+        // transient dirty counts from pages that are clean and have not yet decremented
+        // the count in [`WritePageGuard::drop`]. So, it will still be imposible for a
+        // cache transaction to be larger than MAX_COMMIT_PAGES.
+        pages.dirty_count += 1;
+
+        let mut page = Mutex::lock_arc(&entry);
+        assert!(page.state == PageState::AcquiringPermit);
+        let populated = page.data.is_some();
+        if !populated {
+            page.data = Some(Arc::new([0u8; PAGE_SIZE]));
+        }
+        // Leave state as Clean — the page lock is held by the caller
+        // until WritePageGuard is dropped. DerefMut sets Dirty if
+        // the caller actually mutates; Drop refunds the permit if not.
+        page.state = PageState::Clean;
+
+        self.state_event.notify(usize::MAX);
+        Ok((page, populated))
+    }
+
+    /// Finalize a failed permit acquisition: revert to Clean.
+    fn finalize_permit_failed(&self, entry: Arc<Mutex<PageData>>) {
+        let mut page = entry.lock();
+        assert!(page.state == PageState::AcquiringPermit);
+        page.state = PageState::Clean;
+        drop(page);
         self.state_event.notify(usize::MAX);
     }
 
@@ -579,7 +614,7 @@ impl<F: AsyncFile> PageCache<F> {
 
         for (&key, entry) in pages.map.iter() {
             let mut page = entry.lock();
-            if matches!(page.state, PageState::Dirty | PageState::Overwritten) {
+            if matches!(page.state, PageState::Dirty) {
                 let file_offset = self.resolve_offset(key);
                 let data = page.data.as_ref().expect("dirty page has no data").clone();
 
@@ -638,6 +673,9 @@ impl std::ops::Deref for ReadPageGuard {
 pub struct WritePageGuard<'a, F: AsyncFile> {
     cache: &'a PageCache<F>,
     guard: Option<ArcMutexGuard<parking_lot::RawMutex, PageData>>,
+    /// Data existed before this acquire (loaded or previously written).
+    /// False for first-touch Overwrite (zeroed data).
+    populated: bool,
 }
 
 impl<F: AsyncFile> WritePageGuard<'_, F> {
@@ -648,7 +686,7 @@ impl<F: AsyncFile> WritePageGuard<'_, F> {
     /// - `false`: page was freshly created (zeroed) — the caller must
     ///   populate the entire page before dropping the guard.
     pub fn is_populated(&self) -> bool {
-        self.guard.as_ref().unwrap().state != PageState::Overwritten
+        self.populated
     }
 }
 
@@ -675,11 +713,21 @@ impl<F: AsyncFile> std::ops::DerefMut for WritePageGuard<'_, F> {
 
 impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
     fn drop(&mut self) {
-        if let Some(mut guard) = self.guard.take() {
-            if guard.state == PageState::HasPermit {
-                // Guard dropped without mutation. Refund the permit
-                // and decrement dirty_count.
-                guard.state = PageState::Clean;
+        if let Some(guard) = self.guard.take() {
+            if guard.state != PageState::Dirty {
+                // Guard dropped without mutation. Refund the permit and
+                // decrement dirty_count.
+                //
+                // Note that there is a window where the dirty count is
+                // incremented, the locks are dropped, and the page is not
+                // marked dirty. This is basically harmless, but it does mean
+                // that we cannot assert that dirty_count is < MAX_COMMIT_PAGES
+                // in `finalize_permit` — we might briefly exceed the limit due
+                // to clean pages that haven't yet decremented the count.
+                //
+                // This is necessary because lock ordering constraints require
+                // the page map lock to be acquired before any individual page
+                // lock.
                 drop(guard);
                 self.cache.pages.lock().dirty_count -= 1;
                 if let Some(ref permits) = self.cache.log_permits {
@@ -687,7 +735,7 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
                 }
                 self.cache.state_event.notify(usize::MAX);
             }
-            // Dirty, Overwritten, or Clean: nothing to do. Guard drops, releasing the lock.
+            // If Dirty: permit consumed. Guard drops, releasing page lock.
         }
     }
 }

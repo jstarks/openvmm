@@ -520,11 +520,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         let (tx, rx) = mesh::channel::<LogRequest>();
         let mut vhdx = Self::open_inner(file, false, Some(tx.clone()), options).await?;
 
-        // Repair mismatched region tables before any writes.
-        if let Some(table_data) = vhdx.region_rewrite_data.take() {
-            crate::region::rewrite_region_tables(&*vhdx.file, &table_data).await?;
-        }
-
         // Create shared state for log task communication.
         let flush_sequencer = Arc::new(FlushSequencer::new());
         let log_permits = Arc::new(crate::log_permits::LogPermits::new(
@@ -630,6 +625,22 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         vhdx.flush_sequencer = Some(flush_sequencer);
         vhdx.log_permits = Some(log_permits);
         vhdx.logged_lsn = Some(logged_lsn);
+
+        // Repair mismatched region tables through the write-ahead log.
+        // The pages enter the log pipeline and will be applied in due
+        // course; the next caller-initiated flush() covers them via LSN
+        // ordering. If we crash before that, either log replay applies
+        // the entry or the mismatch is re-detected on reopen.
+        if let Some(table_data) = vhdx.region_rewrite_data.take() {
+            crate::region::rewrite_region_tables(
+                &vhdx.cache,
+                vhdx.log_permits
+                    .as_ref()
+                    .expect("writable file has log_permits"),
+                &table_data,
+            )
+            .await?;
+        }
 
         Ok(vhdx)
     }

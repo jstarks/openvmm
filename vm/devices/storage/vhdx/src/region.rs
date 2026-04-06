@@ -7,11 +7,15 @@
 //! identifies BAT and metadata regions, and checks for overlaps and duplicates.
 
 use crate::AsyncFile;
+use crate::cache::PAGE_SIZE;
+use crate::cache::PageCache;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format;
 use crate::format::RegionTableEntry;
 use crate::format::RegionTableHeader;
+use crate::log_task::CommittedPage;
+use std::sync::Arc;
 use zerocopy::FromBytes;
 
 /// Parsed region table data.
@@ -170,34 +174,50 @@ pub(crate) async fn parse_region_tables(file: &impl AsyncFile) -> Result<ParsedR
     })
 }
 
-/// Write the region table to both on-disk slots and flush.
+/// Write the region table to both on-disk slots via the write-ahead log.
 ///
 /// Called during [`VhdxBuilder::writable`](crate::open::VhdxBuilder::writable) when one region table was corrupt or
-/// the two copies didn't match. Writes the validated table to both
-/// offsets so that a subsequent single-table corruption doesn't lose
-/// the file.
+/// the two copies didn't match. Acquires log permits, sends the pages
+/// through [`PageCache::commit_raw`], and returns the LSN. The caller
+/// must wait for the LSN and flush to make the writes durable.
 pub(crate) async fn rewrite_region_tables(
-    file: &impl AsyncFile,
+    cache: &PageCache<impl AsyncFile>,
+    log_permits: &crate::log_permits::LogPermits,
     table: &[u8],
-) -> Result<(), VhdxError> {
+) -> Result<u64, VhdxError> {
     assert_eq!(
         table.len(),
         format::REGION_TABLE_SIZE as usize,
         "region table must be exactly {} bytes",
         format::REGION_TABLE_SIZE
     );
-    // THIS IS FUCKING BROKEN
-    file.write_at(format::REGION_TABLE_OFFSET, table).await?;
-    file.write_at(format::ALT_REGION_TABLE_OFFSET, table)
-        .await?;
-    file.flush().await?;
-    Ok(())
+
+    let pages_per_table = format::REGION_TABLE_SIZE as usize / PAGE_SIZE;
+    let total_pages = pages_per_table * 2;
+    let mut pages = Vec::with_capacity(total_pages);
+
+    for base_offset in [format::REGION_TABLE_OFFSET, format::ALT_REGION_TABLE_OFFSET] {
+        for i in 0..pages_per_table {
+            let mut page_data = [0u8; PAGE_SIZE];
+            let src_start = i * PAGE_SIZE;
+            page_data.copy_from_slice(&table[src_start..src_start + PAGE_SIZE]);
+            pages.push(CommittedPage {
+                file_offset: base_offset + (i * PAGE_SIZE) as u64,
+                data: Arc::new(page_data),
+            });
+        }
+    }
+
+    log_permits.acquire(total_pages).await?;
+    Ok(cache.commit_raw(pages, None))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::open::VhdxFile;
     use crate::tests::support::InMemoryFile;
+    use pal_async::DefaultDriver;
     use pal_async::async_test;
     use zerocopy::IntoBytes;
 
@@ -362,14 +382,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn rewrite_repairs_corrupt_table() {
+    async fn rewrite_repairs_corrupt_table(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
-
-        // Save the good table contents.
-        let mut good_table = vec![0u8; format::REGION_TABLE_SIZE as usize];
-        file.read_at(format::REGION_TABLE_OFFSET, &mut good_table)
-            .await
-            .unwrap();
 
         // Corrupt the first region table.
         let mut buf = vec![0u8; format::REGION_TABLE_SIZE as usize];
@@ -381,15 +395,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Parse — should detect mismatch and return rewrite_data.
-        let regions = parse_region_tables(&file).await.unwrap();
-        let rewrite_data = regions.rewrite_data.expect("should need rewrite");
-
-        // Rewrite both tables.
-        rewrite_region_tables(&file, &rewrite_data).await.unwrap();
+        // Opening writable should detect and repair the mismatch via the log.
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
+        let file_ref = vhdx.file.clone();
+        vhdx.close().await.unwrap();
 
         // Parse again — both should match now.
-        let regions2 = parse_region_tables(&file).await.unwrap();
+        let regions2 = parse_region_tables(&*file_ref).await.unwrap();
         assert!(
             regions2.rewrite_data.is_none(),
             "tables should match after rewrite"
@@ -398,10 +410,12 @@ mod tests {
         // Verify both on-disk copies are identical.
         let mut t1 = vec![0u8; format::REGION_TABLE_SIZE as usize];
         let mut t2 = vec![0u8; format::REGION_TABLE_SIZE as usize];
-        file.read_at(format::REGION_TABLE_OFFSET, &mut t1)
+        file_ref
+            .read_at(format::REGION_TABLE_OFFSET, &mut t1)
             .await
             .unwrap();
-        file.read_at(format::ALT_REGION_TABLE_OFFSET, &mut t2)
+        file_ref
+            .read_at(format::ALT_REGION_TABLE_OFFSET, &mut t2)
             .await
             .unwrap();
         assert_eq!(t1, t2, "both region tables should be identical");

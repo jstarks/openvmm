@@ -3,10 +3,9 @@
 
 //! VHDX file open orchestration.
 //!
-//! Ties together header, region, metadata, and BAT parsing into a single
-//! [`VhdxFile::open_read_only()`] / [`VhdxFile::open_writable()`] entry
-//! points. Produces an open file handle with
-//! accessor methods for disk geometry and state.
+//! Ties together header, region, metadata, and BAT parsing into
+//! [`VhdxFile::open()`], which returns a [`VhdxBuilder`] for
+//! configuring options before finalizing as read-only or writable.
 
 use crate::AsyncFile;
 use crate::bat::BAT_TAG;
@@ -49,22 +48,30 @@ use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
+/// Builder for opening a VHDX file.
+///
+/// Created via [`VhdxFile::open()`], then configured with builder methods
+/// before calling [`read_only()`](Self::read_only) or
+/// [`writable()`](Self::writable) to produce a [`VhdxFile`].
+///
+/// # Examples
+///
+/// ```ignore
+/// // Default options:
+/// let vhdx = VhdxFile::open(file).read_only().await?;
+///
+/// // With block alignment (for NTFS-DAX / PMEM volumes):
+/// let vhdx = VhdxFile::open(file)
+///     .block_alignment(2 * 1024 * 1024)
+///     .writable(&spawner)
+///     .await?;
+/// ```
 pub struct VhdxBuilder<F> {
     file: F,
     options: OpenOptions,
 }
 
-/// Options for opening a VHDX file.
-///
-/// Provides host-environment hints that affect allocation behavior.
-/// Use [`OpenOptions::new()`] for defaults, then chain builder methods.
-///
-/// # Examples
-///
-/// ```ignore
-/// let opts = OpenOptions::new().block_alignment(2 * 1024 * 1024);
-/// let vhdx = VhdxFile::open_writable(file, &driver, &opts).await?;
-/// ```
+/// Internal options collected by [`VhdxBuilder`].
 #[derive(Debug, Clone)]
 struct OpenOptions {
     /// Block data alignment in bytes. Must be 0 or a power of 2.
@@ -90,7 +97,6 @@ struct OpenOptions {
 }
 
 impl OpenOptions {
-    /// Create a new `OpenOptions` with default values.
     fn new() -> Self {
         Self {
             block_alignment: 0,
@@ -103,20 +109,31 @@ impl<F: 'static + AsyncFile> VhdxBuilder<F> {
     /// Set the block data alignment in bytes.
     ///
     /// Must be 0 or a power of 2. If larger than the VHDX block size,
-    /// it is silently ignored (set to 0) at open time.
+    /// it is silently ignored at open time.
+    ///
+    /// This should be set to the host filesystem's cluster size when the
+    /// VHDX file lives on a volume with clusters larger than 1 MiB (e.g.
+    /// NTFS-DAX with 2 MiB clusters).
     pub fn block_alignment(mut self, alignment: u32) -> Self {
         self.options.block_alignment = alignment;
         self
     }
 
-    /// Allow log replay on a read-only open.
+    /// Allow log replay when opening read-only.
     ///
-    /// See [`OpenOptions::allow_replay`] for details.
+    /// When true, a dirty log is replayed (the file handle must support
+    /// writes for the replay I/O) but the resulting [`VhdxFile`] is still
+    /// read-only. When false, a dirty log returns
+    /// [`CorruptionType::LogReplayRequired`].
+    ///
+    /// Has no effect on [`writable()`](Self::writable) opens, which always
+    /// replay.
     pub fn allow_replay(mut self, allow: bool) -> Self {
         self.options.allow_replay = allow;
         self
     }
 
+    /// Open the VHDX file in read-only mode.
     pub async fn read_only(self) -> Result<VhdxFile<F>, VhdxError>
     where
         F: AsyncFile,
@@ -124,6 +141,12 @@ impl<F: 'static + AsyncFile> VhdxBuilder<F> {
         VhdxFile::open_read_only(self.file, &self.options).await
     }
 
+    /// Open the VHDX file in writable mode with a log task.
+    ///
+    /// Replays a dirty log if needed, then spawns a log task for
+    /// crash-consistent metadata writes.
+    ///
+    /// Call [`VhdxFile::close()`] for a clean shutdown.
     pub async fn writable(
         self,
         spawner: &impl pal_async::task::Spawn,
@@ -168,9 +191,10 @@ pub(crate) enum WriteMode {
 
 /// An open VHDX file handle.
 ///
-/// Created via [`VhdxFile::open_read_only()`] or
-/// [`VhdxFile::open_writable()`], this provides read and write access
-/// to the virtual disk's metadata and BAT (block allocation table).
+/// Created via [`VhdxFile::open()`], which returns a [`VhdxBuilder`]
+/// for configuring options before calling
+/// [`read_only()`](VhdxBuilder::read_only) or
+/// [`writable()`](VhdxBuilder::writable).
 //
 // Lock ordering (must acquire in this order, never reverse):
 //   1. allocation_lock    (futures::lock::Mutex — async, may be held across .await)
@@ -239,14 +263,14 @@ pub struct VhdxFile<F: AsyncFile> {
     pub(crate) read_only: bool,
 
     /// Region table bytes to rewrite (set when the two on-disk copies
-    /// don't match). Consumed by `open_writable`.
+    /// don't match). Consumed by [`VhdxBuilder::writable`].
     region_rewrite_data: Option<Vec<u8>>,
 
     // Error state: once set, all operations fail.
     #[allow(dead_code)] // Phase 7+: used for error propagation on I/O path
     failed: Option<VhdxError>,
 
-    // Log task state (set when opened writable via open_writable).
+    // Log task state (set when opened writable via VhdxBuilder::writable).
     /// Handle to the spawned log task. `None` if no log task is running.
     log_task: Option<pal_async::task::Task<()>>,
     /// Flush sequencer for FSN-gated ordering. `None` for read-only files.
@@ -260,6 +284,9 @@ pub struct VhdxFile<F: AsyncFile> {
 }
 
 impl<F: 'static + AsyncFile> VhdxFile<F> {
+    /// Begin opening a VHDX file, returning a [`VhdxBuilder`] to configure
+    /// options before finalizing with [`read_only()`](VhdxBuilder::read_only)
+    /// or [`writable()`](VhdxBuilder::writable).
     pub fn open(file: F) -> VhdxBuilder<F> {
         VhdxBuilder {
             file,
@@ -267,8 +294,8 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         }
     }
 
-    /// Internal open logic shared by [`open_read_only`](Self::open_read_only)
-    /// and [`open_writable`](Self::open_writable).
+    /// Internal open logic shared by [`VhdxBuilder::read_only`] and
+    /// [`VhdxBuilder::writable`].
     ///
     /// Validates the file identifier, headers, region tables, and metadata.
     /// If the log GUID is non-zero (indicating a dirty log), replays the

@@ -172,7 +172,7 @@ pub(crate) async fn parse_region_tables(file: &impl AsyncFile) -> Result<ParsedR
 
 /// Write the region table to both on-disk slots and flush.
 ///
-/// Called during `open_writable` when one region table was corrupt or
+/// Called during [`VhdxBuilder::writable`](crate::open::VhdxBuilder::writable) when one region table was corrupt or
 /// the two copies didn't match. Writes the validated table to both
 /// offsets so that a subsequent single-table corruption doesn't lose
 /// the file.

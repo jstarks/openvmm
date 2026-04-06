@@ -417,7 +417,7 @@ impl<F: AsyncFile> PageCache<F> {
     ) -> Result<WritePageGuard<'_, F>, WritePendingAction> {
         assert!(
             self.log_permits.is_some(),
-            "acquire_write requires a log (use open_writable)"
+            "acquire_write requires a log (use VhdxFile::open().writable())"
         );
 
         assert!(
@@ -593,7 +593,7 @@ impl<F: AsyncFile> PageCache<F> {
         let client = map
             .log_client
             .as_mut()
-            .expect("commit_raw requires a log client (use open_writable)");
+            .expect("commit_raw requires a log client (use VhdxFile::open().writable())");
         let txn = client.begin();
         txn.commit(raw_pages, pre_log_fsn)
     }
@@ -606,7 +606,7 @@ impl<F: AsyncFile> PageCache<F> {
         let client = pages
             .log_client
             .as_mut()
-            .expect("commit requires a log client (use open_writable)");
+            .expect("commit requires a log client (use VhdxFile::open().writable())");
 
         let mut committed = Vec::new();
         let mut max_pre_log_fsn: Option<u64> = None;

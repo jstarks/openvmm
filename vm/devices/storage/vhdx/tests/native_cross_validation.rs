@@ -409,7 +409,8 @@ impl RustVhdx {
         let file = StdFile::open(path, read_only).expect("open backing file");
         let io_file = Arc::new(StdFile::open(path, read_only).expect("open io file"));
         let vhdx = if read_only {
-            vhdx::VhdxFile::open_read_only(file, true)
+            vhdx::VhdxFile::open(file)
+                .read_only()
                 .await
                 .expect("vhdx open")
         } else {

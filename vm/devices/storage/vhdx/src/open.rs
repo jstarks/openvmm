@@ -89,6 +89,16 @@ struct OpenOptions {
     allow_replay: bool,
 }
 
+impl OpenOptions {
+    /// Create a new `OpenOptions` with default values.
+    fn new() -> Self {
+        Self {
+            block_alignment: 0,
+            allow_replay: false,
+        }
+    }
+}
+
 impl<F: 'static + AsyncFile> VhdxBuilder<F> {
     /// Set the block data alignment in bytes.
     ///
@@ -253,10 +263,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
     pub fn open(file: F) -> VhdxBuilder<F> {
         VhdxBuilder {
             file,
-            options: OpenOptions {
-                block_alignment: 0,
-                allow_replay: false,
-            },
+            options: OpenOptions::new(),
         }
     }
 
@@ -1723,9 +1730,7 @@ mod tests {
         let file3 = InMemoryFile::from_snapshot(snapshot);
 
         // Second open should succeed without replay (log_guid is now ZERO).
-        let vhdx2 = VhdxFile::open_read_only(file3, &OpenOptions::new())
-            .await
-            .unwrap();
+        let vhdx2 = VhdxFile::open(file3).read_only().await.unwrap();
         assert_eq!(vhdx2.disk_size(), format::GB1);
     }
 

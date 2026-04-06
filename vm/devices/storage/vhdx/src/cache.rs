@@ -527,10 +527,16 @@ impl<F: AsyncFile> PageCache<F> {
         if !populated {
             page.data = Some(Arc::new([0u8; PAGE_SIZE]));
         }
-        // Leave state as Clean — the page lock is held by the caller
-        // until WritePageGuard is dropped. DerefMut sets Dirty if
-        // the caller actually mutates; Drop refunds the permit if not.
-        page.state = PageState::Clean;
+        // For populated pages (data loaded from disk or previously written),
+        // leave Clean — if the caller doesn't mutate, the permit is refunded.
+        // For unpopulated pages (fresh zeros for Overwrite), set Dirty —
+        // the zeros are synthetic, not real disk data, so they must be
+        // committed even if the caller doesn't call DerefMut.
+        page.state = if populated {
+            PageState::Clean
+        } else {
+            PageState::Dirty
+        };
 
         self.state_event.notify(usize::MAX);
         Ok((page, populated))

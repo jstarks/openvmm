@@ -195,6 +195,15 @@ impl<F: AsyncFile> VhdxFile<F> {
                 std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
 
             let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
+
+            // If the range covers the entire page, skip the disk read.
+            let full_page = start_bit == 0 && bits_in_this_page == SECTORS_PER_BITMAP_PAGE;
+            let mode = if full_page {
+                WriteMode::Overwrite
+            } else {
+                WriteMode::Modify
+            };
+
             let mut guard = self
                 .cache
                 .acquire_write(
@@ -202,18 +211,34 @@ impl<F: AsyncFile> VhdxFile<F> {
                         tag: SBM_TAG,
                         offset: page_file_offset,
                     },
-                    WriteMode::Modify,
+                    mode,
                 )
                 .await?;
 
-            // Set or clear each bit in the range.
-            for bit_index in start_bit..bits_in_this_page {
-                let byte_index = (bit_index / 8) as usize;
-                let bit_position = (bit_index % 8) as u32;
-                if set {
-                    guard[byte_index] |= 1 << bit_position;
-                } else {
-                    guard[byte_index] &= !(1 << bit_position);
+            if full_page {
+                // Overwrite entire page without reading existing data.
+                guard.fill(if set { 0xFF } else { 0x00 });
+            } else {
+                // Check via read-only Deref whether any bits actually differ.
+                // If not, DerefMut is never called, the page stays clean,
+                // and no write-back occurs.
+                let needs_change = (start_bit..bits_in_this_page).any(|bit_index| {
+                    let byte_index = (bit_index / 8) as usize;
+                    let bit_position = (bit_index % 8) as u32;
+                    let current_set = (guard[byte_index] >> bit_position) & 1 == 1;
+                    current_set != set
+                });
+
+                if needs_change {
+                    for bit_index in start_bit..bits_in_this_page {
+                        let byte_index = (bit_index / 8) as usize;
+                        let bit_position = (bit_index % 8) as u32;
+                        if set {
+                            guard[byte_index] |= 1 << bit_position;
+                        } else {
+                            guard[byte_index] &= !(1 << bit_position);
+                        }
+                    }
                 }
             }
 

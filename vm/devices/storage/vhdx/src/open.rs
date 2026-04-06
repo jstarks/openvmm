@@ -271,16 +271,25 @@ pub struct VhdxFile<F: AsyncFile> {
     failed: Option<VhdxError>,
 
     // Log task state (set when opened writable via VhdxBuilder::writable).
-    /// Handle to the spawned log task. `None` if no log task is running.
-    log_task: Option<pal_async::task::Task<()>>,
-    /// Flush sequencer for FSN-gated ordering. `None` for read-only files.
-    pub(crate) flush_sequencer: Option<Arc<FlushSequencer>>,
-    /// Failable semaphore for log backpressure. Shared with log task.
-    log_permits: Option<Arc<crate::log_permits::LogPermits>>,
+    pub(crate) log_state: Option<LogTaskState>,
+}
+
+/// Log pipeline state for a writable VHDX file.
+///
+/// Created during [`VhdxBuilder::writable`] and consumed by
+/// [`VhdxFile::close`] / [`VhdxFile::abort`]. All fields are set
+/// together when the log task is spawned.
+pub(crate) struct LogTaskState {
+    /// Handle to the spawned log task.
+    log_task: pal_async::task::Task<()>,
+    /// Handle to the spawned apply task.
+    apply_task: pal_async::task::Task<()>,
+    /// Flush sequencer for FSN-gated ordering.
+    pub flush_sequencer: Arc<FlushSequencer>,
+    /// Failable semaphore for log backpressure.
+    pub log_permits: Arc<crate::log_permits::LogPermits>,
     /// LSN watermark published by the log task. `flush()` waits on this.
-    pub(crate) logged_lsn: Option<Arc<crate::lsn_watermark::LsnWatermark>>,
-    /// Handle to the spawned apply task. `None` if no apply task is running.
-    apply_task: Option<pal_async::task::Task<()>>,
+    pub logged_lsn: Arc<crate::lsn_watermark::LsnWatermark>,
 }
 
 impl<F: 'static + AsyncFile> VhdxFile<F> {
@@ -407,7 +416,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             file.clone(),
             log_sender.map(crate::log_task::LogClient::new),
             None,
-            None,
             0,
         );
         cache.register_tag(BAT_TAG, regions.bat_offset);
@@ -475,11 +483,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             region_rewrite_data: regions.rewrite_data,
             failed: None,
 
-            log_task: None,
-            flush_sequencer: None,
-            log_permits: None,
-            logged_lsn: None,
-            apply_task: None,
+            log_state: None,
         })
     }
 
@@ -616,15 +620,19 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             .run(rx),
         );
 
-        // Set log permits and LSN watermark on the cache.
-        vhdx.cache.set_log_permits(log_permits.clone());
-        vhdx.cache.set_applied_lsn(applied_lsn.clone());
+        // Set log state on the cache.
+        vhdx.cache.set_log_state(crate::cache::CacheLogState {
+            permits: log_permits.clone(),
+            applied_lsn: applied_lsn.clone(),
+        });
 
-        vhdx.log_task = Some(task);
-        vhdx.apply_task = Some(apply_task);
-        vhdx.flush_sequencer = Some(flush_sequencer);
-        vhdx.log_permits = Some(log_permits);
-        vhdx.logged_lsn = Some(logged_lsn);
+        vhdx.log_state = Some(LogTaskState {
+            log_task: task,
+            apply_task,
+            flush_sequencer,
+            log_permits,
+            logged_lsn,
+        });
 
         // Repair mismatched region tables through the write-ahead log.
         // The pages enter the log pipeline and will be applied in due
@@ -634,9 +642,11 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         if let Some(table_data) = vhdx.region_rewrite_data.take() {
             crate::region::rewrite_region_tables(
                 &vhdx.cache,
-                vhdx.log_permits
+                &vhdx
+                    .log_state
                     .as_ref()
-                    .expect("writable file has log_permits"),
+                    .expect("writable file has log_state")
+                    .log_permits,
                 &table_data,
             )
             .await?;
@@ -656,7 +666,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
     /// If no log task is running (read-only or opened without log), this is
     /// a no-op.
     pub async fn close(mut self) -> Result<(), VhdxError> {
-        if self.log_task.is_some() {
+        if let Some(state) = self.log_state.take() {
             // Ship any remaining dirty pages to the log task.
             // This is fire-and-forget — the Close RPC below will
             // process after this batch due to channel ordering.
@@ -672,14 +682,10 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             // batches, then respond.
             client.close().await?;
 
-            if let Some(task) = self.log_task.take() {
-                task.await;
-            }
+            state.log_task.await;
             // The log task dropping its apply_tx closes the apply channel,
             // causing the apply task to exit.
-            if let Some(task) = self.apply_task.take() {
-                task.await;
-            }
+            state.apply_task.await;
 
             // Clear log GUID in the header now that the log is fully drained.
             self.write_clean_header().await?;
@@ -703,11 +709,9 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
 
         // Wait for the log task to notice the closed channel and exit.
         // The log task dropping its apply_tx closes the apply channel too.
-        if let Some(task) = self.log_task.take() {
-            task.await;
-        }
-        if let Some(task) = self.apply_task.take() {
-            task.await;
+        if let Some(state) = self.log_state.take() {
+            state.log_task.await;
+            state.apply_task.await;
         }
     }
 }
@@ -996,8 +1000,8 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         self.file.write_at(header_offset, &buf).await?;
 
-        if let Some(seq) = &self.flush_sequencer {
-            seq.flush(self.file.as_ref()).await?;
+        if let Some(ref state) = self.log_state {
+            state.flush_sequencer.flush(self.file.as_ref()).await?;
         } else {
             self.file.flush().await?;
         }

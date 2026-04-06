@@ -109,6 +109,9 @@ struct PageData {
     committed_lsn: Option<u64>,
 }
 
+/// Number of distinct cache tags (BAT=0, METADATA=1, SBM=2).
+const TAG_COUNT: usize = 3;
+
 /// Internal page map wrapping the `HashMap` and dirty page counter.
 struct PageMap {
     map: HashMap<PageKey, Arc<Mutex<PageData>>>,
@@ -118,6 +121,15 @@ struct PageMap {
     dirty_count: usize,
     /// Log client for sending transactions. `None` for read-only caches.
     log_client: Option<LogClient>,
+    /// Base file offset per tag, indexed by tag value.
+    tag_offsets: [u64; TAG_COUNT],
+}
+
+impl PageMap {
+    /// Resolve a [`PageKey`] to an absolute file offset.
+    fn resolve_offset(&self, key: PageKey) -> u64 {
+        self.tag_offsets[key.tag as usize] + key.offset
+    }
 }
 
 /// Action to perform when a page isn't ready (returned by sync helpers).
@@ -143,13 +155,21 @@ enum WritePendingAction {
     AcquirePermit(Arc<Mutex<PageData>>),
 }
 
+/// Log pipeline state shared between the cache and the log/apply tasks.
+///
+/// Present only when the file is opened writable with a log task.
+pub(crate) struct CacheLogState {
+    /// Failable semaphore for log backpressure.
+    pub permits: Arc<LogPermits>,
+    /// LSN watermark published by the apply task.
+    pub applied_lsn: Arc<LsnWatermark>,
+}
+
 /// Write-back page cache backed by an [`AsyncFile`].
 pub struct PageCache<F: AsyncFile> {
     pub(crate) file: Arc<F>,
     pages: Mutex<PageMap>,
-    tags: Mutex<HashMap<u8, u64>>,
-    log_permits: Option<Arc<LogPermits>>,
-    applied_lsn: Option<Arc<LsnWatermark>>,
+    log_state: Option<CacheLogState>,
     /// Notified when a page transitions out of `Loading` or `AcquiringPermit`.
     state_event: event_listener::Event,
     /// Maximum number of pages to keep in the cache. 0 = unlimited.
@@ -161,8 +181,7 @@ impl<F: AsyncFile> PageCache<F> {
     pub fn new(
         file: Arc<F>,
         log_client: Option<LogClient>,
-        log_permits: Option<Arc<LogPermits>>,
-        applied_lsn: Option<Arc<LsnWatermark>>,
+        log_state: Option<CacheLogState>,
         quota: usize,
     ) -> Self {
         Self {
@@ -171,10 +190,9 @@ impl<F: AsyncFile> PageCache<F> {
                 map: HashMap::new(),
                 dirty_count: 0,
                 log_client,
+                tag_offsets: [0; TAG_COUNT],
             }),
-            tags: Mutex::new(HashMap::new()),
-            log_permits,
-            applied_lsn,
+            log_state,
             state_event: event_listener::Event::new(),
             quota,
         }
@@ -185,45 +203,31 @@ impl<F: AsyncFile> PageCache<F> {
         self.pages.lock().log_client.take()
     }
 
-    /// Set the log permits (for late initialization after log task spawn).
-    pub fn set_log_permits(&mut self, permits: Arc<LogPermits>) {
-        self.log_permits = Some(permits);
-    }
-
-    /// Set the applied LSN watermark (for late initialization after apply task spawn).
-    pub fn set_applied_lsn(&mut self, lsn: Arc<LsnWatermark>) {
-        self.applied_lsn = Some(lsn);
+    /// Set the log pipeline state (for late initialization after log task spawn).
+    pub fn set_log_state(&mut self, state: CacheLogState) {
+        self.log_state = Some(state);
     }
 
     /// Register a tag with its base file offset.
     pub fn register_tag(&mut self, tag: u8, base_offset: u64) {
-        self.tags.lock().insert(tag, base_offset);
+        self.pages.lock().tag_offsets[tag as usize] = base_offset;
     }
 
     /// Update the base file offset for a previously registered tag.
     #[allow(dead_code)]
     pub fn update_tag_offset(&self, tag: u8, new_base: u64) {
-        self.tags.lock().insert(tag, new_base);
-    }
-
-    /// Resolve a [`PageKey`] to an absolute file offset.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `key.tag` has not been registered via [`register_tag`](Self::register_tag).
-    pub(crate) fn resolve_offset(&self, key: PageKey) -> u64 {
-        let tags = self.tags.lock();
-        let base = tags
-            .get(&key.tag)
-            .unwrap_or_else(|| panic!("cache tag {} not registered", key.tag));
-        base + key.offset
+        self.pages.lock().tag_offsets[tag as usize] = new_base;
     }
 
     /// Try to evict one clean, applied page to make room.
     /// Must be called with the pages map lock held.
     /// `skip_key` is the page being acquired — never evict it.
     fn try_evict_under_lock(&self, pages: &mut PageMap, skip_key: Option<PageKey>) {
-        let applied = self.applied_lsn.as_ref().map(|w| w.get()).unwrap_or(0);
+        let applied = self
+            .log_state
+            .as_ref()
+            .map(|s| s.applied_lsn.get())
+            .unwrap_or(0);
 
         // Find first evictable page.
         let evict_key = pages.map.iter().find_map(|(&key, entry)| {
@@ -284,8 +288,8 @@ impl<F: AsyncFile> PageCache<F> {
             "page offset {:#x} is not {PAGE_SIZE}-byte aligned",
             key.offset
         );
-        let file_offset = self.resolve_offset(key);
         let mut pages = self.pages.lock();
+        let file_offset = pages.resolve_offset(key);
 
         // Evict if over quota (but not the page we're about to acquire).
         if self.quota > 0 && pages.map.len() >= self.quota {
@@ -384,7 +388,7 @@ impl<F: AsyncFile> PageCache<F> {
                     }
                 }
                 WritePendingAction::AcquirePermit(entry) => {
-                    let permits = self.log_permits.as_ref().unwrap();
+                    let permits = &self.log_state.as_ref().unwrap().permits;
                     let result = permits.acquire(1).await;
                     match result {
                         Ok(()) => {
@@ -416,7 +420,7 @@ impl<F: AsyncFile> PageCache<F> {
         load: bool,
     ) -> Result<WritePageGuard<'_, F>, WritePendingAction> {
         assert!(
-            self.log_permits.is_some(),
+            self.log_state.is_some(),
             "acquire_write requires a log (use VhdxFile::open().writable())"
         );
 
@@ -425,9 +429,9 @@ impl<F: AsyncFile> PageCache<F> {
             "page offset {:#x} is not {PAGE_SIZE}-byte aligned",
             key.offset
         );
-        let file_offset = self.resolve_offset(key);
 
         let mut pages = self.pages.lock();
+        let file_offset = pages.resolve_offset(key);
 
         // Evict if over quota.
         if self.quota > 0 && pages.map.len() >= self.quota {
@@ -502,8 +506,8 @@ impl<F: AsyncFile> PageCache<F> {
                 assert!(page.state == PageState::AcquiringPermit);
                 page.state = PageState::Clean;
                 drop(page);
-                if let Some(ref permits) = self.log_permits {
-                    permits.release(1);
+                if let Some(ref state) = self.log_state {
+                    state.permits.release(1);
                 }
                 self.state_event.notify(usize::MAX);
                 return Err(e);
@@ -617,7 +621,7 @@ impl<F: AsyncFile> PageCache<F> {
         for (&key, entry) in pages.map.iter() {
             let mut page = entry.lock();
             if matches!(page.state, PageState::Dirty) {
-                let file_offset = self.resolve_offset(key);
+                let file_offset = pages.tag_offsets[key.tag as usize] + key.offset;
                 let data = page.data.as_ref().expect("dirty page has no data").clone();
 
                 if let Some(fsn) = page.pre_log_fsn.take() {
@@ -726,8 +730,8 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
                 // lock.
                 drop(guard);
                 self.cache.pages.lock().dirty_count -= 1;
-                if let Some(ref permits) = self.cache.log_permits {
-                    permits.release(1);
+                if let Some(ref state) = self.cache.log_state {
+                    state.permits.release(1);
                 }
                 self.cache.state_event.notify(usize::MAX);
             }
@@ -751,8 +755,10 @@ mod tests {
         let cache = PageCache::new(
             Arc::new(file),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         (cache, rx)
@@ -764,7 +770,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| (i & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None, 0);
+        let mut cache = PageCache::new(Arc::new(file), None, None, 0);
         cache.register_tag(0, 0);
 
         let guard = cache
@@ -789,8 +795,10 @@ mod tests {
         cache = PageCache::new(
             Arc::new(file),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -832,8 +840,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(file),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -859,7 +869,7 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| ((i * 3) & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None, 0);
+        let mut cache = PageCache::new(Arc::new(file), None, None, 0);
         cache.register_tag(0, 0);
 
         let g1 = cache
@@ -883,8 +893,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -920,8 +932,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -958,8 +972,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 4)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1011,7 +1027,7 @@ mod tests {
         let pattern = [0xDE; PAGE_SIZE];
         file.write_at(base + page_offset, &pattern).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None, 0);
+        let mut cache = PageCache::new(Arc::new(file), None, None, 0);
         cache.register_tag(0, base);
 
         let guard = cache
@@ -1032,7 +1048,7 @@ mod tests {
         file.write_at(old_base, &[0xAA; PAGE_SIZE]).await.unwrap();
         file.write_at(new_base, &[0xBB; PAGE_SIZE]).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None, 0);
+        let mut cache = PageCache::new(Arc::new(file), None, None, 0);
         cache.register_tag(0, old_base);
 
         {
@@ -1043,7 +1059,7 @@ mod tests {
             assert_eq!(guard[0], 0xAA);
         }
 
-        let mut cache = PageCache::new(cache.file.clone(), None, None, None, 0);
+        let mut cache = PageCache::new(cache.file.clone(), None, None, 0);
         cache.register_tag(0, old_base);
         cache.update_tag_offset(0, new_base);
 
@@ -1061,8 +1077,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1092,8 +1110,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1130,8 +1150,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1170,8 +1192,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 200)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1213,8 +1237,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 200)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1240,8 +1266,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 200)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1298,7 +1326,7 @@ mod tests {
         file.write_at(PAGE_SIZE as u64, &pattern_b).await.unwrap();
 
         // Quota of 1 page.
-        let mut cache = PageCache::new(Arc::new(file), None, None, None, 1);
+        let mut cache = PageCache::new(Arc::new(file), None, None, 1);
         cache.register_tag(0, 0);
 
         // Load page A.
@@ -1332,7 +1360,7 @@ mod tests {
         file.write_at(0, &pattern_a).await.unwrap();
         file.write_at(PAGE_SIZE as u64, &pattern_b).await.unwrap();
 
-        let mut cache = PageCache::new(Arc::new(file), None, None, None, 1);
+        let mut cache = PageCache::new(Arc::new(file), None, None, 1);
         cache.register_tag(0, 0);
 
         // Load page A.
@@ -1376,8 +1404,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(file),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             1,
         );
         cache.register_tag(0, 0);
@@ -1430,8 +1460,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(file),
             Some(LogClient::new(tx)),
-            Some(permits),
-            Some(applied.clone()),
+            Some(CacheLogState {
+                permits,
+                applied_lsn: applied.clone(),
+            }),
             1,
         );
         cache.register_tag(0, 0);
@@ -1496,8 +1528,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64 * 10)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             2,
         );
         cache.register_tag(0, 0);
@@ -1526,8 +1560,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1550,8 +1586,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(InMemoryFile::new(PAGE_SIZE as u64)),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);
@@ -1592,8 +1630,10 @@ mod tests {
         let mut cache = PageCache::new(
             Arc::new(file),
             Some(LogClient::new(tx)),
-            Some(permits),
-            None,
+            Some(CacheLogState {
+                permits,
+                applied_lsn: Arc::new(LsnWatermark::new()),
+            }),
             0,
         );
         cache.register_tag(0, 0);

@@ -641,8 +641,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                             // the caller writes data), matching the C code's
                             // FreeSpace.RequiredFsn timing.
                             if !space_state.is_safe() {
-                                if let Some(fs) = &self.flush_sequencer {
-                                    let fsn = fs.current_fsn();
+                                if let Some(ref state) = self.log_state {
+                                    let fsn = state.flush_sequencer.current_fsn();
                                     let page_key =
                                         self.bat_page_key_for_block(block_info.block_number);
                                     self.cache.set_pre_log_fsn(page_key, fsn);
@@ -808,8 +808,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // Capture FSN NOW (after caller's data writes,
                         // matching C's Vhd2iDereferenceReadWrite →
                         // Vhd2iGetCurrentFsn timing).
-                        if let Some(fs) = &self.flush_sequencer {
-                            let fsn = fs.current_fsn();
+                        if let Some(ref state) = self.log_state {
+                            let fsn = state.flush_sequencer.current_fsn();
                             let page_key = self.bat_page_key_for_block(block_number);
                             self.cache.set_pre_log_fsn(page_key, fsn);
                         }
@@ -909,21 +909,18 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         let lsn = self.cache.commit()?;
 
+        let state = self
+            .log_state
+            .as_ref()
+            .expect("writable file has log_state");
+
         // Wait for the log task to write WAL entries through this LSN.
         // Even if this commit had no dirty pages, we wait for the most
         // recent LSN to ensure a concurrent flush's WAL write completes.
-        self.logged_lsn
-            .as_ref()
-            .expect("writable file has logged_lsn")
-            .wait_for(lsn)
-            .await?;
+        state.logged_lsn.wait_for(lsn).await?;
 
         // Flush everything: user data, WAL entries, applied pages.
-        self.flush_sequencer
-            .as_ref()
-            .expect("writable file has flush_sequencer")
-            .flush(self.file.as_ref())
-            .await?;
+        state.flush_sequencer.flush(self.file.as_ref()).await?;
 
         Ok(())
     }

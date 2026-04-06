@@ -185,7 +185,7 @@ mod log_task_integration {
 
         // Verify the file is opened in writable mode with a log task.
         assert!(!vhdx.read_only);
-        assert!(vhdx.flush_sequencer.is_some());
+        assert!(vhdx.log_state.is_some());
 
         // Close should succeed cleanly.
         vhdx.close().await.unwrap();
@@ -304,7 +304,7 @@ mod log_task_integration {
         let file = create_test_vhdx_file(format::GB1).await;
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         assert!(vhdx.read_only);
-        assert!(vhdx.flush_sequencer.is_none());
+        assert!(vhdx.log_state.is_none());
     }
 
     #[async_test]

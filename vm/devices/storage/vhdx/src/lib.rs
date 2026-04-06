@@ -48,6 +48,7 @@ pub use io::ReadRange;
 pub use io::WriteRange;
 pub use io_guard::ReadIoGuard;
 pub use io_guard::WriteIoGuard;
+pub use open::OpenOptions;
 pub use open::VhdxFile;
 pub use trim::TrimMode;
 pub use trim::TrimRequest;

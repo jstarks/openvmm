@@ -205,7 +205,9 @@ mod tests {
 
         // Step 2: Re-open and validate
         let bf = BlockingFile::open(&path, false).unwrap();
-        let vhdx = VhdxFile::open_read_only(bf, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(bf, &vhdx::OpenOptions::new())
+            .await
+            .unwrap();
         assert_eq!(vhdx.disk_size(), 1024 * 1024);
         assert_eq!(vhdx.logical_sector_size(), 512);
     }

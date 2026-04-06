@@ -10,6 +10,7 @@ use disk_backend_resources::layer::VhdxDiskLayerHandle;
 use disk_layered::resolve::ResolveDiskLayerParameters;
 use disk_layered::resolve::ResolvedDiskLayer;
 use thiserror::Error;
+use vhdx::OpenOptions;
 use vhdx::VhdxFile;
 use vm_resource::AsyncResolveResource;
 use vm_resource::ResourceResolver;
@@ -47,12 +48,12 @@ impl AsyncResolveResource<DiskLayerHandleKind, VhdxDiskLayerHandle> for VhdxDisk
         let file = BlockingFile::new(resource.file);
         let file2 = file.clone();
         let vhdx = if read_only {
-            VhdxFile::open_read_only(file, true)
+            VhdxFile::open_read_only(file, &OpenOptions::new().allow_replay(true))
                 .await
                 .map_err(ResolveVhdxError::Open)?
         } else {
             let driver = input.driver_source.simple();
-            VhdxFile::open_writable(file, &driver)
+            VhdxFile::open_writable(file, &driver, &OpenOptions::new())
                 .await
                 .map_err(ResolveVhdxError::Open)?
         };

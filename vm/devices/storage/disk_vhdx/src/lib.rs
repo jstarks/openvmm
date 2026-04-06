@@ -304,8 +304,8 @@ mod tests {
     use disk_layered::LayerConfiguration;
     use disk_layered::LayeredDisk;
     use guestmem::GuestMemory;
-    use pal_async::async_test;
     use pal_async::DefaultDriver;
+    use pal_async::async_test;
     use scsi_buffers::OwnedRequestBuffers;
     use vhdx::open::VhdxFile;
 
@@ -322,7 +322,9 @@ mod tests {
         // Re-open and wrap as VhdxLayer.
         let bf = BlockingFile::open(path, false).unwrap();
         let bf2 = bf.clone();
-        let vhdx = VhdxFile::open_writable(bf, driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(bf, driver, &vhdx::OpenOptions::new())
+            .await
+            .unwrap();
         VhdxLayer::new(vhdx, bf2, false)
     }
 
@@ -432,7 +434,9 @@ mod tests {
         {
             let bf = BlockingFile::open(&path, true).unwrap();
             let bf2 = bf.clone();
-            let vhdx = VhdxFile::open_read_only(bf, true).await.unwrap();
+            let vhdx = VhdxFile::open_read_only(bf, &vhdx::OpenOptions::new().allow_replay(true))
+                .await
+                .unwrap();
             let layer = VhdxLayer::new(vhdx, bf2, true);
             let disk = LayeredDisk::new(
                 true,

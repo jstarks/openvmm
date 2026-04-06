@@ -235,6 +235,7 @@ mod tests {
     use crate::format;
     use crate::format::BatEntry;
     use crate::io::ReadRange;
+    use crate::open::OpenOptions;
     use crate::open::VhdxFile;
     use crate::region;
     use crate::tests::support::InMemoryFile;
@@ -293,7 +294,9 @@ mod tests {
         file.write_at(sbm_block_offset, bitmap_data).await.unwrap();
 
         // Open the VHDX.
-        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
+            .await
+            .unwrap();
 
         // Extract the file from the VhdxFile for assertions (we can't, so
         // return a fresh open). Actually, we need the VhdxFile for resolve_read.
@@ -585,7 +588,9 @@ mod tests {
         let needed = data_block_offset + format::DEFAULT_BLOCK_SIZE as u64;
         file.set_file_size(needed).await.unwrap();
 
-        let vhdx = VhdxFile::open_read_only(file, false).await.unwrap();
+        let vhdx = VhdxFile::open_read_only(file, &OpenOptions::new())
+            .await
+            .unwrap();
         let mut ranges = Vec::new();
         let result = vhdx.resolve_read(0, 4096, &mut ranges).await;
         assert!(matches!(
@@ -635,7 +640,9 @@ mod tests {
 
         file.write_at(sbm_block_offset, &bitmap).await.unwrap();
 
-        let vhdx = VhdxFile::open_writable(file, &driver).await.unwrap();
+        let vhdx = VhdxFile::open_writable(file, &driver, &OpenOptions::new())
+            .await
+            .unwrap();
 
         // Verify initial state: sectors 0-7 are transparent.
         let mut ranges = Vec::new();

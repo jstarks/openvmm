@@ -470,6 +470,7 @@ impl Bat {
         block_type: BlockType,
         block_number: u32,
         mapping: InternalBlockMapping,
+        pre_log_fsn: Option<u64>,
     ) -> Result<(), VhdxError> {
         let entry_number = match block_type {
             BlockType::Payload => self.payload_entry_index(block_number),
@@ -505,6 +506,12 @@ impl Bat {
             let byte_offset = entry_within_page * size_of::<BatEntry>();
             guard[byte_offset..byte_offset + size_of::<BatEntry>()]
                 .copy_from_slice(bat_entry.as_bytes());
+        }
+
+        // Set pre-log FSN while the page lock is still held, so
+        // that the FSN is visible atomically with the dirty-mark.
+        if let Some(fsn) = pre_log_fsn {
+            guard.set_pre_log_fsn(fsn);
         }
 
         // BAT pages are always rebuildable from in-memory BatState,

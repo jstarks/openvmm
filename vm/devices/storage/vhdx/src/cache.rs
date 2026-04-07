@@ -37,6 +37,7 @@ use crate::lsn_watermark::LsnWatermark;
 use parking_lot::ArcMutexGuard;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::collections::hash_map;
 use std::sync::Arc;
 
 /// Page size used by the cache (4 KiB).
@@ -185,7 +186,7 @@ impl LruList {
         self.nodes[idx].linked = false;
     }
 
-    /// Insert a node at the MRU end (after sentinel).
+    /// Insert an unlinked node at the MRU end (after sentinel).
     fn push_front(&mut self, idx: usize) {
         debug_assert!(!self.is_linked(idx), "push_front on linked node");
         let old_front = self.nodes[0].next;
@@ -196,9 +197,59 @@ impl LruList {
         self.nodes[idx].linked = true;
     }
 
-    /// Insert a node at the LRU end (before sentinel).
+    /// Insert an unlinked node at the LRU end (before sentinel).
     fn push_back(&mut self, idx: usize) {
         debug_assert!(!self.is_linked(idx), "push_back on linked node");
+        let old_back = self.nodes[0].prev;
+        self.nodes[idx].next = 0;
+        self.nodes[idx].prev = old_back;
+        self.nodes[0].prev = idx;
+        self.nodes[old_back].next = idx;
+        self.nodes[idx].linked = true;
+    }
+
+    /// Move a node to the MRU end. Works whether linked or unlinked.
+    fn move_to_front(&mut self, idx: usize) {
+        if idx == 0 {
+            return;
+        }
+        // Already at front?
+        if self.nodes[0].next == idx {
+            return;
+        }
+        // Remove from current position if linked.
+        if self.nodes[idx].linked {
+            let prev = self.nodes[idx].prev;
+            let next = self.nodes[idx].next;
+            self.nodes[prev].next = next;
+            self.nodes[next].prev = prev;
+        }
+        // Insert after sentinel.
+        let old_front = self.nodes[0].next;
+        self.nodes[idx].prev = 0;
+        self.nodes[idx].next = old_front;
+        self.nodes[0].next = idx;
+        self.nodes[old_front].prev = idx;
+        self.nodes[idx].linked = true;
+    }
+
+    /// Move a node to the LRU end. Works whether linked or unlinked.
+    fn move_to_back(&mut self, idx: usize) {
+        if idx == 0 {
+            return;
+        }
+        // Already at back?
+        if self.nodes[0].prev == idx {
+            return;
+        }
+        // Remove from current position if linked.
+        if self.nodes[idx].linked {
+            let prev = self.nodes[idx].prev;
+            let next = self.nodes[idx].next;
+            self.nodes[prev].next = next;
+            self.nodes[next].prev = prev;
+        }
+        // Insert before sentinel.
         let old_back = self.nodes[0].prev;
         self.nodes[idx].next = 0;
         self.nodes[idx].prev = old_back;
@@ -242,6 +293,10 @@ struct CacheEntry {
     /// Set under the map lock in `commit_locked`, read under the map
     /// lock in eviction — no page lock needed. 0 = never committed.
     committed_lsn: u64,
+    /// True when the page is clean and no writer holds it.
+    /// Set under the map lock on all write-acquire and write-release
+    /// paths. Eviction checks this without taking the page lock.
+    idle: bool,
 }
 
 /// Internal page map wrapping the `HashMap` and dirty page counter.
@@ -364,10 +419,9 @@ impl<F: AsyncFile> PageCache<F> {
             .map(|s| s.applied_lsn.get())
             .unwrap_or(0);
 
-        // Walk backward from the LRU tail. Pages in the LRU are idle
-        // (writes unlink on acquire) or held by a reader (promoted to
-        // MRU on acquire, so unreachable from the tail before we hit
-        // evictable pages).
+        // Walk backward from the LRU tail. Check `idle` and
+        // `committed_lsn` on the entry — both maintained under the
+        // map lock, so no page lock needed.
         let mut idx = pages.lru.tail();
         while self.quota > 0 && pages.map.len() > self.quota {
             if idx == 0 {
@@ -380,11 +434,7 @@ impl<F: AsyncFile> PageCache<F> {
                 continue;
             }
             let entry = pages.map.get(&key).expect("LRU key missing from map");
-            if entry.committed_lsn <= applied {
-                // Lock the page to ensure no outstanding guard holds it.
-                // This should be uncontended — readers are at the MRU end.
-                let _page = entry.page.lock();
-                drop(_page);
+            if entry.idle && entry.committed_lsn <= applied {
                 pages.map.remove(&key);
                 pages.lru.dealloc(idx);
                 idx = pages.lru.tail();
@@ -448,6 +498,7 @@ impl<F: AsyncFile> PageCache<F> {
                         demoted: false,
                     })),
                     committed_lsn: 0,
+                    idle: true,
                 }
             })
             .page
@@ -483,8 +534,7 @@ impl<F: AsyncFile> PageCache<F> {
                 // Promote to MRU.
                 let idx = guard.lru_index;
                 guard.demoted = false;
-                pages.lru.unlink(idx);
-                pages.lru.push_front(idx);
+                pages.lru.move_to_front(idx);
                 drop(pages);
                 Ok(ReadPageGuard { guard })
             }
@@ -589,38 +639,41 @@ impl<F: AsyncFile> PageCache<F> {
             key.offset
         );
 
+        let file_offset;
         let mut pages = self.pages.lock();
-        let file_offset = pages.resolve_offset(key);
+        let mut guard = {
+            let pages = &mut *pages;
+            file_offset = pages.resolve_offset(key);
 
-        // Pre-allocate an LRU slot. Freed below if the entry already exists.
-        let lru_index = pages.lru.alloc(key);
-        let mut inserted = false;
-        let page = pages
-            .map
-            .entry(key)
-            .or_insert_with(|| {
-                inserted = true;
-                CacheEntry {
-                    page: Arc::new(Mutex::new(PageData {
-                        data: None,
-                        state: PageState::Clean,
-                        pre_log_fsn: None,
-                        lru_index,
-                        demoted: false,
-                    })),
-                    committed_lsn: 0,
+            // Pre-allocate an LRU slot. Freed below if the entry already exists.
+            let lru_index = pages.lru.alloc(key);
+            match pages.map.entry(key) {
+                hash_map::Entry::Occupied(entry) => {
+                    let entry = entry.into_mut();
+                    pages.lru.dealloc(lru_index);
+                    entry.idle = false;
+                    entry.page.lock_arc()
                 }
-            })
-            .page
-            .clone();
-
-        if !inserted {
-            pages.lru.dealloc(lru_index);
-        } else if self.quota > 0 && pages.map.len() > self.quota {
-            self.try_evict_under_lock(&mut pages, Some(key));
-        }
-
-        let mut guard = Mutex::lock_arc(&page);
+                hash_map::Entry::Vacant(entry) => {
+                    let entry = entry.insert(CacheEntry {
+                        page: Arc::new(Mutex::new(PageData {
+                            data: None,
+                            state: PageState::Clean,
+                            pre_log_fsn: None,
+                            lru_index,
+                            demoted: false,
+                        })),
+                        committed_lsn: 0,
+                        idle: false,
+                    });
+                    let page = entry.page.clone();
+                    if self.quota > 0 && pages.map.len() > self.quota {
+                        self.try_evict_under_lock(pages, Some(key));
+                    }
+                    page.lock_arc()
+                }
+            }
+        };
 
         match guard.state {
             PageState::Loading | PageState::AcquiringPermit => {
@@ -632,9 +685,10 @@ impl<F: AsyncFile> PageCache<F> {
                     "page in {:?} has no data",
                     guard.state
                 );
-                // Unlink from LRU (no-op if already unlinked from prior write).
-                pages.lru.unlink(guard.lru_index);
+                // Promote to MRU.
+                let idx = guard.lru_index;
                 guard.demoted = false;
+                pages.lru.move_to_front(idx);
                 drop(pages);
                 Ok(WritePageGuard {
                     cache: self,
@@ -650,9 +704,10 @@ impl<F: AsyncFile> PageCache<F> {
                 ))
             }
             PageState::Clean => {
-                // Unlink from LRU before transitioning to AcquiringPermit.
-                pages.lru.unlink(guard.lru_index);
+                // Promote to MRU.
+                let idx = guard.lru_index;
                 guard.demoted = false;
+                pages.lru.move_to_front(idx);
                 guard.state = PageState::AcquiringPermit;
                 Err(WritePendingAction::AcquirePermit(ArcMutexGuard::into_arc(
                     guard,
@@ -680,19 +735,7 @@ impl<F: AsyncFile> PageCache<F> {
         // MAX_COMMIT_PAGES, commit before adding this page.
         if pages.dirty_count >= MAX_COMMIT_PAGES {
             if let Err(e) = self.commit_locked(&mut pages) {
-                // Commit failed — refund the permit and revert the page.
-                let mut page = entry.lock();
-                assert!(page.state == PageState::AcquiringPermit);
-                page.state = PageState::Clean;
-                let lru_index = page.lru_index;
-                drop(page);
-                // Re-link at the back (page wasn't used successfully).
-                pages.lru.push_back(lru_index);
-                drop(pages);
-                if let Some(ref state) = self.log_state {
-                    state.permits.release(1);
-                }
-                self.state_event.notify(usize::MAX);
+                self.revert_permit(&entry, &mut pages);
                 return Err(e);
             }
         }
@@ -725,34 +768,40 @@ impl<F: AsyncFile> PageCache<F> {
         })
     }
 
-    /// Finalize a failed permit acquisition: revert to Clean.
-    fn finalize_permit_failed(&self, entry: Arc<Mutex<PageData>>) {
+    /// Release a clean write permit: mark idle, release the permit,
+    /// decrement dirty_count, and notify waiters. The page must already
+    /// be in `Clean` state.
+    fn release_clean_permit(&self, lru_index: usize, pages: &mut PageMap) {
+        pages.dirty_count -= 1;
+        let key = pages.lru.nodes[lru_index].key;
+        if let Some(ce) = pages.map.get_mut(&key) {
+            ce.idle = true;
+        }
+        if let Some(ref state) = self.log_state {
+            state.permits.release(1);
+        }
+        self.state_event.notify(usize::MAX);
+    }
+
+    /// Revert a page from `AcquiringPermit` back to `Clean` and release
+    /// the permit. Used on permit acquisition failure and commit failure.
+    fn revert_permit(&self, entry: &Arc<Mutex<PageData>>, pages: &mut PageMap) {
         let mut page = entry.lock();
         assert!(page.state == PageState::AcquiringPermit);
         page.state = PageState::Clean;
         let lru_index = page.lru_index;
         drop(page);
-        // Re-link at the back (page wasn't used successfully).
-        let mut pages = self.pages.lock();
-        pages.lru.push_back(lru_index);
-        drop(pages);
-        self.state_event.notify(usize::MAX);
+        self.release_clean_permit(lru_index, pages);
     }
 
-    /// Set the pre-log FSN on a specific page.
-    pub fn set_pre_log_fsn(&self, key: PageKey, fsn: u64) {
-        let pages = self.pages.lock();
-        if let Some(entry) = pages.map.get(&key) {
-            let mut page = entry.page.lock();
-            page.pre_log_fsn = Some(match page.pre_log_fsn {
-                Some(existing) => existing.max(fsn),
-                None => fsn,
-            });
-        }
+    /// Finalize a failed permit acquisition: revert to Clean.
+    fn finalize_permit_failed(&self, entry: Arc<Mutex<PageData>>) {
+        let mut pages = self.pages.lock();
+        self.revert_permit(&entry, &mut pages);
     }
 
     /// Get the pre-log FSN for a specific page, if set.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn get_pre_log_fsn(&self, key: PageKey) -> Option<u64> {
         let pages = self.pages.lock();
         if let Some(entry) = pages.map.get(&key) {
@@ -760,29 +809,6 @@ impl<F: AsyncFile> PageCache<F> {
             page.pre_log_fsn
         } else {
             None
-        }
-    }
-
-    /// Hint that a page is cheap to regenerate and should be evicted
-    /// before other pages.
-    ///
-    /// For use after dropping a [`ReadPageGuard`]. For write guards,
-    /// use [`WritePageGuard::demote`] instead.
-    pub fn demote(&self, key: PageKey) {
-        let mut pages = self.pages.lock();
-        let idx = if let Some(entry) = pages.map.get(&key) {
-            if let Some(mut page) = entry.page.try_lock() {
-                page.demoted = true;
-                Some(page.lru_index)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(idx) = idx {
-            pages.lru.unlink(idx);
-            pages.lru.push_back(idx);
         }
     }
 
@@ -829,16 +855,18 @@ impl<F: AsyncFile> PageCache<F> {
         let txn = client.begin();
         let lsn = txn.lsn();
 
-        // Collect LRU re-link operations and committed keys to update
-        // after the iteration (can't mutate pages.map/lru while iterating).
-        let mut lru_front: Vec<usize> = Vec::new();
-        let mut lru_back: Vec<usize> = Vec::new();
-        let mut committed_keys: Vec<PageKey> = Vec::new();
+        // Destructure to get separate borrows on map, lru, and tag_offsets.
+        let PageMap {
+            ref mut map,
+            ref mut lru,
+            ref tag_offsets,
+            ..
+        } = *pages;
 
-        for (&key, entry) in pages.map.iter() {
+        for (&key, entry) in map.iter_mut() {
             let mut page = entry.page.lock();
             if matches!(page.state, PageState::Dirty) {
-                let file_offset = pages.tag_offsets[key.tag as usize] + key.offset;
+                let file_offset = tag_offsets[key.tag as usize] + key.offset;
                 let data = page.data.as_ref().expect("dirty page has no data").clone();
 
                 if let Some(fsn) = page.pre_log_fsn.take() {
@@ -847,29 +875,16 @@ impl<F: AsyncFile> PageCache<F> {
 
                 page.state = PageState::Clean;
 
-                // Collect LRU re-link for after the loop.
-                let idx = page.lru_index;
                 if page.demoted {
                     page.demoted = false;
-                    lru_back.push(idx);
-                } else {
-                    lru_front.push(idx);
+                    lru.move_to_back(page.lru_index);
                 }
 
-                committed_keys.push(key);
+                entry.committed_lsn = lsn;
+                entry.idle = true;
+
                 committed.push(CommittedPage { file_offset, data });
             }
-        }
-
-        // Apply deferred LRU re-links and committed_lsn updates.
-        for idx in lru_front {
-            pages.lru.push_front(idx);
-        }
-        for idx in lru_back {
-            pages.lru.push_back(idx);
-        }
-        for key in &committed_keys {
-            pages.map.get_mut(key).unwrap().committed_lsn = lsn;
         }
 
         if committed.is_empty() {
@@ -927,6 +942,15 @@ impl<F: AsyncFile> WritePageGuard<'_, F> {
         self.overwriting
     }
 
+    /// Set the pre-log flush sequence number on this page.
+    pub fn set_pre_log_fsn(&mut self, fsn: u64) {
+        let guard = self.guard.as_mut().expect("guard consumed");
+        guard.pre_log_fsn = Some(match guard.pre_log_fsn {
+            Some(existing) => existing.max(fsn),
+            None => fsn,
+        });
+    }
+
     /// Hint that this page is cheap to regenerate and should be evicted
     /// before other pages (e.g., BAT pages that can be rebuilt from
     /// in-memory state).
@@ -965,36 +989,14 @@ impl<F: AsyncFile> Drop for WritePageGuard<'_, F> {
     fn drop(&mut self) {
         if let Some(guard) = self.guard.take() {
             if guard.state != PageState::Dirty {
-                // Guard dropped without mutation. Refund the permit and
-                // decrement dirty_count. Re-link into the LRU.
-                //
-                // Note that there is a window where the dirty count is
-                // incremented, the locks are dropped, and the page is not
-                // marked dirty. This is basically harmless, but it does mean
-                // that we cannot assert that dirty_count is < MAX_COMMIT_PAGES
-                // in `finalize_permit` — we might briefly exceed the limit due
-                // to clean pages that haven't yet decremented the count.
-                //
-                // This is necessary because lock ordering constraints require
-                // the page map lock to be acquired before any individual page
-                // lock.
-                let demoted = guard.demoted;
+                // Guard dropped without mutation. Page is clean — release
+                // the permit and mark idle.
                 let lru_index = guard.lru_index;
                 drop(guard);
                 let mut pages = self.cache.pages.lock();
-                pages.dirty_count -= 1;
-                if demoted {
-                    pages.lru.push_back(lru_index);
-                } else {
-                    pages.lru.push_front(lru_index);
-                }
-                drop(pages);
-                if let Some(ref state) = self.cache.log_state {
-                    state.permits.release(1);
-                }
-                self.cache.state_event.notify(usize::MAX);
+                self.cache.release_clean_permit(lru_index, &mut pages);
             }
-            // If Dirty: permit consumed, page stays out of LRU.
+            // If Dirty: permit consumed, page stays not-idle.
             // Guard drops, releasing page lock.
         }
     }
@@ -1949,69 +1951,6 @@ mod tests {
         assert!(
             !pages.map.contains_key(&key_a),
             "A should have been evicted"
-        );
-        assert!(pages.map.contains_key(&key_b), "B should still be cached");
-        assert!(pages.map.contains_key(&key_c), "C should be cached");
-    }
-
-    #[async_test]
-    async fn demote_evicts_before_non_demoted() {
-        let file = InMemoryFile::new(PAGE_SIZE as u64 * 4);
-        for i in 0..4 {
-            file.write_at(i * PAGE_SIZE as u64, &[(i as u8) + 0xB0; PAGE_SIZE])
-                .await
-                .unwrap();
-        }
-
-        let (tx, _rx) = mesh::channel::<LogRequest>();
-        let permits = Arc::new(LogPermits::new(1000));
-        let applied = Arc::new(LsnWatermark::new());
-        let mut cache = PageCache::new(
-            Arc::new(file),
-            Some(LogClient::new(tx)),
-            Some(CacheLogState {
-                permits,
-                applied_lsn: applied.clone(),
-            }),
-            2,
-        );
-        cache.register_tag(0, 0);
-
-        let key_a = PageKey { tag: 0, offset: 0 };
-        let key_b = PageKey {
-            tag: 0,
-            offset: PAGE_SIZE as u64,
-        };
-        let key_c = PageKey {
-            tag: 0,
-            offset: 2 * PAGE_SIZE as u64,
-        };
-
-        // Load A, then B.
-        let g = cache.acquire_read(key_a).await.unwrap();
-        drop(g);
-
-        let g = cache.acquire_read(key_b).await.unwrap();
-        drop(g);
-
-        // LRU order: MRU=B, LRU=A.
-        // Now re-read A to promote it to MRU (so B becomes LRU).
-        let g = cache.acquire_read(key_a).await.unwrap();
-        drop(g);
-
-        // LRU order now: MRU=A, LRU=B.
-        // Demote A — it should move to LRU end.
-        cache.demote(key_a);
-
-        // Loading C should evict A (demoted) rather than B (older but not demoted).
-        let g = cache.acquire_read(key_c).await.unwrap();
-        assert_eq!(g[0], 0xB2);
-        drop(g);
-
-        let pages = cache.pages.lock();
-        assert!(
-            !pages.map.contains_key(&key_a),
-            "demoted A should have been evicted"
         );
         assert!(pages.map.contains_key(&key_b), "B should still be cached");
         assert!(pages.map.contains_key(&key_c), "C should be cached");

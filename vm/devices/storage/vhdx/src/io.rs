@@ -599,6 +599,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                             BlockType::SectorBitmap,
                                             chunk_number,
                                             new_sbm,
+                                            None,
                                         )
                                         .await?;
                                 }
@@ -624,6 +625,21 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 );
                             }
 
+                            // For non-TFP path: capture per-page FSN when
+                            // !is_safe. The FSN is captured now (before
+                            // the caller writes data), matching the C code's
+                            // FreeSpace.RequiredFsn timing. Passed into
+                            // write_block_mapping so it's set atomically
+                            // with the dirty-mark — no window for commit
+                            // to sweep the page without the FSN.
+                            let pre_log_fsn = if !space_state.is_safe() {
+                                self.log_state
+                                    .as_ref()
+                                    .map(|state| state.flush_sequencer.current_fsn())
+                            } else {
+                                None
+                            };
+
                             // Per-entry cache write (write-through to disk).
                             // LOCK AUDIT: bat_state write-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
                             self.bat
@@ -633,21 +649,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                                     BlockType::Payload,
                                     block_info.block_number,
                                     new_mapping,
+                                    pre_log_fsn,
                                 )
                                 .await?;
-
-                            // For non-TFP path: set per-page FSN when
-                            // !is_safe. The FSN is captured now (before
-                            // the caller writes data), matching the C code's
-                            // FreeSpace.RequiredFsn timing.
-                            if !space_state.is_safe() {
-                                if let Some(ref state) = self.log_state {
-                                    let fsn = state.flush_sequencer.current_fsn();
-                                    let page_key =
-                                        self.bat_page_key_for_block(block_info.block_number);
-                                    self.cache.set_pre_log_fsn(page_key, fsn);
-                                }
-                            }
 
                             // Emit zero + data + zero ranges.
                             // For PartiallyPresent blocks, skip zero-fill —
@@ -792,6 +796,19 @@ impl<F: AsyncFile> VhdxFile<F> {
                 // can still notify waiters.
                 // LOCK AUDIT: bat_state write-lock dropped (end of prior block). No sync locks held.
                 if bat_write_error.is_none() {
+                    // Capture FSN NOW (after caller's data writes,
+                    // matching C's Vhd2iDereferenceReadWrite →
+                    // Vhd2iGetCurrentFsn timing). Passed into
+                    // write_block_mapping so it's set atomically
+                    // with the dirty-mark.
+                    let pre_log_fsn = if needs_flush_before_log {
+                        self.log_state
+                            .as_ref()
+                            .map(|state| state.flush_sequencer.current_fsn())
+                    } else {
+                        None
+                    };
+
                     if let Err(e) = self
                         .bat
                         .write_block_mapping(
@@ -800,19 +817,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                             BlockType::Payload,
                             block_number,
                             final_mapping,
+                            pre_log_fsn,
                         )
                         .await
                     {
                         bat_write_error = Some(e);
-                    } else if needs_flush_before_log {
-                        // Capture FSN NOW (after caller's data writes,
-                        // matching C's Vhd2iDereferenceReadWrite →
-                        // Vhd2iGetCurrentFsn timing).
-                        if let Some(ref state) = self.log_state {
-                            let fsn = state.flush_sequencer.current_fsn();
-                            let page_key = self.bat_page_key_for_block(block_number);
-                            self.cache.set_pre_log_fsn(page_key, fsn);
-                        }
                     }
                 }
             } else if self.has_parent {

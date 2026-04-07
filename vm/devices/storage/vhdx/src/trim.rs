@@ -404,6 +404,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     BlockType::Payload,
                     block_number,
                     new_mapping,
+                    None,
                 )
                 .await?;
 

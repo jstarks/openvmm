@@ -105,8 +105,6 @@ struct PageData {
     /// If set, the log task must wait for this FSN to complete before
     /// including this page in a log entry.
     pre_log_fsn: Option<u64>,
-    /// The LSN of the most recent commit that included this page.
-    committed_lsn: Option<u64>,
     /// Index into `PageMap::lru`. Allocated on entry creation.
     lru_index: usize,
     /// Hint: this page is cheap to regenerate; evict before other pages.
@@ -236,9 +234,19 @@ impl LruList {
 /// Number of distinct cache tags (BAT=0, METADATA=1, SBM=2).
 const TAG_COUNT: usize = 3;
 
+/// Entry in the page map. Wraps the page data mutex with metadata
+/// that can be read under the map lock without taking the page lock.
+struct CacheEntry {
+    page: Arc<Mutex<PageData>>,
+    /// LSN of the most recent commit that included this page.
+    /// Set under the map lock in `commit_locked`, read under the map
+    /// lock in eviction — no page lock needed. 0 = never committed.
+    committed_lsn: u64,
+}
+
 /// Internal page map wrapping the `HashMap` and dirty page counter.
 struct PageMap {
-    map: HashMap<PageKey, Arc<Mutex<PageData>>>,
+    map: HashMap<PageKey, CacheEntry>,
     /// Number of pages with a consumed permit (Dirty, or Clean with
     /// an active `WritePageGuard` that hasn't called `DerefMut` yet).
     /// Maintained under the map lock to prevent races.
@@ -359,7 +367,7 @@ impl<F: AsyncFile> PageCache<F> {
         // Walk backward from the LRU tail. Pages in the LRU are idle
         // (writes unlink on acquire) or held by a reader (promoted to
         // MRU on acquire, so unreachable from the tail before we hit
-        // evictable pages). The page lock is therefore uncontended.
+        // evictable pages).
         let mut idx = pages.lru.tail();
         while self.quota > 0 && pages.map.len() > self.quota {
             if idx == 0 {
@@ -371,14 +379,12 @@ impl<F: AsyncFile> PageCache<F> {
                 idx = prev_idx;
                 continue;
             }
-            let evictable = {
-                let entry = pages.map.get(&key).expect("LRU key missing from map");
-                let page = entry.lock();
-                page.state == PageState::Clean
-                    && page.data.is_some()
-                    && page.committed_lsn.is_none_or(|lsn| lsn <= applied)
-            };
-            if evictable {
+            let entry = pages.map.get(&key).expect("LRU key missing from map");
+            if entry.committed_lsn <= applied {
+                // Lock the page to ensure no outstanding guard holds it.
+                // This should be uncontended — readers are at the MRU end.
+                let _page = entry.page.lock();
+                drop(_page);
                 pages.map.remove(&key);
                 pages.lru.dealloc(idx);
                 idx = pages.lru.tail();
@@ -428,20 +434,23 @@ impl<F: AsyncFile> PageCache<F> {
         // Pre-allocate an LRU slot. Freed below if the entry already exists.
         let lru_index = pages.lru.alloc(key);
         let mut inserted = false;
-        let entry = pages
+        let page = pages
             .map
             .entry(key)
             .or_insert_with(|| {
                 inserted = true;
-                Arc::new(Mutex::new(PageData {
-                    data: None,
-                    state: PageState::Clean,
-                    pre_log_fsn: None,
-                    committed_lsn: None,
-                    lru_index,
-                    demoted: false,
-                }))
+                CacheEntry {
+                    page: Arc::new(Mutex::new(PageData {
+                        data: None,
+                        state: PageState::Clean,
+                        pre_log_fsn: None,
+                        lru_index,
+                        demoted: false,
+                    })),
+                    committed_lsn: 0,
+                }
             })
+            .page
             .clone();
 
         if !inserted {
@@ -450,7 +459,7 @@ impl<F: AsyncFile> PageCache<F> {
             self.try_evict_under_lock(&mut pages, Some(key));
         }
 
-        let mut guard = Mutex::lock_arc(&entry);
+        let mut guard = Mutex::lock_arc(&page);
 
         match guard.state {
             PageState::Loading | PageState::AcquiringPermit => {
@@ -586,20 +595,23 @@ impl<F: AsyncFile> PageCache<F> {
         // Pre-allocate an LRU slot. Freed below if the entry already exists.
         let lru_index = pages.lru.alloc(key);
         let mut inserted = false;
-        let entry = pages
+        let page = pages
             .map
             .entry(key)
             .or_insert_with(|| {
                 inserted = true;
-                Arc::new(Mutex::new(PageData {
-                    data: None,
-                    state: PageState::Clean,
-                    pre_log_fsn: None,
-                    committed_lsn: None,
-                    lru_index,
-                    demoted: false,
-                }))
+                CacheEntry {
+                    page: Arc::new(Mutex::new(PageData {
+                        data: None,
+                        state: PageState::Clean,
+                        pre_log_fsn: None,
+                        lru_index,
+                        demoted: false,
+                    })),
+                    committed_lsn: 0,
+                }
             })
+            .page
             .clone();
 
         if !inserted {
@@ -608,7 +620,7 @@ impl<F: AsyncFile> PageCache<F> {
             self.try_evict_under_lock(&mut pages, Some(key));
         }
 
-        let mut guard = Mutex::lock_arc(&entry);
+        let mut guard = Mutex::lock_arc(&page);
 
         match guard.state {
             PageState::Loading | PageState::AcquiringPermit => {
@@ -731,7 +743,7 @@ impl<F: AsyncFile> PageCache<F> {
     pub fn set_pre_log_fsn(&self, key: PageKey, fsn: u64) {
         let pages = self.pages.lock();
         if let Some(entry) = pages.map.get(&key) {
-            let mut page = entry.lock();
+            let mut page = entry.page.lock();
             page.pre_log_fsn = Some(match page.pre_log_fsn {
                 Some(existing) => existing.max(fsn),
                 None => fsn,
@@ -744,7 +756,7 @@ impl<F: AsyncFile> PageCache<F> {
     pub fn get_pre_log_fsn(&self, key: PageKey) -> Option<u64> {
         let pages = self.pages.lock();
         if let Some(entry) = pages.map.get(&key) {
-            let page = entry.lock();
+            let page = entry.page.lock();
             page.pre_log_fsn
         } else {
             None
@@ -759,7 +771,7 @@ impl<F: AsyncFile> PageCache<F> {
     pub fn demote(&self, key: PageKey) {
         let mut pages = self.pages.lock();
         let idx = if let Some(entry) = pages.map.get(&key) {
-            if let Some(mut page) = entry.try_lock() {
+            if let Some(mut page) = entry.page.try_lock() {
                 page.demoted = true;
                 Some(page.lru_index)
             } else {
@@ -817,13 +829,14 @@ impl<F: AsyncFile> PageCache<F> {
         let txn = client.begin();
         let lsn = txn.lsn();
 
-        // Collect LRU re-link operations to perform after the iteration
-        // (can't mutate pages.lru while iterating pages.map).
+        // Collect LRU re-link operations and committed keys to update
+        // after the iteration (can't mutate pages.map/lru while iterating).
         let mut lru_front: Vec<usize> = Vec::new();
         let mut lru_back: Vec<usize> = Vec::new();
+        let mut committed_keys: Vec<PageKey> = Vec::new();
 
         for (&key, entry) in pages.map.iter() {
-            let mut page = entry.lock();
+            let mut page = entry.page.lock();
             if matches!(page.state, PageState::Dirty) {
                 let file_offset = pages.tag_offsets[key.tag as usize] + key.offset;
                 let data = page.data.as_ref().expect("dirty page has no data").clone();
@@ -833,7 +846,6 @@ impl<F: AsyncFile> PageCache<F> {
                 }
 
                 page.state = PageState::Clean;
-                page.committed_lsn = Some(lsn);
 
                 // Collect LRU re-link for after the loop.
                 let idx = page.lru_index;
@@ -844,16 +856,20 @@ impl<F: AsyncFile> PageCache<F> {
                     lru_front.push(idx);
                 }
 
+                committed_keys.push(key);
                 committed.push(CommittedPage { file_offset, data });
             }
         }
 
-        // Apply deferred LRU re-links.
+        // Apply deferred LRU re-links and committed_lsn updates.
         for idx in lru_front {
             pages.lru.push_front(idx);
         }
         for idx in lru_back {
             pages.lru.push_back(idx);
+        }
+        for key in &committed_keys {
+            pages.map.get_mut(key).unwrap().committed_lsn = lsn;
         }
 
         if committed.is_empty() {
@@ -1411,8 +1427,7 @@ mod tests {
 
         let pages = cache.pages.lock();
         let entry = pages.map.get(&key).unwrap();
-        let page = entry.lock();
-        assert_eq!(page.committed_lsn, Some(lsn));
+        assert_eq!(entry.committed_lsn, lsn);
     }
 
     async fn dirty_pages<F: AsyncFile>(cache: &PageCache<F>, count: usize) {

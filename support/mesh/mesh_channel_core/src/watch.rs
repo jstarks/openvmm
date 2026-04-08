@@ -87,17 +87,12 @@ impl ErasedValue {
 
 struct WatchVtable {
     drop_value: unsafe fn(ErasedValue),
-    #[expect(dead_code)] // will be used when sender encoding snapshots values
+    #[expect(dead_code)] // used by sender encoding
     clone_value: unsafe fn(&ErasedValue) -> ErasedValue,
-    /// Clones the value and wraps it in an `EncodedUpdate<T>` message.
-    /// Callers choose how to send: `control.respond()`, `pwh.send()`,
-    /// `port.send()`, etc.
-    make_update_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
-    decode_update: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
 }
 
 impl WatchVtable {
-    const fn new<T: 'static + MeshField + Send + Clone>() -> Self {
+    const fn new<T: 'static + Send + Clone>() -> Self {
         /// # Safety
         /// `v` must contain a value of type `T`.
         unsafe fn drop_value<T>(v: ErasedValue) {
@@ -110,33 +105,37 @@ impl WatchVtable {
             // SAFETY: guaranteed by caller.
             ErasedValue::new(unsafe { v.as_ref::<T>() }.clone())
         }
-        /// # Safety
-        /// `v` must contain a value of type `T`.
-        unsafe fn make_update_msg<T: 'static + MeshField + Send + Clone>(
-            v: &ErasedValue,
-            version: u64,
-        ) -> Message<'static> {
-            Message::new(EncodedUpdate::<T> {
-                version,
-                // SAFETY: guaranteed by caller.
-                value: unsafe { v.as_ref::<T>() }.clone(),
-            })
-        }
-        /// # Safety
-        /// The message must have been encoded as `EncodedUpdate<T>`.
-        unsafe fn decode_update<T: 'static + MeshField>(
-            message: Message<'_>,
-        ) -> Result<(u64, ErasedValue), ChannelError> {
-            let u: EncodedUpdate<T> = message.parse().map_err(ChannelError::from)?;
-            Ok((u.version, ErasedValue::new(u.value)))
-        }
         Self {
             drop_value: drop_value::<T>,
             clone_value: clone_value::<T>,
-            make_update_msg: make_update_msg::<T>,
-            decode_update: decode_update::<T>,
         }
     }
+}
+
+/// Clones a type-erased value and wraps it in an `EncodedUpdate<T>` message.
+///
+/// # Safety
+/// The `ErasedValue` must contain a value of type `T`.
+unsafe fn make_update_msg<T: 'static + MeshField + Send + Clone>(
+    v: &ErasedValue,
+    version: u64,
+) -> Message<'static> {
+    Message::new(EncodedUpdate::<T> {
+        version,
+        // SAFETY: guaranteed by caller.
+        value: unsafe { v.as_ref::<T>() }.clone(),
+    })
+}
+
+/// Decodes an `EncodedUpdate<T>` from a message.
+///
+/// # Safety
+/// The message must have been encoded as `EncodedUpdate<T>`.
+unsafe fn decode_update_msg<T: 'static + MeshField>(
+    message: Message<'_>,
+) -> Result<(u64, ErasedValue), ChannelError> {
+    let u: EncodedUpdate<T> = message.parse().map_err(ChannelError::from)?;
+    Ok((u.version, ErasedValue::new(u.value)))
 }
 
 // ---- Wire protocol -------------------------------------------------------
@@ -173,7 +172,12 @@ struct WatchCore {
 /// How a `WatchCore` routes subscribe requests for new remote subscribers.
 enum SubscribeState {
     /// Sender-side: pending queue for subscriber registrations.
-    Local(Vec<(u64, Port)>),
+    /// The `make_msg` fn is set at encoding boundaries where `MeshField`
+    /// is available; `None` if no receiver has been encoded yet.
+    Local {
+        pending: Vec<(u64, Port)>,
+        make_msg: Option<unsafe fn(&ErasedValue, u64) -> Message<'static>>,
+    },
     /// Receiver-side: upstream port for forwarding subscribe requests.
     Upstream(PortWithHandler<WatchPortHandler>),
 }
@@ -210,6 +214,9 @@ struct SubHandler {
     pending_ack: bool,
     sent_version: u64,
     pending_subscribes: Vec<(u64, Port)>,
+    /// Type-erased fn to build an update message from the current value.
+    /// Captured at encoding boundaries where `MeshField` is available.
+    make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
 }
 
 impl HandlePortEvent for SubHandler {
@@ -224,9 +231,8 @@ impl HandlePortEvent for SubHandler {
                 self.pending_ack = false;
                 let state = self.core.state.read();
                 if self.sent_version < state.version {
-                    // SAFETY: vtable matches the type.
-                    let msg =
-                        unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                    // SAFETY: make_msg matches the type.
+                    let msg = unsafe { (self.make_msg)(&state.value, state.version) };
                     control.respond(msg);
                     self.pending_ack = true;
                     self.sent_version = state.version;
@@ -238,9 +244,8 @@ impl HandlePortEvent for SubHandler {
                 // and the subscriber would be stuck with stale data.
                 let state = self.core.state.read();
                 let effective_version = if version < state.version {
-                    // SAFETY: vtable matches the type.
-                    let msg =
-                        unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                    // SAFETY: make_msg matches the type.
+                    let msg = unsafe { (self.make_msg)(&state.value, state.version) };
                     port.send(msg);
                     state.version
                 } else {
@@ -385,10 +390,16 @@ impl WatchSenderCore {
 
         // Drain pending subscribes from each SubHandler.
         let mut new_subs: Vec<(u64, Port)> = Vec::new();
+        let mut make_msg = None;
         for sub in &self.subscribers {
-            sub.with_handler(|h| new_subs.append(&mut h.pending_subscribes));
+            sub.with_handler(|h| {
+                new_subs.append(&mut h.pending_subscribes);
+                make_msg = Some(h.make_msg);
+            });
         }
-        self.register_subscribers(new_subs, version);
+        if let (Some(make_msg), false) = (make_msg, new_subs.is_empty()) {
+            self.register_subscribers(new_subs, version, make_msg);
+        }
 
         // Send update to non-pending subscribers.
         //
@@ -402,16 +413,16 @@ impl WatchSenderCore {
             if sub.is_closed().unwrap_or(true) {
                 return false;
             }
-            let should_send = sub.with_handler(|handler| {
+            let make_msg = sub.with_handler(|handler| {
                 if !handler.pending_ack {
                     handler.pending_ack = true;
                     handler.sent_version = version;
-                    true
+                    Some(handler.make_msg)
                 } else {
-                    false
+                    None
                 }
             });
-            if should_send {
+            if let Some(make_msg) = make_msg {
                 // N.B. state(R) is held while send synchronously delivers
                 // to the peer's WatchPortHandler, which acquires *its own*
                 // core's state(W). This is safe because SubHandler and
@@ -419,9 +430,8 @@ impl WatchSenderCore {
                 // instances (created on opposite sides of the port encoding
                 // boundary), so there is no same-lock contention.
                 let state = self.core.state.read();
-                // SAFETY: vtable matches the type.
-                let msg =
-                    unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                // SAFETY: make_msg matches the type (set at encoding boundary).
+                let msg = unsafe { make_msg(&state.value, state.version) };
                 sub.send(msg);
             }
             true
@@ -437,23 +447,31 @@ impl WatchSenderCore {
     }
 
     fn drain_pending_subscribes(&mut self, current_version: u64) {
-        let subs = {
+        let (subs, make_msg) = {
             let mut subscribe = self.core.subscribe.lock();
             match &mut *subscribe {
-                SubscribeState::Local(vec) => mem::take(vec),
-                SubscribeState::Upstream(_) => Vec::new(),
+                SubscribeState::Local { pending, make_msg } => (mem::take(pending), *make_msg),
+                SubscribeState::Upstream(_) => (Vec::new(), None),
             }
         };
-        self.register_subscribers(subs, current_version);
+        if let (Some(make_msg), false) = (make_msg, subs.is_empty()) {
+            self.register_subscribers(subs, current_version, make_msg);
+        }
     }
 
-    fn register_subscribers(&mut self, subs: Vec<(u64, Port)>, current_version: u64) {
+    fn register_subscribers(
+        &mut self,
+        subs: Vec<(u64, Port)>,
+        current_version: u64,
+        make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+    ) {
         for (ver, port) in subs {
             let handler = SubHandler {
                 core: self.core.clone(),
                 pending_ack: false,
                 sent_version: ver,
                 pending_subscribes: Vec::new(),
+                make_msg,
             };
             let sub = port.set_handler(handler);
             if ver < current_version {
@@ -463,9 +481,8 @@ impl WatchSenderCore {
                 });
                 // Same cross-core safety argument as in send() above.
                 let state = self.core.state.read();
-                // SAFETY: vtable matches the type.
-                let msg =
-                    unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                // SAFETY: make_msg matches the type.
+                let msg = unsafe { make_msg(&state.value, state.version) };
                 sub.send(msg);
             }
             self.subscribers.push(sub);
@@ -642,7 +659,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchSender<T>> for Port
         let mut pending: Vec<(u64, Port)> = {
             let mut subscribe = core.subscribe.lock();
             match &mut *subscribe {
-                SubscribeState::Local(vec) => mem::take(vec),
+                SubscribeState::Local { pending, .. } => mem::take(pending),
                 SubscribeState::Upstream(_) => Vec::new(),
             }
         };
@@ -661,7 +678,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchSender<T>> for Port
             let (left, right) = Port::new_pair();
             let handler = WatchPortHandler {
                 core: Arc::downgrade(&core),
-                decode: core.vtable.decode_update,
+                decode: decode_update_msg::<T>,
             };
             let pwh = right.set_handler(handler);
             *core.subscribe.lock() = SubscribeState::Upstream(pwh);
@@ -705,7 +722,10 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<Port> for WatchSender<T>
             }),
             waiters: Mutex::new(Vec::new()),
             vtable,
-            subscribe: Mutex::new(SubscribeState::Local(Vec::new())),
+            subscribe: Mutex::new(SubscribeState::Local {
+                pending: Vec::new(),
+                make_msg: Some(make_update_msg::<T>),
+            }),
         });
 
         let subscribers: Vec<PortWithHandler<SubHandler>> = encoded
@@ -717,6 +737,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<Port> for WatchSender<T>
                     pending_ack: false,
                     sent_version: encoded.version,
                     pending_subscribes: Vec::new(),
+                    make_msg: make_update_msg::<T>,
                 })
             })
             .collect();
@@ -752,8 +773,9 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchReceiver<T>> for Po
         {
             let mut subscribe = core.subscribe.lock();
             match &mut *subscribe {
-                SubscribeState::Local(vec) => {
-                    vec.push((receiver.0.last_seen, sub_right));
+                SubscribeState::Local { pending, make_msg } => {
+                    *make_msg = Some(make_update_msg::<T>);
+                    pending.push((receiver.0.last_seen, sub_right));
                 }
                 SubscribeState::Upstream(pwh) => {
                     // N.B. subscribe(M) is held here while pwh.send()
@@ -814,12 +836,15 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<Port> for WatchReceiver<
             waiters: Mutex::new(Vec::new()),
             vtable,
             // Placeholder — replaced below with Upstream.
-            subscribe: Mutex::new(SubscribeState::Local(Vec::new())),
+            subscribe: Mutex::new(SubscribeState::Local {
+                pending: Vec::new(),
+                make_msg: None,
+            }),
         });
 
         let handler = WatchPortHandler {
             core: Arc::downgrade(&core),
-            decode: vtable.decode_update,
+            decode: decode_update_msg::<T>,
         };
         let upstream_pwh = encoded.port.set_handler(handler);
         *core.subscribe.lock() = SubscribeState::Upstream(upstream_pwh);
@@ -869,9 +894,7 @@ impl HandlePortEvent for OneshotRecvHandler {
 ///
 /// Returns the sender and an initial receiver. Additional receivers can
 /// be created via [`WatchSender::subscribe`].
-pub fn watch<T: 'static + Send + Sync + Clone + MeshField>(
-    initial: T,
-) -> (WatchSender<T>, WatchReceiver<T>) {
+pub fn watch<T: 'static + Send + Sync + Clone>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
     let vtable: &'static WatchVtable = const { &WatchVtable::new::<T>() };
     let core = Arc::new(WatchCore {
         state: RwLock::new(WatchState {
@@ -881,7 +904,10 @@ pub fn watch<T: 'static + Send + Sync + Clone + MeshField>(
         }),
         waiters: Mutex::new(Vec::new()),
         vtable,
-        subscribe: Mutex::new(SubscribeState::Local(Vec::new())),
+        subscribe: Mutex::new(SubscribeState::Local {
+            pending: Vec::new(),
+            make_msg: None,
+        }),
     });
 
     let sender = WatchSenderCore {

@@ -43,6 +43,7 @@ use std::mem;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -94,6 +95,10 @@ struct WatchVtable {
     /// `with_port_and_handler` holds the port lock during event processing —
     /// `Port::send()` releases the lock before processing events.
     send_update: unsafe fn(&ErasedValue, u64, &PortWithHandler<SubHandler>),
+    /// Sends an update to a raw `Port` (not a `PortWithHandler`). Used by
+    /// `SubHandler` to eagerly send the current value to a newly-subscribed
+    /// port before it's been registered as a proper subscriber.
+    send_to_port: unsafe fn(&ErasedValue, u64, &Port),
     decode_update: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
 }
 
@@ -138,6 +143,19 @@ impl WatchVtable {
             }));
         }
         /// # Safety
+        /// `v` must contain a value of type `T`.
+        unsafe fn send_to_port<T: 'static + MeshField + Send + Clone>(
+            v: &ErasedValue,
+            version: u64,
+            port: &Port,
+        ) {
+            port.send(Message::new(EncodedUpdate::<T> {
+                version,
+                // SAFETY: guaranteed by caller.
+                value: unsafe { v.as_ref::<T>() }.clone(),
+            }));
+        }
+        /// # Safety
         /// The message must have been encoded as `EncodedUpdate<T>`.
         unsafe fn decode_update<T: 'static + MeshField>(
             message: Message<'_>,
@@ -150,6 +168,7 @@ impl WatchVtable {
             clone_value: clone_value::<T>,
             encode_and_respond: encode_and_respond::<T>,
             send_update: send_update::<T>,
+            send_to_port: send_to_port::<T>,
             decode_update: decode_update::<T>,
         }
     }
@@ -177,8 +196,21 @@ struct WatchCore {
     state: RwLock<WatchState>,
     waiters: Mutex<Vec<Waker>>,
     vtable: &'static WatchVtable,
-    /// Pending subscriber registrations from receiver encoding.
-    pending_subscribes: Mutex<Vec<(u64, Port)>>,
+    /// How to register new remote subscribers.
+    ///
+    /// - Sender-side core (`Local`): pending queue drained by the sender
+    ///   during `send()`.
+    /// - Receiver-side core (`Upstream`): forwards subscribe requests
+    ///   through the upstream port to the sender.
+    subscribe: Mutex<SubscribeState>,
+}
+
+/// How a `WatchCore` routes subscribe requests for new remote subscribers.
+enum SubscribeState {
+    /// Sender-side: pending queue for subscriber registrations.
+    Local(Vec<(u64, Port)>),
+    /// Receiver-side: upstream port for forwarding subscribe requests.
+    Upstream(PortWithHandler<WatchPortHandler>),
 }
 
 struct WatchState {
@@ -236,6 +268,17 @@ impl HandlePortEvent for SubHandler {
                 }
             }
             ReceiverMessage::Subscribe(version, port) => {
+                // Eagerly send the current value if the subscriber is behind.
+                // This is necessary because `send()` may never be called again,
+                // and the subscriber would be stuck with stale data.
+                let state = self.core.state.read();
+                if version < state.version {
+                    // SAFETY: vtable matches the type.
+                    unsafe {
+                        (self.core.vtable.send_to_port)(&state.value, state.version, &port);
+                    }
+                }
+                drop(state);
                 self.pending_subscribes.push((version, port));
             }
         }
@@ -252,7 +295,7 @@ impl HandlePortEvent for SubHandler {
 // ---- WatchPortHandler (receiver side, upstream) --------------------------
 
 struct WatchPortHandler {
-    core: Arc<WatchCore>,
+    core: Weak<WatchCore>,
     decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
 }
 
@@ -262,22 +305,24 @@ impl HandlePortEvent for WatchPortHandler {
         control: &mut PortControl<'_, '_>,
         message: Message<'_>,
     ) -> Result<(), HandleMessageError> {
+        let core = self
+            .core
+            .upgrade()
+            .ok_or_else(|| HandleMessageError::new("watch core dropped"))?;
         let (version, value) =
-        // SAFETY: decode matches the type used to encode.
+            // SAFETY: decode matches the type used to encode.
             unsafe { (self.decode)(message) }.map_err(HandleMessageError::new)?;
-        let mut state = self.core.state.write();
+        let mut state = core.state.write();
         if version > state.version {
             let old = mem::replace(&mut state.value, value);
             state.version = version;
             drop(state);
             control.respond(Message::new(ReceiverMessage::Ack(version)));
-            let mut waiters = self.core.waiters.lock();
-            for waker in waiters.drain(..) {
+            for waker in core.waiters.lock().drain(..) {
                 control.wake(waker);
             }
             // SAFETY: vtable matches the type.
-            // SAFETY: vtable matches the type.
-            unsafe { (self.core.vtable.drop_value)(old) };
+            unsafe { (core.vtable.drop_value)(old) };
         } else {
             drop(state);
             control.respond(Message::new(ReceiverMessage::Ack(version)));
@@ -286,10 +331,11 @@ impl HandlePortEvent for WatchPortHandler {
     }
 
     fn close(&mut self, control: &mut PortControl<'_, '_>) {
-        {
-            self.core.state.write().closed = true;
-        }
-        for waker in self.core.waiters.lock().drain(..) {
+        let Some(core) = self.core.upgrade() else {
+            return;
+        };
+        core.state.write().closed = true;
+        for waker in core.waiters.lock().drain(..) {
             control.wake(waker);
         }
     }
@@ -415,7 +461,13 @@ impl WatchSenderCore {
     }
 
     fn drain_pending_subscribes(&mut self, current_version: u64) {
-        let subs: Vec<_> = self.core.pending_subscribes.lock().drain(..).collect();
+        let subs = {
+            let mut subscribe = self.core.subscribe.lock();
+            match &mut *subscribe {
+                SubscribeState::Local(vec) => mem::take(vec),
+                SubscribeState::Upstream(_) => Vec::new(),
+            }
+        };
         self.register_subscribers(subs, current_version);
     }
 
@@ -609,20 +661,33 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchSender<T>> for Port
             value = unsafe { state.value.as_ref::<T>() }.clone();
         }
 
+        // Drain pending subscribes from the core and SubHandlers.
+        let mut pending: Vec<(u64, Port)> = {
+            let mut subscribe = core.subscribe.lock();
+            match &mut *subscribe {
+                SubscribeState::Local(vec) => mem::take(vec),
+                SubscribeState::Upstream(_) => Vec::new(),
+            }
+        };
+        for sub in &subscribers {
+            sub.with_handler(|h| pending.append(&mut h.pending_subscribes));
+        }
+
         let mut ports: Vec<Port> = subscribers
             .into_iter()
             .map(|sub| sub.remove_handler().0)
             .collect();
+        ports.extend(pending.into_iter().map(|(_, port)| port));
 
         // If local receivers exist, create a port so they keep getting updates.
         if Arc::strong_count(&core) > 1 {
             let (left, right) = Port::new_pair();
             let handler = WatchPortHandler {
-                core: core.clone(),
+                core: Arc::downgrade(&core),
                 decode: core.vtable.decode_update,
             };
-            let _pwh = right.set_handler(handler);
-            mem::forget(_pwh); // keep alive via Arc cycle
+            let pwh = right.set_handler(handler);
+            *core.subscribe.lock() = SubscribeState::Upstream(pwh);
             ports.push(left);
         }
 
@@ -663,7 +728,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<Port> for WatchSender<T>
             }),
             waiters: Mutex::new(Vec::new()),
             vtable,
-            pending_subscribes: Mutex::new(Vec::new()),
+            subscribe: Mutex::new(SubscribeState::Local(Vec::new())),
         });
 
         let subscribers: Vec<PortWithHandler<SubHandler>> = encoded
@@ -705,9 +770,22 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchReceiver<T>> for Po
         let (sub_left, sub_right) = Port::new_pair();
 
         // Register the right port with the sender for updates.
-        core.pending_subscribes
-            .lock()
-            .push((receiver.0.last_seen, sub_right));
+        // - Sender-side core (Local): push to the pending queue.
+        // - Receiver-side core (Upstream): forward through the upstream port.
+        {
+            let mut subscribe = core.subscribe.lock();
+            match &mut *subscribe {
+                SubscribeState::Local(vec) => {
+                    vec.push((receiver.0.last_seen, sub_right));
+                }
+                SubscribeState::Upstream(pwh) => {
+                    pwh.send(Message::new(ReceiverMessage::Subscribe(
+                        receiver.0.last_seen,
+                        sub_right,
+                    )));
+                }
+            }
+        }
 
         let version;
         let value: T;
@@ -742,6 +820,10 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<Port> for WatchReceiver<
         let _ = pwh.remove_handler();
 
         let vtable: &'static WatchVtable = const { &WatchVtable::new::<T>() };
+
+        // Create the core first, then install the upstream port handler.
+        // We use Weak in the handler to avoid a reference cycle
+        // (WatchCore → subscribe → PWH → handler → Arc<WatchCore>).
         let core = Arc::new(WatchCore {
             state: RwLock::new(WatchState {
                 version: encoded.version,
@@ -750,18 +832,16 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<Port> for WatchReceiver<
             }),
             waiters: Mutex::new(Vec::new()),
             vtable,
-            pending_subscribes: Mutex::new(Vec::new()),
+            // Placeholder — replaced below with Upstream.
+            subscribe: Mutex::new(SubscribeState::Local(Vec::new())),
         });
 
-        // Install the upstream port handler.
         let handler = WatchPortHandler {
-            core: core.clone(),
+            core: Arc::downgrade(&core),
             decode: vtable.decode_update,
         };
-        let _pwh = encoded.port.set_handler(handler);
-        // Leak to keep the port handler alive. The Arc cycle ensures
-        // cleanup when the upstream port closes.
-        mem::forget(_pwh);
+        let upstream_pwh = encoded.port.set_handler(handler);
+        *core.subscribe.lock() = SubscribeState::Upstream(upstream_pwh);
 
         WatchReceiver(
             WatchReceiverCore {
@@ -820,7 +900,7 @@ pub fn watch<T: 'static + Send + Sync + Clone + MeshField>(
         }),
         waiters: Mutex::new(Vec::new()),
         vtable,
-        pending_subscribes: Mutex::new(Vec::new()),
+        subscribe: Mutex::new(SubscribeState::Local(Vec::new())),
     });
 
     let sender = WatchSenderCore {
@@ -978,12 +1058,70 @@ mod tests {
         });
     }
 
-    // TODO: "both sides remote" requires the SubscribeRequest forwarding
-    // mechanism (subscribe_remote callback) so that a receiver encoded from
-    // the old core can route its subscription through the upstream port to
-    // the new sender. This is tracked in the plan under "Remote receiver
-    // clone (SubscribeRequest)".
-    //
-    // #[test]
-    // fn test_both_sides_remote() { ... }
+    #[test]
+    fn test_both_sides_remote() {
+        block_on(async {
+            let (sender, receiver) = watch(5u32);
+            let mut sender = WatchSender::<u32>::from(Port::from(sender));
+            let mut receiver = WatchReceiver::<u32>::from(Port::from(receiver));
+            assert_eq!(*sender.borrow(), 5);
+            assert_eq!(*receiver.borrow(), 5);
+            sender.send(10);
+            receiver.changed().await.unwrap();
+            assert_eq!(*receiver.borrow(), 10);
+        });
+    }
+
+    #[test]
+    fn test_cloned_receiver_goes_remote() {
+        block_on(async {
+            let (mut sender, _r0) = watch(0u32);
+            let r1 = sender.subscribe();
+            // Clone r1, then send the clone through a port round-trip.
+            // This triggers SubscribeRequest through the local pending queue
+            // since both share the sender-side core.
+            let mut r2 = WatchReceiver::<u32>::from(Port::from(r1.clone()));
+            sender.send(7);
+            assert_eq!(*r1.borrow(), 7);
+            r2.changed().await.unwrap();
+            assert_eq!(*r2.borrow(), 7);
+        });
+    }
+
+    #[test]
+    fn test_sender_moves_local_receivers_survive() {
+        block_on(async {
+            let (sender, mut receiver) = watch(0u32);
+            // Move sender to a "remote" process. The local receiver should
+            // get a WatchPortHandler installed on its core.
+            let mut sender = WatchSender::<u32>::from(Port::from(sender));
+            sender.send(42);
+            receiver.changed().await.unwrap();
+            assert_eq!(*receiver.borrow(), 42);
+        });
+    }
+
+    #[test]
+    fn test_subscribe_after_send_no_more_sends() {
+        // Verify that a cloned remote receiver gets the correct current
+        // value, and that sender close propagates even when the subscriber
+        // port is still in SubHandler's pending_subscribes.
+        block_on(async {
+            let (mut sender, receiver) = watch(0u32);
+            // Make receiver remote so it has an upstream port.
+            let receiver = WatchReceiver::<u32>::from(Port::from(receiver));
+            // Send version 1.
+            sender.send(1);
+            // Clone the remote receiver and send the clone through a port
+            // round-trip. This sends a SubscribeRequest to the SubHandler,
+            // which eagerly sends the current value.
+            let mut r2 = WatchReceiver::<u32>::from(Port::from(receiver.clone()));
+            // r2 should have the current value even though we never send again.
+            assert_eq!(r2.get(), 1);
+            // Dropping the sender should close r2 as well.
+            drop(sender);
+            let result = r2.changed().await;
+            assert!(result.is_err());
+        });
+    }
 }

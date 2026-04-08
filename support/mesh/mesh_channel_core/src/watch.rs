@@ -272,14 +272,19 @@ impl HandlePortEvent for SubHandler {
                 // This is necessary because `send()` may never be called again,
                 // and the subscriber would be stuck with stale data.
                 let state = self.core.state.read();
-                if version < state.version {
+                let effective_version = if version < state.version {
                     // SAFETY: vtable matches the type.
                     unsafe {
                         (self.core.vtable.send_to_port)(&state.value, state.version, &port);
                     }
-                }
+                    state.version
+                } else {
+                    version
+                };
                 drop(state);
-                self.pending_subscribes.push((version, port));
+                // Store the effective version so that register_subscribers()
+                // won't redundantly re-send the same value.
+                self.pending_subscribes.push((effective_version, port));
             }
         }
         Ok(())
@@ -442,6 +447,12 @@ impl WatchSenderCore {
                 }
             });
             if should_send {
+                // N.B. state(R) is held while send_update synchronously delivers
+                // to the peer's WatchPortHandler, which acquires *its own*
+                // core's state(W). This is safe because SubHandler and
+                // WatchPortHandler always belong to different WatchCore
+                // instances (created on opposite sides of the port encoding
+                // boundary), so there is no same-lock contention.
                 let state = self.core.state.read();
                 // SAFETY: vtable matches the type.
                 unsafe {
@@ -485,6 +496,7 @@ impl WatchSenderCore {
                     handler.pending_ack = true;
                     handler.sent_version = current_version;
                 });
+                // Same cross-core safety argument as in send() above.
                 let state = self.core.state.read();
                 // SAFETY: vtable matches the type.
                 unsafe {
@@ -779,6 +791,10 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchReceiver<T>> for Po
                     vec.push((receiver.0.last_seen, sub_right));
                 }
                 SubscribeState::Upstream(pwh) => {
+                    // N.B. subscribe(M) is held here while pwh.send()
+                    // synchronously delivers to the sender's SubHandler.
+                    // This is safe because SubHandler only touches the
+                    // *sender's* core (different lock instances).
                     pwh.send(Message::new(ReceiverMessage::Subscribe(
                         receiver.0.last_seen,
                         sub_right,

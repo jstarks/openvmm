@@ -87,18 +87,12 @@ impl ErasedValue {
 
 struct WatchVtable {
     drop_value: unsafe fn(ErasedValue),
-    #[allow(dead_code)] // used by sender encoding (future)
+    #[expect(dead_code)] // will be used when sender encoding snapshots values
     clone_value: unsafe fn(&ErasedValue) -> ErasedValue,
-    encode_and_respond: unsafe fn(&ErasedValue, u64, &mut PortControl<'_, '_>),
-    /// Like `encode_and_respond`, but sends via `PortWithHandler::send()` instead
-    /// of `PortControl::respond()`. This avoids the deadlock that occurs when
-    /// `with_port_and_handler` holds the port lock during event processing —
-    /// `Port::send()` releases the lock before processing events.
-    send_update: unsafe fn(&ErasedValue, u64, &PortWithHandler<SubHandler>),
-    /// Sends an update to a raw `Port` (not a `PortWithHandler`). Used by
-    /// `SubHandler` to eagerly send the current value to a newly-subscribed
-    /// port before it's been registered as a proper subscriber.
-    send_to_port: unsafe fn(&ErasedValue, u64, &Port),
+    /// Clones the value and wraps it in an `EncodedUpdate<T>` message.
+    /// Callers choose how to send: `control.respond()`, `pwh.send()`,
+    /// `port.send()`, etc.
+    make_update_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
     decode_update: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
 }
 
@@ -118,42 +112,15 @@ impl WatchVtable {
         }
         /// # Safety
         /// `v` must contain a value of type `T`.
-        unsafe fn encode_and_respond<T: 'static + MeshField + Send + Clone>(
+        unsafe fn make_update_msg<T: 'static + MeshField + Send + Clone>(
             v: &ErasedValue,
             version: u64,
-            control: &mut PortControl<'_, '_>,
-        ) {
-            control.respond(Message::new(EncodedUpdate::<T> {
+        ) -> Message<'static> {
+            Message::new(EncodedUpdate::<T> {
                 version,
                 // SAFETY: guaranteed by caller.
                 value: unsafe { v.as_ref::<T>() }.clone(),
-            }));
-        }
-        /// # Safety
-        /// `v` must contain a value of type `T`.
-        unsafe fn send_update<T: 'static + MeshField + Send + Clone>(
-            v: &ErasedValue,
-            version: u64,
-            pwh: &PortWithHandler<SubHandler>,
-        ) {
-            pwh.send(Message::new(EncodedUpdate::<T> {
-                version,
-                // SAFETY: guaranteed by caller.
-                value: unsafe { v.as_ref::<T>() }.clone(),
-            }));
-        }
-        /// # Safety
-        /// `v` must contain a value of type `T`.
-        unsafe fn send_to_port<T: 'static + MeshField + Send + Clone>(
-            v: &ErasedValue,
-            version: u64,
-            port: &Port,
-        ) {
-            port.send(Message::new(EncodedUpdate::<T> {
-                version,
-                // SAFETY: guaranteed by caller.
-                value: unsafe { v.as_ref::<T>() }.clone(),
-            }));
+            })
         }
         /// # Safety
         /// The message must have been encoded as `EncodedUpdate<T>`.
@@ -166,9 +133,7 @@ impl WatchVtable {
         Self {
             drop_value: drop_value::<T>,
             clone_value: clone_value::<T>,
-            encode_and_respond: encode_and_respond::<T>,
-            send_update: send_update::<T>,
-            send_to_port: send_to_port::<T>,
+            make_update_msg: make_update_msg::<T>,
             decode_update: decode_update::<T>,
         }
     }
@@ -260,9 +225,9 @@ impl HandlePortEvent for SubHandler {
                 let state = self.core.state.read();
                 if self.sent_version < state.version {
                     // SAFETY: vtable matches the type.
-                    unsafe {
-                        (self.core.vtable.encode_and_respond)(&state.value, state.version, control);
-                    }
+                    let msg =
+                        unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                    control.respond(msg);
                     self.pending_ack = true;
                     self.sent_version = state.version;
                 }
@@ -274,9 +239,9 @@ impl HandlePortEvent for SubHandler {
                 let state = self.core.state.read();
                 let effective_version = if version < state.version {
                     // SAFETY: vtable matches the type.
-                    unsafe {
-                        (self.core.vtable.send_to_port)(&state.value, state.version, &port);
-                    }
+                    let msg =
+                        unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                    port.send(msg);
                     state.version
                 } else {
                     version
@@ -447,7 +412,7 @@ impl WatchSenderCore {
                 }
             });
             if should_send {
-                // N.B. state(R) is held while send_update synchronously delivers
+                // N.B. state(R) is held while send synchronously delivers
                 // to the peer's WatchPortHandler, which acquires *its own*
                 // core's state(W). This is safe because SubHandler and
                 // WatchPortHandler always belong to different WatchCore
@@ -455,9 +420,9 @@ impl WatchSenderCore {
                 // boundary), so there is no same-lock contention.
                 let state = self.core.state.read();
                 // SAFETY: vtable matches the type.
-                unsafe {
-                    (self.core.vtable.send_update)(&state.value, state.version, sub);
-                }
+                let msg =
+                    unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                sub.send(msg);
             }
             true
         });
@@ -499,9 +464,9 @@ impl WatchSenderCore {
                 // Same cross-core safety argument as in send() above.
                 let state = self.core.state.read();
                 // SAFETY: vtable matches the type.
-                unsafe {
-                    (self.core.vtable.send_update)(&state.value, state.version, &sub);
-                }
+                let msg =
+                    unsafe { (self.core.vtable.make_update_msg)(&state.value, state.version) };
+                sub.send(msg);
             }
             self.subscribers.push(sub);
         }

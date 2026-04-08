@@ -279,20 +279,20 @@ impl HandlePortEvent for WatchPortHandler {
             // SAFETY: decode matches the type used to encode.
             unsafe { (self.decode)(message) }.map_err(HandleMessageError::new)?;
         let mut state = core.state.write();
-        if version > state.version {
-            let old = mem::replace(&mut state.value, value);
-            state.version = version;
-            drop(state);
-            control.respond(Message::new(ReceiverMessage::Ack(version)));
-            for waker in core.waiters.lock().drain(..) {
-                control.wake(waker);
-            }
-            // SAFETY: vtable matches the type.
-            unsafe { (core.vtable.drop_value)(old) };
-        } else {
-            drop(state);
-            control.respond(Message::new(ReceiverMessage::Ack(version)));
+        assert!(
+            version > state.version,
+            "received stale or duplicate update: got version {version}, have {}",
+            state.version
+        );
+        let old = mem::replace(&mut state.value, value);
+        state.version = version;
+        drop(state);
+        control.respond(Message::new(ReceiverMessage::Ack(version)));
+        for waker in core.waiters.lock().drain(..) {
+            control.wake(waker);
         }
+        // SAFETY: vtable matches the type.
+        unsafe { (core.vtable.drop_value)(old) };
         Ok(())
     }
 
@@ -405,7 +405,7 @@ impl WatchSenderCore {
                 return false;
             }
             let make_msg = sub.with_handler(|handler| {
-                if !handler.pending_ack {
+                if !handler.pending_ack && handler.sent_version < version {
                     handler.pending_ack = true;
                     handler.sent_version = version;
                     Some(handler.make_msg)
@@ -758,6 +758,19 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchReceiver<T>> for Po
         // Create a port pair. The right side goes to the sender.
         let (sub_left, sub_right) = Port::new_pair();
 
+        // Snapshot the current value first, then register the subscriber
+        // with the snapshot version. This way the SubHandler only eagerly
+        // sends if something *newer* than the snapshot arrived, avoiding
+        // a duplicate send of the same version.
+        let version;
+        let value: T;
+        {
+            let state = core.state.read();
+            version = state.version;
+            // SAFETY: core has element type T.
+            value = unsafe { state.value.as_ref::<T>() }.clone();
+        }
+
         // Register the right port with the sender for updates.
         // - Sender-side core (Local): push to the pending queue.
         // - Receiver-side core (Upstream): forward through the upstream port.
@@ -766,28 +779,16 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchReceiver<T>> for Po
             match &mut *subscribe {
                 SubscribeState::Local { pending, make_msg } => {
                     *make_msg = Some(make_update_msg::<T>);
-                    pending.push((receiver.0.last_seen, sub_right));
+                    pending.push((version, sub_right));
                 }
                 SubscribeState::Upstream(pwh) => {
                     // N.B. subscribe(M) is held here while pwh.send()
                     // synchronously delivers to the sender's SubHandler.
                     // This is safe because SubHandler only touches the
                     // *sender's* core (different lock instances).
-                    pwh.send(Message::new(ReceiverMessage::Subscribe(
-                        receiver.0.last_seen,
-                        sub_right,
-                    )));
+                    pwh.send(Message::new(ReceiverMessage::Subscribe(version, sub_right)));
                 }
             }
-        }
-
-        let version;
-        let value: T;
-        {
-            let state = core.state.read();
-            version = state.version;
-            // SAFETY: core has element type T.
-            value = unsafe { state.value.as_ref::<T>() }.clone();
         }
 
         let (left, right) = Port::new_pair();

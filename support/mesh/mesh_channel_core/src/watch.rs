@@ -556,6 +556,37 @@ impl Clone for WatchReceiverCore {
     }
 }
 
+impl WatchReceiverCore {
+    fn poll_changed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), RecvError>> {
+        loop {
+            {
+                let state = self.core.state.read();
+                if self.last_seen < state.version {
+                    self.last_seen = state.version;
+                    return Poll::Ready(Ok(()));
+                }
+                if state.closed {
+                    return Poll::Ready(Err(RecvError::Closed));
+                }
+            }
+            // Register waker under waiters lock, double-check to avoid
+            // lost wakeup.
+            let mut waiters = self.core.waiters.lock();
+            {
+                let state = self.core.state.read();
+                if self.last_seen < state.version || state.closed {
+                    drop(waiters);
+                    continue;
+                }
+            }
+            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+            return Poll::Pending;
+        }
+    }
+}
+
 impl<T: 'static + Send + Sync + Clone> WatchReceiver<T> {
     /// Gets a clone of the current value.
     pub fn get(&self) -> T {
@@ -586,36 +617,13 @@ impl<T: 'static + Send + Sync> WatchReceiver<T> {
 
     /// Waits until the value has changed since the last observation.
     pub fn changed(&mut self) -> impl Future<Output = Result<(), RecvError>> + '_ {
-        std::future::poll_fn(|cx| self.poll_changed(cx))
+        std::future::poll_fn(|cx| self.core.poll_changed(cx))
     }
 
-    fn poll_changed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), RecvError>> {
-        loop {
-            {
-                let state = self.core.core.state.read();
-                if self.core.last_seen < state.version {
-                    self.core.last_seen = state.version;
-                    return Poll::Ready(Ok(()));
-                }
-                if state.closed {
-                    return Poll::Ready(Err(RecvError::Closed));
-                }
-            }
-            // Register waker under waiters lock, double-check to avoid
-            // lost wakeup.
-            let mut waiters = self.core.core.waiters.lock();
-            {
-                let state = self.core.core.state.read();
-                if self.core.last_seen < state.version || state.closed {
-                    drop(waiters);
-                    continue;
-                }
-            }
-            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                waiters.push(cx.waker().clone());
-            }
-            return Poll::Pending;
-        }
+    /// Polls the watch receiver to check if the value has changed since the
+    /// last observation.
+    pub fn poll_changed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), RecvError>> {
+        self.core.poll_changed(cx)
     }
 }
 

@@ -60,8 +60,8 @@ unsafe impl Send for ErasedValue {}
 unsafe impl Sync for ErasedValue {}
 
 impl ErasedValue {
-    fn new<T>(value: T) -> Self {
-        Self(NonNull::new(Box::into_raw(Box::new(value)).cast()).unwrap())
+    fn new<T>(value: Box<T>) -> Self {
+        Self(NonNull::new(Box::into_raw(value).cast()).unwrap())
     }
 
     /// # Safety
@@ -75,13 +75,24 @@ impl ErasedValue {
     ///
     /// # Safety
     /// `T` must match the type used at construction.
-    unsafe fn take<T>(self) -> T {
+    unsafe fn into_box<T>(self) -> Box<T> {
         // SAFETY: caller guarantees T matches.
-        *unsafe { Box::from_raw(self.0.cast::<T>().as_ptr()) }
+        unsafe { Box::from_raw(self.0.cast::<T>().as_ptr()) }
     }
 
     fn dangling() -> Self {
         Self(NonNull::dangling())
+    }
+
+    /// Clones the value and returns a new `ErasedValue` containing the clone.
+    ///
+    /// # Safety
+    ///
+    /// `T` must match the type used at construction.
+    unsafe fn clone_as<T: Clone>(&self) -> Self {
+        // SAFETY: caller must ensure T matches the type used at construction.
+        let clone: Box<T> = Box::new(unsafe { self.as_ref::<T>().clone() });
+        Self::new(clone)
     }
 }
 
@@ -97,7 +108,7 @@ impl WatchVtable {
         /// `v` must contain a value of type `T`.
         unsafe fn drop_value<T>(v: ErasedValue) {
             // SAFETY: guaranteed by caller.
-            let _ = unsafe { v.take::<T>() };
+            let _ = unsafe { v.into_box::<T>() };
         }
         Self {
             drop_value: drop_value::<T>,
@@ -116,7 +127,7 @@ unsafe fn make_update_msg<T: 'static + MeshField + Send + Clone>(
     Message::new(EncodedUpdate::<T> {
         version,
         // SAFETY: guaranteed by caller.
-        value: unsafe { v.as_ref::<T>() }.clone(),
+        value: Box::new(unsafe { v.as_ref::<T>() }.clone()),
     })
 }
 
@@ -128,7 +139,7 @@ unsafe fn decode_update_msg<T: 'static + MeshField>(
     message: Message<'_>,
 ) -> Result<(u64, ErasedValue), ChannelError> {
     let u: EncodedUpdate<T> = message.parse().map_err(ChannelError::from)?;
-    Ok((u.version, ErasedValue::new(u.value)))
+    Ok((u.version, ErasedValue::new::<T>(u.value)))
 }
 
 // ---- Wire protocol -------------------------------------------------------
@@ -137,7 +148,7 @@ unsafe fn decode_update_msg<T: 'static + MeshField>(
 #[mesh(resource = "Resource")]
 struct EncodedUpdate<T> {
     version: u64,
-    value: T,
+    value: Box<T>,
 }
 
 #[derive(Protobuf)]
@@ -238,18 +249,19 @@ impl HandlePortEvent for SubHandler {
                 // send() to fire in between, and the subscriber would miss
                 // that update.
                 let state = self.core.state.read();
-                let effective_version = if version < state.version {
+                if version > state.version {
+                    return Err(HandleMessageError::new(
+                        "subscriber claims to have seen future version",
+                    ));
+                }
+                if version < state.version {
                     // SAFETY: make_msg matches the type.
                     let msg = unsafe { (self.make_msg)(&state.value, state.version) };
                     port.send(msg);
-                    state.version
-                } else {
-                    version
-                };
+                }
                 // state(R) → subscribe(M) is safe because send() drops
                 // state(W) before acquiring subscribe(M).
-                register_subscriber(&self.core, &state, effective_version, port, self.make_msg);
-                drop(state);
+                register_subscriber(&self.core, &state, port, self.make_msg);
             }
         }
         Ok(())
@@ -441,9 +453,9 @@ impl WatchSenderCore {
             old_value
         }
 
-        let old_value = send_erased(self, ErasedValue::new(value));
+        let old_value = send_erased(self, ErasedValue::new::<T>(Box::new(value)));
         // SAFETY: core has element type T.
-        unsafe { old_value.take::<T>() }
+        *unsafe { old_value.into_box::<T>() }
     }
 
     fn drain_pending_subscribes(&mut self, current_version: u64) {
@@ -642,7 +654,13 @@ impl<T> DefaultEncoding for WatchSender<T> {
 #[mesh(resource = "Resource")]
 struct EncodedWatchSender<T> {
     version: u64,
-    value: T,
+    value: Box<T>,
+    subscribers: Vec<EncodedSubscriber>,
+}
+
+struct ErasedWatchSender {
+    version: u64,
+    value: ErasedValue,
     subscribers: Vec<EncodedSubscriber>,
 }
 
@@ -703,68 +721,81 @@ impl<'a, T: 'static + MeshField + Send + Sync + Clone> MessageDecode<'a, WatchSe
 fn build_encoded_sender<T: 'static + MeshField + Send + Sync + Clone>(
     core_ref: &mut WatchSenderCore,
 ) -> EncodedWatchSender<T> {
-    // Try sole-owner fast path: take value without cloning.
-    if let Some(core) = Arc::get_mut(&mut core_ref.core) {
-        let state = core.state.get_mut();
+    fn build_encoded_sender(
+        core_ref: &mut WatchSenderCore,
+        clone: unsafe fn(&ErasedValue) -> ErasedValue,
+        decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
+    ) -> ErasedWatchSender {
+        // Try sole-owner fast path: take value without cloning.
+        if let Some(core) = Arc::get_mut(&mut core_ref.core) {
+            let state = core.state.get_mut();
+            let version = state.version;
+            let value = mem::replace(&mut state.value, ErasedValue::dangling());
+            // No local receivers (we're sole owner), so no need for upstream port.
+            let subscribers =
+                drain_subscribers(&mut core_ref.subscribers, core.subscribe.get_mut());
+            return ErasedWatchSender {
+                version,
+                value,
+                subscribers,
+            };
+        }
+
+        // Shared path: clone value under lock, then extract subscribers
+        // non-generically.
+        let state = core_ref.core.state.read();
         let version = state.version;
         // SAFETY: core has element type T.
-        let value = unsafe { mem::replace(&mut state.value, ErasedValue::dangling()).take::<T>() };
-        // No local receivers (we're sole owner), so no need for upstream port.
-        let subscribers = drain_subscribers(&mut core_ref.subscribers, core.subscribe.get_mut());
-        return EncodedWatchSender {
+        let value = unsafe { clone(&state.value) };
+        drop(state);
+
+        let subscribers = {
+            // Install the upstream port FIRST, before draining. Once subscribe
+            // is Upstream, any new SubscribeRequest (from SubHandler or receiver
+            // encoding) goes through the upstream port to the new sender, not
+            // into a local pending vec we're about to drain.
+            let (left, right) = Port::new_pair();
+            let handler = WatchPortHandler {
+                core: Arc::downgrade(&core_ref.core),
+                decode,
+            };
+            let pwh = right.set_handler(handler);
+
+            // Swap subscribe to Upstream atomically with draining pending.
+            let mut subscribe = core_ref.core.subscribe.lock();
+            let mut subscribers = drain_subscribers(&mut core_ref.subscribers, &mut subscribe);
+            *subscribe = SubscribeState::Upstream(pwh);
+            drop(subscribe);
+
+            subscribers.push(EncodedSubscriber {
+                port: left,
+                pending_ack: false,
+                sent_version: version,
+            });
+
+            subscribers
+        };
+        ErasedWatchSender {
             version,
             value,
             subscribers,
-        };
+        }
     }
 
-    // Shared path: clone value under lock, then extract subscribers
-    // non-generically.
-    let state = core_ref.core.state.read();
-    let version = state.version;
-    // SAFETY: core has element type T.
-    let value = unsafe { state.value.as_ref::<T>() }.clone();
-    drop(state);
-
-    let subscribers = build_encoded_sender_subscribers(core_ref, version, decode_update_msg::<T>);
-    EncodedWatchSender {
+    let ErasedWatchSender {
         version,
         value,
         subscribers,
+    } = build_encoded_sender(core_ref, ErasedValue::clone_as::<T>, decode_update_msg::<T>);
+
+    EncodedWatchSender {
+        version,
+        value: {
+            // SAFETY: the core has element type T, and the value was cloned from it.
+            unsafe { value.into_box::<T>() }
+        },
+        subscribers,
     }
-}
-
-/// Non-generic: drains all subscriber state from the sender core.
-/// Handles the "local receivers exist" case by installing a WatchPortHandler.
-fn build_encoded_sender_subscribers(
-    core_ref: &mut WatchSenderCore,
-    version: u64,
-    decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
-) -> Vec<EncodedSubscriber> {
-    // Install the upstream port FIRST, before draining. Once subscribe
-    // is Upstream, any new SubscribeRequest (from SubHandler or receiver
-    // encoding) goes through the upstream port to the new sender, not
-    // into a local pending vec we're about to drain.
-    let (left, right) = Port::new_pair();
-    let handler = WatchPortHandler {
-        core: Arc::downgrade(&core_ref.core),
-        decode,
-    };
-    let pwh = right.set_handler(handler);
-
-    // Swap subscribe to Upstream atomically with draining pending.
-    let mut subscribe = core_ref.core.subscribe.lock();
-    let mut subscribers = drain_subscribers(&mut core_ref.subscribers, &mut subscribe);
-    *subscribe = SubscribeState::Upstream(pwh);
-    drop(subscribe);
-
-    subscribers.push(EncodedSubscriber {
-        port: left,
-        pending_ack: false,
-        sent_version: version,
-    });
-
-    subscribers
 }
 
 /// Non-generic: extracts `EncodedSubscriber`s from active PWH subscribers
@@ -804,56 +835,58 @@ fn drain_subscribers(
 fn decode_sender<T: 'static + MeshField + Send + Sync + Clone>(
     encoded: EncodedWatchSender<T>,
 ) -> WatchSender<T> {
-    let make_msg = make_update_msg::<T>;
+    /// Non-generic core of sender decoding: creates the WatchCore and
+    /// installs SubHandlers on each subscriber port.
+    fn decode_sender_core(
+        encoded: ErasedWatchSender,
+        vtable: &'static WatchVtable,
+        make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+    ) -> (Arc<WatchCore>, Vec<PortWithHandler<SubHandler>>) {
+        let core = Arc::new(WatchCore {
+            state: RwLock::new(WatchState {
+                version: encoded.version,
+                value: encoded.value,
+                closed: false,
+            }),
+            waiters: Mutex::new(Vec::new()),
+            vtable,
+            subscribe: Mutex::new(SubscribeState::Local {
+                pending: Vec::new(),
+                make_msg: Some(make_msg),
+            }),
+        });
+
+        let subscribers = encoded
+            .subscribers
+            .into_iter()
+            .map(|es| {
+                es.port.set_handler(SubHandler {
+                    core: core.clone(),
+                    pending_ack: es.pending_ack,
+                    sent_version: es.sent_version,
+                    make_msg,
+                })
+            })
+            .collect();
+
+        (core, subscribers)
+    }
+
+    let encoded = ErasedWatchSender {
+        version: encoded.version,
+        value: ErasedValue::new::<T>(encoded.value),
+        subscribers: encoded.subscribers,
+    };
+
     let (core, subscribers) = decode_sender_core(
-        encoded.version,
-        ErasedValue::new(encoded.value),
-        encoded.subscribers,
+        encoded,
         const { &WatchVtable::new::<T>() },
-        make_msg,
+        make_update_msg::<T>,
     );
     WatchSender {
         core: WatchSenderCore { core, subscribers },
         cached_encoding: None,
     }
-}
-
-/// Non-generic core of sender decoding: creates the WatchCore and
-/// installs SubHandlers on each subscriber port.
-fn decode_sender_core(
-    version: u64,
-    value: ErasedValue,
-    encoded_subscribers: Vec<EncodedSubscriber>,
-    vtable: &'static WatchVtable,
-    make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
-) -> (Arc<WatchCore>, Vec<PortWithHandler<SubHandler>>) {
-    let core = Arc::new(WatchCore {
-        state: RwLock::new(WatchState {
-            version,
-            value,
-            closed: false,
-        }),
-        waiters: Mutex::new(Vec::new()),
-        vtable,
-        subscribe: Mutex::new(SubscribeState::Local {
-            pending: Vec::new(),
-            make_msg: Some(make_msg),
-        }),
-    });
-
-    let subscribers = encoded_subscribers
-        .into_iter()
-        .map(|es| {
-            es.port.set_handler(SubHandler {
-                core: core.clone(),
-                pending_ack: es.pending_ack,
-                sent_version: es.sent_version,
-                make_msg,
-            })
-        })
-        .collect();
-
-    (core, subscribers)
 }
 
 // ---- Encoding: WatchReceiver ---------------------------------------------
@@ -869,7 +902,13 @@ impl<T> DefaultEncoding for WatchReceiver<T> {
 #[mesh(resource = "Resource")]
 struct EncodedWatchReceiver<T> {
     version: u64,
-    value: T,
+    value: Box<T>,
+    port: Port,
+}
+
+struct ErasedWatchReceiver {
+    version: u64,
+    value: ErasedValue,
     port: Port,
 }
 
@@ -919,63 +958,75 @@ impl<'a, T: 'static + MeshField + Send + Sync + Clone> MessageDecode<'a, WatchRe
 fn build_encoded_receiver<T: 'static + MeshField + Send + Sync + Clone>(
     core_ref: &mut WatchReceiverCore,
 ) -> EncodedWatchReceiver<T> {
-    // If we're the sole owner of the core, take the value directly
-    // without cloning or locking.
-    if let Some(core) = Arc::get_mut(&mut core_ref.core) {
-        let state = core.state.get_mut();
-        let version = state.version;
-        // SAFETY: core has element type T.
-        let value = unsafe { mem::replace(&mut state.value, ErasedValue::dangling()).take::<T>() };
-        let port = take_sole_owner_port(core.subscribe.get_mut());
-        return EncodedWatchReceiver {
-            version,
-            value,
-            port,
-        };
+    fn build_encoded_receiver(
+        core_ref: &mut WatchReceiverCore,
+        clone: unsafe fn(&ErasedValue) -> ErasedValue,
+        make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+    ) -> ErasedWatchReceiver {
+        // If we're the sole owner of the core, take the value directly
+        // without cloning or locking.
+        if let Some(core) = Arc::get_mut(&mut core_ref.core) {
+            let state = core.state.get_mut();
+            let version = state.version;
+            let value = mem::replace(&mut state.value, ErasedValue::dangling());
+            let port = {
+                let subscribe: &mut SubscribeState = core.subscribe.get_mut();
+                match mem::replace(
+                    subscribe,
+                    SubscribeState::Local {
+                        pending: Vec::new(),
+                        make_msg: None,
+                    },
+                ) {
+                    SubscribeState::Upstream(_pwh) => {
+                        unreachable!("TODO: should this have been removed already?")
+                    }
+                    SubscribeState::Local { .. } => {
+                        // Sender-side core, sole owner — the sender is gone.
+                        // Create a dead port for the encoded receiver.
+                        Port::new_pair().0
+                    }
+                }
+            };
+            return ErasedWatchReceiver {
+                version,
+                value,
+                port,
+            };
+        }
+
+        // Multiple clones exist. Hold state(R) across the snapshot AND the
+        // subscriber registration to ensure the version we subscribe with
+        // matches the value we encode — preventing a TOCTOU where send()
+        // fires between the snapshot and the registration.
+        let (left, right) = Port::new_pair();
+        let state = core_ref.core.state.read();
+        // Non-generic helper; state(R) → subscribe(M) is safe because
+        // send() drops state(W) before acquiring subscribe(M).
+        register_subscriber(&core_ref.core, &state, right, make_msg);
+        ErasedWatchReceiver {
+            version: state.version,
+            value: {
+                // SAFETY: core has element type T.
+                unsafe { clone(&state.value) }
+            },
+            port: left,
+        }
     }
 
-    // Multiple clones exist. Hold state(R) across the snapshot AND the
-    // subscriber registration to ensure the version we subscribe with
-    // matches the value we encode — preventing a TOCTOU where send()
-    // fires between the snapshot and the registration.
-    let (sub_left, sub_right) = Port::new_pair();
-    let state = core_ref.core.state.read();
-    let version = state.version;
-    // SAFETY: core has element type T.
-    let value = unsafe { state.value.as_ref::<T>() }.clone();
-    // Non-generic helper; state(R) → subscribe(M) is safe because
-    // send() drops state(W) before acquiring subscribe(M).
-    register_subscriber(
-        &core_ref.core,
-        &state,
+    let ErasedWatchReceiver {
         version,
-        sub_right,
-        make_update_msg::<T>,
-    );
-    drop(state);
+        value,
+        port,
+    } = build_encoded_receiver(core_ref, ErasedValue::clone_as::<T>, make_update_msg::<T>);
 
     EncodedWatchReceiver {
         version,
-        value,
-        port: sub_left,
-    }
-}
-
-/// Extracts the port from a sole-owner core's subscribe state.
-fn take_sole_owner_port(subscribe: &mut SubscribeState) -> Port {
-    match mem::replace(
-        subscribe,
-        SubscribeState::Local {
-            pending: Vec::new(),
-            make_msg: None,
+        value: {
+            // SAFETY: the core has element type T, and the value was cloned from it.
+            unsafe { value.into_box::<T>() }
         },
-    ) {
-        SubscribeState::Upstream(pwh) => pwh.remove_handler().0,
-        SubscribeState::Local { .. } => {
-            // Sender-side core, sole owner — the sender is gone.
-            // Create a dead port for the encoded receiver.
-            Port::new_pair().0
-        }
+        port,
     }
 }
 
@@ -986,11 +1037,11 @@ fn take_sole_owner_port(subscribe: &mut SubscribeState) -> Port {
 /// snapshot and registration.
 fn register_subscriber(
     core: &WatchCore,
-    _state: &RwLockReadGuard<'_, WatchState>,
-    version: u64,
+    state: &RwLockReadGuard<'_, WatchState>,
     port: Port,
     make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
 ) {
+    let version = state.version;
     let mut subscribe = core.subscribe.lock();
     match &mut *subscribe {
         SubscribeState::Local {
@@ -1010,52 +1061,54 @@ fn register_subscriber(
 fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
     encoded: EncodedWatchReceiver<T>,
 ) -> WatchReceiver<T> {
+    /// Non-generic core of receiver decoding: creates the WatchCore and
+    /// installs the upstream port handler.
+    fn decode_receiver_core(
+        encoded: ErasedWatchReceiver,
+        vtable: &'static WatchVtable,
+        decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
+    ) -> WatchReceiverCore {
+        let core = Arc::new(WatchCore {
+            state: RwLock::new(WatchState {
+                version: encoded.version,
+                value: encoded.value,
+                closed: false,
+            }),
+            waiters: Mutex::new(Vec::new()),
+            vtable,
+            subscribe: Mutex::new(SubscribeState::Local {
+                pending: Vec::new(),
+                make_msg: None,
+            }),
+        });
+
+        let handler = WatchPortHandler {
+            core: Arc::downgrade(&core),
+            decode,
+        };
+        let upstream_pwh = encoded.port.set_handler(handler);
+        *core.subscribe.lock() = SubscribeState::Upstream(upstream_pwh);
+        WatchReceiverCore {
+            core,
+            last_seen: encoded.version,
+        }
+    }
+
+    let encoded = ErasedWatchReceiver {
+        version: encoded.version,
+        value: ErasedValue::new::<T>(encoded.value),
+        port: encoded.port,
+    };
+
     let core = decode_receiver_core(
-        encoded.version,
-        ErasedValue::new(encoded.value),
-        encoded.port,
+        encoded,
         const { &WatchVtable::new::<T>() },
         decode_update_msg::<T>,
     );
     WatchReceiver {
-        core: WatchReceiverCore {
-            core,
-            last_seen: encoded.version,
-        },
+        core,
         cached_encoding: None,
     }
-}
-
-/// Non-generic core of receiver decoding: creates the WatchCore and
-/// installs the upstream port handler.
-fn decode_receiver_core(
-    version: u64,
-    value: ErasedValue,
-    port: Port,
-    vtable: &'static WatchVtable,
-    decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
-) -> Arc<WatchCore> {
-    let core = Arc::new(WatchCore {
-        state: RwLock::new(WatchState {
-            version,
-            value,
-            closed: false,
-        }),
-        waiters: Mutex::new(Vec::new()),
-        vtable,
-        subscribe: Mutex::new(SubscribeState::Local {
-            pending: Vec::new(),
-            make_msg: None,
-        }),
-    });
-
-    let handler = WatchPortHandler {
-        core: Arc::downgrade(&core),
-        decode,
-    };
-    let upstream_pwh = port.set_handler(handler);
-    *core.subscribe.lock() = SubscribeState::Upstream(upstream_pwh);
-    core
 }
 
 // ---- Constructor ---------------------------------------------------------
@@ -1069,7 +1122,7 @@ pub fn watch<T: 'static + Send + Sync + Clone>(initial: T) -> (WatchSender<T>, W
     let core = Arc::new(WatchCore {
         state: RwLock::new(WatchState {
             version: 0,
-            value: ErasedValue::new(initial),
+            value: ErasedValue::new::<T>(Box::new(initial)),
             closed: false,
         }),
         waiters: Mutex::new(Vec::new()),

@@ -279,11 +279,15 @@ impl HandlePortEvent for WatchPortHandler {
             // SAFETY: decode matches the type used to encode.
             unsafe { (self.decode)(message) }.map_err(HandleMessageError::new)?;
         let mut state = core.state.write();
-        assert!(
-            version > state.version,
-            "received stale or duplicate update: got version {version}, have {}",
-            state.version
-        );
+        if version <= state.version {
+            let current = state.version;
+            drop(state);
+            // SAFETY: vtable matches the type.
+            unsafe { (core.vtable.drop_value)(value) };
+            return Err(HandleMessageError::new(format!(
+                "received stale or duplicate update: got version {version}, have {current}",
+            )));
+        }
         let old = mem::replace(&mut state.value, value);
         state.version = version;
         drop(state);

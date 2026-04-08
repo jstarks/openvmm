@@ -87,8 +87,6 @@ impl ErasedValue {
 
 struct WatchVtable {
     drop_value: unsafe fn(ErasedValue),
-    #[expect(dead_code)] // used by sender encoding
-    clone_value: unsafe fn(&ErasedValue) -> ErasedValue,
 }
 
 impl WatchVtable {
@@ -99,15 +97,8 @@ impl WatchVtable {
             // SAFETY: guaranteed by caller.
             let _ = unsafe { v.take::<T>() };
         }
-        /// # Safety
-        /// `v` must contain a value of type `T`.
-        unsafe fn clone_value<T: Clone>(v: &ErasedValue) -> ErasedValue {
-            // SAFETY: guaranteed by caller.
-            ErasedValue::new(unsafe { v.as_ref::<T>() }.clone())
-        }
         Self {
             drop_value: drop_value::<T>,
-            clone_value: clone_value::<T>,
         }
     }
 }

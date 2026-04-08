@@ -605,7 +605,9 @@ impl<T: 'static + Send + Sync> WatchReceiver<T> {
                     continue;
                 }
             }
-            waiters.push(cx.waker().clone());
+            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
             return Poll::Pending;
         }
     }

@@ -89,6 +89,11 @@ struct WatchVtable {
     #[allow(dead_code)] // used by sender encoding (future)
     clone_value: unsafe fn(&ErasedValue) -> ErasedValue,
     encode_and_respond: unsafe fn(&ErasedValue, u64, &mut PortControl<'_, '_>),
+    /// Like `encode_and_respond`, but sends via `PortWithHandler::send()` instead
+    /// of `PortControl::respond()`. This avoids the deadlock that occurs when
+    /// `with_port_and_handler` holds the port lock during event processing —
+    /// `Port::send()` releases the lock before processing events.
+    send_update: unsafe fn(&ErasedValue, u64, &PortWithHandler<SubHandler>),
     decode_update: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
 }
 
@@ -120,6 +125,19 @@ impl WatchVtable {
             }));
         }
         /// # Safety
+        /// `v` must contain a value of type `T`.
+        unsafe fn send_update<T: 'static + MeshField + Send + Clone>(
+            v: &ErasedValue,
+            version: u64,
+            pwh: &PortWithHandler<SubHandler>,
+        ) {
+            pwh.send(Message::new(EncodedUpdate::<T> {
+                version,
+                // SAFETY: guaranteed by caller.
+                value: unsafe { v.as_ref::<T>() }.clone(),
+            }));
+        }
+        /// # Safety
         /// The message must have been encoded as `EncodedUpdate<T>`.
         unsafe fn decode_update<T: 'static + MeshField>(
             message: Message<'_>,
@@ -131,6 +149,7 @@ impl WatchVtable {
             drop_value: drop_value::<T>,
             clone_value: clone_value::<T>,
             encode_and_respond: encode_and_respond::<T>,
+            send_update: send_update::<T>,
             decode_update: decode_update::<T>,
         }
     }
@@ -356,21 +375,33 @@ impl WatchSenderCore {
         self.register_subscribers(new_subs, version);
 
         // Send update to non-pending subscribers.
+        //
+        // N.B. We use `with_handler` + `send_update` instead of
+        // `with_port_and_handler` + `encode_and_respond` to avoid a deadlock:
+        // `with_port_and_handler` holds the port lock during event processing,
+        // and if the peer responds with an ack that targets this port, the ack
+        // delivery tries to reacquire the lock. `Port::send()` (used by
+        // `send_update`) releases the port lock before processing events.
         self.subscribers.retain(|sub| {
             if sub.is_closed().unwrap_or(true) {
                 return false;
             }
-            sub.with_port_and_handler(|control, handler| {
+            let should_send = sub.with_handler(|handler| {
                 if !handler.pending_ack {
-                    let state = self.core.state.read();
-                    // SAFETY: vtable matches the type.
-                    unsafe {
-                        (self.core.vtable.encode_and_respond)(&state.value, state.version, control);
-                    }
                     handler.pending_ack = true;
-                    handler.sent_version = state.version;
+                    handler.sent_version = version;
+                    true
+                } else {
+                    false
                 }
             });
+            if should_send {
+                let state = self.core.state.read();
+                // SAFETY: vtable matches the type.
+                unsafe {
+                    (self.core.vtable.send_update)(&state.value, state.version, sub);
+                }
+            }
             true
         });
 
@@ -398,15 +429,15 @@ impl WatchSenderCore {
             };
             let sub = port.set_handler(handler);
             if ver < current_version {
-                sub.with_port_and_handler(|control, handler| {
-                    let state = self.core.state.read();
-                    // SAFETY: vtable matches the type.
-                    unsafe {
-                        (self.core.vtable.encode_and_respond)(&state.value, state.version, control);
-                    }
+                sub.with_handler(|handler| {
                     handler.pending_ack = true;
-                    handler.sent_version = state.version;
+                    handler.sent_version = current_version;
                 });
+                let state = self.core.state.read();
+                // SAFETY: vtable matches the type.
+                unsafe {
+                    (self.core.vtable.send_update)(&state.value, state.version, &sub);
+                }
             }
             self.subscribers.push(sub);
         }
@@ -603,7 +634,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> From<WatchSender<T>> for Port
             value,
             ports,
         }));
-        mem::forget(left); // Don't close the port
+        drop(left);
         right
     }
 }
@@ -921,13 +952,38 @@ mod tests {
         assert!(data.is_some(), "message should have been received");
     }
 
-    // TODO: Port round-trip tests currently disabled. The encoding path
-    // needs to use EncodeAs (like Cell) instead of PortField to properly
-    // transfer state + subscriber ports. The in-proc path is correct.
+    #[test]
+    fn test_sender_port_roundtrip() {
+        block_on(async {
+            let (sender, mut receiver) = watch(5u32);
+            // Round-trip the sender through a Port.
+            let mut sender = WatchSender::<u32>::from(Port::from(sender));
+            assert_eq!(*sender.borrow(), 5);
+            sender.send(10);
+            receiver.changed().await.unwrap();
+            assert_eq!(*receiver.borrow(), 10);
+        });
+    }
 
-    // #[test]
-    // fn test_sender_port_roundtrip() { ... }
+    #[test]
+    fn test_receiver_port_roundtrip() {
+        block_on(async {
+            let (mut sender, receiver) = watch(5u32);
+            // Round-trip the receiver through a Port.
+            let mut receiver = WatchReceiver::<u32>::from(Port::from(receiver));
+            assert_eq!(*receiver.borrow(), 5);
+            sender.send(10);
+            receiver.changed().await.unwrap();
+            assert_eq!(*receiver.borrow(), 10);
+        });
+    }
 
+    // TODO: "both sides remote" requires the SubscribeRequest forwarding
+    // mechanism (subscribe_remote callback) so that a receiver encoded from
+    // the old core can route its subscription through the upstream port to
+    // the new sender. This is tracked in the plan under "Remote receiver
+    // clone (SubscribeRequest)".
+    //
     // #[test]
-    // fn test_receiver_port_roundtrip() { ... }
+    // fn test_both_sides_remote() { ... }
 }

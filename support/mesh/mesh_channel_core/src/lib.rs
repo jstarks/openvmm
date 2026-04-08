@@ -12,6 +12,7 @@ mod error;
 mod mpsc;
 mod oneshot;
 mod sync_unsafe_cell;
+pub mod watch;
 
 pub use error::*;
 pub use mpsc::*;

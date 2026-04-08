@@ -381,72 +381,77 @@ impl WatchSenderCore {
     /// # Safety
     /// The core must have element type `T`.
     unsafe fn send<T>(&mut self, value: T) -> T {
-        // Bump version and swap value.
-        let (version, old_value) = {
-            let mut state = self.core.state.write();
-            state.version += 1;
-            let old = mem::replace(&mut state.value, ErasedValue::new(value));
-            (state.version, old)
-        };
-        // state(W) is now released.
+        fn send_erased(this: &mut WatchSenderCore, value: ErasedValue) -> ErasedValue {
+            // Bump version and swap value.
+            let (version, old_value) = {
+                let mut state = this.core.state.write();
+                state.version += 1;
+                let old = mem::replace(&mut state.value, value);
+                (state.version, old)
+            };
+            // state(W) is now released.
 
-        // Drain pending subscribes from the core (from receiver encoding).
-        self.drain_pending_subscribes(version);
+            // Drain pending subscribes from the core (from receiver encoding).
+            this.drain_pending_subscribes(version);
 
-        // Drain pending subscribes from each SubHandler.
-        let mut new_subs: Vec<(u64, Port)> = Vec::new();
-        let mut make_msg = None;
-        for sub in &self.subscribers {
-            sub.with_handler(|h| {
-                new_subs.append(&mut h.pending_subscribes);
-                make_msg = Some(h.make_msg);
-            });
-        }
-        if let (Some(make_msg), false) = (make_msg, new_subs.is_empty()) {
-            self.register_subscribers(new_subs, version, make_msg);
-        }
-
-        // Send update to non-pending subscribers.
-        //
-        // N.B. We use `with_handler` + `send_update` instead of
-        // `with_port_and_handler` + `encode_and_respond` to avoid a deadlock:
-        // `with_port_and_handler` holds the port lock during event processing,
-        // and if the peer responds with an ack that targets this port, the ack
-        // delivery tries to reacquire the lock. `Port::send()` (used by
-        // `send_update`) releases the port lock before processing events.
-        self.subscribers.retain(|sub| {
-            if sub.is_closed().unwrap_or(true) {
-                return false;
+            // Drain pending subscribes from each SubHandler.
+            let mut new_subs: Vec<(u64, Port)> = Vec::new();
+            let mut make_msg = None;
+            for sub in &this.subscribers {
+                sub.with_handler(|h| {
+                    new_subs.append(&mut h.pending_subscribes);
+                    make_msg = Some(h.make_msg);
+                });
             }
-            let make_msg = sub.with_handler(|handler| {
-                if !handler.pending_ack && handler.sent_version < version {
-                    handler.pending_ack = true;
-                    handler.sent_version = version;
-                    Some(handler.make_msg)
-                } else {
-                    None
+            if let (Some(make_msg), false) = (make_msg, new_subs.is_empty()) {
+                this.register_subscribers(new_subs, version, make_msg);
+            }
+
+            // Send update to non-pending subscribers.
+            //
+            // N.B. We use `with_handler` + `pwh.send()` instead of
+            // `with_port_and_handler` + `control.respond()` to avoid a deadlock:
+            // `with_port_and_handler` holds the port lock during event processing,
+            // and if the peer responds with an ack that targets this port, the ack
+            // delivery tries to reacquire the lock. `Port::send()` releases the
+            // port lock before processing events.
+            this.subscribers.retain(|sub| {
+                if sub.is_closed().unwrap_or(true) {
+                    return false;
                 }
+                let make_msg = sub.with_handler(|handler| {
+                    if !handler.pending_ack && handler.sent_version < version {
+                        handler.pending_ack = true;
+                        handler.sent_version = version;
+                        Some(handler.make_msg)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(make_msg) = make_msg {
+                    // N.B. state(R) is held while send synchronously delivers
+                    // to the peer's WatchPortHandler, which acquires *its own*
+                    // core's state(W). This is safe because SubHandler and
+                    // WatchPortHandler always belong to different WatchCore
+                    // instances (created on opposite sides of the port encoding
+                    // boundary), so there is no same-lock contention.
+                    let state = this.core.state.read();
+                    // SAFETY: make_msg matches the type (set at encoding boundary).
+                    let msg = unsafe { make_msg(&state.value, state.version) };
+                    sub.send(msg);
+                }
+                true
             });
-            if let Some(make_msg) = make_msg {
-                // N.B. state(R) is held while send synchronously delivers
-                // to the peer's WatchPortHandler, which acquires *its own*
-                // core's state(W). This is safe because SubHandler and
-                // WatchPortHandler always belong to different WatchCore
-                // instances (created on opposite sides of the port encoding
-                // boundary), so there is no same-lock contention.
-                let state = self.core.state.read();
-                // SAFETY: make_msg matches the type (set at encoding boundary).
-                let msg = unsafe { make_msg(&state.value, state.version) };
-                sub.send(msg);
-            }
-            true
-        });
 
-        // Wake local receivers.
-        for waker in self.core.waiters.lock().drain(..) {
-            waker.wake();
+            // Wake local receivers.
+            for waker in this.core.waiters.lock().drain(..) {
+                waker.wake();
+            }
+
+            old_value
         }
 
+        let old_value = send_erased(self, ErasedValue::new(value));
         // SAFETY: core has element type T.
         unsafe { old_value.take::<T>() }
     }
@@ -752,39 +757,57 @@ fn build_encoded_sender<T: 'static + MeshField + Send + Sync + Clone>(
 fn decode_sender<T: 'static + MeshField + Send + Sync + Clone>(
     encoded: EncodedWatchSender<T>,
 ) -> WatchSender<T> {
-    let vtable: &'static WatchVtable = const { &WatchVtable::new::<T>() };
+    let make_msg = make_update_msg::<T>;
+    let (core, subscribers) = decode_sender_core(
+        encoded.version,
+        ErasedValue::new(encoded.value),
+        encoded.ports,
+        const { &WatchVtable::new::<T>() },
+        make_msg,
+    );
+    WatchSender {
+        core: WatchSenderCore { core, subscribers },
+        cached_encoding: None,
+    }
+}
+
+/// Non-generic core of sender decoding: creates the WatchCore and
+/// installs SubHandlers on each subscriber port.
+fn decode_sender_core(
+    version: u64,
+    value: ErasedValue,
+    ports: Vec<Port>,
+    vtable: &'static WatchVtable,
+    make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+) -> (Arc<WatchCore>, Vec<PortWithHandler<SubHandler>>) {
     let core = Arc::new(WatchCore {
         state: RwLock::new(WatchState {
-            version: encoded.version,
-            value: ErasedValue::new(encoded.value),
+            version,
+            value,
             closed: false,
         }),
         waiters: Mutex::new(Vec::new()),
         vtable,
         subscribe: Mutex::new(SubscribeState::Local {
             pending: Vec::new(),
-            make_msg: Some(make_update_msg::<T>),
+            make_msg: Some(make_msg),
         }),
     });
 
-    let subscribers: Vec<PortWithHandler<SubHandler>> = encoded
-        .ports
+    let subscribers = ports
         .into_iter()
         .map(|port| {
             port.set_handler(SubHandler {
                 core: core.clone(),
                 pending_ack: false,
-                sent_version: encoded.version,
+                sent_version: version,
                 pending_subscribes: Vec::new(),
-                make_msg: make_update_msg::<T>,
+                make_msg,
             })
         })
         .collect();
 
-    WatchSender {
-        core: WatchSenderCore { core, subscribers },
-        cached_encoding: None,
-    }
+    (core, subscribers)
 }
 
 // ---- Encoding: WatchReceiver ---------------------------------------------
@@ -811,7 +834,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> MessageEncode<WatchReceiver<T
         item: &mut WatchReceiver<T>,
         sizer: mesh_protobuf::protobuf::MessageSizer<'_>,
     ) {
-        let mut encoded = build_encoded_receiver::<T>(&item.core);
+        let mut encoded = build_encoded_receiver::<T>(&mut item.core);
         <EncodedWatchReceiver<T> as DefaultEncoding>::Encoding::compute_message_size(
             &mut encoded,
             sizer,
@@ -848,37 +871,36 @@ impl<'a, T: 'static + MeshField + Send + Sync + Clone> MessageDecode<'a, WatchRe
 /// Builds an `EncodedWatchReceiver<T>` from a receiver core.
 /// Registers a subscriber port and snapshots the current value.
 fn build_encoded_receiver<T: 'static + MeshField + Send + Sync + Clone>(
-    core_ref: &WatchReceiverCore,
+    core_ref: &mut WatchReceiverCore,
 ) -> EncodedWatchReceiver<T> {
-    let core = &core_ref.core;
-
-    // Create a port pair. The right side goes to the sender.
-    let (sub_left, sub_right) = Port::new_pair();
-
-    // Snapshot the current value first, then register the subscriber
-    // with the snapshot version.
-    let version;
-    let value: T;
-    {
-        let state = core.state.read();
-        version = state.version;
+    // If we're the sole owner of the core, take the value directly
+    // without cloning or locking.
+    if let Some(core) = Arc::get_mut(&mut core_ref.core) {
+        let state = core.state.get_mut();
+        let version = state.version;
         // SAFETY: core has element type T.
-        value = unsafe { state.value.as_ref::<T>() }.clone();
+        let value = unsafe { mem::replace(&mut state.value, ErasedValue::dangling()).take::<T>() };
+        let port = take_sole_owner_port(core.subscribe.get_mut());
+        return EncodedWatchReceiver {
+            version,
+            value,
+            port,
+        };
     }
 
-    // Register the right port with the sender for updates.
-    {
-        let mut subscribe = core.subscribe.lock();
-        match &mut *subscribe {
-            SubscribeState::Local { pending, make_msg } => {
-                *make_msg = Some(make_update_msg::<T>);
-                pending.push((version, sub_right));
-            }
-            SubscribeState::Upstream(pwh) => {
-                pwh.send(Message::new(ReceiverMessage::Subscribe(version, sub_right)));
-            }
-        }
-    }
+    // Multiple clones exist. Hold state(R) across the snapshot AND the
+    // subscriber registration to ensure the version we subscribe with
+    // matches the value we encode — preventing a TOCTOU where send()
+    // fires between the snapshot and the registration.
+    let (sub_left, sub_right) = Port::new_pair();
+    let state = core_ref.core.state.read();
+    let version = state.version;
+    // SAFETY: core has element type T.
+    let value = unsafe { state.value.as_ref::<T>() }.clone();
+    // Non-generic helper; state(R) → subscribe(M) is safe because
+    // send() drops state(W) before acquiring subscribe(M).
+    register_subscriber(&core_ref.core, version, sub_right, make_update_msg::<T>);
+    drop(state);
 
     EncodedWatchReceiver {
         version,
@@ -887,16 +909,79 @@ fn build_encoded_receiver<T: 'static + MeshField + Send + Sync + Clone>(
     }
 }
 
+/// Extracts the port from a sole-owner core's subscribe state.
+fn take_sole_owner_port(subscribe: &mut SubscribeState) -> Port {
+    match mem::replace(
+        subscribe,
+        SubscribeState::Local {
+            pending: Vec::new(),
+            make_msg: None,
+        },
+    ) {
+        SubscribeState::Upstream(pwh) => pwh.remove_handler().0,
+        SubscribeState::Local { .. } => {
+            // Sender-side core, sole owner — the sender is gone.
+            // Create a dead port for the encoded receiver.
+            Port::new_pair().0
+        }
+    }
+}
+
+/// Registers a subscriber port with the sender (non-generic).
+fn register_subscriber(
+    core: &WatchCore,
+    version: u64,
+    port: Port,
+    make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+) {
+    let mut subscribe = core.subscribe.lock();
+    match &mut *subscribe {
+        SubscribeState::Local {
+            pending,
+            make_msg: mm,
+        } => {
+            *mm = Some(make_msg);
+            pending.push((version, port));
+        }
+        SubscribeState::Upstream(pwh) => {
+            pwh.send(Message::new(ReceiverMessage::Subscribe(version, port)));
+        }
+    }
+}
+
 /// Reconstructs a `WatchReceiver<T>` from its encoded form.
 fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
     encoded: EncodedWatchReceiver<T>,
 ) -> WatchReceiver<T> {
-    let vtable: &'static WatchVtable = const { &WatchVtable::new::<T>() };
+    let core = decode_receiver_core(
+        encoded.version,
+        ErasedValue::new(encoded.value),
+        encoded.port,
+        const { &WatchVtable::new::<T>() },
+        decode_update_msg::<T>,
+    );
+    WatchReceiver {
+        core: WatchReceiverCore {
+            core,
+            last_seen: encoded.version,
+        },
+        cached_encoding: None,
+    }
+}
 
+/// Non-generic core of receiver decoding: creates the WatchCore and
+/// installs the upstream port handler.
+fn decode_receiver_core(
+    version: u64,
+    value: ErasedValue,
+    port: Port,
+    vtable: &'static WatchVtable,
+    decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
+) -> Arc<WatchCore> {
     let core = Arc::new(WatchCore {
         state: RwLock::new(WatchState {
-            version: encoded.version,
-            value: ErasedValue::new(encoded.value),
+            version,
+            value,
             closed: false,
         }),
         waiters: Mutex::new(Vec::new()),
@@ -909,18 +994,11 @@ fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
 
     let handler = WatchPortHandler {
         core: Arc::downgrade(&core),
-        decode: decode_update_msg::<T>,
+        decode,
     };
-    let upstream_pwh = encoded.port.set_handler(handler);
+    let upstream_pwh = port.set_handler(handler);
     *core.subscribe.lock() = SubscribeState::Upstream(upstream_pwh);
-
-    WatchReceiver {
-        core: WatchReceiverCore {
-            core,
-            last_seen: encoded.version,
-        },
-        cached_encoding: None,
-    }
+    core
 }
 
 // ---- Constructor ---------------------------------------------------------

@@ -37,7 +37,6 @@ use mesh_protobuf::inplace_none;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
-use std::any::Any;
 use std::fmt;
 use std::fmt::Debug;
 use std::future::Future;
@@ -330,12 +329,17 @@ impl HandlePortEvent for WatchPortHandler {
 /// The sending half of a watch channel, created by [`watch`].
 ///
 /// Not cloneable, but transferable across mesh nodes via encoding.
-pub struct WatchSender<T>(WatchSenderCore, PhantomData<Arc<Mutex<T>>>);
+pub struct WatchSender<T> {
+    core: WatchSenderCore,
+    /// Cached encoded form, built during `compute_message_size` and
+    /// consumed during `write_message`.
+    cached_encoding: Option<EncodedWatchSender<T>>,
+}
 
 impl<T> Debug for WatchSender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WatchSender")
-            .field("core", &self.0.core)
+            .field("core", &self.core.core)
             .finish()
     }
 }
@@ -343,38 +347,33 @@ impl<T> Debug for WatchSender<T> {
 struct WatchSenderCore {
     core: Arc<WatchCore>,
     subscribers: Vec<PortWithHandler<SubHandler>>,
-    /// Cached encoded form, built during `compute_message_size` and
-    /// consumed during `write_message`. Type-erased because
-    /// `WatchSenderCore` is not generic over `T`.
-    cached_encoding: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl<T: 'static + Send + Sync> WatchSender<T> {
     /// Updates the watched value. Non-blocking. Returns the previous value.
     pub fn send(&mut self, value: T) -> T {
         // SAFETY: the core has element type T.
-        unsafe { self.0.send::<T>(value) }
+        unsafe { self.core.send::<T>(value) }
     }
 
     /// Reads the current value via an RAII guard.
     pub fn borrow(&self) -> Ref<'_, T> {
         Ref {
-            guard: self.0.core.state.read(),
+            guard: self.core.core.state.read(),
             _phantom: PhantomData,
         }
     }
 
     /// Creates a new receiver subscribed to this sender.
     pub fn subscribe(&mut self) -> WatchReceiver<T> {
-        let version = self.0.core.state.read().version;
-        WatchReceiver(
-            WatchReceiverCore {
-                core: self.0.core.clone(),
+        let version = self.core.core.state.read().version;
+        WatchReceiver {
+            core: WatchReceiverCore {
+                core: self.core.core.clone(),
                 last_seen: version,
-                cached_encoding: None,
             },
-            PhantomData,
-        )
+            cached_encoding: None,
+        }
     }
 }
 
@@ -513,28 +512,33 @@ impl Drop for WatchSenderCore {
 /// The receiving half of a watch channel, created by [`watch`].
 ///
 /// Cloneable. Transferable across mesh nodes via encoding.
-pub struct WatchReceiver<T>(WatchReceiverCore, PhantomData<Arc<Mutex<T>>>);
+pub struct WatchReceiver<T> {
+    core: WatchReceiverCore,
+    /// Cached encoded form for the encoding pipeline.
+    cached_encoding: Option<EncodedWatchReceiver<T>>,
+}
 
 impl<T> Debug for WatchReceiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WatchReceiver")
-            .field("core", &self.0.core)
-            .field("last_seen", &self.0.last_seen)
+            .field("core", &self.core.core)
+            .field("last_seen", &self.core.last_seen)
             .finish()
     }
 }
 
 impl<T> Clone for WatchReceiver<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone(), PhantomData)
+        Self {
+            core: self.core.clone(),
+            cached_encoding: None,
+        }
     }
 }
 
 struct WatchReceiverCore {
     core: Arc<WatchCore>,
     last_seen: u64,
-    /// Cached encoded form for the encoding pipeline.
-    cached_encoding: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl Clone for WatchReceiverCore {
@@ -542,7 +546,6 @@ impl Clone for WatchReceiverCore {
         Self {
             core: self.core.clone(),
             last_seen: self.last_seen,
-            cached_encoding: None,
         }
     }
 }
@@ -550,7 +553,7 @@ impl Clone for WatchReceiverCore {
 impl<T: 'static + Send + Sync + Clone> WatchReceiver<T> {
     /// Gets a clone of the current value.
     pub fn get(&self) -> T {
-        let state = self.0.core.state.read();
+        let state = self.core.core.state.read();
         // SAFETY: core has element type T.
         unsafe { state.value.as_ref::<T>() }.clone()
     }
@@ -560,15 +563,15 @@ impl<T: 'static + Send + Sync> WatchReceiver<T> {
     /// Reads the current value via an RAII guard.
     pub fn borrow(&self) -> Ref<'_, T> {
         Ref {
-            guard: self.0.core.state.read(),
+            guard: self.core.core.state.read(),
             _phantom: PhantomData,
         }
     }
 
     /// Reads the current value and marks it as seen.
     pub fn borrow_and_update(&mut self) -> Ref<'_, T> {
-        let guard = self.0.core.state.read();
-        self.0.last_seen = guard.version;
+        let guard = self.core.core.state.read();
+        self.core.last_seen = guard.version;
         Ref {
             guard,
             _phantom: PhantomData,
@@ -583,9 +586,9 @@ impl<T: 'static + Send + Sync> WatchReceiver<T> {
     fn poll_changed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), RecvError>> {
         loop {
             {
-                let state = self.0.core.state.read();
-                if self.0.last_seen < state.version {
-                    self.0.last_seen = state.version;
+                let state = self.core.core.state.read();
+                if self.core.last_seen < state.version {
+                    self.core.last_seen = state.version;
                     return Poll::Ready(Ok(()));
                 }
                 if state.closed {
@@ -594,10 +597,10 @@ impl<T: 'static + Send + Sync> WatchReceiver<T> {
             }
             // Register waker under waiters lock, double-check to avoid
             // lost wakeup.
-            let mut waiters = self.0.core.waiters.lock();
+            let mut waiters = self.core.core.waiters.lock();
             {
-                let state = self.0.core.state.read();
-                if self.0.last_seen < state.version || state.closed {
+                let state = self.core.core.state.read();
+                if self.core.last_seen < state.version || state.closed {
                     drop(waiters);
                     continue;
                 }
@@ -654,13 +657,12 @@ impl<T: 'static + MeshField + Send + Sync + Clone> MessageEncode<WatchSender<T>,
         item: &mut WatchSender<T>,
         sizer: mesh_protobuf::protobuf::MessageSizer<'_>,
     ) {
-        let encoded = build_encoded_sender::<T>(&mut item.0);
-        let mut encoded = Box::new(encoded);
+        let mut encoded = build_encoded_sender::<T>(&mut item.core);
         <EncodedWatchSender<T> as DefaultEncoding>::Encoding::compute_message_size(
-            &mut *encoded,
+            &mut encoded,
             sizer,
         );
-        item.0.cached_encoding = Some(encoded);
+        item.cached_encoding = Some(encoded);
     }
 
     fn write_message(
@@ -668,12 +670,9 @@ impl<T: 'static + MeshField + Send + Sync + Clone> MessageEncode<WatchSender<T>,
         writer: mesh_protobuf::protobuf::MessageWriter<'_, '_, Resource>,
     ) {
         let inner = mem::ManuallyDrop::new(item);
-        // SAFETY: reading fields from ManuallyDrop, won't be used again.
-        let cached: Box<dyn Any + Send> = unsafe { std::ptr::read(&inner.0.cached_encoding) }
+        // SAFETY: reading cached_encoding from ManuallyDrop, won't be used again.
+        let encoded = unsafe { std::ptr::read(&inner.cached_encoding) }
             .expect("compute_message_size must be called before write_message");
-        let encoded = *cached
-            .downcast::<EncodedWatchSender<T>>()
-            .expect("wrong cached type");
         // Don't run WatchSenderCore::drop (which would set closed + wake waiters)
         // since the core has already been transferred.
         <EncodedWatchSender<T> as DefaultEncoding>::Encoding::write_message(encoded, writer);
@@ -780,14 +779,10 @@ fn decode_sender<T: 'static + MeshField + Send + Sync + Clone>(
         })
         .collect();
 
-    WatchSender(
-        WatchSenderCore {
-            core,
-            subscribers,
-            cached_encoding: None,
-        },
-        PhantomData,
-    )
+    WatchSender {
+        core: WatchSenderCore { core, subscribers },
+        cached_encoding: None,
+    }
 }
 
 // ---- Encoding: WatchReceiver ---------------------------------------------
@@ -814,24 +809,21 @@ impl<T: 'static + MeshField + Send + Sync + Clone> MessageEncode<WatchReceiver<T
         item: &mut WatchReceiver<T>,
         sizer: mesh_protobuf::protobuf::MessageSizer<'_>,
     ) {
-        let mut encoded = Box::new(build_encoded_receiver::<T>(&item.0));
+        let mut encoded = build_encoded_receiver::<T>(&item.core);
         <EncodedWatchReceiver<T> as DefaultEncoding>::Encoding::compute_message_size(
-            &mut *encoded,
+            &mut encoded,
             sizer,
         );
-        item.0.cached_encoding = Some(encoded);
+        item.cached_encoding = Some(encoded);
     }
 
     fn write_message(
         item: WatchReceiver<T>,
         writer: mesh_protobuf::protobuf::MessageWriter<'_, '_, Resource>,
     ) {
-        let encoded = *item
-            .0
+        let encoded = item
             .cached_encoding
-            .expect("compute_message_size must be called before write_message")
-            .downcast::<EncodedWatchReceiver<T>>()
-            .expect("wrong cached type");
+            .expect("compute_message_size must be called before write_message");
         <EncodedWatchReceiver<T> as DefaultEncoding>::Encoding::write_message(encoded, writer);
     }
 }
@@ -920,14 +912,13 @@ fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
     let upstream_pwh = encoded.port.set_handler(handler);
     *core.subscribe.lock() = SubscribeState::Upstream(upstream_pwh);
 
-    WatchReceiver(
-        WatchReceiverCore {
+    WatchReceiver {
+        core: WatchReceiverCore {
             core,
             last_seen: encoded.version,
-            cached_encoding: None,
         },
-        PhantomData,
-    )
+        cached_encoding: None,
+    }
 }
 
 // ---- Constructor ---------------------------------------------------------
@@ -955,17 +946,18 @@ pub fn watch<T: 'static + Send + Sync + Clone>(initial: T) -> (WatchSender<T>, W
     let sender = WatchSenderCore {
         core: core.clone(),
         subscribers: Vec::new(),
-        cached_encoding: None,
     };
-    let receiver = WatchReceiverCore {
-        core,
-        last_seen: 0,
-        cached_encoding: None,
-    };
+    let receiver = WatchReceiverCore { core, last_seen: 0 };
 
     (
-        WatchSender(sender, PhantomData),
-        WatchReceiver(receiver, PhantomData),
+        WatchSender {
+            core: sender,
+            cached_encoding: None,
+        },
+        WatchReceiver {
+            core: receiver,
+            cached_encoding: None,
+        },
     )
 }
 

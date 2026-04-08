@@ -279,25 +279,28 @@ impl HandlePortEvent for WatchPortHandler {
             // SAFETY: decode matches the type used to encode.
             unsafe { (self.decode)(message) }.map_err(HandleMessageError::new)?;
         let mut state = core.state.write();
-        if version <= state.version {
-            let current = state.version;
+        let current = state.version;
+        let (old, r) = if version > current {
+            let old = mem::replace(&mut state.value, value);
+            state.version = version;
             drop(state);
-            // SAFETY: vtable matches the type.
-            unsafe { (core.vtable.drop_value)(value) };
-            return Err(HandleMessageError::new(format!(
-                "received stale or duplicate update: got version {version}, have {current}",
-            )));
-        }
-        let old = mem::replace(&mut state.value, value);
-        state.version = version;
-        drop(state);
-        control.respond(Message::new(ReceiverMessage::Ack(version)));
-        for waker in core.waiters.lock().drain(..) {
-            control.wake(waker);
-        }
+            control.respond(Message::new(ReceiverMessage::Ack(version)));
+            for waker in core.waiters.lock().drain(..) {
+                control.wake(waker);
+            }
+            (old, Ok(()))
+        } else {
+            drop(state);
+            (
+                value,
+                Err(HandleMessageError::new(
+                    "received stale or duplicate update",
+                )),
+            )
+        };
         // SAFETY: vtable matches the type.
         unsafe { (core.vtable.drop_value)(old) };
-        Ok(())
+        r
     }
 
     fn close(&mut self, control: &mut PortControl<'_, '_>) {

@@ -606,19 +606,13 @@ impl FreeSpaceTracker {
     }
 
     /// Current file length.
-    #[expect(dead_code)] // used in later stages
+    #[cfg(test)]
     pub fn file_length(&self) -> u64 {
         self.inner.lock().file_length
     }
 
-    /// Current last-file-offset (highest in-use byte).
-    #[expect(dead_code)] // used in later stages
-    pub fn last_file_offset(&self) -> u64 {
-        self.inner.lock().last_file_offset
-    }
-
     /// Current zero offset.
-    #[expect(dead_code)] // used in later stages
+    #[cfg(test)]
     pub fn zero_offset(&self) -> u64 {
         self.inner.lock().zero_offset
     }

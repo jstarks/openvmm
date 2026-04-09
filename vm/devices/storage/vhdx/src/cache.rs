@@ -186,28 +186,6 @@ impl LruList {
         self.nodes[idx].linked = false;
     }
 
-    /// Insert an unlinked node at the MRU end (after sentinel).
-    fn push_front(&mut self, idx: usize) {
-        debug_assert!(!self.is_linked(idx), "push_front on linked node");
-        let old_front = self.nodes[0].next;
-        self.nodes[idx].prev = 0;
-        self.nodes[idx].next = old_front;
-        self.nodes[0].next = idx;
-        self.nodes[old_front].prev = idx;
-        self.nodes[idx].linked = true;
-    }
-
-    /// Insert an unlinked node at the LRU end (before sentinel).
-    fn push_back(&mut self, idx: usize) {
-        debug_assert!(!self.is_linked(idx), "push_back on linked node");
-        let old_back = self.nodes[0].prev;
-        self.nodes[idx].next = 0;
-        self.nodes[idx].prev = old_back;
-        self.nodes[0].prev = idx;
-        self.nodes[old_back].next = idx;
-        self.nodes[idx].linked = true;
-    }
-
     /// Move a node to the MRU end. Works whether linked or unlinked.
     fn move_to_front(&mut self, idx: usize) {
         if idx == 0 {
@@ -404,7 +382,6 @@ impl<F: AsyncFile> PageCache<F> {
     }
 
     /// Update the base file offset for a previously registered tag.
-    #[expect(dead_code)]
     pub fn update_tag_offset(&self, tag: u8, new_base: u64) {
         self.pages.lock().tag_offsets[tag as usize] = new_base;
     }

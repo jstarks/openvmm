@@ -156,7 +156,6 @@ pub struct ReplayResult {
     pub replayed: bool,
     /// Whether the region table was modified during replay
     /// (caller should re-read region tables).
-    #[expect(dead_code)]
     pub region_table_modified: bool,
     /// The last file offset from the newest replayed entry.
     #[expect(dead_code)]
@@ -168,7 +167,6 @@ pub struct ReplayResult {
     #[expect(dead_code)]
     pub head: u32,
     /// Sequence number of the last replayed entry.
-    #[expect(dead_code)]
     pub sequence_number: u64,
     /// Flushed file offset from the newest replayed entry.
     #[expect(dead_code)]

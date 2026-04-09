@@ -282,19 +282,6 @@ impl Bat {
         }
     }
 
-    /// Compute the total number of BAT pages needed.
-    pub fn total_bat_pages(&self) -> usize {
-        let total_entries = if self.has_parent {
-            self.sector_bitmap_block_count as u64 * (self.chunk_ratio as u64 + 1)
-        } else {
-            self.data_block_count as u64
-                + (self.data_block_count.saturating_sub(1) as u64 / self.chunk_ratio as u64)
-                + 1 // account for the partial group's SBM slot
-        };
-        // Each page holds ENTRIES_PER_BAT_PAGE entries.
-        ceil_div(total_entries, ENTRIES_PER_BAT_PAGE) as usize
-    }
-
     /// Look up the payload block mapping from in-memory state.
     ///
     /// Synchronous — no I/O. Reads from the in-memory `BatState`.

@@ -43,7 +43,6 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::task::Context;
@@ -52,7 +51,7 @@ use std::task::Waker;
 
 // ---- Type-erased value ---------------------------------------------------
 
-struct ErasedValue(NonNull<()>);
+struct ErasedValue(*mut ());
 
 // SAFETY: the public API enforces Send/Sync via PhantomData on typed wrappers.
 unsafe impl Send for ErasedValue {}
@@ -61,14 +60,18 @@ unsafe impl Sync for ErasedValue {}
 
 impl ErasedValue {
     fn new<T>(value: Box<T>) -> Self {
-        Self(NonNull::new(Box::into_raw(value).cast()).unwrap())
+        Self(Box::into_raw(value).cast())
+    }
+
+    fn null() -> Self {
+        Self(std::ptr::null_mut())
     }
 
     /// # Safety
     /// `T` must match the type used at construction.
     unsafe fn as_ref<T>(&self) -> &T {
         // SAFETY: caller guarantees T matches.
-        unsafe { &*self.0.cast::<T>().as_ptr() }
+        unsafe { &*self.0.cast::<T>() }
     }
 
     /// Consumes self and returns the value.
@@ -77,11 +80,7 @@ impl ErasedValue {
     /// `T` must match the type used at construction.
     unsafe fn into_box<T>(self) -> Box<T> {
         // SAFETY: caller guarantees T matches.
-        unsafe { Box::from_raw(self.0.cast::<T>().as_ptr()) }
-    }
-
-    fn dangling() -> Self {
-        Self(NonNull::dangling())
+        unsafe { Box::from_raw(self.0.cast::<T>()) }
     }
 
     /// Clones the value and returns a new `ErasedValue` containing the clone.
@@ -93,6 +92,10 @@ impl ErasedValue {
         // SAFETY: caller must ensure T matches the type used at construction.
         let clone: Box<T> = Box::new(unsafe { self.as_ref::<T>().clone() });
         Self::new(clone)
+    }
+
+    fn is_null(&self) -> bool {
+        self.0.is_null()
     }
 }
 
@@ -194,10 +197,11 @@ struct WatchState {
 
 impl Drop for WatchCore {
     fn drop(&mut self) {
-        let state = self.state.get_mut();
-        let val = mem::replace(&mut state.value, ErasedValue::dangling());
-        // SAFETY: vtable matches the type.
-        unsafe { (self.vtable.drop_value)(val) };
+        let value = mem::replace(&mut self.state.get_mut().value, ErasedValue::null());
+        if !value.is_null() {
+            // SAFETY: vtable matches the type.
+            unsafe { (self.vtable.drop_value)(value) };
+        }
     }
 }
 
@@ -347,7 +351,7 @@ pub struct WatchSender<T> {
     core: WatchSenderCore,
     /// Cached encoded form, built during `compute_message_size` and
     /// consumed during `write_message`.
-    cached_encoding: Option<EncodedWatchSender<T>>,
+    cached_encoding: Option<Box<EncodedWatchSender<T>>>,
 }
 
 impl<T> Debug for WatchSender<T> {
@@ -521,7 +525,7 @@ impl Drop for WatchSenderCore {
 pub struct WatchReceiver<T> {
     core: WatchReceiverCore,
     /// Cached encoded form for the encoding pipeline.
-    cached_encoding: Option<EncodedWatchReceiver<T>>,
+    cached_encoding: Option<Box<EncodedWatchReceiver<T>>>,
 }
 
 impl<T> Debug for WatchReceiver<T> {
@@ -692,20 +696,20 @@ impl<T: 'static + MeshField + Send + Sync + Clone> MessageEncode<WatchSender<T>,
             &mut encoded,
             sizer,
         );
-        item.cached_encoding = Some(encoded);
+        item.cached_encoding = Some(Box::new(encoded));
     }
 
     fn write_message(
         item: WatchSender<T>,
         writer: mesh_protobuf::protobuf::MessageWriter<'_, '_, Resource>,
     ) {
-        let inner = mem::ManuallyDrop::new(item);
-        // SAFETY: reading cached_encoding from ManuallyDrop, won't be used again.
-        let encoded = unsafe { std::ptr::read(&inner.cached_encoding) }
+        let encoded = item
+            .cached_encoding
             .expect("compute_message_size must be called before write_message");
-        // Don't run WatchSenderCore::drop (which would set closed + wake waiters)
-        // since the core has already been transferred.
-        <EncodedWatchSender<T> as DefaultEncoding>::Encoding::write_message(encoded, writer);
+        // item drops normally here — WatchSenderCore::drop sets closed
+        // and wakes waiters, which is harmless since subscribers were
+        // already drained during compute_message_size.
+        <EncodedWatchSender<T> as DefaultEncoding>::Encoding::write_message(*encoded, writer);
     }
 }
 
@@ -765,7 +769,7 @@ fn build_encoded_sender<T: 'static + MeshField + Send + Sync + Clone>(
             }));
             let state = core.state.get_mut();
             let version = state.version;
-            let value = mem::replace(&mut state.value, ErasedValue::dangling());
+            let value = mem::replace(&mut state.value, ErasedValue::null());
             return ErasedWatchSender {
                 version,
                 value,
@@ -924,7 +928,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> MessageEncode<WatchReceiver<T
             &mut encoded,
             sizer,
         );
-        item.cached_encoding = Some(encoded);
+        item.cached_encoding = Some(Box::new(encoded));
     }
 
     fn write_message(
@@ -934,7 +938,7 @@ impl<T: 'static + MeshField + Send + Sync + Clone> MessageEncode<WatchReceiver<T
         let encoded = item
             .cached_encoding
             .expect("compute_message_size must be called before write_message");
-        <EncodedWatchReceiver<T> as DefaultEncoding>::Encoding::write_message(encoded, writer);
+        <EncodedWatchReceiver<T> as DefaultEncoding>::Encoding::write_message(*encoded, writer);
     }
 }
 
@@ -963,31 +967,36 @@ fn build_encoded_receiver<T: 'static + MeshField + Send + Sync + Clone>(
         clone: unsafe fn(&ErasedValue) -> ErasedValue,
         make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
     ) -> ErasedWatchReceiver {
-        // If we're the sole owner of the core, take the value directly
-        // without cloning or locking.
-        if let Some(core) = Arc::get_mut(&mut core_ref.core) {
-            let state = core.state.get_mut();
-            let version = state.version;
-            let value = mem::replace(&mut state.value, ErasedValue::dangling());
-            let port = {
-                let subscribe: &mut SubscribeState = core.subscribe.get_mut();
-                match mem::replace(
-                    subscribe,
-                    SubscribeState::Local {
-                        pending: Vec::new(),
-                        make_msg: None,
-                    },
-                ) {
-                    SubscribeState::Upstream(_pwh) => {
-                        unreachable!("TODO: should this have been removed already?")
-                    }
-                    SubscribeState::Local { .. } => {
-                        // Sender-side core, sole owner — the sender is gone.
-                        // Create a dead port for the encoded receiver.
-                        Port::new_pair().0
-                    }
+        // If we're the sole strong owner, we can take the value without
+        // cloning. We check strong_count rather than Arc::get_mut because
+        // the Upstream PWH holds a Weak back to this core, which prevents
+        // get_mut from succeeding. We hold &mut, preventing concurrent
+        // Arc::clone.
+        if Arc::strong_count(&core_ref.core) == 1 {
+            // Remove the PWH (dropping its Weak) and extract the port.
+            let mut subscribe = core_ref.core.subscribe.lock();
+            let port = match mem::replace(
+                &mut *subscribe,
+                SubscribeState::Local {
+                    pending: Vec::new(),
+                    make_msg: None,
+                },
+            ) {
+                SubscribeState::Upstream(pwh) => pwh.remove_handler().0,
+                SubscribeState::Local { .. } => {
+                    // Sender-side core, sole owner — the sender is gone.
+                    Port::new_pair().0
                 }
             };
+            drop(subscribe);
+
+            // With the Weak dropped and no other strong refs, get_mut
+            // succeeds and we can take the value without cloning.
+            let core = Arc::get_mut(&mut core_ref.core)
+                .expect("sole strong ref and no remaining Weak refs");
+            let state = core.state.get_mut();
+            let version = state.version;
+            let value = mem::replace(&mut state.value, ErasedValue::null());
             return ErasedWatchReceiver {
                 version,
                 value,
@@ -1357,5 +1366,25 @@ mod tests {
             let result = r2.changed().await;
             assert!(result.is_err());
         });
+    }
+
+    #[test]
+    fn test_sole_receiver_roundtrip() {
+        // Encode a receiver after all other refs (including sender) are gone.
+        // This exercises the sole-owner fast path in build_encoded_receiver.
+        let (sender, receiver) = watch(42u32);
+        drop(sender);
+        let receiver = round_trip(receiver);
+        assert_eq!(receiver.get(), 42);
+    }
+
+    #[test]
+    fn test_sole_sender_roundtrip() {
+        // Encode a sender after the initial receiver is dropped.
+        // This exercises the sole-owner fast path in build_encoded_sender.
+        let (sender, receiver) = watch(42u32);
+        drop(receiver);
+        let sender = round_trip(sender);
+        assert_eq!(*sender.borrow(), 42);
     }
 }

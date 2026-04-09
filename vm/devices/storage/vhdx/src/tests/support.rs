@@ -140,7 +140,7 @@ impl InMemoryFile {
     ///
     /// Useful when a test needs to pass a file to `VhdxFile::open_writable()` (which
     /// takes ownership) while keeping a handle for subsequent operations.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn clone_file(&self) -> InMemoryFile {
         InMemoryFile {
             inner: Mutex::new(InMemoryFileInner {
@@ -159,7 +159,7 @@ impl InMemoryFile {
     }
 
     /// Create a VHDX file in memory with the given disk size and default parameters.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     ///
     /// Returns the `InMemoryFile` and the validated `CreateParams`.
     pub async fn create_test_vhdx(disk_size: u64) -> (InMemoryFile, crate::create::CreateParams) {
@@ -273,7 +273,7 @@ struct CrashTestFileInner {
 
 /// An entry in the write log, tracking I/O operations for ordering verification.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub enum WriteLogEntry {
     /// A write operation at the given offset and length.
     Write {
@@ -293,7 +293,7 @@ pub enum WriteLogEntry {
 
 impl CrashTestFile {
     /// Create a new crash-test file of the given size (all zeros).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn new(size: u64) -> Self {
         let data = vec![0u8; size as usize];
         Self {
@@ -320,7 +320,7 @@ impl CrashTestFile {
 
     /// Simulate power failure. Returns the durable state.
     /// All unflushed (volatile-only) writes are lost.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn crash(self) -> Vec<u8> {
         self.inner.into_inner().durable
     }
@@ -336,7 +336,7 @@ impl CrashTestFile {
     }
 
     /// Get the write log for ordering verification.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn write_log(&self) -> Vec<WriteLogEntry> {
         self.inner.lock().write_log.clone()
     }

@@ -20,10 +20,10 @@ pub(crate) struct MetadataTable {
     /// The validated entries (sorted by offset for free-space scanning).
     entries: Vec<MetadataTableEntry>,
     /// Total size of system metadata items.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub system_metadata_size: u32,
     /// Total size of user metadata items.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub user_metadata_size: u32,
     /// Number of user metadata entries.
     pub user_item_count: u16,

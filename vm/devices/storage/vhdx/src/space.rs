@@ -176,7 +176,7 @@ impl SpaceBitmap {
     }
 
     /// Clear all bits.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn clear_all(&mut self) {
         for w in &mut self.words {
             *w = 0;
@@ -242,7 +242,7 @@ struct TrimmedBlockTracker {
 }
 
 /// Internal mutable state of the free space tracker.
-#[allow(dead_code)] // fields used in later stages
+#[expect(dead_code)] // fields used in later stages
 struct FreeSpaceInner {
     free_space: FreeSpacePool,
     anchored_space: AnchoredSpacePool,
@@ -559,7 +559,7 @@ impl FreeSpaceTracker {
     }
 
     /// Compute truncation target size.
-    #[allow(dead_code)] // used in later stages
+    #[expect(dead_code)] // used in later stages
     pub fn truncate_target(&self, is_fully_allocated: bool) -> u64 {
         let inner = self.inner.lock();
         let mut target = inner.last_file_offset;
@@ -606,19 +606,19 @@ impl FreeSpaceTracker {
     }
 
     /// Current file length.
-    #[allow(dead_code)] // used in later stages
+    #[expect(dead_code)] // used in later stages
     pub fn file_length(&self) -> u64 {
         self.inner.lock().file_length
     }
 
     /// Current last-file-offset (highest in-use byte).
-    #[allow(dead_code)] // used in later stages
+    #[expect(dead_code)] // used in later stages
     pub fn last_file_offset(&self) -> u64 {
         self.inner.lock().last_file_offset
     }
 
     /// Current zero offset.
-    #[allow(dead_code)] // used in later stages
+    #[expect(dead_code)] // used in later stages
     pub fn zero_offset(&self) -> u64 {
         self.inner.lock().zero_offset
     }
@@ -944,7 +944,6 @@ fn find_and_unanchor_in_memory_inner(
 }
 
 /// Compute excess block count (blocks that won't fit given current space).
-#[allow(dead_code)] // used by truncate_target
 fn compute_excess_block_count(inner: &FreeSpaceInner, max_offset: u64) -> u32 {
     // Count unallocated blocks.
     let total = inner.data_block_count;

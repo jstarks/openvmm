@@ -404,7 +404,7 @@ impl<F: AsyncFile> PageCache<F> {
     }
 
     /// Update the base file offset for a previously registered tag.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn update_tag_offset(&self, tag: u8, new_base: u64) {
         self.pages.lock().tag_offsets[tag as usize] = new_base;
     }

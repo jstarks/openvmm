@@ -23,7 +23,6 @@ pub(crate) struct ParsedRegions {
     /// File offset of the BAT region.
     pub bat_offset: u64,
     /// Length of the BAT region in bytes.
-    #[allow(dead_code)]
     pub bat_length: u32,
     /// File offset of the metadata region.
     pub metadata_offset: u64,

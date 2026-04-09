@@ -219,7 +219,7 @@ pub struct VhdxFile<F: AsyncFile> {
     physical_sector_size: u32,
     pub(crate) has_parent: bool,
     is_fully_allocated: bool,
-    #[allow(dead_code)] // Phase 7+: used for disk_backend integration
+    #[expect(dead_code)] // Phase 7+: used for disk_backend integration
     page_83_data: Guid,
 
     // Metadata table (kept for on-demand metadata reads).
@@ -250,11 +250,10 @@ pub struct VhdxFile<F: AsyncFile> {
     pub(crate) free_space: FreeSpaceTracker,
 
     // Region offsets
-    #[allow(dead_code)] // Phase 9+: used for space management
+    #[expect(dead_code)] // Phase 9+: used for space management
     bat_length: u32,
-    #[allow(dead_code)] // Phase 9+: used for metadata writes
     metadata_offset: u64,
-    #[allow(dead_code)] // Phase 9+: used for metadata writes
+    #[expect(dead_code)] // Phase 9+: used for metadata writes
     metadata_length: u32,
     log_offset: u64,
     log_length: u32,
@@ -267,7 +266,7 @@ pub struct VhdxFile<F: AsyncFile> {
     region_rewrite_data: Option<Vec<u8>>,
 
     // Error state: once set, all operations fail.
-    #[allow(dead_code)] // Phase 7+: used for error propagation on I/O path
+    #[expect(dead_code)] // Phase 7+: used for error propagation on I/O path
     failed: Option<VhdxError>,
 
     // Log task state (set when opened writable via VhdxBuilder::writable).

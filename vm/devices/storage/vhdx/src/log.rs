@@ -16,7 +16,7 @@
 
 // The LogWriter, DataPage, and ZeroRange types are pub(crate) and currently
 // only used from tests (open.rs tests and unit tests in this module).
-// Per-item #[allow(dead_code)] is applied on those types below.
+// Per-item #[expect(dead_code)] is applied on those types below.
 
 use crate::AsyncFile;
 use crate::error::CorruptionType;
@@ -156,22 +156,22 @@ pub struct ReplayResult {
     pub replayed: bool,
     /// Whether the region table was modified during replay
     /// (caller should re-read region tables).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub region_table_modified: bool,
     /// The last file offset from the newest replayed entry.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub last_file_offset: u64,
     /// Tail of the replayed sequence (log-region-relative offset).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub tail: u32,
     /// Head of the replayed sequence (log-region-relative offset).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub head: u32,
     /// Sequence number of the last replayed entry.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub sequence_number: u64,
     /// Flushed file offset from the newest replayed entry.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub flushed_file_offset: u64,
 }
 
@@ -622,7 +622,6 @@ async fn apply_sequence<F: AsyncFile>(
 // ---------------------------------------------------------------------------
 
 /// A page to be logged: 4096 bytes of data at a file offset.
-#[allow(dead_code)]
 pub struct DataPage<'a> {
     /// Target file offset (must be aligned to LOG_SECTOR_SIZE).
     pub file_offset: u64,
@@ -631,7 +630,6 @@ pub struct DataPage<'a> {
 }
 
 /// A range to be zeroed during replay.
-#[allow(dead_code)]
 pub struct ZeroRange {
     /// Target file offset (must be aligned to LOG_SECTOR_SIZE).
     pub file_offset: u64,
@@ -640,7 +638,6 @@ pub struct ZeroRange {
 }
 
 /// Active log state for writing new entries.
-#[allow(dead_code)]
 pub struct LogWriter {
     region: LogRegion,
     tail: u32,
@@ -651,7 +648,7 @@ pub struct LogWriter {
     last_file_offset: u64,
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl LogWriter {
     /// Create a new `LogWriter` for an empty log.
     ///
@@ -830,7 +827,6 @@ impl LogWriter {
 }
 
 /// Build a `LogDataSector` from a page of original data and a sequence number.
-#[allow(dead_code)]
 fn build_data_sector(source: &[u8; SECTOR as usize], sequence_number: u64) -> LogDataSector {
     let mut data = [0u8; 4084];
     data.copy_from_slice(&source[8..SECTOR as usize - 4]);

@@ -86,7 +86,6 @@ impl ErasedValue {
     /// Clones the value and returns a new `ErasedValue` containing the clone.
     ///
     /// # Safety
-    ///
     /// `T` must match the type used at construction.
     unsafe fn clone_as<T: Clone>(&self) -> Self {
         // SAFETY: caller must ensure T matches the type used at construction.
@@ -94,30 +93,24 @@ impl ErasedValue {
         Self::new(clone)
     }
 
+    /// Drops the value by consuming self.
+    ///
+    /// # Safety
+    /// `T` must match the type used at construction.
+    unsafe fn drop_as<T>(self) {
+        // SAFETY: caller must ensure T matches the type used at construction.
+        let _ = unsafe { self.into_box::<T>() };
+    }
+
     fn is_null(&self) -> bool {
         self.0.is_null()
     }
 }
 
-// ---- Vtable --------------------------------------------------------------
-
-struct WatchVtable {
-    drop_value: unsafe fn(ErasedValue),
-}
-
-impl WatchVtable {
-    const fn new<T: 'static + Send + Clone>() -> Self {
-        /// # Safety
-        /// `v` must contain a value of type `T`.
-        unsafe fn drop_value<T>(v: ErasedValue) {
-            // SAFETY: guaranteed by caller.
-            let _ = unsafe { v.into_box::<T>() };
-        }
-        Self {
-            drop_value: drop_value::<T>,
-        }
-    }
-}
+type DropFn = unsafe fn(ErasedValue);
+type CloneFn = unsafe fn(&ErasedValue) -> ErasedValue;
+type MakeMsgFn = unsafe fn(&ErasedValue, u64) -> Message<'static>;
+type DecodeMsgFn = unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>;
 
 /// Clones a type-erased value and wraps it in an `EncodedUpdate<T>` message.
 ///
@@ -166,7 +159,7 @@ enum ReceiverMessage {
 struct WatchCore {
     state: RwLock<WatchState>,
     waiters: Mutex<Vec<Waker>>,
-    vtable: &'static WatchVtable,
+    drop: DropFn,
     /// How to register new remote subscribers.
     ///
     /// - Sender-side core (`Local`): pending queue drained by the sender
@@ -199,8 +192,8 @@ impl Drop for WatchCore {
     fn drop(&mut self) {
         let value = mem::replace(&mut self.state.get_mut().value, ErasedValue::null());
         if !value.is_null() {
-            // SAFETY: vtable matches the type.
-            unsafe { (self.vtable.drop_value)(value) };
+            // SAFETY: drop matches the type.
+            unsafe { (self.drop)(value) };
         }
     }
 }
@@ -223,7 +216,7 @@ struct SubHandler {
     sent_version: u64,
     /// Type-erased fn to build an update message from the current value.
     /// Captured at encoding boundaries where `MeshField` is available.
-    make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+    make_msg: MakeMsgFn,
 }
 
 impl HandlePortEvent for SubHandler {
@@ -282,7 +275,7 @@ impl HandlePortEvent for SubHandler {
 
 struct WatchPortHandler {
     core: Weak<WatchCore>,
-    decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
+    decode: DecodeMsgFn,
 }
 
 impl HandlePortEvent for WatchPortHandler {
@@ -318,8 +311,8 @@ impl HandlePortEvent for WatchPortHandler {
                 )),
             )
         };
-        // SAFETY: vtable matches the type.
-        unsafe { (core.vtable.drop_value)(old) };
+        // SAFETY: drop matches the type.
+        unsafe { (core.drop)(old) };
         r
     }
 
@@ -473,12 +466,7 @@ impl WatchSenderCore {
             let pending_ack = if ver < current_version {
                 let msg = {
                     // SAFETY: make_msg matches the type.
-                    unsafe {
-                        make_msg(
-                            &self.core.state.read().value,
-                            current_version,
-                        )
-                    }
+                    unsafe { make_msg(&self.core.state.read().value, current_version) }
                 };
                 port.send(msg);
                 true
@@ -725,8 +713,8 @@ fn build_encoded_sender<T: 'static + MeshField + Send + Sync + Clone>(
 ) -> EncodedWatchSender<T> {
     fn build_encoded_sender(
         core_ref: &mut WatchSenderCore,
-        clone: unsafe fn(&ErasedValue) -> ErasedValue,
-        decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
+        clone: CloneFn,
+        decode: DecodeMsgFn,
     ) -> ErasedWatchSender {
         // Extract SubHandler state from active subscribers. This drops
         // the Arc<WatchCore> refs held by each SubHandler, which is
@@ -833,8 +821,8 @@ fn decode_sender<T: 'static + MeshField + Send + Sync + Clone>(
     /// installs SubHandlers on each subscriber port.
     fn decode_sender_core(
         encoded: ErasedWatchSender,
-        vtable: &'static WatchVtable,
-        make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+        drop: DropFn,
+        make_msg: MakeMsgFn,
     ) -> (Arc<WatchCore>, Vec<PortWithHandler<SubHandler>>) {
         let core = Arc::new(WatchCore {
             state: RwLock::new(WatchState {
@@ -843,7 +831,7 @@ fn decode_sender<T: 'static + MeshField + Send + Sync + Clone>(
                 closed: false,
             }),
             waiters: Mutex::new(Vec::new()),
-            vtable,
+            drop,
             subscribe: Mutex::new(SubscribeState::Local {
                 pending: Vec::new(),
                 make_msg: Some(make_msg),
@@ -872,11 +860,8 @@ fn decode_sender<T: 'static + MeshField + Send + Sync + Clone>(
         subscribers: encoded.subscribers,
     };
 
-    let (core, subscribers) = decode_sender_core(
-        encoded,
-        const { &WatchVtable::new::<T>() },
-        make_update_msg::<T>,
-    );
+    let (core, subscribers) =
+        decode_sender_core(encoded, ErasedValue::drop_as::<T>, make_update_msg::<T>);
     WatchSender {
         core: WatchSenderCore { core, subscribers },
         cached_encoding: None,
@@ -954,8 +939,8 @@ fn build_encoded_receiver<T: 'static + MeshField + Send + Sync + Clone>(
 ) -> EncodedWatchReceiver<T> {
     fn build_encoded_receiver(
         core_ref: &mut WatchReceiverCore,
-        clone: unsafe fn(&ErasedValue) -> ErasedValue,
-        make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+        clone: CloneFn,
+        make_msg: MakeMsgFn,
     ) -> ErasedWatchReceiver {
         // If we're the sole strong owner, we can take the value without
         // cloning. We check strong_count rather than Arc::get_mut because
@@ -1038,7 +1023,7 @@ fn register_subscriber(
     core: &WatchCore,
     state: &RwLockReadGuard<'_, WatchState>,
     port: Port,
-    make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
+    make_msg: MakeMsgFn,
 ) {
     let version = state.version;
     let mut subscribe = core.subscribe.lock();
@@ -1064,8 +1049,8 @@ fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
     /// installs the upstream port handler.
     fn decode_receiver_core(
         encoded: ErasedWatchReceiver,
-        vtable: &'static WatchVtable,
-        decode: unsafe fn(Message<'_>) -> Result<(u64, ErasedValue), ChannelError>,
+        drop: DropFn,
+        decode: DecodeMsgFn,
     ) -> WatchReceiverCore {
         let core = Arc::new(WatchCore {
             state: RwLock::new(WatchState {
@@ -1074,7 +1059,7 @@ fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
                 closed: false,
             }),
             waiters: Mutex::new(Vec::new()),
-            vtable,
+            drop,
             subscribe: Mutex::new(SubscribeState::Local {
                 pending: Vec::new(),
                 make_msg: None,
@@ -1099,11 +1084,7 @@ fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
         port: encoded.port,
     };
 
-    let core = decode_receiver_core(
-        encoded,
-        const { &WatchVtable::new::<T>() },
-        decode_update_msg::<T>,
-    );
+    let core = decode_receiver_core(encoded, ErasedValue::drop_as::<T>, decode_update_msg::<T>);
     WatchReceiver {
         core,
         cached_encoding: None,
@@ -1117,7 +1098,6 @@ fn decode_receiver<T: 'static + MeshField + Send + Sync + Clone>(
 /// Returns the sender and an initial receiver. Additional receivers can
 /// be created via [`WatchSender::subscribe`].
 pub fn watch<T: 'static + Send + Sync + Clone>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
-    let vtable: &'static WatchVtable = const { &WatchVtable::new::<T>() };
     let core = Arc::new(WatchCore {
         state: RwLock::new(WatchState {
             version: 0,
@@ -1125,7 +1105,7 @@ pub fn watch<T: 'static + Send + Sync + Clone>(initial: T) -> (WatchSender<T>, W
             closed: false,
         }),
         waiters: Mutex::new(Vec::new()),
-        vtable,
+        drop: ErasedValue::drop_as::<T>,
         subscribe: Mutex::new(SubscribeState::Local {
             pending: Vec::new(),
             make_msg: None,

@@ -399,7 +399,7 @@ impl WatchSenderCore {
     /// # Safety
     /// The core must have element type `T`.
     unsafe fn send<T>(&mut self, value: T) -> T {
-        fn send_erased(this: &mut WatchSenderCore, value: ErasedValue) -> ErasedValue {
+        fn send(this: &mut WatchSenderCore, value: ErasedValue) -> ErasedValue {
             // Bump version and swap value.
             let (version, old_value) = {
                 let mut state = this.core.state.write();
@@ -435,15 +435,10 @@ impl WatchSenderCore {
                     }
                 });
                 if let Some(make_msg) = make_msg {
-                    // N.B. state(R) is held while send synchronously delivers
-                    // to the peer's WatchPortHandler, which acquires *its own*
-                    // core's state(W). This is safe because SubHandler and
-                    // WatchPortHandler always belong to different WatchCore
-                    // instances (created on opposite sides of the port encoding
-                    // boundary), so there is no same-lock contention.
-                    let state = this.core.state.read();
-                    // SAFETY: make_msg matches the type (set at encoding boundary).
-                    let msg = unsafe { make_msg(&state.value, state.version) };
+                    let msg = {
+                        // SAFETY: make_msg matches the type (set at encoding boundary).
+                        unsafe { make_msg(&this.core.state.read().value, version) }
+                    };
                     sub.send(msg);
                 }
                 true
@@ -457,7 +452,7 @@ impl WatchSenderCore {
             old_value
         }
 
-        let old_value = send_erased(self, ErasedValue::new::<T>(Box::new(value)));
+        let old_value = send(self, ErasedValue::new::<T>(Box::new(value)));
         // SAFETY: core has element type T.
         *unsafe { old_value.into_box::<T>() }
     }
@@ -470,37 +465,32 @@ impl WatchSenderCore {
                 SubscribeState::Upstream(_) => (Vec::new(), None),
             }
         };
-        if let (Some(make_msg), false) = (make_msg, subs.is_empty()) {
-            self.register_subscribers(subs, current_version, make_msg);
+        if subs.is_empty() {
+            return;
         }
-    }
-
-    fn register_subscribers(
-        &mut self,
-        subs: Vec<(u64, Port)>,
-        current_version: u64,
-        make_msg: unsafe fn(&ErasedValue, u64) -> Message<'static>,
-    ) {
+        let make_msg = make_msg.expect("make_msg was set when subscriber was added");
         for (ver, port) in subs {
-            let handler = SubHandler {
-                core: self.core.clone(),
-                pending_ack: false,
-                sent_version: ver,
-                make_msg,
+            let pending_ack = if ver < current_version {
+                let msg = {
+                    // SAFETY: make_msg matches the type.
+                    unsafe {
+                        make_msg(
+                            &self.core.state.read().value,
+                            current_version,
+                        )
+                    }
+                };
+                port.send(msg);
+                true
+            } else {
+                false
             };
-            let sub = port.set_handler(handler);
-            if ver < current_version {
-                sub.with_handler(|handler| {
-                    handler.pending_ack = true;
-                    handler.sent_version = current_version;
-                });
-                // Same cross-core safety argument as in send() above.
-                let state = self.core.state.read();
-                // SAFETY: make_msg matches the type.
-                let msg = unsafe { make_msg(&state.value, state.version) };
-                sub.send(msg);
-            }
-            self.subscribers.push(sub);
+            self.subscribers.push(port.set_handler(SubHandler {
+                core: self.core.clone(),
+                pending_ack,
+                sent_version: current_version,
+                make_msg,
+            }));
         }
     }
 }

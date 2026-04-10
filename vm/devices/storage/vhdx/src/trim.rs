@@ -409,6 +409,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                 .await?;
 
             // 9e. Handle space management based on old→new transition.
+            //
+            // Space releases are deferred until the BAT change is durable
+            // on disk. Without deferral, a crash could teleport data from
+            // a new block into the old block's offset.
             let old_anchored = is_soft_anchored(old_mapping);
             let new_anchored = is_soft_anchored(new_mapping);
             let old_file_mb = old_mapping.file_megabyte();
@@ -420,22 +424,50 @@ impl<F: AsyncFile> VhdxFile<F> {
                 // Same anchor — assert same file offset, no space management.
                 debug_assert_eq!(old_file_mb, new_file_mb);
             } else if old_anchored && !new_anchored {
-                // Was soft-anchored → no longer: unmark + release.
-                self.free_space
-                    .unmark_trimmed_block(block_number, old_file_offset, block_size)
-                    .map_err(|_| VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))?;
-                self.free_space.release(old_file_offset, block_size);
+                // Was soft-anchored → no longer: unmark/cancel + defer release.
+                // Check deferred list first (may not be in tracker yet).
+                let was_deferred = self.deferred_releases.cancel(block_number);
+                if !was_deferred {
+                    self.free_space
+                        .unmark_trimmed_block(block_number, old_file_offset, block_size)
+                        .map_err(|_| VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))?;
+                }
+                self.deferred_releases.insert(
+                    block_number,
+                    crate::open::DeferredRelease {
+                        file_offset: old_file_offset,
+                        size: block_size,
+                        anchor: false,
+                    },
+                );
             } else if !old_anchored && new_anchored {
-                // Was not anchored → now soft-anchored: mark trimmed.
-                self.free_space
-                    .mark_trimmed_block(block_number, old_file_offset, block_size)
-                    .map_err(|_| VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))?;
+                // Was not anchored → now soft-anchored: defer the anchor.
+                self.deferred_releases.insert(
+                    block_number,
+                    crate::open::DeferredRelease {
+                        file_offset: old_file_offset,
+                        size: block_size,
+                        anchor: true,
+                    },
+                );
             } else {
                 // Neither was nor becomes anchored.
-                // If old had a file offset, release the space.
+                // If old had a file offset, defer the release.
                 if old_file_mb != 0 {
-                    self.free_space.release(old_file_offset, block_size);
+                    self.deferred_releases.insert(
+                        block_number,
+                        crate::open::DeferredRelease {
+                            file_offset: old_file_offset,
+                            size: block_size,
+                            anchor: false,
+                        },
+                    );
                 }
+            }
+
+            // Quota check: force flush if too many deferred releases.
+            if self.deferred_releases.len() >= crate::open::DEFERRED_QUOTA {
+                self.flush().await?;
             }
 
             current_block = block_number + 1;

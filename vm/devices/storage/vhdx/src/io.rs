@@ -478,16 +478,23 @@ impl<F: AsyncFile> VhdxFile<F> {
                     _ => {
                         // Unallocated block — allocate space.
                         //
-                        // If the block is currently soft-anchored (trimmed
-                        // with file space preserved), try to reclaim its own
-                        // space first — matching `Vhd2iAllocateDataBlock` in
-                        // the C code. This is `SpaceState::OwnStale` because
-                        // the space still contains this block's own old
-                        // data, so a power failure after BAT commit but
-                        // before data write would only expose the block's
-                        // own stale data — no cross-block leak.
+                        // First, check if this block has a deferred release
+                        // (non-durable trim). If so, reclaim its own offset
+                        // directly — safe because same-block reclaim can only
+                        // expose the block's own old data (OwnStale).
+                        //
+                        // Next, check if the block is soft-anchored in the
+                        // FreeSpaceTracker (durable trim). Same-block reclaim
+                        // is also safe here.
+                        //
+                        // Otherwise, allocate fresh space.
                         let original = internal;
-                        let (new_offset, space_state) = if crate::trim::is_soft_anchored(internal) {
+                        let (new_offset, space_state) = if let Some(deferred) =
+                            self.deferred_releases.remove(block_info.block_number)
+                        {
+                            // Reclaiming our own deferred (non-durable) space.
+                            (deferred.file_offset, crate::space::SpaceState::OwnStale)
+                        } else if crate::trim::is_soft_anchored(internal) {
                             let old_file_offset = internal.file_megabyte() as u64 * MB1;
                             if self
                                 .free_space
@@ -916,6 +923,13 @@ impl<F: AsyncFile> VhdxFile<F> {
             return Err(VhdxError::ReadOnly);
         }
 
+        // Stamp all uncommitted deferred entries with the current
+        // generation BEFORE commit(). This ensures that entries stamped
+        // here have their BAT pages swept into this commit's WAL entry.
+        // Any new trims that run concurrently will insert with
+        // committed_gen = None and wait for the next flush.
+        let flush_gen = self.deferred_releases.stamp_uncommitted();
+
         let lsn = self.cache.commit()?;
 
         let state = self
@@ -924,12 +938,24 @@ impl<F: AsyncFile> VhdxFile<F> {
             .expect("writable file has log_state");
 
         // Wait for the log task to write WAL entries through this LSN.
-        // Even if this commit had no dirty pages, we wait for the most
-        // recent LSN to ensure a concurrent flush's WAL write completes.
         state.logged_lsn.wait_for(lsn).await?;
 
         // Flush everything: user data, WAL entries, applied pages.
         state.flush_sequencer.flush(self.file.as_ref()).await?;
+
+        // Now that the WAL is durable, promote entries committed at or
+        // before this generation. Their BAT changes are crash-safe.
+        for (block_number, release) in self.deferred_releases.drain_committed(flush_gen) {
+            if release.anchor {
+                let _ = self.free_space.mark_trimmed_block(
+                    block_number,
+                    release.file_offset,
+                    release.size,
+                );
+            } else {
+                self.free_space.release(release.file_offset, release.size);
+            }
+        }
 
         Ok(())
     }

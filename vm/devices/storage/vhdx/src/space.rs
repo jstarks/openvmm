@@ -242,7 +242,6 @@ struct TrimmedBlockTracker {
 }
 
 /// Internal mutable state of the free space tracker.
-#[expect(dead_code)] // fields used in later stages
 struct FreeSpaceInner {
     free_space: FreeSpacePool,
     anchored_space: AnchoredSpacePool,
@@ -262,10 +261,6 @@ struct FreeSpaceInner {
     block_alignment: u32,
     /// Number of data blocks.
     data_block_count: u32,
-
-    /// In-memory soft-anchored block tracking for `find_and_unanchor`.
-    soft_anchored_in_memory_bat_page_number: u32,
-    soft_anchored_in_memory_block_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +325,9 @@ pub(crate) struct AllocateResult {
     pub file_offset: u64,
     /// State of the allocated space.
     pub state: SpaceState,
+    /// If this allocation reclaimed a cross-block soft anchor, the old
+    /// block number whose `file_megabyte` must be cleared by the caller.
+    pub unanchored_block: Option<u32>,
 }
 
 impl FreeSpaceTracker {
@@ -386,8 +384,6 @@ impl FreeSpaceTracker {
             block_size,
             block_alignment: 0,
             data_block_count,
-            soft_anchored_in_memory_bat_page_number: 0,
-            soft_anchored_in_memory_block_count: 0,
         };
 
         // Mark header area as in-use.
@@ -691,7 +687,7 @@ fn mark_trimmed_block_inner(
         return Err(VhdxError::Corrupt(CorruptionType::TrimmedRangeCollision));
     }
 
-    // Check: anchored space bits must be clear (no collision).
+    // Check: anchored space bits must be clear (no collision with another anchor).
     let bit_base = (file_offset / MB1) as usize;
     let bit_count = block_size as usize / MB1 as usize;
     if !inner
@@ -742,7 +738,8 @@ fn unmark_trimmed_block_inner(
         inner
             .anchored_space
             .bitmap
-            .are_bits_set(bit_base, bit_count)
+            .are_bits_set(bit_base, bit_count),
+        "anchored space bits must be set for trimmed block {block_number} at offset {file_offset:#x}"
     );
     inner.anchored_space.bitmap.clear_range(bit_base, bit_count);
 
@@ -818,6 +815,7 @@ fn try_allocate_inner(
         return Some(AllocateResult {
             file_offset: offset,
             state: SpaceState::CrossStale,
+            unanchored_block: None,
         });
     }
 
@@ -835,20 +833,16 @@ fn try_allocate_inner(
         return Some(AllocateResult {
             file_offset: offset,
             state: SpaceState::Zero,
+            unanchored_block: None,
         });
     }
 
-    // Priority 3: soft-anchored space from trimmed blocks (in-memory only).
+    // Priority 3: soft-anchored space from trimmed blocks.
     //
-    // Reclaim space held by a *different* trimmed block. This is
-    // CrossStale because the space contains that other block's old
-    // data — a flush is required before the BAT entry for the new
-    // block can be committed, to prevent cross-block data leaks on
-    // power failure.
-    //
-    // (When a block reclaims its *own* soft-anchored space, the io.rs
-    // write path handles that directly and marks it OwnStale,
-    // since leaking a block's old data back to itself is harmless.)
+    // Only considers blocks in TrimmedBlockTracker, which are populated
+    // by flush() — so they are always durable. The caller must clear
+    // the old block's file_megabyte in BatState and write its BAT page
+    // to cache.
     if size <= inner.block_size {
         if let Some(bat_state) = bat_state {
             if let Some((file_offset, block_number)) =
@@ -860,10 +854,10 @@ fn try_allocate_inner(
                     let excess_size = inner.block_size - size;
                     release_inner(inner, excess_offset, excess_size);
                 }
-                let _ = block_number;
                 return Some(AllocateResult {
                     file_offset,
                     state: SpaceState::CrossStale,
+                    unanchored_block: Some(block_number),
                 });
             }
         }
@@ -912,18 +906,11 @@ fn find_and_unanchor_in_memory_inner(
         );
 
         // Check if it's in-memory only (not on-disk anchored).
-        // For Phase 10, we only handle in-memory-only anchors.
-        // An in-memory-only anchor means the on-disk BAT already has
-        // file_megabyte = 0, but we don't track on-disk state separately.
-        // Instead, check if the state is NOT one of the on-disk anchor
-        // states (Undefined/Trimmed). For now, accept any unmapped block.
-        //
-        // The on-disk states that indicate on-disk soft-anchoring are
-        // BlockUndefined and BlockTrimmed (not InMemory variants).
-        // In our Rust model, we don't distinguish on-disk vs in-memory
-        // unmapped states. For Phase 10, we'll accept all soft-anchored
-        // blocks and treat them as reclaimable (the caller handles
-        // clearing the BAT entry in memory).
+        // Only blocks in TrimmedBlockTracker are considered here, and
+        // those are only populated by flush() after WAL durability, so
+        // the on-disk BAT already reflects the trim. Cross-block reclaim
+        // is safe — the caller just needs to clear the old block's
+        // file_megabyte and write its BAT page to cache.
         let file_offset = mapping.file_megabyte() as u64 * MB1;
 
         // Unmark the trimmed block.

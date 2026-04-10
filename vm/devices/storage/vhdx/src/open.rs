@@ -43,10 +43,137 @@ use crate::space::FreeSpaceTracker;
 use guid::Guid;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
+
+/// Maximum number of deferred entries before trim forces a flush.
+pub(crate) const DEFERRED_QUOTA: usize = 1024;
+
+/// A space release that is deferred until its BAT change is durable on disk.
+///
+/// Without deferral, a crash could "teleport" data: a new block's data
+/// appears at an old block's file offset because the old block's BAT
+/// reverts to FullyPresent on replay.
+pub(crate) struct DeferredRelease {
+    /// File offset of the released space.
+    pub file_offset: u64,
+    /// Size of the released space in bytes.
+    pub size: u32,
+    /// If true (TrimMode::FileSpace), mark as soft-anchored in
+    /// FreeSpaceTracker after durable. If false, release to free pool.
+    pub anchor: bool,
+}
+
+/// Entry in the deferred releases tracker, with generation stamp.
+struct DeferredEntry {
+    release: DeferredRelease,
+    /// `None` = not yet committed to a WAL entry.
+    /// `Some(gen)` = committed in flush generation `gen`.
+    committed_gen: Option<u64>,
+}
+
+/// Tracks deferred space releases with generation-based promotion.
+///
+/// All state is behind a single `parking_lot::Mutex` — never held across
+/// `.await`. The generation counter ensures entries are only promoted
+/// after the flush that committed them reaches WAL durability.
+pub(crate) struct DeferredReleases {
+    inner: Mutex<DeferredInner>,
+}
+
+struct DeferredInner {
+    entries: HashMap<u32, DeferredEntry>,
+    /// Monotonically increasing. Bumped by each flush before commit.
+    generation: u64,
+}
+
+impl DeferredReleases {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(DeferredInner {
+                entries: HashMap::new(),
+                generation: 0,
+            }),
+        }
+    }
+
+    /// Insert or replace a deferred release for a block.
+    /// The entry starts uncommitted (no generation stamp).
+    pub fn insert(&self, block_number: u32, release: DeferredRelease) {
+        self.inner.lock().entries.insert(
+            block_number,
+            DeferredEntry {
+                release,
+                committed_gen: None,
+            },
+        );
+    }
+
+    /// Remove and return a deferred entry for same-block reclaim.
+    /// Returns the release regardless of committed state — same-block
+    /// reclaim is always safe (OwnStale).
+    pub fn remove(&self, block_number: u32) -> Option<DeferredRelease> {
+        self.inner
+            .lock()
+            .entries
+            .remove(&block_number)
+            .map(|e| e.release)
+    }
+
+    /// Check whether a deferred entry exists for a block, and remove
+    /// it if so. Returns true if removed.
+    pub fn cancel(&self, block_number: u32) -> bool {
+        self.inner.lock().entries.remove(&block_number).is_some()
+    }
+
+    /// Number of deferred entries (for quota check).
+    pub fn len(&self) -> usize {
+        self.inner.lock().entries.len()
+    }
+
+    /// Stamp all uncommitted entries with the current generation and
+    /// bump the generation. Called at the start of flush(), before
+    /// `commit()`. Returns the generation that was stamped.
+    pub fn stamp_uncommitted(&self) -> u64 {
+        let mut inner = self.inner.lock();
+        inner.generation += 1;
+        let flush_gen = inner.generation;
+        for entry in inner.entries.values_mut() {
+            if entry.committed_gen.is_none() {
+                entry.committed_gen = Some(flush_gen);
+            }
+        }
+        flush_gen
+    }
+
+    /// Drain all entries committed at or before the given generation.
+    /// Returns them for promotion to the FreeSpaceTracker.
+    pub fn drain_committed(&self, up_to_gen: u64) -> Vec<(u32, DeferredRelease)> {
+        let mut inner = self.inner.lock();
+        let mut drained = Vec::new();
+        inner.entries.retain(|&block, entry| {
+            if entry.committed_gen.is_some_and(|g| g <= up_to_gen) {
+                // Move out the release. We can't move out of a &mut in
+                // retain, so swap with a dummy.
+                drained.push((
+                    block,
+                    DeferredRelease {
+                        file_offset: entry.release.file_offset,
+                        size: entry.release.size,
+                        anchor: entry.release.anchor,
+                    },
+                ));
+                false // remove from map
+            } else {
+                true // keep
+            }
+        });
+        drained
+    }
+}
 
 /// Builder for opening a VHDX file.
 ///
@@ -248,6 +375,10 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Free space tracker. Manages all space allocation within the file,
     /// replacing the simple EOF-bump allocator.
     pub(crate) free_space: FreeSpaceTracker,
+
+    /// Space releases deferred until their BAT changes are durable.
+    /// Uses generation-based stamping to coordinate with flush().
+    pub(crate) deferred_releases: DeferredReleases,
 
     // Region offsets
     #[expect(dead_code)] // Phase 9+: used for space management
@@ -472,6 +603,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             allocation_event: event_listener::Event::new(),
             trim_event: event_listener::Event::new(),
             free_space,
+            deferred_releases: DeferredReleases::new(),
 
             bat_length: regions.bat_length,
             metadata_offset: regions.metadata_offset,
@@ -753,7 +885,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                 && internal.file_megabyte() != 0
             {
                 // Soft-anchored block: unmapped/undefined with non-zero file offset.
+                // Mark the space as in-use first (so it's not in the free pool),
+                // then register it as a soft anchor for potential reclaim.
                 let file_offset = internal.file_megabyte() as u64 * MB1;
+                free_space.mark_range_in_use(file_offset, bat.block_size)?;
                 free_space.mark_trimmed_block(block, file_offset, bat.block_size)?;
             }
             payload_mappings.push(internal);
@@ -927,6 +1062,36 @@ impl<F: AsyncFile> VhdxFile<F> {
             };
 
             if let Some(alloc) = result {
+                // If this was a cross-block soft-anchor reclaim, clear the
+                // old block's file_megabyte in BatState and write its BAT
+                // page to cache. The old block's trim is already durable
+                // (TrimmedBlockTracker is only populated after flush), so
+                // no extra flush is needed — just BAT write ordering.
+                if let Some(old_block) = alloc.unanchored_block {
+                    let cleared_mapping = {
+                        let mut bat_state = self.bat_state.write();
+                        let old_mapping = bat_state.get_payload_mapping(old_block);
+                        let cleared = InternalBlockMapping::new()
+                            .with_state(old_mapping.state())
+                            .with_transitioning_to_fully_present(false)
+                            .with_file_megabyte(0);
+                        bat_state.set_payload_mapping(&self.bat, old_block, cleared);
+                        cleared
+                    };
+                    // Write old block's BAT page to cache (async).
+                    // LOCK AUDIT: bat_state write-lock dropped. allocation_lock held.
+                    self.bat
+                        .write_block_mapping(
+                            &self.cache,
+                            &self.bat_state,
+                            BlockType::Payload,
+                            old_block,
+                            cleared_mapping,
+                            None,
+                        )
+                        .await?;
+                }
+
                 if flags.zero() && !alloc.state.is_zero() {
                     // Space from pool/anchor may contain stale data — zero it.
                     let zeros = vec![0u8; size as usize];

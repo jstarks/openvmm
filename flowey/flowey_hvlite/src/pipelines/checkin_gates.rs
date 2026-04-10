@@ -294,6 +294,11 @@ impl IntoPipeline for CheckinGatesCli {
             all_jobs.push(windows_fmt_job);
         }
 
+        // Stash Windows pipette handles for the container image jobs
+        // (assigned after ContainerImageArtifacts is defined below).
+        let mut container_image_pipette_windows_x64 = None;
+        let mut container_image_pipette_windows_aarch64 = None;
+
         // emit windows build machine jobs
         //
         // In order to ensure we start running VMM tests as soon as possible, we emit
@@ -343,6 +348,8 @@ impl IntoPipeline for CheckinGatesCli {
                         Some(use_tpm_guest_tests_windows.clone());
                     vmm_tests_artifacts_windows_x86.use_test_igvm_agent_rpc_server =
                         Some(use_test_igvm_agent_rpc_server.clone());
+
+                    container_image_pipette_windows_x64 = Some(use_pipette_windows.clone());
                 }
                 CommonArch::Aarch64 => {
                     vmm_tests_artifacts_windows_aarch64.use_openvmm = Some(use_openvmm.clone());
@@ -350,6 +357,8 @@ impl IntoPipeline for CheckinGatesCli {
                         Some(use_pipette_windows.clone());
                     vmm_tests_artifacts_windows_aarch64.use_tmk_vmm = Some(use_tmk_vmm.clone());
                     vmm_tests_artifacts_windows_aarch64.use_vmgstool = Some(use_vmgstool.clone());
+
+                    container_image_pipette_windows_aarch64 = Some(use_pipette_windows.clone());
                 }
             }
             // emit a job for artifacts which _are not_ in the VMM tests "hot
@@ -541,6 +550,7 @@ impl IntoPipeline for CheckinGatesCli {
             use_openvmm: Option<UseTypedArtifact<flowey_lib_hvlite::build_openvmm::OpenvmmOutput>>,
             use_openvmm_vhost: Option<UseTypedArtifact<flowey_lib_hvlite::build_openvmm_vhost::OpenvmmVhostOutput>>,
             use_pipette_linux_musl: Option<UseTypedArtifact<flowey_lib_hvlite::build_pipette::PipetteOutput>>,
+            use_pipette_windows: Option<UseTypedArtifact<flowey_lib_hvlite::build_pipette::PipetteOutput>>,
             use_tmk_vmm: Option<UseTypedArtifact<flowey_lib_hvlite::build_tmk_vmm::TmkVmmOutput>>,
             use_tmks: Option<UseTypedArtifact<flowey_lib_hvlite::build_tmks::TmksOutput>>,
             use_vmgstool: Option<UseTypedArtifact<flowey_lib_hvlite::build_vmgstool::VmgstoolOutput>>,
@@ -552,6 +562,7 @@ impl IntoPipeline for CheckinGatesCli {
             use_openvmm: None,
             use_openvmm_vhost: None,
             use_pipette_linux_musl: None,
+            use_pipette_windows: None,
             use_tmk_vmm: None,
             use_tmks: None,
             use_vmgstool: None,
@@ -563,12 +574,17 @@ impl IntoPipeline for CheckinGatesCli {
             use_openvmm: None,
             use_openvmm_vhost: None,
             use_pipette_linux_musl: None,
+            use_pipette_windows: None,
             use_tmk_vmm: None,
             use_tmks: None,
             use_vmgstool: None,
             use_guest_test_uefi: None,
             use_entrypoint: None,
         };
+
+        // Assign Windows pipette handles stashed from the Windows build loop
+        container_image_x64.use_pipette_windows = container_image_pipette_windows_x64;
+        container_image_aarch64.use_pipette_windows = container_image_pipette_windows_aarch64;
 
         // emit linux build machine jobs (without openhcl)
         for arch in [CommonArch::Aarch64, CommonArch::X86_64] {
@@ -996,6 +1012,9 @@ impl IntoPipeline for CheckinGatesCli {
                             pipette_linux: ctx.use_typed_artifact(
                                 ci_artifacts.use_pipette_linux_musl.as_ref().unwrap(),
                             ),
+                            pipette_windows: ci_artifacts.use_pipette_windows
+                                .as_ref()
+                                .map(|a| ctx.use_typed_artifact(a)),
                             tmk_vmm: ci_artifacts.use_tmk_vmm
                                 .as_ref()
                                 .map(|a| ctx.use_typed_artifact(a)),

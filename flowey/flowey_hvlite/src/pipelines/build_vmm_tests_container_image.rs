@@ -192,6 +192,7 @@ impl IntoPipeline for BuildVmmTestsContainerImageCli {
                     openvmm: ctx.use_typed_artifact(&use_openvmm),
                     openvmm_vhost: Some(ctx.use_typed_artifact(&use_openvmm_vhost)),
                     pipette_linux: ctx.use_typed_artifact(&use_pipette),
+                    pipette_windows: None, // not available for local Linux builds
                     tmk_vmm: Some(ctx.use_typed_artifact(&use_tmk_vmm)),
                     tmks: Some(ctx.use_typed_artifact(&use_tmks)),
                     vmgstool: Some(ctx.use_typed_artifact(&use_vmgstool)),

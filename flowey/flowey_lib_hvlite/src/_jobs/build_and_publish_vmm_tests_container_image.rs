@@ -43,6 +43,9 @@ flowey_request! {
         /// The pipette binary (Linux musl).
         pub pipette_linux: ReadVar<PipetteOutput>,
 
+        /// The pipette binary (Windows), injected into Windows guests.
+        pub pipette_windows: Option<ReadVar<PipetteOutput>>,
+
         /// The TMK VMM binary (Linux).
         pub tmk_vmm: Option<ReadVar<TmkVmmOutput>>,
 
@@ -90,6 +93,7 @@ impl SimpleFlowNode for Node {
             openvmm,
             openvmm_vhost,
             pipette_linux,
+            pipette_windows,
             tmk_vmm,
             tmks,
             vmgstool,
@@ -116,6 +120,7 @@ impl SimpleFlowNode for Node {
             let openvmm = openvmm.claim(ctx);
             let openvmm_vhost = openvmm_vhost.claim(ctx);
             let pipette_linux = pipette_linux.claim(ctx);
+            let pipette_windows = pipette_windows.claim(ctx);
             let tmk_vmm = tmk_vmm.claim(ctx);
             let tmks = tmks.claim(ctx);
             let vmgstool = vmgstool.claim(ctx);
@@ -169,13 +174,25 @@ impl SimpleFlowNode for Node {
                     fs_err::copy(bin, bin_dir.join("openvmm_vhost"))?;
                 }
 
-                // Copy pipette
+                // Copy pipette (linux)
                 match rt.read(pipette_linux) {
                     PipetteOutput::LinuxBin { bin, dbg: _ } => {
                         fs_err::copy(bin, bin_dir.join("pipette"))?;
                     }
                     _ => {
                         anyhow::bail!("container image requires Linux pipette binary");
+                    }
+                }
+
+                // Copy pipette (windows) — injected into Windows guests
+                if let Some(pipette_windows) = pipette_windows {
+                    match rt.read(pipette_windows) {
+                        PipetteOutput::WindowsBin { exe, pdb: _ } => {
+                            fs_err::copy(exe, bin_dir.join("pipette.exe"))?;
+                        }
+                        _ => {
+                            anyhow::bail!("expected Windows pipette binary");
+                        }
                     }
                 }
 

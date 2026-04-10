@@ -535,6 +535,16 @@ impl IntoPipeline for CheckinGatesCli {
             all_jobs.push(job.finish());
         }
 
+        // Container image artifact handles (x64 Linux only, collected during build job setup)
+        let mut container_image_use_openvmm = None;
+        let mut container_image_use_openvmm_vhost = None;
+        let mut container_image_use_pipette_linux_musl = None;
+        let mut container_image_use_tmk_vmm = None;
+        let mut container_image_use_tmks = None;
+        let mut container_image_use_vmgstool = None;
+        let mut container_image_use_guest_test_uefi = None;
+        let mut container_image_use_entrypoint = None;
+
         // emit linux build machine jobs (without openhcl)
         for arch in [CommonArch::Aarch64, CommonArch::X86_64] {
             let arch_tag = match arch {
@@ -567,6 +577,16 @@ impl IntoPipeline for CheckinGatesCli {
             let (pub_guest_test_uefi, use_guest_test_uefi) =
                 pipeline.new_typed_artifact(format!("{arch_tag}-guest_test_uefi"));
 
+            // Container entrypoint binary (x64 only)
+            let pub_entrypoint = if matches!(arch, CommonArch::X86_64) {
+                let (pub_entrypoint, use_entrypoint) =
+                    pipeline.new_typed_artifact("x64-linux-vmm-test-container-entrypoint");
+                container_image_use_entrypoint = Some(use_entrypoint);
+                Some(pub_entrypoint)
+            } else {
+                None
+            };
+
             // skim off interesting artifacts required by the VMM tests job
             match arch {
                 CommonArch::X86_64 => {
@@ -581,6 +601,13 @@ impl IntoPipeline for CheckinGatesCli {
                     vmm_tests_artifacts_linux_x86.use_tmks = Some(use_tmks.clone());
                     vmm_tests_artifacts_windows_x86.use_tpm_guest_tests_linux =
                         Some(use_tpm_guest_tests.clone());
+
+                    // Also save for container image job
+                    container_image_use_openvmm = Some(use_openvmm.clone());
+                    container_image_use_openvmm_vhost = Some(use_openvmm_vhost.clone());
+                    container_image_use_tmks = Some(use_tmks.clone());
+                    container_image_use_vmgstool = Some(use_vmgstool.clone());
+                    container_image_use_guest_test_uefi = Some(use_guest_test_uefi.clone());
                 }
                 CommonArch::Aarch64 => {
                     vmm_tests_artifacts_windows_aarch64.use_guest_test_uefi =
@@ -700,6 +727,20 @@ impl IntoPipeline for CheckinGatesCli {
                         ctx.publish_typed_artifact(pub_vmm_tests_archive_linux_x86),
                     ),
                 });
+
+                // Build the container entrypoint binary on this job too
+                if let Some(pub_entrypoint) = pub_entrypoint {
+                    job = job.dep_on(|ctx| {
+                        flowey_lib_hvlite::build_vmm_test_container_entrypoint::Request {
+                            target: CommonTriple::Common {
+                                arch: CommonArch::X86_64,
+                                platform: CommonPlatform::LinuxGnu,
+                            },
+                            profile: CommonProfile::from_release(release),
+                            entrypoint: ctx.publish_typed_artifact(pub_entrypoint),
+                        }
+                    });
+                }
             }
 
             all_jobs.push(job.finish());
@@ -753,6 +794,10 @@ impl IntoPipeline for CheckinGatesCli {
                     vmm_tests_artifacts_linux_x86.use_tmk_vmm = Some(use_tmk_vmm.clone());
                     vmm_tests_artifacts_windows_x86.use_tmk_vmm_linux_musl =
                         Some(use_tmk_vmm.clone());
+
+                    // Also save for container image job
+                    container_image_use_pipette_linux_musl = Some(use_pipette_linux_musl.clone());
+                    container_image_use_tmk_vmm = Some(use_tmk_vmm.clone());
                 }
                 CommonArch::Aarch64 => {
                     vmm_tests_artifacts_windows_aarch64.use_openhcl_igvm_files =
@@ -1570,6 +1615,72 @@ impl IntoPipeline for CheckinGatesCli {
             // All other jobs must succeed in order to publish
             for job in all_jobs.iter() {
                 pipeline.non_artifact_dep(&publish_vmgstool_job, job);
+            }
+        }
+
+        // Build the VMM tests container image (GitHub-only).
+        // On CI: build + push to ghcr.io. On PR: build only (validates Dockerfile).
+        if matches!(backend_hint, PipelineBackendHint::Github) {
+            let is_ci = matches!(config, PipelineConfig::Ci);
+            let container_image_job = pipeline
+                .new_job(
+                    FlowPlatform::Linux(FlowPlatformLinuxDistro::Ubuntu),
+                    FlowArch::X86_64,
+                    if is_ci {
+                        "publish vmm-tests container image"
+                    } else {
+                        "build vmm-tests container image"
+                    },
+                )
+                .gh_grant_permissions::<flowey_lib_hvlite::_jobs::build_and_publish_vmm_tests_container_image::Node>([(
+                    GhPermission::Packages,
+                    GhPermissionValue::Write,
+                )])
+                .gh_set_pool(crate::pipelines_shared::gh_pools::gh_hosted_x64_linux())
+                .dep_on(|ctx| {
+                    flowey_lib_hvlite::_jobs::build_and_publish_vmm_tests_container_image::Params {
+                        image_tags: vec![
+                            "ghcr.io/microsoft/openvmm/vmm-tests:latest".into(),
+                        ],
+                        push: is_ci,
+                        rust_arch: "x86_64".into(),
+                        uefi_arch: "X64".into(),
+                        nextest_archive: ctx.use_typed_artifact(
+                            &use_vmm_tests_archive_linux_x86,
+                        ),
+                        openvmm: ctx.use_typed_artifact(
+                            container_image_use_openvmm.as_ref().unwrap(),
+                        ),
+                        openvmm_vhost: container_image_use_openvmm_vhost
+                            .as_ref()
+                            .map(|a| ctx.use_typed_artifact(a)),
+                        pipette_linux: ctx.use_typed_artifact(
+                            container_image_use_pipette_linux_musl.as_ref().unwrap(),
+                        ),
+                        tmk_vmm: container_image_use_tmk_vmm
+                            .as_ref()
+                            .map(|a| ctx.use_typed_artifact(a)),
+                        tmks: container_image_use_tmks
+                            .as_ref()
+                            .map(|a| ctx.use_typed_artifact(a)),
+                        vmgstool: container_image_use_vmgstool
+                            .as_ref()
+                            .map(|a| ctx.use_typed_artifact(a)),
+                        guest_test_uefi: container_image_use_guest_test_uefi
+                            .as_ref()
+                            .map(|a| ctx.use_typed_artifact(a)),
+                        openhcl_igvm_files: None, // TODO: add once container needs OpenHCL
+                        entrypoint_bin: ctx.use_typed_artifact(
+                            container_image_use_entrypoint.as_ref().unwrap(),
+                        ),
+                        done: ctx.new_done_handle(),
+                    }
+                })
+                .finish();
+
+            // All other jobs must succeed in order to publish
+            for job in all_jobs.iter() {
+                pipeline.non_artifact_dep(&container_image_job, job);
             }
         }
 

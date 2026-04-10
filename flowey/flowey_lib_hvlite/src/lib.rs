@@ -35,6 +35,7 @@ pub mod build_tmks;
 pub mod build_tpm_guest_tests;
 pub mod build_vmfirmwareigvm_dll;
 pub mod build_vmgstool;
+pub mod build_vmm_test_container_entrypoint;
 pub mod build_xtask;
 pub mod cfg_openvmm_magicpath;
 pub mod cfg_rustup_version;

@@ -1754,6 +1754,8 @@ jobs:
       echo "$(FLOWEY_TEMP_DIR)/publish_artifacts/x64-linux-vmgs_lib" | $FLOWEY_BIN v 7 'artifact_publish_from_x64-linux-vmgs_lib' --is-raw-string update
       mkdir -p "$(AgentTempDirNormal)/publish_artifacts/x64-linux-vmgstool"
       echo "$(FLOWEY_TEMP_DIR)/publish_artifacts/x64-linux-vmgstool" | $FLOWEY_BIN v 7 'artifact_publish_from_x64-linux-vmgstool' --is-raw-string update
+      mkdir -p "$(AgentTempDirNormal)/publish_artifacts/x64-linux-vmm-test-container-entrypoint"
+      echo "$(FLOWEY_TEMP_DIR)/publish_artifacts/x64-linux-vmm-test-container-entrypoint" | $FLOWEY_BIN v 7 'artifact_publish_from_x64-linux-vmm-test-container-entrypoint' --is-raw-string update
       mkdir -p "$(AgentTempDirNormal)/publish_artifacts/x64-linux-vmm-tests-archive"
       echo "$(FLOWEY_TEMP_DIR)/publish_artifacts/x64-linux-vmm-tests-archive" | $FLOWEY_BIN v 7 'artifact_publish_from_x64-linux-vmm-tests-archive' --is-raw-string update
       mkdir -p "$(AgentTempDirNormal)/publish_artifacts/x64-tmks"
@@ -1900,7 +1902,7 @@ jobs:
       $(FLOWEY_BIN) e 7 flowey_lib_hvlite::run_cargo_build 4
       $(FLOWEY_BIN) e 7 flowey_lib_hvlite::build_ohcldiag_dev 0
       $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 5
-      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::init_cross_build 9
+      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::init_cross_build 10
     displayName: split debug symbols
   - bash: |-
       set -e
@@ -1980,7 +1982,15 @@ jobs:
       $(FLOWEY_BIN) e 7 flowey_lib_common::run_cargo_nextest_archive 0
       $(FLOWEY_BIN) e 7 flowey_lib_hvlite::build_nextest_vmm_tests 0
       $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 9
+      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::init_cross_build 9
     displayName: build + archive 'vmm_tests' nextests
+  - bash: |-
+      set -e
+      $(FLOWEY_BIN) e 7 flowey_lib_common::run_cargo_build 9
+      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::run_cargo_build 18
+      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::build_vmm_test_container_entrypoint 0
+      $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 10
+    displayName: cargo build vmm_test_container_entrypoint
   - bash: $(FLOWEY_BIN) e 7 flowey_lib_common::cache 3
     displayName: 'validate cache entry: cargo-nextest'
   - bash: $(FLOWEY_BIN) e 7 flowey_lib_common::cache 7
@@ -2009,6 +2019,9 @@ jobs:
   - publish: $(FLOWEY_TEMP_DIR)/publish_artifacts/x64-linux-vmgstool
     displayName: 🌼📦 Publish x64-linux-vmgstool
     artifact: x64-linux-vmgstool
+  - publish: $(FLOWEY_TEMP_DIR)/publish_artifacts/x64-linux-vmm-test-container-entrypoint
+    displayName: 🌼📦 Publish x64-linux-vmm-test-container-entrypoint
+    artifact: x64-linux-vmm-test-container-entrypoint
   - publish: $(FLOWEY_TEMP_DIR)/publish_artifacts/x64-linux-vmm-tests-archive
     displayName: 🌼📦 Publish x64-linux-vmm-tests-archive
     artifact: x64-linux-vmm-tests-archive

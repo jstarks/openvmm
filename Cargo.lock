@@ -9967,6 +9967,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmm_test_container_entrypoint"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fs-err",
+ "vmm_test_images",
+]
+
+[[package]]
 name = "vmm_test_igvm_agent"
 version = "0.0.0"
 dependencies = [

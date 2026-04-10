@@ -959,3 +959,185 @@ async fn headers_alternate_between_slots(driver: DefaultDriver) {
 
     vhdx.close().await.unwrap();
 }
+
+// =============================================================================
+// Deferred space reclaim tests
+// =============================================================================
+
+/// Trim block A (FileSpace), then write the same block again (same-block
+/// reclaim from deferred list). The write should reuse A's offset without
+/// needing a flush — OwnStale.
+#[async_test]
+async fn deferred_same_block_reclaim(driver: DefaultDriver) {
+    let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+    let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size as u64;
+
+    // Write block 0.
+    write_pattern(&vhdx, 0, block_size as usize, 0xAA).await;
+    let original_offset = {
+        let bat_state = vhdx.bat_state.read();
+        bat_state.get_payload_mapping(0).file_megabyte()
+    };
+    assert!(original_offset > 0);
+
+    // Trim block 0 with FileSpace (creates deferred anchor).
+    let trim_req = crate::trim::TrimRequest::new(crate::trim::TrimMode::FileSpace, 0, block_size);
+    vhdx.trim(trim_req).await.unwrap();
+
+    // Write block 0 again — should reclaim from deferred list (no flush).
+    write_pattern(&vhdx, 0, block_size as usize, 0xBB).await;
+
+    // Block 0 should be FullyPresent at the same offset.
+    let new_offset = {
+        let bat_state = vhdx.bat_state.read();
+        let mapping = bat_state.get_payload_mapping(0);
+        assert_eq!(
+            crate::format::BatEntryState::from_raw(mapping.state()),
+            Some(crate::format::BatEntryState::FullyPresent)
+        );
+        mapping.file_megabyte()
+    };
+    assert_eq!(original_offset, new_offset, "should reuse same offset");
+
+    // Verify data.
+    let buf = read_pattern(&vhdx, 0, block_size as usize).await;
+    assert!(buf.iter().all(|&b| b == 0xBB));
+
+    vhdx.close().await.unwrap();
+}
+
+/// Trim block A (FileSpace), crash before flush. On reopen, A should
+/// still be FullyPresent with its data intact — the trim was never durable.
+#[async_test]
+async fn deferred_trim_crash_no_data_loss(driver: DefaultDriver) {
+    let (mem_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashTestFile::from_durable(snapshot);
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size as u64;
+
+    // Write block 0.
+    write_pattern(&vhdx, 0, block_size as usize, 0xDD).await;
+    vhdx.flush().await.unwrap();
+
+    // Trim block 0 with FileSpace — deferred, NOT flushed.
+    let trim_req = crate::trim::TrimRequest::new(crate::trim::TrimMode::FileSpace, 0, block_size);
+    vhdx.trim(trim_req).await.unwrap();
+
+    // Crash — get durable state.
+    let durable = vhdx.file.durable_snapshot();
+    vhdx.abort().await;
+
+    // Reopen from durable state.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Block 0 should still have its data (trim wasn't durable).
+    let buf = read_pattern(&vhdx2, 0, block_size as usize).await;
+    assert!(
+        buf.iter().all(|&b| b == 0xDD),
+        "data should survive crash when trim wasn't flushed"
+    );
+}
+
+/// Trim block A (FileSpace), write block B using separate space, crash
+/// before flush. A should keep its data, B's write should be lost.
+/// No data teleportation.
+#[async_test]
+async fn deferred_no_teleportation_on_crash(driver: DefaultDriver) {
+    let (mem_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashTestFile::from_durable(snapshot);
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size as u64;
+
+    // Write blocks 0 and 1.
+    write_pattern(&vhdx, 0, block_size as usize, 0x11).await;
+    write_pattern(&vhdx, block_size, block_size as usize, 0x22).await;
+    vhdx.flush().await.unwrap();
+
+    // Trim block 0 — deferred, not flushed.
+    let trim_req = crate::trim::TrimRequest::new(crate::trim::TrimMode::FileSpace, 0, block_size);
+    vhdx.trim(trim_req).await.unwrap();
+
+    // Write block 1 with new data — this uses block 1's existing offset
+    // (overwrite, no allocation needed).
+    write_pattern(&vhdx, block_size, block_size as usize, 0x33).await;
+
+    // Do NOT flush. Crash.
+    let durable = vhdx.file.durable_snapshot();
+    vhdx.abort().await;
+
+    // Reopen.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Block 0 should still have original data (trim wasn't durable).
+    let buf0 = read_pattern(&vhdx2, 0, block_size as usize).await;
+    assert!(
+        buf0.iter().all(|&b| b == 0x11),
+        "block 0 data should be intact after crash (trim not durable)"
+    );
+
+    // Block 1: may have old (0x22) or new (0x33) data depending on
+    // whether the overwrite was flushed. Either is acceptable.
+    // What is NOT acceptable: block 1 reading as 0x11 (block 0's data).
+    let buf1 = read_pattern(&vhdx2, block_size, block_size as usize).await;
+    assert!(
+        buf1.iter().all(|&b| b == 0x22) || buf1.iter().all(|&b| b == 0x33),
+        "block 1 should have its own data, not block 0's"
+    );
+}
+
+/// Trim + flush + write + flush + reopen: verify clean ownership.
+#[async_test]
+async fn deferred_trim_flush_write_flush_reopen(driver: DefaultDriver) {
+    let (mem_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashTestFile::from_durable(snapshot);
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size as u64;
+
+    // Write block 0, flush.
+    write_pattern(&vhdx, 0, block_size as usize, 0xAA).await;
+    vhdx.flush().await.unwrap();
+
+    // Trim block 0, flush (trim becomes durable).
+    let trim_req = crate::trim::TrimRequest::new(crate::trim::TrimMode::FileSpace, 0, block_size);
+    vhdx.trim(trim_req).await.unwrap();
+    vhdx.flush().await.unwrap();
+
+    // Write block 0 again (same-block reclaim of durable anchor), flush.
+    write_pattern(&vhdx, 0, block_size as usize, 0xBB).await;
+    vhdx.flush().await.unwrap();
+
+    // Graceful close.
+    let durable = vhdx.file.durable_snapshot();
+    vhdx.close().await.unwrap();
+
+    // Reopen and verify.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    let buf = read_pattern(&vhdx2, 0, block_size as usize).await;
+    assert!(
+        buf.iter().all(|&b| b == 0xBB),
+        "block 0 should have new data after trim+write+flush cycle"
+    );
+}

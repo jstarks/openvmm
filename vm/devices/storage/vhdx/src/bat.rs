@@ -23,6 +23,9 @@ use crate::format::MB1;
 use bitfield_struct::bitfield;
 use zerocopy::IntoBytes;
 
+use crate::space::FreeSpaceTracker;
+use zerocopy::FromBytes;
+
 /// Cache tag for BAT region pages.
 pub(crate) const BAT_TAG: u8 = 0;
 
@@ -506,6 +509,106 @@ impl Bat {
         guard.demote();
 
         Ok(())
+    }
+
+    /// Load the in-memory BAT state from disk BAT pages.
+    ///
+    /// During parse, marks allocated blocks in the FreeSpaceTracker and
+    /// records soft-anchored blocks.
+    pub(crate) async fn load_bat_state<F: AsyncFile>(
+        &self,
+        cache: &PageCache<F>,
+        free_space: &FreeSpaceTracker,
+    ) -> Result<BatState, VhdxError> {
+        let mut payload_mappings = Vec::with_capacity(self.data_block_count as usize);
+        let mut sector_bitmap_mappings =
+            Vec::with_capacity(self.sector_bitmap_block_count as usize);
+        let mut allocated_block_count: u32 = 0;
+
+        // Read all payload entries.
+        for block in 0..self.data_block_count {
+            let entry_index = self.payload_entry_index(block);
+            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
+            // Validate the entry state.
+            let raw_state = entry.state();
+            if BatEntryState::from_raw(raw_state).is_none() {
+                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
+            }
+            let internal = InternalBlockMapping::from_bat_entry(entry);
+            if raw_state == BatEntryState::FullyPresent as u8
+                || raw_state == BatEntryState::PartiallyPresent as u8
+            {
+                allocated_block_count += 1;
+                // Mark the block's file region as in-use in the space tracker.
+                let file_offset = internal.file_megabyte() as u64 * MB1;
+                if file_offset != 0 {
+                    free_space.mark_range_in_use(file_offset, self.block_size)?;
+                }
+            } else if (raw_state == BatEntryState::Unmapped as u8
+                || raw_state == BatEntryState::Undefined as u8)
+                && internal.file_megabyte() != 0
+            {
+                // Soft-anchored block: unmapped/undefined with non-zero file offset.
+                // Mark the space as in-use first (so it's not in the free pool),
+                // then register it as a soft anchor for potential reclaim.
+                let file_offset = internal.file_megabyte() as u64 * MB1;
+                free_space.mark_range_in_use(file_offset, self.block_size)?;
+                free_space.mark_trimmed_block(block, file_offset, self.block_size)?;
+            }
+            payload_mappings.push(internal);
+        }
+
+        // Read all sector bitmap entries.
+        for chunk in 0..self.sector_bitmap_block_count {
+            let entry_index = self.sector_bitmap_entry_index(chunk);
+            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
+            let raw_state = entry.state();
+            if BatEntryState::from_raw(raw_state).is_none() {
+                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
+            }
+            let internal = InternalBlockMapping::from_bat_entry(entry);
+            // Mark sector bitmap block's file region as in-use if allocated.
+            if raw_state == BatEntryState::FullyPresent as u8
+                || raw_state == BatEntryState::PartiallyPresent as u8
+            {
+                let file_offset = internal.file_megabyte() as u64 * MB1;
+                if file_offset != 0 {
+                    free_space.mark_range_in_use(file_offset, SECTOR_BITMAP_BLOCK_SIZE)?;
+                }
+            }
+            sector_bitmap_mappings.push(internal);
+        }
+
+        let payload_count = payload_mappings.len();
+        Ok(BatState {
+            payload_mappings,
+            sector_bitmap_mappings,
+            allocated_block_count,
+            io_refcounts: vec![0u32; payload_count],
+        })
+    }
+
+    /// Read a single raw BAT entry from disk through the cache.
+    async fn read_bat_entry_raw<F: AsyncFile>(
+        cache: &PageCache<F>,
+        entry_index: u32,
+    ) -> Result<BatEntry, VhdxError> {
+        let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
+        let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
+
+        let guard = cache
+            .acquire_read(PageKey {
+                tag: BAT_TAG,
+                offset: page_offset,
+            })
+            .await?;
+
+        let byte_offset = entry_within_page * size_of::<BatEntry>();
+        let entry_bytes = &guard[byte_offset..byte_offset + size_of::<BatEntry>()];
+        let entry = BatEntry::read_from_bytes(entry_bytes)
+            .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
+
+        Ok(entry)
     }
 }
 

@@ -12,22 +12,14 @@ use crate::bat::BAT_TAG;
 use crate::bat::Bat;
 use crate::bat::BatState;
 use crate::bat::BlockMapping;
-use crate::bat::BlockType;
-use crate::bat::InternalBlockMapping;
 use crate::bat::METADATA_TAG;
 use crate::cache::PageCache;
-use crate::cache::PageKey;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::flush::FlushSequencer;
 use crate::format;
-use crate::format::BatEntry;
-use crate::format::BatEntryState;
-use crate::format::CACHE_PAGE_SIZE;
-use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::FileIdentifier;
 use crate::format::Header;
-use crate::format::MB1;
 use crate::header::parse_headers;
 use crate::known_meta::read_known_metadata;
 use crate::known_meta::verify_known_metadata;
@@ -37,143 +29,15 @@ use crate::log_task::LogRequest;
 use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use crate::sector_bitmap::SBM_TAG;
-use crate::space::AllocateFlags;
-use crate::space::AllocateResult;
+use crate::space::DeferredReleases;
 use crate::space::FreeSpaceTracker;
 use guid::Guid;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::Arc;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
-
-/// Maximum number of deferred entries before trim forces a flush.
-pub(crate) const DEFERRED_QUOTA: usize = 1024;
-
-/// A space release that is deferred until its BAT change is durable on disk.
-///
-/// Without deferral, a crash could "teleport" data: a new block's data
-/// appears at an old block's file offset because the old block's BAT
-/// reverts to FullyPresent on replay.
-pub(crate) struct DeferredRelease {
-    /// File offset of the released space.
-    pub file_offset: u64,
-    /// Size of the released space in bytes.
-    pub size: u32,
-    /// If true (TrimMode::FileSpace), mark as soft-anchored in
-    /// FreeSpaceTracker after durable. If false, release to free pool.
-    pub anchor: bool,
-}
-
-/// Entry in the deferred releases tracker, with generation stamp.
-struct DeferredEntry {
-    release: DeferredRelease,
-    /// `None` = not yet committed to a WAL entry.
-    /// `Some(gen)` = committed in flush generation `gen`.
-    committed_gen: Option<u64>,
-}
-
-/// Tracks deferred space releases with generation-based promotion.
-///
-/// All state is behind a single `parking_lot::Mutex` — never held across
-/// `.await`. The generation counter ensures entries are only promoted
-/// after the flush that committed them reaches WAL durability.
-pub(crate) struct DeferredReleases {
-    inner: Mutex<DeferredInner>,
-}
-
-struct DeferredInner {
-    entries: HashMap<u32, DeferredEntry>,
-    /// Monotonically increasing. Bumped by each flush before commit.
-    generation: u64,
-}
-
-impl DeferredReleases {
-    pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(DeferredInner {
-                entries: HashMap::new(),
-                generation: 0,
-            }),
-        }
-    }
-
-    /// Insert or replace a deferred release for a block.
-    /// The entry starts uncommitted (no generation stamp).
-    pub fn insert(&self, block_number: u32, release: DeferredRelease) {
-        self.inner.lock().entries.insert(
-            block_number,
-            DeferredEntry {
-                release,
-                committed_gen: None,
-            },
-        );
-    }
-
-    /// Remove and return a deferred entry for same-block reclaim.
-    /// Returns the release regardless of committed state — same-block
-    /// reclaim is always safe (OwnStale).
-    pub fn remove(&self, block_number: u32) -> Option<DeferredRelease> {
-        self.inner
-            .lock()
-            .entries
-            .remove(&block_number)
-            .map(|e| e.release)
-    }
-
-    /// Check whether a deferred entry exists for a block, and remove
-    /// it if so. Returns true if removed.
-    pub fn cancel(&self, block_number: u32) -> bool {
-        self.inner.lock().entries.remove(&block_number).is_some()
-    }
-
-    /// Number of deferred entries (for quota check).
-    pub fn len(&self) -> usize {
-        self.inner.lock().entries.len()
-    }
-
-    /// Stamp all uncommitted entries with the current generation and
-    /// bump the generation. Called at the start of flush(), before
-    /// `commit()`. Returns the generation that was stamped.
-    pub fn stamp_uncommitted(&self) -> u64 {
-        let mut inner = self.inner.lock();
-        inner.generation += 1;
-        let flush_gen = inner.generation;
-        for entry in inner.entries.values_mut() {
-            if entry.committed_gen.is_none() {
-                entry.committed_gen = Some(flush_gen);
-            }
-        }
-        flush_gen
-    }
-
-    /// Drain all entries committed at or before the given generation.
-    /// Returns them for promotion to the FreeSpaceTracker.
-    pub fn drain_committed(&self, up_to_gen: u64) -> Vec<(u32, DeferredRelease)> {
-        let mut inner = self.inner.lock();
-        let mut drained = Vec::new();
-        inner.entries.retain(|&block, entry| {
-            if entry.committed_gen.is_some_and(|g| g <= up_to_gen) {
-                // Move out the release. We can't move out of a &mut in
-                // retain, so swap with a dummy.
-                drained.push((
-                    block,
-                    DeferredRelease {
-                        file_offset: entry.release.file_offset,
-                        size: entry.release.size,
-                        anchor: entry.release.anchor,
-                    },
-                ));
-                false // remove from map
-            } else {
-                true // keep
-            }
-        });
-        drained
-    }
-}
 
 /// Builder for opening a VHDX file.
 ///
@@ -572,7 +436,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         }
 
         // 14. Load in-memory BAT from disk.
-        let bat_state = Self::load_bat_state(&cache, &bat, &free_space).await?;
+        let bat_state = bat.load_bat_state(&cache, &free_space).await?;
 
         // 15. Finalize free space initialization after BAT parse.
         free_space.complete_initialization();
@@ -848,108 +712,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
 }
 
 impl<F: AsyncFile> VhdxFile<F> {
-    /// Load the in-memory BAT state from disk BAT pages.
-    ///
-    /// During parse, marks allocated blocks in the FreeSpaceTracker and
-    /// records soft-anchored blocks.
-    async fn load_bat_state(
-        cache: &PageCache<F>,
-        bat: &Bat,
-        free_space: &FreeSpaceTracker,
-    ) -> Result<BatState, VhdxError> {
-        let mut payload_mappings = Vec::with_capacity(bat.data_block_count as usize);
-        let mut sector_bitmap_mappings = Vec::with_capacity(bat.sector_bitmap_block_count as usize);
-        let mut allocated_block_count: u32 = 0;
-
-        // Read all payload entries.
-        for block in 0..bat.data_block_count {
-            let entry_index = bat.payload_entry_index(block);
-            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
-            // Validate the entry state.
-            let raw_state = entry.state();
-            if BatEntryState::from_raw(raw_state).is_none() {
-                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-            }
-            let internal = InternalBlockMapping::from_bat_entry(entry);
-            if raw_state == BatEntryState::FullyPresent as u8
-                || raw_state == BatEntryState::PartiallyPresent as u8
-            {
-                allocated_block_count += 1;
-                // Mark the block's file region as in-use in the space tracker.
-                let file_offset = internal.file_megabyte() as u64 * MB1;
-                if file_offset != 0 {
-                    free_space.mark_range_in_use(file_offset, bat.block_size)?;
-                }
-            } else if (raw_state == BatEntryState::Unmapped as u8
-                || raw_state == BatEntryState::Undefined as u8)
-                && internal.file_megabyte() != 0
-            {
-                // Soft-anchored block: unmapped/undefined with non-zero file offset.
-                // Mark the space as in-use first (so it's not in the free pool),
-                // then register it as a soft anchor for potential reclaim.
-                let file_offset = internal.file_megabyte() as u64 * MB1;
-                free_space.mark_range_in_use(file_offset, bat.block_size)?;
-                free_space.mark_trimmed_block(block, file_offset, bat.block_size)?;
-            }
-            payload_mappings.push(internal);
-        }
-
-        // Read all sector bitmap entries.
-        for chunk in 0..bat.sector_bitmap_block_count {
-            let entry_index = bat.sector_bitmap_entry_index(chunk);
-            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
-            let raw_state = entry.state();
-            if BatEntryState::from_raw(raw_state).is_none() {
-                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-            }
-            let internal = InternalBlockMapping::from_bat_entry(entry);
-            // Mark sector bitmap block's file region as in-use if allocated.
-            if raw_state == BatEntryState::FullyPresent as u8
-                || raw_state == BatEntryState::PartiallyPresent as u8
-            {
-                let file_offset = internal.file_megabyte() as u64 * MB1;
-                if file_offset != 0 {
-                    free_space
-                        .mark_range_in_use(file_offset, crate::bat::SECTOR_BITMAP_BLOCK_SIZE)?;
-                }
-            }
-            sector_bitmap_mappings.push(internal);
-        }
-
-        let payload_count = payload_mappings.len();
-        Ok(BatState {
-            payload_mappings,
-            sector_bitmap_mappings,
-            allocated_block_count,
-            io_refcounts: vec![0u32; payload_count],
-        })
-    }
-
-    /// Read a single raw BAT entry from disk through the cache.
-    async fn read_bat_entry_raw(
-        cache: &PageCache<F>,
-        entry_index: u32,
-    ) -> Result<BatEntry, VhdxError> {
-        let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
-        let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
-
-        let entry = {
-            let guard = cache
-                .acquire_read(PageKey {
-                    tag: BAT_TAG,
-                    offset: page_offset,
-                })
-                .await?;
-
-            let byte_offset = entry_within_page * size_of::<BatEntry>();
-            let entry_bytes = &guard[byte_offset..byte_offset + size_of::<BatEntry>()];
-            BatEntry::read_from_bytes(entry_bytes)
-                .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?
-        };
-
-        Ok(entry)
-    }
-
     /// Virtual disk size in bytes.
     pub fn disk_size(&self) -> u64 {
         self.disk_size
@@ -1026,107 +788,6 @@ impl<F: AsyncFile> VhdxFile<F> {
         let bat_state = self.bat_state.read();
         self.bat
             .get_sbm_mapping_from_state(&bat_state, chunk_number)
-    }
-
-    /// Allocate space for a new block. Async — may extend the file.
-    ///
-    /// Called under `allocation_lock` (the `FreeSpaceWorkerLock` equivalent).
-    /// Tries pool → near-EOF → anchored, extends file and retries if needed.
-    ///
-    /// When `flags` includes [`AllocateFlags::ZERO`], the allocated region
-    /// is guaranteed to be zeroed on disk before returning. Near-EOF
-    /// allocations are inherently zero; pool/anchor allocations get an
-    /// explicit zero-write.
-    ///
-    /// When `flags` includes [`AllocateFlags::ALIGNED`], the allocation is
-    /// aligned to `block_alignment`.
-    ///
-    /// Corresponds to `Vhd2iContinueAllocateSpace`.
-    pub(crate) async fn allocate_space(
-        &self,
-        size: u32,
-        flags: AllocateFlags,
-    ) -> Result<AllocateResult, VhdxError> {
-        debug_assert!(
-            (size as u64).is_multiple_of(MB1),
-            "allocation size must be MB1-aligned"
-        );
-
-        loop {
-            // Try priorities 1–3 (pool, near-EOF, anchored).
-            // Pass BAT state for soft-anchor lookup.
-            let result = {
-                let bat_state = self.bat_state.read();
-                self.free_space
-                    .try_allocate_with_bat(size, flags.aligned(), &bat_state)
-            };
-
-            if let Some(alloc) = result {
-                // If this was a cross-block soft-anchor reclaim, clear the
-                // old block's file_megabyte in BatState and write its BAT
-                // page to cache. The old block's trim is already durable
-                // (TrimmedBlockTracker is only populated after flush), so
-                // no extra flush is needed — just BAT write ordering.
-                if let Some(old_block) = alloc.unanchored_block {
-                    let cleared_mapping = {
-                        let mut bat_state = self.bat_state.write();
-                        let old_mapping = bat_state.get_payload_mapping(old_block);
-                        let cleared = InternalBlockMapping::new()
-                            .with_state(old_mapping.state())
-                            .with_transitioning_to_fully_present(false)
-                            .with_file_megabyte(0);
-                        bat_state.set_payload_mapping(&self.bat, old_block, cleared);
-                        cleared
-                    };
-                    // Write old block's BAT page to cache (async).
-                    // LOCK AUDIT: bat_state write-lock dropped. allocation_lock held.
-                    self.bat
-                        .write_block_mapping(
-                            &self.cache,
-                            &self.bat_state,
-                            BlockType::Payload,
-                            old_block,
-                            cleared_mapping,
-                            None,
-                        )
-                        .await?;
-                }
-
-                if flags.zero() && !alloc.state.is_zero() {
-                    // Space from pool/anchor may contain stale data — zero it.
-                    let zeros = vec![0u8; size as usize];
-                    self.file
-                        .write_at(alloc.file_offset, &zeros)
-                        .await
-                        .map_err(VhdxError::Io)?;
-                }
-                return Ok(alloc);
-            }
-
-            // Priority 4: extend EOF.
-            let target = self.free_space.required_file_length(size, flags.aligned());
-            // LOCK AUDIT: bat_state read-lock dropped (end of block above). allocation_lock held (async Mutex — OK across .await).
-            self.file
-                .set_file_size(target)
-                .await
-                .map_err(VhdxError::Io)?;
-            self.free_space.complete_file_extend(target);
-            // Retry — will succeed from near-EOF space.
-        }
-    }
-
-    /// Compute the cache [`PageKey`] for the BAT page containing the given
-    /// payload block's entry.
-    ///
-    /// Used by the crash-consistency mechanism to attach per-page
-    /// `pre_log_fsn` constraints to BAT pages during block allocation.
-    pub(crate) fn bat_page_key_for_block(&self, block_number: u32) -> PageKey {
-        let entry_index = self.bat.payload_entry_index(block_number);
-        let page_offset = (entry_index as u64 * 8) & !(CACHE_PAGE_SIZE - 1);
-        PageKey {
-            tag: BAT_TAG,
-            offset: page_offset,
-        }
     }
 
     /// Write a header with `log_guid = ZERO` to mark the file as clean.
@@ -1283,8 +944,11 @@ async fn validate_file_identifier(file: &impl AsyncFile) -> Result<(), VhdxError
 mod tests {
     use super::*;
     use crate::create::{self, CreateParams};
+    use crate::format::BatEntry;
     use crate::format::BatEntryState;
     use crate::format::Header;
+    use crate::format::MB1;
+    use crate::space::AllocateFlags;
     use crate::tests::support::InMemoryFile;
     use pal_async::async_test;
     use zerocopy::IntoBytes;

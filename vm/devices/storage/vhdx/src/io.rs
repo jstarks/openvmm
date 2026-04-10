@@ -489,11 +489,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                         //
                         // Otherwise, allocate fresh space.
                         let original = internal;
-                        let (new_offset, space_state) = if let Some(deferred) =
+                        let (new_offset, space_state) = if let Some(deferred_offset) =
                             self.deferred_releases.remove(block_info.block_number)
                         {
                             // Reclaiming our own deferred (non-durable) space.
-                            (deferred.file_offset, crate::space::SpaceState::OwnStale)
+                            (deferred_offset, crate::space::SpaceState::OwnStale)
                         } else if crate::trim::is_soft_anchored(internal) {
                             let old_file_offset = internal.file_megabyte() as u64 * MB1;
                             if self
@@ -945,15 +945,15 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Now that the WAL is durable, promote entries committed at or
         // before this generation. Their BAT changes are crash-safe.
-        for (block_number, release) in self.deferred_releases.drain_committed(flush_gen) {
-            if release.anchor {
-                let _ = self.free_space.mark_trimmed_block(
-                    block_number,
-                    release.file_offset,
-                    release.size,
-                );
+        for (block_number, file_offset, size, anchor) in
+            self.deferred_releases.drain_committed(flush_gen)
+        {
+            if anchor {
+                let _ = self
+                    .free_space
+                    .mark_trimmed_block(block_number, file_offset, size);
             } else {
-                self.free_space.release(release.file_offset, release.size);
+                self.free_space.release(file_offset, size);
             }
         }
 

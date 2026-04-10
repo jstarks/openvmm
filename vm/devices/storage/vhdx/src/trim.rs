@@ -432,41 +432,23 @@ impl<F: AsyncFile> VhdxFile<F> {
                         .unmark_trimmed_block(block_number, old_file_offset, block_size)
                         .map_err(|_| VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))?;
                 }
-                self.deferred_releases.insert(
-                    block_number,
-                    crate::open::DeferredRelease {
-                        file_offset: old_file_offset,
-                        size: block_size,
-                        anchor: false,
-                    },
-                );
+                self.deferred_releases
+                    .insert(block_number, old_file_offset, block_size, false);
             } else if !old_anchored && new_anchored {
                 // Was not anchored → now soft-anchored: defer the anchor.
-                self.deferred_releases.insert(
-                    block_number,
-                    crate::open::DeferredRelease {
-                        file_offset: old_file_offset,
-                        size: block_size,
-                        anchor: true,
-                    },
-                );
+                self.deferred_releases
+                    .insert(block_number, old_file_offset, block_size, true);
             } else {
                 // Neither was nor becomes anchored.
                 // If old had a file offset, defer the release.
                 if old_file_mb != 0 {
-                    self.deferred_releases.insert(
-                        block_number,
-                        crate::open::DeferredRelease {
-                            file_offset: old_file_offset,
-                            size: block_size,
-                            anchor: false,
-                        },
-                    );
+                    self.deferred_releases
+                        .insert(block_number, old_file_offset, block_size, false);
                 }
             }
 
             // Quota check: force flush if too many deferred releases.
-            if self.deferred_releases.len() >= crate::open::DEFERRED_QUOTA {
+            if self.deferred_releases.needs_flush() {
                 self.flush().await?;
             }
 

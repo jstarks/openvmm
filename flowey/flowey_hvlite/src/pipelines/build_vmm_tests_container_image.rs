@@ -184,6 +184,17 @@ impl IntoPipeline for BuildVmmTestsContainerImageCli {
                     ),
                 },
             )
+            .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_common::Params {
+                local_only: Some(flowey_lib_hvlite::_jobs::cfg_common::LocalOnlyParams {
+                    interactive: true,
+                    auto_install: install_missing_deps,
+                    ignore_rust_version: true,
+                }),
+                verbose: ReadVar::from_static(false),
+                locked: false,
+                deny_warnings: false,
+                no_incremental: false,
+            })
             .dep_on(|ctx| {
                 flowey_lib_hvlite::_jobs::build_and_publish_vmm_tests_container_image::Params {
                     push: false,

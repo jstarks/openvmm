@@ -18,23 +18,18 @@ use crate::build_tmk_vmm::TmkVmmOutput;
 use crate::build_tmks::TmksOutput;
 use crate::build_vmgstool::VmgstoolOutput;
 use crate::build_vmm_test_container_entrypoint::VmmTestContainerEntrypointOutput;
+use crate::run_cargo_build::common::CommonArch;
 use flowey::node::prelude::*;
 
 const DOCKERFILE: &str = include_str!("../build_vmm_tests_container_image/Dockerfile");
 
 flowey_request! {
     pub struct Params {
-        /// The container image tag(s) to apply (e.g., "ghcr.io/microsoft/openvmm/vmm-tests:latest").
-        pub image_tags: Vec<String>,
-
         /// Whether to push the image to the registry after building.
         pub push: bool,
 
-        /// Rust target architecture string ("x86_64" or "aarch64").
-        pub rust_arch: String,
-
-        /// UEFI architecture string ("X64" or "AARCH64").
-        pub uefi_arch: String,
+        /// Target architecture for the container image.
+        pub arch: CommonArch,
 
         /// The nextest VMM tests archive.
         pub nextest_archive: ReadVar<NextestVmmTestsArchive>,
@@ -89,10 +84,8 @@ impl SimpleFlowNode for Node {
 
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let Params {
-            image_tags,
             push,
-            rust_arch,
-            uefi_arch,
+            arch,
             nextest_archive,
             openvmm,
             openvmm_vhost,
@@ -109,9 +102,17 @@ impl SimpleFlowNode for Node {
         // Get the nextest config from the repo checkout.
         let repo_dir = ctx.reqv(crate::git_checkout_openvmm_repo::req::GetRepoDir);
 
+        // Read branch name from GH context (only available on GitHub backend).
+        let branch_name = matches!(ctx.backend(), FlowBackend::Github)
+            .then(|| ctx.get_gh_context_var().global().ref_name());
+
+        // Only push on GitHub — local builds just --load.
+        let push = push && matches!(ctx.backend(), FlowBackend::Github);
+
         ctx.emit_rust_step("build vmm-tests container image", |ctx| {
             done.claim(ctx);
             let nextest_archive = nextest_archive.claim(ctx);
+            let branch_name = branch_name.claim(ctx);
             let openvmm = openvmm.claim(ctx);
             let openvmm_vhost = openvmm_vhost.claim(ctx);
             let pipette_linux = pipette_linux.claim(ctx);
@@ -122,9 +123,6 @@ impl SimpleFlowNode for Node {
             let openhcl_igvm_files = openhcl_igvm_files.claim(ctx);
             let entrypoint_bin = entrypoint_bin.claim(ctx);
             let repo_dir = repo_dir.claim(ctx);
-            let image_tags = image_tags.clone();
-            let rust_arch = rust_arch.clone();
-            let uefi_arch = uefi_arch.clone();
             move |rt| {
                 // --- Set up build context directory ---
                 let context_dir = rt.sh.current_dir().absolute()?.join("docker-context");
@@ -241,40 +239,57 @@ impl SimpleFlowNode for Node {
                 let openvmm_deps_version = crate::_jobs::cfg_versions::OPENVMM_DEPS;
                 let mu_msvm_version = crate::_jobs::cfg_versions::MU_MSVM;
 
-                let mut cmd_args = vec![
-                    "docker".into(),
-                    "buildx".into(),
-                    "build".into(),
-                    format!("--build-arg=NEXTEST_VERSION={nextest_version}"),
-                    format!("--build-arg=OPENVMM_DEPS_VERSION={openvmm_deps_version}"),
-                    format!("--build-arg=MU_MSVM_VERSION={mu_msvm_version}"),
-                    format!("--build-arg=RUST_ARCH={rust_arch}"),
-                    format!("--build-arg=UEFI_ARCH={uefi_arch}"),
-                ];
+                let (rust_arch, uefi_arch) = match arch {
+                    CommonArch::X86_64 => ("x86_64", "X64"),
+                    CommonArch::Aarch64 => ("aarch64", "AARCH64"),
+                };
 
-                for tag in &image_tags {
-                    cmd_args.push(format!("--tag={tag}"));
-                }
+                let arch_tag = match arch {
+                    CommonArch::X86_64 => "x64",
+                    CommonArch::Aarch64 => "aarch64",
+                };
 
-                // When pushing, also generate a date+sha tag for traceability
-                if push {
-                    let short_sha = flowey::shell_cmd!(rt, "git rev-parse --short HEAD").read()?;
-                    let date = flowey::shell_cmd!(rt, "date -u +%Y%m%d").read()?;
-                    let versioned_tag =
-                        format!("ghcr.io/microsoft/openvmm/vmm-tests:main-{date}-{short_sha}");
-                    cmd_args.push(format!("--tag={versioned_tag}"));
-                }
-
-                if push {
-                    cmd_args.push("--push".into());
+                // Generate image tag.
+                // On GitHub: use branch name + commit date + SHA for a
+                // meaningful, immutable tag.
+                // Locally: use a simple local tag (not pushed).
+                let short_sha = flowey::shell_cmd!(rt, "git rev-parse --short HEAD").read()?;
+                let tag = if let Some(branch_name) = branch_name {
+                    let branch: String = rt.read(branch_name);
+                    let branch_tag = branch.replace('/', "-");
+                    let date = flowey::shell_cmd!(
+                        rt,
+                        "git log -1 --format=%cd --date=format:%Y%m%d"
+                    )
+                    .read()?;
+                    format!(
+                        "ghcr.io/microsoft/openvmm/vmm-tests:{arch_tag}-{branch_tag}-{date}-{short_sha}"
+                    )
                 } else {
-                    cmd_args.push("--load".into());
-                }
+                    format!("openvmm/vmm-tests:{arch_tag}-local-{short_sha}")
+                };
 
-                cmd_args.push(context_dir.display().to_string());
+                let nextest_arg = format!("NEXTEST_VERSION={nextest_version}");
+                let deps_arg = format!("OPENVMM_DEPS_VERSION={openvmm_deps_version}");
+                let msvm_arg = format!("MU_MSVM_VERSION={mu_msvm_version}");
+                let rust_arg = format!("RUST_ARCH={rust_arch}");
+                let uefi_arg = format!("UEFI_ARCH={uefi_arch}");
 
-                let cmd_str = cmd_args.join(" ");
-                flowey::shell_cmd!(rt, "{cmd_str}").run()?;
+                let push_or_load: &str = if push { "--push" } else { "--load" };
+
+                flowey::shell_cmd!(
+                    rt,
+                    "docker buildx build
+                        --build-arg {nextest_arg}
+                        --build-arg {deps_arg}
+                        --build-arg {msvm_arg}
+                        --build-arg {rust_arg}
+                        --build-arg {uefi_arg}
+                        --tag {tag}
+                        {push_or_load}
+                        {context_dir}"
+                )
+                .run()?;
 
                 Ok(())
             }

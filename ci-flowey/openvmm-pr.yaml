@@ -1984,13 +1984,6 @@ jobs:
       $(FLOWEY_BIN) e 7 flowey_lib_common::run_cargo_nextest_archive 0
       $(FLOWEY_BIN) e 7 flowey_lib_hvlite::build_nextest_vmm_tests 0
       $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 9
-      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::init_cross_build 2
-    displayName: build + archive 'vmm_tests' nextests
-  - bash: |-
-      set -e
-      $(FLOWEY_BIN) e 7 flowey_lib_common::run_cargo_nextest_archive 1
-      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::build_nextest_vmm_tests 1
-      $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 10
       $(FLOWEY_BIN) e 7 flowey_lib_hvlite::init_cross_build 10
     displayName: build + archive 'vmm_tests' nextests
   - bash: |-
@@ -1998,8 +1991,15 @@ jobs:
       $(FLOWEY_BIN) e 7 flowey_lib_common::run_cargo_build 9
       $(FLOWEY_BIN) e 7 flowey_lib_hvlite::run_cargo_build 18
       $(FLOWEY_BIN) e 7 flowey_lib_hvlite::build_vmm_test_container_entrypoint 0
-      $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 11
+      $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 10
+      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::init_cross_build 2
     displayName: cargo build vmm_test_container_entrypoint
+  - bash: |-
+      set -e
+      $(FLOWEY_BIN) e 7 flowey_lib_common::run_cargo_nextest_archive 1
+      $(FLOWEY_BIN) e 7 flowey_lib_hvlite::build_nextest_vmm_tests 1
+      $(FLOWEY_BIN) e 7 flowey_core::pipeline::artifact::publish 11
+    displayName: build + archive 'vmm_tests' nextests
   - bash: $(FLOWEY_BIN) e 7 flowey_lib_common::cache 3
     displayName: 'validate cache entry: cargo-nextest'
   - bash: $(FLOWEY_BIN) e 7 flowey_lib_common::cache 7

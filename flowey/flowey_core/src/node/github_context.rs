@@ -117,6 +117,16 @@ impl GhContextVarReader<'_, state::Global> {
         self.read_var("github.workspace", false, false)
     }
 
+    /// `github.ref_name` — branch or tag name that triggered the workflow
+    pub fn ref_name(self) -> ReadVar<String> {
+        self.read_var("github.ref_name", false, false)
+    }
+
+    /// `github.sha` — commit SHA that triggered the workflow
+    pub fn sha(self) -> ReadVar<String> {
+        self.read_var("github.sha", false, false)
+    }
+
     /// `github.token`
     pub fn token(self) -> ReadVar<String> {
         // TODO: change is_secret parameter to true.

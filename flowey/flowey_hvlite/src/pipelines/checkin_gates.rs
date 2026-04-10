@@ -745,14 +745,33 @@ impl IntoPipeline for CheckinGatesCli {
                     },
                     profile: CommonProfile::from_release(release),
                     tpm_guest_tests: ctx.publish_typed_artifact(pub_tpm_guest_tests),
-                });
+                })
+                .dep_on(|ctx| {
+                    flowey_lib_hvlite::build_nextest_vmm_tests::Request {
+                target: CommonTriple::Common {
+                arch,
+                platform: CommonPlatform::LinuxGnu,
+            }.as_triple(),
+                profile: CommonProfile::from_release(release),
+                build_mode:
+                    flowey_lib_hvlite::build_nextest_vmm_tests::BuildNextestVmmTestsMode::Archive(
+                        ctx.publish_typed_artifact(pub_container_nextest_archive),
+                    ),
+            }
+                })
+                .dep_on(
+                    |ctx| flowey_lib_hvlite::build_vmm_test_container_entrypoint::Request {
+                        target: CommonTriple::Common {
+                            arch,
+                            platform: CommonPlatform::LinuxGnu,
+                        },
+                        profile: CommonProfile::from_release(release),
+                        entrypoint: ctx.publish_typed_artifact(pub_entrypoint),
+                    },
+                );
 
             // Build the VMM tests nextest archive for this arch.
             // x64 archive is also used by VMM test runner jobs in CI.
-            let linux_target = CommonTriple::Common {
-                arch,
-                platform: CommonPlatform::LinuxGnu,
-            };
             if matches!(arch, CommonArch::X86_64) {
                 let pub_vmm_tests_archive_linux_x86 =
                     pub_vmm_tests_archive_linux_x86.take().unwrap();
@@ -764,26 +783,6 @@ impl IntoPipeline for CheckinGatesCli {
                     ),
                 });
             }
-
-            // Build the nextest archive for the container image (both arches)
-            job = job.dep_on(|ctx| flowey_lib_hvlite::build_nextest_vmm_tests::Request {
-                target: linux_target.as_triple(),
-                profile: CommonProfile::from_release(release),
-                build_mode:
-                    flowey_lib_hvlite::build_nextest_vmm_tests::BuildNextestVmmTestsMode::Archive(
-                        ctx.publish_typed_artifact(pub_container_nextest_archive),
-                    ),
-            });
-
-            // Build the container entrypoint binary (both arches)
-            job =
-                job.dep_on(
-                    |ctx| flowey_lib_hvlite::build_vmm_test_container_entrypoint::Request {
-                        target: linux_target,
-                        profile: CommonProfile::from_release(release),
-                        entrypoint: ctx.publish_typed_artifact(pub_entrypoint),
-                    },
-                );
 
             all_jobs.push(job.finish());
         }
@@ -950,6 +949,74 @@ impl IntoPipeline for CheckinGatesCli {
                     )
                     .finish();
                 all_jobs.push(job);
+            }
+        }
+
+        // Build the VMM tests container image (GitHub-only).
+        // On CI: build + push to ghcr.io. On PR: build only (validates Dockerfile).
+        if matches!(backend_hint, PipelineBackendHint::Github) {
+            let is_ci = matches!(config, PipelineConfig::Ci);
+
+            for (arch, ci_artifacts) in [
+                (CommonArch::X86_64, &container_image_x64),
+                (CommonArch::Aarch64, &container_image_aarch64),
+            ] {
+                let arch_tag = match arch {
+                    CommonArch::X86_64 => "x64",
+                    CommonArch::Aarch64 => "aarch64",
+                };
+                let container_image_job = pipeline
+                    .new_job(
+                        FlowPlatform::Linux(FlowPlatformLinuxDistro::Ubuntu),
+                        FlowArch::X86_64,
+                        if is_ci {
+                            format!("publish vmm-tests container image [{arch_tag}]")
+                        } else {
+                            format!("build vmm-tests container image [{arch_tag}]")
+                        },
+                    )
+                    .gh_grant_permissions::<flowey_lib_hvlite::_jobs::build_and_publish_vmm_tests_container_image::Node>([(
+                        GhPermission::Packages,
+                        GhPermissionValue::Write,
+                    )])
+                    .gh_set_pool(crate::pipelines_shared::gh_pools::gh_hosted_x64_linux())
+                    .dep_on(|ctx| {
+                        flowey_lib_hvlite::_jobs::build_and_publish_vmm_tests_container_image::Params {
+                            push: is_ci,
+                            arch,
+                            nextest_archive: ctx.use_typed_artifact(
+                                ci_artifacts.use_nextest_archive.as_ref().unwrap(),
+                            ),
+                            openvmm: ctx.use_typed_artifact(
+                                ci_artifacts.use_openvmm.as_ref().unwrap(),
+                            ),
+                            openvmm_vhost: ci_artifacts.use_openvmm_vhost
+                                .as_ref()
+                                .map(|a| ctx.use_typed_artifact(a)),
+                            pipette_linux: ctx.use_typed_artifact(
+                                ci_artifacts.use_pipette_linux_musl.as_ref().unwrap(),
+                            ),
+                            tmk_vmm: ci_artifacts.use_tmk_vmm
+                                .as_ref()
+                                .map(|a| ctx.use_typed_artifact(a)),
+                            tmks: ci_artifacts.use_tmks
+                                .as_ref()
+                                .map(|a| ctx.use_typed_artifact(a)),
+                            vmgstool: ci_artifacts.use_vmgstool
+                                .as_ref()
+                                .map(|a| ctx.use_typed_artifact(a)),
+                            guest_test_uefi: ci_artifacts.use_guest_test_uefi
+                                .as_ref()
+                                .map(|a| ctx.use_typed_artifact(a)),
+                            openhcl_igvm_files: None, // TODO: add once container needs OpenHCL
+                            entrypoint_bin: ctx.use_typed_artifact(
+                                ci_artifacts.use_entrypoint.as_ref().unwrap(),
+                            ),
+                            done: ctx.new_done_handle(),
+                        }
+                    })
+                    .finish();
+                let _ = container_image_job;
             }
         }
 
@@ -1661,78 +1728,6 @@ impl IntoPipeline for CheckinGatesCli {
             // All other jobs must succeed in order to publish
             for job in all_jobs.iter() {
                 pipeline.non_artifact_dep(&publish_vmgstool_job, job);
-            }
-        }
-
-        // Build the VMM tests container image (GitHub-only).
-        // On CI: build + push to ghcr.io. On PR: build only (validates Dockerfile).
-        if matches!(backend_hint, PipelineBackendHint::Github) {
-            let is_ci = matches!(config, PipelineConfig::Ci);
-
-            for (arch_tag, rust_arch, uefi_arch, ci_artifacts) in [
-                ("x64", "x86_64", "X64", &container_image_x64),
-                ("aarch64", "aarch64", "AARCH64", &container_image_aarch64),
-            ] {
-                let container_image_job = pipeline
-                    .new_job(
-                        FlowPlatform::Linux(FlowPlatformLinuxDistro::Ubuntu),
-                        FlowArch::X86_64,
-                        if is_ci {
-                            format!("publish vmm-tests container image [{arch_tag}]")
-                        } else {
-                            format!("build vmm-tests container image [{arch_tag}]")
-                        },
-                    )
-                    .gh_grant_permissions::<flowey_lib_hvlite::_jobs::build_and_publish_vmm_tests_container_image::Node>([(
-                        GhPermission::Packages,
-                        GhPermissionValue::Write,
-                    )])
-                    .gh_set_pool(crate::pipelines_shared::gh_pools::gh_hosted_x64_linux())
-                    .dep_on(|ctx| {
-                        flowey_lib_hvlite::_jobs::build_and_publish_vmm_tests_container_image::Params {
-                            image_tags: vec![
-                                format!("ghcr.io/microsoft/openvmm/vmm-tests:{arch_tag}-latest"),
-                            ],
-                            push: is_ci,
-                            rust_arch: rust_arch.into(),
-                            uefi_arch: uefi_arch.into(),
-                            nextest_archive: ctx.use_typed_artifact(
-                                ci_artifacts.use_nextest_archive.as_ref().unwrap(),
-                            ),
-                            openvmm: ctx.use_typed_artifact(
-                                ci_artifacts.use_openvmm.as_ref().unwrap(),
-                            ),
-                            openvmm_vhost: ci_artifacts.use_openvmm_vhost
-                                .as_ref()
-                                .map(|a| ctx.use_typed_artifact(a)),
-                            pipette_linux: ctx.use_typed_artifact(
-                                ci_artifacts.use_pipette_linux_musl.as_ref().unwrap(),
-                            ),
-                            tmk_vmm: ci_artifacts.use_tmk_vmm
-                                .as_ref()
-                                .map(|a| ctx.use_typed_artifact(a)),
-                            tmks: ci_artifacts.use_tmks
-                                .as_ref()
-                                .map(|a| ctx.use_typed_artifact(a)),
-                            vmgstool: ci_artifacts.use_vmgstool
-                                .as_ref()
-                                .map(|a| ctx.use_typed_artifact(a)),
-                            guest_test_uefi: ci_artifacts.use_guest_test_uefi
-                                .as_ref()
-                                .map(|a| ctx.use_typed_artifact(a)),
-                            openhcl_igvm_files: None, // TODO: add once container needs OpenHCL
-                            entrypoint_bin: ctx.use_typed_artifact(
-                                ci_artifacts.use_entrypoint.as_ref().unwrap(),
-                            ),
-                            done: ctx.new_done_handle(),
-                        }
-                    })
-                    .finish();
-
-                // All other jobs must succeed in order to publish
-                for job in all_jobs.iter() {
-                    pipeline.non_artifact_dep(&container_image_job, job);
-                }
             }
         }
 

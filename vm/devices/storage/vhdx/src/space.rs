@@ -413,26 +413,21 @@ impl FreeSpaceTracker {
         };
 
         // Mark header area as in-use.
-        mark_range_in_use_inner(&mut inner, &mut eof_state, 0, header_area_size as u32)?;
+        inner.mark_range_in_use_inner(&mut eof_state, 0, header_area_size as u32)?;
 
         // Mark log as in-use.
         if log_length > 0 {
-            mark_range_in_use_inner(&mut inner, &mut eof_state, log_offset, log_length)?;
+            inner.mark_range_in_use_inner(&mut eof_state, log_offset, log_length)?;
         }
 
         // Mark BAT region as in-use.
         // BAT length is rounded up to MB1 for space tracking.
         let bat_length_aligned = round_up_mb1(bat_length as u64) as u32;
-        mark_range_in_use_inner(&mut inner, &mut eof_state, bat_offset, bat_length_aligned)?;
+        inner.mark_range_in_use_inner(&mut eof_state, bat_offset, bat_length_aligned)?;
 
         // Mark metadata region as in-use.
         let metadata_length_aligned = round_up_mb1(metadata_length as u64) as u32;
-        mark_range_in_use_inner(
-            &mut inner,
-            &mut eof_state,
-            metadata_offset,
-            metadata_length_aligned,
-        )?;
+        inner.mark_range_in_use_inner(&mut eof_state, metadata_offset, metadata_length_aligned)?;
 
         Ok((
             FreeSpaceTracker {
@@ -458,8 +453,9 @@ impl FreeSpaceTracker {
         offset: u64,
         length: u32,
     ) -> Result<(), VhdxError> {
-        let mut inner = self.inner.lock();
-        mark_range_in_use_inner(&mut inner, eof, offset, length)
+        self.inner
+            .lock()
+            .mark_range_in_use_inner(eof, offset, length)
     }
 
     /// Mark a trimmed block as soft-anchored during BAT parse.
@@ -471,8 +467,9 @@ impl FreeSpaceTracker {
         file_offset: u64,
         block_size: u32,
     ) -> Result<(), VhdxError> {
-        let mut inner = self.inner.lock();
-        mark_trimmed_block_inner(&mut inner, block_number, file_offset, block_size)
+        self.inner
+            .lock()
+            .mark_trimmed_block_inner(block_number, file_offset, block_size)
     }
 
     /// Finalize after BAT parse. Separates EOF free space from pool free space.
@@ -504,12 +501,77 @@ impl FreeSpaceTracker {
         self.try_allocate_inner(eof, size, aligned, Some(bat_state))
     }
 
+    /// Try all three in-memory allocation priorities.
+    fn try_allocate_inner(
+        &self,
+        eof: &mut EofState,
+        size: u32,
+        aligned: bool,
+        bat_state: Option<&BatState>,
+    ) -> Option<AllocateResult> {
+        let mut inner = self.inner.lock();
+        // Priority 1: free space pool.
+        if let Some(offset) = inner.free_space_pool_alloc(eof, size) {
+            return Some(AllocateResult {
+                file_offset: offset,
+                state: SpaceState::CrossStale,
+                unanchored_block: None,
+            });
+        }
+
+        // Priority 2: near-EOF space (between ZeroOffset and FileLength).
+        let aligned_zero_offset = if aligned && self.block_alignment != 0 {
+            round_up(eof.zero_offset, self.block_alignment as u64)
+        } else {
+            eof.zero_offset
+        };
+
+        if eof.file_length >= aligned_zero_offset + size as u64 {
+            let offset = aligned_zero_offset;
+            eof.zero_offset = aligned_zero_offset + size as u64;
+            eof.last_file_offset = eof.zero_offset;
+            return Some(AllocateResult {
+                file_offset: offset,
+                state: SpaceState::Zero,
+                unanchored_block: None,
+            });
+        }
+
+        // Priority 3: soft-anchored space from trimmed blocks.
+        //
+        // Only considers blocks in TrimmedBlockTracker, which are populated
+        // by flush() — so they are always durable. The caller must clear
+        // the old block's file_megabyte in BatState and write its BAT page
+        // to cache.
+        if size <= inner.block_size {
+            if let Some(bat_state) = bat_state {
+                if let Some((file_offset, block_number)) =
+                    inner.find_and_unanchor_in_memory_inner(bat_state)
+                {
+                    // If the allocated block is larger than needed, release excess.
+                    if size < inner.block_size {
+                        let excess_offset = file_offset + size as u64;
+                        let excess_size = inner.block_size - size;
+                        inner.release_inner(excess_offset, excess_size);
+                    }
+                    return Some(AllocateResult {
+                        file_offset,
+                        state: SpaceState::CrossStale,
+                        unanchored_block: Some(block_number),
+                    });
+                }
+            }
+        }
+
+        // Priority 4: caller must extend EOF.
+        None
+    }
+
     /// Release space back to the free pool.
     ///
     /// Corresponds to `Vhd2ReleaseFileSpaceNoResizeFreeSpaceBitmapLocked`.
     pub fn release(&self, offset: u64, size: u32) {
-        let mut inner = self.inner.lock();
-        release_inner(&mut inner, offset, size);
+        self.inner.lock().release_inner(offset, size);
     }
 
     /// Unmark a trimmed block (when its space is reclaimed).
@@ -522,7 +584,7 @@ impl FreeSpaceTracker {
         block_size: u32,
     ) -> Result<(), VhdxError> {
         let mut inner = self.inner.lock();
-        unmark_trimmed_block_inner(&mut inner, block_number, file_offset, block_size)
+        inner.unmark_trimmed_block_inner(block_number, file_offset, block_size)
     }
 
     /// Compute truncation target size.
@@ -530,7 +592,7 @@ impl FreeSpaceTracker {
         let inner = self.inner.lock();
         let mut target = eof.last_file_offset;
         if is_fully_allocated {
-            let excess = compute_excess_block_count(&inner, eof, target);
+            let excess = inner.compute_excess_block_count(eof, target);
             let extra = (excess as u64) * inner.block_size as u64;
             target = (target + extra).min(eof.file_length);
         }
@@ -603,346 +665,273 @@ fn round_up_mb1(value: u64) -> u64 {
     round_up(value, MB1)
 }
 
-/// Mark a file range as in-use during parse (internal, no lock).
-fn mark_range_in_use_inner(
-    inner: &mut FreeSpaceInner,
-    eof: &mut EofState,
-    offset: u64,
-    length: u32,
-) -> Result<(), VhdxError> {
-    debug_assert!(offset.is_multiple_of(MB1), "offset must be MB1-aligned");
-    debug_assert!(
-        (length as u64).is_multiple_of(MB1),
-        "length must be MB1-aligned"
-    );
-
-    if length == 0 {
-        return Ok(());
-    }
-
-    // Check range is within file.
-    if eof.file_length < offset || eof.file_length - offset < length as u64 {
-        return Err(VhdxError::Corrupt(CorruptionType::RangeBeyondEof));
-    }
-
-    let bit_base = (offset / MB1) as usize;
-    let bit_count = length as usize / MB1 as usize;
-
-    // Overlap check: all bits must currently be SET (free).
-    if !inner.free_space.bitmap.are_bits_set(bit_base, bit_count) {
-        return Err(VhdxError::Corrupt(CorruptionType::RangeCollision));
-    }
-
-    // Mark as in-use (clear the bits).
-    inner.free_space.bitmap.clear_range(bit_base, bit_count);
-
-    // Update last_file_offset and zero_offset.
-    let range_end = offset + length as u64;
-    if range_end > eof.last_file_offset {
-        eof.last_file_offset = range_end;
-        if eof.last_file_offset > eof.zero_offset {
-            eof.zero_offset = eof.last_file_offset;
-        }
-    }
-
-    Ok(())
-}
-
-/// Mark a trimmed block as soft-anchored (internal, no lock).
-fn mark_trimmed_block_inner(
-    inner: &mut FreeSpaceInner,
-    block_number: u32,
-    file_offset: u64,
-    block_size: u32,
-) -> Result<(), VhdxError> {
-    debug_assert!(block_number < inner.data_block_count);
-    debug_assert!(block_size.is_multiple_of(MB1 as u32));
-
-    // Check: already marked as trimmed?
-    if inner.trimmed_blocks.bitmap.check_bit(block_number as usize) {
-        return Err(VhdxError::Corrupt(CorruptionType::TrimmedRangeCollision));
-    }
-
-    // Check: anchored space bits must be clear (no collision with another anchor).
-    let bit_base = (file_offset / MB1) as usize;
-    let bit_count = block_size as usize / MB1 as usize;
-    if !inner
-        .anchored_space
-        .bitmap
-        .are_bits_clear(bit_base, bit_count)
-    {
-        return Err(VhdxError::Corrupt(CorruptionType::TrimmedRangeCollision));
-    }
-
-    // Mark in trimmed block tracker.
-    inner.trimmed_blocks.bitmap.set_bit(block_number as usize);
-    inner.trimmed_blocks.num_trimmed_blocks += 1;
-    inner.trimmed_blocks.lowest_block_number_hint = inner
-        .trimmed_blocks
-        .lowest_block_number_hint
-        .min(block_number);
-
-    // Mark in anchored space bitmap.
-    inner.anchored_space.bitmap.set_range(bit_base, bit_count);
-    inner.anchored_space.lowest_bit_hint =
-        inner.anchored_space.lowest_bit_hint.min(bit_base as u32);
-
-    Ok(())
-}
-
-/// Unmark a trimmed block (internal, no lock).
-fn unmark_trimmed_block_inner(
-    inner: &mut FreeSpaceInner,
-    block_number: u32,
-    file_offset: u64,
-    block_size: u32,
-) -> Result<(), VhdxError> {
-    debug_assert!(block_number < inner.data_block_count);
-    debug_assert!(block_size.is_multiple_of(MB1 as u32));
-
-    // If not marked, someone else already claimed it.
-    if !inner.trimmed_blocks.bitmap.check_bit(block_number as usize) {
-        return Err(VhdxError::Corrupt(CorruptionType::Other));
-    }
-
-    inner.trimmed_blocks.bitmap.clear_bit(block_number as usize);
-    inner.trimmed_blocks.num_trimmed_blocks -= 1;
-
-    let bit_base = (file_offset / MB1) as usize;
-    let bit_count = block_size as usize / MB1 as usize;
-    debug_assert!(
-        inner
-            .anchored_space
-            .bitmap
-            .are_bits_set(bit_base, bit_count),
-        "anchored space bits must be set for trimmed block {block_number} at offset {file_offset:#x}"
-    );
-    inner.anchored_space.bitmap.clear_range(bit_base, bit_count);
-
-    Ok(())
-}
-
-/// Release space to the free pool (internal, no lock).
-fn release_inner(inner: &mut FreeSpaceInner, offset: u64, size: u32) {
-    debug_assert!(offset.is_multiple_of(MB1));
-    debug_assert!((size as u64).is_multiple_of(MB1));
-
-    let bit_base = (offset / MB1) as usize;
-    let bit_count = size as usize / MB1 as usize;
-
-    if bit_base + bit_count > inner.free_space.bitmap.len() {
-        // Defensive: can't release beyond bitmap size.
-        return;
-    }
-
-    debug_assert!(inner.free_space.bitmap.are_bits_clear(bit_base, bit_count));
-    inner.free_space.bitmap.set_range(bit_base, bit_count);
-    inner.free_space.no_free_blocks = false;
-
-    if (bit_base as u32) < inner.free_space.lowest_bit_hint {
-        inner.free_space.lowest_bit_hint = bit_base as u32;
-    }
-}
-
-/// Priority 1: free space pool allocation (internal, no lock).
-fn free_space_pool_alloc(
-    inner: &mut FreeSpaceInner,
-    eof: &mut EofState,
-    length: u32,
-) -> Option<u64> {
-    debug_assert!((length as u64).is_multiple_of(MB1));
-    let bit_count = length as usize / MB1 as usize;
-
-    // Fast-path skip for block-sized allocations.
-    if length >= inner.block_size && inner.free_space.no_free_blocks {
-        return None;
-    }
-
-    let result = inner
-        .free_space
-        .bitmap
-        .find_set_bits(bit_count, inner.free_space.lowest_bit_hint as usize);
-
-    match result {
-        Some(bit_base) => {
-            // Claim the space.
-            inner.free_space.bitmap.clear_range(bit_base, bit_count);
-            inner.free_space.lowest_bit_hint = (bit_base + bit_count) as u32;
-            let max_offset = (bit_base + bit_count) as u64 * MB1;
-            if eof.last_file_offset < max_offset {
-                eof.last_file_offset = max_offset;
-            }
-            Some(bit_base as u64 * MB1)
-        }
-        None => {
-            if length <= inner.block_size {
-                inner.free_space.no_free_blocks = true;
-            }
-            None
-        }
-    }
-}
-
-/// Try all three in-memory allocation priorities.
-impl FreeSpaceTracker {
-    fn try_allocate_inner(
-        &self,
+impl FreeSpaceInner {
+    /// Mark a file range as in-use during parse (internal, no lock).
+    fn mark_range_in_use_inner(
+        &mut self,
         eof: &mut EofState,
-        size: u32,
-        aligned: bool,
-        bat_state: Option<&BatState>,
-    ) -> Option<AllocateResult> {
-        let mut inner = self.inner.lock();
-        // Priority 1: free space pool.
-        if let Some(offset) = free_space_pool_alloc(&mut inner, eof, size) {
-            return Some(AllocateResult {
-                file_offset: offset,
-                state: SpaceState::CrossStale,
-                unanchored_block: None,
-            });
-        }
-
-        // Priority 2: near-EOF space (between ZeroOffset and FileLength).
-        let aligned_zero_offset = if aligned && self.block_alignment != 0 {
-            round_up(eof.zero_offset, self.block_alignment as u64)
-        } else {
-            eof.zero_offset
-        };
-
-        if eof.file_length >= aligned_zero_offset + size as u64 {
-            let offset = aligned_zero_offset;
-            eof.zero_offset = aligned_zero_offset + size as u64;
-            eof.last_file_offset = eof.zero_offset;
-            return Some(AllocateResult {
-                file_offset: offset,
-                state: SpaceState::Zero,
-                unanchored_block: None,
-            });
-        }
-
-        // Priority 3: soft-anchored space from trimmed blocks.
-        //
-        // Only considers blocks in TrimmedBlockTracker, which are populated
-        // by flush() — so they are always durable. The caller must clear
-        // the old block's file_megabyte in BatState and write its BAT page
-        // to cache.
-        if size <= inner.block_size {
-            if let Some(bat_state) = bat_state {
-                if let Some((file_offset, block_number)) =
-                    find_and_unanchor_in_memory_inner(&mut inner, bat_state)
-                {
-                    // If the allocated block is larger than needed, release excess.
-                    if size < inner.block_size {
-                        let excess_offset = file_offset + size as u64;
-                        let excess_size = inner.block_size - size;
-                        release_inner(&mut inner, excess_offset, excess_size);
-                    }
-                    return Some(AllocateResult {
-                        file_offset,
-                        state: SpaceState::CrossStale,
-                        unanchored_block: Some(block_number),
-                    });
-                }
-            }
-        }
-
-        // Priority 4: caller must extend EOF.
-        None
-    }
-}
-
-/// Find and unanchor an in-memory-only soft-anchored block.
-fn find_and_unanchor_in_memory_inner(
-    inner: &mut FreeSpaceInner,
-    bat_state: &BatState,
-) -> Option<(u64, u32)> {
-    if inner.trimmed_blocks.num_trimmed_blocks == 0 {
-        return None;
-    }
-
-    let block_size = inner.block_size;
-
-    // Try to find an in-memory-only soft-anchored block by scanning
-    // the TrimmedBlock bitmap.
-    let mut trimmed_found = 0u32;
-    let total_trimmed = inner.trimmed_blocks.num_trimmed_blocks;
-    let mut hint = inner.trimmed_blocks.lowest_block_number_hint as usize;
-
-    while trimmed_found < total_trimmed {
-        let block_number = match inner.trimmed_blocks.bitmap.find_set_bits(1, hint) {
-            Some(n) => n,
-            None => break,
-        };
-
-        trimmed_found += 1;
-        let mapping = bat_state.get_payload_mapping(block_number as u32);
-
-        // Block must be soft-anchored: unmapped/undefined state with non-zero file_megabyte.
-        let state = mapping.state();
-        let is_unmapped = state == BatEntryState::Unmapped as u8
-            || state == BatEntryState::Undefined as u8
-            || state == BatEntryState::Zero as u8
-            || state == BatEntryState::NotPresent as u8;
-
+        offset: u64,
+        length: u32,
+    ) -> Result<(), VhdxError> {
+        debug_assert!(offset.is_multiple_of(MB1), "offset must be MB1-aligned");
         debug_assert!(
-            is_unmapped && mapping.file_megabyte() != 0,
-            "trimmed block {block_number} is not soft-anchored"
+            (length as u64).is_multiple_of(MB1),
+            "length must be MB1-aligned"
         );
 
-        // Check if it's in-memory only (not on-disk anchored).
-        // Only blocks in TrimmedBlockTracker are considered here, and
-        // those are only populated by flush() after WAL durability, so
-        // the on-disk BAT already reflects the trim. Cross-block reclaim
-        // is safe — the caller just needs to clear the old block's
-        // file_megabyte and write its BAT page to cache.
-        let file_offset = mapping.file_megabyte() as u64 * MB1;
-
-        // Unmark the trimmed block.
-        if unmark_trimmed_block_inner(inner, block_number as u32, file_offset, block_size).is_ok() {
-            return Some((file_offset, block_number as u32));
+        if length == 0 {
+            return Ok(());
         }
 
-        hint = block_number + 1;
+        // Check range is within file.
+        if eof.file_length < offset || eof.file_length - offset < length as u64 {
+            return Err(VhdxError::Corrupt(CorruptionType::RangeBeyondEof));
+        }
+
+        let bit_base = (offset / MB1) as usize;
+        let bit_count = length as usize / MB1 as usize;
+
+        // Overlap check: all bits must currently be SET (free).
+        if !self.free_space.bitmap.are_bits_set(bit_base, bit_count) {
+            return Err(VhdxError::Corrupt(CorruptionType::RangeCollision));
+        }
+
+        // Mark as in-use (clear the bits).
+        self.free_space.bitmap.clear_range(bit_base, bit_count);
+
+        // Update last_file_offset and zero_offset.
+        let range_end = offset + length as u64;
+        if range_end > eof.last_file_offset {
+            eof.last_file_offset = range_end;
+            if eof.last_file_offset > eof.zero_offset {
+                eof.zero_offset = eof.last_file_offset;
+            }
+        }
+
+        Ok(())
     }
 
-    None
-}
+    /// Mark a trimmed block as soft-anchored (internal, no lock).
+    fn mark_trimmed_block_inner(
+        &mut self,
+        block_number: u32,
+        file_offset: u64,
+        block_size: u32,
+    ) -> Result<(), VhdxError> {
+        debug_assert!(block_number < self.data_block_count);
+        debug_assert!(block_size.is_multiple_of(MB1 as u32));
 
-/// Compute excess block count (blocks that won't fit given current space).
-fn compute_excess_block_count(inner: &FreeSpaceInner, eof: &EofState, max_offset: u64) -> u32 {
-    // Count unallocated blocks.
-    let total = inner.data_block_count;
-    // Available space: count of free bits in free space bitmap + anchored space
-    // + space from zero_offset to file_length.
-    let mut available_mb: u64 = 0;
+        // Check: already marked as trimmed?
+        if self.trimmed_blocks.bitmap.check_bit(block_number as usize) {
+            return Err(VhdxError::Corrupt(CorruptionType::TrimmedRangeCollision));
+        }
 
-    // Count free bits up to the bitmap.
-    for i in 0..inner.free_space.bitmap.len() {
-        if inner.free_space.bitmap.check_bit(i) {
-            available_mb += 1;
+        // Check: anchored space bits must be clear (no collision with another anchor).
+        let bit_base = (file_offset / MB1) as usize;
+        let bit_count = block_size as usize / MB1 as usize;
+        if !self
+            .anchored_space
+            .bitmap
+            .are_bits_clear(bit_base, bit_count)
+        {
+            return Err(VhdxError::Corrupt(CorruptionType::TrimmedRangeCollision));
+        }
+
+        // Mark in trimmed block tracker.
+        self.trimmed_blocks.bitmap.set_bit(block_number as usize);
+        self.trimmed_blocks.num_trimmed_blocks += 1;
+        self.trimmed_blocks.lowest_block_number_hint = self
+            .trimmed_blocks
+            .lowest_block_number_hint
+            .min(block_number);
+
+        // Mark in anchored space bitmap.
+        self.anchored_space.bitmap.set_range(bit_base, bit_count);
+        self.anchored_space.lowest_bit_hint =
+            self.anchored_space.lowest_bit_hint.min(bit_base as u32);
+
+        Ok(())
+    }
+
+    /// Unmark a trimmed block (internal, no lock).
+    fn unmark_trimmed_block_inner(
+        &mut self,
+        block_number: u32,
+        file_offset: u64,
+        block_size: u32,
+    ) -> Result<(), VhdxError> {
+        debug_assert!(block_number < self.data_block_count);
+        debug_assert!(block_size.is_multiple_of(MB1 as u32));
+
+        // If not marked, someone else already claimed it.
+        if !self.trimmed_blocks.bitmap.check_bit(block_number as usize) {
+            return Err(VhdxError::Corrupt(CorruptionType::Other));
+        }
+
+        self.trimmed_blocks.bitmap.clear_bit(block_number as usize);
+        self.trimmed_blocks.num_trimmed_blocks -= 1;
+
+        let bit_base = (file_offset / MB1) as usize;
+        let bit_count = block_size as usize / MB1 as usize;
+        debug_assert!(
+            self.anchored_space.bitmap.are_bits_set(bit_base, bit_count),
+            "anchored space bits must be set for trimmed block {block_number} at offset {file_offset:#x}"
+        );
+        self.anchored_space.bitmap.clear_range(bit_base, bit_count);
+
+        Ok(())
+    }
+
+    /// Release space to the free pool (internal, no lock).
+    fn release_inner(&mut self, offset: u64, size: u32) {
+        debug_assert!(offset.is_multiple_of(MB1));
+        debug_assert!((size as u64).is_multiple_of(MB1));
+
+        let bit_base = (offset / MB1) as usize;
+        let bit_count = size as usize / MB1 as usize;
+
+        if bit_base + bit_count > self.free_space.bitmap.len() {
+            // Defensive: can't release beyond bitmap size.
+            return;
+        }
+
+        debug_assert!(self.free_space.bitmap.are_bits_clear(bit_base, bit_count));
+        self.free_space.bitmap.set_range(bit_base, bit_count);
+        self.free_space.no_free_blocks = false;
+
+        if (bit_base as u32) < self.free_space.lowest_bit_hint {
+            self.free_space.lowest_bit_hint = bit_base as u32;
         }
     }
 
-    // Count anchored bits.
-    for i in 0..inner.anchored_space.bitmap.len() {
-        if inner.anchored_space.bitmap.check_bit(i) {
-            available_mb += 1;
+    /// Priority 1: free space pool allocation (internal, no lock).
+    fn free_space_pool_alloc(&mut self, eof: &mut EofState, length: u32) -> Option<u64> {
+        debug_assert!((length as u64).is_multiple_of(MB1));
+        let bit_count = length as usize / MB1 as usize;
+
+        // Fast-path skip for block-sized allocations.
+        if length >= self.block_size && self.free_space.no_free_blocks {
+            return None;
+        }
+
+        let result = self
+            .free_space
+            .bitmap
+            .find_set_bits(bit_count, self.free_space.lowest_bit_hint as usize);
+
+        match result {
+            Some(bit_base) => {
+                // Claim the space.
+                self.free_space.bitmap.clear_range(bit_base, bit_count);
+                self.free_space.lowest_bit_hint = (bit_base + bit_count) as u32;
+                let max_offset = (bit_base + bit_count) as u64 * MB1;
+                if eof.last_file_offset < max_offset {
+                    eof.last_file_offset = max_offset;
+                }
+                Some(bit_base as u64 * MB1)
+            }
+            None => {
+                if length <= self.block_size {
+                    self.free_space.no_free_blocks = true;
+                }
+                None
+            }
         }
     }
 
-    // EOF space.
-    let zero = eof.zero_offset.min(max_offset);
-    if eof.file_length > zero {
-        available_mb += (eof.file_length - zero) / MB1;
+    /// Find and unanchor an in-memory-only soft-anchored block.
+    fn find_and_unanchor_in_memory_inner(&mut self, bat_state: &BatState) -> Option<(u64, u32)> {
+        if self.trimmed_blocks.num_trimmed_blocks == 0 {
+            return None;
+        }
+
+        let block_size = self.block_size;
+
+        // Try to find an in-memory-only soft-anchored block by scanning
+        // the TrimmedBlock bitmap.
+        let mut trimmed_found = 0u32;
+        let total_trimmed = self.trimmed_blocks.num_trimmed_blocks;
+        let mut hint = self.trimmed_blocks.lowest_block_number_hint as usize;
+
+        while trimmed_found < total_trimmed {
+            let block_number = match self.trimmed_blocks.bitmap.find_set_bits(1, hint) {
+                Some(n) => n,
+                None => break,
+            };
+
+            trimmed_found += 1;
+            let mapping = bat_state.get_payload_mapping(block_number as u32);
+
+            // Block must be soft-anchored: unmapped/undefined state with non-zero file_megabyte.
+            let state = mapping.state();
+            let is_unmapped = state == BatEntryState::Unmapped as u8
+                || state == BatEntryState::Undefined as u8
+                || state == BatEntryState::Zero as u8
+                || state == BatEntryState::NotPresent as u8;
+
+            debug_assert!(
+                is_unmapped && mapping.file_megabyte() != 0,
+                "trimmed block {block_number} is not soft-anchored"
+            );
+
+            // Check if it's in-memory only (not on-disk anchored).
+            // Only blocks in TrimmedBlockTracker are considered here, and
+            // those are only populated by flush() after WAL durability, so
+            // the on-disk BAT already reflects the trim. Cross-block reclaim
+            // is safe — the caller just needs to clear the old block's
+            // file_megabyte and write its BAT page to cache.
+            let file_offset = mapping.file_megabyte() as u64 * MB1;
+
+            // Unmark the trimmed block.
+            if self
+                .unmark_trimmed_block_inner(block_number as u32, file_offset, block_size)
+                .is_ok()
+            {
+                return Some((file_offset, block_number as u32));
+            }
+
+            hint = block_number + 1;
+        }
+
+        None
     }
 
-    let block_mb = inner.block_size as u64 / MB1;
-    let available_blocks = available_mb / block_mb;
-    let needed = total as u64;
-    if needed > available_blocks {
-        (needed - available_blocks) as u32
-    } else {
-        0
+    /// Compute excess block count (blocks that won't fit given current space).
+    fn compute_excess_block_count(&self, eof: &EofState, max_offset: u64) -> u32 {
+        // Count unallocated blocks.
+        let total = self.data_block_count;
+        // Available space: count of free bits in free space bitmap + anchored space
+        // + space from zero_offset to file_length.
+        let mut available_mb: u64 = 0;
+
+        // Count free bits up to the bitmap.
+        for i in 0..self.free_space.bitmap.len() {
+            if self.free_space.bitmap.check_bit(i) {
+                available_mb += 1;
+            }
+        }
+
+        // Count anchored bits.
+        for i in 0..self.anchored_space.bitmap.len() {
+            if self.anchored_space.bitmap.check_bit(i) {
+                available_mb += 1;
+            }
+        }
+
+        // EOF space.
+        let zero = eof.zero_offset.min(max_offset);
+        if eof.file_length > zero {
+            available_mb += (eof.file_length - zero) / MB1;
+        }
+
+        let block_mb = self.block_size as u64 / MB1;
+        let available_blocks = available_mb / block_mb;
+        let needed = total as u64;
+        if needed > available_blocks {
+            (needed - available_blocks) as u32
+        } else {
+            0
+        }
     }
 }
 
@@ -1243,7 +1232,7 @@ impl FreeSpaceTracker {
     /// Find and unanchor a soft-anchored block (in-memory only anchors).
     pub fn find_and_unanchor_in_memory(&self, bat_state: &BatState) -> Option<(u64, u32)> {
         let mut inner = self.inner.lock();
-        find_and_unanchor_in_memory_inner(&mut inner, bat_state)
+        inner.find_and_unanchor_in_memory_inner(bat_state)
     }
 
     /// Check if a range is in use (for debug/validation).

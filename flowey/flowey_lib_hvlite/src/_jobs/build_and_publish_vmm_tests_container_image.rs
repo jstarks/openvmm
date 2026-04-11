@@ -152,13 +152,16 @@ impl SimpleFlowNode for Node {
                     artifacts_dir.join("nextest.toml"),
                 )?;
 
-                // Copy workspace Cargo.toml (needed by nextest --workspace-remap)
+                // Copy the repo source tree into the build context.
+                // Nextest --workspace-remap needs the workspace structure
+                // (Cargo.toml + crate directories) to exist at the remapped
+                // path. Simplest to just include the source.
                 let workspace_dir = artifacts_dir.join("workspace");
-                fs_err::create_dir_all(&workspace_dir)?;
-                fs_err::copy(
-                    repo_dir.join("Cargo.toml"),
-                    workspace_dir.join("Cargo.toml"),
-                )?;
+                flowey::shell_cmd!(
+                    rt,
+                    "rsync -a --exclude target --exclude .git {repo_dir}/ {workspace_dir}/"
+                )
+                .run()?;
 
                 // Copy entrypoint binary
                 let entrypoint = rt.read(entrypoint_bin);

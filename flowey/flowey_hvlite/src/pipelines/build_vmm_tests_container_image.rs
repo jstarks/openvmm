@@ -70,6 +70,8 @@ impl IntoPipeline for BuildVmmTestsContainerImageCli {
         let (pub_openvmm, use_openvmm) = pipeline.new_typed_artifact("openvmm");
         let (pub_openvmm_vhost, use_openvmm_vhost) = pipeline.new_typed_artifact("openvmm_vhost");
         let (pub_pipette, use_pipette) = pipeline.new_typed_artifact("pipette");
+        let (pub_pipette_windows, use_pipette_windows) =
+            pipeline.new_typed_artifact("pipette_windows");
         let (pub_tmk_vmm, use_tmk_vmm) = pipeline.new_typed_artifact("tmk_vmm");
         let (pub_tmks, use_tmks) = pipeline.new_typed_artifact("tmks");
         let (pub_vmgstool, use_vmgstool) = pipeline.new_typed_artifact("vmgstool");
@@ -128,6 +130,14 @@ impl IntoPipeline for BuildVmmTestsContainerImageCli {
                 target: musl_target.clone(),
                 profile,
                 pipette: ctx.publish_typed_artifact(pub_pipette),
+            })
+            .dep_on(|ctx| flowey_lib_hvlite::build_pipette::Request {
+                target: CommonTriple::Common {
+                    arch,
+                    platform: CommonPlatform::WindowsMsvc,
+                },
+                profile,
+                pipette: ctx.publish_typed_artifact(pub_pipette_windows),
             })
             .dep_on(|ctx| flowey_lib_hvlite::build_tmk_vmm::Request {
                 target: musl_target.clone(),
@@ -203,7 +213,7 @@ impl IntoPipeline for BuildVmmTestsContainerImageCli {
                     openvmm: ctx.use_typed_artifact(&use_openvmm),
                     openvmm_vhost: Some(ctx.use_typed_artifact(&use_openvmm_vhost)),
                     pipette_linux: ctx.use_typed_artifact(&use_pipette),
-                    pipette_windows: None, // not available for local Linux builds
+                    pipette_windows: Some(ctx.use_typed_artifact(&use_pipette_windows)),
                     tmk_vmm: Some(ctx.use_typed_artifact(&use_tmk_vmm)),
                     tmks: Some(ctx.use_typed_artifact(&use_tmks)),
                     vmgstool: Some(ctx.use_typed_artifact(&use_vmgstool)),

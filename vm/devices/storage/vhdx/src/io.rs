@@ -124,11 +124,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
         let block_count = end_block - start_block + 1;
 
-        self.acquire_io_refcounts(start_block, block_count).await;
-
-        // Create the guard now so its Drop cleans up refcounts if
-        // anything below (e.g. resolve_partial_block_read) fails.
-        let guard = ReadIoGuard::new(self, start_block, block_count);
+        let guard = self.acquire_io_refcounts(start_block, block_count).await;
 
         let mut current_offset: u32 = 0;
 
@@ -245,12 +241,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
         let block_count = end_block - start_block + 1;
 
-        self.acquire_io_refcounts(start_block, block_count).await;
-
-        // Wrap refcounts in a read guard immediately so they're released
-        // on any early return or panic below. We'll either consume it
-        // (no-allocation path) or explicitly drop it (allocation path).
-        let refcount_guard = ReadIoGuard::new(self, start_block, block_count);
+        let refcount_guard = self.acquire_io_refcounts(start_block, block_count).await;
 
         // Track which blocks we've resolved in the read phase.
         // Blocks needing allocation are collected for the allocation phase.
@@ -853,13 +844,14 @@ impl<F: AsyncFile> VhdxFile<F> {
         Ok(())
     }
 
-    /// Atomically increment I/O refcounts for a range of blocks.
+    /// Atomically increment I/O refcounts for a range of blocks,
+    /// returning a [`ReadIoGuard`] that will release them on drop.
     ///
     /// Uses CAS to increment each block's refcount. If any block has the
     /// trim sentinel set, undoes partial increments, waits for trim to
     /// release, and retries. Returns once all blocks are successfully
     /// claimed.
-    async fn acquire_io_refcounts(&self, start_block: u32, block_count: u32) {
+    async fn acquire_io_refcounts(&self, start_block: u32, block_count: u32) -> ReadIoGuard<'_, F> {
         loop {
             let listener = self.io_wait_event.listen();
             let mut incremented = 0u32;
@@ -875,7 +867,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             }
 
             if !blocked {
-                return;
+                return ReadIoGuard::new(self, start_block, block_count);
             }
 
             // Undo partial increments.

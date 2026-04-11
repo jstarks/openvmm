@@ -21,6 +21,7 @@ use crate::format::CACHE_PAGE_SIZE;
 use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::MB1;
 use bitfield_struct::bitfield;
+use parking_lot::RwLock;
 use zerocopy::IntoBytes;
 
 use crate::space::EofState;
@@ -52,6 +53,8 @@ pub(crate) struct Bat {
     pub block_size: u32,
     /// Whether the disk has a parent (differencing).
     pub has_parent: bool,
+
+    pub bat_state: RwLock<BatState>,
 }
 
 /// The mapping state returned from a BAT lookup.
@@ -206,6 +209,7 @@ impl Bat {
         block_size: u32,
         logical_sector_size: u32,
         has_parent: bool,
+        bat_length: u32,
     ) -> Result<Self, VhdxError> {
         let chunk_ratio = chunk_block_count(block_size, logical_sector_size);
         if chunk_ratio == 0 {
@@ -219,22 +223,11 @@ impl Bat {
             0
         };
 
-        Ok(Bat {
-            data_block_count,
-            sector_bitmap_block_count,
-            chunk_ratio,
-            block_size,
-            has_parent,
-        })
-    }
-
-    /// Validate that the BAT region is large enough for all entries.
-    pub fn validate_bat_size(&self, bat_length: u32) -> Result<(), VhdxError> {
-        let entry_count = if self.has_parent {
-            self.sector_bitmap_block_count as u64 * (self.chunk_ratio as u64 + 1)
+        let entry_count = if has_parent {
+            sector_bitmap_block_count as u64 * (chunk_ratio as u64 + 1)
         } else {
-            self.data_block_count as u64
-                + (self.data_block_count.saturating_sub(1) as u64 / self.chunk_ratio as u64)
+            data_block_count as u64
+                + (data_block_count.saturating_sub(1) as u64 / chunk_ratio as u64)
         };
 
         let required_bytes = entry_count * size_of::<BatEntry>() as u64;
@@ -242,7 +235,21 @@ impl Bat {
             return Err(VhdxError::Corrupt(CorruptionType::BatTooSmall));
         }
 
-        Ok(())
+        let bat_state = BatState {
+            payload_mappings: Vec::with_capacity(data_block_count as usize),
+            sector_bitmap_mappings: Vec::with_capacity(sector_bitmap_block_count as usize),
+            allocated_block_count: 0,
+            io_refcounts: vec![0; data_block_count as usize],
+        };
+
+        Ok(Bat {
+            data_block_count,
+            sector_bitmap_block_count,
+            chunk_ratio,
+            block_size,
+            has_parent,
+            bat_state: bat_state.into(),
+        })
     }
 
     /// Compute the BAT entry index for a given data block number.
@@ -517,16 +524,11 @@ impl Bat {
     /// During parse, marks allocated blocks in the FreeSpaceTracker and
     /// records soft-anchored blocks.
     pub(crate) async fn load_bat_state<F: AsyncFile>(
-        &self,
+        &mut self,
         cache: &PageCache<F>,
         free_space: &FreeSpaceTracker,
-        mut eof_state: EofState,
-    ) -> Result<(BatState, EofState), VhdxError> {
-        let mut payload_mappings = Vec::with_capacity(self.data_block_count as usize);
-        let mut sector_bitmap_mappings =
-            Vec::with_capacity(self.sector_bitmap_block_count as usize);
-        let mut allocated_block_count: u32 = 0;
-
+        eof_state: &mut EofState,
+    ) -> Result<(), VhdxError> {
         // Read all payload entries.
         for block in 0..self.data_block_count {
             let entry_index = self.payload_entry_index(block);
@@ -540,11 +542,11 @@ impl Bat {
             if raw_state == BatEntryState::FullyPresent as u8
                 || raw_state == BatEntryState::PartiallyPresent as u8
             {
-                allocated_block_count += 1;
+                self.bat_state.get_mut().allocated_block_count += 1;
                 // Mark the block's file region as in-use in the space tracker.
                 let file_offset = internal.file_megabyte() as u64 * MB1;
                 if file_offset != 0 {
-                    free_space.mark_range_in_use(&mut eof_state, file_offset, self.block_size)?;
+                    free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
                 }
             } else if (raw_state == BatEntryState::Unmapped as u8
                 || raw_state == BatEntryState::Undefined as u8)
@@ -554,10 +556,10 @@ impl Bat {
                 // Mark the space as in-use first (so it's not in the free pool),
                 // then register it as a soft anchor for potential reclaim.
                 let file_offset = internal.file_megabyte() as u64 * MB1;
-                free_space.mark_range_in_use(&mut eof_state, file_offset, self.block_size)?;
+                free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
                 free_space.mark_trimmed_block(block, file_offset, self.block_size)?;
             }
-            payload_mappings.push(internal);
+            self.bat_state.get_mut().payload_mappings.push(internal);
         }
 
         // Read all sector bitmap entries.
@@ -576,25 +578,19 @@ impl Bat {
                 let file_offset = internal.file_megabyte() as u64 * MB1;
                 if file_offset != 0 {
                     free_space.mark_range_in_use(
-                        &mut eof_state,
+                        eof_state,
                         file_offset,
                         SECTOR_BITMAP_BLOCK_SIZE,
                     )?;
                 }
             }
-            sector_bitmap_mappings.push(internal);
+            self.bat_state
+                .get_mut()
+                .sector_bitmap_mappings
+                .push(internal);
         }
 
-        let payload_count = payload_mappings.len();
-        Ok((
-            BatState {
-                payload_mappings,
-                sector_bitmap_mappings,
-                allocated_block_count,
-                io_refcounts: vec![0u32; payload_count],
-            },
-            eof_state,
-        ))
+        Ok(())
     }
 
     /// Read a single raw BAT entry from disk through the cache.

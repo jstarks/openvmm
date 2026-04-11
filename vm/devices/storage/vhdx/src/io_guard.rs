@@ -52,7 +52,7 @@ impl<F: AsyncFile> Drop for ReadIoGuard<'_, F> {
         if self.block_count == 0 {
             return;
         }
-        let mut bat_state = self.vhdx.bat_state.write();
+        let mut bat_state = self.vhdx.bat.bat_state.write();
         let mut any_zero = false;
         for block in self.start_block..self.start_block + self.block_count {
             if bat_state.decrement_io_refcount(block) == 0 {
@@ -145,7 +145,7 @@ impl<F: AsyncFile> Drop for WriteIoGuard<'_, F> {
     fn drop(&mut self) {
         // Decrement refcounts.
         if self.block_count > 0 {
-            let mut bat_state = self.vhdx.bat_state.write();
+            let mut bat_state = self.vhdx.bat.bat_state.write();
             let mut any_zero = false;
             for block in self.start_block..self.start_block + self.block_count {
                 if bat_state.decrement_io_refcount(block) == 0 {

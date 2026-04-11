@@ -344,7 +344,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             loop {
                 let listener = self.trim_event.listen();
                 {
-                    let bat_state = self.bat_state.read();
+                    let bat_state = self.bat.bat_state.read();
                     if current_block >= end_block {
                         return Ok(());
                     }
@@ -360,7 +360,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             //     block whose mapping actually changes. Skip no-ops without
             //     re-acquiring the lock.
             let scan_result = {
-                let bat_state = self.bat_state.read();
+                let bat_state = self.bat.bat_state.read();
                 loop {
                     if current_block >= end_block {
                         break None;
@@ -393,7 +393,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             // 9c. Update in-memory BAT under write lock.
             {
-                let mut bat_state = self.bat_state.write();
+                let mut bat_state = self.bat.bat_state.write();
                 bat_state.set_payload_mapping(&self.bat, block_number, new_mapping);
             }
 
@@ -402,7 +402,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             self.bat
                 .write_block_mapping(
                     &self.cache,
-                    &self.bat_state,
+                    &self.bat.bat_state,
                     BlockType::Payload,
                     block_number,
                     new_mapping,
@@ -518,7 +518,7 @@ mod tests {
         block_number: u32,
         expected: BatEntryState,
     ) {
-        let bat_state = vhdx.bat_state.read();
+        let bat_state = vhdx.bat.bat_state.read();
         let mapping = bat_state.get_payload_mapping(block_number);
         let actual = BatEntryState::from_raw(mapping.state()).unwrap();
         assert_eq!(
@@ -529,7 +529,7 @@ mod tests {
 
     /// Helper to check if a block has a non-zero file megabyte (soft anchor).
     fn block_has_file_offset(vhdx: &VhdxFile<InMemoryFile>, block_number: u32) -> bool {
-        let bat_state = vhdx.bat_state.read();
+        let bat_state = vhdx.bat.bat_state.read();
         let mapping = bat_state.get_payload_mapping(block_number);
         mapping.file_megabyte() != 0
     }
@@ -1058,7 +1058,7 @@ mod tests {
             .unwrap();
 
         // Blocks should be unchanged.
-        let bat_state = vhdx.bat_state.read();
+        let bat_state = vhdx.bat.bat_state.read();
         let mapping = bat_state.get_payload_mapping(0);
         let state = BatEntryState::from_raw(mapping.state()).unwrap();
         // On a fully-allocated disk, blocks start as Undefined (not yet written).

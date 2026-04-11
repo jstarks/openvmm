@@ -220,9 +220,6 @@ pub struct VhdxFile<F: AsyncFile> {
     // Mutable header / write-mode state.
     pub(crate) write_state: Mutex<WriteState>,
 
-    // In-memory BAT state.
-    pub(crate) bat_state: RwLock<BatState>,
-
     /// Serializes block allocation decisions and protects EOF geometry
     /// state. Only one allocation sequence runs at a time.
     /// Uses futures::lock::Mutex because it may be held across .await points.
@@ -394,15 +391,13 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         let known = read_known_metadata(&file, &metadata_table, regions.metadata_offset).await?;
 
         // 9. Create BAT manager.
-        let bat = Bat::new(
+        let mut bat = Bat::new(
             known.disk_size,
             known.block_size,
             known.logical_sector_size,
             known.has_parent,
+            regions.bat_length,
         )?;
-
-        // 10. Validate BAT region size.
-        bat.validate_bat_size(regions.bat_length)?;
 
         // 11. Wrap file in Arc for shared access.
         let file = Arc::new(file);
@@ -419,7 +414,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         cache.register_tag(SBM_TAG, 0);
 
         // 13. Create FreeSpaceTracker.
-        let (free_space, eof_state) = FreeSpaceTracker::new(
+        let (free_space, mut eof_state) = FreeSpaceTracker::new(
             file_length,
             known.block_size,
             options.block_alignment,
@@ -434,7 +429,8 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         )?;
 
         // 14. Load in-memory BAT from disk.
-        let (bat_state, eof_state) = bat.load_bat_state(&cache, &free_space, eof_state).await?;
+        bat.load_bat_state(&cache, &free_space, &mut eof_state)
+            .await?;
 
         // 15. Finalize free space initialization after BAT parse.
         free_space.complete_initialization(&eof_state);
@@ -460,7 +456,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
                 log_guid: Guid::ZERO,
                 first_header_current: header.first_header_current,
             }),
-            bat_state: RwLock::new(bat_state),
             allocation_lock: futures::lock::Mutex::new(eof_state),
             allocation_event: event_listener::Event::new(),
             trim_event: event_listener::Event::new(),
@@ -802,7 +797,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     ///
     /// Synchronous — reads from the in-memory BAT, no I/O.
     pub(crate) fn get_block_mapping(&self, block_number: u32) -> BlockMapping {
-        let bat_state = self.bat_state.read();
+        let bat_state = self.bat.bat_state.read();
         self.bat
             .get_block_mapping_from_state(&bat_state, block_number)
     }
@@ -811,7 +806,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     ///
     /// Synchronous — reads from the in-memory BAT, no I/O.
     pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
-        let bat_state = self.bat_state.read();
+        let bat_state = self.bat.bat_state.read();
         self.bat
             .get_sbm_mapping_from_state(&bat_state, chunk_number)
     }
@@ -1209,7 +1204,7 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
-        let bat_state = vhdx.bat_state.read();
+        let bat_state = vhdx.bat.bat_state.read();
         // All payload entries should be NotPresent.
         for (i, mapping) in bat_state.payload_mappings.iter().enumerate() {
             assert_eq!(
@@ -1247,7 +1242,7 @@ mod tests {
             .unwrap();
 
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
-        let bat_state = vhdx.bat_state.read();
+        let bat_state = vhdx.bat.bat_state.read();
         assert_eq!(
             bat_state.payload_mappings[0].state(),
             BatEntryState::FullyPresent as u8,

@@ -976,7 +976,7 @@ async fn deferred_same_block_reclaim(driver: DefaultDriver) {
     // Write block 0.
     write_pattern(&vhdx, 0, block_size as usize, 0xAA).await;
     let original_offset = {
-        let bat_state = vhdx.bat_state.read();
+        let bat_state = vhdx.bat.bat_state.read();
         bat_state.get_payload_mapping(0).file_megabyte()
     };
     assert!(original_offset > 0);
@@ -990,7 +990,7 @@ async fn deferred_same_block_reclaim(driver: DefaultDriver) {
 
     // Block 0 should be FullyPresent at the same offset.
     let new_offset = {
-        let bat_state = vhdx.bat_state.read();
+        let bat_state = vhdx.bat.bat_state.read();
         let mapping = bat_state.get_payload_mapping(0);
         assert_eq!(
             format::BatEntryState::from_raw(mapping.state()),

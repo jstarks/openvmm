@@ -27,16 +27,28 @@ ADD --unpack --link \
     https://get.nexte.st/${NEXTEST_VERSION}/${RUST_ARCH}-unknown-linux-gnu.tar.gz \
     /usr/local/bin/
 
-# openvmm-deps: Linux kernel, initrd, petritools (auto-extracted remote tarball)
+# Determine arch-specific directory names for the content dir layout.
+# These must match what petri_artifact_resolver_openvmm_known_paths expects:
+#   x86_64: kernel at bin/x64/vmlinux, initrd at bin/x64/initrd
+#   aarch64: kernel at bin/aarch64/Image, initrd at bin/aarch64/initrd
+ARG CONTENT_ARCH_DIR
+ARG UEFI_CONTENT_DIR
+
+# openvmm-deps: Linux kernel, initrd, petritools — placed directly into the
+# content dir layout the artifact resolver expects.
 ADD --unpack --link \
     https://github.com/microsoft/openvmm-deps/releases/download/${OPENVMM_DEPS_VERSION}/openvmm-deps.${RUST_ARCH}.${OPENVMM_DEPS_VERSION}.tar.bz2 \
-    /opt/openvmm/deps/
+    /opt/openvmm/bin/${CONTENT_ARCH_DIR}/
 
-# UEFI firmware from microsoft/mu_msvm GitHub Releases (ZIP — not auto-extracted)
+# UEFI firmware from microsoft/mu_msvm GitHub Releases (ZIP — not auto-extracted).
+# Extracted into the deep path the artifact resolver expects.
 ADD --link \
     https://github.com/microsoft/mu_msvm/releases/download/v${MU_MSVM_VERSION}/RELEASE-${UEFI_ARCH}-artifacts.zip \
     /tmp/uefi.zip
-RUN unzip -q /tmp/uefi.zip -d /opt/openvmm/firmware/ && rm /tmp/uefi.zip
+RUN mkdir -p "/opt/openvmm/bin/${UEFI_CONTENT_DIR}" && \
+    unzip -q /tmp/uefi.zip -d /tmp/uefi && \
+    find /tmp/uefi -name MSVM.fd -exec cp {} "/opt/openvmm/bin/${UEFI_CONTENT_DIR}/MSVM.fd" \; && \
+    rm -rf /tmp/uefi /tmp/uefi.zip
 
 # Pre-built artifacts assembled by flowey into the build context:
 #   artifacts/bin/       — openvmm, pipette, tmk_vmm, etc.

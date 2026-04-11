@@ -265,6 +265,19 @@ impl SimpleFlowNode for Node {
                     CommonArch::Aarch64 => ("aarch64", "AARCH64"),
                 };
 
+                // Content dir subdirectory names — must match
+                // petri_artifact_resolver_openvmm_known_paths bundle names.
+                let (content_arch_dir, uefi_content_dir) = match arch {
+                    CommonArch::X86_64 => (
+                        "x64",
+                        "hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV",
+                    ),
+                    CommonArch::Aarch64 => (
+                        "aarch64",
+                        "hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_VS2022/FV",
+                    ),
+                };
+
                 let arch_tag = match arch {
                     CommonArch::X86_64 => "x64",
                     CommonArch::Aarch64 => "aarch64",
@@ -295,6 +308,8 @@ impl SimpleFlowNode for Node {
                 let msvm_arg = format!("MU_MSVM_VERSION={mu_msvm_version}");
                 let rust_arg = format!("RUST_ARCH={rust_arch}");
                 let uefi_arg = format!("UEFI_ARCH={uefi_arch}");
+                let content_arch_arg = format!("CONTENT_ARCH_DIR={content_arch_dir}");
+                let uefi_content_arg = format!("UEFI_CONTENT_DIR={uefi_content_dir}");
 
                 let push_or_load: &str = if push { "--push" } else { "--load" };
 
@@ -309,6 +324,8 @@ impl SimpleFlowNode for Node {
                         --build-arg {msvm_arg}
                         --build-arg {rust_arg}
                         --build-arg {uefi_arg}
+                        --build-arg {content_arch_arg}
+                        --build-arg {uefi_content_arg}
                         --tag {tag}
                         {push_or_load}
                         {context_dir}"

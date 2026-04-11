@@ -79,11 +79,10 @@ fn check_kvm() {
     }
 }
 
-/// Create output directories if they don't exist.
+/// Create output directories.
 fn setup_directories() -> anyhow::Result<()> {
     fs_err::create_dir_all(paths::RESULTS_DIR).context("failed to create results directory")?;
 
-    // Use /images if it's mounted, otherwise use /cache/images.
     let images_dir = images_dir();
     fs_err::create_dir_all(&images_dir).context("failed to create images directory")?;
 

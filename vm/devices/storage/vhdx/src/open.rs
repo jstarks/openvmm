@@ -421,6 +421,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         let (free_space, eof_state) = FreeSpaceTracker::new(
             file_length,
             known.block_size,
+            options.block_alignment,
             format::HEADER_AREA_SIZE,
             header.log_offset,
             header.log_length,
@@ -430,11 +431,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             regions.metadata_length,
             bat.data_block_count,
         )?;
-
-        // 13b. Apply block alignment from open options.
-        if options.block_alignment != 0 {
-            free_space.set_block_alignment(options.block_alignment)?;
-        }
 
         // 14. Load in-memory BAT from disk.
         let (bat_state, eof_state) = bat.load_bat_state(&cache, &free_space, eof_state).await?;

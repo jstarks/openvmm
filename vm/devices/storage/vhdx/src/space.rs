@@ -267,8 +267,6 @@ struct FreeSpaceInner {
 
     /// Block size in bytes.
     block_size: u32,
-    /// Block alignment (0 or power of 2 ≤ block_size).
-    block_alignment: u32,
     /// Number of data blocks.
     data_block_count: u32,
 }
@@ -285,6 +283,8 @@ struct FreeSpaceInner {
 /// allocation sequence including any file I/O.
 pub(crate) struct FreeSpaceTracker {
     inner: Mutex<FreeSpaceInner>,
+    /// Block alignment (0 or power of 2 ≤ block_size). Constant after construction.
+    block_alignment: u32,
 }
 
 /// Flags for [`VhdxFile::allocate_space()`].
@@ -353,6 +353,7 @@ impl FreeSpaceTracker {
     pub fn new(
         file_length: u64,
         block_size: u32,
+        block_alignment: u32,
         header_area_size: u64,
         log_offset: u64,
         log_length: u32,
@@ -362,6 +363,17 @@ impl FreeSpaceTracker {
         metadata_length: u32,
         data_block_count: u32,
     ) -> Result<(Self, EofState), VhdxError> {
+        // Validate alignment.
+        if block_alignment != 0 && !block_alignment.is_power_of_two() {
+            return Err(VhdxError::InvalidFormat(
+                crate::error::InvalidFormatReason::BlockAlignmentNotPowerOfTwo,
+            ));
+        }
+        let effective_alignment = if block_alignment > block_size {
+            0
+        } else {
+            block_alignment
+        };
         // File length must be MB1-aligned.
         let aligned_file_length = (file_length + MB1 - 1) & !(MB1 - 1);
         let bit_count = (aligned_file_length / MB1) as usize;
@@ -397,7 +409,6 @@ impl FreeSpaceTracker {
                 num_trimmed_blocks: 0,
             },
             block_size,
-            block_alignment: 0,
             data_block_count,
         };
 
@@ -426,33 +437,15 @@ impl FreeSpaceTracker {
         Ok((
             FreeSpaceTracker {
                 inner: Mutex::new(inner),
+                block_alignment: effective_alignment,
             },
             eof_state,
         ))
     }
 
-    /// Set block alignment. Must be 0 or a power of 2.
-    /// If alignment > block_size, it is ignored (set to 0).
-    ///
-    /// Corresponds to `Vhd2SetBlockAlignment`.
-    pub fn set_block_alignment(&self, alignment: u32) -> Result<(), VhdxError> {
-        if alignment != 0 && !alignment.is_power_of_two() {
-            return Err(VhdxError::InvalidFormat(
-                crate::error::InvalidFormatReason::BlockAlignmentNotPowerOfTwo,
-            ));
-        }
-        let mut inner = self.inner.lock();
-        inner.block_alignment = if inner.block_size < alignment {
-            0
-        } else {
-            alignment
-        };
-        Ok(())
-    }
-
-    /// Current block alignment (0 or power of 2).
+    /// Block alignment (0 or power of 2). Constant after construction.
     pub fn block_alignment(&self) -> u32 {
-        self.inner.lock().block_alignment
+        self.block_alignment
     }
 
     /// Mark a file range as in-use during BAT parse.
@@ -499,23 +492,6 @@ impl FreeSpaceTracker {
         }
     }
 
-    /// Try to allocate space using priorities 1–3 (pool, near-EOF, anchored).
-    ///
-    /// Returns `Some(result)` on success, `None` if EOF extension is needed.
-    /// When `None`, the caller should call [`EofState::required_file_length()`],
-    /// extend the file, call [`EofState::complete_file_extend()`], then retry.
-    ///
-    /// Corresponds to `Vhd2iContinueAllocateSpace`.
-    pub fn try_allocate(
-        &self,
-        eof: &mut EofState,
-        size: u32,
-        aligned: bool,
-    ) -> Option<AllocateResult> {
-        let mut inner = self.inner.lock();
-        try_allocate_inner(&mut inner, eof, size, aligned, None)
-    }
-
     /// Try to allocate using priorities 1–3, with access to the BAT state
     /// for soft-anchor lookup (priority 3).
     pub fn try_allocate_with_bat(
@@ -525,8 +501,7 @@ impl FreeSpaceTracker {
         aligned: bool,
         bat_state: &BatState,
     ) -> Option<AllocateResult> {
-        let mut inner = self.inner.lock();
-        try_allocate_inner(&mut inner, eof, size, aligned, Some(bat_state))
+        self.try_allocate_inner(eof, size, aligned, Some(bat_state))
     }
 
     /// Release space back to the free pool.
@@ -548,15 +523,6 @@ impl FreeSpaceTracker {
     ) -> Result<(), VhdxError> {
         let mut inner = self.inner.lock();
         unmark_trimmed_block_inner(&mut inner, block_number, file_offset, block_size)
-    }
-
-    /// Find and unanchor a soft-anchored block (in-memory only anchors).
-    ///
-    /// Returns the file offset and block number if found.
-    /// Corresponds to the in-memory path of `Vhd2iFindAndUnanchorSpaceLocked`.
-    pub fn find_and_unanchor_in_memory(&self, bat_state: &BatState) -> Option<(u64, u32)> {
-        let mut inner = self.inner.lock();
-        find_and_unanchor_in_memory_inner(&mut inner, bat_state)
     }
 
     /// Compute truncation target size.
@@ -585,21 +551,6 @@ impl FreeSpaceTracker {
 
         eof.file_length = aligned;
         eof.zero_offset = eof.zero_offset.min(aligned);
-    }
-
-    /// Check if a range is in use (for debug/validation).
-    pub fn is_range_in_use(&self, eof: &EofState, offset: u64, length: u32) -> bool {
-        let inner = self.inner.lock();
-        debug_assert!(offset.is_multiple_of(MB1));
-        debug_assert!((length as u64).is_multiple_of(MB1));
-
-        if eof.file_length < offset || eof.file_length - offset < length as u64 {
-            return true;
-        }
-
-        let bit_base = (offset / MB1) as usize;
-        let bit_count = length as usize / MB1 as usize;
-        !inner.free_space.bitmap.are_bits_set(bit_base, bit_count)
     }
 }
 
@@ -832,69 +783,72 @@ fn free_space_pool_alloc(
     }
 }
 
-/// Try all three in-memory allocation priorities (internal).
-fn try_allocate_inner(
-    inner: &mut FreeSpaceInner,
-    eof: &mut EofState,
-    size: u32,
-    aligned: bool,
-    bat_state: Option<&BatState>,
-) -> Option<AllocateResult> {
-    // Priority 1: free space pool.
-    if let Some(offset) = free_space_pool_alloc(inner, eof, size) {
-        return Some(AllocateResult {
-            file_offset: offset,
-            state: SpaceState::CrossStale,
-            unanchored_block: None,
-        });
-    }
+/// Try all three in-memory allocation priorities.
+impl FreeSpaceTracker {
+    fn try_allocate_inner(
+        &self,
+        eof: &mut EofState,
+        size: u32,
+        aligned: bool,
+        bat_state: Option<&BatState>,
+    ) -> Option<AllocateResult> {
+        let mut inner = self.inner.lock();
+        // Priority 1: free space pool.
+        if let Some(offset) = free_space_pool_alloc(&mut inner, eof, size) {
+            return Some(AllocateResult {
+                file_offset: offset,
+                state: SpaceState::CrossStale,
+                unanchored_block: None,
+            });
+        }
 
-    // Priority 2: near-EOF space (between ZeroOffset and FileLength).
-    let aligned_zero_offset = if aligned && inner.block_alignment != 0 {
-        round_up(eof.zero_offset, inner.block_alignment as u64)
-    } else {
-        eof.zero_offset
-    };
+        // Priority 2: near-EOF space (between ZeroOffset and FileLength).
+        let aligned_zero_offset = if aligned && self.block_alignment != 0 {
+            round_up(eof.zero_offset, self.block_alignment as u64)
+        } else {
+            eof.zero_offset
+        };
 
-    if eof.file_length >= aligned_zero_offset + size as u64 {
-        let offset = aligned_zero_offset;
-        eof.zero_offset = aligned_zero_offset + size as u64;
-        eof.last_file_offset = eof.zero_offset;
-        return Some(AllocateResult {
-            file_offset: offset,
-            state: SpaceState::Zero,
-            unanchored_block: None,
-        });
-    }
+        if eof.file_length >= aligned_zero_offset + size as u64 {
+            let offset = aligned_zero_offset;
+            eof.zero_offset = aligned_zero_offset + size as u64;
+            eof.last_file_offset = eof.zero_offset;
+            return Some(AllocateResult {
+                file_offset: offset,
+                state: SpaceState::Zero,
+                unanchored_block: None,
+            });
+        }
 
-    // Priority 3: soft-anchored space from trimmed blocks.
-    //
-    // Only considers blocks in TrimmedBlockTracker, which are populated
-    // by flush() — so they are always durable. The caller must clear
-    // the old block's file_megabyte in BatState and write its BAT page
-    // to cache.
-    if size <= inner.block_size {
-        if let Some(bat_state) = bat_state {
-            if let Some((file_offset, block_number)) =
-                find_and_unanchor_in_memory_inner(inner, bat_state)
-            {
-                // If the allocated block is larger than needed, release excess.
-                if size < inner.block_size {
-                    let excess_offset = file_offset + size as u64;
-                    let excess_size = inner.block_size - size;
-                    release_inner(inner, excess_offset, excess_size);
+        // Priority 3: soft-anchored space from trimmed blocks.
+        //
+        // Only considers blocks in TrimmedBlockTracker, which are populated
+        // by flush() — so they are always durable. The caller must clear
+        // the old block's file_megabyte in BatState and write its BAT page
+        // to cache.
+        if size <= inner.block_size {
+            if let Some(bat_state) = bat_state {
+                if let Some((file_offset, block_number)) =
+                    find_and_unanchor_in_memory_inner(&mut inner, bat_state)
+                {
+                    // If the allocated block is larger than needed, release excess.
+                    if size < inner.block_size {
+                        let excess_offset = file_offset + size as u64;
+                        let excess_size = inner.block_size - size;
+                        release_inner(&mut inner, excess_offset, excess_size);
+                    }
+                    return Some(AllocateResult {
+                        file_offset,
+                        state: SpaceState::CrossStale,
+                        unanchored_block: Some(block_number),
+                    });
                 }
-                return Some(AllocateResult {
-                    file_offset,
-                    state: SpaceState::CrossStale,
-                    unanchored_block: Some(block_number),
-                });
             }
         }
-    }
 
-    // Priority 4: caller must extend EOF.
-    None
+        // Priority 4: caller must extend EOF.
+        None
+    }
 }
 
 /// Find and unanchor an in-memory-only soft-anchored block.
@@ -1270,6 +1224,45 @@ impl<F: AsyncFile> VhdxFile<F> {
 }
 
 // ---------------------------------------------------------------------------
+// Test-only helpers on FreeSpaceTracker
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+impl FreeSpaceTracker {
+    /// Try to allocate space using priorities 1–3 (pool, near-EOF, anchored)
+    /// without a BAT state (skips priority 3).
+    pub fn try_allocate(
+        &self,
+        eof: &mut EofState,
+        size: u32,
+        aligned: bool,
+    ) -> Option<AllocateResult> {
+        self.try_allocate_inner(eof, size, aligned, None)
+    }
+
+    /// Find and unanchor a soft-anchored block (in-memory only anchors).
+    pub fn find_and_unanchor_in_memory(&self, bat_state: &BatState) -> Option<(u64, u32)> {
+        let mut inner = self.inner.lock();
+        find_and_unanchor_in_memory_inner(&mut inner, bat_state)
+    }
+
+    /// Check if a range is in use (for debug/validation).
+    pub fn is_range_in_use(&self, eof: &EofState, offset: u64, length: u32) -> bool {
+        let inner = self.inner.lock();
+        debug_assert!(offset.is_multiple_of(MB1));
+        debug_assert!((length as u64).is_multiple_of(MB1));
+
+        if eof.file_length < offset || eof.file_length - offset < length as u64 {
+            return true;
+        }
+
+        let bit_base = (offset / MB1) as usize;
+        let bit_count = length as usize / MB1 as usize;
+        !inner.free_space.bitmap.are_bits_set(bit_base, bit_count)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1348,6 +1341,14 @@ mod tests {
 
     /// Helper: create a tracker for a small test file.
     fn make_test_tracker(file_mb: u64, block_size_mb: u32) -> (FreeSpaceTracker, EofState) {
+        make_test_tracker_aligned(file_mb, block_size_mb, 0)
+    }
+
+    fn make_test_tracker_aligned(
+        file_mb: u64,
+        block_size_mb: u32,
+        block_alignment: u32,
+    ) -> (FreeSpaceTracker, EofState) {
         let file_length = file_mb * MB1;
         let block_size = block_size_mb * MB1 as u32;
         let data_block_count = 16; // arbitrary for testing
@@ -1355,6 +1356,7 @@ mod tests {
         FreeSpaceTracker::new(
             file_length,
             block_size,
+            block_alignment,
             MB1,        // header_area_size = 1 MB
             MB1,        // log_offset = 1 MB
             MB1 as u32, // log_length = 1 MB
@@ -1466,8 +1468,7 @@ mod tests {
     #[test]
     fn allocate_alignment() {
         // 20MB file, 4MB block size, 4MB alignment.
-        let (tracker, mut eof) = make_test_tracker(20, 4);
-        tracker.set_block_alignment(4 * MB1 as u32).unwrap();
+        let (tracker, mut eof) = make_test_tracker_aligned(20, 4, 4 * MB1 as u32);
         tracker.complete_initialization(&eof);
 
         // zero_offset = 4MB (after regions).
@@ -1744,8 +1745,7 @@ mod tests {
     #[test]
     fn aligned_alloc_from_pool() {
         // 20 MB file, 4 MB block size, 4 MB alignment.
-        let (tracker, mut eof) = make_test_tracker(20, 4);
-        tracker.set_block_alignment(4 * MB1 as u32).unwrap();
+        let (tracker, mut eof) = make_test_tracker_aligned(20, 4, 4 * MB1 as u32);
 
         // Mark 4..8 MB in-use, then release to create a 4MB pool hole at an aligned offset.
         tracker
@@ -1767,8 +1767,7 @@ mod tests {
     #[test]
     fn aligned_alloc_skips_unaligned_eof_offset() {
         // 20 MB file, 4 MB block size, 4 MB alignment.
-        let (tracker, mut eof) = make_test_tracker(20, 4);
-        tracker.set_block_alignment(4 * MB1 as u32).unwrap();
+        let (tracker, mut eof) = make_test_tracker_aligned(20, 4, 4 * MB1 as u32);
 
         // Mark 4..5 MB in-use. This pushes zero_offset to 5 MB (not 4MB-aligned).
         tracker
@@ -2033,8 +2032,7 @@ mod tests {
 
     #[test]
     fn required_file_length_with_alignment() {
-        let (tracker, eof) = make_test_tracker(4, 4);
-        tracker.set_block_alignment(4 * MB1 as u32).unwrap();
+        let (tracker, eof) = make_test_tracker_aligned(4, 4, 4 * MB1 as u32);
         tracker.complete_initialization(&eof);
         // zero_offset = 4 MB (already aligned).
 

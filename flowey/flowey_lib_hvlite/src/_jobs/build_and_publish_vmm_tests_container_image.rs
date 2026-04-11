@@ -152,6 +152,14 @@ impl SimpleFlowNode for Node {
                     artifacts_dir.join("nextest.toml"),
                 )?;
 
+                // Copy workspace Cargo.toml (needed by nextest --workspace-remap)
+                let workspace_dir = artifacts_dir.join("workspace");
+                fs_err::create_dir_all(&workspace_dir)?;
+                fs_err::copy(
+                    repo_dir.join("Cargo.toml"),
+                    workspace_dir.join("Cargo.toml"),
+                )?;
+
                 // Copy entrypoint binary
                 let entrypoint = rt.read(entrypoint_bin);
                 let entrypoint_dst = context_dir.join("run-vmm-tests");

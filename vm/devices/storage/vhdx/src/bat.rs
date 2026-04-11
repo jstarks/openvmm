@@ -415,8 +415,11 @@ impl Bat {
     /// their `file_offset_mb` masked to zero (allocation not committed
     /// yet). Matches the C code's `Vhd2iProduceBatPageLocked` +
     /// `Vhd2iGenerateBatEntry` behavior.
-    fn produce_page(&self, page_index: usize) -> [u8; CACHE_PAGE_SIZE as usize] {
-        let mut buf = [0u8; CACHE_PAGE_SIZE as usize];
+    fn produce_page(
+        &self,
+        page_index: usize,
+        buf: &mut [u8; CACHE_PAGE_SIZE as usize],
+    ) -> [u8; CACHE_PAGE_SIZE as usize] {
         let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
         let bat_state = self.bat_state.read();
         for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
@@ -444,7 +447,6 @@ impl Bat {
             let offset = i as usize * size_of::<BatEntry>();
             buf[offset..offset + size_of::<BatEntry>()].copy_from_slice(bat_entry.as_bytes());
         }
-        buf
     }
 
     /// Write a block mapping to the cache, converting from in-memory
@@ -487,8 +489,7 @@ impl Bat {
         if guard.is_overwriting() {
             // Slow path: page not cached — build from in-memory state.
             // Sync lock only, no await point.
-            let page_buf = self.produce_page(page_number);
-            guard.copy_from_slice(&page_buf);
+            self.produce_page(page_number, &mut *guard);
         } else {
             // Fast path: page is cached — patch just the one entry.
             let bat_entry = BatEntry::new()

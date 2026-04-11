@@ -1131,7 +1131,6 @@ impl<F: AsyncFile> VhdxFile<F> {
                     self.bat
                         .write_block_mapping(
                             &self.cache,
-                            &self.bat.bat_state,
                             BlockType::Payload,
                             old_block,
                             cleared_mapping,

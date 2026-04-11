@@ -415,13 +415,10 @@ impl Bat {
     /// their `file_offset_mb` masked to zero (allocation not committed
     /// yet). Matches the C code's `Vhd2iProduceBatPageLocked` +
     /// `Vhd2iGenerateBatEntry` behavior.
-    pub fn produce_page(
-        &self,
-        bat_state: &BatState,
-        page_index: usize,
-    ) -> [u8; CACHE_PAGE_SIZE as usize] {
+    fn produce_page(&self, page_index: usize) -> [u8; CACHE_PAGE_SIZE as usize] {
         let mut buf = [0u8; CACHE_PAGE_SIZE as usize];
         let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
+        let bat_state = self.bat_state.read();
         for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
             let entry_number = base_entry + i;
             let bat_entry = match self.entry_number_to_block_id(entry_number) {
@@ -464,7 +461,6 @@ impl Bat {
     pub async fn write_block_mapping<F: AsyncFile>(
         &self,
         cache: &PageCache<F>,
-        bat_state: &parking_lot::RwLock<BatState>,
         block_type: BlockType,
         block_number: u32,
         mapping: InternalBlockMapping,
@@ -491,10 +487,7 @@ impl Bat {
         if guard.is_overwriting() {
             // Slow path: page not cached — build from in-memory state.
             // Sync lock only, no await point.
-            let page_buf = {
-                let bs = bat_state.read();
-                self.produce_page(&bs, page_number)
-            };
+            let page_buf = self.produce_page(page_number);
             guard.copy_from_slice(&page_buf);
         } else {
             // Fast path: page is cached — patch just the one entry.

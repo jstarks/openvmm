@@ -264,7 +264,7 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Error state: once set, all I/O operations fail with
     /// [`VhdxError::Failed`]. Shared with log and apply tasks so they
     /// can poison the file directly on fatal error.
-    failed: Arc<FailureFlag>,
+    pub(crate) failed: Arc<FailureFlag>,
 
     // Log task state (set when opened writable via VhdxBuilder::writable).
     pub(crate) log_state: Option<LogTaskState>,

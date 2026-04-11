@@ -94,7 +94,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         len: u32,
         ranges: &mut Vec<ReadRange>,
     ) -> Result<ReadIoGuard<'_, F>, VhdxError> {
-        self.check_failed()?;
+        self.failed.check()?;
 
         // Zero-length reads succeed immediately.
         if len == 0 {
@@ -206,7 +206,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         len: u32,
         ranges: &mut Vec<WriteRange>,
     ) -> Result<WriteIoGuard<'_, F>, VhdxError> {
-        self.check_failed()?;
+        self.failed.check()?;
 
         // Check read-only.
         if self.read_only {
@@ -925,7 +925,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// entry to be written, then flushes to make everything durable:
     /// user data writes, WAL entries, and apply-task writes.
     pub async fn flush(&self) -> Result<(), VhdxError> {
-        self.check_failed()?;
+        self.failed.check()?;
 
         if self.read_only {
             return Err(VhdxError::ReadOnly);

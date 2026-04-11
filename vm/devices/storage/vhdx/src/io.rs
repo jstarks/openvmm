@@ -366,7 +366,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // writer's post-allocate to clear TFP before proceeding.
         // LOCK AUDIT: No synchronous locks held entering allocation loop.
         // allocation_lock (futures::Mutex) is acquired via .await — fine.
-        let _alloc_guard = loop {
+        let mut _alloc_guard = loop {
             let alloc_guard = self.allocation_lock.lock().await;
 
             // Check all blocks under BAT lock for TFP overlap.
@@ -411,6 +411,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // Re-check and allocate under the lock.
         // No block in our set should have TFP at this point — we waited
         // for all concurrent allocators to finish above.
+        let eof = &mut *_alloc_guard;
         let allocation_result = async {
             for block_info in &blocks_needing_allocation {
                 let is_full_block =
@@ -512,14 +513,14 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 // normal allocation.
                                 // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
                                 let r = self
-                                    .allocate_space(self.block_size, AllocateFlags::new())
+                                    .allocate_space(eof, self.block_size, AllocateFlags::new())
                                     .await?;
                                 (r.file_offset, r.state)
                             }
                         } else {
                             // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
                             let r = self
-                                .allocate_space(self.block_size, AllocateFlags::new())
+                                .allocate_space(eof, self.block_size, AllocateFlags::new())
                                 .await?;
                             (r.file_offset, r.state)
                         };
@@ -583,6 +584,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                     // (near-EOF space is already zero).
                                     let sbm_alloc = self
                                         .allocate_space(
+                                            eof,
                                             crate::bat::SECTOR_BITMAP_BLOCK_SIZE,
                                             AllocateFlags::new().with_zero(true),
                                         )
@@ -1932,13 +1934,13 @@ mod tests {
         file.set_file_size(needed_size).await.unwrap();
 
         let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
-        let eof_before = vhdx.free_space.file_length();
+        let eof_before = vhdx.allocation_lock.lock().await.file_length;
 
         let mut ranges = Vec::new();
         let _guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
 
         // No new allocation should occur — verify file length unchanged.
-        let eof_after = vhdx.free_space.file_length();
+        let eof_after = vhdx.allocation_lock.lock().await.file_length;
         assert_eq!(
             eof_before, eof_after,
             "eof should not change for existing block"

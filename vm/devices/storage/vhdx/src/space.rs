@@ -242,20 +242,29 @@ struct TrimmedBlockTracker {
     num_trimmed_blocks: u32,
 }
 
+/// EOF geometry state — describes where new space comes from.
+///
+/// These fields are only mutated under the `allocation_lock` (the async
+/// `futures::lock::Mutex<()>` on `VhdxFile` that serializes the
+/// allocate→TFP→write sequence). They live outside `FreeSpaceInner`
+/// so they don't contend with the sync mutex.
+pub(crate) struct EofState {
+    /// Current file length (always MB1-aligned).
+    pub file_length: u64,
+    /// Highest in-use file offset.
+    pub last_file_offset: u64,
+    /// Offset at which all data beyond is guaranteed zero.
+    pub zero_offset: u64,
+    /// Minimum chunk for EOF extension (constant after init).
+    pub eof_extension_length: u32,
+}
+
 /// Internal mutable state of the free space tracker.
 struct FreeSpaceInner {
     free_space: FreeSpacePool,
     anchored_space: AnchoredSpacePool,
     trimmed_blocks: TrimmedBlockTracker,
 
-    /// Current file length (always MB1-aligned).
-    file_length: u64,
-    /// Highest in-use file offset.
-    last_file_offset: u64,
-    /// Offset at which all data beyond is guaranteed zero.
-    zero_offset: u64,
-    /// Minimum chunk for EOF extension.
-    eof_extension_length: u32,
     /// Block size in bytes.
     block_size: u32,
     /// Block alignment (0 or power of 2 ≤ block_size).
@@ -338,6 +347,8 @@ impl FreeSpaceTracker {
     /// space as free, then marks the header area, log, BAT, and metadata
     /// regions as in-use.
     ///
+    /// Returns both the tracker and the initial [`EofState`].
+    ///
     /// Corresponds to `Vhd2iInitializeSpace`.
     pub fn new(
         file_length: u64,
@@ -350,7 +361,7 @@ impl FreeSpaceTracker {
         metadata_offset: u64,
         metadata_length: u32,
         data_block_count: u32,
-    ) -> Result<Self, VhdxError> {
+    ) -> Result<(Self, EofState), VhdxError> {
         // File length must be MB1-aligned.
         let aligned_file_length = (file_length + MB1 - 1) & !(MB1 - 1);
         let bit_count = (aligned_file_length / MB1) as usize;
@@ -362,6 +373,13 @@ impl FreeSpaceTracker {
 
         // Mark entire file as free.
         free_space_bitmap.set_all();
+
+        let mut eof_state = EofState {
+            file_length: aligned_file_length,
+            last_file_offset: 0,
+            zero_offset: 0,
+            eof_extension_length: DEFAULT_EOF_EXTENSION_LENGTH,
+        };
 
         let mut inner = FreeSpaceInner {
             free_space: FreeSpacePool {
@@ -378,35 +396,39 @@ impl FreeSpaceTracker {
                 lowest_block_number_hint: data_block_count,
                 num_trimmed_blocks: 0,
             },
-            file_length: aligned_file_length,
-            last_file_offset: 0,
-            zero_offset: 0,
-            eof_extension_length: DEFAULT_EOF_EXTENSION_LENGTH,
             block_size,
             block_alignment: 0,
             data_block_count,
         };
 
         // Mark header area as in-use.
-        mark_range_in_use_inner(&mut inner, 0, header_area_size as u32)?;
+        mark_range_in_use_inner(&mut inner, &mut eof_state, 0, header_area_size as u32)?;
 
         // Mark log as in-use.
         if log_length > 0 {
-            mark_range_in_use_inner(&mut inner, log_offset, log_length)?;
+            mark_range_in_use_inner(&mut inner, &mut eof_state, log_offset, log_length)?;
         }
 
         // Mark BAT region as in-use.
         // BAT length is rounded up to MB1 for space tracking.
         let bat_length_aligned = round_up_mb1(bat_length as u64) as u32;
-        mark_range_in_use_inner(&mut inner, bat_offset, bat_length_aligned)?;
+        mark_range_in_use_inner(&mut inner, &mut eof_state, bat_offset, bat_length_aligned)?;
 
         // Mark metadata region as in-use.
         let metadata_length_aligned = round_up_mb1(metadata_length as u64) as u32;
-        mark_range_in_use_inner(&mut inner, metadata_offset, metadata_length_aligned)?;
+        mark_range_in_use_inner(
+            &mut inner,
+            &mut eof_state,
+            metadata_offset,
+            metadata_length_aligned,
+        )?;
 
-        Ok(FreeSpaceTracker {
-            inner: Mutex::new(inner),
-        })
+        Ok((
+            FreeSpaceTracker {
+                inner: Mutex::new(inner),
+            },
+            eof_state,
+        ))
     }
 
     /// Set block alignment. Must be 0 or a power of 2.
@@ -428,13 +450,23 @@ impl FreeSpaceTracker {
         Ok(())
     }
 
+    /// Current block alignment (0 or power of 2).
+    pub fn block_alignment(&self) -> u32 {
+        self.inner.lock().block_alignment
+    }
+
     /// Mark a file range as in-use during BAT parse.
     ///
     /// Validates that the range doesn't overlap with an already-in-use range
     /// and doesn't extend past EOF. Corresponds to `Vhd2iMarkRangeInUseDuringParse`.
-    pub fn mark_range_in_use(&self, offset: u64, length: u32) -> Result<(), VhdxError> {
+    pub fn mark_range_in_use(
+        &self,
+        eof: &mut EofState,
+        offset: u64,
+        length: u32,
+    ) -> Result<(), VhdxError> {
         let mut inner = self.inner.lock();
-        mark_range_in_use_inner(&mut inner, offset, length)
+        mark_range_in_use_inner(&mut inner, eof, offset, length)
     }
 
     /// Mark a trimmed block as soft-anchored during BAT parse.
@@ -457,10 +489,10 @@ impl FreeSpaceTracker {
     /// the FreeSpace bitmap.
     ///
     /// Corresponds to `Vhd2iCompleteSpaceInitialization`.
-    pub fn complete_initialization(&self) {
+    pub fn complete_initialization(&self, eof: &EofState) {
         let mut inner = self.inner.lock();
-        let bit_base = (inner.zero_offset / MB1) as usize;
-        let bit_count = ((inner.file_length - inner.zero_offset) / MB1) as usize;
+        let bit_base = (eof.zero_offset / MB1) as usize;
+        let bit_count = ((eof.file_length - eof.zero_offset) / MB1) as usize;
         if bit_count > 0 {
             debug_assert!(inner.free_space.bitmap.are_bits_set(bit_base, bit_count));
             inner.free_space.bitmap.clear_range(bit_base, bit_count);
@@ -470,59 +502,31 @@ impl FreeSpaceTracker {
     /// Try to allocate space using priorities 1–3 (pool, near-EOF, anchored).
     ///
     /// Returns `Some(result)` on success, `None` if EOF extension is needed.
-    /// When `None`, the caller should call `required_file_length()`, extend
-    /// the file, call `complete_file_extend()`, then retry.
+    /// When `None`, the caller should call [`EofState::required_file_length()`],
+    /// extend the file, call [`EofState::complete_file_extend()`], then retry.
     ///
     /// Corresponds to `Vhd2iContinueAllocateSpace`.
-    pub fn try_allocate(&self, size: u32, aligned: bool) -> Option<AllocateResult> {
+    pub fn try_allocate(
+        &self,
+        eof: &mut EofState,
+        size: u32,
+        aligned: bool,
+    ) -> Option<AllocateResult> {
         let mut inner = self.inner.lock();
-        try_allocate_inner(&mut inner, size, aligned, None)
+        try_allocate_inner(&mut inner, eof, size, aligned, None)
     }
 
     /// Try to allocate using priorities 1–3, with access to the BAT state
     /// for soft-anchor lookup (priority 3).
     pub fn try_allocate_with_bat(
         &self,
+        eof: &mut EofState,
         size: u32,
         aligned: bool,
         bat_state: &BatState,
     ) -> Option<AllocateResult> {
         let mut inner = self.inner.lock();
-        try_allocate_inner(&mut inner, size, aligned, Some(bat_state))
-    }
-
-    /// Compute the target file size for EOF extension.
-    ///
-    /// Includes `eof_extension_length` minimum chunk.
-    pub fn required_file_length(&self, size: u32, aligned: bool) -> u64 {
-        let inner = self.inner.lock();
-        let aligned_zero_offset = if aligned && inner.block_alignment != 0 {
-            round_up(inner.zero_offset, inner.block_alignment as u64)
-        } else {
-            inner.zero_offset
-        };
-        let target = aligned_zero_offset + size as u64;
-        let min_target = inner.file_length + inner.eof_extension_length as u64;
-        target.max(min_target)
-    }
-
-    /// Update state after file extension completed.
-    ///
-    /// Resizes bitmaps if needed and updates `file_length`.
-    pub fn complete_file_extend(&self, new_file_length: u64) {
-        let mut inner = self.inner.lock();
-        let aligned = (new_file_length + MB1 - 1) & !(MB1 - 1);
-        let new_bit_count = (aligned / MB1) as usize;
-        let old_bit_count = inner.free_space.bitmap.len();
-
-        if new_bit_count > old_bit_count {
-            // Grow by at least 125% to avoid O(n²) behavior.
-            let target_bits = (old_bit_count + old_bit_count / 4).max(new_bit_count);
-            inner.free_space.bitmap.resize(target_bits);
-            inner.anchored_space.bitmap.resize(target_bits);
-        }
-
-        inner.file_length = aligned;
+        try_allocate_inner(&mut inner, eof, size, aligned, Some(bat_state))
     }
 
     /// Release space back to the free pool.
@@ -557,22 +561,19 @@ impl FreeSpaceTracker {
 
     /// Compute truncation target size.
     #[expect(dead_code)] // used in later stages
-    pub fn truncate_target(&self, is_fully_allocated: bool) -> u64 {
+    pub fn truncate_target(&self, eof: &EofState, is_fully_allocated: bool) -> u64 {
         let inner = self.inner.lock();
-        let mut target = inner.last_file_offset;
+        let mut target = eof.last_file_offset;
         if is_fully_allocated {
-            // Count unallocated blocks that still need space.
-            // For simplicity, use the same approach as the C code:
-            // add excess blocks * block_size without exceeding file_length.
-            let excess = compute_excess_block_count(&inner, target);
+            let excess = compute_excess_block_count(&inner, eof, target);
             let extra = (excess as u64) * inner.block_size as u64;
-            target = (target + extra).min(inner.file_length);
+            target = (target + extra).min(eof.file_length);
         }
         target
     }
 
     /// Update state after truncation.
-    pub fn apply_truncate(&self, new_file_length: u64) {
+    pub fn apply_truncate(&self, eof: &mut EofState, new_file_length: u64) {
         let mut inner = self.inner.lock();
         let aligned = (new_file_length + MB1 - 1) & !(MB1 - 1);
         let new_bit_count = (aligned / MB1) as usize;
@@ -583,17 +584,17 @@ impl FreeSpaceTracker {
             inner.anchored_space.bitmap.resize(new_bit_count);
         }
 
-        inner.file_length = aligned;
-        inner.zero_offset = inner.zero_offset.min(aligned);
+        eof.file_length = aligned;
+        eof.zero_offset = eof.zero_offset.min(aligned);
     }
 
     /// Check if a range is in use (for debug/validation).
-    pub fn is_range_in_use(&self, offset: u64, length: u32) -> bool {
+    pub fn is_range_in_use(&self, eof: &EofState, offset: u64, length: u32) -> bool {
         let inner = self.inner.lock();
         debug_assert!(offset.is_multiple_of(MB1));
         debug_assert!((length as u64).is_multiple_of(MB1));
 
-        if inner.file_length < offset || inner.file_length - offset < length as u64 {
+        if eof.file_length < offset || eof.file_length - offset < length as u64 {
             return true;
         }
 
@@ -601,17 +602,40 @@ impl FreeSpaceTracker {
         let bit_count = length as usize / MB1 as usize;
         !inner.free_space.bitmap.are_bits_set(bit_base, bit_count)
     }
+}
 
-    /// Current file length.
-    #[cfg(test)]
-    pub fn file_length(&self) -> u64 {
-        self.inner.lock().file_length
+impl EofState {
+    /// Compute the target file size for EOF extension.
+    ///
+    /// Includes `eof_extension_length` minimum chunk.
+    pub fn required_file_length(&self, block_alignment: u32, size: u32, aligned: bool) -> u64 {
+        let aligned_zero_offset = if aligned && block_alignment != 0 {
+            round_up(self.zero_offset, block_alignment as u64)
+        } else {
+            self.zero_offset
+        };
+        let target = aligned_zero_offset + size as u64;
+        let min_target = self.file_length + self.eof_extension_length as u64;
+        target.max(min_target)
     }
 
-    /// Current zero offset.
-    #[cfg(test)]
-    pub fn zero_offset(&self) -> u64 {
-        self.inner.lock().zero_offset
+    /// Update state after file extension completed.
+    ///
+    /// Resizes bitmaps if needed and updates `file_length`.
+    pub fn complete_file_extend(&mut self, tracker: &FreeSpaceTracker, new_file_length: u64) {
+        let mut inner = tracker.inner.lock();
+        let aligned = (new_file_length + MB1 - 1) & !(MB1 - 1);
+        let new_bit_count = (aligned / MB1) as usize;
+        let old_bit_count = inner.free_space.bitmap.len();
+
+        if new_bit_count > old_bit_count {
+            // Grow by at least 125% to avoid O(n²) behavior.
+            let target_bits = (old_bit_count + old_bit_count / 4).max(new_bit_count);
+            inner.free_space.bitmap.resize(target_bits);
+            inner.anchored_space.bitmap.resize(target_bits);
+        }
+
+        self.file_length = aligned;
     }
 }
 
@@ -632,6 +656,7 @@ fn round_up_mb1(value: u64) -> u64 {
 /// Mark a file range as in-use during parse (internal, no lock).
 fn mark_range_in_use_inner(
     inner: &mut FreeSpaceInner,
+    eof: &mut EofState,
     offset: u64,
     length: u32,
 ) -> Result<(), VhdxError> {
@@ -646,7 +671,7 @@ fn mark_range_in_use_inner(
     }
 
     // Check range is within file.
-    if inner.file_length < offset || inner.file_length - offset < length as u64 {
+    if eof.file_length < offset || eof.file_length - offset < length as u64 {
         return Err(VhdxError::Corrupt(CorruptionType::RangeBeyondEof));
     }
 
@@ -663,10 +688,10 @@ fn mark_range_in_use_inner(
 
     // Update last_file_offset and zero_offset.
     let range_end = offset + length as u64;
-    if range_end > inner.last_file_offset {
-        inner.last_file_offset = range_end;
-        if inner.last_file_offset > inner.zero_offset {
-            inner.zero_offset = inner.last_file_offset;
+    if range_end > eof.last_file_offset {
+        eof.last_file_offset = range_end;
+        if eof.last_file_offset > eof.zero_offset {
+            eof.zero_offset = eof.last_file_offset;
         }
     }
 
@@ -770,7 +795,11 @@ fn release_inner(inner: &mut FreeSpaceInner, offset: u64, size: u32) {
 }
 
 /// Priority 1: free space pool allocation (internal, no lock).
-fn free_space_pool_alloc(inner: &mut FreeSpaceInner, length: u32) -> Option<u64> {
+fn free_space_pool_alloc(
+    inner: &mut FreeSpaceInner,
+    eof: &mut EofState,
+    length: u32,
+) -> Option<u64> {
     debug_assert!((length as u64).is_multiple_of(MB1));
     let bit_count = length as usize / MB1 as usize;
 
@@ -790,8 +819,8 @@ fn free_space_pool_alloc(inner: &mut FreeSpaceInner, length: u32) -> Option<u64>
             inner.free_space.bitmap.clear_range(bit_base, bit_count);
             inner.free_space.lowest_bit_hint = (bit_base + bit_count) as u32;
             let max_offset = (bit_base + bit_count) as u64 * MB1;
-            if inner.last_file_offset < max_offset {
-                inner.last_file_offset = max_offset;
+            if eof.last_file_offset < max_offset {
+                eof.last_file_offset = max_offset;
             }
             Some(bit_base as u64 * MB1)
         }
@@ -807,12 +836,13 @@ fn free_space_pool_alloc(inner: &mut FreeSpaceInner, length: u32) -> Option<u64>
 /// Try all three in-memory allocation priorities (internal).
 fn try_allocate_inner(
     inner: &mut FreeSpaceInner,
+    eof: &mut EofState,
     size: u32,
     aligned: bool,
     bat_state: Option<&BatState>,
 ) -> Option<AllocateResult> {
     // Priority 1: free space pool.
-    if let Some(offset) = free_space_pool_alloc(inner, size) {
+    if let Some(offset) = free_space_pool_alloc(inner, eof, size) {
         return Some(AllocateResult {
             file_offset: offset,
             state: SpaceState::CrossStale,
@@ -822,15 +852,15 @@ fn try_allocate_inner(
 
     // Priority 2: near-EOF space (between ZeroOffset and FileLength).
     let aligned_zero_offset = if aligned && inner.block_alignment != 0 {
-        round_up(inner.zero_offset, inner.block_alignment as u64)
+        round_up(eof.zero_offset, inner.block_alignment as u64)
     } else {
-        inner.zero_offset
+        eof.zero_offset
     };
 
-    if inner.file_length >= aligned_zero_offset + size as u64 {
+    if eof.file_length >= aligned_zero_offset + size as u64 {
         let offset = aligned_zero_offset;
-        inner.zero_offset = aligned_zero_offset + size as u64;
-        inner.last_file_offset = inner.zero_offset;
+        eof.zero_offset = aligned_zero_offset + size as u64;
+        eof.last_file_offset = eof.zero_offset;
         return Some(AllocateResult {
             file_offset: offset,
             state: SpaceState::Zero,
@@ -926,7 +956,7 @@ fn find_and_unanchor_in_memory_inner(
 }
 
 /// Compute excess block count (blocks that won't fit given current space).
-fn compute_excess_block_count(inner: &FreeSpaceInner, max_offset: u64) -> u32 {
+fn compute_excess_block_count(inner: &FreeSpaceInner, eof: &EofState, max_offset: u64) -> u32 {
     // Count unallocated blocks.
     let total = inner.data_block_count;
     // Available space: count of free bits in free space bitmap + anchored space
@@ -948,9 +978,9 @@ fn compute_excess_block_count(inner: &FreeSpaceInner, max_offset: u64) -> u32 {
     }
 
     // EOF space.
-    let zero = inner.zero_offset.min(max_offset);
-    if inner.file_length > zero {
-        available_mb += (inner.file_length - zero) / MB1;
+    let zero = eof.zero_offset.min(max_offset);
+    if eof.file_length > zero {
+        available_mb += (eof.file_length - zero) / MB1;
     }
 
     let block_mb = inner.block_size as u64 / MB1;
@@ -1104,6 +1134,8 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Allocate space for a new block. Async — may extend the file.
     ///
     /// Called under `allocation_lock` (the `FreeSpaceWorkerLock` equivalent).
+    /// The caller must pass `&mut EofState` obtained from locking
+    /// `allocation_lock`.
     /// Tries pool → near-EOF → anchored, extends file and retries if needed.
     ///
     /// When `flags` includes [`AllocateFlags::ZERO`], the allocated region
@@ -1117,6 +1149,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Corresponds to `Vhd2iContinueAllocateSpace`.
     pub(crate) async fn allocate_space(
         &self,
+        eof: &mut EofState,
         size: u32,
         flags: AllocateFlags,
     ) -> Result<AllocateResult, VhdxError> {
@@ -1131,7 +1164,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let result = {
                 let bat_state = self.bat_state.read();
                 self.free_space
-                    .try_allocate_with_bat(size, flags.aligned(), &bat_state)
+                    .try_allocate_with_bat(eof, size, flags.aligned(), &bat_state)
             };
 
             if let Some(alloc) = result {
@@ -1177,13 +1210,14 @@ impl<F: AsyncFile> VhdxFile<F> {
             }
 
             // Priority 4: extend EOF.
-            let target = self.free_space.required_file_length(size, flags.aligned());
+            let block_alignment = self.free_space.block_alignment();
+            let target = eof.required_file_length(block_alignment, size, flags.aligned());
             // LOCK AUDIT: bat_state read-lock dropped (end of block above). allocation_lock held (async Mutex — OK across .await).
             self.file
                 .set_file_size(target)
                 .await
                 .map_err(VhdxError::Io)?;
-            self.free_space.complete_file_extend(target);
+            eof.complete_file_extend(&self.free_space, target);
             // Retry — will succeed from near-EOF space.
         }
     }
@@ -1284,7 +1318,7 @@ mod tests {
     // -- FreeSpaceTracker initialization tests --
 
     /// Helper: create a tracker for a small test file.
-    fn make_test_tracker(file_mb: u64, block_size_mb: u32) -> FreeSpaceTracker {
+    fn make_test_tracker(file_mb: u64, block_size_mb: u32) -> (FreeSpaceTracker, EofState) {
         let file_length = file_mb * MB1;
         let block_size = block_size_mb * MB1 as u32;
         let data_block_count = 16; // arbitrary for testing
@@ -1306,25 +1340,25 @@ mod tests {
 
     #[test]
     fn init_marks_header_in_use() {
-        let tracker = make_test_tracker(10, 2);
+        let (tracker, eof) = make_test_tracker(10, 2);
         // Header area (0..1MB) should be in-use.
-        assert!(tracker.is_range_in_use(0, MB1 as u32));
+        assert!(tracker.is_range_in_use(&eof, 0, MB1 as u32));
     }
 
     #[test]
     fn init_marks_regions_in_use() {
-        let tracker = make_test_tracker(10, 2);
+        let (tracker, eof) = make_test_tracker(10, 2);
         // Log (1..2MB), BAT (2..3MB), metadata (3..4MB) should be in-use.
-        assert!(tracker.is_range_in_use(MB1, MB1 as u32));
-        assert!(tracker.is_range_in_use(2 * MB1, MB1 as u32));
-        assert!(tracker.is_range_in_use(3 * MB1, MB1 as u32));
+        assert!(tracker.is_range_in_use(&eof, MB1, MB1 as u32));
+        assert!(tracker.is_range_in_use(&eof, 2 * MB1, MB1 as u32));
+        assert!(tracker.is_range_in_use(&eof, 3 * MB1, MB1 as u32));
     }
 
     #[test]
     fn overlap_detection() {
-        let tracker = make_test_tracker(10, 2);
+        let (tracker, mut eof) = make_test_tracker(10, 2);
         // Try to mark the header area again — should fail with RangeCollision.
-        let result = tracker.mark_range_in_use(0, MB1 as u32);
+        let result = tracker.mark_range_in_use(&mut eof, 0, MB1 as u32);
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::RangeCollision))
@@ -1333,9 +1367,9 @@ mod tests {
 
     #[test]
     fn range_beyond_eof_detected() {
-        let tracker = make_test_tracker(10, 2);
+        let (tracker, mut eof) = make_test_tracker(10, 2);
         // Try to mark a range that extends beyond file length.
-        let result = tracker.mark_range_in_use(9 * MB1, 2 * MB1 as u32);
+        let result = tracker.mark_range_in_use(&mut eof, 9 * MB1, 2 * MB1 as u32);
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::RangeBeyondEof))
@@ -1346,16 +1380,18 @@ mod tests {
 
     #[test]
     fn allocate_from_free_pool() {
-        let tracker = make_test_tracker(10, 2);
+        let (tracker, mut eof) = make_test_tracker(10, 2);
         // Mark offset 4MB in-use (simulating BAT parse finding a block there).
-        tracker.mark_range_in_use(4 * MB1, MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
         // Now zero_offset = 5*MB. Near-EOF = 5..10 MB (5 MB).
         // Bit 4 is in-use (cleared). Release it back to pool.
         tracker.release(4 * MB1, MB1 as u32);
 
         // Priority 1: should find the released space.
-        let result = tracker.try_allocate(MB1 as u32, false);
+        let result = tracker.try_allocate(&mut eof, MB1 as u32, false);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.file_offset, 4 * MB1);
@@ -1364,12 +1400,12 @@ mod tests {
 
     #[test]
     fn allocate_from_eof_space() {
-        let tracker = make_test_tracker(10, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(10, 2);
+        tracker.complete_initialization(&eof);
 
         // After initialization, zero_offset = 4*MB, file_length = 10*MB.
         // Near-EOF space = 6 MB.
-        let result = tracker.try_allocate(2 * MB1 as u32, false);
+        let result = tracker.try_allocate(&mut eof, 2 * MB1 as u32, false);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.file_offset, 4 * MB1);
@@ -1379,21 +1415,21 @@ mod tests {
     #[test]
     fn allocate_extends_eof() {
         // Create a tracker with only 4MB (all in-use by regions).
-        let tracker = make_test_tracker(4, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(4, 2);
+        tracker.complete_initialization(&eof);
 
         // No free space, no near-EOF space.
-        let result = tracker.try_allocate(MB1 as u32, false);
+        let result = tracker.try_allocate(&mut eof, MB1 as u32, false);
         assert!(result.is_none());
 
         // Compute required length and extend.
-        let target = tracker.required_file_length(MB1 as u32, false);
+        let target = eof.required_file_length(tracker.block_alignment(), MB1 as u32, false);
         assert!(target > 4 * MB1);
 
-        tracker.complete_file_extend(target);
+        eof.complete_file_extend(&tracker, target);
 
         // Now retry — should succeed from near-EOF.
-        let result = tracker.try_allocate(MB1 as u32, false);
+        let result = tracker.try_allocate(&mut eof, MB1 as u32, false);
         assert!(result.is_some());
         assert!(result.unwrap().state.is_safe());
     }
@@ -1401,13 +1437,13 @@ mod tests {
     #[test]
     fn allocate_alignment() {
         // 20MB file, 4MB block size, 4MB alignment.
-        let tracker = make_test_tracker(20, 4);
+        let (tracker, mut eof) = make_test_tracker(20, 4);
         tracker.set_block_alignment(4 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker.complete_initialization(&eof);
 
         // zero_offset = 4MB (after regions).
         // Aligned allocation from EOF: should be at 4MB (already aligned).
-        let result = tracker.try_allocate(4 * MB1 as u32, true);
+        let result = tracker.try_allocate(&mut eof, 4 * MB1 as u32, true);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.file_offset % (4 * MB1), 0);
@@ -1415,8 +1451,8 @@ mod tests {
 
     #[test]
     fn allocate_sets_no_free_blocks_flag() {
-        let tracker = make_test_tracker(10, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(10, 2);
+        tracker.complete_initialization(&eof);
 
         // Exhaust near-EOF space with pool allocations — first exhaust pool.
         // After init, pool is empty (regions fill 0..4MB, rest is EOF space).
@@ -1426,10 +1462,10 @@ mod tests {
         // Instead, fill up all space and verify the flag works.
         // Allocate all 6 MB of EOF space.
         for _ in 0..6 {
-            tracker.try_allocate(MB1 as u32, false).unwrap();
+            tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         }
         // Now no space left.
-        let result = tracker.try_allocate(MB1 as u32, false);
+        let result = tracker.try_allocate(&mut eof, MB1 as u32, false);
         assert!(result.is_none());
     }
 
@@ -1459,7 +1495,7 @@ mod tests {
 
     #[test]
     fn mark_and_find_anchored_block() {
-        let tracker = make_test_tracker(20, 2);
+        let (tracker, _eof) = make_test_tracker(20, 2);
         // Mark block 3 as trimmed at file offset 6*MB.
         tracker
             .mark_trimmed_block(3, 6 * MB1, 2 * MB1 as u32)
@@ -1474,7 +1510,7 @@ mod tests {
 
     #[test]
     fn unmark_trimmed_block() {
-        let tracker = make_test_tracker(20, 2);
+        let (tracker, _eof) = make_test_tracker(20, 2);
         tracker
             .mark_trimmed_block(3, 6 * MB1, 2 * MB1 as u32)
             .unwrap();
@@ -1490,7 +1526,7 @@ mod tests {
 
     #[test]
     fn find_and_unanchor_in_memory() {
-        let tracker = make_test_tracker(20, 2);
+        let (tracker, _eof) = make_test_tracker(20, 2);
         // Mark block 5 as trimmed at file offset 8*MB.
         tracker
             .mark_trimmed_block(5, 8 * MB1, 2 * MB1 as u32)
@@ -1514,22 +1550,28 @@ mod tests {
     fn anchored_space_before_eof_extend() {
         // Set up a full file with no free pool and no EOF space,
         // but with a soft-anchored block.
-        let tracker = make_test_tracker(10, 2);
+        let (tracker, mut eof) = make_test_tracker(10, 2);
 
         // Mark block 2 as trimmed at offset 6*MB.
         tracker
             .mark_trimmed_block(2, 6 * MB1, 2 * MB1 as u32)
             .unwrap();
         // Mark remaining free space as in-use so pool is empty.
-        tracker.mark_range_in_use(4 * MB1, MB1 as u32).unwrap();
-        tracker.mark_range_in_use(5 * MB1, MB1 as u32).unwrap();
-        tracker.mark_range_in_use(8 * MB1, 2 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, MB1 as u32)
+            .unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 5 * MB1, MB1 as u32)
+            .unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 8 * MB1, 2 * MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
 
         let bat_state = make_bat_state_with_anchored_block(2, 6, 16);
 
         // Should find anchored space (priority 3) instead of extending EOF.
-        let result = tracker.try_allocate_with_bat(2 * MB1 as u32, false, &bat_state);
+        let result = tracker.try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.file_offset, 6 * MB1);
@@ -1539,18 +1581,18 @@ mod tests {
 
     #[test]
     fn release_then_reallocate() {
-        let tracker = make_test_tracker(10, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(10, 2);
+        tracker.complete_initialization(&eof);
 
         // Allocate from EOF space.
-        let r1 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r1 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         let offset = r1.file_offset;
 
         // Release it back to free pool.
         tracker.release(offset, MB1 as u32);
 
         // Allocate again — should reuse the released space.
-        let r2 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r2 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r2.file_offset, offset);
     }
 
@@ -1558,14 +1600,13 @@ mod tests {
 
     #[test]
     fn truncate_shrinks_bitmaps() {
-        let tracker = make_test_tracker(10, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(10, 2);
+        tracker.complete_initialization(&eof);
 
-        let orig_len = tracker.file_length();
-        assert_eq!(orig_len, 10 * MB1);
+        assert_eq!(eof.file_length, 10 * MB1);
 
-        tracker.apply_truncate(6 * MB1);
-        assert_eq!(tracker.file_length(), 6 * MB1);
+        tracker.apply_truncate(&mut eof, 6 * MB1);
+        assert_eq!(eof.file_length, 6 * MB1);
     }
 
     // -- Bitmap resize test --
@@ -1590,20 +1631,26 @@ mod tests {
     #[test]
     fn priority_cascade_pool_then_eof_then_anchor_then_extend() {
         // Walk through all 4 priorities in sequence.
-        let tracker = make_test_tracker(10, 2);
+        let (tracker, mut eof) = make_test_tracker(10, 2);
 
         // Mark 4..5 MB in-use (a data block during BAT parse).
-        tracker.mark_range_in_use(4 * MB1, MB1 as u32).unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, MB1 as u32)
+            .unwrap();
         // Mark 5..7 MB in-use, then mark as soft-anchored (trimmed block 1).
         // The C code always marks in-use first, then marks as trimmed.
-        tracker.mark_range_in_use(5 * MB1, 2 * MB1 as u32).unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 5 * MB1, 2 * MB1 as u32)
+            .unwrap();
         tracker
             .mark_trimmed_block(1, 5 * MB1, 2 * MB1 as u32)
             .unwrap();
         // Mark 7..8 MB in-use.
-        tracker.mark_range_in_use(7 * MB1, MB1 as u32).unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 7 * MB1, MB1 as u32)
+            .unwrap();
 
-        tracker.complete_initialization();
+        tracker.complete_initialization(&eof);
         // zero_offset = 8 MB, file_length = 10 MB.
         // Pool: empty (all bits 0..8 are cleared). Near-EOF: 8..10 (2 MB).
 
@@ -1615,21 +1662,21 @@ mod tests {
 
         // Priority 1: pool (offset 4 MB).
         let r1 = tracker
-            .try_allocate_with_bat(MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r1.file_offset, 4 * MB1);
         assert!(!r1.state.is_safe());
 
         // Pool now empty. Priority 2: near-EOF (offset 8 MB).
         let r2 = tracker
-            .try_allocate_with_bat(MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r2.file_offset, 8 * MB1);
         assert!(r2.state.is_safe());
 
         // Take the second EOF MB too.
         let r3 = tracker
-            .try_allocate_with_bat(MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r3.file_offset, 9 * MB1);
         assert!(r3.state.is_safe());
@@ -1637,27 +1684,27 @@ mod tests {
         // Pool and EOF exhausted. Priority 3: soft-anchored (offset 5 MB).
         // The block is 2 MB but we only need 1 MB — excess goes to pool.
         let r4 = tracker
-            .try_allocate_with_bat(MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r4.file_offset, 5 * MB1);
         assert!(!r4.state.is_safe());
 
         // The excess 1 MB from the anchored block should now be in pool.
         let r5 = tracker
-            .try_allocate_with_bat(MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r5.file_offset, 6 * MB1);
         assert!(!r5.state.is_safe());
 
         // Everything exhausted. Priority 4: returns None.
-        let r6 = tracker.try_allocate_with_bat(MB1 as u32, false, &bat_state);
+        let r6 = tracker.try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state);
         assert!(r6.is_none());
 
         // Extend EOF, then retry.
-        let target = tracker.required_file_length(MB1 as u32, false);
-        tracker.complete_file_extend(target);
+        let target = eof.required_file_length(tracker.block_alignment(), MB1 as u32, false);
+        eof.complete_file_extend(&tracker, target);
         let r7 = tracker
-            .try_allocate_with_bat(MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
             .unwrap();
         assert!(r7.state.is_safe());
         assert_eq!(r7.file_offset, 10 * MB1);
@@ -1668,16 +1715,20 @@ mod tests {
     #[test]
     fn aligned_alloc_from_pool() {
         // 20 MB file, 4 MB block size, 4 MB alignment.
-        let tracker = make_test_tracker(20, 4);
+        let (tracker, mut eof) = make_test_tracker(20, 4);
         tracker.set_block_alignment(4 * MB1 as u32).unwrap();
 
         // Mark 4..8 MB in-use, then release to create a 4MB pool hole at an aligned offset.
-        tracker.mark_range_in_use(4 * MB1, 4 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, 4 * MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
         tracker.release(4 * MB1, 4 * MB1 as u32);
 
         // Pool allocation ignores alignment (alignment only applies to near-EOF).
-        let result = tracker.try_allocate(4 * MB1 as u32, true).unwrap();
+        let result = tracker
+            .try_allocate(&mut eof, 4 * MB1 as u32, true)
+            .unwrap();
         assert_eq!(result.file_offset, 4 * MB1);
         assert!(!result.state.is_safe());
     }
@@ -1687,16 +1738,20 @@ mod tests {
     #[test]
     fn aligned_alloc_skips_unaligned_eof_offset() {
         // 20 MB file, 4 MB block size, 4 MB alignment.
-        let tracker = make_test_tracker(20, 4);
+        let (tracker, mut eof) = make_test_tracker(20, 4);
         tracker.set_block_alignment(4 * MB1 as u32).unwrap();
 
         // Mark 4..5 MB in-use. This pushes zero_offset to 5 MB (not 4MB-aligned).
-        tracker.mark_range_in_use(4 * MB1, MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
         // zero_offset = 5 MB. Aligned to 4 MB → round up to 8 MB.
         // So the allocation should come from offset 8 MB (skipping 5..8).
 
-        let result = tracker.try_allocate(4 * MB1 as u32, true).unwrap();
+        let result = tracker
+            .try_allocate(&mut eof, 4 * MB1 as u32, true)
+            .unwrap();
         assert_eq!(result.file_offset, 8 * MB1);
         assert!(result.state.is_safe());
     }
@@ -1705,8 +1760,8 @@ mod tests {
 
     #[test]
     fn complete_file_extend_grows_bitmaps() {
-        let tracker = make_test_tracker(4, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(4, 2);
+        tracker.complete_initialization(&eof);
 
         // Bitmap should be 4 bits (4 MB / 1 MB).
         {
@@ -1715,8 +1770,8 @@ mod tests {
         }
 
         // Extend to 100 MB.
-        tracker.complete_file_extend(100 * MB1);
-        assert_eq!(tracker.file_length(), 100 * MB1);
+        eof.complete_file_extend(&tracker, 100 * MB1);
+        assert_eq!(eof.file_length, 100 * MB1);
 
         {
             let inner = tracker.inner.lock();
@@ -1726,7 +1781,7 @@ mod tests {
         }
 
         // Near-EOF space should now be available.
-        let result = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let result = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert!(result.state.is_safe());
     }
 
@@ -1734,13 +1789,13 @@ mod tests {
 
     #[test]
     fn no_free_blocks_flag_resets_on_release() {
-        let tracker = make_test_tracker(6, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(6, 2);
+        tracker.complete_initialization(&eof);
 
         // Exhaust all space: 2 MB of near-EOF (6-4=2).
-        tracker.try_allocate(MB1 as u32, false).unwrap();
-        tracker.try_allocate(MB1 as u32, false).unwrap();
-        assert!(tracker.try_allocate(MB1 as u32, false).is_none());
+        tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
+        tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
+        assert!(tracker.try_allocate(&mut eof, MB1 as u32, false).is_none());
 
         // The no_free_blocks flag should be set now.
         {
@@ -1758,7 +1813,7 @@ mod tests {
         }
 
         // Should be able to allocate again.
-        let result = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let result = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(result.file_offset, 4 * MB1);
         assert!(!result.state.is_safe());
     }
@@ -1767,10 +1822,12 @@ mod tests {
 
     #[test]
     fn fragmented_pool_allocates_from_lowest_hint() {
-        let tracker = make_test_tracker(20, 2);
+        let (tracker, mut eof) = make_test_tracker(20, 2);
         // Mark a contiguous range 4..11 MB in-use during BAT parse.
-        tracker.mark_range_in_use(4 * MB1, 7 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, 7 * MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
         // zero_offset = 11 MB. Near-EOF = 11..20 (9 MB).
         // Pool: empty (bits 0..11 all cleared).
 
@@ -1781,20 +1838,20 @@ mod tests {
         tracker.release(4 * MB1, MB1 as u32);
 
         // Pool should find the lowest free bit first.
-        let r1 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r1 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r1.file_offset, 4 * MB1);
 
-        let r2 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r2 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r2.file_offset, 6 * MB1);
 
-        let r3 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r3 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r3.file_offset, 8 * MB1);
 
-        let r4 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r4 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r4.file_offset, 10 * MB1);
 
         // Pool exhausted — next allocation comes from near-EOF.
-        let r5 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r5 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r5.file_offset, 11 * MB1);
         assert!(r5.state.is_safe());
     }
@@ -1803,19 +1860,23 @@ mod tests {
 
     #[test]
     fn pool_allocates_contiguous_multi_mb() {
-        let tracker = make_test_tracker(20, 2);
+        let (tracker, mut eof) = make_test_tracker(20, 2);
         // Mark a contiguous 4 MB region (bits 4..8) in-use, then release.
-        tracker.mark_range_in_use(4 * MB1, 4 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, 4 * MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
         tracker.release(4 * MB1, 4 * MB1 as u32);
 
         // Now request a 3 MB allocation from pool — should find the 4MB hole.
-        let result = tracker.try_allocate(3 * MB1 as u32, false).unwrap();
+        let result = tracker
+            .try_allocate(&mut eof, 3 * MB1 as u32, false)
+            .unwrap();
         assert_eq!(result.file_offset, 4 * MB1);
         assert!(!result.state.is_safe());
 
         // 1 MB of the hole (bit 7) is still in pool.
-        let r2 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r2 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r2.file_offset, 7 * MB1);
     }
 
@@ -1823,42 +1884,54 @@ mod tests {
 
     #[test]
     fn truncate_clamps_zero_offset() {
-        let tracker = make_test_tracker(10, 2);
-        tracker.complete_initialization();
+        let (tracker, mut eof) = make_test_tracker(10, 2);
+        tracker.complete_initialization(&eof);
         // zero_offset = 4 MB, file_length = 10 MB.
 
         // Allocate some EOF space to advance zero_offset.
-        tracker.try_allocate(3 * MB1 as u32, false).unwrap();
-        assert_eq!(tracker.zero_offset(), 7 * MB1);
+        tracker
+            .try_allocate(&mut eof, 3 * MB1 as u32, false)
+            .unwrap();
+        assert_eq!(eof.zero_offset, 7 * MB1);
 
         // Truncate file to 5 MB.
-        tracker.apply_truncate(5 * MB1);
-        assert_eq!(tracker.file_length(), 5 * MB1);
+        tracker.apply_truncate(&mut eof, 5 * MB1);
+        assert_eq!(eof.file_length, 5 * MB1);
         // zero_offset should be clamped to file_length.
-        assert!(tracker.zero_offset() <= 5 * MB1);
+        assert!(eof.zero_offset <= 5 * MB1);
     }
 
     // -- Multiple anchored blocks: only one reclaimed per allocate --
 
     #[test]
     fn multiple_anchored_blocks_reclaimed_one_at_a_time() {
-        let tracker = make_test_tracker(20, 2);
+        let (tracker, mut eof) = make_test_tracker(20, 2);
         // Mark anchored regions in-use first (matching C code sequence),
         // then mark as trimmed.
-        tracker.mark_range_in_use(6 * MB1, 2 * MB1 as u32).unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 6 * MB1, 2 * MB1 as u32)
+            .unwrap();
         tracker
             .mark_trimmed_block(2, 6 * MB1, 2 * MB1 as u32)
             .unwrap();
-        tracker.mark_range_in_use(10 * MB1, 2 * MB1 as u32).unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 10 * MB1, 2 * MB1 as u32)
+            .unwrap();
         tracker
             .mark_trimmed_block(5, 10 * MB1, 2 * MB1 as u32)
             .unwrap();
 
         // Fill all remaining space so pool + EOF are empty.
-        tracker.mark_range_in_use(4 * MB1, 2 * MB1 as u32).unwrap();
-        tracker.mark_range_in_use(8 * MB1, 2 * MB1 as u32).unwrap();
-        tracker.mark_range_in_use(12 * MB1, 8 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 4 * MB1, 2 * MB1 as u32)
+            .unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 8 * MB1, 2 * MB1 as u32)
+            .unwrap();
+        tracker
+            .mark_range_in_use(&mut eof, 12 * MB1, 8 * MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
 
         // BAT state with both blocks anchored.
         let mut payload_mappings =
@@ -1878,14 +1951,14 @@ mod tests {
 
         // First allocate gets block 2 (lowest block number).
         let r1 = tracker
-            .try_allocate_with_bat(2 * MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r1.file_offset, 6 * MB1);
         assert!(!r1.state.is_safe());
 
         // Second allocate gets block 5.
         let r2 = tracker
-            .try_allocate_with_bat(2 * MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r2.file_offset, 10 * MB1);
         assert!(!r2.state.is_safe());
@@ -1893,7 +1966,7 @@ mod tests {
         // No more anchored blocks.
         assert!(
             tracker
-                .try_allocate_with_bat(2 * MB1 as u32, false, &bat_state)
+                .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state)
                 .is_none()
         );
     }
@@ -1902,25 +1975,27 @@ mod tests {
 
     #[test]
     fn anchored_block_excess_released_to_pool() {
-        let tracker = make_test_tracker(10, 2); // block_size = 2 MB
+        let (tracker, mut eof) = make_test_tracker(10, 2); // block_size = 2 MB
         // Anchor block 0 at offset 4..6 MB.
         tracker
             .mark_trimmed_block(0, 4 * MB1, 2 * MB1 as u32)
             .unwrap();
         // Fill the rest.
-        tracker.mark_range_in_use(6 * MB1, 4 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker
+            .mark_range_in_use(&mut eof, 6 * MB1, 4 * MB1 as u32)
+            .unwrap();
+        tracker.complete_initialization(&eof);
 
         let bat_state = make_bat_state_with_anchored_block(0, 4, 16);
 
         // Request only 1 MB from a 2 MB anchored block.
         let r = tracker
-            .try_allocate_with_bat(MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
             .unwrap();
         assert_eq!(r.file_offset, 4 * MB1);
 
         // The excess 1 MB (at offset 5 MB) should now be in the free pool.
-        let r2 = tracker.try_allocate(MB1 as u32, false).unwrap();
+        let r2 = tracker.try_allocate(&mut eof, MB1 as u32, false).unwrap();
         assert_eq!(r2.file_offset, 5 * MB1);
         assert!(!r2.state.is_safe());
     }
@@ -1929,12 +2004,12 @@ mod tests {
 
     #[test]
     fn required_file_length_with_alignment() {
-        let tracker = make_test_tracker(4, 4);
+        let (tracker, eof) = make_test_tracker(4, 4);
         tracker.set_block_alignment(4 * MB1 as u32).unwrap();
-        tracker.complete_initialization();
+        tracker.complete_initialization(&eof);
         // zero_offset = 4 MB (already aligned).
 
-        let target = tracker.required_file_length(4 * MB1 as u32, true);
+        let target = eof.required_file_length(tracker.block_alignment(), 4 * MB1 as u32, true);
         // Should be at least file_length + extension_length.
         assert!(target >= 4 * MB1 + DEFAULT_EOF_EXTENSION_LENGTH as u64);
         // And aligned target should fit the request.
@@ -1945,9 +2020,9 @@ mod tests {
 
     #[test]
     fn mark_zero_length_is_noop() {
-        let tracker = make_test_tracker(10, 2);
-        assert!(tracker.mark_range_in_use(4 * MB1, 0).is_ok());
+        let (tracker, mut eof) = make_test_tracker(10, 2);
+        assert!(tracker.mark_range_in_use(&mut eof, 4 * MB1, 0).is_ok());
         // The range should still be free.
-        assert!(!tracker.is_range_in_use(4 * MB1, MB1 as u32));
+        assert!(!tracker.is_range_in_use(&eof, 4 * MB1, MB1 as u32));
     }
 }

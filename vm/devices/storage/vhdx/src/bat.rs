@@ -23,6 +23,7 @@ use crate::format::MB1;
 use bitfield_struct::bitfield;
 use zerocopy::IntoBytes;
 
+use crate::space::EofState;
 use crate::space::FreeSpaceTracker;
 use zerocopy::FromBytes;
 
@@ -519,7 +520,8 @@ impl Bat {
         &self,
         cache: &PageCache<F>,
         free_space: &FreeSpaceTracker,
-    ) -> Result<BatState, VhdxError> {
+        mut eof_state: EofState,
+    ) -> Result<(BatState, EofState), VhdxError> {
         let mut payload_mappings = Vec::with_capacity(self.data_block_count as usize);
         let mut sector_bitmap_mappings =
             Vec::with_capacity(self.sector_bitmap_block_count as usize);
@@ -542,7 +544,7 @@ impl Bat {
                 // Mark the block's file region as in-use in the space tracker.
                 let file_offset = internal.file_megabyte() as u64 * MB1;
                 if file_offset != 0 {
-                    free_space.mark_range_in_use(file_offset, self.block_size)?;
+                    free_space.mark_range_in_use(&mut eof_state, file_offset, self.block_size)?;
                 }
             } else if (raw_state == BatEntryState::Unmapped as u8
                 || raw_state == BatEntryState::Undefined as u8)
@@ -552,7 +554,7 @@ impl Bat {
                 // Mark the space as in-use first (so it's not in the free pool),
                 // then register it as a soft anchor for potential reclaim.
                 let file_offset = internal.file_megabyte() as u64 * MB1;
-                free_space.mark_range_in_use(file_offset, self.block_size)?;
+                free_space.mark_range_in_use(&mut eof_state, file_offset, self.block_size)?;
                 free_space.mark_trimmed_block(block, file_offset, self.block_size)?;
             }
             payload_mappings.push(internal);
@@ -573,19 +575,26 @@ impl Bat {
             {
                 let file_offset = internal.file_megabyte() as u64 * MB1;
                 if file_offset != 0 {
-                    free_space.mark_range_in_use(file_offset, SECTOR_BITMAP_BLOCK_SIZE)?;
+                    free_space.mark_range_in_use(
+                        &mut eof_state,
+                        file_offset,
+                        SECTOR_BITMAP_BLOCK_SIZE,
+                    )?;
                 }
             }
             sector_bitmap_mappings.push(internal);
         }
 
         let payload_count = payload_mappings.len();
-        Ok(BatState {
-            payload_mappings,
-            sector_bitmap_mappings,
-            allocated_block_count,
-            io_refcounts: vec![0u32; payload_count],
-        })
+        Ok((
+            BatState {
+                payload_mappings,
+                sector_bitmap_mappings,
+                allocated_block_count,
+                io_refcounts: vec![0u32; payload_count],
+            },
+            eof_state,
+        ))
     }
 
     /// Read a single raw BAT entry from disk through the cache.

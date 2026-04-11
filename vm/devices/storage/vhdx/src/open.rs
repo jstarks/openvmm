@@ -30,6 +30,7 @@ use crate::metadata::MetadataTable;
 use crate::region::parse_region_tables;
 use crate::sector_bitmap::SBM_TAG;
 use crate::space::DeferredReleases;
+use crate::space::EofState;
 use crate::space::FreeSpaceTracker;
 use guid::Guid;
 use parking_lot::Mutex;
@@ -222,10 +223,10 @@ pub struct VhdxFile<F: AsyncFile> {
     // In-memory BAT state.
     pub(crate) bat_state: RwLock<BatState>,
 
-    /// Serializes block allocation decisions. Only one allocation sequence
-    /// runs at a time. Uses futures::lock::Mutex because it may be held
-    /// across .await points.
-    pub(crate) allocation_lock: futures::lock::Mutex<()>,
+    /// Serializes block allocation decisions and protects EOF geometry
+    /// state. Only one allocation sequence runs at a time.
+    /// Uses futures::lock::Mutex because it may be held across .await points.
+    pub(crate) allocation_lock: futures::lock::Mutex<EofState>,
 
     /// Broadcast event notified when a TFP block completes post-allocation.
     /// Writers that encounter a TFP block listen on this event and retry.
@@ -417,7 +418,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         cache.register_tag(SBM_TAG, 0);
 
         // 13. Create FreeSpaceTracker.
-        let free_space = FreeSpaceTracker::new(
+        let (free_space, eof_state) = FreeSpaceTracker::new(
             file_length,
             known.block_size,
             format::HEADER_AREA_SIZE,
@@ -436,10 +437,10 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         }
 
         // 14. Load in-memory BAT from disk.
-        let bat_state = bat.load_bat_state(&cache, &free_space).await?;
+        let (bat_state, eof_state) = bat.load_bat_state(&cache, &free_space, eof_state).await?;
 
         // 15. Finalize free space initialization after BAT parse.
-        free_space.complete_initialization();
+        free_space.complete_initialization(&eof_state);
 
         // 16. Construct VhdxFile.
         Ok(VhdxFile {
@@ -463,7 +464,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
                 first_header_current: header.first_header_current,
             }),
             bat_state: RwLock::new(bat_state),
-            allocation_lock: futures::lock::Mutex::new(()),
+            allocation_lock: futures::lock::Mutex::new(eof_state),
             allocation_event: event_listener::Event::new(),
             trim_event: event_listener::Event::new(),
             free_space,
@@ -1210,12 +1211,13 @@ mod tests {
         let vhdx = VhdxFile::open_inner(file, false, None, &OpenOptions::new())
             .await
             .unwrap();
+        let mut eof = vhdx.allocation_lock.lock().await;
         let a = vhdx
-            .allocate_space(MB1 as u32, AllocateFlags::new())
+            .allocate_space(&mut eof, MB1 as u32, AllocateFlags::new())
             .await
             .unwrap();
         let b = vhdx
-            .allocate_space(MB1 as u32, AllocateFlags::new())
+            .allocate_space(&mut eof, MB1 as u32, AllocateFlags::new())
             .await
             .unwrap();
         // Two allocations must not overlap.
@@ -1229,8 +1231,9 @@ mod tests {
         let vhdx = VhdxFile::open_inner(file, false, None, &OpenOptions::new())
             .await
             .unwrap();
+        let mut eof = vhdx.allocation_lock.lock().await;
         let result = vhdx
-            .allocate_space(MB1 as u32, AllocateFlags::new())
+            .allocate_space(&mut eof, MB1 as u32, AllocateFlags::new())
             .await
             .unwrap();
         assert_eq!(result.file_offset % MB1, 0, "offset must be MB1-aligned");
@@ -1254,7 +1257,11 @@ mod tests {
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
         // The free space tracker should have offset 4*MB marked as in-use.
-        assert!(vhdx.free_space.is_range_in_use(4 * MB1, vhdx.block_size()));
+        let eof = vhdx.allocation_lock.lock().await;
+        assert!(
+            vhdx.free_space
+                .is_range_in_use(&eof, 4 * MB1, vhdx.block_size())
+        );
     }
 
     #[async_test]

@@ -8,7 +8,6 @@
 //! interleaving of payload block entries with sector bitmap entries.
 
 use crate::AsyncFile;
-use crate::VhdxFile;
 use crate::cache::PageCache;
 use crate::cache::PageKey;
 use crate::cache::WriteMode;
@@ -82,15 +81,6 @@ pub(crate) struct Bat {
     io_wait_event: event_listener::Event,
 }
 
-/// The mapping state returned from a BAT lookup.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockMapping {
-    /// The parsed block state.
-    pub state: BatEntryState,
-    /// File byte offset of the block data (0 if not backed by file data).
-    pub file_offset: u64,
-}
-
 /// In-memory BAT entry. Compact 32-bit representation used in the in-memory
 /// BAT array (not on disk).
 ///
@@ -113,27 +103,56 @@ pub(crate) struct InternalBlockMapping {
 }
 
 impl InternalBlockMapping {
-    /// Convert this in-memory mapping to a [`BlockMapping`] for the read path.
-    pub fn to_block_mapping(self) -> BlockMapping {
-        let state = BatEntryState::from_raw(self.state()).unwrap_or(BatEntryState::NotPresent);
-        BlockMapping {
-            state,
-            file_offset: self.file_megabyte() as u64 * MB1,
-        }
+    /// File byte offset (converts the megabyte field to bytes).
+    pub fn file_offset(self) -> u64 {
+        self.file_megabyte() as u64 * MB1
+    }
+
+    /// Parse the block state, returning `None` for unknown values.
+    pub fn bat_state(self) -> Option<BatEntryState> {
+        BatEntryState::from_raw(self.state())
     }
 
     /// Create an `InternalBlockMapping` from an on-disk [`BatEntry`].
     ///
+    /// For non-differencing disks (`has_parent == false`), normalizes
+    /// `PartiallyPresent` to `FullyPresent` at load time so callers
+    /// don't need to handle the distinction.
+    ///
     /// Panics if the on-disk file offset exceeds the 28-bit megabyte field
     /// (files > 256 TB).
-    pub fn from_bat_entry(entry: BatEntry) -> Self {
+    pub fn from_bat_entry(entry: BatEntry, has_parent: bool) -> Self {
         let file_mb = entry.file_offset_mb();
         assert!(
             file_mb <= 0x0FFF_FFFF,
             "file offset {file_mb} MB exceeds 28-bit InternalBlockMapping limit (256 TB)"
         );
+        let mut state = entry.state();
+        // Normalize PartiallyPresent → FullyPresent for non-diff disks.
+        if !has_parent && state == BatEntryState::PartiallyPresent as u8 {
+            state = BatEntryState::FullyPresent as u8;
+        }
         InternalBlockMapping::new()
-            .with_state(entry.state())
+            .with_state(state)
+            .with_transitioning_to_fully_present(false)
+            .with_file_megabyte(file_mb as u32)
+    }
+
+    /// Create an `InternalBlockMapping` from an on-disk SBM [`BatEntry`].
+    ///
+    /// Normalizes `PartiallyPresent` to `FullyPresent` (compatibility).
+    pub fn from_sbm_bat_entry(entry: BatEntry) -> Self {
+        let file_mb = entry.file_offset_mb();
+        assert!(
+            file_mb <= 0x0FFF_FFFF,
+            "file offset {file_mb} MB exceeds 28-bit InternalBlockMapping limit (256 TB)"
+        );
+        let mut state = entry.state();
+        if state == BatEntryState::PartiallyPresent as u8 {
+            state = BatEntryState::FullyPresent as u8;
+        }
+        InternalBlockMapping::new()
+            .with_state(state)
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte(file_mb as u32)
     }
@@ -377,41 +396,6 @@ impl Bat {
         }
     }
 
-    /// Look up the payload block mapping from in-memory state.
-    ///
-    /// Synchronous — no I/O. Reads from the in-memory `BatState`.
-    pub fn get_block_mapping_from_state(
-        &self,
-        bat_state: &BatState,
-        block_number: u32,
-    ) -> BlockMapping {
-        let internal = bat_state.get_payload_mapping(block_number);
-        let mut mapping = internal.to_block_mapping();
-        // Apply the same validation/normalization as parse_payload_entry:
-        // For non-differencing disks, PartiallyPresent → FullyPresent.
-        if !self.has_parent && mapping.state == BatEntryState::PartiallyPresent {
-            mapping.state = BatEntryState::FullyPresent;
-        }
-        mapping
-    }
-
-    /// Look up the sector bitmap block mapping from in-memory state.
-    ///
-    /// Synchronous — no I/O. Reads from the in-memory `BatState`.
-    pub fn get_sbm_mapping_from_state(
-        &self,
-        bat_state: &BatState,
-        chunk_number: u32,
-    ) -> BlockMapping {
-        let internal = bat_state.get_sbm_mapping(chunk_number);
-        let mut mapping = internal.to_block_mapping();
-        // SBM entries: PartiallyPresent → FullyPresent (compatibility).
-        if mapping.state == BatEntryState::PartiallyPresent {
-            mapping.state = BatEntryState::FullyPresent;
-        }
-        mapping
-    }
-
     /// Convert a virtual disk byte offset to a block number.
     pub fn offset_to_block(&self, offset: u64) -> u32 {
         (offset / self.block_size as u64) as u32
@@ -420,77 +404,6 @@ impl Bat {
     /// Compute the byte offset within a block for a given virtual disk offset.
     pub fn offset_within_block(&self, offset: u64) -> u32 {
         (offset % self.block_size as u64) as u32
-    }
-
-    /// Parse and validate a payload BAT entry.
-    fn parse_payload_entry(&self, entry: BatEntry) -> Result<BlockMapping, VhdxError> {
-        let raw_state = entry.state();
-        let state = BatEntryState::from_raw(raw_state)
-            .ok_or(VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
-        let file_offset = entry.file_offset();
-
-        match state {
-            BatEntryState::FullyPresent => {
-                if file_offset == 0 {
-                    return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-                }
-                Ok(BlockMapping {
-                    state: BatEntryState::FullyPresent,
-                    file_offset,
-                })
-            }
-            BatEntryState::PartiallyPresent => {
-                if file_offset == 0 {
-                    return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-                }
-                // For disks without a parent, treat PartiallyPresent as
-                // FullyPresent (compatibility quirk from the C implementation).
-                let effective_state = if self.has_parent {
-                    BatEntryState::PartiallyPresent
-                } else {
-                    BatEntryState::FullyPresent
-                };
-                Ok(BlockMapping {
-                    state: effective_state,
-                    file_offset,
-                })
-            }
-            BatEntryState::NotPresent => {
-                // For differencing disks with has_parent, file_offset must be
-                // zero (transparent to parent). For non-parent disks this is
-                // "undefined" (zero-filled).
-                if self.has_parent && file_offset != 0 {
-                    return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-                }
-                Ok(BlockMapping {
-                    state: BatEntryState::NotPresent,
-                    file_offset: 0,
-                })
-            }
-            BatEntryState::Zero => {
-                if file_offset != 0 {
-                    return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-                }
-                Ok(BlockMapping {
-                    state: BatEntryState::Zero,
-                    file_offset: 0,
-                })
-            }
-            BatEntryState::Unmapped => {
-                // Trimmed block — may have non-zero file_offset (soft anchor).
-                Ok(BlockMapping {
-                    state: BatEntryState::Unmapped,
-                    file_offset,
-                })
-            }
-            BatEntryState::Undefined => {
-                // Undefined block — may have non-zero file_offset (soft anchor).
-                Ok(BlockMapping {
-                    state: BatEntryState::Undefined,
-                    file_offset,
-                })
-            }
-        }
     }
 
     /// Serialize a BAT page from in-memory state.
@@ -612,13 +525,13 @@ impl Bat {
             if BatEntryState::from_raw(raw_state).is_none() {
                 return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
             }
-            let internal = InternalBlockMapping::from_bat_entry(entry);
+            let internal = InternalBlockMapping::from_bat_entry(entry, self.has_parent);
             if raw_state == BatEntryState::FullyPresent as u8
                 || raw_state == BatEntryState::PartiallyPresent as u8
             {
                 self.bat_state.get_mut().allocated_block_count += 1;
                 // Mark the block's file region as in-use in the space tracker.
-                let file_offset = internal.file_megabyte() as u64 * MB1;
+                let file_offset = internal.file_offset();
                 if file_offset != 0 {
                     free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
                 }
@@ -629,7 +542,7 @@ impl Bat {
                 // Soft-anchored block: unmapped/undefined with non-zero file offset.
                 // Mark the space as in-use first (so it's not in the free pool),
                 // then register it as a soft anchor for potential reclaim.
-                let file_offset = internal.file_megabyte() as u64 * MB1;
+                let file_offset = internal.file_offset();
                 free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
                 free_space.mark_trimmed_block(block, file_offset, self.block_size)?;
             }
@@ -644,12 +557,12 @@ impl Bat {
             if BatEntryState::from_raw(raw_state).is_none() {
                 return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
             }
-            let internal = InternalBlockMapping::from_bat_entry(entry);
+            let internal = InternalBlockMapping::from_sbm_bat_entry(entry);
             // Mark sector bitmap block's file region as in-use if allocated.
             if raw_state == BatEntryState::FullyPresent as u8
                 || raw_state == BatEntryState::PartiallyPresent as u8
             {
-                let file_offset = internal.file_megabyte() as u64 * MB1;
+                let file_offset = internal.file_offset();
                 if file_offset != 0 {
                     free_space.mark_range_in_use(
                         eof_state,
@@ -728,20 +641,20 @@ impl Bat {
         }
     }
 
-    /// Look up the block mapping for a given data block number.
+    /// Look up the payload block mapping for a given data block number.
     ///
-    /// Synchronous — reads from the in-memory BAT, no I/O.
-    pub(crate) fn get_block_mapping(&self, block_number: u32) -> BlockMapping {
+    /// Synchronous — reads from the in-memory BAT under a read lock.
+    pub(crate) fn get_block_mapping(&self, block_number: u32) -> InternalBlockMapping {
         let bat_state = self.bat_state.read();
-        self.get_block_mapping_from_state(&bat_state, block_number)
+        bat_state.get_payload_mapping(block_number)
     }
 
     /// Look up the sector bitmap block mapping for a given chunk number.
     ///
-    /// Synchronous — reads from the in-memory BAT, no I/O.
-    pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
+    /// Synchronous — reads from the in-memory BAT under a read lock.
+    pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> InternalBlockMapping {
         let bat_state = self.bat_state.read();
-        self.get_sbm_mapping_from_state(&bat_state, chunk_number)
+        bat_state.get_sbm_mapping(chunk_number)
     }
 }
 
@@ -964,42 +877,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_payload_zero_must_have_zero_offset() {
-        let bat = Bat::new(
-            format::GB1,
-            format::DEFAULT_BLOCK_SIZE,
-            512,
-            false,
-            MB1 as u32,
-        )
-        .unwrap();
-        let entry = BatEntry::new().with_state(2).with_file_offset_mb(1);
-        let result = bat.parse_payload_entry(entry);
-        assert!(matches!(
-            result,
-            Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState))
-        ));
-    }
-
-    #[test]
-    fn parse_payload_fully_present_zero_offset_is_corrupt() {
-        let bat = Bat::new(
-            format::GB1,
-            format::DEFAULT_BLOCK_SIZE,
-            512,
-            false,
-            MB1 as u32,
-        )
-        .unwrap();
-        let entry = BatEntry::new().with_state(6).with_file_offset_mb(0);
-        let result = bat.parse_payload_entry(entry);
-        assert!(matches!(
-            result,
-            Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState))
-        ));
-    }
-
-    #[test]
     fn internal_mapping_roundtrip() {
         let mapping = InternalBlockMapping::new()
             .with_state(BatEntryState::FullyPresent as u8)
@@ -1019,8 +896,7 @@ mod tests {
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_megabyte(max_mb);
         assert_eq!(mapping.file_megabyte(), max_mb);
-        let bm = mapping.to_block_mapping();
-        assert_eq!(bm.file_offset, max_mb as u64 * MB1);
+        assert_eq!(mapping.file_offset(), max_mb as u64 * MB1);
     }
 
     #[test]
@@ -1045,7 +921,7 @@ mod tests {
         let entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_offset_mb(100);
-        let internal = InternalBlockMapping::from_bat_entry(entry);
+        let internal = InternalBlockMapping::from_bat_entry(entry, false);
         assert_eq!(internal.state(), BatEntryState::FullyPresent as u8);
         assert_eq!(internal.file_megabyte(), 100);
         assert!(!internal.transitioning_to_fully_present());

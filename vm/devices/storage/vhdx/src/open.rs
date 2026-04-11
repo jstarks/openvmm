@@ -11,7 +11,6 @@ use crate::AsyncFile;
 use crate::bat::BAT_TAG;
 use crate::bat::Bat;
 
-use crate::bat::BlockMapping;
 use crate::bat::METADATA_TAG;
 use crate::cache::PageCache;
 use crate::error::CorruptionType;
@@ -1143,8 +1142,8 @@ mod tests {
 
         // A newly created dynamic disk has all blocks as NotPresent.
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::NotPresent);
-        assert_eq!(mapping.file_offset, 0);
+        assert_eq!(mapping.bat_state(), Some(BatEntryState::NotPresent));
+        assert_eq!(mapping.file_offset(), 0);
     }
 
     #[async_test]
@@ -1162,8 +1161,8 @@ mod tests {
 
         for block in 0..block_count {
             let mapping = vhdx.bat.get_block_mapping(block);
-            assert_eq!(mapping.state, BatEntryState::NotPresent);
-            assert_eq!(mapping.file_offset, 0);
+            assert_eq!(mapping.bat_state(), Some(BatEntryState::NotPresent));
+            assert_eq!(mapping.file_offset(), 0);
         }
     }
 
@@ -1232,8 +1231,8 @@ mod tests {
         // not an async fn. We call it without .await.
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
-        let mapping: BlockMapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::NotPresent);
+        let mapping = vhdx.bat.get_block_mapping(0);
+        assert_eq!(mapping.bat_state(), Some(BatEntryState::NotPresent));
     }
 
     #[async_test]

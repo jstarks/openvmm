@@ -139,9 +139,9 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             let mapping = self.bat.get_block_mapping(block_number);
 
-            match mapping.state {
+            match mapping.bat_state().unwrap() {
                 BatEntryState::FullyPresent => {
-                    let file_offset = mapping.file_offset + block_offset as u64;
+                    let file_offset = mapping.file_offset() + block_offset as u64;
                     ranges.push(ReadRange::Data {
                         guest_offset: virtual_offset,
                         length: block_length,
@@ -150,7 +150,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 }
                 BatEntryState::PartiallyPresent => {
                     self.resolve_partial_block_read(
-                        mapping.file_offset,
+                        mapping.file_offset(),
                         virtual_offset,
                         block_length,
                         ranges,
@@ -275,12 +275,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                 let (state, file_offset, has_tfp) = {
                     let bat_state = self.bat.bat_state.read();
                     let internal = bat_state.get_payload_mapping(block_number);
-                    let mapping = self
-                        .bat
-                        .get_block_mapping_from_state(&bat_state, block_number);
                     (
-                        mapping.state,
-                        mapping.file_offset,
+                        internal.bat_state().unwrap(),
+                        internal.file_offset(),
                         internal.transitioning_to_fully_present(),
                     )
                 };
@@ -428,30 +425,26 @@ impl<F: AsyncFile> VhdxFile<F> {
                     block_info.block_offset == 0 && block_info.block_length >= self.block_size;
 
                 // Re-read mapping under lock (may have changed since read phase).
-                let (internal, mapping) = {
+                let mapping = {
                     let bat_state = self.bat.bat_state.read();
-                    let internal = bat_state.get_payload_mapping(block_info.block_number);
-                    let mapping = self
-                        .bat
-                        .get_block_mapping_from_state(&bat_state, block_info.block_number);
-                    (internal, mapping)
+                    bat_state.get_payload_mapping(block_info.block_number)
                 };
 
                 // Assert no TFP — we serialized against concurrent
                 // allocators in the loop above.
                 debug_assert!(
-                    !internal.transitioning_to_fully_present(),
+                    !mapping.transitioning_to_fully_present(),
                     "block {} has TFP after overlap wait",
                     block_info.block_number
                 );
 
-                match mapping.state {
+                match mapping.bat_state().unwrap() {
                     BatEntryState::FullyPresent => {
                         // Already allocated by a concurrent writer — just emit range.
                         ranges.push(WriteRange::Data {
                             guest_offset: block_info.virtual_offset,
                             length: block_info.block_length,
-                            file_offset: mapping.file_offset + block_info.block_offset as u64,
+                            file_offset: mapping.file_offset() + block_info.block_offset as u64,
                         });
                     }
                     BatEntryState::PartiallyPresent if is_full_block => {
@@ -459,11 +452,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // on existing mapping, no new space.
                         // This is always safe (space already has this block's
                         // data), so no change to needs_flush_before_log.
-                        let original = internal;
+                        let original = mapping;
                         let new_mapping = InternalBlockMapping::new()
-                            .with_state(internal.state())
+                            .with_state(mapping.state())
                             .with_transitioning_to_fully_present(true)
-                            .with_file_megabyte(internal.file_megabyte());
+                            .with_file_megabyte(mapping.file_megabyte());
 
                         {
                             let mut bat_state = self.bat.bat_state.write();
@@ -483,7 +476,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         ranges.push(WriteRange::Data {
                             guest_offset: block_info.virtual_offset,
                             length: block_info.block_length,
-                            file_offset: mapping.file_offset + block_info.block_offset as u64,
+                            file_offset: mapping.file_offset() + block_info.block_offset as u64,
                         });
                     }
                     _ => {
@@ -499,14 +492,14 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // is also safe here.
                         //
                         // Otherwise, allocate fresh space.
-                        let original = internal;
+                        let original = mapping;
                         let (new_offset, space_state) = if let Some(deferred_offset) =
                             self.deferred_releases.remove(block_info.block_number)
                         {
                             // Reclaiming our own deferred (non-durable) space.
                             (deferred_offset, crate::space::SpaceState::OwnStale)
-                        } else if crate::trim::is_soft_anchored(internal) {
-                            let old_file_offset = internal.file_megabyte() as u64 * MB1;
+                        } else if crate::trim::is_soft_anchored(mapping) {
+                            let old_file_offset = mapping.file_megabyte() as u64 * MB1;
                             if self
                                 .free_space
                                 .unmark_trimmed_block(
@@ -538,7 +531,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         if is_full_block {
                             // Fully-covering: set TFP, defer BAT commit.
                             let new_mapping = InternalBlockMapping::new()
-                                .with_state(internal.state())
+                                .with_state(mapping.state())
                                 .with_transitioning_to_fully_present(true)
                                 .with_file_megabyte((new_offset / MB1) as u32);
 
@@ -580,15 +573,15 @@ impl<F: AsyncFile> VhdxFile<F> {
                             // For non-diff disks or blocks in other states
                             // (Zero, Unmapped, Undefined): allocate as
                             // FullyPresent with zero-padding.
-                            let is_partial_present =
-                                self.has_parent && mapping.state == BatEntryState::NotPresent;
+                            let is_partial_present = self.has_parent
+                                && mapping.bat_state().unwrap() == BatEntryState::NotPresent;
 
                             // --- SBM block allocation for PartiallyPresent ---
                             if is_partial_present {
                                 let chunk_number = block_info.block_number / self.bat.chunk_ratio;
                                 let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
 
-                                if sbm_mapping.state != BatEntryState::FullyPresent {
+                                if sbm_mapping.bat_state().unwrap() != BatEntryState::FullyPresent {
                                     // Allocate 1 MiB for the SBM block.
                                     // Zero flag ensures stale data is cleared
                                     // (near-EOF space is already zero).
@@ -830,7 +823,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             } else if self.has_parent {
                 // Non-TFP PartiallyPresent blocks: update sector bitmaps.
                 let mapping = self.bat.get_block_mapping(block_number);
-                if mapping.state == BatEntryState::PartiallyPresent {
+                if mapping.bat_state().unwrap() == BatEntryState::PartiallyPresent {
                     self.set_sector_bitmap_bits(virtual_offset, block_length, true)
                         .await?;
                 }
@@ -2101,8 +2094,8 @@ mod tests {
 
         // Block should be back to NotPresent with zero offset.
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::NotPresent);
-        assert_eq!(mapping.file_offset, 0);
+        assert_eq!(mapping.bat_state().unwrap(), BatEntryState::NotPresent);
+        assert_eq!(mapping.file_offset(), 0);
 
         vhdx.close().await.unwrap();
     }
@@ -2884,7 +2877,7 @@ mod tests {
         // After complete + drop, refcount should be 0 and block should be FullyPresent.
         assert_eq!(vhdx.bat.io_refcount(0), 0);
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+        assert_eq!(mapping.bat_state().unwrap(), BatEntryState::FullyPresent);
     }
 
     #[async_test]
@@ -2908,7 +2901,7 @@ mod tests {
         // Refcount should be 0, block should be back to NotPresent.
         assert_eq!(vhdx.bat.io_refcount(0), 0);
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::NotPresent);
+        assert_eq!(mapping.bat_state().unwrap(), BatEntryState::NotPresent);
     }
 
     #[async_test]
@@ -2974,7 +2967,7 @@ mod tests {
 
         // Check what actually happened by examining block state.
         let mapping = vhdx.bat.get_block_mapping(0);
-        match mapping.state {
+        match mapping.bat_state().unwrap() {
             BatEntryState::Unmapped => {
                 // Trim won — read should return zeros.
                 verify_block_pattern(&*vhdx, 0, block_size, 0x00).await;
@@ -3004,7 +2997,7 @@ mod tests {
 
         let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(
-            mapping.state,
+            mapping.bat_state().unwrap(),
             BatEntryState::Unmapped,
             "block should be Unmapped after trim"
         );
@@ -3013,7 +3006,7 @@ mod tests {
         write_block(&*vhdx, 0, block_size, 0xBB).await;
 
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+        assert_eq!(mapping.bat_state().unwrap(), BatEntryState::FullyPresent);
         verify_block_pattern(&*vhdx, 0, block_size, 0xBB).await;
 
         // Now do trim + write concurrently.
@@ -3037,7 +3030,7 @@ mod tests {
 
         // Verify no panics and data is consistent.
         let mapping = vhdx.bat.get_block_mapping(0);
-        match mapping.state {
+        match mapping.bat_state().unwrap() {
             BatEntryState::Unmapped => {
                 verify_block_pattern(&*vhdx, 0, block_size, 0x00).await;
             }
@@ -3340,7 +3333,7 @@ mod tests {
 
         // Verify block 0 state is consistent.
         let mapping = vhdx.bat.get_block_mapping(0);
-        match mapping.state {
+        match mapping.bat_state().unwrap() {
             BatEntryState::Unmapped => {
                 // Trim completed — read should return zeros.
                 verify_block_pattern(&*vhdx, 0, block_size, 0x00).await;
@@ -3516,11 +3509,17 @@ mod tests {
 
         // Block 0 should be PartiallyPresent.
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::PartiallyPresent);
+        assert_eq!(
+            mapping.bat_state().unwrap(),
+            BatEntryState::PartiallyPresent
+        );
 
         // SBM block for chunk 0 should be FullyPresent (allocated).
         let sbm_mapping = vhdx.bat.get_sector_bitmap_mapping(0);
-        assert_eq!(sbm_mapping.state, BatEntryState::FullyPresent);
+        assert_eq!(
+            sbm_mapping.bat_state().unwrap(),
+            BatEntryState::FullyPresent
+        );
 
         // Read the written range — should return Data.
         let mut ranges = Vec::new();
@@ -3600,12 +3599,12 @@ mod tests {
 
         // Block 0 should be FullyPresent (TFP path).
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+        assert_eq!(mapping.bat_state().unwrap(), BatEntryState::FullyPresent);
 
         // SBM block for chunk 0 should NOT be allocated.
         let sbm_mapping = vhdx.bat.get_sector_bitmap_mapping(0);
         assert_ne!(
-            sbm_mapping.state,
+            sbm_mapping.bat_state().unwrap(),
             BatEntryState::FullyPresent,
             "full-block write should not allocate SBM"
         );
@@ -3629,15 +3628,21 @@ mod tests {
         write_block(&vhdx, 0, 4096, 0x11).await;
 
         let sbm_mapping_1 = vhdx.bat.get_sector_bitmap_mapping(0);
-        assert_eq!(sbm_mapping_1.state, BatEntryState::FullyPresent);
-        let sbm_offset_1 = sbm_mapping_1.file_offset;
+        assert_eq!(
+            sbm_mapping_1.bat_state().unwrap(),
+            BatEntryState::FullyPresent
+        );
+        let sbm_offset_1 = sbm_mapping_1.file_offset();
 
         // Second partial write to block 1 (same chunk).
         write_block(&vhdx, block_size, 4096, 0x22).await;
 
         let sbm_mapping_2 = vhdx.bat.get_sector_bitmap_mapping(0);
-        assert_eq!(sbm_mapping_2.state, BatEntryState::FullyPresent);
-        let sbm_offset_2 = sbm_mapping_2.file_offset;
+        assert_eq!(
+            sbm_mapping_2.bat_state().unwrap(),
+            BatEntryState::FullyPresent
+        );
+        let sbm_offset_2 = sbm_mapping_2.file_offset();
 
         // SBM should be reused (same file offset).
         assert_eq!(
@@ -3670,7 +3675,7 @@ mod tests {
 
         // Block should be FullyPresent (not PartiallyPresent).
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.state, BatEntryState::FullyPresent);
+        assert_eq!(mapping.bat_state().unwrap(), BatEntryState::FullyPresent);
 
         // SBM should NOT be allocated.
         // For non-diff disks, sector_bitmap_block_count may be 0,
@@ -3679,7 +3684,7 @@ mod tests {
         if sbm_count > 0 {
             let sbm_mapping = vhdx.bat.get_sector_bitmap_mapping(0);
             assert_ne!(
-                sbm_mapping.state,
+                sbm_mapping.bat_state().unwrap(),
                 BatEntryState::FullyPresent,
                 "non-diff disk should not allocate SBM"
             );

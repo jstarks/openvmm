@@ -61,7 +61,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // 2. Get sector bitmap block mapping (synchronous).
         let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
-        if sbm_mapping.state != BatEntryState::FullyPresent {
+        if sbm_mapping.bat_state().unwrap() != BatEntryState::FullyPresent {
             return Err(VhdxError::Corrupt(
                 CorruptionType::UnallocatedSectorBitmapBlock,
             ));
@@ -81,7 +81,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
 
             // Acquire the bitmap page for this portion.
-            let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
+            let page_file_offset = sbm_mapping.file_offset() + cur_page_number * CACHE_PAGE_SIZE;
             {
                 let guard = self
                     .cache
@@ -160,7 +160,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Get sector bitmap block mapping (synchronous).
         let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
-        if sbm_mapping.state != BatEntryState::FullyPresent {
+        if sbm_mapping.bat_state().unwrap() != BatEntryState::FullyPresent {
             return Err(VhdxError::Corrupt(
                 CorruptionType::UnallocatedSectorBitmapBlock,
             ));
@@ -177,7 +177,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let bits_in_this_page =
                 std::cmp::min(start_bit + remaining_sectors, SECTORS_PER_BITMAP_PAGE);
 
-            let page_file_offset = sbm_mapping.file_offset + cur_page_number * CACHE_PAGE_SIZE;
+            let page_file_offset = sbm_mapping.file_offset() + cur_page_number * CACHE_PAGE_SIZE;
 
             // If the range covers the entire page, skip the disk read.
             let full_page = start_bit == 0 && bits_in_this_page == SECTORS_PER_BITMAP_PAGE;

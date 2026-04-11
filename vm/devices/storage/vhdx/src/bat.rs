@@ -625,40 +625,61 @@ mod tests {
     #[test]
     fn chunk_ratio_default_params() {
         // 2 MiB blocks, 512-byte sectors → chunk_ratio = 2048
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         assert_eq!(bat.chunk_ratio, 2048);
     }
 
     #[test]
     fn chunk_ratio_various_sizes() {
         // 1 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, MB1 as u32, 512, false, MB1 as u32).unwrap();
         assert_eq!(bat.chunk_ratio, 4096);
 
         // 4 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, 4 * MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, 4 * MB1 as u32, 512, false, MB1 as u32).unwrap();
         assert_eq!(bat.chunk_ratio, 1024);
 
         // 32 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, 32 * MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, 32 * MB1 as u32, 512, false, MB1 as u32).unwrap();
         assert_eq!(bat.chunk_ratio, 128);
 
         // 256 MiB blocks, 512 sectors
-        let bat = Bat::new(format::GB1, 256 * MB1 as u32, 512, false).unwrap();
+        let bat = Bat::new(format::GB1, 256 * MB1 as u32, 512, false, MB1 as u32).unwrap();
         assert_eq!(bat.chunk_ratio, 16);
 
         // 2 MiB blocks, 4096 sectors: sectors_per_block = 512, chunk_ratio = 8388608 / 512 = 16384
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 4096, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            4096,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         assert_eq!(bat.chunk_ratio, 16384);
 
         // 1 MiB blocks, 4096 sectors: sectors_per_block = 256, chunk_ratio = 8388608 / 256 = 32768
-        let bat = Bat::new(format::GB1, MB1 as u32, 4096, false).unwrap();
+        let bat = Bat::new(format::GB1, MB1 as u32, 4096, false, MB1 as u32).unwrap();
         assert_eq!(bat.chunk_ratio, 32768);
     }
 
     #[test]
     fn payload_entry_index_calculations() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         // chunk_ratio = 2048
         assert_eq!(bat.payload_entry_index(0), 0);
         assert_eq!(bat.payload_entry_index(1), 1);
@@ -684,7 +705,14 @@ mod tests {
 
     #[test]
     fn sector_bitmap_entry_index_calculations() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            true,
+            MB1 as u32,
+        )
+        .unwrap();
         // SBM entry 0 is at position chunk_ratio.
         assert_eq!(bat.sector_bitmap_entry_index(0), bat.chunk_ratio);
         // SBM entry 1 is at position 2*chunk_ratio + 1.
@@ -693,20 +721,23 @@ mod tests {
 
     #[test]
     fn validate_bat_size_ok() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
         // For 1 GiB / 2 MiB = 512 data blocks, chunk_ratio = 2048.
-        // entries = 512 + 0 = 512 (no SBM entries since 512 < 2048).
-        // Actually: entries = 512 + ((512-1)/2048) = 512 + 0 = 512
-        // 512 * 8 = 4096 bytes. Round up to 1 MiB.
-        // Any bat_length >= 4096 is fine.
-        bat.validate_bat_size(MB1 as u32).unwrap();
+        // entries = 512 + ((512-1)/2048) = 512 + 0 = 512
+        // 512 * 8 = 4096 bytes. Any bat_length >= 4096 is fine.
+        Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
     }
 
     #[test]
     fn validate_bat_size_too_small() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
         // 512 entries * 8 bytes = 4096 bytes needed.
-        let result = bat.validate_bat_size(4095);
+        let result = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false, 4095);
         assert!(matches!(
             result,
             Err(VhdxError::Corrupt(CorruptionType::BatTooSmall))
@@ -715,7 +746,14 @@ mod tests {
 
     #[test]
     fn offset_to_block_calculations() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         assert_eq!(bat.offset_to_block(0), 0);
         assert_eq!(
             bat.offset_to_block(format::DEFAULT_BLOCK_SIZE as u64 - 1),
@@ -730,7 +768,14 @@ mod tests {
 
     #[test]
     fn offset_within_block_calculations() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         assert_eq!(bat.offset_within_block(0), 0);
         assert_eq!(bat.offset_within_block(512), 512);
         assert_eq!(
@@ -745,7 +790,14 @@ mod tests {
 
     #[test]
     fn parse_payload_zero_must_have_zero_offset() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         let entry = BatEntry::new().with_state(2).with_file_offset_mb(1);
         let result = bat.parse_payload_entry(entry);
         assert!(matches!(
@@ -756,7 +808,14 @@ mod tests {
 
     #[test]
     fn parse_payload_fully_present_zero_offset_is_corrupt() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         let entry = BatEntry::new().with_state(6).with_file_offset_mb(0);
         let result = bat.parse_payload_entry(entry);
         assert!(matches!(
@@ -820,7 +879,14 @@ mod tests {
     #[test]
     fn entry_number_to_block_id_payload() {
         // Non-differencing: all entries are payload.
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         // chunk_ratio = 2048, data_block_count = 512
         for i in 0..bat.data_block_count {
             let entry_index = bat.payload_entry_index(i);
@@ -835,7 +901,7 @@ mod tests {
         // Use small chunk_ratio to exercise interleaving.
         // 1 MiB blocks, 4096 sectors → chunk_ratio = 32768.
         // Use 256 MiB blocks, 512 sectors → chunk_ratio = 16.
-        let bat = Bat::new(format::GB1, 256 * MB1 as u32, 512, true).unwrap();
+        let bat = Bat::new(format::GB1, 256 * MB1 as u32, 512, true, MB1 as u32).unwrap();
         assert_eq!(bat.chunk_ratio, 16);
         // data_block_count = 4, sector_bitmap_block_count = 1
 
@@ -856,7 +922,14 @@ mod tests {
 
     #[test]
     fn entry_number_to_block_id_beyond_end() {
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            false,
+            MB1 as u32,
+        )
+        .unwrap();
         // Entry beyond all data blocks should return None.
         let beyond = bat.payload_entry_index(bat.data_block_count);
         assert_eq!(bat.entry_number_to_block_id(beyond), None);
@@ -864,7 +937,7 @@ mod tests {
 
     #[test]
     fn bat_state_allocated_count_tracking() {
-        let bat = Bat::new(4 * MB1, format::DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+        let bat = Bat::new(4 * MB1, format::DEFAULT_BLOCK_SIZE, 512, false, MB1 as u32).unwrap();
         // 2 blocks
         let mut state = BatState {
             payload_mappings: vec![InternalBlockMapping::new(); bat.data_block_count as usize],

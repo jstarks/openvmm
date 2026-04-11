@@ -1104,7 +1104,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             // Try priorities 1–3 (pool, near-EOF, anchored).
             // Pass BAT state for soft-anchor lookup.
             let result = {
-                let bat_state = self.bat_state.read();
+                let bat_state = self.bat.bat_state.read();
                 self.free_space
                     .try_allocate_with_bat(eof, size, flags.aligned(), &bat_state)
             };
@@ -1117,7 +1117,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 // no extra flush is needed — just BAT write ordering.
                 if let Some(old_block) = alloc.unanchored_block {
                     let cleared_mapping = {
-                        let mut bat_state = self.bat_state.write();
+                        let mut bat_state = self.bat.bat_state.write();
                         let old_mapping = bat_state.get_payload_mapping(old_block);
                         let cleared = InternalBlockMapping::new()
                             .with_state(old_mapping.state())
@@ -1131,7 +1131,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     self.bat
                         .write_block_mapping(
                             &self.cache,
-                            &self.bat_state,
+                            &self.bat.bat_state,
                             BlockType::Payload,
                             old_block,
                             cleared_mapping,

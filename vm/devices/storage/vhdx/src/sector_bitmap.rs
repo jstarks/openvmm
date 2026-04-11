@@ -267,7 +267,14 @@ mod tests {
         // Compute entry indices. With 2 MiB blocks, 512-byte sectors,
         // chunk_ratio = 2048. Block 0 is payload entry 0. SBM entry for
         // chunk 0 is at index chunk_ratio = 2048.
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            true,
+            format::MB1 as u32,
+        )
+        .unwrap();
         let payload_index = bat.payload_entry_index(0);
         let sbm_index = bat.sector_bitmap_entry_index(0);
 
@@ -569,7 +576,14 @@ mod tests {
 
         let regions = region::parse_region_tables(&file).await.unwrap();
         let bat_offset = regions.bat_offset;
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            true,
+            format::MB1 as u32,
+        )
+        .unwrap();
         let payload_index = bat.payload_entry_index(0);
 
         // Set block 0 to PartiallyPresent but do NOT set the SBM entry.
@@ -613,7 +627,14 @@ mod tests {
         create::create(&file, &mut params).await.unwrap();
         let regions = region::parse_region_tables(&file).await.unwrap();
         let bat_offset = regions.bat_offset;
-        let bat = Bat::new(format::GB1, format::DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+        let bat = Bat::new(
+            format::GB1,
+            format::DEFAULT_BLOCK_SIZE,
+            512,
+            true,
+            format::MB1 as u32,
+        )
+        .unwrap();
         let payload_index = bat.payload_entry_index(0);
         let sbm_index = bat.sector_bitmap_entry_index(0);
 

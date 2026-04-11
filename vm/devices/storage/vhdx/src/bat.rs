@@ -8,6 +8,7 @@
 //! interleaving of payload block entries with sector bitmap entries.
 
 use crate::AsyncFile;
+use crate::VhdxFile;
 use crate::cache::PageCache;
 use crate::cache::PageKey;
 use crate::cache::WriteMode;
@@ -69,7 +70,16 @@ pub(crate) struct Bat {
     /// - `0`: idle — no I/O in progress, trim may claim.
     /// - `1..TRIM_SENTINEL-1`: I/O refcount — trim must wait.
     /// - `TRIM_SENTINEL` (`u32::MAX`): trim has claimed the block — I/O must wait.
-    pub io_refcounts: Vec<AtomicU32>,
+    io_refcounts: Vec<AtomicU32>,
+
+    /// Broadcast event notified when any I/O guard is dropped and a block's
+    /// refcount reaches zero. Trim (Phase 11) waits on this event when it
+    /// finds a block with refcount > 0.
+    trim_event: event_listener::Event,
+
+    /// Broadcast event notified when trim releases its claim on a block.
+    /// I/O paths wait on this event when they find a block claimed by trim.
+    io_wait_event: event_listener::Event,
 }
 
 /// The mapping state returned from a BAT lookup.
@@ -247,6 +257,8 @@ impl Bat {
             has_parent,
             bat_state: bat_state.into(),
             io_refcounts,
+            trim_event: event_listener::Event::new(),
+            io_wait_event: event_listener::Event::new(),
         })
     }
 
@@ -255,7 +267,7 @@ impl Bat {
     /// Returns `true` if the increment succeeded, `false` if trim has
     /// claimed the block (sentinel set). Uses a CAS loop to avoid
     /// needing the bat_state write lock.
-    pub(crate) fn try_increment_io_refcount(&self, block_number: u32) -> bool {
+    fn try_increment_io_refcount(&self, block_number: u32) -> bool {
         let rc = &self.io_refcounts[block_number as usize];
         loop {
             let old = rc.load(Ordering::Acquire);
@@ -273,7 +285,7 @@ impl Bat {
     /// Atomically decrement the I/O refcount. Returns the previous value.
     ///
     /// Panics on underflow or if the sentinel is set (trim owns the block).
-    pub(crate) fn decrement_io_refcount(&self, block_number: u32) -> u32 {
+    fn decrement_io_refcount(&self, block_number: u32) -> u32 {
         let prev = self.io_refcounts[block_number as usize].fetch_sub(1, Ordering::AcqRel);
         assert!(
             prev > 0 && prev != TRIM_SENTINEL,
@@ -286,22 +298,40 @@ impl Bat {
     ///
     /// Returns `true` if the claim succeeded (block was idle), `false` if
     /// I/O is active (refcount > 0) or another trim already claimed it.
-    pub(crate) fn try_claim_for_trim(&self, block_number: u32) -> bool {
-        self.io_refcounts[block_number as usize]
-            .compare_exchange(0, TRIM_SENTINEL, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    pub(crate) async fn claim_for_trim(&self, block_number: u32) -> TrimGuard<'_> {
+        loop {
+            let listener = self.trim_event.listen();
+            match self.io_refcounts[block_number as usize].compare_exchange(
+                0,
+                TRIM_SENTINEL,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return TrimGuard {
+                        bat: self,
+                        block_number,
+                    };
+                }
+                Err(_) => {
+                    listener.await;
+                }
+            }
+        }
     }
 
     /// Release a trim claim on a block (store 0).
-    pub(crate) fn release_trim_claim(&self, block_number: u32) {
+    fn release_trim_claim(&self, block_number: u32) {
         let prev = self.io_refcounts[block_number as usize].swap(0, Ordering::Release);
         assert_eq!(
             prev, TRIM_SENTINEL,
             "release_trim_claim on block {block_number} that wasn't claimed (was {prev})"
         );
+        self.io_wait_event.notify(usize::MAX);
     }
 
     /// Load the current I/O refcount for a block.
+    #[cfg(test)]
     pub(crate) fn io_refcount(&self, block_number: u32) -> u32 {
         self.io_refcounts[block_number as usize].load(Ordering::Acquire)
     }
@@ -324,7 +354,7 @@ impl Bat {
     /// Reverse-map a flat BAT entry number to (block_type, block_number).
     ///
     /// Returns `None` if the entry is beyond the end of the disk.
-    pub fn entry_number_to_block_id(&self, entry_number: u32) -> Option<(BlockType, u32)> {
+    fn entry_number_to_block_id(&self, entry_number: u32) -> Option<(BlockType, u32)> {
         let group_size = self.chunk_ratio + 1;
         let group = entry_number / group_size;
         let position = entry_number % group_size;
@@ -658,6 +688,91 @@ impl Bat {
             .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
 
         Ok(entry)
+    }
+
+    /// Atomically increment I/O refcounts for a range of blocks,
+    /// returning a [`ReadIoGuard`] that will release them on drop.
+    ///
+    /// Uses CAS to increment each block's refcount. If any block has the
+    /// trim sentinel set, undoes partial increments, waits for trim to
+    /// release, and retries. Returns once all blocks are successfully
+    /// claimed.
+    pub async fn acquire_io_refcounts(&self, start_block: u32, block_count: u32) -> BatGuard<'_> {
+        loop {
+            let mut guard = BatGuard {
+                bat: Some(self),
+                start_block,
+                block_count: 0,
+            };
+            let listener = self.io_wait_event.listen();
+            let mut blocked = false;
+
+            for block in start_block..start_block + block_count {
+                if self.try_increment_io_refcount(block) {
+                    guard.block_count += 1;
+                } else {
+                    blocked = true;
+                    break;
+                }
+            }
+
+            if !blocked {
+                return guard;
+            }
+
+            // Undo partial increments.
+            drop(guard);
+
+            // LOCK AUDIT: no locks held. Safe to await.
+            listener.await;
+        }
+    }
+}
+
+#[must_use]
+pub struct BatGuard<'a> {
+    bat: Option<&'a Bat>,
+    /// First payload block number with incremented refcount.
+    start_block: u32,
+    /// Number of consecutive payload blocks with incremented refcounts.
+    block_count: u32,
+}
+
+impl<'a> BatGuard<'a> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            bat: None,
+            start_block: 0,
+            block_count: 0,
+        }
+    }
+}
+
+impl Drop for BatGuard<'_> {
+    fn drop(&mut self) {
+        let Some(bat) = self.bat else { return };
+        let mut any_zero = false;
+        for block in self.start_block..self.start_block + self.block_count {
+            if bat.decrement_io_refcount(block) == 1 {
+                // Was 1, now 0 — trim may be waiting.
+                any_zero = true;
+            }
+        }
+        if any_zero {
+            bat.trim_event.notify(usize::MAX);
+        }
+    }
+}
+
+#[must_use]
+pub struct TrimGuard<'a> {
+    bat: &'a Bat,
+    block_number: u32,
+}
+
+impl Drop for TrimGuard<'_> {
+    fn drop(&mut self) {
+        self.bat.release_trim_claim(self.block_number);
     }
 }
 

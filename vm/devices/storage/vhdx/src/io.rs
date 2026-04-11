@@ -98,7 +98,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Zero-length reads succeed immediately.
         if len == 0 {
-            return Ok(ReadIoGuard::new(self, 0, 0));
+            return Ok(ReadIoGuard::empty());
         }
 
         // Validate alignment to logical sector size.
@@ -124,7 +124,10 @@ impl<F: AsyncFile> VhdxFile<F> {
         let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
         let block_count = end_block - start_block + 1;
 
-        let guard = self.acquire_io_refcounts(start_block, block_count).await;
+        let guard = self
+            .bat
+            .acquire_io_refcounts(start_block, block_count)
+            .await;
 
         let mut current_offset: u32 = 0;
 
@@ -178,7 +181,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             current_offset += block_length;
         }
 
-        Ok(guard)
+        Ok(ReadIoGuard::new(guard))
     }
 
     /// Resolve a write request into file-level ranges.
@@ -241,7 +244,10 @@ impl<F: AsyncFile> VhdxFile<F> {
         let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
         let block_count = end_block - start_block + 1;
 
-        let refcount_guard = self.acquire_io_refcounts(start_block, block_count).await;
+        let refcount_guard = self
+            .bat
+            .acquire_io_refcounts(start_block, block_count)
+            .await;
 
         // Track which blocks we've resolved in the read phase.
         // Blocks needing allocation are collected for the allocation phase.
@@ -349,6 +355,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // ownership from the ReadIoGuard to the WriteIoGuard.
         if blocks_needing_allocation.is_empty() {
             return Ok(WriteIoGuard::new(
+                self,
                 refcount_guard,
                 offset,
                 len,
@@ -728,6 +735,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // returning ranges to caller).
 
         Ok(WriteIoGuard::new(
+            self,
             refcount_guard,
             offset,
             len,
@@ -842,44 +850,6 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         Ok(())
-    }
-
-    /// Atomically increment I/O refcounts for a range of blocks,
-    /// returning a [`ReadIoGuard`] that will release them on drop.
-    ///
-    /// Uses CAS to increment each block's refcount. If any block has the
-    /// trim sentinel set, undoes partial increments, waits for trim to
-    /// release, and retries. Returns once all blocks are successfully
-    /// claimed.
-    async fn acquire_io_refcounts(&self, start_block: u32, block_count: u32) -> ReadIoGuard<'_, F> {
-        loop {
-            let listener = self.io_wait_event.listen();
-            let mut incremented = 0u32;
-            let mut blocked = false;
-
-            for block in start_block..start_block + block_count {
-                if self.bat.try_increment_io_refcount(block) {
-                    incremented += 1;
-                } else {
-                    blocked = true;
-                    break;
-                }
-            }
-
-            if !blocked {
-                return ReadIoGuard::new(self, start_block, block_count);
-            }
-
-            // Undo partial increments.
-            for block in start_block..start_block + incremented {
-                if self.bat.decrement_io_refcount(block) == 1 {
-                    self.trim_event.notify(usize::MAX);
-                }
-            }
-
-            // LOCK AUDIT: no locks held. Safe to await.
-            listener.await;
-        }
     }
 
     /// Synchronous abort path for `WriteIoGuard::drop()`.
@@ -2845,9 +2815,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(guard.block_count(), 3);
-        assert_eq!(guard.start_block(), 0);
-
         assert_eq!(vhdx.bat.io_refcount(0), 1);
         assert_eq!(vhdx.bat.io_refcount(1), 1);
         assert_eq!(vhdx.bat.io_refcount(2), 1);
@@ -2869,7 +2836,6 @@ mod tests {
         let mut ranges = Vec::new();
         let guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
-        assert!(guard.block_count() > 0);
         assert_eq!(vhdx.bat.io_refcount(0), 1);
 
         drop(guard);

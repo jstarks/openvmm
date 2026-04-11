@@ -228,15 +228,6 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Writers that encounter a TFP block listen on this event and retry.
     pub(crate) allocation_event: event_listener::Event,
 
-    /// Broadcast event notified when any I/O guard is dropped and a block's
-    /// refcount reaches zero. Trim (Phase 11) waits on this event when it
-    /// finds a block with refcount > 0.
-    pub(crate) trim_event: event_listener::Event,
-
-    /// Broadcast event notified when trim releases its claim on a block.
-    /// I/O paths wait on this event when they find a block claimed by trim.
-    pub(crate) io_wait_event: event_listener::Event,
-
     /// Free space tracker. Manages all space allocation within the file,
     /// replacing the simple EOF-bump allocator.
     pub(crate) free_space: FreeSpaceTracker,
@@ -461,8 +452,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             }),
             allocation_lock: futures::lock::Mutex::new(eof_state),
             allocation_event: event_listener::Event::new(),
-            trim_event: event_listener::Event::new(),
-            io_wait_event: event_listener::Event::new(),
             free_space,
             deferred_releases: DeferredReleases::new(),
 

@@ -348,15 +348,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             // 9a. Claim the block: CAS refcount 0 → TRIM_SENTINEL.
             //     If I/O is active (refcount > 0), wait for it to drain.
-            loop {
-                let listener = self.trim_event.listen();
-                if self.bat.try_claim_for_trim(current_block) {
-                    break;
-                }
-                // I/O is active on this block — wait.
-                // LOCK AUDIT: no locks held. Safe to await.
-                listener.await;
-            }
+            let claim = self.bat.claim_for_trim(current_block).await;
 
             // 9b. Block is claimed — no new I/O can start on it.
             //     Read the mapping and compute the trim conversion.
@@ -369,8 +361,6 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             if old_mapping == new_mapping {
                 // No-op — release claim and advance.
-                self.bat.release_trim_claim(current_block);
-                self.io_wait_event.notify(usize::MAX);
                 current_block += 1;
                 continue;
             }
@@ -383,8 +373,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             // 9d. Write BAT entry to cache (async).
             // LOCK AUDIT: bat_state write-lock dropped. Trim claim held (not a sync lock). Safe to await.
-            let cache_result = self
-                .bat
+            self.bat
                 .write_block_mapping(
                     &self.cache,
                     BlockType::Payload,
@@ -392,14 +381,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     new_mapping,
                     None,
                 )
-                .await;
-
-            if let Err(e) = cache_result {
-                // Release claim before propagating error.
-                self.bat.release_trim_claim(current_block);
-                self.io_wait_event.notify(usize::MAX);
-                return Err(e);
-            }
+                .await?;
 
             // 9e. Handle space management based on old→new transition.
             //
@@ -420,13 +402,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                 // Was soft-anchored → no longer: unmark/cancel + defer release.
                 let was_deferred = self.deferred_releases.cancel(current_block);
                 if !was_deferred {
-                    self.free_space
-                        .unmark_trimmed_block(current_block, old_file_offset, block_size)
-                        .map_err(|_| {
-                            self.bat.release_trim_claim(current_block);
-                            self.io_wait_event.notify(usize::MAX);
-                            VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk)
-                        })?;
+                    self.free_space.unmark_trimmed_block(
+                        current_block,
+                        old_file_offset,
+                        block_size,
+                    )?;
                 }
                 self.deferred_releases
                     .insert(current_block, old_file_offset, block_size, false);
@@ -447,8 +427,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             }
 
             // 9f. Release the trim claim — I/O can resume on this block.
-            self.bat.release_trim_claim(current_block);
-            self.io_wait_event.notify(usize::MAX);
+            drop(claim);
 
             // Quota check: force flush if too many deferred releases.
             if self.deferred_releases.needs_flush() {

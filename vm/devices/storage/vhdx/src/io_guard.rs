@@ -9,6 +9,7 @@
 //! freeing blocks during active I/O.
 
 use crate::AsyncFile;
+use crate::bat::BatGuard;
 use crate::error::VhdxError;
 use crate::open::VhdxFile;
 
@@ -17,50 +18,24 @@ use crate::open::VhdxFile;
 /// Returned by [`VhdxFile::resolve_read`]. Dropping this guard decrements
 /// per-block refcounts, allowing trim to proceed.
 pub struct ReadIoGuard<'a, F: AsyncFile> {
-    vhdx: &'a VhdxFile<F>,
-    /// First payload block number with incremented refcount.
-    start_block: u32,
-    /// Number of consecutive payload blocks with incremented refcounts.
-    block_count: u32,
+    // Significant drop.
+    _bat_guard: BatGuard<'a>,
+    _phantom: std::marker::PhantomData<&'a VhdxFile<F>>,
 }
 
 impl<'a, F: AsyncFile> ReadIoGuard<'a, F> {
     /// Create a new read guard with refcount tracking.
-    pub(crate) fn new(vhdx: &'a VhdxFile<F>, start_block: u32, block_count: u32) -> Self {
+    pub(crate) fn new(bat_guard: BatGuard<'a>) -> Self {
         Self {
-            vhdx,
-            start_block,
-            block_count,
+            _bat_guard: bat_guard,
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    /// The first payload block number tracked by this guard.
-    #[cfg(test)]
-    pub(crate) fn start_block(&self) -> u32 {
-        self.start_block
-    }
-
-    /// The number of consecutive payload blocks tracked by this guard.
-    #[cfg(test)]
-    pub(crate) fn block_count(&self) -> u32 {
-        self.block_count
-    }
-}
-
-impl<F: AsyncFile> Drop for ReadIoGuard<'_, F> {
-    fn drop(&mut self) {
-        if self.block_count == 0 {
-            return;
-        }
-        let mut any_zero = false;
-        for block in self.start_block..self.start_block + self.block_count {
-            if self.vhdx.bat.decrement_io_refcount(block) == 1 {
-                // Was 1, now 0 — trim may be waiting.
-                any_zero = true;
-            }
-        }
-        if any_zero {
-            self.vhdx.trim_event.notify(usize::MAX);
+    pub(crate) fn empty() -> Self {
+        Self {
+            _bat_guard: BatGuard::empty(),
+            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -73,9 +48,9 @@ impl<F: AsyncFile> Drop for ReadIoGuard<'_, F> {
 /// allocated space. In both cases, per-block refcounts are decremented
 /// via the owned [`ReadIoGuard`].
 pub struct WriteIoGuard<'a, F: AsyncFile> {
-    /// Owns the per-block refcounts. Dropped after abort logic runs,
-    /// which is the correct order (abort needs the mappings stable).
-    refcounts: ReadIoGuard<'a, F>,
+    vhdx: &'a VhdxFile<F>,
+    // Significant drop.
+    _bat_guard: BatGuard<'a>,
     /// The guest offset of the write (needed for complete_write logic).
     offset: u64,
     /// The length of the write in bytes.
@@ -96,13 +71,15 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// Create a new write guard that takes ownership of a [`ReadIoGuard`]
     /// for refcount management.
     pub(crate) fn new(
-        refcounts: ReadIoGuard<'a, F>,
+        vhdx: &'a VhdxFile<F>,
+        bat_guard: BatGuard<'a>,
         offset: u64,
         len: u32,
         needs_flush_before_log: bool,
     ) -> Self {
         Self {
-            refcounts,
+            vhdx,
+            _bat_guard: bat_guard,
             offset,
             len,
             completed: false,
@@ -113,7 +90,8 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// Create a write guard that is already completed (for zero-length writes).
     pub(crate) fn new_completed(vhdx: &'a VhdxFile<F>) -> Self {
         Self {
-            refcounts: ReadIoGuard::new(vhdx, 0, 0),
+            vhdx,
+            _bat_guard: BatGuard::empty(),
             offset: 0,
             len: 0,
             completed: true,
@@ -128,8 +106,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// after this method returns.
     pub async fn complete(mut self) -> Result<(), VhdxError> {
         self.completed = true;
-        self.refcounts
-            .vhdx
+        self.vhdx
             .complete_write_inner(self.offset, self.len, self.needs_flush_before_log)
             .await
     }
@@ -139,8 +116,8 @@ impl<F: AsyncFile> Drop for WriteIoGuard<'_, F> {
     fn drop(&mut self) {
         // If complete() was not called, abort the write.
         if !self.completed {
-            self.refcounts.vhdx.abort_write_sync(self.offset, self.len);
+            self.vhdx.abort_write_sync(self.offset, self.len);
         }
-        // Refcounts are decremented when self.refcounts (ReadIoGuard) drops.
+        // Refcounts are decremented when self.bat_guard drops.
     }
 }

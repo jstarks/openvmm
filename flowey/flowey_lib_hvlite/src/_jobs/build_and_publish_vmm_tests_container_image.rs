@@ -152,9 +152,33 @@ impl SimpleFlowNode for Node {
                     artifacts_dir.join("nextest.toml"),
                 )?;
 
-                // Pass the repo as a named build context so Docker can
-                // COPY it into the image (for nextest --workspace-remap).
-                // The repo root has a .dockerignore that excludes target/, .git/, etc.
+                // Build a workspace skeleton containing only Cargo.toml files
+                // and directory structure. nextest's --workspace-remap only
+                // needs the crate directory layout, not the full source tree.
+                // This saves ~250MB vs copying the entire repo.
+                // See: https://github.com/nextest-rs/nextest/issues/692
+                let skeleton_dir = context_dir.join("workspace");
+                for entry in walkdir::WalkDir::new(&repo_dir)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        let name = e.file_name().to_string_lossy();
+                        // Skip directories excluded by .dockerignore + large
+                        // non-source dirs that nextest doesn't need.
+                        !matches!(
+                            name.as_ref(),
+                            "target" | ".git" | "flowey-out" | "flowey-persist" | ".packages" | "images"
+                        )
+                    })
+                {
+                    let entry = entry?;
+                    let rel = entry.path().strip_prefix(&repo_dir)?;
+                    let dest = skeleton_dir.join(rel);
+                    if entry.file_type().is_dir() {
+                        fs_err::create_dir_all(&dest)?;
+                    } else if entry.file_name() == "Cargo.toml" {
+                        fs_err::copy(entry.path(), &dest)?;
+                    }
+                }
 
                 // Copy entrypoint binary
                 let entrypoint = rt.read(entrypoint_bin);
@@ -313,12 +337,9 @@ impl SimpleFlowNode for Node {
 
                 let push_or_load: &str = if push { "--push" } else { "--load" };
 
-                let workspace_context = format!("workspace={}", repo_dir.display());
-
                 flowey::shell_cmd!(
                     rt,
                     "docker buildx build
-                        --build-context {workspace_context}
                         --build-arg {nextest_arg}
                         --build-arg {deps_arg}
                         --build-arg {msvm_arg}

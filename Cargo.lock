@@ -2116,6 +2116,7 @@ dependencies = [
  "serde_json",
  "target-lexicon",
  "vmm_test_images",
+ "walkdir",
  "which 8.0.0",
 ]
 

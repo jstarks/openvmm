@@ -56,9 +56,11 @@ RUN mkdir -p "/opt/openvmm/bin/${UEFI_CONTENT_DIR}" && \
 #   artifacts/nextest.toml      — nextest config
 COPY --link artifacts/ /opt/openvmm/
 
-# Workspace source (from named build context "workspace", filtered by .dockerignore).
-# Needed by nextest --workspace-remap to locate crate directories.
-COPY --link --from=workspace . /opt/openvmm/workspace/
+# Workspace skeleton — only Cargo.toml files and directory structure.
+# nextest --workspace-remap only needs the crate directory layout to set
+# working directories, not the full source tree (~250MB savings).
+# See: https://github.com/nextest-rs/nextest/issues/692
+COPY --link workspace/ /opt/openvmm/workspace/
 
 # Entrypoint binary (built from vmm_tests/vmm_test_container_entrypoint)
 COPY --link run-vmm-tests /opt/openvmm/run-vmm-tests

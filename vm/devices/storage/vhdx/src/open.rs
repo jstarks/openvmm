@@ -684,7 +684,22 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             state.apply_task.await;
 
             // Clear log GUID in the header now that the log is fully drained.
+            // Done BEFORE truncation so that a crash during truncation
+            // doesn't leave a non-zero log GUID pointing at a file that
+            // may have been partially shrunk. With the GUID cleared first,
+            // a crash at any later point just leaves a larger-than-necessary
+            // file — no replay is attempted.
             self.write_clean_header().await?;
+
+            // Truncate the file to reclaim unused trailing space.
+            // Best-effort: if this fails, the file is still correct,
+            // just not compacted.
+            if let Err(e) = self.truncate_file().await {
+                tracing::warn!(
+                    error = &e as &dyn std::error::Error,
+                    "failed to truncate VHDX file on close"
+                );
+            }
         }
         Ok(())
     }

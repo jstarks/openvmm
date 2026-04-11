@@ -560,7 +560,6 @@ impl FreeSpaceTracker {
     }
 
     /// Compute truncation target size.
-    #[expect(dead_code)] // used in later stages
     pub fn truncate_target(&self, eof: &EofState, is_fully_allocated: bool) -> u64 {
         let inner = self.inner.lock();
         let mut target = eof.last_file_offset;
@@ -1220,6 +1219,36 @@ impl<F: AsyncFile> VhdxFile<F> {
             eof.complete_file_extend(&self.free_space, target);
             // Retry — will succeed from near-EOF space.
         }
+    }
+
+    /// Truncate the file to reclaim unused trailing space.
+    ///
+    /// Shrinks the file to just past the highest in-use offset, rounded
+    /// up to MB1. For fully-allocated (fixed) disks, reserves extra
+    /// space for blocks that haven't been allocated yet.
+    ///
+    /// Called during [`close()`](Self::close) after all WAL entries are
+    /// drained. Must NOT be called while the log task is running.
+    pub(crate) async fn truncate_file(&self) -> Result<(), VhdxError> {
+        let mut eof = self.allocation_lock.lock().await;
+        let target = self
+            .free_space
+            .truncate_target(&eof, self.is_fully_allocated());
+
+        // Only shrink, never grow. And don't bother if the savings
+        // are less than the EOF extension length (avoids thrashing
+        // on files that are close to their minimum size).
+        if target < eof.file_length && eof.file_length - target >= eof.eof_extension_length as u64 {
+            // Round up to MB1.
+            let target_aligned = (target + MB1 - 1) & !(MB1 - 1);
+            self.file
+                .set_file_size(target_aligned)
+                .await
+                .map_err(VhdxError::Io)?;
+            self.free_space.apply_truncate(&mut eof, target_aligned);
+        }
+
+        Ok(())
     }
 
     /// Compute the cache [`PageKey`] for the BAT page containing the given

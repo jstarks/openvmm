@@ -44,6 +44,10 @@ RUN unzip -q /tmp/uefi.zip -d /opt/openvmm/firmware/ && rm /tmp/uefi.zip
 #   artifacts/nextest.toml      — nextest config
 COPY --link artifacts/ /opt/openvmm/
 
+# Workspace source (from named build context "workspace", filtered by .dockerignore).
+# Needed by nextest --workspace-remap to locate crate directories.
+COPY --link --from=workspace . /opt/openvmm/workspace/
+
 # Entrypoint binary (built from vmm_tests/vmm_test_container_entrypoint)
 COPY --link run-vmm-tests /opt/openvmm/run-vmm-tests
 

@@ -1,0 +1,5 @@
+target/
+.git/
+flowey-out/
+flowey-persist/
+.packages/

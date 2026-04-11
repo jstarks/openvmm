@@ -22,6 +22,8 @@ use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::MB1;
 use bitfield_struct::bitfield;
 use parking_lot::RwLock;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use zerocopy::IntoBytes;
 
 use crate::space::EofState;
@@ -42,6 +44,10 @@ pub(crate) const SECTOR_BITMAP_BLOCK_SIZE: u32 = 1024 * 1024;
 /// The VHDX BAT interleaves data block entries with sector bitmap entries.
 /// Every `chunk_ratio` payload entries are followed by one sector bitmap
 /// entry. This struct computes the correct entry index for any block number.
+/// Sentinel value stored in an atomic refcount to indicate that trim
+/// has claimed the block. IO paths must wait when they see this value.
+pub(crate) const TRIM_SENTINEL: u32 = u32::MAX;
+
 pub(crate) struct Bat {
     /// Number of data blocks (payload blocks) in the disk.
     pub data_block_count: u32,
@@ -55,6 +61,15 @@ pub(crate) struct Bat {
     pub has_parent: bool,
 
     pub bat_state: RwLock<BatState>,
+
+    /// Per-payload-block I/O refcounts. Atomic to avoid requiring
+    /// the bat_state write lock on the read/write hot path.
+    ///
+    /// Values:
+    /// - `0`: idle — no I/O in progress, trim may claim.
+    /// - `1..TRIM_SENTINEL-1`: I/O refcount — trim must wait.
+    /// - `TRIM_SENTINEL` (`u32::MAX`): trim has claimed the block — I/O must wait.
+    pub io_refcounts: Vec<AtomicU32>,
 }
 
 /// The mapping state returned from a BAT lookup.
@@ -125,6 +140,9 @@ pub(crate) enum BlockType {
 
 /// In-memory BAT state. Protected by `parking_lot::RwLock` on `VhdxFile`.
 /// All block state lookups read from this structure — no file I/O needed.
+///
+/// I/O refcounts are stored separately on [`Bat::io_refcounts`] as atomics,
+/// outside this lock.
 pub(crate) struct BatState {
     /// One entry per payload block (indexed by block number).
     pub payload_mappings: Vec<InternalBlockMapping>,
@@ -132,10 +150,6 @@ pub(crate) struct BatState {
     pub sector_bitmap_mappings: Vec<InternalBlockMapping>,
     /// Running count of allocated (FullyPresent or PartiallyPresent) blocks.
     pub allocated_block_count: u32,
-    /// Per-payload-block I/O refcounts. While a block's refcount is > 0,
-    /// trim must not free that block's file space. One entry per payload
-    /// block, parallel to `payload_mappings`.
-    pub io_refcounts: Vec<u32>,
 }
 
 /// Whether a block state counts as "allocated" for `allocated_block_count`.
@@ -180,24 +194,6 @@ impl BatState {
         let _ = bat;
         self.sector_bitmap_mappings[chunk_number as usize] = mapping;
     }
-
-    /// Increment the I/O refcount for a payload block.
-    pub fn increment_io_refcount(&mut self, block_number: u32) {
-        self.io_refcounts[block_number as usize] += 1;
-    }
-
-    /// Decrement the I/O refcount for a payload block.
-    /// Returns the new refcount value.
-    pub fn decrement_io_refcount(&mut self, block_number: u32) -> u32 {
-        let rc = &mut self.io_refcounts[block_number as usize];
-        *rc = rc.checked_sub(1).expect("io_refcount underflow");
-        *rc
-    }
-
-    /// Get the I/O refcount for a payload block.
-    pub fn io_refcount(&self, block_number: u32) -> u32 {
-        self.io_refcounts[block_number as usize]
-    }
 }
 
 impl Bat {
@@ -239,8 +235,9 @@ impl Bat {
             payload_mappings: Vec::with_capacity(data_block_count as usize),
             sector_bitmap_mappings: Vec::with_capacity(sector_bitmap_block_count as usize),
             allocated_block_count: 0,
-            io_refcounts: vec![0; data_block_count as usize],
         };
+
+        let io_refcounts = (0..data_block_count).map(|_| AtomicU32::new(0)).collect();
 
         Ok(Bat {
             data_block_count,
@@ -249,7 +246,64 @@ impl Bat {
             block_size,
             has_parent,
             bat_state: bat_state.into(),
+            io_refcounts,
         })
+    }
+
+    /// Try to atomically increment the I/O refcount for a block.
+    ///
+    /// Returns `true` if the increment succeeded, `false` if trim has
+    /// claimed the block (sentinel set). Uses a CAS loop to avoid
+    /// needing the bat_state write lock.
+    pub(crate) fn try_increment_io_refcount(&self, block_number: u32) -> bool {
+        let rc = &self.io_refcounts[block_number as usize];
+        loop {
+            let old = rc.load(Ordering::Acquire);
+            if old == TRIM_SENTINEL {
+                return false;
+            }
+            let new = old.checked_add(1).expect("io_refcount overflow");
+            match rc.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Atomically decrement the I/O refcount. Returns the previous value.
+    ///
+    /// Panics on underflow or if the sentinel is set (trim owns the block).
+    pub(crate) fn decrement_io_refcount(&self, block_number: u32) -> u32 {
+        let prev = self.io_refcounts[block_number as usize].fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            prev > 0 && prev != TRIM_SENTINEL,
+            "io_refcount underflow or trim sentinel on block {block_number}"
+        );
+        prev
+    }
+
+    /// Try to claim a block for trim by CAS 0 → TRIM_SENTINEL.
+    ///
+    /// Returns `true` if the claim succeeded (block was idle), `false` if
+    /// I/O is active (refcount > 0) or another trim already claimed it.
+    pub(crate) fn try_claim_for_trim(&self, block_number: u32) -> bool {
+        self.io_refcounts[block_number as usize]
+            .compare_exchange(0, TRIM_SENTINEL, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release a trim claim on a block (store 0).
+    pub(crate) fn release_trim_claim(&self, block_number: u32) {
+        let prev = self.io_refcounts[block_number as usize].swap(0, Ordering::Release);
+        assert_eq!(
+            prev, TRIM_SENTINEL,
+            "release_trim_claim on block {block_number} that wasn't claimed (was {prev})"
+        );
+    }
+
+    /// Load the current I/O refcount for a block.
+    pub(crate) fn io_refcount(&self, block_number: u32) -> u32 {
+        self.io_refcounts[block_number as usize].load(Ordering::Acquire)
     }
 
     /// Compute the BAT entry index for a given data block number.
@@ -415,11 +469,7 @@ impl Bat {
     /// their `file_offset_mb` masked to zero (allocation not committed
     /// yet). Matches the C code's `Vhd2iProduceBatPageLocked` +
     /// `Vhd2iGenerateBatEntry` behavior.
-    fn produce_page(
-        &self,
-        page_index: usize,
-        buf: &mut [u8; CACHE_PAGE_SIZE as usize],
-    ) -> [u8; CACHE_PAGE_SIZE as usize] {
+    fn produce_page(&self, page_index: usize, buf: &mut [u8; CACHE_PAGE_SIZE as usize]) {
         let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
         let bat_state = self.bat_state.read();
         for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
@@ -937,7 +987,6 @@ mod tests {
             payload_mappings: vec![InternalBlockMapping::new(); bat.data_block_count as usize],
             sector_bitmap_mappings: vec![],
             allocated_block_count: 0,
-            io_refcounts: vec![0u32; bat.data_block_count as usize],
         };
 
         // Allocate block 0.

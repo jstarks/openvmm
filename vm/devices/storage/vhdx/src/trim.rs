@@ -335,79 +335,71 @@ impl<F: AsyncFile> VhdxFile<F> {
         let end_block = start_block + block_count;
 
         // 9. Main trim loop.
+        //
+        // For each block, we atomically claim it (CAS 0 → SENTINEL),
+        // preventing any new I/O from reading stale mappings. Then we
+        // read + convert the mapping, write the BAT, handle space
+        // management, and release the claim.
         let mut current_block = start_block;
         loop {
-            // 9a. Wait for I/O refcount == 0 on the current block.
-            //     We must check this BEFORE scanning for the next changed
-            //     block, because we need the block to be quiescent before
-            //     modifying its state.
+            if current_block >= end_block {
+                return Ok(());
+            }
+
+            // 9a. Claim the block: CAS refcount 0 → TRIM_SENTINEL.
+            //     If I/O is active (refcount > 0), wait for it to drain.
             loop {
                 let listener = self.trim_event.listen();
-                {
-                    let bat_state = self.bat.bat_state.read();
-                    if current_block >= end_block {
-                        return Ok(());
-                    }
-                    if bat_state.io_refcount(current_block) == 0 {
-                        break;
-                    }
+                if self.bat.try_claim_for_trim(current_block) {
+                    break;
                 }
-                // LOCK AUDIT: bat_state read-lock dropped (end of block above). Safe to await.
+                // I/O is active on this block — wait.
+                // LOCK AUDIT: no locks held. Safe to await.
                 listener.await;
             }
 
-            // 9b. Scan forward under a single read-lock to find the next
-            //     block whose mapping actually changes. Skip no-ops without
-            //     re-acquiring the lock.
-            let scan_result = {
+            // 9b. Block is claimed — no new I/O can start on it.
+            //     Read the mapping and compute the trim conversion.
+            let (old_mapping, new_mapping) = {
                 let bat_state = self.bat.bat_state.read();
-                loop {
-                    if current_block >= end_block {
-                        break None;
-                    }
-                    // Re-check refcount for the current block (it may have
-                    // gained refs since we checked above if we advanced).
-                    if bat_state.io_refcount(current_block) != 0 {
-                        // Need to wait — break out to outer loop.
-                        break None;
-                    }
-                    let old = bat_state.get_payload_mapping(current_block);
-                    let new = convert_mapping(mode, old);
-                    if old != new {
-                        break Some((old, new, current_block));
-                    }
-                    current_block += 1;
-                }
+                let old = bat_state.get_payload_mapping(current_block);
+                let new = convert_mapping(mode, old);
+                (old, new)
             };
 
-            let (old_mapping, new_mapping, block_number) = match scan_result {
-                Some(result) => result,
-                None => {
-                    if current_block >= end_block {
-                        return Ok(());
-                    }
-                    // Refcount non-zero on current_block — restart outer wait loop.
-                    continue;
-                }
-            };
+            if old_mapping == new_mapping {
+                // No-op — release claim and advance.
+                self.bat.release_trim_claim(current_block);
+                self.io_wait_event.notify(usize::MAX);
+                current_block += 1;
+                continue;
+            }
 
             // 9c. Update in-memory BAT under write lock.
             {
                 let mut bat_state = self.bat.bat_state.write();
-                bat_state.set_payload_mapping(&self.bat, block_number, new_mapping);
+                bat_state.set_payload_mapping(&self.bat, current_block, new_mapping);
             }
 
             // 9d. Write BAT entry to cache (async).
-            // LOCK AUDIT: bat_state write-lock dropped in step 9d block. No sync locks held.
-            self.bat
+            // LOCK AUDIT: bat_state write-lock dropped. Trim claim held (not a sync lock). Safe to await.
+            let cache_result = self
+                .bat
                 .write_block_mapping(
                     &self.cache,
                     BlockType::Payload,
-                    block_number,
+                    current_block,
                     new_mapping,
                     None,
                 )
-                .await?;
+                .await;
+
+            if let Err(e) = cache_result {
+                // Release claim before propagating error.
+                self.bat.release_trim_claim(current_block);
+                self.io_wait_event.notify(usize::MAX);
+                return Err(e);
+            }
 
             // 9e. Handle space management based on old→new transition.
             //
@@ -426,34 +418,44 @@ impl<F: AsyncFile> VhdxFile<F> {
                 debug_assert_eq!(old_file_mb, new_file_mb);
             } else if old_anchored && !new_anchored {
                 // Was soft-anchored → no longer: unmark/cancel + defer release.
-                // Check deferred list first (may not be in tracker yet).
-                let was_deferred = self.deferred_releases.cancel(block_number);
+                let was_deferred = self.deferred_releases.cancel(current_block);
                 if !was_deferred {
                     self.free_space
-                        .unmark_trimmed_block(block_number, old_file_offset, block_size)
-                        .map_err(|_| VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))?;
+                        .unmark_trimmed_block(current_block, old_file_offset, block_size)
+                        .map_err(|_| {
+                            self.bat.release_trim_claim(current_block);
+                            self.io_wait_event.notify(usize::MAX);
+                            VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk)
+                        })?;
                 }
                 self.deferred_releases
-                    .insert(block_number, old_file_offset, block_size, false);
+                    .insert(current_block, old_file_offset, block_size, false);
             } else if !old_anchored && new_anchored {
                 // Was not anchored → now soft-anchored: defer the anchor.
                 self.deferred_releases
-                    .insert(block_number, old_file_offset, block_size, true);
+                    .insert(current_block, old_file_offset, block_size, true);
             } else {
                 // Neither was nor becomes anchored.
-                // If old had a file offset, defer the release.
                 if old_file_mb != 0 {
-                    self.deferred_releases
-                        .insert(block_number, old_file_offset, block_size, false);
+                    self.deferred_releases.insert(
+                        current_block,
+                        old_file_offset,
+                        block_size,
+                        false,
+                    );
                 }
             }
+
+            // 9f. Release the trim claim — I/O can resume on this block.
+            self.bat.release_trim_claim(current_block);
+            self.io_wait_event.notify(usize::MAX);
 
             // Quota check: force flush if too many deferred releases.
             if self.deferred_releases.needs_flush() {
                 self.flush().await?;
             }
 
-            current_block = block_number + 1;
+            current_block += 1;
         }
     }
 }

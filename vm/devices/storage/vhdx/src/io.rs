@@ -116,6 +116,20 @@ impl<F: AsyncFile> VhdxFile<F> {
             return Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk));
         }
 
+        // Increment per-block refcounts atomically. If trim has claimed
+        // any block (sentinel), wait and retry. Once the refcount is
+        // incremented, trim cannot modify that block's mapping, so the
+        // subsequent mapping reads are guaranteed to see stable state.
+        let start_block = self.bat.offset_to_block(offset);
+        let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
+        let block_count = end_block - start_block + 1;
+
+        self.acquire_io_refcounts(start_block, block_count).await;
+
+        // Create the guard now so its Drop cleans up refcounts if
+        // anything below (e.g. resolve_partial_block_read) fails.
+        let guard = ReadIoGuard::new(self, start_block, block_count);
+
         let mut current_offset: u32 = 0;
 
         while current_offset < len {
@@ -168,19 +182,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             current_offset += block_length;
         }
 
-        // Compute the block range and increment refcounts.
-        let start_block = self.bat.offset_to_block(offset);
-        let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
-        let block_count = end_block - start_block + 1;
-
-        {
-            let mut bat_state = self.bat.bat_state.write();
-            for block in start_block..start_block + block_count {
-                bat_state.increment_io_refcount(block);
-            }
-        }
-
-        Ok(ReadIoGuard::new(self, start_block, block_count))
+        Ok(guard)
     }
 
     /// Resolve a write request into file-level ranges.
@@ -235,6 +237,20 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // First-write gate: update header with new GUIDs before any data.
         self.enable_write_mode(WriteMode::DataWritable).await?;
+
+        // Increment per-block refcounts BEFORE reading mappings to prevent
+        // trim from changing them underneath us. If trim has claimed any
+        // block, this waits for it to finish.
+        let start_block = self.bat.offset_to_block(offset);
+        let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
+        let block_count = end_block - start_block + 1;
+
+        self.acquire_io_refcounts(start_block, block_count).await;
+
+        // Wrap refcounts in a read guard immediately so they're released
+        // on any early return or panic below. We'll either consume it
+        // (no-allocation path) or explicitly drop it (allocation path).
+        let refcount_guard = ReadIoGuard::new(self, start_block, block_count);
 
         // Track which blocks we've resolved in the read phase.
         // Blocks needing allocation are collected for the allocation phase.
@@ -338,29 +354,21 @@ impl<F: AsyncFile> VhdxFile<F> {
             current_offset += block_length;
         }
 
-        // If nothing needs allocation, we're done.
+        // If nothing needs allocation, we're done. Transfer refcount
+        // ownership from the ReadIoGuard to the WriteIoGuard.
         if blocks_needing_allocation.is_empty() {
-            // Compute block range and increment refcounts.
-            let start_block = self.bat.offset_to_block(offset);
-            let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
-            let block_count = end_block - start_block + 1;
-
-            {
-                let mut bat_state = self.bat.bat_state.write();
-                for block in start_block..start_block + block_count {
-                    bat_state.increment_io_refcount(block);
-                }
-            }
-
             return Ok(WriteIoGuard::new(
-                self,
+                refcount_guard,
                 offset,
                 len,
-                start_block,
-                block_count,
                 false, // no allocation → no flush barrier needed
             ));
         }
+
+        // --- Allocation phase ---
+        // Keep refcount_guard alive — its Drop will release refcounts
+        // if any error path below returns early. On success, we forget
+        // it and let the WriteIoGuard take ownership.
 
         // --- Allocation phase: acquire BlockAllocationLock ---
         // Wait until no blocks in our allocation set have TFP set by
@@ -728,24 +736,10 @@ impl<F: AsyncFile> VhdxFile<F> {
         // Allocation lock is released when _alloc_guard drops (after
         // returning ranges to caller).
 
-        // Compute block range and increment refcounts on success path.
-        let start_block = self.bat.offset_to_block(offset);
-        let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
-        let block_count = end_block - start_block + 1;
-
-        {
-            let mut bat_state = self.bat.bat_state.write();
-            for block in start_block..start_block + block_count {
-                bat_state.increment_io_refcount(block);
-            }
-        }
-
         Ok(WriteIoGuard::new(
-            self,
+            refcount_guard,
             offset,
             len,
-            start_block,
-            block_count,
             needs_flush_before_log,
         ))
     }
@@ -857,6 +851,43 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         Ok(())
+    }
+
+    /// Atomically increment I/O refcounts for a range of blocks.
+    ///
+    /// Uses CAS to increment each block's refcount. If any block has the
+    /// trim sentinel set, undoes partial increments, waits for trim to
+    /// release, and retries. Returns once all blocks are successfully
+    /// claimed.
+    async fn acquire_io_refcounts(&self, start_block: u32, block_count: u32) {
+        loop {
+            let listener = self.io_wait_event.listen();
+            let mut incremented = 0u32;
+            let mut blocked = false;
+
+            for block in start_block..start_block + block_count {
+                if self.bat.try_increment_io_refcount(block) {
+                    incremented += 1;
+                } else {
+                    blocked = true;
+                    break;
+                }
+            }
+
+            if !blocked {
+                return;
+            }
+
+            // Undo partial increments.
+            for block in start_block..start_block + incremented {
+                if self.bat.decrement_io_refcount(block) == 1 {
+                    self.trim_event.notify(usize::MAX);
+                }
+            }
+
+            // LOCK AUDIT: no locks held. Safe to await.
+            listener.await;
+        }
     }
 
     /// Synchronous abort path for `WriteIoGuard::drop()`.
@@ -2774,18 +2805,12 @@ mod tests {
         let mut ranges = Vec::new();
         let guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
-        {
-            let bat_state = vhdx.bat.bat_state.read();
-            assert_eq!(bat_state.io_refcount(0), 1);
-        }
+        assert_eq!(vhdx.bat.io_refcount(0), 1);
 
         // Drop the guard — refcount should go back to 0.
         drop(guard);
 
-        {
-            let bat_state = vhdx.bat.bat_state.read();
-            assert_eq!(bat_state.io_refcount(0), 0);
-        }
+        assert_eq!(vhdx.bat.io_refcount(0), 0);
     }
 
     #[async_test]
@@ -2801,13 +2826,13 @@ mod tests {
         let guard = vhdx.resolve_read(0, block_size, &mut ranges).await.unwrap();
 
         // Refcount is 1 while guard is held.
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 1);
+        assert_eq!(vhdx.bat.io_refcount(0), 1);
 
         // Drop explicitly.
         drop(guard);
 
         // Refcount back to 0.
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 0);
+        assert_eq!(vhdx.bat.io_refcount(0), 0);
     }
 
     #[async_test]
@@ -2831,21 +2856,15 @@ mod tests {
         assert_eq!(guard.block_count(), 3);
         assert_eq!(guard.start_block(), 0);
 
-        {
-            let bat_state = vhdx.bat.bat_state.read();
-            assert_eq!(bat_state.io_refcount(0), 1);
-            assert_eq!(bat_state.io_refcount(1), 1);
-            assert_eq!(bat_state.io_refcount(2), 1);
-        }
+        assert_eq!(vhdx.bat.io_refcount(0), 1);
+        assert_eq!(vhdx.bat.io_refcount(1), 1);
+        assert_eq!(vhdx.bat.io_refcount(2), 1);
 
         drop(guard);
 
-        {
-            let bat_state = vhdx.bat.bat_state.read();
-            assert_eq!(bat_state.io_refcount(0), 0);
-            assert_eq!(bat_state.io_refcount(1), 0);
-            assert_eq!(bat_state.io_refcount(2), 0);
-        }
+        assert_eq!(vhdx.bat.io_refcount(0), 0);
+        assert_eq!(vhdx.bat.io_refcount(1), 0);
+        assert_eq!(vhdx.bat.io_refcount(2), 0);
     }
 
     #[async_test]
@@ -2859,11 +2878,11 @@ mod tests {
         let guard = vhdx.resolve_read(0, 4096, &mut ranges).await.unwrap();
 
         assert!(guard.block_count() > 0);
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 1);
+        assert_eq!(vhdx.bat.io_refcount(0), 1);
 
         drop(guard);
 
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 0);
+        assert_eq!(vhdx.bat.io_refcount(0), 0);
     }
 
     #[async_test]
@@ -2879,7 +2898,7 @@ mod tests {
             .unwrap();
 
         // Refcount should be 1.
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 1);
+        assert_eq!(vhdx.bat.io_refcount(0), 1);
 
         // Write data and complete.
         for wr in &ranges {
@@ -2905,7 +2924,7 @@ mod tests {
         guard.complete().await.unwrap();
 
         // After complete + drop, refcount should be 0 and block should be FullyPresent.
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 0);
+        assert_eq!(vhdx.bat.io_refcount(0), 0);
         let mapping = vhdx.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::FullyPresent);
     }
@@ -2923,13 +2942,13 @@ mod tests {
             .unwrap();
 
         // Refcount should be 1.
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 1);
+        assert_eq!(vhdx.bat.io_refcount(0), 1);
 
         // Drop without calling complete() — abort.
         drop(guard);
 
         // Refcount should be 0, block should be back to NotPresent.
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 0);
+        assert_eq!(vhdx.bat.io_refcount(0), 0);
         let mapping = vhdx.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::NotPresent);
     }
@@ -2950,15 +2969,15 @@ mod tests {
         let guard2 = vhdx.resolve_read(0, 4096, &mut ranges2).await.unwrap();
 
         // Refcount should be 2.
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 2);
+        assert_eq!(vhdx.bat.io_refcount(0), 2);
 
         // Drop first guard — refcount should be 1.
         drop(guard1);
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 1);
+        assert_eq!(vhdx.bat.io_refcount(0), 1);
 
         // Drop second guard — refcount should be 0.
         drop(guard2);
-        assert_eq!(vhdx.bat.bat_state.read().io_refcount(0), 0);
+        assert_eq!(vhdx.bat.io_refcount(0), 0);
     }
 
     // ---- Phase 16b: Concurrent write+trim and mixed-workload stress tests ----

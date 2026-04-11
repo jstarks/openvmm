@@ -52,14 +52,13 @@ impl<F: AsyncFile> Drop for ReadIoGuard<'_, F> {
         if self.block_count == 0 {
             return;
         }
-        let mut bat_state = self.vhdx.bat.bat_state.write();
         let mut any_zero = false;
         for block in self.start_block..self.start_block + self.block_count {
-            if bat_state.decrement_io_refcount(block) == 0 {
+            if self.vhdx.bat.decrement_io_refcount(block) == 1 {
+                // Was 1, now 0 — trim may be waiting.
                 any_zero = true;
             }
         }
-        drop(bat_state);
         if any_zero {
             self.vhdx.trim_event.notify(usize::MAX);
         }
@@ -71,13 +70,12 @@ impl<F: AsyncFile> Drop for ReadIoGuard<'_, F> {
 ///
 /// Returned by [`VhdxFile::resolve_write`]. Dropping without calling
 /// `complete()` aborts the write, reverting TFP blocks and releasing
-/// allocated space. In both cases, per-block refcounts are decremented.
+/// allocated space. In both cases, per-block refcounts are decremented
+/// via the owned [`ReadIoGuard`].
 pub struct WriteIoGuard<'a, F: AsyncFile> {
-    vhdx: &'a VhdxFile<F>,
-    /// First payload block number with incremented refcount.
-    start_block: u32,
-    /// Number of consecutive payload blocks with incremented refcounts.
-    block_count: u32,
+    /// Owns the per-block refcounts. Dropped after abort logic runs,
+    /// which is the correct order (abort needs the mappings stable).
+    refcounts: ReadIoGuard<'a, F>,
     /// The guest offset of the write (needed for complete_write logic).
     offset: u64,
     /// The length of the write in bytes.
@@ -95,19 +93,16 @@ pub struct WriteIoGuard<'a, F: AsyncFile> {
 }
 
 impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
-    /// Create a new write guard with refcount tracking.
+    /// Create a new write guard that takes ownership of a [`ReadIoGuard`]
+    /// for refcount management.
     pub(crate) fn new(
-        vhdx: &'a VhdxFile<F>,
+        refcounts: ReadIoGuard<'a, F>,
         offset: u64,
         len: u32,
-        start_block: u32,
-        block_count: u32,
         needs_flush_before_log: bool,
     ) -> Self {
         Self {
-            vhdx,
-            start_block,
-            block_count,
+            refcounts,
             offset,
             len,
             completed: false,
@@ -118,9 +113,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// Create a write guard that is already completed (for zero-length writes).
     pub(crate) fn new_completed(vhdx: &'a VhdxFile<F>) -> Self {
         Self {
-            vhdx,
-            start_block: 0,
-            block_count: 0,
+            refcounts: ReadIoGuard::new(vhdx, 0, 0),
             offset: 0,
             len: 0,
             completed: true,
@@ -135,7 +128,8 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// after this method returns.
     pub async fn complete(mut self) -> Result<(), VhdxError> {
         self.completed = true;
-        self.vhdx
+        self.refcounts
+            .vhdx
             .complete_write_inner(self.offset, self.len, self.needs_flush_before_log)
             .await
     }
@@ -143,24 +137,10 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
 
 impl<F: AsyncFile> Drop for WriteIoGuard<'_, F> {
     fn drop(&mut self) {
-        // Decrement refcounts.
-        if self.block_count > 0 {
-            let mut bat_state = self.vhdx.bat.bat_state.write();
-            let mut any_zero = false;
-            for block in self.start_block..self.start_block + self.block_count {
-                if bat_state.decrement_io_refcount(block) == 0 {
-                    any_zero = true;
-                }
-            }
-            drop(bat_state);
-            if any_zero {
-                self.vhdx.trim_event.notify(usize::MAX);
-            }
-        }
-
         // If complete() was not called, abort the write.
         if !self.completed {
-            self.vhdx.abort_write_sync(self.offset, self.len);
+            self.refcounts.vhdx.abort_write_sync(self.offset, self.len);
         }
+        // Refcounts are decremented when self.refcounts (ReadIoGuard) drops.
     }
 }

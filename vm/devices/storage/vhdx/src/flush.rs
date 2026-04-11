@@ -17,6 +17,7 @@
 
 use crate::AsyncFile;
 use crate::error::VhdxError;
+use crate::open::FailureFlag;
 use event_listener::Event;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -38,6 +39,7 @@ use std::sync::atomic::Ordering::Release;
 /// is logged").
 pub(crate) struct FlushSequencer {
     state: Mutex<FlushState>,
+    failure_flag: Option<Arc<FailureFlag>>,
 }
 
 struct FlushState {
@@ -74,7 +76,13 @@ impl FlushSequencer {
                 completed_fsn: 0,
                 active_flush: None,
             }),
+            failure_flag: None,
         }
+    }
+
+    /// Set the failure flag for poisoning on I/O errors.
+    pub fn set_failure_flag(&mut self, flag: Arc<FailureFlag>) {
+        self.failure_flag = Some(flag);
     }
 
     /// Returns the next FSN that will be assigned to a flush request.
@@ -196,7 +204,12 @@ impl FlushSequencer {
         };
         my_flush.done.store(true, Release);
         my_flush.event.notify(usize::MAX);
-        r.map_err(VhdxError::Io)?;
+        r.map_err(|e| {
+            if let Some(flag) = &self.failure_flag {
+                flag.set(&e);
+            }
+            VhdxError::Io(e)
+        })?;
         Ok(completed_fsn)
     }
 }

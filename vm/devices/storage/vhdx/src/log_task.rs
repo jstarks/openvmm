@@ -30,6 +30,7 @@ use crate::log::DataPage;
 use crate::log::LogWriter;
 use crate::log_permits::LogPermits;
 use crate::lsn_watermark::LsnWatermark;
+use crate::open::FailureFlag;
 use mesh::rpc::Rpc;
 use std::sync::Arc;
 
@@ -156,6 +157,7 @@ pub(crate) struct LogTask<F: AsyncFile> {
     applied_lsn: Arc<LsnWatermark>,
     apply_tx: mesh::Sender<ApplyBatch>,
     pending_tails: Vec<PendingTail>,
+    failure_flag: Arc<FailureFlag>,
 }
 
 impl<F: AsyncFile> LogTask<F> {
@@ -168,6 +170,7 @@ impl<F: AsyncFile> LogTask<F> {
         logged_lsn: Arc<LsnWatermark>,
         applied_lsn: Arc<LsnWatermark>,
         apply_tx: mesh::Sender<ApplyBatch>,
+        failure_flag: Arc<FailureFlag>,
     ) -> Self {
         Self {
             file,
@@ -178,6 +181,7 @@ impl<F: AsyncFile> LogTask<F> {
             applied_lsn,
             apply_tx,
             pending_tails: Vec::new(),
+            failure_flag,
         }
     }
 
@@ -203,6 +207,7 @@ impl<F: AsyncFile> LogTask<F> {
                         tracing::error!("VHDX log task fatal error: {e}");
                         self.log_permits.fail(e.to_string());
                         self.logged_lsn.fail(e.to_string());
+                        self.failure_flag.set(&e);
                         break;
                     }
                 }
@@ -397,15 +402,16 @@ mod tests {
             length: log_size,
         };
         let guid = guid::Guid::new_random();
-        let log_writer =
-            crate::log::LogWriter::initialize(file.as_ref(), region, guid, 4 * 1024 * 1024)
-                .await
-                .unwrap();
+        let log_writer = LogWriter::initialize(file.as_ref(), region, guid, 4 * 1024 * 1024)
+            .await
+            .unwrap();
 
         let flush_sequencer = Arc::new(FlushSequencer::new());
         let log_permits = Arc::new(LogPermits::new(permit_count));
         let logged_lsn = Arc::new(LsnWatermark::new());
         let applied_lsn = Arc::new(LsnWatermark::new());
+
+        let failure_flag = Arc::new(FailureFlag::new());
 
         let (apply_tx, apply_rx) = mesh::channel::<ApplyBatch>();
         let (log_tx, log_rx) = mesh::channel::<LogRequest>();
@@ -419,6 +425,7 @@ mod tests {
                 flush_sequencer.clone(),
                 applied_lsn.clone(),
                 log_permits.clone(),
+                failure_flag.clone(),
             ),
         );
 
@@ -433,6 +440,7 @@ mod tests {
                 logged_lsn.clone(),
                 applied_lsn.clone(),
                 apply_tx,
+                failure_flag,
             )
             .run(log_rx),
         );

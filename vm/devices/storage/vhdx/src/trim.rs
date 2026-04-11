@@ -263,6 +263,8 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// - The range extends beyond the disk size (unless `skip_disk_size_check`)
     /// - The file is in a permanently failed state
     pub async fn trim(&self, request: TrimRequest) -> Result<(), VhdxError> {
+        self.check_failed()?;
+
         let TrimRequest {
             mode,
             offset,

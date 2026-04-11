@@ -1690,7 +1690,7 @@ mod tests {
             .await
             .unwrap();
 
-        let applied = Arc::new(crate::lsn_watermark::LsnWatermark::new());
+        let applied = Arc::new(LsnWatermark::new());
         // applied_lsn = 0, so committed pages with lsn > 0 are not evictable.
 
         let (tx, _rx) = mesh::channel::<LogRequest>();
@@ -1735,7 +1735,7 @@ mod tests {
         applied.advance(1, 0);
 
         // Load another page — now A is evictable.
-        let file_size = PAGE_SIZE as u64 * 4;
+        let _file_size = PAGE_SIZE as u64 * 4;
         // Load page at offset 2*PAGE_SIZE (need data there).
         cache
             .file

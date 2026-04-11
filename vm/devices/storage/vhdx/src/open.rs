@@ -261,9 +261,10 @@ pub struct VhdxFile<F: AsyncFile> {
     /// don't match). Consumed by [`VhdxBuilder::writable`].
     region_rewrite_data: Option<Vec<u8>>,
 
-    // Error state: once set, all operations fail.
-    #[expect(dead_code)] // Phase 7+: used for error propagation on I/O path
-    failed: Option<VhdxError>,
+    /// Error state: once set, all I/O operations fail with
+    /// [`VhdxError::Failed`]. Shared with log and apply tasks so they
+    /// can poison the file directly on fatal error.
+    failed: Arc<FailureFlag>,
 
     // Log task state (set when opened writable via VhdxBuilder::writable).
     pub(crate) log_state: Option<LogTaskState>,
@@ -473,7 +474,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             log_length: header.log_length,
             read_only,
             region_rewrite_data: regions.rewrite_data,
-            failed: None,
+            failed: Arc::new(FailureFlag::new()),
 
             log_state: None,
         })
@@ -517,7 +518,11 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         let mut vhdx = Self::open_inner(file, false, Some(tx.clone()), options).await?;
 
         // Create shared state for log task communication.
-        let flush_sequencer = Arc::new(FlushSequencer::new());
+        let flush_sequencer = {
+            let mut fs = FlushSequencer::new();
+            fs.set_failure_flag(vhdx.failed.clone());
+            Arc::new(fs)
+        };
         let log_permits = Arc::new(crate::log_permits::LogPermits::new(
             // Permit count is a multiple of MAX_COMMIT_PAGES to allow
             // pipelining: multiple batches can be in-flight (committed
@@ -594,6 +599,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
                 flush_sequencer.clone(),
                 applied_lsn.clone(),
                 log_permits.clone(),
+                vhdx.failed.clone(),
             ),
         );
 
@@ -608,6 +614,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
                 logged_lsn.clone(),
                 applied_lsn.clone(),
                 apply_tx,
+                vhdx.failed.clone(),
             )
             .run(rx),
         );
@@ -724,6 +731,13 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
 }
 
 impl<F: AsyncFile> VhdxFile<F> {
+    /// Check whether the file has been poisoned by a fatal error.
+    /// If so, return `Err(VhdxError::Failed(...))`. Fast path is a
+    /// single atomic load.
+    pub(crate) fn check_failed(&self) -> Result<(), VhdxError> {
+        self.failed.check()
+    }
+
     /// Virtual disk size in bytes.
     pub fn disk_size(&self) -> u64 {
         self.disk_size
@@ -950,6 +964,42 @@ async fn validate_file_identifier(file: &impl AsyncFile) -> Result<(), VhdxError
     }
 
     Ok(())
+}
+
+/// Shared failure flag for poisoning the VHDX file from any task.
+///
+/// Uses an `AtomicBool` for the fast path (`check`) and a mutex for
+/// the error message. Once set, the flag is never cleared.
+pub(crate) struct FailureFlag {
+    flag: std::sync::atomic::AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+impl FailureFlag {
+    pub fn new() -> Self {
+        Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            message: Mutex::new(None),
+        }
+    }
+
+    /// Check whether the flag is set. Fast path: single atomic load.
+    pub fn check(&self) -> Result<(), VhdxError> {
+        if self.flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let msg = self.message.lock().clone().unwrap_or_default();
+            return Err(VhdxError::Failed(msg));
+        }
+        Ok(())
+    }
+
+    /// Set the failure flag. First caller's message wins.
+    pub fn set(&self, error: &dyn std::fmt::Display) {
+        let mut msg = self.message.lock();
+        if msg.is_none() {
+            *msg = Some(error.to_string());
+        }
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

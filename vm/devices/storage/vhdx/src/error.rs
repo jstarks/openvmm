@@ -26,6 +26,10 @@ pub enum VhdxError {
     /// A write was attempted on a read-only file.
     #[error("VHDX file is opened read-only")]
     ReadOnly,
+
+    /// The file has been poisoned by a previous fatal error.
+    #[error("VHDX file failed: {0}")]
+    Failed(String),
 }
 
 /// Specific reasons a VHDX creation or parameter validation may fail.

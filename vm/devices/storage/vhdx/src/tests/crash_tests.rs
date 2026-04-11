@@ -993,8 +993,8 @@ async fn deferred_same_block_reclaim(driver: DefaultDriver) {
         let bat_state = vhdx.bat_state.read();
         let mapping = bat_state.get_payload_mapping(0);
         assert_eq!(
-            crate::format::BatEntryState::from_raw(mapping.state()),
-            Some(crate::format::BatEntryState::FullyPresent)
+            format::BatEntryState::from_raw(mapping.state()),
+            Some(format::BatEntryState::FullyPresent)
         );
         mapping.file_megabyte()
     };

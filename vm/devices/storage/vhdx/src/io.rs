@@ -94,6 +94,8 @@ impl<F: AsyncFile> VhdxFile<F> {
         len: u32,
         ranges: &mut Vec<ReadRange>,
     ) -> Result<ReadIoGuard<'_, F>, VhdxError> {
+        self.check_failed()?;
+
         // Zero-length reads succeed immediately.
         if len == 0 {
             return Ok(ReadIoGuard::new(self, 0, 0));
@@ -204,6 +206,8 @@ impl<F: AsyncFile> VhdxFile<F> {
         len: u32,
         ranges: &mut Vec<WriteRange>,
     ) -> Result<WriteIoGuard<'_, F>, VhdxError> {
+        self.check_failed()?;
+
         // Check read-only.
         if self.read_only {
             return Err(VhdxError::ReadOnly);
@@ -921,6 +925,8 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// entry to be written, then flushes to make everything durable:
     /// user data writes, WAL entries, and apply-task writes.
     pub async fn flush(&self) -> Result<(), VhdxError> {
+        self.check_failed()?;
+
         if self.read_only {
             return Err(VhdxError::ReadOnly);
         }
@@ -3720,5 +3726,226 @@ mod tests {
                 panic!("non-diff disk should never return Unmapped for allocated block");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // File poisoning tests
+    // -----------------------------------------------------------------------
+
+    /// Interceptor with atomic flags for runtime fault injection.
+    struct DynamicFailInterceptor {
+        fail_writes: AtomicBool,
+        fail_flushes: AtomicBool,
+    }
+
+    impl DynamicFailInterceptor {
+        fn new() -> Self {
+            Self {
+                fail_writes: AtomicBool::new(false),
+                fail_flushes: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl IoInterceptor for DynamicFailInterceptor {
+        fn before_write(&self, _offset: u64, _data: &[u8]) -> Result<(), std::io::Error> {
+            if self.fail_writes.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            Ok(())
+        }
+
+        fn before_flush(&self) -> Result<(), std::io::Error> {
+            if self.fail_flushes.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("injected flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Helper: create a writable VHDX with a dynamic fault interceptor.
+    async fn create_writable_with_faults(
+        driver: &DefaultDriver,
+    ) -> (VhdxFile<InMemoryFile>, Arc<DynamicFailInterceptor>) {
+        // Create a clean VHDX, snapshot it, reopen with interceptor.
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+        let snapshot = file.snapshot();
+
+        let interceptor = Arc::new(DynamicFailInterceptor::new());
+        let file2 = InMemoryFile::with_interceptor(snapshot.len() as u64, interceptor.clone());
+        file2.write_at(0, &snapshot).await.unwrap();
+
+        let vhdx = VhdxFile::open(file2).writable(driver).await.unwrap();
+        (vhdx, interceptor)
+    }
+
+    #[async_test]
+    async fn flush_io_error_poisons_file(driver: DefaultDriver) {
+        let (vhdx, interceptor) = create_writable_with_faults(&driver).await;
+
+        // Write some data successfully.
+        let data = [0xAAu8; 4096];
+        let mut ranges = Vec::new();
+        let guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+        for range in &ranges {
+            if let WriteRange::Data {
+                file_offset,
+                length,
+                ..
+            } = range
+            {
+                vhdx.file
+                    .write_at(*file_offset, &data[..*length as usize])
+                    .await
+                    .unwrap();
+            }
+        }
+        guard.complete().await.unwrap();
+
+        // Now inject flush failure.
+        interceptor.fail_flushes.store(true, Ordering::Relaxed);
+
+        // Flush should fail.
+        let result = vhdx.flush().await;
+        assert!(result.is_err(), "flush should fail with injected error");
+
+        // Disable the fault — shouldn't matter, file is poisoned.
+        interceptor.fail_flushes.store(false, Ordering::Relaxed);
+
+        // Subsequent writes should be rejected with Failed.
+        {
+            let mut ranges = Vec::new();
+            let result = vhdx.resolve_write(0, 4096, &mut ranges).await;
+            assert!(
+                matches!(result, Err(VhdxError::Failed(_))),
+                "write after poison should return Failed"
+            );
+        }
+
+        // Reads should also be rejected.
+        {
+            let mut ranges = Vec::new();
+            let result = vhdx.resolve_read(0, 4096, &mut ranges).await;
+            assert!(
+                matches!(result, Err(VhdxError::Failed(_))),
+                "read after poison should return Failed"
+            );
+        }
+
+        vhdx.abort().await;
+    }
+
+    #[async_test]
+    async fn apply_write_error_poisons_file(driver: DefaultDriver) {
+        let (vhdx, interceptor) = create_writable_with_faults(&driver).await;
+
+        // Write one block successfully and flush to ensure the pipeline works.
+        let data = [0xBBu8; 4096];
+        let mut ranges = Vec::new();
+        let guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+        for range in &ranges {
+            if let WriteRange::Data {
+                file_offset,
+                length,
+                ..
+            } = range
+            {
+                vhdx.file
+                    .write_at(*file_offset, &data[..*length as usize])
+                    .await
+                    .unwrap();
+            }
+        }
+        guard.complete().await.unwrap();
+        vhdx.flush().await.unwrap();
+
+        // Now inject write failures — this will hit the log task when
+        // it tries to write the WAL entry, and/or the apply task when
+        // it tries to write pages to their final file offsets.
+        interceptor.fail_writes.store(true, Ordering::Relaxed);
+
+        // Write to a different block to generate new dirty BAT pages.
+        let block_size = vhdx.block_size() as u64;
+        let mut ranges = Vec::new();
+        let guard = vhdx
+            .resolve_write(block_size, 4096, &mut ranges)
+            .await
+            .unwrap();
+        for range in &ranges {
+            if let WriteRange::Data {
+                file_offset,
+                length,
+                ..
+            } = range
+            {
+                let _ = vhdx
+                    .file
+                    .write_at(*file_offset, &data[..*length as usize])
+                    .await;
+            }
+        }
+        guard.complete().await.unwrap();
+
+        // Flush sends to the log pipeline. The log task's WAL write
+        // will hit the injected failure and poison the file.
+        let _ = vhdx.flush().await;
+
+        // Clear the fault — the file should stay poisoned regardless.
+        interceptor.fail_writes.store(false, Ordering::Relaxed);
+
+        // A second flush attempt synchronizes with the poisoned pipeline
+        // and ensures the error has propagated.
+        let _ = vhdx.flush().await;
+
+        // The file should now be poisoned. Try an operation.
+        {
+            let mut ranges = Vec::new();
+            let result = vhdx.resolve_write(0, 4096, &mut ranges).await;
+            assert!(
+                matches!(result, Err(VhdxError::Failed(_))),
+                "write after apply failure should return Failed"
+            );
+        }
+
+        vhdx.abort().await;
+    }
+
+    #[async_test]
+    async fn poison_error_message_preserved(driver: DefaultDriver) {
+        let (vhdx, interceptor) = create_writable_with_faults(&driver).await;
+
+        // Write data.
+        let data = [0xCCu8; 4096];
+        let mut ranges = Vec::new();
+        let guard = vhdx.resolve_write(0, 4096, &mut ranges).await.unwrap();
+        for range in &ranges {
+            if let WriteRange::Data {
+                file_offset,
+                length,
+                ..
+            } = range
+            {
+                vhdx.file
+                    .write_at(*file_offset, &data[..*length as usize])
+                    .await
+                    .unwrap();
+            }
+        }
+        guard.complete().await.unwrap();
+
+        // Inject flush failure and flush.
+        interceptor.fail_flushes.store(true, Ordering::Relaxed);
+        let _ = vhdx.flush().await;
+
+        // The error message should contain something useful.
+        let result = vhdx.check_failed();
+        match result {
+            Err(VhdxError::Failed(msg)) => {
+                assert!(!msg.is_empty(), "poison error message should not be empty");
+            }
+            other => panic!("expected Failed, got: {other:?}"),
+        }
+
+        vhdx.abort().await;
     }
 }

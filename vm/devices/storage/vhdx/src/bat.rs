@@ -727,6 +727,22 @@ impl Bat {
             listener.await;
         }
     }
+
+    /// Look up the block mapping for a given data block number.
+    ///
+    /// Synchronous — reads from the in-memory BAT, no I/O.
+    pub(crate) fn get_block_mapping(&self, block_number: u32) -> BlockMapping {
+        let bat_state = self.bat_state.read();
+        self.get_block_mapping_from_state(&bat_state, block_number)
+    }
+
+    /// Look up the sector bitmap block mapping for a given chunk number.
+    ///
+    /// Synchronous — reads from the in-memory BAT, no I/O.
+    pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
+        let bat_state = self.bat_state.read();
+        self.get_sbm_mapping_from_state(&bat_state, chunk_number)
+    }
 }
 
 #[must_use]

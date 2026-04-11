@@ -786,24 +786,6 @@ impl<F: AsyncFile> VhdxFile<F> {
         self.read_only
     }
 
-    /// Look up the block mapping for a given data block number.
-    ///
-    /// Synchronous — reads from the in-memory BAT, no I/O.
-    pub(crate) fn get_block_mapping(&self, block_number: u32) -> BlockMapping {
-        let bat_state = self.bat.bat_state.read();
-        self.bat
-            .get_block_mapping_from_state(&bat_state, block_number)
-    }
-
-    /// Look up the sector bitmap block mapping for a given chunk number.
-    ///
-    /// Synchronous — reads from the in-memory BAT, no I/O.
-    pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
-        let bat_state = self.bat.bat_state.read();
-        self.bat
-            .get_sbm_mapping_from_state(&bat_state, chunk_number)
-    }
-
     /// Write a header with `log_guid = ZERO` to mark the file as clean.
     ///
     /// Uses the write state to determine the current sequence number and
@@ -1160,7 +1142,7 @@ mod tests {
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
         // A newly created dynamic disk has all blocks as NotPresent.
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::NotPresent);
         assert_eq!(mapping.file_offset, 0);
     }
@@ -1179,7 +1161,7 @@ mod tests {
         let block_count = (disk_size / vhdx.block_size() as u64) as u32;
 
         for block in 0..block_count {
-            let mapping = vhdx.get_block_mapping(block);
+            let mapping = vhdx.bat.get_block_mapping(block);
             assert_eq!(mapping.state, BatEntryState::NotPresent);
             assert_eq!(mapping.file_offset, 0);
         }
@@ -1250,7 +1232,7 @@ mod tests {
         // not an async fn. We call it without .await.
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
-        let mapping: BlockMapping = vhdx.get_block_mapping(0);
+        let mapping: BlockMapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::NotPresent);
     }
 

@@ -137,7 +137,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let block_offset = self.bat.offset_within_block(virtual_offset);
             let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
-            let mapping = self.get_block_mapping(block_number);
+            let mapping = self.bat.get_block_mapping(block_number);
 
             match mapping.state {
                 BatEntryState::FullyPresent => {
@@ -586,7 +586,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             // --- SBM block allocation for PartiallyPresent ---
                             if is_partial_present {
                                 let chunk_number = block_info.block_number / self.bat.chunk_ratio;
-                                let sbm_mapping = self.get_sector_bitmap_mapping(chunk_number);
+                                let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
 
                                 if sbm_mapping.state != BatEntryState::FullyPresent {
                                     // Allocate 1 MiB for the SBM block.
@@ -829,7 +829,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 }
             } else if self.has_parent {
                 // Non-TFP PartiallyPresent blocks: update sector bitmaps.
-                let mapping = self.get_block_mapping(block_number);
+                let mapping = self.bat.get_block_mapping(block_number);
                 if mapping.state == BatEntryState::PartiallyPresent {
                     self.set_sector_bitmap_bits(virtual_offset, block_length, true)
                         .await?;
@@ -2100,7 +2100,7 @@ mod tests {
         drop(guard);
 
         // Block should be back to NotPresent with zero offset.
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::NotPresent);
         assert_eq!(mapping.file_offset, 0);
 
@@ -2883,7 +2883,7 @@ mod tests {
 
         // After complete + drop, refcount should be 0 and block should be FullyPresent.
         assert_eq!(vhdx.bat.io_refcount(0), 0);
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::FullyPresent);
     }
 
@@ -2907,7 +2907,7 @@ mod tests {
 
         // Refcount should be 0, block should be back to NotPresent.
         assert_eq!(vhdx.bat.io_refcount(0), 0);
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::NotPresent);
     }
 
@@ -2973,7 +2973,7 @@ mod tests {
         trim_result.unwrap();
 
         // Check what actually happened by examining block state.
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         match mapping.state {
             BatEntryState::Unmapped => {
                 // Trim won — read should return zeros.
@@ -3002,7 +3002,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(
             mapping.state,
             BatEntryState::Unmapped,
@@ -3012,7 +3012,7 @@ mod tests {
         // Re-write with pattern 0xBB.
         write_block(&*vhdx, 0, block_size, 0xBB).await;
 
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::FullyPresent);
         verify_block_pattern(&*vhdx, 0, block_size, 0xBB).await;
 
@@ -3036,7 +3036,7 @@ mod tests {
         write_result.unwrap();
 
         // Verify no panics and data is consistent.
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         match mapping.state {
             BatEntryState::Unmapped => {
                 verify_block_pattern(&*vhdx, 0, block_size, 0x00).await;
@@ -3339,7 +3339,7 @@ mod tests {
         read_result.unwrap();
 
         // Verify block 0 state is consistent.
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         match mapping.state {
             BatEntryState::Unmapped => {
                 // Trim completed — read should return zeros.
@@ -3515,11 +3515,11 @@ mod tests {
         write_block(&vhdx, 0, 4096, 0xAB).await;
 
         // Block 0 should be PartiallyPresent.
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::PartiallyPresent);
 
         // SBM block for chunk 0 should be FullyPresent (allocated).
-        let sbm_mapping = vhdx.get_sector_bitmap_mapping(0);
+        let sbm_mapping = vhdx.bat.get_sector_bitmap_mapping(0);
         assert_eq!(sbm_mapping.state, BatEntryState::FullyPresent);
 
         // Read the written range — should return Data.
@@ -3599,11 +3599,11 @@ mod tests {
         write_block(&vhdx, 0, block_size, 0xEE).await;
 
         // Block 0 should be FullyPresent (TFP path).
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::FullyPresent);
 
         // SBM block for chunk 0 should NOT be allocated.
-        let sbm_mapping = vhdx.get_sector_bitmap_mapping(0);
+        let sbm_mapping = vhdx.bat.get_sector_bitmap_mapping(0);
         assert_ne!(
             sbm_mapping.state,
             BatEntryState::FullyPresent,
@@ -3628,14 +3628,14 @@ mod tests {
         // First partial write to block 0.
         write_block(&vhdx, 0, 4096, 0x11).await;
 
-        let sbm_mapping_1 = vhdx.get_sector_bitmap_mapping(0);
+        let sbm_mapping_1 = vhdx.bat.get_sector_bitmap_mapping(0);
         assert_eq!(sbm_mapping_1.state, BatEntryState::FullyPresent);
         let sbm_offset_1 = sbm_mapping_1.file_offset;
 
         // Second partial write to block 1 (same chunk).
         write_block(&vhdx, block_size, 4096, 0x22).await;
 
-        let sbm_mapping_2 = vhdx.get_sector_bitmap_mapping(0);
+        let sbm_mapping_2 = vhdx.bat.get_sector_bitmap_mapping(0);
         assert_eq!(sbm_mapping_2.state, BatEntryState::FullyPresent);
         let sbm_offset_2 = sbm_mapping_2.file_offset;
 
@@ -3669,7 +3669,7 @@ mod tests {
         write_block(&vhdx, 0, 4096, 0x77).await;
 
         // Block should be FullyPresent (not PartiallyPresent).
-        let mapping = vhdx.get_block_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.state, BatEntryState::FullyPresent);
 
         // SBM should NOT be allocated.
@@ -3677,7 +3677,7 @@ mod tests {
         // so we check via bat_state directly.
         let sbm_count = vhdx.bat.sector_bitmap_block_count;
         if sbm_count > 0 {
-            let sbm_mapping = vhdx.get_sector_bitmap_mapping(0);
+            let sbm_mapping = vhdx.bat.get_sector_bitmap_mapping(0);
             assert_ne!(
                 sbm_mapping.state,
                 BatEntryState::FullyPresent,

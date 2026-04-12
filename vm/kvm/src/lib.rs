@@ -1406,6 +1406,15 @@ impl<'a> VpRunner<'a> {
                     error: &mut msr.error,
                 }
             }
+            KVM_EXIT_SYSTEM_EVENT => {
+                // SAFETY: this is the active union field.
+                let system_event = unsafe { &self.run_data().__bindgen_anon_1.system_event };
+                Exit::SystemEvent {
+                    event_type: system_event.type_,
+                    // SAFETY: accessing the flags field of the union.
+                    event_flags: unsafe { system_event.__bindgen_anon_1.flags },
+                }
+            }
             exit_reason => return Err(Error::UnknownExit(exit_reason)),
         };
         Ok(exit)
@@ -1502,6 +1511,10 @@ pub enum Exit<'a> {
     },
     Eoi {
         irq: u8,
+    },
+    SystemEvent {
+        event_type: u32,
+        event_flags: u64,
     },
 }
 

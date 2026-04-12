@@ -399,8 +399,7 @@ pub(crate) struct InitializedVm {
 trait BuildTopology<T: ArchTopology + Inspect> {
     fn to_topology(
         &self,
-        platform_gsiv: Option<u32>,
-        supports_gic_v3: bool,
+        platform_info: &virt::PlatformInfo,
     ) -> anyhow::Result<ProcessorTopology<T>>;
 }
 
@@ -432,8 +431,7 @@ impl ExtractTopologyConfig for ProcessorTopology<X86Topology> {
 impl BuildTopology<X86Topology> for ProcessorTopologyConfig {
     fn to_topology(
         &self,
-        _platform_gsiv: Option<u32>,
-        _supports_gic_v3: bool,
+        _platform_info: &virt::PlatformInfo,
     ) -> anyhow::Result<ProcessorTopology<X86Topology>> {
         use vm_topology::processor::x86::X2ApicState;
 
@@ -492,8 +490,7 @@ impl ExtractTopologyConfig for ProcessorTopology<Aarch64Topology> {
 impl BuildTopology<Aarch64Topology> for ProcessorTopologyConfig {
     fn to_topology(
         &self,
-        platform_gsiv: Option<u32>,
-        supports_gic_v3: bool,
+        platform_info: &virt::PlatformInfo,
     ) -> anyhow::Result<ProcessorTopology<Aarch64Topology>> {
         let arch = match &self.arch {
             None => Default::default(),
@@ -508,7 +505,7 @@ impl BuildTopology<Aarch64Topology> for ProcessorTopologyConfig {
         let pmu_gsiv = match arch.pmu_gsiv {
             PmuGsivConfig::Disabled => None,
             PmuGsivConfig::Gsiv(gsiv) => Some(gsiv),
-            PmuGsivConfig::Platform => platform_gsiv,
+            PmuGsivConfig::Platform => platform_info.platform_gsiv,
         };
 
         // TODO: When this value is supported on all platforms, we should change
@@ -518,42 +515,34 @@ impl BuildTopology<Aarch64Topology> for ProcessorTopologyConfig {
             tracing::warn!("PMU GSIV is not set");
         }
 
-        let gic_version = if let Some(gic_config) = &arch.gic_config {
-            if supports_gic_v3 {
-                GicVersion::V3 {
-                    redistributors_base: gic_config.gic_redistributors_base,
-                }
-            } else {
-                GicVersion::V2 {
-                    cpu_interface_base: gic_config.gic_redistributors_base,
-                }
-            }
-        } else if supports_gic_v3 {
+        let (gic_distributor_base, gic_second_base) = if let Some(gic_config) = &arch.gic_config {
+            (
+                gic_config.gic_distributor_base,
+                gic_config.gic_redistributors_base,
+            )
+        } else {
+            (
+                openvmm_defs::config::DEFAULT_GIC_DISTRIBUTOR_BASE,
+                openvmm_defs::config::DEFAULT_GIC_REDISTRIBUTORS_BASE,
+            )
+        };
+
+        let gic_version = if platform_info.supports_gic_v3 {
             GicVersion::V3 {
-                redistributors_base: openvmm_defs::config::DEFAULT_GIC_REDISTRIBUTORS_BASE,
+                redistributors_base: gic_second_base,
             }
         } else {
             GicVersion::V2 {
-                cpu_interface_base: openvmm_defs::config::DEFAULT_GIC_REDISTRIBUTORS_BASE,
+                cpu_interface_base: gic_second_base,
             }
         };
 
-        let platform = if let Some(gic_config) = &arch.gic_config {
-            Aarch64PlatformConfig {
-                gic_distributor_base: gic_config.gic_distributor_base,
-                gic_version,
-                gic_v2m,
-                pmu_gsiv,
-                virt_timer_ppi: openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI,
-            }
-        } else {
-            Aarch64PlatformConfig {
-                gic_distributor_base: openvmm_defs::config::DEFAULT_GIC_DISTRIBUTOR_BASE,
-                gic_version,
-                gic_v2m,
-                pmu_gsiv,
-                virt_timer_ppi: openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI,
-            }
+        let platform = Aarch64PlatformConfig {
+            gic_distributor_base,
+            gic_version,
+            gic_v2m,
+            pmu_gsiv,
+            virt_timer_ppi: openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI,
         };
 
         let mut builder = TopologyBuilder::new_aarch64(platform);
@@ -727,8 +716,7 @@ impl InitializedVm {
     pub(crate) async fn new_with_hypervisor<P, H>(
         driver_source: VmTaskDriverSource,
         hypervisor: &mut H,
-        platform_gsiv: Option<u32>,
-        supports_gic_v3: bool,
+        platform_info: virt::PlatformInfo,
         cfg: Manifest,
         shared_memory: Option<SharedMemoryBacking>,
     ) -> anyhow::Result<Self>
@@ -776,9 +764,7 @@ impl InitializedVm {
             None
         };
 
-        let processor_topology = cfg
-            .processor_topology
-            .to_topology(platform_gsiv, supports_gic_v3)?;
+        let processor_topology = cfg.processor_topology.to_topology(&platform_info)?;
 
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {

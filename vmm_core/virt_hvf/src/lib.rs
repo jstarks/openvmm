@@ -92,6 +92,13 @@ impl virt::Hypervisor for HvfHypervisor {
     type Partition = HvfPartition;
     type Error = Error;
 
+    fn platform_info(&self) -> virt::PlatformInfo {
+        virt::PlatformInfo {
+            platform_gsiv: None,
+            supports_gic_v3: true,
+        }
+    }
+
     fn new_partition<'a>(
         &'a mut self,
         config: virt::ProtoPartitionConfig<'a>,

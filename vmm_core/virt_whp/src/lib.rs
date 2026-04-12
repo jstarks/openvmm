@@ -755,6 +755,20 @@ impl virt::Hypervisor for Whp {
     type Partition = WhpPartition;
     type Error = Error;
 
+    fn platform_info(&self) -> virt::PlatformInfo {
+        #[cfg(guest_arch = "x86_64")]
+        {
+            virt::PlatformInfo {}
+        }
+        #[cfg(guest_arch = "aarch64")]
+        {
+            virt::PlatformInfo {
+                platform_gsiv: Some(WHP_PMU_GSIV),
+                supports_gic_v3: true,
+            }
+        }
+    }
+
     fn new_partition<'a>(
         &mut self,
         config: ProtoPartitionConfig<'a>,
@@ -771,11 +785,6 @@ impl virt::Hypervisor for Whp {
         };
 
         Ok(WhpProtoPartition { vtl0, vtl2, config })
-    }
-
-    #[cfg(guest_arch = "aarch64")]
-    fn platform_gsiv(&self) -> Option<u32> {
-        Some(WHP_PMU_GSIV)
     }
 }
 

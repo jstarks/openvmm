@@ -921,8 +921,11 @@ impl virt::Hypervisor for Kvm {
     type Partition = KvmPartition;
     type Error = KvmError;
 
-    fn supports_gic_v3(&self) -> bool {
-        self.supports_gic_v3
+    fn platform_info(&self) -> virt::PlatformInfo {
+        virt::PlatformInfo {
+            platform_gsiv: None,
+            supports_gic_v3: self.supports_gic_v3,
+        }
     }
 
     fn new_partition<'a>(

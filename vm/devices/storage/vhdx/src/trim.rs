@@ -114,18 +114,16 @@ fn mode_skips_write_guid(mode: TrimMode) -> bool {
 /// Check whether a block mapping is soft-anchored: unmapped/undefined
 /// with a non-zero file offset.
 pub(crate) fn is_soft_anchored(mapping: InternalBlockMapping) -> bool {
-    let state = BatEntryState::from_raw(mapping.state());
-    matches!(
-        state,
-        Some(BatEntryState::Unmapped) | Some(BatEntryState::Undefined)
-    ) && mapping.file_megabyte() != 0
+    let state = mapping.bat_state();
+    matches!(state, BatEntryState::Unmapped | BatEntryState::Undefined)
+        && mapping.file_megabyte() != 0
 }
 
 /// Convert a block mapping according to the trim mode.
 ///
 /// Returns the new mapping, which may be identical to `old` (no-op).
 fn convert_mapping(mode: TrimMode, old: InternalBlockMapping) -> InternalBlockMapping {
-    let state = BatEntryState::from_raw(old.state());
+    let state = old.bat_state();
     match mode {
         TrimMode::FileSpace => convert_file_space(state, old),
         TrimMode::FreeSpace => convert_free_space(state, old),
@@ -137,14 +135,11 @@ fn convert_mapping(mode: TrimMode, old: InternalBlockMapping) -> InternalBlockMa
 
 /// FileSpace: FullyPresent/PartiallyPresent → Unmapped (keep soft anchor).
 /// All other states are no-ops.
-fn convert_file_space(
-    state: Option<BatEntryState>,
-    old: InternalBlockMapping,
-) -> InternalBlockMapping {
+fn convert_file_space(state: BatEntryState, old: InternalBlockMapping) -> InternalBlockMapping {
     match state {
-        Some(BatEntryState::FullyPresent) | Some(BatEntryState::PartiallyPresent) => {
+        BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => {
             InternalBlockMapping::new()
-                .with_state(BatEntryState::Unmapped as u8)
+                .with_bat_state(BatEntryState::Unmapped)
                 .with_transitioning_to_fully_present(false)
                 .with_file_megabyte(old.file_megabyte()) // keep as soft anchor
         }
@@ -156,26 +151,23 @@ fn convert_file_space(
 /// Zero → Undefined (clear offset).
 /// Unmapped → Undefined (keep soft anchor).
 /// Others → no change.
-fn convert_free_space(
-    state: Option<BatEntryState>,
-    old: InternalBlockMapping,
-) -> InternalBlockMapping {
+fn convert_free_space(state: BatEntryState, old: InternalBlockMapping) -> InternalBlockMapping {
     match state {
-        Some(BatEntryState::FullyPresent) | Some(BatEntryState::PartiallyPresent) => {
+        BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => {
             // Release space — clear file offset.
             InternalBlockMapping::new()
-                .with_state(BatEntryState::Undefined as u8)
+                .with_bat_state(BatEntryState::Undefined)
                 .with_transitioning_to_fully_present(false)
                 .with_file_megabyte(0)
         }
-        Some(BatEntryState::Zero) => InternalBlockMapping::new()
-            .with_state(BatEntryState::Undefined as u8)
+        BatEntryState::Zero => InternalBlockMapping::new()
+            .with_bat_state(BatEntryState::Undefined)
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte(0),
-        Some(BatEntryState::Unmapped) => {
+        BatEntryState::Unmapped => {
             // Keep soft anchor if present.
             InternalBlockMapping::new()
-                .with_state(BatEntryState::Undefined as u8)
+                .with_bat_state(BatEntryState::Undefined)
                 .with_transitioning_to_fully_present(false)
                 .with_file_megabyte(old.file_megabyte())
         }
@@ -184,16 +176,16 @@ fn convert_free_space(
 }
 
 /// Zero: any state → Zero (clear file offset).
-fn convert_zero(state: Option<BatEntryState>, old: InternalBlockMapping) -> InternalBlockMapping {
+fn convert_zero(state: BatEntryState, old: InternalBlockMapping) -> InternalBlockMapping {
     match state {
-        Some(BatEntryState::Zero) if old.file_megabyte() == 0 => old, // already Zero with no offset
+        BatEntryState::Zero if old.file_megabyte() == 0 => old, // already Zero with no offset
         _ => {
             debug_assert!(
                 !old.transitioning_to_fully_present(),
                 "cannot trim TFP block to Zero"
             );
             InternalBlockMapping::new()
-                .with_state(BatEntryState::Zero as u8)
+                .with_bat_state(BatEntryState::Zero)
                 .with_transitioning_to_fully_present(false)
                 .with_file_megabyte(0)
         }
@@ -202,13 +194,13 @@ fn convert_zero(state: Option<BatEntryState>, old: InternalBlockMapping) -> Inte
 
 /// MakeTransparent: any state → NotPresent (clear file offset).
 fn convert_make_transparent(
-    state: Option<BatEntryState>,
+    state: BatEntryState,
     old: InternalBlockMapping,
 ) -> InternalBlockMapping {
     match state {
-        Some(BatEntryState::NotPresent) if old.file_megabyte() == 0 => old, // already NotPresent
+        BatEntryState::NotPresent if old.file_megabyte() == 0 => old, // already NotPresent
         _ => InternalBlockMapping::new()
-            .with_state(BatEntryState::NotPresent as u8)
+            .with_bat_state(BatEntryState::NotPresent)
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte(0),
     }
@@ -218,7 +210,7 @@ fn convert_make_transparent(
 fn convert_remove_soft_anchors(old: InternalBlockMapping) -> InternalBlockMapping {
     if is_soft_anchored(old) {
         InternalBlockMapping::new()
-            .with_state(old.state())
+            .with_bat_state(old.bat_state())
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte(0)
     } else {
@@ -500,7 +492,7 @@ mod tests {
     ) {
         let bat_state = vhdx.bat.bat_state.read();
         let mapping = bat_state.get_payload_mapping(block_number);
-        let actual = BatEntryState::from_raw(mapping.state()).unwrap();
+        let actual = mapping.bat_state();
         assert_eq!(
             actual, expected,
             "block {block_number}: expected {expected:?}, got {actual:?}"
@@ -1040,7 +1032,7 @@ mod tests {
         // Blocks should be unchanged.
         let bat_state = vhdx.bat.bat_state.read();
         let mapping = bat_state.get_payload_mapping(0);
-        let state = BatEntryState::from_raw(mapping.state()).unwrap();
+        let state = mapping.bat_state();
         // On a fully-allocated disk, blocks start as Undefined (not yet written).
         // The FileSpace mode is a no-op, so they stay the same.
         assert_ne!(state, BatEntryState::Unmapped);
@@ -1292,25 +1284,22 @@ mod tests {
     fn convert_file_space_mappings() {
         // FullyPresent → Unmapped (keep offset)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
+            .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
         let r = convert_mapping(TrimMode::FileSpace, m);
-        assert_eq!(
-            BatEntryState::from_raw(r.state()),
-            Some(BatEntryState::Unmapped)
-        );
+        assert_eq!(r.bat_state(), BatEntryState::Unmapped);
         assert_eq!(r.file_megabyte(), 4);
 
         // Undefined → Undefined (no change)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Undefined as u8)
+            .with_bat_state(BatEntryState::Undefined)
             .with_file_megabyte(0);
         let r = convert_mapping(TrimMode::FileSpace, m);
         assert_eq!(r, m);
 
         // Unmapped → Unmapped (no change)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
         let r = convert_mapping(TrimMode::FileSpace, m);
         assert_eq!(r, m);
@@ -1320,24 +1309,18 @@ mod tests {
     fn convert_free_space_mappings() {
         // FullyPresent → Undefined (clear offset)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
+            .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
         let r = convert_mapping(TrimMode::FreeSpace, m);
-        assert_eq!(
-            BatEntryState::from_raw(r.state()),
-            Some(BatEntryState::Undefined)
-        );
+        assert_eq!(r.bat_state(), BatEntryState::Undefined);
         assert_eq!(r.file_megabyte(), 0);
 
         // Unmapped → Undefined (keep anchor)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
         let r = convert_mapping(TrimMode::FreeSpace, m);
-        assert_eq!(
-            BatEntryState::from_raw(r.state()),
-            Some(BatEntryState::Undefined)
-        );
+        assert_eq!(r.bat_state(), BatEntryState::Undefined);
         assert_eq!(r.file_megabyte(), 5);
     }
 
@@ -1345,18 +1328,15 @@ mod tests {
     fn convert_zero_mappings() {
         // FullyPresent → Zero (clear offset)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
+            .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
         let r = convert_mapping(TrimMode::Zero, m);
-        assert_eq!(
-            BatEntryState::from_raw(r.state()),
-            Some(BatEntryState::Zero)
-        );
+        assert_eq!(r.bat_state(), BatEntryState::Zero);
         assert_eq!(r.file_megabyte(), 0);
 
         // Zero (no offset) → Zero (no change)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Zero as u8)
+            .with_bat_state(BatEntryState::Zero)
             .with_file_megabyte(0);
         let r = convert_mapping(TrimMode::Zero, m);
         assert_eq!(r, m);
@@ -1366,18 +1346,15 @@ mod tests {
     fn convert_make_transparent_mappings() {
         // FullyPresent → NotPresent
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
+            .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
         let r = convert_mapping(TrimMode::MakeTransparent, m);
-        assert_eq!(
-            BatEntryState::from_raw(r.state()),
-            Some(BatEntryState::NotPresent)
-        );
+        assert_eq!(r.bat_state(), BatEntryState::NotPresent);
         assert_eq!(r.file_megabyte(), 0);
 
         // NotPresent → NotPresent (no change)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::NotPresent as u8)
+            .with_bat_state(BatEntryState::NotPresent)
             .with_file_megabyte(0);
         let r = convert_mapping(TrimMode::MakeTransparent, m);
         assert_eq!(r, m);
@@ -1387,18 +1364,15 @@ mod tests {
     fn convert_remove_soft_anchors_mappings() {
         // Unmapped with offset → clear offset
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
         let r = convert_mapping(TrimMode::RemoveSoftAnchors, m);
-        assert_eq!(
-            BatEntryState::from_raw(r.state()),
-            Some(BatEntryState::Unmapped)
-        );
+        assert_eq!(r.bat_state(), BatEntryState::Unmapped);
         assert_eq!(r.file_megabyte(), 0);
 
         // FullyPresent → no change (not soft-anchored)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
+            .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
         let r = convert_mapping(TrimMode::RemoveSoftAnchors, m);
         assert_eq!(r, m);
@@ -1408,25 +1382,25 @@ mod tests {
     fn is_soft_anchored_checks() {
         // Unmapped with offset → anchored
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
         assert!(is_soft_anchored(m));
 
         // Undefined with offset → anchored
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Undefined as u8)
+            .with_bat_state(BatEntryState::Undefined)
             .with_file_megabyte(3);
         assert!(is_soft_anchored(m));
 
         // Unmapped with no offset → not anchored
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(0);
         assert!(!is_soft_anchored(m));
 
         // FullyPresent with offset → not anchored (wrong state)
         let m = InternalBlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
+            .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
         assert!(!is_soft_anchored(m));
     }

@@ -863,11 +863,11 @@ impl FreeSpaceInner {
             let mapping = bat_state.get_payload_mapping(block_number as u32);
 
             // Block must be soft-anchored: unmapped/undefined state with non-zero file_megabyte.
-            let state = mapping.state();
-            let is_unmapped = state == BatEntryState::Unmapped as u8
-                || state == BatEntryState::Undefined as u8
-                || state == BatEntryState::Zero as u8
-                || state == BatEntryState::NotPresent as u8;
+            let state = mapping.bat_state();
+            let is_unmapped = state == BatEntryState::Unmapped
+                || state == BatEntryState::Undefined
+                || state == BatEntryState::Zero
+                || state == BatEntryState::NotPresent;
 
             debug_assert!(
                 is_unmapped && mapping.file_megabyte() != 0,
@@ -1120,7 +1120,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         let mut bat_state = self.bat.bat_state.write();
                         let old_mapping = bat_state.get_payload_mapping(old_block);
                         let cleared = InternalBlockMapping::new()
-                            .with_state(old_mapping.state())
+                            .with_bat_state(old_mapping.bat_state())
                             .with_transitioning_to_fully_present(false)
                             .with_file_megabyte(0);
                         bat_state.set_payload_mapping(&self.bat, old_block, cleared);
@@ -1496,11 +1496,11 @@ mod tests {
     ) -> BatState {
         let mut payload_mappings = vec![
             InternalBlockMapping::new()
-                .with_state(BatEntryState::NotPresent as u8);
+                .with_bat_state(BatEntryState::NotPresent);
             data_block_count as usize
         ];
         payload_mappings[block_number as usize] = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(file_megabyte);
 
         BatState {
@@ -1950,12 +1950,12 @@ mod tests {
 
         // BAT state with both blocks anchored.
         let mut payload_mappings =
-            vec![InternalBlockMapping::new().with_state(BatEntryState::NotPresent as u8); 16];
+            vec![InternalBlockMapping::new().with_bat_state(BatEntryState::NotPresent); 16];
         payload_mappings[2] = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(6);
         payload_mappings[5] = InternalBlockMapping::new()
-            .with_state(BatEntryState::Unmapped as u8)
+            .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(10);
         let bat_state = BatState {
             payload_mappings,

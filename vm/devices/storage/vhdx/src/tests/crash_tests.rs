@@ -992,10 +992,7 @@ async fn deferred_same_block_reclaim(driver: DefaultDriver) {
     let new_offset = {
         let bat_state = vhdx.bat.bat_state.read();
         let mapping = bat_state.get_payload_mapping(0);
-        assert_eq!(
-            format::BatEntryState::from_raw(mapping.state()),
-            Some(format::BatEntryState::FullyPresent)
-        );
+        assert_eq!(mapping.bat_state(), format::BatEntryState::FullyPresent);
         mapping.file_megabyte()
     };
     assert_eq!(original_offset, new_offset, "should reuse same offset");

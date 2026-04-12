@@ -92,7 +92,7 @@ pub(crate) struct Bat {
 pub(crate) struct InternalBlockMapping {
     /// Block state (same values as BatEntryState).
     #[bits(3)]
-    pub state: u8,
+    state: u8,
     /// Set during allocation: space has been allocated but data I/O may still
     /// be in flight. Other writers to this block must wait.
     #[bits(1)]
@@ -115,6 +115,10 @@ impl InternalBlockMapping {
     /// values at runtime.
     pub fn bat_state(self) -> BatEntryState {
         BatEntryState::from_raw(self.state()).expect("InternalBlockMapping has invalid state")
+    }
+
+    pub fn with_bat_state(self, state: BatEntryState) -> Self {
+        self.with_state(state as u8)
     }
 
     /// Create an `InternalBlockMapping` from an on-disk [`BatEntry`].
@@ -186,8 +190,8 @@ pub(crate) struct BatState {
 }
 
 /// Whether a block state counts as "allocated" for `allocated_block_count`.
-fn is_allocated_state(state: u8) -> bool {
-    state == BatEntryState::FullyPresent as u8 || state == BatEntryState::PartiallyPresent as u8
+fn is_allocated_state(state: BatEntryState) -> bool {
+    state == BatEntryState::FullyPresent || state == BatEntryState::PartiallyPresent
 }
 
 impl BatState {
@@ -212,8 +216,8 @@ impl BatState {
     ) {
         let _ = bat; // Used for consistency; entry index needed only for dirty tracking.
         let old = self.payload_mappings[block_number as usize];
-        let was_allocated = is_allocated_state(old.state());
-        let now_allocated = is_allocated_state(mapping.state());
+        let was_allocated = is_allocated_state(old.bat_state());
+        let now_allocated = is_allocated_state(mapping.bat_state());
         if was_allocated && !now_allocated {
             self.allocated_block_count -= 1;
         } else if !was_allocated && now_allocated {

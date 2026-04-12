@@ -1182,8 +1182,8 @@ mod tests {
         // All payload entries should be NotPresent.
         for (i, mapping) in bat_state.payload_mappings.iter().enumerate() {
             assert_eq!(
-                mapping.state(),
-                BatEntryState::NotPresent as u8,
+                mapping.bat_state(),
+                BatEntryState::NotPresent,
                 "block {i} should be NotPresent"
             );
         }
@@ -1218,8 +1218,8 @@ mod tests {
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         let bat_state = vhdx.bat.bat_state.read();
         assert_eq!(
-            bat_state.payload_mappings[0].state(),
-            BatEntryState::FullyPresent as u8,
+            bat_state.payload_mappings[0].bat_state(),
+            BatEntryState::FullyPresent,
         );
         assert_eq!(bat_state.payload_mappings[0].file_megabyte(), 4);
         assert_eq!(bat_state.allocated_block_count, 1);

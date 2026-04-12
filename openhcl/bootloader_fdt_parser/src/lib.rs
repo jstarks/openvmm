@@ -541,6 +541,7 @@ fn parse_gic(node: &Node<'_>) -> anyhow::Result<Aarch64PlatformConfig> {
         pmu_gsiv: None,
         // TODO: parse from the DT timer node instead of hardcoding.
         virt_timer_ppi: 20,
+        gic_nr_irqs: 992,
     })
 }
 
@@ -1080,6 +1081,7 @@ mod tests {
                 gic_v2m: None,
                 pmu_gsiv: Some(0x17),
                 virt_timer_ppi: 20,
+                gic_nr_irqs: 992,
             }),
             accepted_ranges: vec![
                 MemoryRange::new(0x10000..0x20000),

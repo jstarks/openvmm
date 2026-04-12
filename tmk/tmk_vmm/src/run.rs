@@ -68,6 +68,7 @@ impl CommonState {
                 gic_v2m: None,
                 pmu_gsiv: None,
                 virt_timer_ppi: 20, // DEFAULT_VIRT_TIMER_PPI
+                gic_nr_irqs: 256,
             })
             .build(1)
             .context("failed to build processor topology")?;

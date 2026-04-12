@@ -582,6 +582,7 @@ impl BuildTopology<Aarch64Topology> for ProcessorTopologyConfig {
             gic_v2m,
             pmu_gsiv,
             virt_timer_ppi: openvmm_defs::config::DEFAULT_VIRT_TIMER_PPI,
+            gic_nr_irqs: openvmm_defs::config::DEFAULT_GIC_NR_IRQS,
         };
 
         let mut builder = TopologyBuilder::new_aarch64(platform);

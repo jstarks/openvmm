@@ -579,7 +579,9 @@ impl KvmProtoPartition<'_> {
             return Err(KvmError::Misaligned);
         }
 
-        const GIC_NR_IRQS: u32 = 1024;
+        // KVM validates: 64 <= nr_irqs <= 1023 and must be a multiple of 32.
+        // 992 is the largest valid value (31 * 32).
+        let gic_nr_irqs: u32 = self.config.processor_topology.gic_nr_irqs();
 
         let gicv3 = self
             .vm
@@ -615,7 +617,7 @@ impl KvmProtoPartition<'_> {
         // SAFETY: passing the right type for the attribute.
         unsafe {
             gicv3
-                .set_device_attr::<u32>(KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &GIC_NR_IRQS, 0)
+                .set_device_attr::<u32>(KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &gic_nr_irqs, 0)
                 .map_err(kvm::Error::SetDeviceAttr)?;
         }
 
@@ -641,7 +643,7 @@ impl KvmProtoPartition<'_> {
     fn add_gicv2(&mut self, cpu_interface_base: u64) -> Result<(), KvmError> {
         let gic_dist_base: u64 = self.config.processor_topology.gic_distributor_base();
 
-        const GIC_NR_IRQS: u32 = 1024;
+        let gic_nr_irqs: u32 = self.config.processor_topology.gic_nr_irqs();
 
         let gicv2 = self
             .vm
@@ -675,7 +677,7 @@ impl KvmProtoPartition<'_> {
         // SAFETY: passing the right type for the attribute.
         unsafe {
             gicv2
-                .set_device_attr::<u32>(KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &GIC_NR_IRQS, 0)
+                .set_device_attr::<u32>(KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &gic_nr_irqs, 0)
                 .map_err(kvm::Error::SetDeviceAttr)?;
         }
 

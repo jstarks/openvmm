@@ -77,6 +77,11 @@ pub struct Aarch64PlatformConfig {
     pub pmu_gsiv: Option<u32>,
     /// Virtual timer PPI (GIC INTID, e.g. 20 for PPI 4).
     pub virt_timer_ppi: u32,
+    /// Total number of GIC interrupts (SGIs + PPIs + SPIs).
+    ///
+    /// KVM requires: `64 <= gic_nr_irqs <= 1023` and a multiple of 32.
+    /// The maximum valid value is 992 (31 × 32).
+    pub gic_nr_irqs: u32,
 }
 
 /// GIC v2m MSI frame parameters.
@@ -146,6 +151,10 @@ impl TopologyBuilder<Aarch64Topology> {
             if !(16..32).contains(&gsiv) {
                 return Err(InvalidTopology::InvalidPpiIntid(gsiv));
             }
+        }
+        let nr = self.arch.platform.gic_nr_irqs;
+        if nr < 64 || nr > 992 || nr % 32 != 0 {
+            return Err(InvalidTopology::InvalidGicNrIrqs(nr));
         }
         let mpidrs = (0..proc_count).map(|vp_index| {
             // TODO: construct mpidr appropriately for the specified
@@ -234,5 +243,10 @@ impl ProcessorTopology<Aarch64Topology> {
     /// Returns the virtual timer PPI (GIC INTID).
     pub fn virt_timer_ppi(&self) -> u32 {
         self.arch.platform.virt_timer_ppi
+    }
+
+    /// Returns the total number of GIC interrupts to configure.
+    pub fn gic_nr_irqs(&self) -> u32 {
+        self.arch.platform.gic_nr_irqs
     }
 }

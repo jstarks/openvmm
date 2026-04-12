@@ -8,8 +8,8 @@
 //! and emits [`ReadRange`] entries describing where to find the data.
 
 use crate::AsyncFile;
+use crate::bat::BlockMapping;
 use crate::bat::BlockType;
-use crate::bat::InternalBlockMapping;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
@@ -403,7 +403,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // Track blocks that got TFP set (for error cleanup).
         struct TfpRecord {
             block_number: u32,
-            original_mapping: InternalBlockMapping,
+            original_mapping: BlockMapping,
             /// File offset of newly allocated space, if any (for release on error).
             allocated_offset: Option<u64>,
         }
@@ -527,7 +527,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                         if is_full_block {
                             // Fully-covering: set TFP, defer BAT commit.
-                            let new_mapping = InternalBlockMapping::new()
+                            let new_mapping = BlockMapping::new()
                                 .with_bat_state(mapping.bat_state())
                                 .with_transitioning_to_fully_present(true)
                                 .with_file_megabyte((new_offset / MB1) as u32);
@@ -591,7 +591,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                         .await?;
 
                                     // Update in-memory SBM BAT entry.
-                                    let new_sbm = InternalBlockMapping::new()
+                                    let new_sbm = BlockMapping::new()
                                         .with_bat_state(BatEntryState::FullyPresent)
                                         .with_file_megabyte((sbm_alloc.file_offset / MB1) as u32);
 
@@ -619,7 +619,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 BatEntryState::FullyPresent
                             };
 
-                            let new_mapping = InternalBlockMapping::new()
+                            let new_mapping = BlockMapping::new()
                                 .with_bat_state(new_state)
                                 .with_transitioning_to_fully_present(false)
                                 .with_file_megabyte((new_offset / MB1) as u32);
@@ -776,7 +776,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 had_tfp = true;
 
                 // Clear TFP, set FullyPresent.
-                let final_mapping = InternalBlockMapping::new()
+                let final_mapping = BlockMapping::new()
                     .with_bat_state(BatEntryState::FullyPresent)
                     .with_transitioning_to_fully_present(false)
                     .with_file_megabyte(internal.file_megabyte());
@@ -870,7 +870,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 had_tfp = true;
                 let original_state = internal.bat_state();
                 let reverted = match original_state {
-                    BatEntryState::PartiallyPresent => InternalBlockMapping::new()
+                    BatEntryState::PartiallyPresent => BlockMapping::new()
                         .with_bat_state(internal.bat_state())
                         .with_transitioning_to_fully_present(false)
                         .with_file_megabyte(internal.file_megabyte()),
@@ -879,7 +879,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         if file_offset != 0 {
                             self.free_space.release(file_offset, self.block_size);
                         }
-                        InternalBlockMapping::new()
+                        BlockMapping::new()
                             .with_bat_state(internal.bat_state())
                             .with_transitioning_to_fully_present(false)
                             .with_file_megabyte(0)

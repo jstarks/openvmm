@@ -1068,8 +1068,8 @@ impl DeferredReleases {
 // ---------------------------------------------------------------------------
 
 use crate::AsyncFile;
+use crate::bat::BlockMapping;
 use crate::bat::BlockType;
-use crate::bat::InternalBlockMapping;
 use crate::open::VhdxFile;
 
 impl<F: AsyncFile> VhdxFile<F> {
@@ -1119,7 +1119,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     let cleared_mapping = {
                         let mut bat_state = self.bat.bat_state.write();
                         let old_mapping = bat_state.get_payload_mapping(old_block);
-                        let cleared = InternalBlockMapping::new()
+                        let cleared = BlockMapping::new()
                             .with_bat_state(old_mapping.bat_state())
                             .with_transitioning_to_fully_present(false)
                             .with_file_megabyte(0);
@@ -1257,7 +1257,7 @@ impl FreeSpaceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bat::InternalBlockMapping;
+    use crate::bat::BlockMapping;
     use crate::format::BatEntryState;
 
     // -- Bitmap unit tests --
@@ -1495,11 +1495,11 @@ mod tests {
         data_block_count: u32,
     ) -> BatState {
         let mut payload_mappings = vec![
-            InternalBlockMapping::new()
+            BlockMapping::new()
                 .with_bat_state(BatEntryState::NotPresent);
             data_block_count as usize
         ];
-        payload_mappings[block_number as usize] = InternalBlockMapping::new()
+        payload_mappings[block_number as usize] = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(file_megabyte);
 
@@ -1950,11 +1950,11 @@ mod tests {
 
         // BAT state with both blocks anchored.
         let mut payload_mappings =
-            vec![InternalBlockMapping::new().with_bat_state(BatEntryState::NotPresent); 16];
-        payload_mappings[2] = InternalBlockMapping::new()
+            vec![BlockMapping::new().with_bat_state(BatEntryState::NotPresent); 16];
+        payload_mappings[2] = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(6);
-        payload_mappings[5] = InternalBlockMapping::new()
+        payload_mappings[5] = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(10);
         let bat_state = BatState {

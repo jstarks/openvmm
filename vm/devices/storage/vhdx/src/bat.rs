@@ -89,7 +89,7 @@ pub(crate) struct Bat {
 /// The 28-bit `file_megabyte` field supports files up to 2^28 MB = 256 TB.
 #[bitfield(u32)]
 #[derive(PartialEq, Eq)]
-pub(crate) struct InternalBlockMapping {
+pub(crate) struct BlockMapping {
     /// Block state (same values as BatEntryState).
     #[bits(3)]
     state: u8,
@@ -102,7 +102,7 @@ pub(crate) struct InternalBlockMapping {
     pub file_megabyte: u32,
 }
 
-impl InternalBlockMapping {
+impl BlockMapping {
     /// File byte offset (converts the megabyte field to bytes).
     pub fn file_offset(self) -> u64 {
         self.file_megabyte() as u64 * MB1
@@ -140,7 +140,7 @@ impl InternalBlockMapping {
         if !has_parent && state == BatEntryState::PartiallyPresent as u8 {
             state = BatEntryState::FullyPresent as u8;
         }
-        InternalBlockMapping::new()
+        BlockMapping::new()
             .with_state(state)
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte(file_mb as u32)
@@ -159,7 +159,7 @@ impl InternalBlockMapping {
         if state == BatEntryState::PartiallyPresent as u8 {
             state = BatEntryState::FullyPresent as u8;
         }
-        InternalBlockMapping::new()
+        BlockMapping::new()
             .with_state(state)
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte(file_mb as u32)
@@ -182,9 +182,9 @@ pub(crate) enum BlockType {
 /// outside this lock.
 pub(crate) struct BatState {
     /// One entry per payload block (indexed by block number).
-    pub payload_mappings: Vec<InternalBlockMapping>,
+    pub payload_mappings: Vec<BlockMapping>,
     /// One entry per sector bitmap block (indexed by chunk number).
-    pub sector_bitmap_mappings: Vec<InternalBlockMapping>,
+    pub sector_bitmap_mappings: Vec<BlockMapping>,
     /// Running count of allocated (FullyPresent or PartiallyPresent) blocks.
     pub allocated_block_count: u32,
 }
@@ -196,24 +196,19 @@ fn is_allocated_state(state: BatEntryState) -> bool {
 
 impl BatState {
     /// Get the in-memory mapping for a payload block.
-    pub fn get_payload_mapping(&self, block_number: u32) -> InternalBlockMapping {
+    pub fn get_payload_mapping(&self, block_number: u32) -> BlockMapping {
         self.payload_mappings[block_number as usize]
     }
 
     /// Get the in-memory mapping for a sector bitmap block.
-    pub fn get_sbm_mapping(&self, chunk_number: u32) -> InternalBlockMapping {
+    pub fn get_sbm_mapping(&self, chunk_number: u32) -> BlockMapping {
         self.sector_bitmap_mappings[chunk_number as usize]
     }
 
     /// Update the in-memory mapping for a payload block.
     ///
     /// Adjusts `allocated_block_count` based on the old and new states.
-    pub fn set_payload_mapping(
-        &mut self,
-        bat: &Bat,
-        block_number: u32,
-        mapping: InternalBlockMapping,
-    ) {
+    pub fn set_payload_mapping(&mut self, bat: &Bat, block_number: u32, mapping: BlockMapping) {
         let _ = bat; // Used for consistency; entry index needed only for dirty tracking.
         let old = self.payload_mappings[block_number as usize];
         let was_allocated = is_allocated_state(old.bat_state());
@@ -227,7 +222,7 @@ impl BatState {
     }
 
     /// Update the in-memory mapping for a sector bitmap block.
-    pub fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: InternalBlockMapping) {
+    pub fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: BlockMapping) {
         let _ = bat;
         self.sector_bitmap_mappings[chunk_number as usize] = mapping;
     }
@@ -466,7 +461,7 @@ impl Bat {
         cache: &PageCache<F>,
         block_type: BlockType,
         block_number: u32,
-        mapping: InternalBlockMapping,
+        mapping: BlockMapping,
         pre_log_fsn: Option<u64>,
     ) -> Result<(), VhdxError> {
         let entry_number = match block_type {
@@ -533,7 +528,7 @@ impl Bat {
             if BatEntryState::from_raw(raw_state).is_none() {
                 return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
             }
-            let internal = InternalBlockMapping::from_bat_entry(entry, self.has_parent);
+            let internal = BlockMapping::from_bat_entry(entry, self.has_parent);
             if raw_state == BatEntryState::FullyPresent as u8
                 || raw_state == BatEntryState::PartiallyPresent as u8
             {
@@ -565,7 +560,7 @@ impl Bat {
             if BatEntryState::from_raw(raw_state).is_none() {
                 return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
             }
-            let internal = InternalBlockMapping::from_sbm_bat_entry(entry);
+            let internal = BlockMapping::from_sbm_bat_entry(entry);
             // Mark sector bitmap block's file region as in-use if allocated.
             if raw_state == BatEntryState::FullyPresent as u8
                 || raw_state == BatEntryState::PartiallyPresent as u8
@@ -652,7 +647,7 @@ impl Bat {
     /// Look up the payload block mapping for a given data block number.
     ///
     /// Synchronous — reads from the in-memory BAT under a read lock.
-    pub(crate) fn get_block_mapping(&self, block_number: u32) -> InternalBlockMapping {
+    pub(crate) fn get_block_mapping(&self, block_number: u32) -> BlockMapping {
         let bat_state = self.bat_state.read();
         bat_state.get_payload_mapping(block_number)
     }
@@ -660,7 +655,7 @@ impl Bat {
     /// Look up the sector bitmap block mapping for a given chunk number.
     ///
     /// Synchronous — reads from the in-memory BAT under a read lock.
-    pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> InternalBlockMapping {
+    pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
         let bat_state = self.bat_state.read();
         bat_state.get_sbm_mapping(chunk_number)
     }
@@ -886,12 +881,12 @@ mod tests {
 
     #[test]
     fn internal_mapping_roundtrip() {
-        let mapping = InternalBlockMapping::new()
+        let mapping = BlockMapping::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_transitioning_to_fully_present(true)
             .with_file_megabyte(12345);
         let raw = u32::from(mapping);
-        let restored = InternalBlockMapping::from(raw);
+        let restored = BlockMapping::from(raw);
         assert_eq!(restored.state(), BatEntryState::FullyPresent as u8);
         assert!(restored.transitioning_to_fully_present());
         assert_eq!(restored.file_megabyte(), 12345);
@@ -900,7 +895,7 @@ mod tests {
     #[test]
     fn internal_mapping_max_file_megabyte() {
         let max_mb: u32 = (1 << 28) - 1; // 268435455
-        let mapping = InternalBlockMapping::new()
+        let mapping = BlockMapping::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_megabyte(max_mb);
         assert_eq!(mapping.file_megabyte(), max_mb);
@@ -909,12 +904,12 @@ mod tests {
 
     #[test]
     fn internal_mapping_tfp_flag() {
-        let with_tfp = InternalBlockMapping::new()
+        let with_tfp = BlockMapping::new()
             .with_state(BatEntryState::NotPresent as u8)
             .with_transitioning_to_fully_present(true);
         assert!(with_tfp.transitioning_to_fully_present());
 
-        let without_tfp = InternalBlockMapping::new()
+        let without_tfp = BlockMapping::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_transitioning_to_fully_present(false);
         assert!(!without_tfp.transitioning_to_fully_present());
@@ -929,7 +924,7 @@ mod tests {
         let entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_offset_mb(100);
-        let internal = InternalBlockMapping::from_bat_entry(entry, false);
+        let internal = BlockMapping::from_bat_entry(entry, false);
         assert_eq!(internal.state(), BatEntryState::FullyPresent as u8);
         assert_eq!(internal.file_megabyte(), 100);
         assert!(!internal.transitioning_to_fully_present());
@@ -999,27 +994,27 @@ mod tests {
         let bat = Bat::new(4 * MB1, format::DEFAULT_BLOCK_SIZE, 512, false, MB1 as u32).unwrap();
         // 2 blocks
         let mut state = BatState {
-            payload_mappings: vec![InternalBlockMapping::new(); bat.data_block_count as usize],
+            payload_mappings: vec![BlockMapping::new(); bat.data_block_count as usize],
             sector_bitmap_mappings: vec![],
             allocated_block_count: 0,
         };
 
         // Allocate block 0.
-        let mapping = InternalBlockMapping::new()
+        let mapping = BlockMapping::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_megabyte(100);
         state.set_payload_mapping(&bat, 0, mapping);
         assert_eq!(state.allocated_block_count, 1);
 
         // Allocate block 1.
-        let mapping2 = InternalBlockMapping::new()
+        let mapping2 = BlockMapping::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_megabyte(102);
         state.set_payload_mapping(&bat, 1, mapping2);
         assert_eq!(state.allocated_block_count, 2);
 
         // Deallocate block 0 → NotPresent.
-        let dealloc = InternalBlockMapping::new().with_state(BatEntryState::NotPresent as u8);
+        let dealloc = BlockMapping::new().with_state(BatEntryState::NotPresent as u8);
         state.set_payload_mapping(&bat, 0, dealloc);
         assert_eq!(state.allocated_block_count, 1);
     }

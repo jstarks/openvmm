@@ -62,7 +62,9 @@ impl CommonState {
         let processor_topology =
             TopologyBuilder::new_aarch64(vm_topology::processor::arch::Aarch64PlatformConfig {
                 gic_distributor_base: 0xff000000,
-                gic_redistributors_base: 0xff020000,
+                gic_version: vm_topology::processor::aarch64::GicVersion::V3 {
+                    redistributors_base: 0xff020000,
+                },
                 gic_v2m: None,
                 pmu_gsiv: None,
                 virt_timer_ppi: 20, // DEFAULT_VIRT_TIMER_PPI

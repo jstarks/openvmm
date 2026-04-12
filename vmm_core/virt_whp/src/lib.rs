@@ -671,7 +671,10 @@ impl virt::BindProcessor for WhpProcessorBinder {
                     .for_op("set mpidr")?;
                 vp.vp
                     .whp(vtl)
-                    .set_register(whp::Register64::GicrBaseGpa, vp_info.gicr)
+                    .set_register(
+                        whp::Register64::GicrBaseGpa,
+                        vp_info.gicr.expect("WHP requires GICv3"),
+                    )
                     .for_op("set GICR base")?;
             }
         }

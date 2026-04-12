@@ -186,7 +186,9 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
                         .config
                         .vmtime
                         .access(format!("vp{}", vp.base.vp_index.index())),
-                    gicr_range: vp.gicr..vp.gicr + aarch64defs::GIC_REDISTRIBUTOR_SIZE,
+                    gicr_range: vp.gicr.expect("HVF requires GICv3")
+                        ..vp.gicr.expect("HVF requires GICv3")
+                            + aarch64defs::GIC_REDISTRIBUTOR_SIZE,
                 }),
             });
         }

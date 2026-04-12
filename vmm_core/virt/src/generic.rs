@@ -58,6 +58,15 @@ pub trait Hypervisor: 'static {
         None
     }
 
+    /// Returns whether this hypervisor supports GICv3.
+    ///
+    /// When `false`, the hypervisor only supports GICv2 (e.g., Raspberry Pi 5
+    /// with a GIC-400). Callers should configure the topology accordingly.
+    /// Defaults to `true`. Ignored on non-aarch64.
+    fn supports_gic_v3(&self) -> bool {
+        true
+    }
+
     /// Returns a new prototype partition from the given configuration.
     fn new_partition<'a>(
         &'a mut self,

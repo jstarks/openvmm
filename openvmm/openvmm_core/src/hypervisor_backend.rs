@@ -73,10 +73,12 @@ impl ResolvedHypervisorBackend {
             Box::pin(async move {
                 let mut hv = hypervisor;
                 let platform_gsiv = virt::Hypervisor::platform_gsiv(&hv);
+                let supports_gic_v3 = virt::Hypervisor::supports_gic_v3(&hv);
                 InitializedVm::new_with_hypervisor(
                     driver_source,
                     &mut hv,
                     platform_gsiv,
+                    supports_gic_v3,
                     cfg,
                     shared_memory,
                 )

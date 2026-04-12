@@ -469,14 +469,19 @@ impl ExtractTopologyConfig for ProcessorTopology<Aarch64Topology> {
             vps_per_socket: Some(self.reserved_vps_per_socket()),
             enable_smt: Some(self.smt_enabled()),
             arch: Some(ArchTopologyConfig::Aarch64(Aarch64TopologyConfig {
-                gic_config: Some(GicConfig {
-                    gic_distributor_base: self.gic_distributor_base(),
-                    gic_redistributors_base: match self.gic_version() {
-                        GicVersion::V3 {
-                            redistributors_base,
-                        } => redistributors_base,
-                        GicVersion::V2 { cpu_interface_base } => cpu_interface_base,
-                    },
+                gic_config: Some(match self.gic_version() {
+                    GicVersion::V3 {
+                        redistributors_base,
+                    } => GicConfig::V3(Some(openvmm_defs::config::GicV3Config {
+                        gic_distributor_base: self.gic_distributor_base(),
+                        gic_redistributors_base: redistributors_base,
+                    })),
+                    GicVersion::V2 { cpu_interface_base } => {
+                        GicConfig::V2(Some(openvmm_defs::config::GicV2Config {
+                            gic_distributor_base: self.gic_distributor_base(),
+                            cpu_interface_base,
+                        }))
+                    }
                 }),
                 pmu_gsiv: match self.pmu_gsiv() {
                     Some(gsiv) => PmuGsivConfig::Gsiv(gsiv),
@@ -515,25 +520,59 @@ impl BuildTopology<Aarch64Topology> for ProcessorTopologyConfig {
             tracing::warn!("PMU GSIV is not set");
         }
 
-        let (gic_distributor_base, gic_second_base) = if let Some(gic_config) = &arch.gic_config {
-            (
-                gic_config.gic_distributor_base,
-                gic_config.gic_redistributors_base,
-            )
-        } else {
-            (
-                openvmm_defs::config::DEFAULT_GIC_DISTRIBUTOR_BASE,
-                openvmm_defs::config::DEFAULT_GIC_REDISTRIBUTORS_BASE,
-            )
-        };
-
-        let gic_version = if platform_info.supports_gic_v3 {
-            GicVersion::V3 {
-                redistributors_base: gic_second_base,
+        let (gic_distributor_base, gic_version) = match &arch.gic_config {
+            Some(GicConfig::V3(config)) => {
+                let dist = config
+                    .as_ref()
+                    .map(|c| c.gic_distributor_base)
+                    .unwrap_or(openvmm_defs::config::DEFAULT_GIC_DISTRIBUTOR_BASE);
+                let redist = config
+                    .as_ref()
+                    .map(|c| c.gic_redistributors_base)
+                    .unwrap_or(openvmm_defs::config::DEFAULT_GIC_REDISTRIBUTORS_BASE);
+                (
+                    dist,
+                    GicVersion::V3 {
+                        redistributors_base: redist,
+                    },
+                )
             }
-        } else {
-            GicVersion::V2 {
-                cpu_interface_base: gic_second_base,
+            Some(GicConfig::V2(config)) => {
+                let dist = config
+                    .as_ref()
+                    .map(|c| c.gic_distributor_base)
+                    .unwrap_or(openvmm_defs::config::DEFAULT_GIC_DISTRIBUTOR_BASE);
+                let cpu_if = config
+                    .as_ref()
+                    .map(|c| c.cpu_interface_base)
+                    .unwrap_or(openvmm_defs::config::DEFAULT_GIC_REDISTRIBUTORS_BASE);
+                (
+                    dist,
+                    GicVersion::V2 {
+                        cpu_interface_base: cpu_if,
+                    },
+                )
+            }
+            None => {
+                // No explicit GIC config — use the hypervisor's detected version
+                // with default addresses.
+                let dist = openvmm_defs::config::DEFAULT_GIC_DISTRIBUTOR_BASE;
+                let second = openvmm_defs::config::DEFAULT_GIC_REDISTRIBUTORS_BASE;
+                if platform_info.supports_gic_v3 {
+                    (
+                        dist,
+                        GicVersion::V3 {
+                            redistributors_base: second,
+                        },
+                    )
+                } else {
+                    (
+                        dist,
+                        GicVersion::V2 {
+                            cpu_interface_base: second,
+                        },
+                    )
+                }
             }
         };
 

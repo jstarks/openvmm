@@ -288,8 +288,28 @@ pub struct Aarch64TopologyConfig {
     pub pmu_gsiv: PmuGsivConfig,
 }
 
+/// GIC configuration for the virtual machine.
+///
+/// The variant selects the GIC version. `None` inner config means use
+/// defaults for that version's addresses.
 #[derive(Debug, Protobuf, Clone)]
-pub struct GicConfig {
+pub enum GicConfig {
+    /// GICv2 with optional address overrides.
+    V2(Option<GicV2Config>),
+    /// GICv3 with optional address overrides.
+    V3(Option<GicV3Config>),
+}
+
+/// GICv2-specific address configuration.
+#[derive(Debug, Protobuf, Clone)]
+pub struct GicV2Config {
+    pub gic_distributor_base: u64,
+    pub cpu_interface_base: u64,
+}
+
+/// GICv3-specific address configuration.
+#[derive(Debug, Protobuf, Clone)]
+pub struct GicV3Config {
     pub gic_distributor_base: u64,
     pub gic_redistributors_base: u64,
 }

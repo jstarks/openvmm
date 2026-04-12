@@ -108,9 +108,13 @@ impl InternalBlockMapping {
         self.file_megabyte() as u64 * MB1
     }
 
-    /// Parse the block state, returning `None` for unknown values.
-    pub fn bat_state(self) -> Option<BatEntryState> {
-        BatEntryState::from_raw(self.state())
+    /// Parse the block state.
+    ///
+    /// Panics if the raw state is invalid — this is an internal invariant
+    /// since states are validated at BAT load time and only set to known
+    /// values at runtime.
+    pub fn bat_state(self) -> BatEntryState {
+        BatEntryState::from_raw(self.state()).expect("InternalBlockMapping has invalid state")
     }
 
     /// Create an `InternalBlockMapping` from an on-disk [`BatEntry`].

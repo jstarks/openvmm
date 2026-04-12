@@ -61,7 +61,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // 2. Get sector bitmap block mapping (synchronous).
         let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
-        if sbm_mapping.bat_state().unwrap() != BatEntryState::FullyPresent {
+        if sbm_mapping.bat_state() != BatEntryState::FullyPresent {
             return Err(VhdxError::Corrupt(
                 CorruptionType::UnallocatedSectorBitmapBlock,
             ));
@@ -160,7 +160,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Get sector bitmap block mapping (synchronous).
         let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
-        if sbm_mapping.bat_state().unwrap() != BatEntryState::FullyPresent {
+        if sbm_mapping.bat_state() != BatEntryState::FullyPresent {
             return Err(VhdxError::Corrupt(
                 CorruptionType::UnallocatedSectorBitmapBlock,
             ));

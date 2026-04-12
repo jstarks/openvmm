@@ -1142,7 +1142,7 @@ mod tests {
 
         // A newly created dynamic disk has all blocks as NotPresent.
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.bat_state(), Some(BatEntryState::NotPresent));
+        assert_eq!(mapping.bat_state(), BatEntryState::NotPresent);
         assert_eq!(mapping.file_offset(), 0);
     }
 
@@ -1161,7 +1161,7 @@ mod tests {
 
         for block in 0..block_count {
             let mapping = vhdx.bat.get_block_mapping(block);
-            assert_eq!(mapping.bat_state(), Some(BatEntryState::NotPresent));
+            assert_eq!(mapping.bat_state(), BatEntryState::NotPresent);
             assert_eq!(mapping.file_offset(), 0);
         }
     }
@@ -1232,7 +1232,7 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
         let mapping = vhdx.bat.get_block_mapping(0);
-        assert_eq!(mapping.bat_state(), Some(BatEntryState::NotPresent));
+        assert_eq!(mapping.bat_state(), BatEntryState::NotPresent);
     }
 
     #[async_test]

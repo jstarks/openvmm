@@ -579,7 +579,7 @@ impl KvmProtoPartition<'_> {
             return Err(KvmError::Misaligned);
         }
 
-        const GIC_NR_IRQS: u32 = 64;
+        const GIC_NR_IRQS: u32 = 1024;
 
         let gicv3 = self
             .vm
@@ -641,7 +641,7 @@ impl KvmProtoPartition<'_> {
     fn add_gicv2(&mut self, cpu_interface_base: u64) -> Result<(), KvmError> {
         let gic_dist_base: u64 = self.config.processor_topology.gic_distributor_base();
 
-        const GIC_NR_IRQS: u32 = 64;
+        const GIC_NR_IRQS: u32 = 1024;
 
         let gicv2 = self
             .vm
@@ -882,8 +882,7 @@ const GIC_IRQ_MAX: u32 = 0x3fb;
 
 impl virt::irqcon::ControlGic for KvmPartitionInner {
     fn set_spi_irq(&self, irq_id: u32, high: bool) {
-        // tracing::warn!("set_spi_irq: irq_id={}", irq_id);
-        debug_assert!(
+        assert!(
             (GIC_IRQ_BASE..=GIC_IRQ_MAX).contains(&irq_id),
             "invalid irq_id"
         );
@@ -891,15 +890,20 @@ impl virt::irqcon::ControlGic for KvmPartitionInner {
         let irqchip_irq =
             (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | ((irq_id) & KVM_ARM_IRQ_NUM_MASK);
 
-        self.kvm
-            .irq_line(irqchip_irq, high)
-            .expect("interrupt delivery failure");
+        if let Err(err) = self.kvm.irq_line(irqchip_irq, high) {
+            tracelimit::warn_ratelimited!(
+                irq_id,
+                high,
+                err = &err as &dyn std::error::Error,
+                "failed to set SPI IRQ",
+            );
+        }
     }
 }
 
 impl virt::Aarch64Partition for KvmPartition {
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic> {
-        debug_assert!(vtl == Vtl::Vtl0);
+        assert!(vtl == Vtl::Vtl0);
         self.inner.clone()
     }
 }

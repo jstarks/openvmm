@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Read I/O range resolution for VHDX files.
+//! VHDX read/write I/O resolution and guards.
 //!
-//! Given a guest virtual disk offset and length, [`VhdxFile::resolve_read`]
-//! walks the request block-by-block, looks up each block's state in the BAT,
-//! and emits [`ReadRange`] entries describing where to find the data.
+//! Translates guest virtual disk offsets into file-level ranges via
+//! [`VhdxFile::resolve_read`] and [`VhdxFile::resolve_write`], handling
+//! block allocation, TFP lifecycle, sector bitmap updates, and
+//! crash-consistent BAT commits.
 
 use crate::AsyncFile;
 use crate::bat::BatGuard;
@@ -580,8 +581,6 @@ impl<F: AsyncFile> VhdxFile<F> {
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte((new_offset / MB1) as u32);
 
-        self.bat.set_block_mapping(span.block_number, new_mapping);
-
         // Capture per-page FSN when !is_safe. The FSN is captured now
         // (before the caller writes data), matching the C code's
         // FreeSpace.RequiredFsn timing.
@@ -659,8 +658,6 @@ impl<F: AsyncFile> VhdxFile<F> {
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte((sbm_alloc.file_offset / MB1) as u32);
 
-        self.bat.set_sector_bitmap_mapping(chunk_number, new_sbm);
-
         self.bat
             .write_block_mapping(
                 &self.cache,
@@ -702,9 +699,6 @@ impl<F: AsyncFile> VhdxFile<F> {
                 .with_bat_state(BatEntryState::FullyPresent)
                 .with_transitioning_to_fully_present(false)
                 .with_file_megabyte(mapping.file_megabyte());
-
-            self.bat
-                .set_block_mapping(record.block_number, final_mapping);
 
             // Write per-entry to cache. Errors are deferred so we
             // can still notify waiters.

@@ -468,12 +468,13 @@ impl Bat {
     /// Write a block mapping to the cache, converting from in-memory
     /// representation to on-disk BAT entry format.
     ///
+    /// Atomically updates the in-memory BAT and the cache page under
+    /// the page lock, ensuring no window where the in-memory state is
+    /// visible but the cache page hasn't been stamped with the FSN.
+    ///
     /// Uses `Overwrite` mode to avoid unnecessary disk reads. If the
     /// page is already cached, patches only the single entry. If not
     /// cached, builds the full page from in-memory state (no disk read).
-    ///
-    /// The `bat_state` lock is only acquired in the rare uncached path,
-    /// after the async cache acquire completes — no lock held across await.
     ///
     /// Matches the C code's `Vhd2iUpdateBlockStateWithNode` pattern.
     pub async fn write_block_mapping<F: AsyncFile>(
@@ -502,9 +503,24 @@ impl Bat {
             )
             .await?;
 
+        // Update in-memory BAT under the page lock. This ensures a
+        // concurrent trim on a block sharing the same page can't dirty
+        // the page (and get it flushed to WAL) between our in-memory
+        // update and the FSN stamp below.
+        {
+            let mut bat_state = self.bat_state.write();
+            match block_type {
+                BlockType::Payload => {
+                    bat_state.set_payload_mapping(self, block_number, mapping);
+                }
+                BlockType::SectorBitmap => {
+                    bat_state.set_sbm_mapping(self, block_number, mapping);
+                }
+            }
+        }
+
         if guard.is_overwriting() {
             // Slow path: page not cached — build from in-memory state.
-            // Sync lock only, no await point.
             self.produce_page(page_number, &mut *guard);
         } else {
             // Fast path: page is cached — patch just the one entry.
@@ -668,14 +684,6 @@ impl Bat {
     pub(crate) fn set_block_mapping(&self, block_number: u32, mapping: BlockMapping) {
         let mut bat_state = self.bat_state.write();
         bat_state.set_payload_mapping(self, block_number, mapping);
-    }
-
-    /// Update the sector bitmap block mapping for a given chunk number.
-    ///
-    /// Synchronous — writes to the in-memory BAT under a write lock.
-    pub(crate) fn set_sector_bitmap_mapping(&self, chunk_number: u32, mapping: BlockMapping) {
-        let mut bat_state = self.bat_state.write();
-        bat_state.set_sbm_mapping(self, chunk_number, mapping);
     }
 
     /// Return the number of allocated (FullyPresent or PartiallyPresent) blocks.

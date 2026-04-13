@@ -342,10 +342,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 continue;
             }
 
-            // 9c. Update in-memory BAT.
-            self.bat.set_block_mapping(current_block, new_mapping);
-
-            // 9d. Write BAT entry to cache (async).
+            // 9c. Write BAT entry to cache (also updates in-memory BAT atomically).
             // LOCK AUDIT: Trim claim held (not a sync lock). Safe to await.
             self.bat
                 .write_block_mapping(

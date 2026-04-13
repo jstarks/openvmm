@@ -22,7 +22,7 @@ use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::MB1;
 use bitfield_struct::bitfield;
 use parking_lot::RwLock;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
 use zerocopy::IntoBytes;
 
@@ -39,14 +39,53 @@ pub(crate) const METADATA_TAG: u8 = 1;
 /// Size of a sector bitmap block in bytes (1 MiB).
 pub(crate) const SECTOR_BITMAP_BLOCK_SIZE: u32 = 1024 * 1024;
 
-/// Manages BAT (Block Allocation Table) lookups through the page cache.
+/// Per-block I/O refcount packed into a `u16`.
 ///
-/// The VHDX BAT interleaves data block entries with sector bitmap entries.
-/// Every `chunk_ratio` payload entries are followed by one sector bitmap
-/// entry. This struct computes the correct entry index for any block number.
-/// Sentinel value stored in an atomic refcount to indicate that trim
-/// has claimed the block. IO paths must wait when they see this value.
-pub(crate) const TRIM_SENTINEL: u32 = u32::MAX;
+/// Layout:
+/// - Bit 15 (`TRIM_PENDING_BIT`): set by trim to block new I/O acquisitions.
+/// - Bits 0-14: I/O reference count (0..32767).
+///
+/// Valid states:
+/// - `0x0000` — idle, no I/O, no trim.
+/// - `0x0001..MAX_IO_REFCOUNT` — active I/O refcount.
+/// - `TRIM_PENDING` (`0x8000`) — trim pending, I/Os drained, ready to claim.
+/// - `0x8001..0xFFFE` — trim pending + draining I/Os.
+/// - `TRIM_CLAIMED` (`0xFFFF`) — trim owns the block exclusively.
+///
+/// The pending bit gives trim **writer priority**: once set, no new I/O
+/// can increment the refcount, preventing livelock from a steady I/O stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IoBlockRef(u16);
+
+impl IoBlockRef {
+    /// High bit: trim is pending (blocks new I/O).
+    const TRIM_PENDING_BIT: u16 = 0x8000;
+    /// Maximum I/O refcount (bits 0-14 all set).
+    const MAX_IO_REFCOUNT: u16 = 0x7FFF;
+    const FREE: Self = Self(0);
+    /// Trim pending, all I/Os drained — ready to finish claiming.
+    const TRIM_PENDING: Self = Self(Self::TRIM_PENDING_BIT);
+    /// Trim has exclusively claimed the block.
+    const TRIM_CLAIMED: Self = Self(u16::MAX);
+
+    /// The I/O refcount (bits 0-14), ignoring the trim-pending bit.
+    fn io_count(self) -> u16 {
+        self.0 & Self::MAX_IO_REFCOUNT
+    }
+
+    /// Whether the trim-pending bit is set.
+    fn trim_pending(self) -> bool {
+        self.0 & Self::TRIM_PENDING_BIT != 0
+    }
+
+    /// Whether new I/O acquisitions should be blocked.
+    ///
+    /// True when the trim-pending bit is set OR the I/O count is at
+    /// the maximum (would overflow into the pending bit).
+    fn blocks_new_io(self) -> bool {
+        self.0 >= Self::MAX_IO_REFCOUNT
+    }
+}
 
 pub(crate) struct Bat {
     /// Number of data blocks (payload blocks) in the disk.
@@ -62,23 +101,15 @@ pub(crate) struct Bat {
 
     bat_state: RwLock<BatState>,
 
-    /// Per-payload-block I/O refcounts. Atomic to avoid requiring
-    /// the bat_state write lock on the read/write hot path.
-    ///
-    /// Values:
-    /// - `0`: idle — no I/O in progress, trim may claim.
-    /// - `1..TRIM_SENTINEL-1`: I/O refcount — trim must wait.
-    /// - `TRIM_SENTINEL` (`u32::MAX`): trim has claimed the block — I/O must wait.
-    io_refcounts: Vec<AtomicU32>,
+    /// Per-payload-block I/O refcounts (see [`IoBlockRef`] for layout).
+    /// Atomic to avoid requiring the bat_state write lock on the hot path.
+    io_refcounts: Vec<AtomicU16>,
 
-    /// Broadcast event notified when any I/O guard is dropped and a block's
-    /// refcount reaches zero. Trim (Phase 11) waits on this event when it
-    /// finds a block with refcount > 0.
-    trim_event: event_listener::Event,
-
-    /// Broadcast event notified when trim releases its claim on a block.
-    /// I/O paths wait on this event when they find a block claimed by trim.
-    io_wait_event: event_listener::Event,
+    /// Notified whenever a block's refcount changes in a way that could
+    /// unblock a waiter: I/O count reaching zero (unblocks trim),
+    /// trim releasing a claim (unblocks I/O), or I/O count dropping
+    /// below the overflow threshold (unblocks I/O).
+    refcount_event: event_listener::Event,
 }
 
 /// In-memory BAT entry. Compact 32-bit representation used in the in-memory
@@ -273,7 +304,7 @@ impl Bat {
             allocated_block_count: 0,
         };
 
-        let io_refcounts = (0..data_block_count).map(|_| AtomicU32::new(0)).collect();
+        let io_refcounts = (0..data_block_count).map(|_| AtomicU16::new(0)).collect();
 
         Ok(Bat {
             data_block_count,
@@ -283,82 +314,106 @@ impl Bat {
             has_parent,
             bat_state: bat_state.into(),
             io_refcounts,
-            trim_event: event_listener::Event::new(),
-            io_wait_event: event_listener::Event::new(),
+            refcount_event: event_listener::Event::new(),
         })
     }
 
     /// Try to atomically increment the I/O refcount for a block.
     ///
-    /// Returns `true` if the increment succeeded, `false` if trim has
-    /// claimed the block (sentinel set). Uses a CAS loop to avoid
-    /// needing the bat_state write lock.
+    /// Returns `true` if the increment succeeded, `false` if new I/O is
+    /// blocked. New I/O is blocked when:
+    /// - The trim-pending bit is set (trim has writer priority).
+    /// - The I/O count is at `MAX_IO_REFCOUNT` (would overflow).
+    /// - The block is trim-claimed (`TRIM_CLAIMED`).
     fn try_increment_io_refcount(&self, block_number: u32) -> bool {
         let rc = &self.io_refcounts[block_number as usize];
         loop {
-            let old = rc.load(Ordering::Acquire);
-            if old == TRIM_SENTINEL {
+            let old = IoBlockRef(rc.load(Ordering::Acquire));
+            if old.blocks_new_io() {
                 return false;
             }
-            let new = old.checked_add(1).expect("io_refcount overflow");
-            match rc.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+            let new = old.0 + 1;
+            match rc.compare_exchange_weak(old.0, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return true,
                 Err(_) => continue,
             }
         }
     }
 
-    /// Atomically decrement the I/O refcount. Returns the previous value.
+    /// Atomically decrement the I/O refcount.
     ///
-    /// Panics on underflow or if the sentinel is set (trim owns the block).
-    fn decrement_io_refcount(&self, block_number: u32) -> u32 {
-        let prev = self.io_refcounts[block_number as usize].fetch_sub(1, Ordering::AcqRel);
+    /// The trim-pending bit is preserved — only the I/O count in
+    /// bits 0-14 is decremented. Panics on underflow or if the block
+    /// is trim-claimed.
+    ///
+    /// Returns `true` if callers should notify `refcount_event`:
+    /// when the I/O count hits zero with trim-pending set (trim is
+    /// waiting to finish claiming), or when the count drops from
+    /// the overflow threshold (I/O acquirers may be waiting).
+    #[must_use]
+    fn decrement_io_refcount(&self, block_number: u32) -> bool {
+        let prev =
+            IoBlockRef(self.io_refcounts[block_number as usize].fetch_sub(1, Ordering::AcqRel));
         assert!(
-            prev > 0 && prev != TRIM_SENTINEL,
-            "io_refcount underflow or trim sentinel on block {block_number}"
+            prev.io_count() > 0 && prev != IoBlockRef::TRIM_CLAIMED,
+            "io_refcount underflow or trim claimed on block {block_number} (was {:#06x})",
+            prev.0,
         );
-        prev
+        // Trim is waiting for count to reach 0.
+        (prev.io_count() == 1 && prev.trim_pending())
+        // I/O acquirers are waiting for overflow to clear.
+        || prev.io_count() == IoBlockRef::MAX_IO_REFCOUNT
     }
 
-    /// Try to claim a block for trim by CAS 0 → TRIM_SENTINEL.
-    ///
-    /// Returns `true` if the claim succeeded (block was idle), `false` if
-    /// I/O is active (refcount > 0) or another trim already claimed it.
+    /// Claim a block for trim, with writer priority.
     pub(crate) async fn claim_for_trim(&self, block_number: u32) -> TrimGuard<'_> {
+        let rc = &self.io_refcounts[block_number as usize];
         loop {
-            let listener = self.trim_event.listen();
-            match self.io_refcounts[block_number as usize].compare_exchange(
-                0,
-                TRIM_SENTINEL,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return TrimGuard {
-                        bat: self,
-                        block_number,
-                    };
+            let listener = self.refcount_event.listen();
+            let result = rc.fetch_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
+                let old = IoBlockRef(raw);
+                match old {
+                    // Idle — claim directly.
+                    IoBlockRef::FREE => Some(IoBlockRef::TRIM_CLAIMED.0),
+                    // Pending bit set, I/Os drained — finish claiming.
+                    IoBlockRef::TRIM_PENDING => Some(IoBlockRef::TRIM_CLAIMED.0),
+                    // Already claimed — wait for release.
+                    IoBlockRef::TRIM_CLAIMED => None,
+                    // I/Os active, no pending bit — set it.
+                    _ if !old.trim_pending() => Some(old.0 | IoBlockRef::TRIM_PENDING_BIT),
+                    // Pending bit set, I/Os still draining — wait.
+                    _ => None,
                 }
-                Err(_) => {
+            });
+            break match result.map(IoBlockRef) {
+                Ok(IoBlockRef::FREE | IoBlockRef::TRIM_PENDING) => TrimGuard {
+                    bat: self,
+                    block_number,
+                },
+                _ => {
+                    // Wait for the I/O count to reach 0 or for the trim claim to be released.
                     listener.await;
+                    continue;
                 }
-            }
+            };
         }
     }
 
-    /// Release a trim claim on a block (store 0).
+    /// Release a trim claim on a block (store 0), waking blocked I/O paths.
     fn release_trim_claim(&self, block_number: u32) {
-        let prev = self.io_refcounts[block_number as usize].swap(0, Ordering::Release);
+        let prev = IoBlockRef(self.io_refcounts[block_number as usize].swap(0, Ordering::Release));
         assert_eq!(
-            prev, TRIM_SENTINEL,
-            "release_trim_claim on block {block_number} that wasn't claimed (was {prev})"
+            prev,
+            IoBlockRef::TRIM_CLAIMED,
+            "release_trim_claim on block {block_number} that wasn't claimed (was {:#06x})",
+            prev.0,
         );
-        self.io_wait_event.notify(usize::MAX);
+        self.refcount_event.notify(usize::MAX);
     }
 
-    /// Load the current I/O refcount for a block.
+    /// Load the current raw I/O refcount for a block (for testing).
     #[cfg(test)]
-    pub(crate) fn io_refcount(&self, block_number: u32) -> u32 {
+    pub(crate) fn io_refcount(&self, block_number: u32) -> u16 {
         self.io_refcounts[block_number as usize].load(Ordering::Acquire)
     }
 
@@ -638,7 +693,7 @@ impl Bat {
                 start_block,
                 block_count: 0,
             };
-            let listener = self.io_wait_event.listen();
+            let listener = self.refcount_event.listen();
             let mut blocked = false;
 
             for block in start_block..start_block + block_count {
@@ -654,7 +709,9 @@ impl Bat {
                 return guard;
             }
 
-            // Undo partial increments.
+            // Undo partial increments. With the corrected notification
+            // policy, rollback of blocks without trim-pending set will
+            // NOT fire refcount_event, so our listener stays live.
             drop(guard);
 
             // LOCK AUDIT: no locks held. Safe to await.
@@ -727,15 +784,12 @@ impl<'a> BatGuard<'a> {
 impl Drop for BatGuard<'_> {
     fn drop(&mut self) {
         let Some(bat) = self.bat else { return };
-        let mut any_zero = false;
+        let mut notify = false;
         for block in self.start_block..self.start_block + self.block_count {
-            if bat.decrement_io_refcount(block) == 1 {
-                // Was 1, now 0 — trim may be waiting.
-                any_zero = true;
-            }
+            notify |= bat.decrement_io_refcount(block);
         }
-        if any_zero {
-            bat.trim_event.notify(usize::MAX);
+        if notify {
+            bat.refcount_event.notify(usize::MAX);
         }
     }
 }
@@ -811,6 +865,8 @@ impl Iterator for BlockSpanIter {
 mod tests {
     use super::*;
     use crate::format;
+    use pal_async::async_test;
+    use std::sync::Arc;
 
     #[test]
     fn chunk_ratio_default_params() {
@@ -1103,5 +1159,175 @@ mod tests {
         let dealloc = BlockMapping::new().with_state(BatEntryState::NotPresent as u8);
         state.set_payload_mapping(&bat, 0, dealloc);
         assert_eq!(state.allocated_block_count, 1);
+    }
+
+    // ---- Refcount async behavior tests ----
+
+    fn make_test_bat() -> Bat {
+        Bat::new(4 * MB1, format::DEFAULT_BLOCK_SIZE, 512, false, MB1 as u32).unwrap()
+    }
+
+    #[test]
+    fn decrement_preserves_trim_pending_bit() {
+        let bat = make_test_bat();
+        // Simulate: trim-pending with 3 in-flight I/Os draining.
+        bat.io_refcounts[0].store(IoBlockRef::TRIM_PENDING_BIT | 3, Ordering::Release);
+        assert!(!bat.decrement_io_refcount(0), "3→2 should not need notify");
+        // After decrement: pending bit preserved, count is 2.
+        let cur = IoBlockRef(bat.io_refcount(0));
+        assert!(cur.trim_pending());
+        assert_eq!(cur.io_count(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "io_refcount underflow")]
+    fn decrement_panics_on_underflow() {
+        let _ = make_test_bat().decrement_io_refcount(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "trim claimed")]
+    fn decrement_panics_on_trim_claimed() {
+        let bat = make_test_bat();
+        bat.io_refcounts[0].store(IoBlockRef::TRIM_CLAIMED.0, Ordering::Release);
+        let _ = bat.decrement_io_refcount(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "wasn't claimed")]
+    fn release_trim_claim_panics_if_not_claimed() {
+        make_test_bat().release_trim_claim(0);
+    }
+
+    #[async_test]
+    async fn acquire_io_on_idle_block() {
+        let bat = make_test_bat();
+        let guard = bat.acquire_io_refcounts(0, 1).await;
+        assert_eq!(bat.io_refcount(0), 1);
+        drop(guard);
+        assert_eq!(bat.io_refcount(0), 0);
+    }
+
+    #[async_test]
+    async fn acquire_io_resumes_after_trim_releases() {
+        let bat = Arc::new(make_test_bat());
+        bat.io_refcounts[0].store(IoBlockRef::TRIM_CLAIMED.0, Ordering::Release);
+
+        let bat2 = bat.clone();
+        let io_task = async move {
+            let guard = bat2.acquire_io_refcounts(0, 1).await;
+            assert_eq!(bat2.io_refcount(0), 1);
+            drop(guard);
+        };
+
+        let release_task = async {
+            bat.release_trim_claim(0);
+        };
+
+        futures::future::join(io_task, release_task).await;
+        assert_eq!(bat.io_refcount(0), 0);
+    }
+
+    #[async_test]
+    async fn acquire_io_multi_block_rolls_back_on_partial_conflict() {
+        let bat = Arc::new(make_test_bat());
+        bat.io_refcounts[1].store(IoBlockRef::TRIM_CLAIMED.0, Ordering::Release);
+
+        let bat2 = bat.clone();
+        let io_task = async move {
+            let guard = bat2.acquire_io_refcounts(0, 2).await;
+            assert_eq!(bat2.io_refcount(0), 1);
+            assert_eq!(bat2.io_refcount(1), 1);
+            drop(guard);
+        };
+
+        let release_task = async {
+            bat.release_trim_claim(1);
+        };
+
+        futures::future::join(io_task, release_task).await;
+    }
+
+    #[async_test]
+    async fn claim_for_trim_on_idle_block() {
+        let bat = make_test_bat();
+        let guard = bat.claim_for_trim(0).await;
+        assert_eq!(bat.io_refcount(0), IoBlockRef::TRIM_CLAIMED.0);
+        drop(guard);
+        assert_eq!(bat.io_refcount(0), 0);
+    }
+
+    #[async_test]
+    async fn claim_for_trim_waits_for_io_drain() {
+        let bat = Arc::new(make_test_bat());
+
+        let io_guard = bat.acquire_io_refcounts(0, 1).await;
+        assert_eq!(bat.io_refcount(0), 1);
+
+        let trim_task = async {
+            let guard = bat.claim_for_trim(0).await;
+            assert_eq!(bat.io_refcount(0), IoBlockRef::TRIM_CLAIMED.0);
+            guard
+        };
+
+        let drain_task = async {
+            // After trim_task's first poll, trim-pending is set.
+            assert!(IoBlockRef(bat.io_refcount(0)).trim_pending());
+            assert!(!bat.try_increment_io_refcount(0));
+            drop(io_guard);
+        };
+
+        let (trim_guard, ()) = futures::future::join(trim_task, drain_task).await;
+        drop(trim_guard);
+        assert_eq!(bat.io_refcount(0), 0);
+    }
+
+    #[async_test]
+    async fn trim_has_writer_priority_over_new_io() {
+        let bat = Arc::new(make_test_bat());
+
+        // Block 0 has an in-flight I/O.
+        let io_guard = bat.acquire_io_refcounts(0, 1).await;
+
+        // Trim claims — sets pending, waits for drain.
+        let trim_task = async {
+            let guard = bat.claim_for_trim(0).await;
+            assert_eq!(bat.io_refcount(0), IoBlockRef::TRIM_CLAIMED.0);
+            guard
+        };
+        let drain_task = async { drop(io_guard) };
+
+        let (trim_guard, ()) = futures::future::join(trim_task, drain_task).await;
+
+        // Trim owns the block. New I/O should be blocked.
+        assert!(!bat.try_increment_io_refcount(0));
+
+        // Release trim, then new I/O should succeed.
+        drop(trim_guard);
+        let io_guard2 = bat.acquire_io_refcounts(0, 1).await;
+        assert_eq!(bat.io_refcount(0), 1);
+        drop(io_guard2);
+        assert_eq!(bat.io_refcount(0), 0);
+    }
+
+    #[async_test]
+    async fn acquire_io_blocked_at_overflow_resumes() {
+        let bat = Arc::new(make_test_bat());
+        bat.io_refcounts[0].store(IoBlockRef::MAX_IO_REFCOUNT, Ordering::Release);
+
+        let bat2 = bat.clone();
+        let io_task = async move {
+            let guard = bat2.acquire_io_refcounts(0, 1).await;
+            assert_eq!(bat2.io_refcount(0), IoBlockRef::MAX_IO_REFCOUNT);
+            drop(guard);
+        };
+
+        let unblock_task = async {
+            if bat.decrement_io_refcount(0) {
+                bat.refcount_event.notify(usize::MAX);
+            }
+        };
+
+        futures::future::join(io_task, unblock_task).await;
     }
 }

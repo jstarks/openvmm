@@ -327,8 +327,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                 return Ok(());
             }
 
-            // 9a. Claim the block: CAS refcount 0 → TRIM_SENTINEL.
-            //     If I/O is active (refcount > 0), wait for it to drain.
+            // 9a. Claim the block: set trim-pending to block new I/O,
+            //     wait for in-flight I/Os to drain, then take exclusive
+            //     ownership.
             let claim = self.bat.claim_for_trim(current_block).await;
 
             // 9b. Block is claimed — no new I/O can start on it.

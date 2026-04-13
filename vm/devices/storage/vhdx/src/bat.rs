@@ -21,8 +21,8 @@ use crate::format::CACHE_PAGE_SIZE;
 use crate::format::ENTRIES_PER_BAT_PAGE;
 use crate::format::MB1;
 use bitfield_struct::bitfield;
-use parking_lot::RwLock;
 use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use zerocopy::IntoBytes;
 
@@ -99,10 +99,14 @@ pub(crate) struct Bat {
     /// Whether the disk has a parent (differencing).
     pub has_parent: bool,
 
-    bat_state: RwLock<BatState>,
+    /// One `AtomicU32` per payload block (indexed by block number).
+    /// Each stores a [`BlockMapping`] bitfield. Lock-free: individual
+    /// entries are read/written atomically without a shared lock.
+    payload_mappings: Vec<AtomicU32>,
+    /// One `AtomicU32` per sector bitmap block (indexed by chunk number).
+    sector_bitmap_mappings: Vec<AtomicU32>,
 
     /// Per-payload-block I/O refcounts (see [`IoBlockRef`] for layout).
-    /// Atomic to avoid requiring the bat_state write lock on the hot path.
     io_refcounts: Vec<AtomicU16>,
 
     /// Notified whenever a block's refcount changes in a way that could
@@ -215,40 +219,6 @@ pub(crate) enum BlockType {
     SectorBitmap,
 }
 
-/// In-memory BAT state. Protected by `parking_lot::RwLock` on `VhdxFile`.
-/// All block state lookups read from this structure — no file I/O needed.
-///
-/// I/O refcounts are stored separately on [`Bat::io_refcounts`] as atomics,
-/// outside this lock.
-struct BatState {
-    /// One entry per payload block (indexed by block number).
-    payload_mappings: Vec<BlockMapping>,
-    /// One entry per sector bitmap block (indexed by chunk number).
-    sector_bitmap_mappings: Vec<BlockMapping>,
-}
-
-impl BatState {
-    /// Get the in-memory mapping for a payload block.
-    fn get_payload_mapping(&self, block_number: u32) -> BlockMapping {
-        self.payload_mappings[block_number as usize]
-    }
-
-    /// Get the in-memory mapping for a sector bitmap block.
-    fn get_sbm_mapping(&self, chunk_number: u32) -> BlockMapping {
-        self.sector_bitmap_mappings[chunk_number as usize]
-    }
-
-    /// Update the in-memory mapping for a payload block.
-    fn set_payload_mapping(&mut self, block_number: u32, mapping: BlockMapping) {
-        self.payload_mappings[block_number as usize] = mapping;
-    }
-
-    /// Update the in-memory mapping for a sector bitmap block.
-    fn set_sbm_mapping(&mut self, chunk_number: u32, mapping: BlockMapping) {
-        self.sector_bitmap_mappings[chunk_number as usize] = mapping;
-    }
-}
-
 impl Bat {
     /// Create a new BAT manager from parsed metadata.
     ///
@@ -284,11 +254,10 @@ impl Bat {
             return Err(VhdxError::Corrupt(CorruptionType::BatTooSmall));
         }
 
-        let bat_state = BatState {
-            payload_mappings: Vec::with_capacity(data_block_count as usize),
-            sector_bitmap_mappings: Vec::with_capacity(sector_bitmap_block_count as usize),
-        };
-
+        let payload_mappings = (0..data_block_count).map(|_| AtomicU32::new(0)).collect();
+        let sector_bitmap_mappings = (0..sector_bitmap_block_count)
+            .map(|_| AtomicU32::new(0))
+            .collect();
         let io_refcounts = (0..data_block_count).map(|_| AtomicU16::new(0)).collect();
 
         Ok(Bat {
@@ -297,7 +266,8 @@ impl Bat {
             chunk_ratio,
             block_size,
             has_parent,
-            bat_state: bat_state.into(),
+            payload_mappings,
+            sector_bitmap_mappings,
             io_refcounts,
             refcount_event: event_listener::Event::new(),
         })
@@ -473,12 +443,11 @@ impl Bat {
     /// `Vhd2iGenerateBatEntry` behavior.
     fn produce_page(&self, page_index: usize, buf: &mut [u8; CACHE_PAGE_SIZE as usize]) {
         let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
-        let bat_state = self.bat_state.read();
         for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
             let entry_number = base_entry + i;
             let bat_entry = match self.entry_number_to_block_id(entry_number) {
                 Some((BlockType::Payload, block_number)) => {
-                    let mapping = bat_state.get_payload_mapping(block_number);
+                    let mapping = self.get_block_mapping(block_number);
                     let file_mb = if mapping.transitioning_to_fully_present() {
                         0
                     } else {
@@ -489,7 +458,7 @@ impl Bat {
                         .with_file_offset_mb(file_mb)
                 }
                 Some((BlockType::SectorBitmap, chunk_number)) => {
-                    let mapping = bat_state.get_sbm_mapping(chunk_number);
+                    let mapping = self.get_sector_bitmap_mapping(chunk_number);
                     BatEntry::new()
                         .with_state(mapping.state())
                         .with_file_offset_mb(mapping.file_megabyte() as u64)
@@ -543,15 +512,12 @@ impl Bat {
         // concurrent trim on a block sharing the same page can't dirty
         // the page (and get it flushed to WAL) between our in-memory
         // update and the FSN stamp below.
-        {
-            let mut bat_state = self.bat_state.write();
-            match block_type {
-                BlockType::Payload => {
-                    bat_state.set_payload_mapping(block_number, mapping);
-                }
-                BlockType::SectorBitmap => {
-                    bat_state.set_sbm_mapping(block_number, mapping);
-                }
+        match block_type {
+            BlockType::Payload => {
+                self.set_block_mapping(block_number, mapping);
+            }
+            BlockType::SectorBitmap => {
+                self.set_sector_bitmap_mapping(block_number, mapping);
             }
         }
 
@@ -609,7 +575,7 @@ impl Bat {
                 free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
                 free_space.mark_trimmed_block(block, file_offset, self.block_size)?;
             }
-            self.bat_state.get_mut().payload_mappings.push(mapping);
+            self.payload_mappings[block as usize].store(mapping.into(), Ordering::Relaxed);
         }
 
         // Read all sector bitmap entries.
@@ -627,10 +593,7 @@ impl Bat {
                     )?;
                 }
             }
-            self.bat_state
-                .get_mut()
-                .sector_bitmap_mappings
-                .push(mapping);
+            self.sector_bitmap_mappings[chunk as usize].store(mapping.into(), Ordering::Relaxed);
         }
 
         Ok(())
@@ -686,38 +649,83 @@ impl Bat {
 
     /// Look up the payload block mapping for a given data block number.
     ///
-    /// Synchronous — reads from the in-memory BAT under a read lock.
+    /// Returns a point-in-time snapshot. Callers that hold I/O
+    /// refcounts can rely on the following:
+    ///
+    /// - **`file_offset` is stable for allocated blocks.** If the
+    ///   mapping shows `FullyPresent` or `PartiallyPresent`, the file
+    ///   offset won't be reclaimed out from under you — trim must
+    ///   drain I/O refcounts before it can claim the block.
+    /// - **State can only advance, not regress.** A block that is
+    ///   `FullyPresent` won't revert to `NotPresent` while I/O
+    ///   refcounts are held. (Trim sets the pending bit to block new
+    ///   I/O, then waits for existing I/O to drain.)
+    /// - **TFP blocks are in flight.** If `transitioning_to_fully_present`
+    ///   is set, another writer is mid-allocation. The write path waits
+    ///   on `allocation_event` and retries; the read path ignores TFP
+    ///   and uses the current state+offset directly (safe because the
+    ///   file offset is valid and I/O refcounts prevent reclamation).
+    ///
+    /// Without I/O refcounts (or a trim claim), the mapping is purely
+    /// advisory — the block could be trimmed between the load and any
+    /// action on it.
     pub(crate) fn get_block_mapping(&self, block_number: u32) -> BlockMapping {
-        let bat_state = self.bat_state.read();
-        bat_state.get_payload_mapping(block_number)
+        BlockMapping::from(self.payload_mappings[block_number as usize].load(Ordering::Acquire))
     }
 
     /// Look up the sector bitmap block mapping for a given chunk number.
     ///
-    /// Synchronous — reads from the in-memory BAT under a read lock.
+    /// SBM mappings are set once during allocation and never revert,
+    /// so any reader that sees `FullyPresent` can rely on the file
+    /// offset being stable indefinitely. A reader that sees
+    /// `NotPresent` must allocate the SBM block before proceeding
+    /// (see `ensure_sbm_allocated`).
     pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
-        let bat_state = self.bat_state.read();
-        bat_state.get_sbm_mapping(chunk_number)
+        BlockMapping::from(
+            self.sector_bitmap_mappings[chunk_number as usize].load(Ordering::Acquire),
+        )
     }
 
     /// Update the payload block mapping for a given data block number.
     ///
-    /// Synchronous — writes to the in-memory BAT under a write lock.
+    /// In-memory only — does not persist to cache or disk. Use
+    /// [`write_block_mapping`](Self::write_block_mapping) to persist.
+    ///
+    /// Allowed transitions and their required guards:
+    ///
+    /// - Unallocated → same state + TFP + file offset: `allocation_lock`.
+    ///   (Unallocated = NotPresent, Zero, Unmapped, or Undefined.)
+    /// - PartiallyPresent → same state + TFP: `allocation_lock`.
+    /// - Any + TFP → original mapping (revert): abort path — TFP
+    ///   acts as an exclusive flag so no other guard is needed.
+    /// - Soft-anchored → same state + file_megabyte=0: `allocation_lock`.
+    ///
+    /// The TFP bit is the key invariant: once set on a block, no other
+    /// allocator will touch that block (they wait on `allocation_event`),
+    /// and trim cannot reach it because the allocator holds I/O
+    /// refcounts on TFP blocks. This makes the setter the exclusive
+    /// owner until TFP is cleared.
     pub(crate) fn set_block_mapping(&self, block_number: u32, mapping: BlockMapping) {
-        let mut bat_state = self.bat_state.write();
-        bat_state.set_payload_mapping(self, block_number, mapping);
+        self.payload_mappings[block_number as usize].store(mapping.into(), Ordering::Release);
+    }
+
+    /// Update the sector bitmap block mapping for a given chunk number.
+    ///
+    /// Only called from [`write_block_mapping`](Self::write_block_mapping)
+    /// under the page cache write lock. SBM mappings transition from
+    /// `NotPresent` to `FullyPresent` exactly once and never revert.
+    fn set_sector_bitmap_mapping(&self, chunk_number: u32, mapping: BlockMapping) {
+        self.sector_bitmap_mappings[chunk_number as usize].store(mapping.into(), Ordering::Release);
     }
 
     /// Initialize payload mappings for testing. Replaces any existing
     /// mappings with `data_block_count` entries set to `NotPresent`.
     #[cfg(test)]
     pub(crate) fn init_test_payload_mappings(&mut self) {
-        let state = self.bat_state.get_mut();
-        state.payload_mappings.clear();
-        state.payload_mappings.resize(
-            self.data_block_count as usize,
-            BlockMapping::new().with_bat_state(BatEntryState::NotPresent),
-        );
+        let not_present = BlockMapping::new().with_bat_state(BatEntryState::NotPresent);
+        for mapping in &self.payload_mappings {
+            mapping.store(not_present.into(), Ordering::Relaxed);
+        }
     }
 }
 

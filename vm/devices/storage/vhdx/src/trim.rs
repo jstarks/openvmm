@@ -341,12 +341,8 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             // 9b. Block is claimed — no new I/O can start on it.
             //     Read the mapping and compute the trim conversion.
-            let (old_mapping, new_mapping) = {
-                let bat_state = self.bat.bat_state.read();
-                let old = bat_state.get_payload_mapping(current_block);
-                let new = convert_mapping(mode, old);
-                (old, new)
-            };
+            let old_mapping = self.bat.get_block_mapping(current_block);
+            let new_mapping = convert_mapping(mode, old_mapping);
 
             if old_mapping == new_mapping {
                 // No-op — release claim and advance.
@@ -354,14 +350,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                 continue;
             }
 
-            // 9c. Update in-memory BAT under write lock.
-            {
-                let mut bat_state = self.bat.bat_state.write();
-                bat_state.set_payload_mapping(&self.bat, current_block, new_mapping);
-            }
+            // 9c. Update in-memory BAT.
+            self.bat.set_block_mapping(current_block, new_mapping);
 
             // 9d. Write BAT entry to cache (async).
-            // LOCK AUDIT: bat_state write-lock dropped. Trim claim held (not a sync lock). Safe to await.
+            // LOCK AUDIT: Trim claim held (not a sync lock). Safe to await.
             self.bat
                 .write_block_mapping(
                     &self.cache,
@@ -487,8 +480,7 @@ mod tests {
         block_number: u32,
         expected: BatEntryState,
     ) {
-        let bat_state = vhdx.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(block_number);
+        let mapping = vhdx.bat.get_block_mapping(block_number);
         let actual = mapping.bat_state();
         assert_eq!(
             actual, expected,
@@ -498,9 +490,7 @@ mod tests {
 
     /// Helper to check if a block has a non-zero file megabyte (soft anchor).
     fn block_has_file_offset(vhdx: &VhdxFile<InMemoryFile>, block_number: u32) -> bool {
-        let bat_state = vhdx.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(block_number);
-        mapping.file_megabyte() != 0
+        vhdx.bat.get_block_mapping(block_number).file_megabyte() != 0
     }
 
     // ---- included_blocks unit tests ----
@@ -1027,8 +1017,7 @@ mod tests {
             .unwrap();
 
         // Blocks should be unchanged.
-        let bat_state = vhdx.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         let state = mapping.bat_state();
         // On a fully-allocated disk, blocks start as Undefined (not yet written).
         // The FileSpace mode is a no-op, so they stay the same.

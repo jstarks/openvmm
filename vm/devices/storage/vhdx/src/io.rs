@@ -273,8 +273,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             // Read the in-memory BAT state.
             loop {
                 let (state, file_offset, has_tfp) = {
-                    let bat_state = self.bat.bat_state.read();
-                    let mapping = bat_state.get_payload_mapping(block_number);
+                    let mapping = self.bat.get_block_mapping(block_number);
                     (
                         mapping.bat_state(),
                         mapping.file_offset(),
@@ -284,17 +283,14 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                 if has_tfp {
                     // Block is being allocated by another task — wait and retry.
-                    let listener = {
-                        let _bat_state = self.bat.bat_state.read();
-                        // Re-check under lock to avoid wake-miss race.
-                        let mapping = _bat_state.get_payload_mapping(block_number);
-                        if !mapping.transitioning_to_fully_present() {
-                            continue; // TFP cleared while we were setting up — retry
-                        }
-                        self.allocation_event.listen()
-                    };
-                    // LOCK AUDIT: bat_state read-lock dropped above (end of block). Safe to await.
-                    listener.await;
+                    let listener = self.allocation_event.listen();
+                    if self
+                        .bat
+                        .get_block_mapping(block_number)
+                        .transitioning_to_fully_present()
+                    {
+                        listener.await;
+                    }
                     continue;
                 }
 
@@ -378,25 +374,15 @@ impl<F: AsyncFile> VhdxFile<F> {
 
             // Check all blocks under BAT lock for TFP overlap.
             // Register listener before dropping locks to avoid missed wakes.
-            let listener = {
-                let bat_state = self.bat.bat_state.read();
-                let has_overlap = blocks_needing_allocation.iter().any(|block_info| {
-                    bat_state
-                        .get_payload_mapping(block_info.block_number)
-                        .transitioning_to_fully_present()
-                });
-                if !has_overlap {
-                    break alloc_guard;
-                }
-                // Register listener while holding bat_state lock to
-                // avoid wake-miss race.
-                self.allocation_event.listen()
-            };
-
-            // Drop the allocation lock before waiting so that the
-            // concurrent writer can complete its post-allocate.
+            let listener = self.allocation_event.listen();
+            if !blocks_needing_allocation.iter().any(|block_info| {
+                self.bat
+                    .get_block_mapping(block_info.block_number)
+                    .transitioning_to_fully_present()
+            }) {
+                break alloc_guard;
+            }
             drop(alloc_guard);
-            // LOCK AUDIT: Both allocation_lock and bat_state dropped above. Safe to await.
             listener.await;
         };
 
@@ -424,11 +410,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                 let is_full_block =
                     block_info.block_offset == 0 && block_info.block_length >= self.block_size;
 
-                // Re-read mapping under lock (may have changed since read phase).
-                let mapping = {
-                    let bat_state = self.bat.bat_state.read();
-                    bat_state.get_payload_mapping(block_info.block_number)
-                };
+                // Re-read mapping (may have changed since read phase).
+                let mapping = self.bat.get_block_mapping(block_info.block_number);
 
                 // Assert no TFP — we serialized against concurrent
                 // allocators in the loop above.
@@ -455,14 +438,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                         let original = mapping;
                         let new_mapping = original.with_transitioning_to_fully_present(true);
 
-                        {
-                            let mut bat_state = self.bat.bat_state.write();
-                            bat_state.set_payload_mapping(
-                                &self.bat,
-                                block_info.block_number,
-                                new_mapping,
-                            );
-                        }
+                        self.bat
+                            .set_block_mapping(block_info.block_number, new_mapping);
 
                         tfp_records.push(TfpRecord {
                             block_number: block_info.block_number,
@@ -532,14 +509,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 .with_transitioning_to_fully_present(true)
                                 .with_file_megabyte((new_offset / MB1) as u32);
 
-                            {
-                                let mut bat_state = self.bat.bat_state.write();
-                                bat_state.set_payload_mapping(
-                                    &self.bat,
-                                    block_info.block_number,
-                                    new_mapping,
-                                );
-                            }
+                            self.bat
+                                .set_block_mapping(block_info.block_number, new_mapping);
 
                             tfp_records.push(TfpRecord {
                                 block_number: block_info.block_number,
@@ -595,10 +566,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                         .with_bat_state(BatEntryState::FullyPresent)
                                         .with_file_megabyte((sbm_alloc.file_offset / MB1) as u32);
 
-                                    {
-                                        let mut bat_state = self.bat.bat_state.write();
-                                        bat_state.set_sbm_mapping(&self.bat, chunk_number, new_sbm);
-                                    }
+                                    self.bat.set_sector_bitmap_mapping(chunk_number, new_sbm);
 
                                     // Persist SBM BAT entry to disk.
                                     self.bat
@@ -624,14 +592,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 .with_transitioning_to_fully_present(false)
                                 .with_file_megabyte((new_offset / MB1) as u32);
 
-                            {
-                                let mut bat_state = self.bat.bat_state.write();
-                                bat_state.set_payload_mapping(
-                                    &self.bat,
-                                    block_info.block_number,
-                                    new_mapping,
-                                );
-                            }
+                            self.bat
+                                .set_block_mapping(block_info.block_number, new_mapping);
 
                             // For non-TFP path: capture per-page FSN when
                             // !is_safe. The FSN is captured now (before
@@ -703,18 +665,12 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Error cleanup: revert TFP-marked blocks and release allocated space on failure.
         if let Err(e) = allocation_result {
-            {
-                let mut bat_state = self.bat.bat_state.write();
-                for record in &tfp_records {
-                    bat_state.set_payload_mapping(
-                        &self.bat,
-                        record.block_number,
-                        record.original_mapping,
-                    );
-                    // Release allocated space back to free pool.
-                    if let Some(offset) = record.allocated_offset {
-                        self.free_space.release(offset, self.block_size);
-                    }
+            for record in &tfp_records {
+                self.bat
+                    .set_block_mapping(record.block_number, record.original_mapping);
+                // Release allocated space back to free pool.
+                if let Some(offset) = record.allocated_offset {
+                    self.free_space.release(offset, self.block_size);
                 }
             }
             self.allocation_event.notify(usize::MAX);
@@ -767,10 +723,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
             // Read the in-memory mapping to check for TFP.
-            let mapping = {
-                let bat_state = self.bat.bat_state.read();
-                bat_state.get_payload_mapping(block_number)
-            };
+            let mapping = self.bat.get_block_mapping(block_number);
 
             if mapping.transitioning_to_fully_present() {
                 had_tfp = true;
@@ -781,10 +734,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     .with_transitioning_to_fully_present(false)
                     .with_file_megabyte(mapping.file_megabyte());
 
-                {
-                    let mut bat_state = self.bat.bat_state.write();
-                    bat_state.set_payload_mapping(&self.bat, block_number, final_mapping);
-                }
+                self.bat.set_block_mapping(block_number, final_mapping);
 
                 // Write per-entry to cache. Errors are deferred so we
                 // can still notify waiters.
@@ -861,10 +811,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             let block_offset = self.bat.offset_within_block(virtual_offset);
             let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
-            let mapping = {
-                let bat_state = self.bat.bat_state.read();
-                bat_state.get_payload_mapping(block_number)
-            };
+            let mapping = self.bat.get_block_mapping(block_number);
 
             if mapping.transitioning_to_fully_present() {
                 had_tfp = true;
@@ -886,8 +833,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     }
                 };
 
-                let mut bat_state = self.bat.bat_state.write();
-                bat_state.set_payload_mapping(&self.bat, block_number, reverted);
+                self.bat.set_block_mapping(block_number, reverted);
             }
 
             current_offset += block_length;
@@ -1789,8 +1735,7 @@ mod tests {
             .unwrap();
 
         // Full-block write should set TFP on block 0.
-        let bat_state = vhdx.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert!(
             mapping.transitioning_to_fully_present(),
             "full-block resolve_write should set TFP"
@@ -1810,8 +1755,7 @@ mod tests {
         let _guard = vhdx.resolve_write(0, 512, &mut ranges).await.unwrap();
 
         // Partial-block write should NOT set TFP — BAT committed immediately.
-        let bat_state = vhdx.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert!(
             !mapping.transitioning_to_fully_present(),
             "partial-block resolve_write should not set TFP"
@@ -1963,8 +1907,7 @@ mod tests {
         // Reopen from snapshot (log replay recovers the state).
         let recovered = InMemoryFile::from_snapshot(snapshot);
         let vhdx2 = VhdxFile::open(recovered).writable(&driver).await.unwrap();
-        let bat_state = vhdx2.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(0);
+        let mapping = vhdx2.bat.get_block_mapping(0);
         assert_eq!(
             mapping.bat_state(),
             BatEntryState::FullyPresent,
@@ -1990,8 +1933,7 @@ mod tests {
             .unwrap();
 
         {
-            let bat_state = vhdx.bat.bat_state.read();
-            let mapping = bat_state.get_payload_mapping(0);
+            let mapping = vhdx.bat.get_block_mapping(0);
             assert!(mapping.transitioning_to_fully_present());
         }
 
@@ -1999,8 +1941,7 @@ mod tests {
         guard.complete().await.unwrap();
 
         {
-            let bat_state = vhdx.bat.bat_state.read();
-            let mapping = bat_state.get_payload_mapping(0);
+            let mapping = vhdx.bat.get_block_mapping(0);
             assert!(
                 !mapping.transitioning_to_fully_present(),
                 "TFP should be cleared after complete_write"
@@ -2026,10 +1967,7 @@ mod tests {
             .unwrap();
 
         // Get the allocated offset from in-memory BAT.
-        let expected_mb = {
-            let bat_state = vhdx.bat.bat_state.read();
-            bat_state.get_payload_mapping(0).file_megabyte()
-        };
+        let expected_mb = vhdx.bat.get_block_mapping(0).file_megabyte();
 
         guard.complete().await.unwrap();
         vhdx.flush().await.unwrap();
@@ -2040,8 +1978,7 @@ mod tests {
         // Reopen from snapshot (log replay recovers the state).
         let recovered = InMemoryFile::from_snapshot(snapshot);
         let vhdx2 = VhdxFile::open(recovered).writable(&driver).await.unwrap();
-        let bat_state = vhdx2.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(0);
+        let mapping = vhdx2.bat.get_block_mapping(0);
         assert_eq!(
             mapping.bat_state(),
             BatEntryState::FullyPresent,
@@ -2110,10 +2047,9 @@ mod tests {
 
         // TFP should be set.
         {
-            let bat_state = vhdx.bat.bat_state.read();
             assert!(
-                bat_state
-                    .get_payload_mapping(0)
+                vhdx.bat
+                    .get_block_mapping(0)
                     .transitioning_to_fully_present()
             );
         }
@@ -2123,8 +2059,7 @@ mod tests {
 
         // TFP should be cleared and state reverted to NotPresent.
         {
-            let bat_state = vhdx.bat.bat_state.read();
-            let mapping = bat_state.get_payload_mapping(0);
+            let mapping = vhdx.bat.get_block_mapping(0);
             assert!(
                 !mapping.transitioning_to_fully_present(),
                 "TFP should be cleared after abort"
@@ -2165,8 +2100,7 @@ mod tests {
         guard2.complete().await.unwrap();
 
         // Block should be FullyPresent now.
-        let bat_state = vhdx.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.bat_state(), BatEntryState::FullyPresent);
         assert!(!mapping.transitioning_to_fully_present());
     }
@@ -2211,8 +2145,7 @@ mod tests {
 
         // TFP should be cleared and state set to FullyPresent.
         {
-            let bat_state = vhdx.bat.bat_state.read();
-            let mapping = bat_state.get_payload_mapping(0);
+            let mapping = vhdx.bat.get_block_mapping(0);
             assert!(
                 !mapping.transitioning_to_fully_present(),
                 "TFP should be cleared after complete"
@@ -2265,8 +2198,7 @@ mod tests {
 
         // TFP should be reverted.
         {
-            let bat_state = vhdx.bat.bat_state.read();
-            let mapping = bat_state.get_payload_mapping(0);
+            let mapping = vhdx.bat.get_block_mapping(0);
             assert!(
                 !mapping.transitioning_to_fully_present(),
                 "TFP should be reverted on resolve_write error"
@@ -2644,8 +2576,7 @@ mod tests {
         assert!(!ranges_b.is_empty(), "task_b produced no ranges");
 
         // Block should be FullyPresent.
-        let bat_state = vhdx.bat.bat_state.read();
-        let mapping = bat_state.get_payload_mapping(0);
+        let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.bat_state(), BatEntryState::FullyPresent);
         assert!(!mapping.transitioning_to_fully_present());
     }

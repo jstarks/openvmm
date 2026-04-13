@@ -15,7 +15,7 @@
 //! The bitmap uses 1-bit-per-megabyte granularity with SET = free / anchored
 //! and CLEAR = in-use, matching the C implementation's `RTL_BITMAP` semantics.
 
-use crate::bat::BatState;
+use crate::bat::Bat;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
@@ -496,9 +496,9 @@ impl FreeSpaceTracker {
         eof: &mut EofState,
         size: u32,
         aligned: bool,
-        bat_state: &BatState,
+        bat: &Bat,
     ) -> Option<AllocateResult> {
-        self.try_allocate_inner(eof, size, aligned, Some(bat_state))
+        self.try_allocate_inner(eof, size, aligned, Some(bat))
     }
 
     /// Try all three in-memory allocation priorities.
@@ -507,7 +507,7 @@ impl FreeSpaceTracker {
         eof: &mut EofState,
         size: u32,
         aligned: bool,
-        bat_state: Option<&BatState>,
+        bat: Option<&Bat>,
     ) -> Option<AllocateResult> {
         let mut inner = self.inner.lock();
         // Priority 1: free space pool.
@@ -544,9 +544,9 @@ impl FreeSpaceTracker {
         // the old block's file_megabyte in BatState and write its BAT page
         // to cache.
         if size <= inner.block_size {
-            if let Some(bat_state) = bat_state {
+            if let Some(bat) = bat {
                 if let Some((file_offset, block_number)) =
-                    inner.find_and_unanchor_in_memory_inner(bat_state)
+                    inner.find_and_unanchor_in_memory_inner(bat)
                 {
                     // If the allocated block is larger than needed, release excess.
                     if size < inner.block_size {
@@ -840,7 +840,7 @@ impl FreeSpaceInner {
     }
 
     /// Find and unanchor an in-memory-only soft-anchored block.
-    fn find_and_unanchor_in_memory_inner(&mut self, bat_state: &BatState) -> Option<(u64, u32)> {
+    fn find_and_unanchor_in_memory_inner(&mut self, bat: &Bat) -> Option<(u64, u32)> {
         if self.trimmed_blocks.num_trimmed_blocks == 0 {
             return None;
         }
@@ -860,7 +860,7 @@ impl FreeSpaceInner {
             };
 
             trimmed_found += 1;
-            let mapping = bat_state.get_payload_mapping(block_number as u32);
+            let mapping = bat.get_block_mapping(block_number as u32);
 
             // Block must be soft-anchored: unmapped/undefined state with non-zero file_megabyte.
             let state = mapping.bat_state();
@@ -1102,12 +1102,9 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         loop {
             // Try priorities 1–3 (pool, near-EOF, anchored).
-            // Pass BAT state for soft-anchor lookup.
-            let result = {
-                let bat_state = self.bat.bat_state.read();
-                self.free_space
-                    .try_allocate_with_bat(eof, size, flags.aligned(), &bat_state)
-            };
+            let result = self
+                .free_space
+                .try_allocate_with_bat(eof, size, flags.aligned(), &self.bat);
 
             if let Some(alloc) = result {
                 // If this was a cross-block soft-anchor reclaim, clear the
@@ -1116,18 +1113,15 @@ impl<F: AsyncFile> VhdxFile<F> {
                 // (TrimmedBlockTracker is only populated after flush), so
                 // no extra flush is needed — just BAT write ordering.
                 if let Some(old_block) = alloc.unanchored_block {
-                    let cleared_mapping = {
-                        let mut bat_state = self.bat.bat_state.write();
-                        let old_mapping = bat_state.get_payload_mapping(old_block);
-                        let cleared = BlockMapping::new()
-                            .with_bat_state(old_mapping.bat_state())
-                            .with_transitioning_to_fully_present(false)
-                            .with_file_megabyte(0);
-                        bat_state.set_payload_mapping(&self.bat, old_block, cleared);
-                        cleared
-                    };
+                    let old_mapping = self.bat.get_block_mapping(old_block);
+                    let cleared_mapping = BlockMapping::new()
+                        .with_bat_state(old_mapping.bat_state())
+                        .with_transitioning_to_fully_present(false)
+                        .with_file_megabyte(0);
+                    self.bat.set_block_mapping(old_block, cleared_mapping);
+
                     // Write old block's BAT page to cache (async).
-                    // LOCK AUDIT: bat_state write-lock dropped. allocation_lock held.
+                    // LOCK AUDIT: allocation_lock held.
                     self.bat
                         .write_block_mapping(
                             &self.cache,
@@ -1229,9 +1223,9 @@ impl FreeSpaceTracker {
     }
 
     /// Find and unanchor a soft-anchored block (in-memory only anchors).
-    pub fn find_and_unanchor_in_memory(&self, bat_state: &BatState) -> Option<(u64, u32)> {
+    pub fn find_and_unanchor_in_memory(&self, bat: &Bat) -> Option<(u64, u32)> {
         let mut inner = self.inner.lock();
-        inner.find_and_unanchor_in_memory_inner(bat_state)
+        inner.find_and_unanchor_in_memory_inner(bat)
     }
 
     /// Check if a range is in use (for debug/validation).
@@ -1489,25 +1483,27 @@ mod tests {
 
     // -- Soft anchoring tests --
 
-    fn make_bat_state_with_anchored_block(
+    /// Create a minimal `Bat` for soft-anchor tests with one anchored block.
+    ///
+    /// Uses 2 MiB block size, 512-byte sectors, no parent. The
+    /// `data_block_count` parameter controls how many payload entries
+    /// the BAT has.
+    fn make_test_bat_with_anchored_block(
         block_number: u32,
         file_megabyte: u32,
         data_block_count: u32,
-    ) -> BatState {
-        let mut payload_mappings = vec![
+    ) -> Bat {
+        let block_size = 2 * MB1 as u32;
+        let disk_size = data_block_count as u64 * block_size as u64;
+        let mut bat = Bat::new(disk_size, block_size, 512, false, MB1 as u32).unwrap();
+        bat.init_test_payload_mappings();
+        bat.set_block_mapping(
+            block_number,
             BlockMapping::new()
-                .with_bat_state(BatEntryState::NotPresent);
-            data_block_count as usize
-        ];
-        payload_mappings[block_number as usize] = BlockMapping::new()
-            .with_bat_state(BatEntryState::Unmapped)
-            .with_file_megabyte(file_megabyte);
-
-        BatState {
-            payload_mappings,
-            sector_bitmap_mappings: Vec::new(),
-            allocated_block_count: 0,
-        }
+                .with_bat_state(BatEntryState::Unmapped)
+                .with_file_megabyte(file_megabyte),
+        );
+        bat
     }
 
     #[test]
@@ -1549,9 +1545,9 @@ mod tests {
             .mark_trimmed_block(5, 8 * MB1, 2 * MB1 as u32)
             .unwrap();
 
-        let bat_state = make_bat_state_with_anchored_block(5, 8, 16);
+        let bat = make_test_bat_with_anchored_block(5, 8, 16);
 
-        let result = tracker.find_and_unanchor_in_memory(&bat_state);
+        let result = tracker.find_and_unanchor_in_memory(&bat);
         assert!(result.is_some());
         let (offset, block_num) = result.unwrap();
         assert_eq!(offset, 8 * MB1);
@@ -1585,10 +1581,10 @@ mod tests {
             .unwrap();
         tracker.complete_initialization(&eof);
 
-        let bat_state = make_bat_state_with_anchored_block(2, 6, 16);
+        let bat = make_test_bat_with_anchored_block(2, 6, 16);
 
         // Should find anchored space (priority 3) instead of extending EOF.
-        let result = tracker.try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state);
+        let result = tracker.try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.file_offset, 6 * MB1);
@@ -1674,26 +1670,26 @@ mod tests {
         // Release bit 4 back to pool.
         tracker.release(4 * MB1, MB1 as u32);
 
-        // Create BAT state for soft-anchor lookup.
-        let bat_state = make_bat_state_with_anchored_block(1, 5, 16);
+        // Create BAT for soft-anchor lookup.
+        let bat = make_test_bat_with_anchored_block(1, 5, 16);
 
         // Priority 1: pool (offset 4 MB).
         let r1 = tracker
-            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r1.file_offset, 4 * MB1);
         assert!(!r1.state.is_safe());
 
         // Pool now empty. Priority 2: near-EOF (offset 8 MB).
         let r2 = tracker
-            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r2.file_offset, 8 * MB1);
         assert!(r2.state.is_safe());
 
         // Take the second EOF MB too.
         let r3 = tracker
-            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r3.file_offset, 9 * MB1);
         assert!(r3.state.is_safe());
@@ -1701,27 +1697,27 @@ mod tests {
         // Pool and EOF exhausted. Priority 3: soft-anchored (offset 5 MB).
         // The block is 2 MB but we only need 1 MB — excess goes to pool.
         let r4 = tracker
-            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r4.file_offset, 5 * MB1);
         assert!(!r4.state.is_safe());
 
         // The excess 1 MB from the anchored block should now be in pool.
         let r5 = tracker
-            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r5.file_offset, 6 * MB1);
         assert!(!r5.state.is_safe());
 
         // Everything exhausted. Priority 4: returns None.
-        let r6 = tracker.try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state);
+        let r6 = tracker.try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat);
         assert!(r6.is_none());
 
         // Extend EOF, then retry.
         let target = eof.required_file_length(tracker.block_alignment(), MB1 as u32, false);
         eof.complete_file_extend(&tracker, target);
         let r7 = tracker
-            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat)
             .unwrap();
         assert!(r7.state.is_safe());
         assert_eq!(r7.file_offset, 10 * MB1);
@@ -1948,31 +1944,25 @@ mod tests {
             .unwrap();
         tracker.complete_initialization(&eof);
 
-        // BAT state with both blocks anchored.
-        let mut payload_mappings =
-            vec![BlockMapping::new().with_bat_state(BatEntryState::NotPresent); 16];
-        payload_mappings[2] = BlockMapping::new()
-            .with_bat_state(BatEntryState::Unmapped)
-            .with_file_megabyte(6);
-        payload_mappings[5] = BlockMapping::new()
-            .with_bat_state(BatEntryState::Unmapped)
-            .with_file_megabyte(10);
-        let bat_state = BatState {
-            payload_mappings,
-            sector_bitmap_mappings: Vec::new(),
-            allocated_block_count: 0,
-        };
+        // BAT with both blocks anchored.
+        let mut bat = make_test_bat_with_anchored_block(2, 6, 16);
+        bat.set_block_mapping(
+            5,
+            BlockMapping::new()
+                .with_bat_state(BatEntryState::Unmapped)
+                .with_file_megabyte(10),
+        );
 
         // First allocate gets block 2 (lowest block number).
         let r1 = tracker
-            .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r1.file_offset, 6 * MB1);
         assert!(!r1.state.is_safe());
 
         // Second allocate gets block 5.
         let r2 = tracker
-            .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r2.file_offset, 10 * MB1);
         assert!(!r2.state.is_safe());
@@ -1980,7 +1970,7 @@ mod tests {
         // No more anchored blocks.
         assert!(
             tracker
-                .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat_state)
+                .try_allocate_with_bat(&mut eof, 2 * MB1 as u32, false, &bat)
                 .is_none()
         );
     }
@@ -2000,11 +1990,11 @@ mod tests {
             .unwrap();
         tracker.complete_initialization(&eof);
 
-        let bat_state = make_bat_state_with_anchored_block(0, 4, 16);
+        let bat = make_test_bat_with_anchored_block(0, 4, 16);
 
         // Request only 1 MB from a 2 MB anchored block.
         let r = tracker
-            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat_state)
+            .try_allocate_with_bat(&mut eof, MB1 as u32, false, &bat)
             .unwrap();
         assert_eq!(r.file_offset, 4 * MB1);
 

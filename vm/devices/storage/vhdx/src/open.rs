@@ -1178,24 +1178,15 @@ mod tests {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
 
-        let bat_state = vhdx.bat.bat_state.read();
         // All payload entries should be NotPresent.
-        for (i, mapping) in bat_state.payload_mappings.iter().enumerate() {
+        for i in 0..vhdx.bat.data_block_count {
             assert_eq!(
-                mapping.bat_state(),
+                vhdx.bat.get_block_mapping(i).bat_state(),
                 BatEntryState::NotPresent,
                 "block {i} should be NotPresent"
             );
         }
-        assert_eq!(bat_state.allocated_block_count, 0);
-        assert_eq!(
-            bat_state.payload_mappings.len(),
-            vhdx.bat.data_block_count as usize
-        );
-        assert_eq!(
-            bat_state.sector_bitmap_mappings.len(),
-            vhdx.bat.sector_bitmap_block_count as usize
-        );
+        assert_eq!(vhdx.bat.allocated_block_count(), 0);
     }
 
     #[async_test]
@@ -1216,13 +1207,10 @@ mod tests {
             .unwrap();
 
         let vhdx = VhdxFile::open(file).read_only().await.unwrap();
-        let bat_state = vhdx.bat.bat_state.read();
-        assert_eq!(
-            bat_state.payload_mappings[0].bat_state(),
-            BatEntryState::FullyPresent,
-        );
-        assert_eq!(bat_state.payload_mappings[0].file_megabyte(), 4);
-        assert_eq!(bat_state.allocated_block_count, 1);
+        let mapping = vhdx.bat.get_block_mapping(0);
+        assert_eq!(mapping.bat_state(), BatEntryState::FullyPresent,);
+        assert_eq!(mapping.file_megabyte(), 4);
+        assert_eq!(vhdx.bat.allocated_block_count(), 1);
     }
 
     #[async_test]

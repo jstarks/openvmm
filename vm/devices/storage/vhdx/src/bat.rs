@@ -60,7 +60,7 @@ pub(crate) struct Bat {
     /// Whether the disk has a parent (differencing).
     pub has_parent: bool,
 
-    pub bat_state: RwLock<BatState>,
+    bat_state: RwLock<BatState>,
 
     /// Per-payload-block I/O refcounts. Atomic to avoid requiring
     /// the bat_state write lock on the read/write hot path.
@@ -636,6 +636,40 @@ impl Bat {
     pub(crate) fn get_sector_bitmap_mapping(&self, chunk_number: u32) -> BlockMapping {
         let bat_state = self.bat_state.read();
         bat_state.get_sbm_mapping(chunk_number)
+    }
+
+    /// Update the payload block mapping for a given data block number.
+    ///
+    /// Synchronous — writes to the in-memory BAT under a write lock.
+    pub(crate) fn set_block_mapping(&self, block_number: u32, mapping: BlockMapping) {
+        let mut bat_state = self.bat_state.write();
+        bat_state.set_payload_mapping(self, block_number, mapping);
+    }
+
+    /// Update the sector bitmap block mapping for a given chunk number.
+    ///
+    /// Synchronous — writes to the in-memory BAT under a write lock.
+    pub(crate) fn set_sector_bitmap_mapping(&self, chunk_number: u32, mapping: BlockMapping) {
+        let mut bat_state = self.bat_state.write();
+        bat_state.set_sbm_mapping(self, chunk_number, mapping);
+    }
+
+    /// Return the number of allocated (FullyPresent or PartiallyPresent) blocks.
+    #[cfg(test)]
+    pub(crate) fn allocated_block_count(&self) -> u32 {
+        self.bat_state.read().allocated_block_count
+    }
+
+    /// Initialize payload mappings for testing. Replaces any existing
+    /// mappings with `data_block_count` entries set to `NotPresent`.
+    #[cfg(test)]
+    pub(crate) fn init_test_payload_mappings(&mut self) {
+        let state = self.bat_state.get_mut();
+        state.payload_mappings.clear();
+        state.payload_mappings.resize(
+            self.data_block_count as usize,
+            BlockMapping::new().with_bat_state(BatEntryState::NotPresent),
+        );
     }
 }
 

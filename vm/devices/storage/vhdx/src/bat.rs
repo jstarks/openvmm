@@ -347,9 +347,8 @@ impl Bat {
     /// is trim-claimed.
     ///
     /// Returns `true` if callers should notify `refcount_event`:
-    /// when the I/O count hits zero with trim-pending set (trim is
-    /// waiting to finish claiming), or when the count drops from
-    /// the overflow threshold (I/O acquirers may be waiting).
+    /// when the I/O count hits zero (trim may be waiting), or when
+    /// the count drops from the overflow threshold.
     #[must_use]
     fn decrement_io_refcount(&self, block_number: u32) -> bool {
         let prev =
@@ -359,10 +358,7 @@ impl Bat {
             "io_refcount underflow or trim claimed on block {block_number} (was {:#06x})",
             prev.0,
         );
-        // Trim is waiting for count to reach 0.
-        (prev.io_count() == 1 && prev.trim_pending())
-        // I/O acquirers are waiting for overflow to clear.
-        || prev.io_count() == IoBlockRef::MAX_IO_REFCOUNT
+        prev.io_count() == 1 || prev.io_count() == IoBlockRef::MAX_IO_REFCOUNT
     }
 
     /// Claim a block for trim, with writer priority.
@@ -679,44 +675,29 @@ impl Bat {
         Ok(entry)
     }
 
-    /// Atomically increment I/O refcounts for a range of blocks,
-    /// returning a [`ReadIoGuard`] that will release them on drop.
+    /// Atomically increment I/O refcounts for a contiguous range of
+    /// blocks, returning a [`BatGuard`] that releases them on drop.
     ///
-    /// Uses CAS to increment each block's refcount. If any block has the
-    /// trim sentinel set, undoes partial increments, waits for trim to
-    /// release, and retries. Returns once all blocks are successfully
-    /// claimed.
+    /// Blocks are acquired in ascending order. If a block is claimed
+    /// by trim, the caller holds previously-acquired blocks and waits
+    /// for the blocked block to become available. Deadlock-free because
+    /// both I/O and trim always acquire blocks in ascending order.
     pub async fn acquire_io_refcounts(&self, start_block: u32, block_count: u32) -> BatGuard<'_> {
-        loop {
-            let mut guard = BatGuard {
-                bat: Some(self),
-                start_block,
-                block_count: 0,
-            };
-            let listener = self.refcount_event.listen();
-            let mut blocked = false;
-
-            for block in start_block..start_block + block_count {
-                if self.try_increment_io_refcount(block) {
-                    guard.block_count += 1;
-                } else {
-                    blocked = true;
-                    break;
+        let mut guard = BatGuard {
+            bat: Some(self),
+            start_block,
+            block_count: 0,
+        };
+        for block in start_block..start_block + block_count {
+            while !self.try_increment_io_refcount(block) {
+                let listener = self.refcount_event.listen();
+                if !self.try_increment_io_refcount(block) {
+                    listener.await;
                 }
             }
-
-            if !blocked {
-                return guard;
-            }
-
-            // Undo partial increments. With the corrected notification
-            // policy, rollback of blocks without trim-pending set will
-            // NOT fire refcount_event, so our listener stays live.
-            drop(guard);
-
-            // LOCK AUDIT: no locks held. Safe to await.
-            listener.await;
+            guard.block_count += 1;
         }
+        guard
     }
 
     /// Look up the payload block mapping for a given data block number.

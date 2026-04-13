@@ -547,79 +547,107 @@ impl Bat {
         Ok(())
     }
 
-    /// Load the in-memory BAT state from disk BAT pages.
+    /// Read chunk size for BAT loading (256 KiB = 32768 entries).
+    const BAT_READ_CHUNK: usize = 256 * 1024;
+
+    /// Load the in-memory BAT state from disk.
     ///
-    /// During parse, marks allocated blocks in the FreeSpaceTracker and
-    /// records soft-anchored blocks.
+    /// Reads the BAT region in fixed-size chunks and does a single
+    /// sequential pass over all entries, dispatching payload vs. SBM
+    /// entries via [`entry_number_to_block_id`]. This avoids both a
+    /// large peak allocation and redundant reads of the same region.
+    ///
+    /// During parse, marks allocated blocks in the FreeSpaceTracker
+    /// and records soft-anchored blocks.
     pub(crate) async fn load_bat_state<F: AsyncFile>(
         &mut self,
-        cache: &PageCache<F>,
+        file: &F,
+        bat_offset: u64,
+        bat_length: u32,
         free_space: &FreeSpaceTracker,
         eof_state: &mut EofState,
     ) -> Result<(), VhdxError> {
-        // Read all payload entries.
-        for block in 0..self.data_block_count {
-            let entry_index = self.payload_entry_index(block);
-            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
-            let mapping = BlockMapping::from_bat_entry(entry, self.has_parent)?;
-            if mapping.bat_state().is_allocated() {
-                let file_offset = mapping.file_offset();
-                if file_offset != 0 {
-                    free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
-                }
-            } else if (mapping.bat_state() == BatEntryState::Unmapped
-                || mapping.bat_state() == BatEntryState::Undefined)
-                && mapping.file_megabyte() != 0
-            {
-                let file_offset = mapping.file_offset();
-                free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
-                free_space.mark_trimmed_block(block, file_offset, self.block_size)?;
-            }
-            self.payload_mappings[block as usize].store(mapping.into(), Ordering::Relaxed);
-        }
+        let bat_len = bat_length as usize;
+        let total_entries = bat_len / size_of::<BatEntry>();
+        let chunk_size = std::cmp::min(bat_len, Self::BAT_READ_CHUNK);
+        let mut buf = vec![0u8; chunk_size];
+        let entries_per_chunk = chunk_size / size_of::<BatEntry>();
 
-        // Read all sector bitmap entries.
-        for chunk in 0..self.sector_bitmap_block_count {
-            let entry_index = self.sector_bitmap_entry_index(chunk);
-            let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
-            let mapping = BlockMapping::from_sbm_bat_entry(entry)?;
-            if mapping.bat_state().is_allocated() {
-                let file_offset = mapping.file_offset();
-                if file_offset != 0 {
-                    free_space.mark_range_in_use(
-                        eof_state,
-                        file_offset,
-                        SECTOR_BITMAP_BLOCK_SIZE,
-                    )?;
+        let mut file_pos: usize = 0;
+        let mut entry_num: u32 = 0;
+
+        while (entry_num as usize) < total_entries {
+            // Read the next chunk.
+            let remaining = bat_len - file_pos;
+            let read_len = std::cmp::min(chunk_size, remaining);
+            file.read_at(bat_offset + file_pos as u64, &mut buf[..read_len])
+                .await?;
+
+            let entries_in_chunk = std::cmp::min(entries_per_chunk, total_entries - entry_num as usize);
+            for i in 0..entries_in_chunk {
+                let byte_offset = i * size_of::<BatEntry>();
+                let entry = BatEntry::read_from_bytes(
+                    &buf[byte_offset..byte_offset + size_of::<BatEntry>()],
+                )
+                .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
+
+                match self.entry_number_to_block_id(entry_num + i as u32) {
+                    Some((BlockType::Payload, block_number)) => {
+                        let mapping = BlockMapping::from_bat_entry(entry, self.has_parent)?;
+                        if mapping.bat_state().is_allocated() {
+                            let file_offset = mapping.file_offset();
+                            if file_offset != 0 {
+                                free_space.mark_range_in_use(
+                                    eof_state,
+                                    file_offset,
+                                    self.block_size,
+                                )?;
+                            }
+                        } else if (mapping.bat_state() == BatEntryState::Unmapped
+                            || mapping.bat_state() == BatEntryState::Undefined)
+                            && mapping.file_megabyte() != 0
+                        {
+                            let file_offset = mapping.file_offset();
+                            free_space.mark_range_in_use(
+                                eof_state,
+                                file_offset,
+                                self.block_size,
+                            )?;
+                            free_space.mark_trimmed_block(
+                                block_number,
+                                file_offset,
+                                self.block_size,
+                            )?;
+                        }
+                        self.payload_mappings[block_number as usize]
+                            .store(mapping.into(), Ordering::Relaxed);
+                    }
+                    Some((BlockType::SectorBitmap, chunk_number)) => {
+                        let mapping = BlockMapping::from_sbm_bat_entry(entry)?;
+                        if mapping.bat_state().is_allocated() {
+                            let file_offset = mapping.file_offset();
+                            if file_offset != 0 {
+                                free_space.mark_range_in_use(
+                                    eof_state,
+                                    file_offset,
+                                    SECTOR_BITMAP_BLOCK_SIZE,
+                                )?;
+                            }
+                        }
+                        self.sector_bitmap_mappings[chunk_number as usize]
+                            .store(mapping.into(), Ordering::Relaxed);
+                    }
+                    None => {
+                        // Entry beyond the disk — padding per the VHDX spec.
+                    }
                 }
             }
-            self.sector_bitmap_mappings[chunk as usize].store(mapping.into(), Ordering::Relaxed);
+
+            entry_num += entries_in_chunk as u32;
+            file_pos += read_len;
         }
 
         Ok(())
-    }
-
-    /// Read a single raw BAT entry from disk through the cache.
-    async fn read_bat_entry_raw<F: AsyncFile>(
-        cache: &PageCache<F>,
-        entry_index: u32,
-    ) -> Result<BatEntry, VhdxError> {
-        let page_offset = (entry_index as u64 / ENTRIES_PER_BAT_PAGE) * CACHE_PAGE_SIZE;
-        let entry_within_page = entry_index as usize % ENTRIES_PER_BAT_PAGE as usize;
-
-        let guard = cache
-            .acquire_read(PageKey {
-                tag: BAT_TAG,
-                offset: page_offset,
-            })
-            .await?;
-
-        let byte_offset = entry_within_page * size_of::<BatEntry>();
-        let entry_bytes = &guard[byte_offset..byte_offset + size_of::<BatEntry>()];
-        let entry = BatEntry::read_from_bytes(entry_bytes)
-            .map_err(|_| VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
-
-        Ok(entry)
     }
 
     /// Atomically increment I/O refcounts for a contiguous range of

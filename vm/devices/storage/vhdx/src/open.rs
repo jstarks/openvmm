@@ -375,8 +375,14 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         )?;
 
         // 14. Load in-memory BAT from disk.
-        bat.load_bat_state(&cache, &free_space, &mut eof_state)
-            .await?;
+        bat.load_bat_state(
+            &*file,
+            regions.bat_offset,
+            regions.bat_length,
+            &free_space,
+            &mut eof_state,
+        )
+        .await?;
 
         // 15. Finalize free space initialization after BAT parse.
         free_space.complete_initialization(&eof_state);

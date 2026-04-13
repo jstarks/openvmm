@@ -39,14 +39,6 @@ struct TfpRecord {
     allocated_offset: Option<u64>,
 }
 
-/// Collected during [`VhdxFile::resolve_write`] and stored in the
-/// [`WriteIoGuard`]. Provides everything `complete()` and `abort()`
-/// need without re-walking the block range.
-struct WriteCompletionRecords {
-    /// Blocks that had TFP set during allocation.
-    tfp_records: Vec<TfpRecord>,
-}
-
 /// Resolved range from a read operation.
 ///
 /// Each range describes a contiguous portion of the read request and its
@@ -111,11 +103,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// block. Returns the [`BatGuard`] that holds the refcounts.
     ///
     /// Callers must handle zero-length requests before calling this.
-    async fn validate_and_acquire(
-        &self,
-        offset: u64,
-        len: u32,
-    ) -> Result<BatGuard<'_>, VhdxError> {
+    async fn validate_and_acquire(&self, offset: u64, len: u32) -> Result<BatGuard<'_>, VhdxError> {
         self.failed.check()?;
 
         // Validate alignment to logical sector size.
@@ -349,7 +337,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // writer's post-allocate to clear TFP before proceeding.
         // LOCK AUDIT: No synchronous locks held entering allocation loop.
         // allocation_lock (futures::Mutex) is acquired via .await — fine.
-        let mut _alloc_guard = loop {
+        let mut alloc_guard = loop {
             let alloc_guard = self.allocation_lock.lock().await;
 
             // Check all blocks under BAT lock for TFP overlap.
@@ -378,7 +366,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         // Re-check and allocate under the lock.
         // No block in our set should have TFP at this point — we waited
         // for all concurrent allocators to finish above.
-        let eof = &mut *_alloc_guard;
+        let eof = &mut *alloc_guard;
         let allocation_result = async {
             for span in &blocks_needing_allocation {
                 let is_full_block = span.is_full_block(self.block_size);
@@ -624,7 +612,6 @@ impl<F: AsyncFile> VhdxFile<F> {
                                     length: self.block_size - end_offset,
                                 });
                             }
-
                         }
                     }
                 }
@@ -636,9 +623,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Error cleanup: revert TFP-marked blocks and release allocated space on failure.
         if let Err(e) = allocation_result {
-            self.abort_write_sync(WriteCompletionRecords {
-                tfp_records,
-            });
+            self.abort_write_sync(tfp_records);
             return Err(e);
         }
 
@@ -651,9 +636,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             offset,
             len,
             needs_flush_before_log,
-            WriteCompletionRecords {
-                tfp_records,
-            },
+            tfp_records,
         ))
     }
 
@@ -662,7 +645,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Called by [`WriteIoGuard::complete()`] after the caller has written
     /// data to the resolved ranges.
     ///
-    /// Uses the [`WriteCompletionRecords`] collected during `resolve_write`
+    /// Uses the TFP records collected during `resolve_write`
     /// to clear TFP flags, set state to FullyPresent, write BAT entries,
     /// and update sector bitmaps — without re-walking the block range.
     ///
@@ -672,13 +655,13 @@ impl<F: AsyncFile> VhdxFile<F> {
         &self,
         offset: u64,
         len: u32,
-        records: WriteCompletionRecords,
+        tfp_records: Vec<TfpRecord>,
         needs_flush_before_log: bool,
     ) -> Result<(), VhdxError> {
-        let had_tfp = !records.tfp_records.is_empty();
+        let had_tfp = !tfp_records.is_empty();
         let mut bat_write_error: Option<VhdxError> = None;
 
-        for record in &records.tfp_records {
+        for record in &tfp_records {
             // Clear TFP, set FullyPresent.
             let mapping = self.bat.get_block_mapping(record.block_number);
             let final_mapping = BlockMapping::new()
@@ -756,12 +739,12 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// [`TfpRecord::original_mapping`], releases any newly allocated space
     /// back to the free pool, and notifies allocation waiters. Does not
     /// perform any file I/O.
-    fn abort_write_sync(&self, records: WriteCompletionRecords) {
-        if records.tfp_records.is_empty() {
+    fn abort_write_sync(&self, tfp_records: Vec<TfpRecord>) {
+        if tfp_records.is_empty() {
             return;
         }
 
-        for record in &records.tfp_records {
+        for record in &tfp_records {
             self.bat
                 .set_block_mapping(record.block_number, record.original_mapping);
             // Release allocated space back to free pool.
@@ -881,7 +864,7 @@ pub struct WriteIoGuard<'a, F: AsyncFile> {
     needs_flush_before_log: bool,
     /// TFP records collected during resolve_write, needed by complete/abort.
     /// `None` after complete() or for zero-length writes.
-    records: Option<WriteCompletionRecords>,
+    tfp_records: Option<Vec<TfpRecord>>,
 }
 
 impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
@@ -893,7 +876,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
         offset: u64,
         len: u32,
         needs_flush_before_log: bool,
-        records: WriteCompletionRecords,
+        tfp_records: Vec<TfpRecord>,
     ) -> Self {
         Self {
             vhdx,
@@ -902,7 +885,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len,
             completed: false,
             needs_flush_before_log,
-            records: Some(records),
+            tfp_records: Some(tfp_records),
         }
     }
 
@@ -915,19 +898,14 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len: 0,
             completed: true,
             needs_flush_before_log: false,
-            records: None,
+            tfp_records: None,
         }
     }
 
     /// Create a write guard with no completion records (no allocation was
     /// needed — all blocks were already FullyPresent or PartiallyPresent
     /// with a sub-block write).
-    fn new_no_alloc(
-        vhdx: &'a VhdxFile<F>,
-        bat_guard: BatGuard<'a>,
-        offset: u64,
-        len: u32,
-    ) -> Self {
+    fn new_no_alloc(vhdx: &'a VhdxFile<F>, bat_guard: BatGuard<'a>, offset: u64, len: u32) -> Self {
         Self {
             vhdx,
             _bat_guard: bat_guard,
@@ -935,7 +913,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len,
             completed: false,
             needs_flush_before_log: false,
-            records: None,
+            tfp_records: None,
         }
     }
 
@@ -946,11 +924,9 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// after this method returns.
     pub async fn complete(mut self) -> Result<(), VhdxError> {
         self.completed = true;
-        let records = self.records.take().unwrap_or(WriteCompletionRecords {
-            tfp_records: Vec::new(),
-        });
+        let tfp_records = self.tfp_records.take().unwrap_or_default();
         self.vhdx
-            .complete_write_inner(self.offset, self.len, records, self.needs_flush_before_log)
+            .complete_write_inner(self.offset, self.len, tfp_records, self.needs_flush_before_log)
             .await
     }
 }
@@ -959,8 +935,8 @@ impl<F: AsyncFile> Drop for WriteIoGuard<'_, F> {
     fn drop(&mut self) {
         // If complete() was not called, abort the write.
         if !self.completed {
-            if let Some(records) = self.records.take() {
-                self.vhdx.abort_write_sync(records);
+            if let Some(tfp_records) = self.tfp_records.take() {
+                self.vhdx.abort_write_sync(tfp_records);
             }
         }
         // Refcounts are decremented when self.bat_guard drops.

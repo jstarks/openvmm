@@ -21,6 +21,33 @@ use crate::io_guard::WriteIoGuard;
 use crate::open::VhdxFile;
 use crate::space::AllocateFlags;
 
+/// Record of a block that had Transitioning-to-Fully-Present (TFP) set
+/// during the allocation phase of [`VhdxFile::resolve_write`].
+///
+/// Carried inside [`WriteIoGuard`] so that `complete()` can finalize
+/// the BAT without re-walking the block range, and `abort()` can revert
+/// without guessing which blocks were modified.
+pub(crate) struct TfpRecord {
+    /// Block number in the BAT.
+    pub block_number: u32,
+    /// The block's mapping before TFP was set. Used by the abort path
+    /// to revert the in-memory BAT.
+    pub original_mapping: BlockMapping,
+    /// File offset of newly allocated space, if any. `None` when TFP
+    /// was set on an already-allocated block (e.g. PartiallyPresent →
+    /// FullyPresent promotion). The abort path releases this space back
+    /// to the free pool.
+    pub allocated_offset: Option<u64>,
+}
+
+/// Collected during [`VhdxFile::resolve_write`] and stored in the
+/// [`WriteIoGuard`]. Provides everything `complete()` and `abort()`
+/// need without re-walking the block range.
+pub(crate) struct WriteCompletionRecords {
+    /// Blocks that had TFP set during allocation.
+    pub tfp_records: Vec<TfpRecord>,
+}
+
 /// Resolved range from a read operation.
 ///
 /// Each range describes a contiguous portion of the read request and its
@@ -302,12 +329,11 @@ impl<F: AsyncFile> VhdxFile<F> {
         // If nothing needs allocation, we're done. Transfer refcount
         // ownership from the ReadIoGuard to the WriteIoGuard.
         if blocks_needing_allocation.is_empty() {
-            return Ok(WriteIoGuard::new(
+            return Ok(WriteIoGuard::new_no_alloc(
                 self,
                 refcount_guard,
                 offset,
                 len,
-                false, // no allocation → no flush barrier needed
             ));
         }
 
@@ -341,13 +367,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             listener.await;
         };
 
-        // Track blocks that got TFP set (for error cleanup).
-        struct TfpRecord {
-            block_number: u32,
-            original_mapping: BlockMapping,
-            /// File offset of newly allocated space, if any (for release on error).
-            allocated_offset: Option<u64>,
-        }
+        // Track blocks that got TFP set (for error cleanup and complete/abort).
         let mut tfp_records: Vec<TfpRecord> = Vec::new();
 
         // Track whether any TFP allocation used unsafe (non-safe-data) space.
@@ -605,6 +625,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                     length: self.block_size - end_offset,
                                 });
                             }
+
                         }
                     }
                 }
@@ -616,15 +637,9 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Error cleanup: revert TFP-marked blocks and release allocated space on failure.
         if let Err(e) = allocation_result {
-            for record in &tfp_records {
-                self.bat
-                    .set_block_mapping(record.block_number, record.original_mapping);
-                // Release allocated space back to free pool.
-                if let Some(offset) = record.allocated_offset {
-                    self.free_space.release(offset, self.block_size);
-                }
-            }
-            self.allocation_event.notify(usize::MAX);
+            self.abort_write_sync(WriteCompletionRecords {
+                tfp_records,
+            });
             return Err(e);
         }
 
@@ -637,6 +652,9 @@ impl<F: AsyncFile> VhdxFile<F> {
             offset,
             len,
             needs_flush_before_log,
+            WriteCompletionRecords {
+                tfp_records,
+            },
         ))
     }
 
@@ -645,9 +663,9 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Called by [`WriteIoGuard::complete()`] after the caller has written
     /// data to the resolved ranges.
     ///
-    /// Clears TFP flags, sets state to FullyPresent, writes per-entry BAT
-    /// to cache, and notifies waiters. For PartiallyPresent blocks (non-TFP,
-    /// i.e. partial writes to differencing disks), updates sector bitmaps.
+    /// Uses the [`WriteCompletionRecords`] collected during `resolve_write`
+    /// to clear TFP flags, set state to FullyPresent, write BAT entries,
+    /// and update sector bitmaps — without re-walking the block range.
     ///
     /// The abort path (write failure / guard dropped without `complete()`)
     /// is handled synchronously by [`abort_write_sync()`].
@@ -655,66 +673,65 @@ impl<F: AsyncFile> VhdxFile<F> {
         &self,
         offset: u64,
         len: u32,
+        records: WriteCompletionRecords,
         needs_flush_before_log: bool,
     ) -> Result<(), VhdxError> {
-        // Zero-length — nothing to do.
-        if len == 0 {
-            return Ok(());
-        }
-
-        let mut had_tfp = false;
+        let had_tfp = !records.tfp_records.is_empty();
         let mut bat_write_error: Option<VhdxError> = None;
 
-        for span in self.bat.block_spans(offset, len) {
-            // Read the in-memory mapping to check for TFP.
-            let mapping = self.bat.get_block_mapping(span.block_number);
+        for record in &records.tfp_records {
+            // Clear TFP, set FullyPresent.
+            let mapping = self.bat.get_block_mapping(record.block_number);
+            let final_mapping = BlockMapping::new()
+                .with_bat_state(BatEntryState::FullyPresent)
+                .with_transitioning_to_fully_present(false)
+                .with_file_megabyte(mapping.file_megabyte());
 
-            if mapping.transitioning_to_fully_present() {
-                had_tfp = true;
+            self.bat
+                .set_block_mapping(record.block_number, final_mapping);
 
-                // Clear TFP, set FullyPresent.
-                let final_mapping = BlockMapping::new()
-                    .with_bat_state(BatEntryState::FullyPresent)
-                    .with_transitioning_to_fully_present(false)
-                    .with_file_megabyte(mapping.file_megabyte());
+            // Write per-entry to cache. Errors are deferred so we
+            // can still notify waiters.
+            if bat_write_error.is_none() {
+                // Capture FSN NOW (after caller's data writes,
+                // matching C's Vhd2iDereferenceReadWrite →
+                // Vhd2iGetCurrentFsn timing). Passed into
+                // write_block_mapping so it's set atomically
+                // with the dirty-mark.
+                let pre_log_fsn = if needs_flush_before_log {
+                    self.log_state
+                        .as_ref()
+                        .map(|state| state.flush_sequencer.current_fsn())
+                } else {
+                    None
+                };
 
-                self.bat.set_block_mapping(span.block_number, final_mapping);
-
-                // Write per-entry to cache. Errors are deferred so we
-                // can still notify waiters.
-                // LOCK AUDIT: bat_state write-lock dropped (end of prior block). No sync locks held.
-                if bat_write_error.is_none() {
-                    // Capture FSN NOW (after caller's data writes,
-                    // matching C's Vhd2iDereferenceReadWrite →
-                    // Vhd2iGetCurrentFsn timing). Passed into
-                    // write_block_mapping so it's set atomically
-                    // with the dirty-mark.
-                    let pre_log_fsn = if needs_flush_before_log {
-                        self.log_state
-                            .as_ref()
-                            .map(|state| state.flush_sequencer.current_fsn())
-                    } else {
-                        None
-                    };
-
-                    if let Err(e) = self
-                        .bat
-                        .write_block_mapping(
-                            &self.cache,
-                            BlockType::Payload,
-                            span.block_number,
-                            final_mapping,
-                            pre_log_fsn,
-                        )
-                        .await
-                    {
-                        bat_write_error = Some(e);
-                    }
+                if let Err(e) = self
+                    .bat
+                    .write_block_mapping(
+                        &self.cache,
+                        BlockType::Payload,
+                        record.block_number,
+                        final_mapping,
+                        pre_log_fsn,
+                    )
+                    .await
+                {
+                    bat_write_error = Some(e);
                 }
-            } else if self.has_parent {
-                // Non-TFP PartiallyPresent blocks: update sector bitmaps.
+            }
+        }
+
+        // Update sector bitmaps for partial writes to differencing disks.
+        // Walk the block range to find PartiallyPresent blocks that need
+        // their sector bitmaps updated. This is cheap (BAT state is in memory)
+        // and avoids carrying SBM records in the guard.
+        if self.has_parent && len > 0 {
+            for span in self.bat.block_spans(offset, len) {
                 let mapping = self.bat.get_block_mapping(span.block_number);
-                if mapping.bat_state() == BatEntryState::PartiallyPresent {
+                if !mapping.transitioning_to_fully_present()
+                    && mapping.bat_state() == BatEntryState::PartiallyPresent
+                {
                     self.set_sector_bitmap_bits(span.virtual_offset, span.length, true)
                         .await?;
                 }
@@ -736,46 +753,25 @@ impl<F: AsyncFile> VhdxFile<F> {
 
     /// Synchronous abort path for `WriteIoGuard::drop()`.
     ///
-    /// Reverts TFP blocks to their original state, releases any newly
-    /// allocated space back to the free pool, marks BAT pages dirty, and
-    /// notifies allocation waiters. Does not perform any file I/O.
-    pub(crate) fn abort_write_sync(&self, offset: u64, len: u32) {
-        if len == 0 {
+    /// Reverts TFP blocks to their original state using the saved
+    /// [`TfpRecord::original_mapping`], releases any newly allocated space
+    /// back to the free pool, and notifies allocation waiters. Does not
+    /// perform any file I/O.
+    pub(crate) fn abort_write_sync(&self, records: WriteCompletionRecords) {
+        if records.tfp_records.is_empty() {
             return;
         }
 
-        let mut had_tfp = false;
-
-        for span in self.bat.block_spans(offset, len) {
-            let mapping = self.bat.get_block_mapping(span.block_number);
-
-            if mapping.transitioning_to_fully_present() {
-                had_tfp = true;
-                let original_state = mapping.bat_state();
-                let reverted = match original_state {
-                    BatEntryState::PartiallyPresent => BlockMapping::new()
-                        .with_bat_state(mapping.bat_state())
-                        .with_transitioning_to_fully_present(false)
-                        .with_file_megabyte(mapping.file_megabyte()),
-                    _ => {
-                        let file_offset = mapping.file_offset();
-                        if file_offset != 0 {
-                            self.free_space.release(file_offset, self.block_size);
-                        }
-                        BlockMapping::new()
-                            .with_bat_state(mapping.bat_state())
-                            .with_transitioning_to_fully_present(false)
-                            .with_file_megabyte(0)
-                    }
-                };
-
-                self.bat.set_block_mapping(span.block_number, reverted);
+        for record in &records.tfp_records {
+            self.bat
+                .set_block_mapping(record.block_number, record.original_mapping);
+            // Release allocated space back to free pool.
+            if let Some(offset) = record.allocated_offset {
+                self.free_space.release(offset, self.block_size);
             }
         }
 
-        if had_tfp {
-            self.allocation_event.notify(usize::MAX);
-        }
+        self.allocation_event.notify(usize::MAX);
     }
 
     /// Flush all writes to stable storage.

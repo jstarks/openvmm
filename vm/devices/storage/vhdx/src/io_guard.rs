@@ -11,6 +11,7 @@
 use crate::AsyncFile;
 use crate::bat::BatGuard;
 use crate::error::VhdxError;
+use crate::io::WriteCompletionRecords;
 use crate::open::VhdxFile;
 
 /// Guard for read I/O. Drop after file reads are complete.
@@ -51,7 +52,7 @@ pub struct WriteIoGuard<'a, F: AsyncFile> {
     vhdx: &'a VhdxFile<F>,
     // Significant drop.
     _bat_guard: BatGuard<'a>,
-    /// The guest offset of the write (needed for complete_write logic).
+    /// The guest offset of the write (needed for SBM bitmap updates).
     offset: u64,
     /// The length of the write in bytes.
     len: u32,
@@ -65,6 +66,9 @@ pub struct WriteIoGuard<'a, F: AsyncFile> {
     ///
     /// Matches C's `NeedsFlushDuringPostAllocate` flag.
     needs_flush_before_log: bool,
+    /// TFP records collected during resolve_write, needed by complete/abort.
+    /// `None` after complete() or for zero-length writes.
+    records: Option<WriteCompletionRecords>,
 }
 
 impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
@@ -76,6 +80,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
         offset: u64,
         len: u32,
         needs_flush_before_log: bool,
+        records: WriteCompletionRecords,
     ) -> Self {
         Self {
             vhdx,
@@ -84,6 +89,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len,
             completed: false,
             needs_flush_before_log,
+            records: Some(records),
         }
     }
 
@@ -96,6 +102,27 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len: 0,
             completed: true,
             needs_flush_before_log: false,
+            records: None,
+        }
+    }
+
+    /// Create a write guard with no completion records (no allocation was
+    /// needed — all blocks were already FullyPresent or PartiallyPresent
+    /// with a sub-block write).
+    pub(crate) fn new_no_alloc(
+        vhdx: &'a VhdxFile<F>,
+        bat_guard: BatGuard<'a>,
+        offset: u64,
+        len: u32,
+    ) -> Self {
+        Self {
+            vhdx,
+            _bat_guard: bat_guard,
+            offset,
+            len,
+            completed: false,
+            needs_flush_before_log: false,
+            records: None,
         }
     }
 
@@ -106,8 +133,11 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// after this method returns.
     pub async fn complete(mut self) -> Result<(), VhdxError> {
         self.completed = true;
+        let records = self.records.take().unwrap_or(WriteCompletionRecords {
+            tfp_records: Vec::new(),
+        });
         self.vhdx
-            .complete_write_inner(self.offset, self.len, self.needs_flush_before_log)
+            .complete_write_inner(self.offset, self.len, records, self.needs_flush_before_log)
             .await
     }
 }
@@ -116,7 +146,9 @@ impl<F: AsyncFile> Drop for WriteIoGuard<'_, F> {
     fn drop(&mut self) {
         // If complete() was not called, abort the write.
         if !self.completed {
-            self.vhdx.abort_write_sync(self.offset, self.len);
+            if let Some(records) = self.records.take() {
+                self.vhdx.abort_write_sync(records);
+            }
         }
         // Refcounts are decremented when self.bat_guard drops.
     }

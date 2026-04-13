@@ -41,8 +41,6 @@ members = [
   "vm/devices/storage/scsi_buffers/fuzz",
   "vm/devices/storage/storage_tests",
   "vm/devices/storage/storvsp/fuzz",
-  "vm/devices/storage/disk_vhdx",
-  "vm/devices/storage/vhdx",
   "vm/vmcore/guestmem/fuzz",
   "vm/x86/x86emu/fuzz",
   # in-guest test bins

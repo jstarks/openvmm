@@ -316,8 +316,8 @@ pub enum CorruptionType {
     LogReplayRequired,
 
     /// A read or write request extends beyond the end of the virtual disk.
-    #[error("read or write request extends beyond end of virtual disk")]
-    ReadBeyondEndOfDisk,
+    #[error("I/O request extends beyond end of virtual disk")]
+    IoBeyondEndOfDisk,
 
     /// A read or write request is not aligned to the logical sector size.
     #[error("I/O request is not aligned to logical sector size")]

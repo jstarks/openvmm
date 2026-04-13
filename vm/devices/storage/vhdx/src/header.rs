@@ -12,8 +12,11 @@ use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format;
 use crate::format::Header;
+use crate::open::VhdxFile;
 use guid::Guid;
 use zerocopy::FromBytes;
+use zerocopy::FromZeros;
+use zerocopy::IntoBytes;
 
 /// Parsed and validated header data extracted from a VHDX file.
 pub(crate) struct ParsedHeader {
@@ -136,6 +139,91 @@ pub(crate) async fn parse_headers(
         version: header.version,
         first_header_current,
     })
+}
+
+/// Serialize a VHDX header to a 4 KiB buffer with CRC and determine
+/// the target offset (non-current header slot).
+///
+/// Returns `(buffer, file_offset)` ready for `write_at`.
+pub(crate) fn serialize_header(
+    sequence_number: u64,
+    file_write_guid: Guid,
+    data_write_guid: Guid,
+    log_guid: Guid,
+    log_offset: u64,
+    log_length: u32,
+    first_header_current: bool,
+) -> (Vec<u8>, u64) {
+    let mut header = Header::new_zeroed();
+    header.signature = format::HEADER_SIGNATURE;
+    header.sequence_number = sequence_number;
+    header.file_write_guid = file_write_guid;
+    header.data_write_guid = data_write_guid;
+    header.log_guid = log_guid;
+    header.log_version = format::LOG_VERSION;
+    header.version = format::VERSION_1;
+    header.log_length = log_length;
+    header.log_offset = log_offset;
+    header.checksum = 0;
+
+    let mut buf = vec![0u8; format::HEADER_SIZE as usize];
+    let hdr_bytes = header.as_bytes();
+    buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
+    let crc = format::compute_checksum(&buf, 4);
+    buf[4..8].copy_from_slice(&crc.to_le_bytes());
+
+    let offset = if first_header_current {
+        format::HEADER_OFFSET_2
+    } else {
+        format::HEADER_OFFSET_1
+    };
+
+    (buf, offset)
+}
+
+impl<F: AsyncFile> VhdxFile<F> {
+    /// Write a header with `log_guid = ZERO` to mark the file as clean.
+    pub(crate) async fn write_clean_header(&mut self) -> Result<(), VhdxError> {
+        self.write_state.get_mut().log_guid = Guid::ZERO;
+        self.write_current_header().await
+    }
+
+    /// Bump the sequence number, serialize the current [`WriteState`] as a
+    /// header, write it to the non-current slot, flush, and flip the
+    /// active header slot.
+    ///
+    /// Callers must set any state fields (log_guid, write GUIDs, etc.)
+    /// before calling this method.
+    pub(crate) async fn write_current_header(&self) -> Result<(), VhdxError> {
+        let (buf, offset) = {
+            let mut state = self.write_state.lock();
+            state.sequence_number += 1;
+            serialize_header(
+                state.sequence_number,
+                state.file_write_guid,
+                state.data_write_guid,
+                state.log_guid,
+                self.log_offset,
+                self.log_length,
+                state.first_header_current,
+            )
+        };
+
+        self.file.write_at(offset, &buf).await?;
+
+        if let Some(ref log_state) = self.log_state {
+            log_state.flush_sequencer.flush(self.file.as_ref()).await?;
+        } else {
+            self.file.flush().await?;
+        }
+
+        {
+            let mut state = self.write_state.lock();
+            state.first_header_current = !state.first_header_current;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1102,9 +1102,9 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         loop {
             // Try priorities 1–3 (pool, near-EOF, anchored).
-            let result = self
-                .free_space
-                .try_allocate_with_bat(eof, size, flags.aligned(), &self.bat);
+            let result =
+                self.free_space
+                    .try_allocate_with_bat(eof, size, flags.aligned(), &self.bat);
 
             if let Some(alloc) = result {
                 // If this was a cross-block soft-anchor reclaim, clear the

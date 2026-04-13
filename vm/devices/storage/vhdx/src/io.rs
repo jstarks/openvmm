@@ -113,7 +113,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             .checked_add(len as u64)
             .is_none_or(|end| end > self.disk_size)
         {
-            return Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk));
+            return Err(VhdxError::Corrupt(CorruptionType::IoBeyondEndOfDisk));
         }
 
         // Increment per-block refcounts atomically. If trim has claimed
@@ -231,7 +231,7 @@ impl<F: AsyncFile> VhdxFile<F> {
             .checked_add(len as u64)
             .is_none_or(|end| end > self.disk_size)
         {
-            return Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk));
+            return Err(VhdxError::Corrupt(CorruptionType::IoBeyondEndOfDisk));
         }
 
         // First-write gate: update header with new GUIDs before any data.
@@ -954,7 +954,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))
+            Err(VhdxError::Corrupt(CorruptionType::IoBeyondEndOfDisk))
         ));
     }
 
@@ -1552,7 +1552,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))
+            Err(VhdxError::Corrupt(CorruptionType::IoBeyondEndOfDisk))
         ));
     }
 

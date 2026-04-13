@@ -18,8 +18,8 @@ use crate::error::VhdxError;
 use crate::flush::FlushSequencer;
 use crate::format;
 use crate::format::FileIdentifier;
-use crate::format::Header;
 use crate::header::parse_headers;
+use crate::header::serialize_header;
 use crate::known_meta::read_known_metadata;
 use crate::known_meta::verify_known_metadata;
 use crate::log;
@@ -35,8 +35,6 @@ use guid::Guid;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use zerocopy::FromBytes;
-use zerocopy::FromZeros;
-use zerocopy::IntoBytes;
 
 /// Builder for opening a VHDX file.
 ///
@@ -241,8 +239,8 @@ pub struct VhdxFile<F: AsyncFile> {
     metadata_offset: u64,
     #[expect(dead_code)] // Phase 9+: used for metadata writes
     metadata_length: u32,
-    log_offset: u64,
-    log_length: u32,
+    pub(crate) log_offset: u64,
+    pub(crate) log_length: u32,
 
     // Mode
     pub(crate) read_only: bool,
@@ -333,33 +331,16 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
 
             if replay_result.replayed {
                 // Write a clean header: clear log_guid, bump sequence number.
-                // Write to the non-current header slot, then flush.
                 let new_seq = header.sequence_number + 1;
-
-                let mut clean_header = Header::new_zeroed();
-                clean_header.signature = format::HEADER_SIGNATURE;
-                clean_header.sequence_number = new_seq;
-                clean_header.file_write_guid = header.file_write_guid;
-                clean_header.data_write_guid = header.data_write_guid;
-                clean_header.log_guid = Guid::ZERO;
-                clean_header.log_version = format::LOG_VERSION;
-                clean_header.version = format::VERSION_1;
-                clean_header.log_length = header.log_length;
-                clean_header.log_offset = header.log_offset;
-                clean_header.checksum = 0;
-
-                let mut buf = vec![0u8; format::HEADER_SIZE as usize];
-                let hdr_bytes = clean_header.as_bytes();
-                buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
-                let crc = format::compute_checksum(&buf, 4);
-                buf[4..8].copy_from_slice(&crc.to_le_bytes());
-
-                // Write to the non-current slot.
-                let write_offset = if header.first_header_current {
-                    format::HEADER_OFFSET_2
-                } else {
-                    format::HEADER_OFFSET_1
-                };
+                let (buf, write_offset) = serialize_header(
+                    new_seq,
+                    header.file_write_guid,
+                    header.data_write_guid,
+                    Guid::ZERO,
+                    header.log_offset,
+                    header.log_length,
+                    header.first_header_current,
+                );
                 file.write_at(write_offset, &buf).await?;
                 file.flush().await?;
 
@@ -533,47 +514,8 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         // Write header with log_guid set (marks file as dirty).
         // This is done BEFORE spawning the log task so the file is marked
         // dirty before any log entries are written.
-        let (offset, buf) = {
-            let mut state = vhdx.write_state.lock();
-            state.sequence_number += 1;
-
-            let mut header = Header::new_zeroed();
-            header.signature = format::HEADER_SIGNATURE;
-            header.sequence_number = state.sequence_number;
-            header.file_write_guid = state.file_write_guid;
-            header.data_write_guid = state.data_write_guid;
-            header.log_guid = log_guid;
-            header.log_version = format::LOG_VERSION;
-            header.version = format::VERSION_1;
-            header.log_length = vhdx.log_length;
-            header.log_offset = vhdx.log_offset;
-            header.checksum = 0;
-
-            let mut buf = vec![0u8; format::HEADER_SIZE as usize];
-            let hdr_bytes = header.as_bytes();
-            buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
-            let crc = format::compute_checksum(&buf, 4);
-            buf[4..8].copy_from_slice(&crc.to_le_bytes());
-
-            let offset = if state.first_header_current {
-                format::HEADER_OFFSET_2
-            } else {
-                format::HEADER_OFFSET_1
-            };
-
-            (offset, buf)
-            // MutexGuard dropped here
-        };
-
-        vhdx.file.write_at(offset, &buf).await?;
-        vhdx.file.flush().await?;
-
-        // Update state after flush.
-        {
-            let mut state = vhdx.write_state.lock();
-            state.first_header_current = !state.first_header_current;
-            state.log_guid = log_guid;
-        }
+        vhdx.write_state.lock().log_guid = log_guid;
+        vhdx.write_current_header().await?;
 
         // Spawn the apply task.
         let applied_lsn = Arc::new(crate::lsn_watermark::LsnWatermark::new());
@@ -785,53 +727,6 @@ impl<F: AsyncFile> VhdxFile<F> {
         self.read_only
     }
 
-    /// Write a header with `log_guid = ZERO` to mark the file as clean.
-    ///
-    /// Uses the write state to determine the current sequence number and
-    /// header slot, then writes to the non-current slot and flushes.
-    async fn write_clean_header(&mut self) -> Result<(), VhdxError> {
-        let state = self.write_state.get_mut();
-        state.sequence_number += 1;
-        state.log_guid = Guid::ZERO;
-
-        let mut header = Header::new_zeroed();
-        header.signature = format::HEADER_SIGNATURE;
-        header.sequence_number = state.sequence_number;
-        header.file_write_guid = state.file_write_guid;
-        header.data_write_guid = state.data_write_guid;
-        header.log_guid = Guid::ZERO;
-        header.log_version = format::LOG_VERSION;
-        header.version = format::VERSION_1;
-        header.log_length = self.log_length;
-        header.log_offset = self.log_offset;
-        header.checksum = 0;
-
-        let mut buf = vec![0u8; format::HEADER_SIZE as usize];
-        let hdr_bytes = header.as_bytes();
-        buf[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
-        let crc = format::compute_checksum(&buf, 4);
-        buf[4..8].copy_from_slice(&crc.to_le_bytes());
-
-        let header_offset = if state.first_header_current {
-            format::HEADER_OFFSET_2
-        } else {
-            format::HEADER_OFFSET_1
-        };
-
-        self.file.write_at(header_offset, &buf).await?;
-
-        if let Some(ref state) = self.log_state {
-            state.flush_sequencer.flush(self.file.as_ref()).await?;
-        } else {
-            self.file.flush().await?;
-        }
-
-        self.write_state.get_mut().first_header_current =
-            !self.write_state.get_mut().first_header_current;
-
-        Ok(())
-    }
-
     /// Ensures the requested write mode is enabled, updating the header
     /// and flushing if needed. If the current mode already satisfies the
     /// request, this is a no-op.
@@ -850,8 +745,8 @@ impl<F: AsyncFile> VhdxFile<F> {
             return Ok(());
         }
 
-        // Prepare the header update under the lock, then release before I/O.
-        let (header_buf, header_offset) = {
+        // Update GUIDs under the lock, then release before I/O.
+        {
             let mut state = self.write_state.lock();
 
             // Double-check under lock (another caller may have raced).
@@ -868,53 +763,12 @@ impl<F: AsyncFile> VhdxFile<F> {
             if mode >= WriteMode::DataWritable {
                 state.data_write_guid = Guid::new_random();
             }
-
-            // Increment sequence number.
-            state.sequence_number += 1;
-
-            // Build the header.
-            let mut header = Header::new_zeroed();
-            header.signature = format::HEADER_SIGNATURE;
-            header.sequence_number = state.sequence_number;
-            header.file_write_guid = state.file_write_guid;
-            header.data_write_guid = state.data_write_guid;
-            header.log_guid = state.log_guid;
-            header.log_version = format::LOG_VERSION;
-            header.version = format::VERSION_1;
-            header.log_length = self.log_length;
-            header.log_offset = self.log_offset;
-            header.checksum = 0;
-
-            // Serialize to a 4 KiB buffer and compute CRC.
-            let mut buf = vec![0u8; format::HEADER_SIZE as usize];
-            let header_bytes = header.as_bytes();
-            buf[..header_bytes.len()].copy_from_slice(header_bytes);
-            let crc = format::compute_checksum(&buf, 4);
-            buf[4..8].copy_from_slice(&crc.to_le_bytes());
-
-            // Write to the non-current slot.
-            let offset = if state.first_header_current {
-                format::HEADER_OFFSET_2
-            } else {
-                format::HEADER_OFFSET_1
-            };
-
-            (buf, offset)
-        };
-        // LOCK AUDIT: write_state Mutex dropped here (end of block). Safe to do async I/O.
-
-        // Write the header to disk.
-        self.file.write_at(header_offset, &header_buf).await?;
-
-        // Flush to ensure the header is on stable storage before any data writes.
-        self.file.flush().await?;
-
-        // Re-acquire lock to commit the state change.
-        {
-            let mut state = self.write_state.lock();
-            state.first_header_current = !state.first_header_current;
-            state.write_mode = Some(mode);
         }
+
+        self.write_current_header().await?;
+
+        // Commit the mode change after the header is on stable storage.
+        self.write_state.lock().write_mode = Some(mode);
 
         Ok(())
     }

@@ -285,7 +285,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                 .checked_add(length)
                 .is_none_or(|end| end > self.disk_size)
             {
-                return Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk));
+                return Err(VhdxError::Corrupt(CorruptionType::IoBeyondEndOfDisk));
             }
         }
 
@@ -1236,7 +1236,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(VhdxError::Corrupt(CorruptionType::ReadBeyondEndOfDisk))
+            Err(VhdxError::Corrupt(CorruptionType::IoBeyondEndOfDisk))
         ));
     }
 

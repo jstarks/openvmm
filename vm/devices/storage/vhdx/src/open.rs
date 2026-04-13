@@ -968,7 +968,6 @@ mod tests {
                 "block {i} should be NotPresent"
             );
         }
-        assert_eq!(vhdx.bat.allocated_block_count(), 0);
     }
 
     #[async_test]
@@ -992,7 +991,6 @@ mod tests {
         let mapping = vhdx.bat.get_block_mapping(0);
         assert_eq!(mapping.bat_state(), BatEntryState::FullyPresent,);
         assert_eq!(mapping.file_megabyte(), 4);
-        assert_eq!(vhdx.bat.allocated_block_count(), 1);
     }
 
     #[async_test]

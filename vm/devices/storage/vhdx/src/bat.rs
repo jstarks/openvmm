@@ -225,8 +225,6 @@ struct BatState {
     payload_mappings: Vec<BlockMapping>,
     /// One entry per sector bitmap block (indexed by chunk number).
     sector_bitmap_mappings: Vec<BlockMapping>,
-    /// Running count of allocated (FullyPresent or PartiallyPresent) blocks.
-    allocated_block_count: u32,
 }
 
 impl BatState {
@@ -241,24 +239,12 @@ impl BatState {
     }
 
     /// Update the in-memory mapping for a payload block.
-    ///
-    /// Adjusts `allocated_block_count` based on the old and new states.
-    fn set_payload_mapping(&mut self, bat: &Bat, block_number: u32, mapping: BlockMapping) {
-        let _ = bat; // Used for consistency; entry index needed only for dirty tracking.
-        let old = self.payload_mappings[block_number as usize];
-        let was_allocated = old.bat_state().is_allocated();
-        let now_allocated = mapping.bat_state().is_allocated();
-        if was_allocated && !now_allocated {
-            self.allocated_block_count -= 1;
-        } else if !was_allocated && now_allocated {
-            self.allocated_block_count += 1;
-        }
+    fn set_payload_mapping(&mut self, block_number: u32, mapping: BlockMapping) {
         self.payload_mappings[block_number as usize] = mapping;
     }
 
     /// Update the in-memory mapping for a sector bitmap block.
-    fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: BlockMapping) {
-        let _ = bat;
+    fn set_sbm_mapping(&mut self, chunk_number: u32, mapping: BlockMapping) {
         self.sector_bitmap_mappings[chunk_number as usize] = mapping;
     }
 }
@@ -301,7 +287,6 @@ impl Bat {
         let bat_state = BatState {
             payload_mappings: Vec::with_capacity(data_block_count as usize),
             sector_bitmap_mappings: Vec::with_capacity(sector_bitmap_block_count as usize),
-            allocated_block_count: 0,
         };
 
         let io_refcounts = (0..data_block_count).map(|_| AtomicU16::new(0)).collect();
@@ -562,10 +547,10 @@ impl Bat {
             let mut bat_state = self.bat_state.write();
             match block_type {
                 BlockType::Payload => {
-                    bat_state.set_payload_mapping(self, block_number, mapping);
+                    bat_state.set_payload_mapping(block_number, mapping);
                 }
                 BlockType::SectorBitmap => {
-                    bat_state.set_sbm_mapping(self, block_number, mapping);
+                    bat_state.set_sbm_mapping(block_number, mapping);
                 }
             }
         }
@@ -612,7 +597,6 @@ impl Bat {
             let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
             let mapping = BlockMapping::from_bat_entry(entry, self.has_parent)?;
             if mapping.bat_state().is_allocated() {
-                self.bat_state.get_mut().allocated_block_count += 1;
                 let file_offset = mapping.file_offset();
                 if file_offset != 0 {
                     free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
@@ -722,12 +706,6 @@ impl Bat {
     pub(crate) fn set_block_mapping(&self, block_number: u32, mapping: BlockMapping) {
         let mut bat_state = self.bat_state.write();
         bat_state.set_payload_mapping(self, block_number, mapping);
-    }
-
-    /// Return the number of allocated (FullyPresent or PartiallyPresent) blocks.
-    #[cfg(test)]
-    pub(crate) fn allocated_block_count(&self) -> u32 {
-        self.bat_state.read().allocated_block_count
     }
 
     /// Initialize payload mappings for testing. Replaces any existing
@@ -1110,36 +1088,6 @@ mod tests {
         // Entry beyond all data blocks should return None.
         let beyond = bat.payload_entry_index(bat.data_block_count);
         assert_eq!(bat.entry_number_to_block_id(beyond), None);
-    }
-
-    #[test]
-    fn bat_state_allocated_count_tracking() {
-        let bat = Bat::new(4 * MB1, format::DEFAULT_BLOCK_SIZE, 512, false, MB1 as u32).unwrap();
-        // 2 blocks
-        let mut state = BatState {
-            payload_mappings: vec![BlockMapping::new(); bat.data_block_count as usize],
-            sector_bitmap_mappings: vec![],
-            allocated_block_count: 0,
-        };
-
-        // Allocate block 0.
-        let mapping = BlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
-            .with_file_megabyte(100);
-        state.set_payload_mapping(&bat, 0, mapping);
-        assert_eq!(state.allocated_block_count, 1);
-
-        // Allocate block 1.
-        let mapping2 = BlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
-            .with_file_megabyte(102);
-        state.set_payload_mapping(&bat, 1, mapping2);
-        assert_eq!(state.allocated_block_count, 2);
-
-        // Deallocate block 0 → NotPresent.
-        let dealloc = BlockMapping::new().with_state(BatEntryState::NotPresent as u8);
-        state.set_payload_mapping(&bat, 0, dealloc);
-        assert_eq!(state.allocated_block_count, 1);
     }
 
     // ---- Refcount async behavior tests ----

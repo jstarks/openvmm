@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 use crate::AsyncFile;
 use crate::create::{self, CreateParams};
 use crate::error::CorruptionType;

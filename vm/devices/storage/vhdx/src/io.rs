@@ -417,7 +417,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // Unallocated block — allocate space.
                         let original = mapping;
                         let (new_offset, space_state) = self
-                            .resolve_block_space(span.block_number, mapping, eof)
+                            .allocate_block_space(span.block_number, mapping, eof)
                             .await?;
 
                         if is_full_block {
@@ -468,7 +468,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         ))
     }
 
-    /// Resolve space for a payload block allocation.
+    /// Allocate file space for a payload block.
     ///
     /// Tries three sources in priority order:
     /// 1. Deferred releases (non-durable trim) — reclaim same-block space.
@@ -476,7 +476,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// 3. Fresh allocation via [`allocate_space`].
     ///
     /// Returns the file offset and [`SpaceState`] of the allocated region.
-    async fn resolve_block_space(
+    async fn allocate_block_space(
         &self,
         block_number: u32,
         mapping: BlockMapping,

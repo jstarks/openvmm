@@ -409,6 +409,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

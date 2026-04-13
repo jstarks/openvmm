@@ -5,6 +5,8 @@ pub mod support;
 
 #[cfg(test)]
 mod crash_tests;
+#[cfg(test)]
+mod io_tests;
 
 #[cfg(test)]
 mod integration {

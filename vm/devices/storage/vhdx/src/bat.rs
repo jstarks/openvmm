@@ -121,6 +121,14 @@ impl BlockMapping {
         self.with_state(state as u8)
     }
 
+    /// Whether this mapping is soft-anchored: unmapped or undefined
+    /// with a non-zero file offset retained for potential reuse.
+    pub fn is_soft_anchored(self) -> bool {
+        let state = self.bat_state();
+        matches!(state, BatEntryState::Unmapped | BatEntryState::Undefined)
+            && self.file_megabyte() != 0
+    }
+
     /// Create a [`BlockMapping`] from an on-disk [`BatEntry`].
     ///
     /// Validates the entry state and file offset. For non-differencing

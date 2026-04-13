@@ -488,7 +488,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         // 2. Check soft-anchored blocks (durable trim).
-        if crate::trim::is_soft_anchored(mapping) {
+        if mapping.is_soft_anchored() {
             let old_file_offset = mapping.file_offset();
             if self
                 .free_space
@@ -960,7 +960,12 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
         self.completed = true;
         let tfp_records = self.tfp_records.take().unwrap_or_default();
         self.vhdx
-            .complete_write_inner(self.offset, self.len, tfp_records, self.needs_flush_before_log)
+            .complete_write_inner(
+                self.offset,
+                self.len,
+                tfp_records,
+                self.needs_flush_before_log,
+            )
             .await
     }
 }

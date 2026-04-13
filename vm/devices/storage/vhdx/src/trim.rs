@@ -111,14 +111,6 @@ fn mode_skips_write_guid(mode: TrimMode) -> bool {
     matches!(mode, TrimMode::RemoveSoftAnchors)
 }
 
-/// Check whether a block mapping is soft-anchored: unmapped/undefined
-/// with a non-zero file offset.
-pub(crate) fn is_soft_anchored(mapping: BlockMapping) -> bool {
-    let state = mapping.bat_state();
-    matches!(state, BatEntryState::Unmapped | BatEntryState::Undefined)
-        && mapping.file_megabyte() != 0
-}
-
 /// Convert a block mapping according to the trim mode.
 ///
 /// Returns the new mapping, which may be identical to `old` (no-op).
@@ -205,7 +197,7 @@ fn convert_make_transparent(state: BatEntryState, old: BlockMapping) -> BlockMap
 
 /// RemoveSoftAnchors: clear file offset if soft-anchored, otherwise no-op.
 fn convert_remove_soft_anchors(old: BlockMapping) -> BlockMapping {
-    if is_soft_anchored(old) {
+    if old.is_soft_anchored() {
         BlockMapping::new()
             .with_bat_state(old.bat_state())
             .with_transitioning_to_fully_present(false)
@@ -370,8 +362,8 @@ impl<F: AsyncFile> VhdxFile<F> {
             // Space releases are deferred until the BAT change is durable
             // on disk. Without deferral, a crash could teleport data from
             // a new block into the old block's offset.
-            let old_anchored = is_soft_anchored(old_mapping);
-            let new_anchored = is_soft_anchored(new_mapping);
+            let old_anchored = old_mapping.is_soft_anchored();
+            let new_anchored = new_mapping.is_soft_anchored();
             let old_file_mb = old_mapping.file_megabyte();
             let new_file_mb = new_mapping.file_megabyte();
             let old_file_offset = old_file_mb as u64 * MB1;
@@ -1370,24 +1362,24 @@ mod tests {
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
-        assert!(is_soft_anchored(m));
+        assert!(m.is_soft_anchored());
 
         // Undefined with offset → anchored
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Undefined)
             .with_file_megabyte(3);
-        assert!(is_soft_anchored(m));
+        assert!(m.is_soft_anchored());
 
         // Unmapped with no offset → not anchored
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(0);
-        assert!(!is_soft_anchored(m));
+        assert!(!m.is_soft_anchored());
 
         // FullyPresent with offset → not anchored (wrong state)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
-        assert!(!is_soft_anchored(m));
+        assert!(!m.is_soft_anchored());
     }
 }

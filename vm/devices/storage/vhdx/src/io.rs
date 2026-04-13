@@ -452,7 +452,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // Error cleanup: revert TFP-marked blocks and release allocated space on failure.
         if let Err(e) = allocation_result {
-            self.abort_write_sync(tfp_records);
+            self.abort_write_sync(&tfp_records);
             return Err(e);
         }
 
@@ -676,60 +676,62 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Called by [`WriteIoGuard::complete()`] after the caller has written
     /// data to the resolved ranges.
     ///
-    /// Uses the TFP records collected during `resolve_write`
-    /// to clear TFP flags, set state to FullyPresent, write BAT entries,
-    /// and update sector bitmaps — without re-walking the block range.
+    /// Iterates the TFP records from `resolve_write`, clearing the TFP
+    /// flag and setting each block to `FullyPresent` via
+    /// [`write_block_mapping`] (which atomically updates the in-memory
+    /// BAT and dirties the cache page). Then updates sector bitmaps for
+    /// any `PartiallyPresent` blocks (differencing disk partial writes).
     ///
-    /// The abort path (write failure / guard dropped without `complete()`)
-    /// is handled synchronously by [`abort_write_sync()`].
+    /// If a cache write fails, the remaining TFP records are reverted
+    /// via [`abort_write_sync`] and the error is returned. The file will
+    /// be poisoned by the log pipeline shortly after.
     async fn complete_write_inner(
         &self,
         offset: u64,
         len: u32,
-        tfp_records: Vec<TfpRecord>,
+        tfp_records: &[TfpRecord],
         needs_flush_before_log: bool,
     ) -> Result<(), VhdxError> {
         let had_tfp = !tfp_records.is_empty();
-        let mut bat_write_error: Option<VhdxError> = None;
 
-        for record in &tfp_records {
-            // Clear TFP, set FullyPresent.
+        // Capture FSN after the caller's data writes (matching C's
+        // Vhd2iDereferenceReadWrite → Vhd2iGetCurrentFsn timing).
+        // Passed into write_block_mapping so it's stamped on the
+        // cache page atomically with the dirty-mark.
+        let pre_log_fsn = if needs_flush_before_log {
+            self.log_state
+                .as_ref()
+                .map(|state| state.flush_sequencer.current_fsn())
+        } else {
+            None
+        };
+
+        for (i, record) in tfp_records.iter().enumerate() {
             let mapping = self.bat.get_block_mapping(record.block_number);
             let final_mapping = BlockMapping::new()
                 .with_bat_state(BatEntryState::FullyPresent)
                 .with_transitioning_to_fully_present(false)
                 .with_file_megabyte(mapping.file_megabyte());
 
-            // Write per-entry to cache. Errors are deferred so we
-            // can still notify waiters.
-            if bat_write_error.is_none() {
-                // Capture FSN NOW (after caller's data writes,
-                // matching C's Vhd2iDereferenceReadWrite →
-                // Vhd2iGetCurrentFsn timing). Passed into
-                // write_block_mapping so it's set atomically
-                // with the dirty-mark.
-                let pre_log_fsn = if needs_flush_before_log {
-                    self.log_state
-                        .as_ref()
-                        .map(|state| state.flush_sequencer.current_fsn())
-                } else {
-                    None
-                };
-
-                if let Err(e) = self
-                    .bat
-                    .write_block_mapping(
-                        &self.cache,
-                        BlockType::Payload,
-                        record.block_number,
-                        final_mapping,
-                        pre_log_fsn,
-                    )
-                    .await
-                {
-                    bat_write_error = Some(e);
-                }
+            if let Err(e) = self
+                .bat
+                .write_block_mapping(
+                    &self.cache,
+                    BlockType::Payload,
+                    record.block_number,
+                    final_mapping,
+                    pre_log_fsn,
+                )
+                .await
+            {
+                self.abort_write_sync(&tfp_records[i..]);
+                return Err(e);
             }
+        }
+
+        // Notify waiters ALWAYS, even on failure or cache write error.
+        if had_tfp {
+            self.allocation_event.notify(usize::MAX);
         }
 
         // Update sector bitmaps for partial writes to differencing disks.
@@ -748,31 +750,24 @@ impl<F: AsyncFile> VhdxFile<F> {
             }
         }
 
-        // Notify waiters ALWAYS, even on failure or cache write error.
-        if had_tfp {
-            self.allocation_event.notify(usize::MAX);
-        }
-
-        // Propagate any deferred BAT cache write error.
-        if let Some(e) = bat_write_error {
-            return Err(e);
-        }
-
         Ok(())
     }
 
-    /// Synchronous abort path for `WriteIoGuard::drop()`.
+    /// Revert TFP blocks to their original state.
     ///
-    /// Reverts TFP blocks to their original state using the saved
-    /// [`TfpRecord::original_mapping`], releases any newly allocated space
-    /// back to the free pool, and notifies allocation waiters. Does not
-    /// perform any file I/O.
-    fn abort_write_sync(&self, tfp_records: Vec<TfpRecord>) {
+    /// Called on two paths:
+    /// - `WriteIoGuard::drop()` without `complete()` (write aborted)
+    /// - `complete_write_inner()` when a cache write fails (partial completion)
+    ///
+    /// Restores each block's in-memory BAT to [`TfpRecord::original_mapping`],
+    /// releases any newly allocated space back to the free pool, and
+    /// notifies allocation waiters. Does not perform any file I/O.
+    fn abort_write_sync(&self, tfp_records: &[TfpRecord]) {
         if tfp_records.is_empty() {
             return;
         }
 
-        for record in &tfp_records {
+        for record in tfp_records {
             self.bat
                 .set_block_mapping(record.block_number, record.original_mapping);
             // Release allocated space back to free pool.
@@ -892,7 +887,7 @@ pub struct WriteIoGuard<'a, F: AsyncFile> {
     needs_flush_before_log: bool,
     /// TFP records collected during resolve_write, needed by complete/abort.
     /// `None` after complete() or for zero-length writes.
-    tfp_records: Option<Vec<TfpRecord>>,
+    tfp_records: Vec<TfpRecord>,
 }
 
 impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
@@ -913,7 +908,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len,
             completed: false,
             needs_flush_before_log,
-            tfp_records: Some(tfp_records),
+            tfp_records,
         }
     }
 
@@ -926,7 +921,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len: 0,
             completed: true,
             needs_flush_before_log: false,
-            tfp_records: None,
+            tfp_records: Vec::new(),
         }
     }
 
@@ -941,7 +936,7 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
             len,
             completed: false,
             needs_flush_before_log: false,
-            tfp_records: None,
+            tfp_records: Vec::new(),
         }
     }
 
@@ -952,12 +947,11 @@ impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
     /// after this method returns.
     pub async fn complete(mut self) -> Result<(), VhdxError> {
         self.completed = true;
-        let tfp_records = self.tfp_records.take().unwrap_or_default();
         self.vhdx
             .complete_write_inner(
                 self.offset,
                 self.len,
-                tfp_records,
+                &self.tfp_records,
                 self.needs_flush_before_log,
             )
             .await
@@ -968,9 +962,7 @@ impl<F: AsyncFile> Drop for WriteIoGuard<'_, F> {
     fn drop(&mut self) {
         // If complete() was not called, abort the write.
         if !self.completed {
-            if let Some(tfp_records) = self.tfp_records.take() {
-                self.vhdx.abort_write_sync(tfp_records);
-            }
+            self.vhdx.abort_write_sync(&self.tfp_records);
         }
         // Refcounts are decremented when self.bat_guard drops.
     }

@@ -9,6 +9,7 @@
 
 use crate::AsyncFile;
 use crate::bat::BlockMapping;
+use crate::bat::BlockSpan;
 use crate::bat::BlockType;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
@@ -77,29 +78,19 @@ pub enum WriteRange {
 }
 
 impl<F: AsyncFile> VhdxFile<F> {
-    /// Resolve a read request into file-level ranges.
+    /// Validate an I/O request and acquire per-block refcounts.
     ///
-    /// Walks the read request block-by-block, looking up each block's state
-    /// in the BAT and appending one or more [`ReadRange`] entries to `ranges`.
-    /// The caller performs actual file I/O based on the returned ranges.
+    /// Checks the failure flag, alignment, and bounds. Then increments
+    /// per-block refcounts atomically, waiting if trim has claimed any
+    /// block. Returns the [`BatGuard`] that holds the refcounts.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the read extends beyond the virtual disk size,
-    /// if the offset or length is not aligned to the logical sector size,
-    /// or if a BAT entry is corrupt.
-    pub async fn resolve_read(
+    /// Callers must handle zero-length requests before calling this.
+    async fn validate_and_acquire(
         &self,
         offset: u64,
         len: u32,
-        ranges: &mut Vec<ReadRange>,
-    ) -> Result<ReadIoGuard<'_, F>, VhdxError> {
+    ) -> Result<crate::bat::BatGuard<'_>, VhdxError> {
         self.failed.check()?;
-
-        // Zero-length reads succeed immediately.
-        if len == 0 {
-            return Ok(ReadIoGuard::empty());
-        }
 
         // Validate alignment to logical sector size.
         if !offset.is_multiple_of(self.logical_sector_size as u64)
@@ -129,30 +120,50 @@ impl<F: AsyncFile> VhdxFile<F> {
             .acquire_io_refcounts(start_block, block_count)
             .await;
 
-        let mut current_offset: u32 = 0;
+        Ok(guard)
+    }
 
-        while current_offset < len {
-            let virtual_offset = offset + current_offset as u64;
-            let block_number = self.bat.offset_to_block(virtual_offset);
-            let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
+    /// Resolve a read request into file-level ranges.
+    ///
+    /// Walks the read request block-by-block, looking up each block's state
+    /// in the BAT and appending one or more [`ReadRange`] entries to `ranges`.
+    /// The caller performs actual file I/O based on the returned ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read extends beyond the virtual disk size,
+    /// if the offset or length is not aligned to the logical sector size,
+    /// or if a BAT entry is corrupt.
+    pub async fn resolve_read(
+        &self,
+        offset: u64,
+        len: u32,
+        ranges: &mut Vec<ReadRange>,
+    ) -> Result<ReadIoGuard<'_, F>, VhdxError> {
+        // Zero-length reads succeed immediately.
+        if len == 0 {
+            return Ok(ReadIoGuard::empty());
+        }
 
-            let mapping = self.bat.get_block_mapping(block_number);
+        let guard = self.validate_and_acquire(offset, len).await?;
+
+        for span in self.bat.block_spans(offset, len) {
+            let mapping = self.bat.get_block_mapping(span.block_number);
 
             match mapping.bat_state() {
                 BatEntryState::FullyPresent => {
-                    let file_offset = mapping.file_offset() + block_offset as u64;
+                    let file_offset = mapping.file_offset() + span.block_offset as u64;
                     ranges.push(ReadRange::Data {
-                        guest_offset: virtual_offset,
-                        length: block_length,
+                        guest_offset: span.virtual_offset,
+                        length: span.length,
                         file_offset,
                     });
                 }
                 BatEntryState::PartiallyPresent => {
                     self.resolve_partial_block_read(
                         mapping.file_offset(),
-                        virtual_offset,
-                        block_length,
+                        span.virtual_offset,
+                        span.length,
                         ranges,
                     )
                     .await?;
@@ -160,25 +171,23 @@ impl<F: AsyncFile> VhdxFile<F> {
                 BatEntryState::NotPresent => {
                     if self.has_parent {
                         ranges.push(ReadRange::Unmapped {
-                            guest_offset: virtual_offset,
-                            length: block_length,
+                            guest_offset: span.virtual_offset,
+                            length: span.length,
                         });
                     } else {
                         ranges.push(ReadRange::Zero {
-                            guest_offset: virtual_offset,
-                            length: block_length,
+                            guest_offset: span.virtual_offset,
+                            length: span.length,
                         });
                     }
                 }
                 BatEntryState::Zero | BatEntryState::Unmapped | BatEntryState::Undefined => {
                     ranges.push(ReadRange::Zero {
-                        guest_offset: virtual_offset,
-                        length: block_length,
+                        guest_offset: span.virtual_offset,
+                        length: span.length,
                     });
                 }
             }
-
-            current_offset += block_length;
         }
 
         Ok(ReadIoGuard::new(guard))
@@ -207,8 +216,6 @@ impl<F: AsyncFile> VhdxFile<F> {
         len: u32,
         ranges: &mut Vec<WriteRange>,
     ) -> Result<WriteIoGuard<'_, F>, VhdxError> {
-        self.failed.check()?;
-
         // Check read-only.
         if self.read_only {
             return Err(VhdxError::ReadOnly);
@@ -219,61 +226,21 @@ impl<F: AsyncFile> VhdxFile<F> {
             return Ok(WriteIoGuard::new_completed(self));
         }
 
-        // Validate alignment to logical sector size.
-        if !offset.is_multiple_of(self.logical_sector_size as u64)
-            || !(len as u64).is_multiple_of(self.logical_sector_size as u64)
-        {
-            return Err(VhdxError::Corrupt(CorruptionType::UnalignedIo));
-        }
-
-        // Validate bounds.
-        if offset
-            .checked_add(len as u64)
-            .is_none_or(|end| end > self.disk_size)
-        {
-            return Err(VhdxError::Corrupt(CorruptionType::IoBeyondEndOfDisk));
-        }
-
         // First-write gate: update header with new GUIDs before any data.
         self.enable_write_mode(WriteMode::DataWritable).await?;
 
-        // Increment per-block refcounts BEFORE reading mappings to prevent
-        // trim from changing them underneath us. If trim has claimed any
-        // block, this waits for it to finish.
-        let start_block = self.bat.offset_to_block(offset);
-        let end_block = self.bat.offset_to_block(offset + len as u64 - 1);
-        let block_count = end_block - start_block + 1;
+        let refcount_guard = self.validate_and_acquire(offset, len).await?;
 
-        let refcount_guard = self
-            .bat
-            .acquire_io_refcounts(start_block, block_count)
-            .await;
-
-        // Track which blocks we've resolved in the read phase.
-        // Blocks needing allocation are collected for the allocation phase.
-        struct BlockInfo {
-            block_number: u32,
-            block_offset: u32,
-            block_length: u32,
-            virtual_offset: u64,
-        }
-
-        let mut current_offset: u32 = 0;
-        let mut blocks_needing_allocation = Vec::new();
+        let mut blocks_needing_allocation: Vec<BlockSpan> = Vec::new();
 
         // --- Read phase: check BAT state for each block ---
-        while current_offset < len {
-            let virtual_offset = offset + current_offset as u64;
-            let block_number = self.bat.offset_to_block(virtual_offset);
-            let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
-
-            let is_full_block = block_offset == 0 && block_length >= self.block_size;
+        for span in self.bat.block_spans(offset, len) {
+            let is_full_block = span.is_full_block(self.block_size);
 
             // Read the in-memory BAT state.
             loop {
                 let (state, file_offset, has_tfp) = {
-                    let mapping = self.bat.get_block_mapping(block_number);
+                    let mapping = self.bat.get_block_mapping(span.block_number);
                     (
                         mapping.bat_state(),
                         mapping.file_offset(),
@@ -286,7 +253,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     let listener = self.allocation_event.listen();
                     if self
                         .bat
-                        .get_block_mapping(block_number)
+                        .get_block_mapping(span.block_number)
                         .transitioning_to_fully_present()
                     {
                         listener.await;
@@ -297,9 +264,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                 match state {
                     BatEntryState::FullyPresent => {
                         ranges.push(WriteRange::Data {
-                            guest_offset: virtual_offset,
-                            length: block_length,
-                            file_offset: file_offset + block_offset as u64,
+                            guest_offset: span.virtual_offset,
+                            length: span.length,
+                            file_offset: file_offset + span.block_offset as u64,
                         });
                         break;
                     }
@@ -307,9 +274,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // Partial write to already-allocated block — write
                         // directly. complete_write() updates sector bitmaps.
                         ranges.push(WriteRange::Data {
-                            guest_offset: virtual_offset,
-                            length: block_length,
-                            file_offset: file_offset + block_offset as u64,
+                            guest_offset: span.virtual_offset,
+                            length: span.length,
+                            file_offset: file_offset + span.block_offset as u64,
                         });
                         break;
                     }
@@ -317,12 +284,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // Fully-covering write to PartiallyPresent block —
                         // needs TFP to promote to FullyPresent. Fall through
                         // to allocation phase.
-                        blocks_needing_allocation.push(BlockInfo {
-                            block_number,
-                            block_offset,
-                            block_length,
-                            virtual_offset,
-                        });
+                        blocks_needing_allocation.push(span);
                         break;
                     }
                     BatEntryState::NotPresent
@@ -330,18 +292,11 @@ impl<F: AsyncFile> VhdxFile<F> {
                     | BatEntryState::Unmapped
                     | BatEntryState::Undefined => {
                         // Unallocated — needs allocation.
-                        blocks_needing_allocation.push(BlockInfo {
-                            block_number,
-                            block_offset,
-                            block_length,
-                            virtual_offset,
-                        });
+                        blocks_needing_allocation.push(span);
                         break;
                     }
                 }
             }
-
-            current_offset += block_length;
         }
 
         // If nothing needs allocation, we're done. Transfer refcount
@@ -375,9 +330,9 @@ impl<F: AsyncFile> VhdxFile<F> {
             // Check all blocks under BAT lock for TFP overlap.
             // Register listener before dropping locks to avoid missed wakes.
             let listener = self.allocation_event.listen();
-            if !blocks_needing_allocation.iter().any(|block_info| {
+            if !blocks_needing_allocation.iter().any(|span| {
                 self.bat
-                    .get_block_mapping(block_info.block_number)
+                    .get_block_mapping(span.block_number)
                     .transitioning_to_fully_present()
             }) {
                 break alloc_guard;
@@ -406,28 +361,27 @@ impl<F: AsyncFile> VhdxFile<F> {
         // for all concurrent allocators to finish above.
         let eof = &mut *_alloc_guard;
         let allocation_result = async {
-            for block_info in &blocks_needing_allocation {
-                let is_full_block =
-                    block_info.block_offset == 0 && block_info.block_length >= self.block_size;
+            for span in &blocks_needing_allocation {
+                let is_full_block = span.is_full_block(self.block_size);
 
                 // Re-read mapping (may have changed since read phase).
-                let mapping = self.bat.get_block_mapping(block_info.block_number);
+                let mapping = self.bat.get_block_mapping(span.block_number);
 
                 // Assert no TFP — we serialized against concurrent
                 // allocators in the loop above.
                 debug_assert!(
                     !mapping.transitioning_to_fully_present(),
                     "block {} has TFP after overlap wait",
-                    block_info.block_number
+                    span.block_number
                 );
 
                 match mapping.bat_state() {
                     BatEntryState::FullyPresent => {
                         // Already allocated by a concurrent writer — just emit range.
                         ranges.push(WriteRange::Data {
-                            guest_offset: block_info.virtual_offset,
-                            length: block_info.block_length,
-                            file_offset: mapping.file_offset() + block_info.block_offset as u64,
+                            guest_offset: span.virtual_offset,
+                            length: span.length,
+                            file_offset: mapping.file_offset() + span.block_offset as u64,
                         });
                     }
                     BatEntryState::PartiallyPresent if is_full_block => {
@@ -438,19 +392,18 @@ impl<F: AsyncFile> VhdxFile<F> {
                         let original = mapping;
                         let new_mapping = original.with_transitioning_to_fully_present(true);
 
-                        self.bat
-                            .set_block_mapping(block_info.block_number, new_mapping);
+                        self.bat.set_block_mapping(span.block_number, new_mapping);
 
                         tfp_records.push(TfpRecord {
-                            block_number: block_info.block_number,
+                            block_number: span.block_number,
                             original_mapping: original,
                             allocated_offset: None,
                         });
 
                         ranges.push(WriteRange::Data {
-                            guest_offset: block_info.virtual_offset,
-                            length: block_info.block_length,
-                            file_offset: mapping.file_offset() + block_info.block_offset as u64,
+                            guest_offset: span.virtual_offset,
+                            length: span.length,
+                            file_offset: mapping.file_offset() + span.block_offset as u64,
                         });
                     }
                     _ => {
@@ -468,7 +421,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         // Otherwise, allocate fresh space.
                         let original = mapping;
                         let (new_offset, space_state) = if let Some(deferred_offset) =
-                            self.deferred_releases.remove(block_info.block_number)
+                            self.deferred_releases.remove(span.block_number)
                         {
                             // Reclaiming our own deferred (non-durable) space.
                             (deferred_offset, crate::space::SpaceState::OwnStale)
@@ -477,7 +430,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                             if self
                                 .free_space
                                 .unmark_trimmed_block(
-                                    block_info.block_number,
+                                    span.block_number,
                                     old_file_offset,
                                     self.block_size,
                                 )
@@ -509,11 +462,10 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 .with_transitioning_to_fully_present(true)
                                 .with_file_megabyte((new_offset / MB1) as u32);
 
-                            self.bat
-                                .set_block_mapping(block_info.block_number, new_mapping);
+                            self.bat.set_block_mapping(span.block_number, new_mapping);
 
                             tfp_records.push(TfpRecord {
-                                block_number: block_info.block_number,
+                                block_number: span.block_number,
                                 original_mapping: original,
                                 allocated_offset: Some(new_offset),
                             });
@@ -524,9 +476,9 @@ impl<F: AsyncFile> VhdxFile<F> {
                             }
 
                             ranges.push(WriteRange::Data {
-                                guest_offset: block_info.virtual_offset,
-                                length: block_info.block_length,
-                                file_offset: new_offset + block_info.block_offset as u64,
+                                guest_offset: span.virtual_offset,
+                                length: span.length,
+                                file_offset: new_offset + span.block_offset as u64,
                             });
                         } else {
                             // Partial write — commit BAT immediately.
@@ -546,7 +498,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
                             // --- SBM block allocation for PartiallyPresent ---
                             if is_partial_present {
-                                let chunk_number = block_info.block_number / self.bat.chunk_ratio;
+                                let chunk_number = span.block_number / self.bat.chunk_ratio;
                                 let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
 
                                 if sbm_mapping.bat_state() != BatEntryState::FullyPresent {
@@ -592,8 +544,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 .with_transitioning_to_fully_present(false)
                                 .with_file_megabyte((new_offset / MB1) as u32);
 
-                            self.bat
-                                .set_block_mapping(block_info.block_number, new_mapping);
+                            self.bat.set_block_mapping(span.block_number, new_mapping);
 
                             // For non-TFP path: capture per-page FSN when
                             // !is_safe. The FSN is captured now (before
@@ -616,7 +567,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                                 .write_block_mapping(
                                     &self.cache,
                                     BlockType::Payload,
-                                    block_info.block_number,
+                                    span.block_number,
                                     new_mapping,
                                     pre_log_fsn,
                                 )
@@ -629,22 +580,22 @@ impl<F: AsyncFile> VhdxFile<F> {
                             // For FullyPresent blocks, zero-fill surround
                             // unless the space is already safe.
                             if !is_partial_present
-                                && block_info.block_offset > 0
+                                && span.block_offset > 0
                                 && !space_state.is_zero()
                             {
                                 ranges.push(WriteRange::Zero {
                                     file_offset: new_offset,
-                                    length: block_info.block_offset,
+                                    length: span.block_offset,
                                 });
                             }
 
                             ranges.push(WriteRange::Data {
-                                guest_offset: block_info.virtual_offset,
-                                length: block_info.block_length,
-                                file_offset: new_offset + block_info.block_offset as u64,
+                                guest_offset: span.virtual_offset,
+                                length: span.length,
+                                file_offset: new_offset + span.block_offset as u64,
                             });
 
-                            let end_offset = block_info.block_offset + block_info.block_length;
+                            let end_offset = span.block_offset + span.length;
                             if !is_partial_present
                                 && end_offset < self.block_size
                                 && !space_state.is_zero()
@@ -714,16 +665,9 @@ impl<F: AsyncFile> VhdxFile<F> {
         let mut had_tfp = false;
         let mut bat_write_error: Option<VhdxError> = None;
 
-        let mut current_offset: u32 = 0;
-
-        while current_offset < len {
-            let virtual_offset = offset + current_offset as u64;
-            let block_number = self.bat.offset_to_block(virtual_offset);
-            let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
-
+        for span in self.bat.block_spans(offset, len) {
             // Read the in-memory mapping to check for TFP.
-            let mapping = self.bat.get_block_mapping(block_number);
+            let mapping = self.bat.get_block_mapping(span.block_number);
 
             if mapping.transitioning_to_fully_present() {
                 had_tfp = true;
@@ -734,7 +678,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                     .with_transitioning_to_fully_present(false)
                     .with_file_megabyte(mapping.file_megabyte());
 
-                self.bat.set_block_mapping(block_number, final_mapping);
+                self.bat.set_block_mapping(span.block_number, final_mapping);
 
                 // Write per-entry to cache. Errors are deferred so we
                 // can still notify waiters.
@@ -758,7 +702,7 @@ impl<F: AsyncFile> VhdxFile<F> {
                         .write_block_mapping(
                             &self.cache,
                             BlockType::Payload,
-                            block_number,
+                            span.block_number,
                             final_mapping,
                             pre_log_fsn,
                         )
@@ -769,14 +713,12 @@ impl<F: AsyncFile> VhdxFile<F> {
                 }
             } else if self.has_parent {
                 // Non-TFP PartiallyPresent blocks: update sector bitmaps.
-                let mapping = self.bat.get_block_mapping(block_number);
+                let mapping = self.bat.get_block_mapping(span.block_number);
                 if mapping.bat_state() == BatEntryState::PartiallyPresent {
-                    self.set_sector_bitmap_bits(virtual_offset, block_length, true)
+                    self.set_sector_bitmap_bits(span.virtual_offset, span.length, true)
                         .await?;
                 }
             }
-
-            current_offset += block_length;
         }
 
         // Notify waiters ALWAYS, even on failure or cache write error.
@@ -803,15 +745,9 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         let mut had_tfp = false;
-        let mut current_offset: u32 = 0;
 
-        while current_offset < len {
-            let virtual_offset = offset + current_offset as u64;
-            let block_number = self.bat.offset_to_block(virtual_offset);
-            let block_offset = self.bat.offset_within_block(virtual_offset);
-            let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
-
-            let mapping = self.bat.get_block_mapping(block_number);
+        for span in self.bat.block_spans(offset, len) {
+            let mapping = self.bat.get_block_mapping(span.block_number);
 
             if mapping.transitioning_to_fully_present() {
                 had_tfp = true;
@@ -833,10 +769,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                     }
                 };
 
-                self.bat.set_block_mapping(block_number, reverted);
+                self.bat.set_block_mapping(span.block_number, reverted);
             }
-
-            current_offset += block_length;
         }
 
         if had_tfp {

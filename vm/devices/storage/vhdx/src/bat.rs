@@ -401,8 +401,24 @@ impl Bat {
     }
 
     /// Compute the byte offset within a block for a given virtual disk offset.
+    #[cfg(test)]
     pub fn offset_within_block(&self, offset: u64) -> u32 {
         (offset % self.block_size as u64) as u32
+    }
+
+    /// Iterate over the block spans touched by a virtual disk range.
+    ///
+    /// Given a guest `offset` and `len`, yields one [`BlockSpan`] per
+    /// block touched, with the block-relative offset and clamped length.
+    /// This is the single source of truth for the block-walk arithmetic
+    /// used by read, write, complete, and abort paths.
+    pub fn block_spans(&self, offset: u64, len: u32) -> BlockSpanIter {
+        BlockSpanIter {
+            block_size: self.block_size,
+            base_offset: offset,
+            total_len: len,
+            current_offset: 0,
+        }
     }
 
     /// Serialize a BAT page from in-memory state.
@@ -717,6 +733,61 @@ pub struct TrimGuard<'a> {
 impl Drop for TrimGuard<'_> {
     fn drop(&mut self) {
         self.bat.release_trim_claim(self.block_number);
+    }
+}
+
+/// A single block's portion of a virtual disk I/O range.
+///
+/// Produced by [`Bat::block_spans`]. Each span describes one block's
+/// contribution to an `(offset, len)` range.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockSpan {
+    /// Block number within the BAT.
+    pub block_number: u32,
+    /// Byte offset within the block where this span starts.
+    pub block_offset: u32,
+    /// Number of bytes this span covers within the block.
+    pub length: u32,
+    /// Absolute guest virtual disk byte offset for this span.
+    pub virtual_offset: u64,
+}
+
+impl BlockSpan {
+    /// Whether this span covers the entire block.
+    pub fn is_full_block(&self, block_size: u32) -> bool {
+        self.block_offset == 0 && self.length >= block_size
+    }
+}
+
+/// Iterator over [`BlockSpan`]s produced by [`Bat::block_spans`].
+pub struct BlockSpanIter {
+    block_size: u32,
+    base_offset: u64,
+    total_len: u32,
+    current_offset: u32,
+}
+
+impl Iterator for BlockSpanIter {
+    type Item = BlockSpan;
+
+    fn next(&mut self) -> Option<BlockSpan> {
+        if self.current_offset >= self.total_len {
+            return None;
+        }
+        let virtual_offset = self.base_offset + self.current_offset as u64;
+        let block_number = (virtual_offset / self.block_size as u64) as u32;
+        let block_offset = (virtual_offset % self.block_size as u64) as u32;
+        let length = std::cmp::min(
+            self.block_size - block_offset,
+            self.total_len - self.current_offset,
+        );
+        self.current_offset += length;
+        Some(BlockSpan {
+            block_number,
+            block_offset,
+            length,
+            virtual_offset,
+        })
     }
 }
 

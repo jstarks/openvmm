@@ -274,11 +274,11 @@ impl<F: AsyncFile> VhdxFile<F> {
             loop {
                 let (state, file_offset, has_tfp) = {
                     let bat_state = self.bat.bat_state.read();
-                    let internal = bat_state.get_payload_mapping(block_number);
+                    let mapping = bat_state.get_payload_mapping(block_number);
                     (
-                        internal.bat_state(),
-                        internal.file_offset(),
-                        internal.transitioning_to_fully_present(),
+                        mapping.bat_state(),
+                        mapping.file_offset(),
+                        mapping.transitioning_to_fully_present(),
                     )
                 };
 
@@ -287,8 +287,8 @@ impl<F: AsyncFile> VhdxFile<F> {
                     let listener = {
                         let _bat_state = self.bat.bat_state.read();
                         // Re-check under lock to avoid wake-miss race.
-                        let internal = _bat_state.get_payload_mapping(block_number);
-                        if !internal.transitioning_to_fully_present() {
+                        let mapping = _bat_state.get_payload_mapping(block_number);
+                        if !mapping.transitioning_to_fully_present() {
                             continue; // TFP cleared while we were setting up — retry
                         }
                         self.allocation_event.listen()
@@ -767,19 +767,19 @@ impl<F: AsyncFile> VhdxFile<F> {
             let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
             // Read the in-memory mapping to check for TFP.
-            let internal = {
+            let mapping = {
                 let bat_state = self.bat.bat_state.read();
                 bat_state.get_payload_mapping(block_number)
             };
 
-            if internal.transitioning_to_fully_present() {
+            if mapping.transitioning_to_fully_present() {
                 had_tfp = true;
 
                 // Clear TFP, set FullyPresent.
                 let final_mapping = BlockMapping::new()
                     .with_bat_state(BatEntryState::FullyPresent)
                     .with_transitioning_to_fully_present(false)
-                    .with_file_megabyte(internal.file_megabyte());
+                    .with_file_megabyte(mapping.file_megabyte());
 
                 {
                     let mut bat_state = self.bat.bat_state.write();
@@ -861,26 +861,26 @@ impl<F: AsyncFile> VhdxFile<F> {
             let block_offset = self.bat.offset_within_block(virtual_offset);
             let block_length = std::cmp::min(self.block_size - block_offset, len - current_offset);
 
-            let internal = {
+            let mapping = {
                 let bat_state = self.bat.bat_state.read();
                 bat_state.get_payload_mapping(block_number)
             };
 
-            if internal.transitioning_to_fully_present() {
+            if mapping.transitioning_to_fully_present() {
                 had_tfp = true;
-                let original_state = internal.bat_state();
+                let original_state = mapping.bat_state();
                 let reverted = match original_state {
                     BatEntryState::PartiallyPresent => BlockMapping::new()
-                        .with_bat_state(internal.bat_state())
+                        .with_bat_state(mapping.bat_state())
                         .with_transitioning_to_fully_present(false)
-                        .with_file_megabyte(internal.file_megabyte()),
+                        .with_file_megabyte(mapping.file_megabyte()),
                     _ => {
-                        let file_offset = internal.file_offset();
+                        let file_offset = mapping.file_offset();
                         if file_offset != 0 {
                             self.free_space.release(file_offset, self.block_size);
                         }
                         BlockMapping::new()
-                            .with_bat_state(internal.bat_state())
+                            .with_bat_state(mapping.bat_state())
                             .with_transitioning_to_fully_present(false)
                             .with_file_megabyte(0)
                     }

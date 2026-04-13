@@ -368,6 +368,11 @@ impl BatEntryState {
             _ => None,
         }
     }
+
+    /// Whether this state counts as "allocated" (backed by file space).
+    pub fn is_allocated(self) -> bool {
+        matches!(self, Self::FullyPresent | Self::PartiallyPresent)
+    }
 }
 
 /// Metadata table header.

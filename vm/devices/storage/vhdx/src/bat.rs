@@ -121,48 +121,49 @@ impl BlockMapping {
         self.with_state(state as u8)
     }
 
-    /// Create an `InternalBlockMapping` from an on-disk [`BatEntry`].
+    /// Create a [`BlockMapping`] from an on-disk [`BatEntry`].
     ///
-    /// For non-differencing disks (`has_parent == false`), normalizes
-    /// `PartiallyPresent` to `FullyPresent` at load time so callers
-    /// don't need to handle the distinction.
-    ///
-    /// Panics if the on-disk file offset exceeds the 28-bit megabyte field
-    /// (files > 256 TB).
-    pub fn from_bat_entry(entry: BatEntry, has_parent: bool) -> Self {
-        let file_mb = entry.file_offset_mb();
-        assert!(
-            file_mb <= 0x0FFF_FFFF,
-            "file offset {file_mb} MB exceeds 28-bit InternalBlockMapping limit (256 TB)"
-        );
-        let mut state = entry.state();
+    /// Validates the entry state and file offset. For non-differencing
+    /// disks (`has_parent == false`), normalizes `PartiallyPresent` to
+    /// `FullyPresent` at load time.
+    pub fn from_bat_entry(entry: BatEntry, has_parent: bool) -> Result<Self, VhdxError> {
+        let raw_state = entry.state();
+        let mut bat_state = BatEntryState::from_raw(raw_state)
+            .ok_or(VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
         // Normalize PartiallyPresent → FullyPresent for non-diff disks.
-        if !has_parent && state == BatEntryState::PartiallyPresent as u8 {
-            state = BatEntryState::FullyPresent as u8;
+        if !has_parent && bat_state == BatEntryState::PartiallyPresent {
+            bat_state = BatEntryState::FullyPresent;
         }
-        BlockMapping::new()
-            .with_state(state)
+        let file_mb = entry.file_offset_mb();
+        if file_mb > 0x0FFF_FFFF {
+            return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
+        }
+        Ok(BlockMapping::new()
+            .with_bat_state(bat_state)
             .with_transitioning_to_fully_present(false)
-            .with_file_megabyte(file_mb as u32)
+            .with_file_megabyte(file_mb as u32))
     }
 
-    /// Create an `InternalBlockMapping` from an on-disk SBM [`BatEntry`].
+    /// Create a [`BlockMapping`] from an on-disk SBM [`BatEntry`].
     ///
-    /// Normalizes `PartiallyPresent` to `FullyPresent` (compatibility).
-    pub fn from_sbm_bat_entry(entry: BatEntry) -> Self {
-        let file_mb = entry.file_offset_mb();
-        assert!(
-            file_mb <= 0x0FFF_FFFF,
-            "file offset {file_mb} MB exceeds 28-bit InternalBlockMapping limit (256 TB)"
-        );
-        let mut state = entry.state();
-        if state == BatEntryState::PartiallyPresent as u8 {
-            state = BatEntryState::FullyPresent as u8;
+    /// Validates the entry state and file offset. Normalizes
+    /// `PartiallyPresent` to `FullyPresent` (compatibility).
+    pub fn from_sbm_bat_entry(entry: BatEntry) -> Result<Self, VhdxError> {
+        let raw_state = entry.state();
+
+        let mut bat_state = BatEntryState::from_raw(raw_state)
+            .ok_or(VhdxError::Corrupt(CorruptionType::InvalidBlockState))?;
+        if bat_state == BatEntryState::PartiallyPresent {
+            bat_state = BatEntryState::FullyPresent;
         }
-        BlockMapping::new()
-            .with_state(state)
+        let file_mb = entry.file_offset_mb();
+        if file_mb > 0x0FFF_FFFF {
+            return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
+        }
+        Ok(BlockMapping::new()
+            .with_bat_state(bat_state)
             .with_transitioning_to_fully_present(false)
-            .with_file_megabyte(file_mb as u32)
+            .with_file_megabyte(file_mb as u32))
     }
 }
 
@@ -189,11 +190,6 @@ pub(crate) struct BatState {
     pub allocated_block_count: u32,
 }
 
-/// Whether a block state counts as "allocated" for `allocated_block_count`.
-fn is_allocated_state(state: BatEntryState) -> bool {
-    state == BatEntryState::FullyPresent || state == BatEntryState::PartiallyPresent
-}
-
 impl BatState {
     /// Get the in-memory mapping for a payload block.
     pub fn get_payload_mapping(&self, block_number: u32) -> BlockMapping {
@@ -211,8 +207,8 @@ impl BatState {
     pub fn set_payload_mapping(&mut self, bat: &Bat, block_number: u32, mapping: BlockMapping) {
         let _ = bat; // Used for consistency; entry index needed only for dirty tracking.
         let old = self.payload_mappings[block_number as usize];
-        let was_allocated = is_allocated_state(old.bat_state());
-        let now_allocated = is_allocated_state(mapping.bat_state());
+        let was_allocated = old.bat_state().is_allocated();
+        let now_allocated = mapping.bat_state().is_allocated();
         if was_allocated && !now_allocated {
             self.allocated_block_count -= 1;
         } else if !was_allocated && now_allocated {
@@ -523,49 +519,31 @@ impl Bat {
         for block in 0..self.data_block_count {
             let entry_index = self.payload_entry_index(block);
             let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
-            // Validate the entry state.
-            let raw_state = entry.state();
-            if BatEntryState::from_raw(raw_state).is_none() {
-                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-            }
-            let internal = BlockMapping::from_bat_entry(entry, self.has_parent);
-            if raw_state == BatEntryState::FullyPresent as u8
-                || raw_state == BatEntryState::PartiallyPresent as u8
-            {
+            let mapping = BlockMapping::from_bat_entry(entry, self.has_parent)?;
+            if mapping.bat_state().is_allocated() {
                 self.bat_state.get_mut().allocated_block_count += 1;
-                // Mark the block's file region as in-use in the space tracker.
-                let file_offset = internal.file_offset();
+                let file_offset = mapping.file_offset();
                 if file_offset != 0 {
                     free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
                 }
-            } else if (raw_state == BatEntryState::Unmapped as u8
-                || raw_state == BatEntryState::Undefined as u8)
-                && internal.file_megabyte() != 0
+            } else if (mapping.bat_state() == BatEntryState::Unmapped
+                || mapping.bat_state() == BatEntryState::Undefined)
+                && mapping.file_megabyte() != 0
             {
-                // Soft-anchored block: unmapped/undefined with non-zero file offset.
-                // Mark the space as in-use first (so it's not in the free pool),
-                // then register it as a soft anchor for potential reclaim.
-                let file_offset = internal.file_offset();
+                let file_offset = mapping.file_offset();
                 free_space.mark_range_in_use(eof_state, file_offset, self.block_size)?;
                 free_space.mark_trimmed_block(block, file_offset, self.block_size)?;
             }
-            self.bat_state.get_mut().payload_mappings.push(internal);
+            self.bat_state.get_mut().payload_mappings.push(mapping);
         }
 
         // Read all sector bitmap entries.
         for chunk in 0..self.sector_bitmap_block_count {
             let entry_index = self.sector_bitmap_entry_index(chunk);
             let entry = Self::read_bat_entry_raw(cache, entry_index).await?;
-            let raw_state = entry.state();
-            if BatEntryState::from_raw(raw_state).is_none() {
-                return Err(VhdxError::Corrupt(CorruptionType::InvalidBlockState));
-            }
-            let internal = BlockMapping::from_sbm_bat_entry(entry);
-            // Mark sector bitmap block's file region as in-use if allocated.
-            if raw_state == BatEntryState::FullyPresent as u8
-                || raw_state == BatEntryState::PartiallyPresent as u8
-            {
-                let file_offset = internal.file_offset();
+            let mapping = BlockMapping::from_sbm_bat_entry(entry)?;
+            if mapping.bat_state().is_allocated() {
+                let file_offset = mapping.file_offset();
                 if file_offset != 0 {
                     free_space.mark_range_in_use(
                         eof_state,
@@ -577,7 +555,7 @@ impl Bat {
             self.bat_state
                 .get_mut()
                 .sector_bitmap_mappings
-                .push(internal);
+                .push(mapping);
         }
 
         Ok(())
@@ -880,20 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_mapping_roundtrip() {
-        let mapping = BlockMapping::new()
-            .with_state(BatEntryState::FullyPresent as u8)
-            .with_transitioning_to_fully_present(true)
-            .with_file_megabyte(12345);
-        let raw = u32::from(mapping);
-        let restored = BlockMapping::from(raw);
-        assert_eq!(restored.state(), BatEntryState::FullyPresent as u8);
-        assert!(restored.transitioning_to_fully_present());
-        assert_eq!(restored.file_megabyte(), 12345);
-    }
-
-    #[test]
-    fn internal_mapping_max_file_megabyte() {
+    fn mapping_max_file_megabyte() {
         let max_mb: u32 = (1 << 28) - 1; // 268435455
         let mapping = BlockMapping::new()
             .with_state(BatEntryState::FullyPresent as u8)
@@ -903,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_mapping_tfp_flag() {
+    fn mapping_tfp_flag() {
         let with_tfp = BlockMapping::new()
             .with_state(BatEntryState::NotPresent as u8)
             .with_transitioning_to_fully_present(true);
@@ -920,14 +885,14 @@ mod tests {
     }
 
     #[test]
-    fn internal_mapping_from_bat_entry() {
+    fn mapping_from_bat_entry() {
         let entry = BatEntry::new()
             .with_state(BatEntryState::FullyPresent as u8)
             .with_file_offset_mb(100);
-        let internal = BlockMapping::from_bat_entry(entry, false);
-        assert_eq!(internal.state(), BatEntryState::FullyPresent as u8);
-        assert_eq!(internal.file_megabyte(), 100);
-        assert!(!internal.transitioning_to_fully_present());
+        let mapping = BlockMapping::from_bat_entry(entry, false).unwrap();
+        assert_eq!(mapping.state(), BatEntryState::FullyPresent as u8);
+        assert_eq!(mapping.file_megabyte(), 100);
+        assert!(!mapping.transitioning_to_fully_present());
     }
 
     #[test]

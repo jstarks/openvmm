@@ -830,19 +830,13 @@ async fn flush_advances_header_sequence(driver: DefaultDriver) {
     let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
     let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
 
-    let seq_before = {
-        let state = vhdx.write_state.lock();
-        state.sequence_number
-    };
+    let seq_before = vhdx.header_state.sequence_number().await;
 
     write_pattern(&vhdx, 0, vhdx.block_size as usize, 0xAA).await;
     vhdx.flush().await.unwrap();
 
     // The enable_write_mode call during the first write bumps the sequence number.
-    let seq_after = {
-        let state = vhdx.write_state.lock();
-        state.sequence_number
-    };
+    let seq_after = vhdx.header_state.sequence_number().await;
     assert!(
         seq_after > seq_before,
         "sequence number should advance after write: before={}, after={}",

@@ -18,6 +18,8 @@ use crate::error::VhdxError;
 use crate::flush::FlushSequencer;
 use crate::format;
 use crate::format::FileIdentifier;
+use crate::header::HeaderState;
+use crate::header::WriteMode;
 use crate::header::parse_headers;
 use crate::header::serialize_header;
 use crate::known_meta::read_known_metadata;
@@ -146,37 +148,6 @@ impl<F: 'static + AsyncFile> VhdxBuilder<F> {
     }
 }
 
-/// Mutable header and write-mode state, protected by a mutex.
-///
-/// All fields here may change during write operations. The mutex must
-/// be dropped before any `.await` point.
-pub(crate) struct WriteState {
-    /// Current write mode (None if no writes have occurred).
-    pub write_mode: Option<WriteMode>,
-    /// Current header sequence number.
-    pub sequence_number: u64,
-    /// GUID changed on every file-level write.
-    pub file_write_guid: Guid,
-    /// GUID changed on every virtual-disk data write.
-    pub data_write_guid: Guid,
-    /// Active log GUID. Zero when no log task is running.
-    pub log_guid: Guid,
-    /// True if header slot 1 (offset 64 KiB) is the current header.
-    pub first_header_current: bool,
-}
-
-/// The kind of modification being made to the VHDX file. Controls which
-/// GUIDs are updated in the header before the first write.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum WriteMode {
-    /// The file is being modified (metadata only, e.g. resize/compact).
-    /// Updates FileWriteGuid.
-    FileWritable,
-    /// User-visible virtual disk data is being modified.
-    /// Updates both FileWriteGuid and DataWriteGuid.
-    DataWritable,
-}
-
 /// An open VHDX file handle.
 ///
 /// Created via [`VhdxFile::open()`], which returns a [`VhdxBuilder`]
@@ -185,16 +156,18 @@ pub(crate) enum WriteMode {
 /// [`writable()`](VhdxBuilder::writable).
 //
 // Lock ordering (must acquire in this order, never reverse):
-//   1. allocation_lock    (futures::lock::Mutex — async, may be held across .await)
-//   2. bat_state           (parking_lot::RwLock — synchronous, NEVER across .await)
-//   3. write_state         (parking_lot::Mutex — synchronous, NEVER across .await)
-//   4. free_space.inner    (parking_lot::Mutex — synchronous, NEVER across .await)
-//   5. cache.pages/tags    (parking_lot::Mutex — brief, NEVER across .await)
+//   1. header_state.inner  (futures::lock::Mutex — async, may be held across .await)
+//   2. allocation_lock     (futures::lock::Mutex — async, may be held across .await)
+//   3. bat_state            (parking_lot::RwLock — synchronous, NEVER across .await)
+//   4. free_space.inner     (parking_lot::Mutex — synchronous, NEVER across .await)
+//   5. cache.pages/tags     (parking_lot::Mutex — brief, NEVER across .await)
 //
+// header_state.inner serializes all header writes (enable_write_mode, set_log_guid,
+// clear_log_guid). Its write_mode AtomicU8 provides a lock-free fast path for
+// enable_write_mode, which is called on every write.
 // The allocation_lock serializes the entire allocation decision (check BAT, allocate
 // space, mark TFP). It is released AFTER TFP is set but BEFORE data I/O begins.
 // The bat_state RwLock is held for < 1μs per access (reading/writing in-memory entries).
-// The write_state Mutex is held only in enable_write_mode() to check/update the mode.
 pub struct VhdxFile<F: AsyncFile> {
     pub(crate) file: Arc<F>,
     pub(crate) cache: PageCache<F>,
@@ -213,8 +186,9 @@ pub struct VhdxFile<F: AsyncFile> {
     // Metadata table (kept for on-demand metadata reads).
     metadata_table: MetadataTable,
 
-    // Mutable header / write-mode state.
-    pub(crate) write_state: Mutex<WriteState>,
+    // Header and write-mode state (async mutex for serialization,
+    // AtomicU8 for lock-free hot-path write-mode checks).
+    pub(crate) header_state: HeaderState,
 
     /// Serializes block allocation decisions and protects EOF geometry
     /// state. Only one allocation sequence runs at a time.
@@ -239,8 +213,6 @@ pub struct VhdxFile<F: AsyncFile> {
     metadata_offset: u64,
     #[expect(dead_code)] // Phase 9+: used for metadata writes
     metadata_length: u32,
-    pub(crate) log_offset: u64,
-    pub(crate) log_length: u32,
 
     // Mode
     pub(crate) read_only: bool,
@@ -422,14 +394,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             is_fully_allocated: known.leave_blocks_allocated,
             page_83_data: known.page_83_data,
             metadata_table,
-            write_state: Mutex::new(WriteState {
-                write_mode: None,
-                sequence_number: header.sequence_number,
-                file_write_guid: header.file_write_guid,
-                data_write_guid: header.data_write_guid,
-                log_guid: Guid::ZERO,
-                first_header_current: header.first_header_current,
-            }),
+            header_state: HeaderState::new(&header),
             allocation_lock: futures::lock::Mutex::new(eof_state),
             allocation_event: event_listener::Event::new(),
             free_space,
@@ -438,8 +403,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             bat_length: regions.bat_length,
             metadata_offset: regions.metadata_offset,
             metadata_length: regions.metadata_length,
-            log_offset: header.log_offset,
-            log_length: header.log_length,
             read_only,
             region_rewrite_data: regions.rewrite_data,
             failed: Arc::new(FailureFlag::new()),
@@ -502,9 +465,10 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
 
         // Initialize the log writer.
         let log_guid = Guid::new_random();
+        let (log_offset, log_length) = vhdx.header_state.log_region();
         let log_region = LogRegion {
-            file_offset: vhdx.log_offset,
-            length: vhdx.log_length,
+            file_offset: log_offset,
+            length: log_length,
         };
         let file_length = vhdx.file.file_size().await.map_err(VhdxError::Io)?;
         let log_writer =
@@ -514,8 +478,9 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
         // Write header with log_guid set (marks file as dirty).
         // This is done BEFORE spawning the log task so the file is marked
         // dirty before any log entries are written.
-        vhdx.write_state.lock().log_guid = log_guid;
-        vhdx.write_current_header().await?;
+        vhdx.header_state
+            .set_log_guid(log_guid, vhdx.file.as_ref(), None)
+            .await?;
 
         // Spawn the apply task.
         let applied_lsn = Arc::new(crate::lsn_watermark::LsnWatermark::new());
@@ -621,7 +586,9 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             // may have been partially shrunk. With the GUID cleared first,
             // a crash at any later point just leaves a larger-than-necessary
             // file — no replay is attempted.
-            self.write_clean_header().await?;
+            self.header_state
+                .clear_log_guid(self.file.as_ref(), Some(state.flush_sequencer.as_ref()))
+                .await?;
 
             // Truncate the file to reclaim unused trailing space.
             // Best-effort: if this fails, the file is still correct,
@@ -660,13 +627,6 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
 }
 
 impl<F: AsyncFile> VhdxFile<F> {
-    /// Check whether the file has been poisoned by a fatal error.
-    /// If so, return `Err(VhdxError::Failed(...))`. Fast path is a
-    /// single atomic load.
-    pub(crate) fn check_failed(&self) -> Result<(), VhdxError> {
-        self.failed.check()
-    }
-
     /// Virtual disk size in bytes.
     pub fn disk_size(&self) -> u64 {
         self.disk_size
@@ -719,7 +679,7 @@ impl<F: AsyncFile> VhdxFile<F> {
 
     /// GUID changed on every virtual-disk data write.
     pub fn data_write_guid(&self) -> Guid {
-        self.write_state.lock().data_write_guid
+        self.header_state.data_write_guid()
     }
 
     /// Whether the file was opened in read-only mode.
@@ -731,46 +691,14 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// and flushing if needed. If the current mode already satisfies the
     /// request, this is a no-op.
     ///
-    /// The header is written to the non-current slot with new GUIDs and
-    /// an incremented sequence number, then flushed to disk. Only after
-    /// the flush completes is the mode committed in memory.
+    /// Hot path (mode already enabled): single atomic load, no lock.
+    /// Cold path (mode transition): acquires the header async mutex,
+    /// generates new GUIDs, writes the header, flushes, then publishes.
     pub(crate) async fn enable_write_mode(&self, mode: WriteMode) -> Result<(), VhdxError> {
-        // Check if the mode is already enabled (fast path).
-        let needs_update = {
-            let state = self.write_state.lock();
-            !matches!(state.write_mode, Some(current) if current >= mode)
-        };
-
-        if !needs_update {
-            return Ok(());
-        }
-
-        // Update GUIDs under the lock, then release before I/O.
-        {
-            let mut state = self.write_state.lock();
-
-            // Double-check under lock (another caller may have raced).
-            if let Some(current) = state.write_mode {
-                if current >= mode {
-                    return Ok(());
-                }
-            }
-
-            // Always update file_write_guid (any write mode implies file modification).
-            state.file_write_guid = Guid::new_random();
-
-            // Update data_write_guid if escalating to DataWritable.
-            if mode >= WriteMode::DataWritable {
-                state.data_write_guid = Guid::new_random();
-            }
-        }
-
-        self.write_current_header().await?;
-
-        // Commit the mode change after the header is on stable storage.
-        self.write_state.lock().write_mode = Some(mode);
-
-        Ok(())
+        let flush_sequencer = self.log_state.as_ref().map(|s| s.flush_sequencer.as_ref());
+        self.header_state
+            .enable_write_mode(mode, self.file.as_ref(), flush_sequencer)
+            .await
     }
 }
 

@@ -15,8 +15,8 @@ use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
 use crate::format::MB1;
+use crate::header::WriteMode;
 use crate::open::VhdxFile;
-use crate::open::WriteMode;
 
 /// Trim mode determining the target block state.
 ///

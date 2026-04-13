@@ -1,19 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Dual header parsing and validation for VHDX files.
+//! Dual header parsing, validation, and write-mode management for VHDX files.
 //!
 //! Reads both VHDX headers, validates their signatures and CRC-32C checksums,
 //! selects the active header (higher sequence number), and validates log
 //! region parameters.
+//!
+//! Also provides [`HeaderState`], which serializes all header writes behind
+//! a `futures::lock::Mutex` and exposes the current [`WriteMode`] via an
+//! `AtomicU8` for lock-free hot-path checks.
 
 use crate::AsyncFile;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
+use crate::flush::FlushSequencer;
 use crate::format;
 use crate::format::Header;
-use crate::open::VhdxFile;
 use guid::Guid;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
@@ -181,47 +187,216 @@ pub(crate) fn serialize_header(
     (buf, offset)
 }
 
-impl<F: AsyncFile> VhdxFile<F> {
-    /// Write a header with `log_guid = ZERO` to mark the file as clean.
-    pub(crate) async fn write_clean_header(&mut self) -> Result<(), VhdxError> {
-        self.write_state.get_mut().log_guid = Guid::ZERO;
-        self.write_current_header().await
+/// The kind of modification being made to the VHDX file. Controls which
+/// GUIDs are updated in the header before the first write.
+///
+/// Values are ordered: `FileWritable < DataWritable`. Once `DataWritable`
+/// is reached, `FileWritable` is a no-op. The `#[repr(u8)]` layout
+/// matches the `AtomicU8` stored in [`HeaderState`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub(crate) enum WriteMode {
+    /// The file is being modified (metadata only, e.g. resize/compact).
+    /// Updates FileWriteGuid.
+    FileWritable = 1,
+    /// User-visible virtual disk data is being modified.
+    /// Updates both FileWriteGuid and DataWriteGuid.
+    DataWritable = 2,
+}
+
+/// Value used in [`HeaderState::write_mode`] when no write has occurred yet.
+const WRITE_MODE_NONE: u8 = 0;
+
+/// Mutable header state, serialized behind a `futures::lock::Mutex`.
+///
+/// All header writes go through [`HeaderState::write()`], which holds the
+/// async mutex across the serialize→write→flush→flip sequence, preventing
+/// concurrent header writes from interleaving.
+///
+/// The current [`WriteMode`] is also published to an `AtomicU8` so that
+/// the hot path (`enable_write_mode`) can check it with a single atomic
+/// load and avoid taking any lock.
+pub(crate) struct HeaderState {
+    /// Current write mode, published atomically for lock-free fast-path
+    /// checks. Updated *after* the header is on stable storage.
+    write_mode: AtomicU8,
+    /// Data-write GUID, stored separately for the sync public accessor
+    /// `VhdxFile::data_write_guid()`. Updated under the async mutex,
+    /// read via `parking_lot::Mutex` (or `AtomicU64` pair if needed).
+    /// Here we use `parking_lot::Mutex` since it's a brief, non-contended
+    /// read.
+    data_write_guid: parking_lot::Mutex<Guid>,
+    /// File offset of the log region (immutable after open).
+    log_offset: u64,
+    /// Length of the log region in bytes (immutable after open).
+    log_length: u32,
+    /// Async mutex serializing all header writes.
+    inner: futures::lock::Mutex<HeaderStateInner>,
+}
+
+/// Fields protected by the async mutex inside [`HeaderState`].
+struct HeaderStateInner {
+    /// Current header sequence number (bumped on every write).
+    sequence_number: u64,
+    /// GUID changed on every file-level write.
+    file_write_guid: Guid,
+    /// GUID changed on every virtual-disk data write.
+    data_write_guid: Guid,
+    /// Active log GUID. Zero when no log task is running.
+    log_guid: Guid,
+    /// True if header slot 1 (offset 64 KiB) is the current header.
+    first_header_current: bool,
+}
+
+impl HeaderState {
+    /// Create a new `HeaderState` from a parsed header.
+    pub fn new(header: &ParsedHeader) -> Self {
+        Self {
+            write_mode: AtomicU8::new(WRITE_MODE_NONE),
+            data_write_guid: parking_lot::Mutex::new(header.data_write_guid),
+            log_offset: header.log_offset,
+            log_length: header.log_length,
+            inner: futures::lock::Mutex::new(HeaderStateInner {
+                sequence_number: header.sequence_number,
+                file_write_guid: header.file_write_guid,
+                data_write_guid: header.data_write_guid,
+                log_guid: header.log_guid,
+                first_header_current: header.first_header_current,
+            }),
+        }
     }
 
-    /// Bump the sequence number, serialize the current [`WriteState`] as a
-    /// header, write it to the non-current slot, flush, and flip the
-    /// active header slot.
+    /// Lock-free check: is the current write mode ≥ `mode`?
+    pub fn is_mode_enabled(&self, mode: WriteMode) -> bool {
+        self.write_mode.load(Ordering::Acquire) >= mode as u8
+    }
+
+    /// Read the current data-write GUID (sync, brief lock).
+    pub fn data_write_guid(&self) -> Guid {
+        *self.data_write_guid.lock()
+    }
+
+    /// Get the log region offset and length (immutable after open).
+    pub fn log_region(&self) -> (u64, u32) {
+        (self.log_offset, self.log_length)
+    }
+
+    /// Read the current sequence number. Requires the async lock.
+    #[cfg(test)]
+    pub async fn sequence_number(&self) -> u64 {
+        self.inner.lock().await.sequence_number
+    }
+
+    /// Read the current write mode (for test assertions).
+    #[cfg(test)]
+    pub fn write_mode(&self) -> Option<WriteMode> {
+        match self.write_mode.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(WriteMode::FileWritable),
+            2 => Some(WriteMode::DataWritable),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Ensure the file is in at least write mode `mode`.
     ///
-    /// Callers must set any state fields (log_guid, write GUIDs, etc.)
-    /// before calling this method.
-    pub(crate) async fn write_current_header(&self) -> Result<(), VhdxError> {
-        let (buf, offset) = {
-            let mut state = self.write_state.lock();
-            state.sequence_number += 1;
-            serialize_header(
-                state.sequence_number,
-                state.file_write_guid,
-                state.data_write_guid,
-                state.log_guid,
-                self.log_offset,
-                self.log_length,
-                state.first_header_current,
-            )
-        };
+    /// Hot path (mode already enabled): single atomic load, no lock.
+    ///
+    /// Cold path (mode transition): acquires the async mutex, generates
+    /// new GUIDs, writes the header to the non-current slot, flushes,
+    /// flips the active slot, then publishes the new mode atomically.
+    ///
+    /// Safe to call concurrently — the async mutex serializes transitions.
+    pub async fn enable_write_mode(
+        &self,
+        mode: WriteMode,
+        file: &impl AsyncFile,
+        flush_sequencer: Option<&FlushSequencer>,
+    ) -> Result<(), VhdxError> {
+        // Hot path: single atomic load.
+        if self.is_mode_enabled(mode) {
+            return Ok(());
+        }
 
-        self.file.write_at(offset, &buf).await?;
+        // Cold path: serialize under async mutex.
+        let mut inner = self.inner.lock().await;
 
-        if let Some(ref log_state) = self.log_state {
-            log_state.flush_sequencer.flush(self.file.as_ref()).await?;
+        // Double-check under lock (another caller may have raced).
+        if self.write_mode.load(Ordering::Relaxed) >= mode as u8 {
+            return Ok(());
+        }
+
+        // Generate new GUIDs.
+        inner.file_write_guid = Guid::new_random();
+        if mode >= WriteMode::DataWritable {
+            inner.data_write_guid = Guid::new_random();
+            *self.data_write_guid.lock() = inner.data_write_guid;
+        }
+
+        // Write header, flush, flip slot.
+        self.write_header(&mut inner, file, flush_sequencer).await?;
+
+        // Publish the mode change — only after the header is on stable storage.
+        self.write_mode.store(mode as u8, Ordering::Release);
+
+        Ok(())
+    }
+
+    /// Set the log GUID and write a header update. Used by `open_writable`
+    /// to mark the file as dirty before spawning the log task.
+    pub async fn set_log_guid(
+        &self,
+        log_guid: Guid,
+        file: &impl AsyncFile,
+        flush_sequencer: Option<&FlushSequencer>,
+    ) -> Result<(), VhdxError> {
+        let mut inner = self.inner.lock().await;
+        inner.log_guid = log_guid;
+        self.write_header(&mut inner, file, flush_sequencer).await
+    }
+
+    /// Clear the log GUID (set to ZERO) and write a clean header.
+    /// Used by `close()` after the log is fully drained.
+    pub async fn clear_log_guid(
+        &self,
+        file: &impl AsyncFile,
+        flush_sequencer: Option<&FlushSequencer>,
+    ) -> Result<(), VhdxError> {
+        let mut inner = self.inner.lock().await;
+        inner.log_guid = Guid::ZERO;
+        self.write_header(&mut inner, file, flush_sequencer).await
+    }
+
+    /// Bump the sequence number, serialize the header, write to the
+    /// non-current slot, flush, and flip the active slot.
+    ///
+    /// Caller must hold the async mutex (`inner` is `&mut`).
+    async fn write_header(
+        &self,
+        inner: &mut HeaderStateInner,
+        file: &impl AsyncFile,
+        flush_sequencer: Option<&FlushSequencer>,
+    ) -> Result<(), VhdxError> {
+        inner.sequence_number += 1;
+        let (buf, offset) = serialize_header(
+            inner.sequence_number,
+            inner.file_write_guid,
+            inner.data_write_guid,
+            inner.log_guid,
+            self.log_offset,
+            self.log_length,
+            inner.first_header_current,
+        );
+
+        file.write_at(offset, &buf).await?;
+
+        if let Some(fs) = flush_sequencer {
+            fs.flush(file).await?;
         } else {
-            self.file.flush().await?;
+            file.flush().await?;
         }
 
-        {
-            let mut state = self.write_state.lock();
-            state.first_header_current = !state.first_header_current;
-        }
-
+        inner.first_header_current = !inner.first_header_current;
         Ok(())
     }
 }

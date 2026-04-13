@@ -14,10 +14,10 @@ use crate::error::CorruptionType;
 use crate::error::VhdxError;
 use crate::format::BatEntryState;
 use crate::format::MB1;
+use crate::header::WriteMode;
 use crate::io_guard::ReadIoGuard;
 use crate::io_guard::WriteIoGuard;
 use crate::open::VhdxFile;
-use crate::open::WriteMode;
 use crate::space::AllocateFlags;
 
 /// Resolved range from a read operation.
@@ -1694,8 +1694,10 @@ mod tests {
         assert_eq!(vhdx.data_write_guid(), original_data_guid);
 
         // But the write mode should be set (subsequent DataWritable will escalate).
-        let state = vhdx.write_state.lock();
-        assert_eq!(state.write_mode, Some(WriteMode::FileWritable));
+        assert_eq!(
+            vhdx.header_state.write_mode(),
+            Some(WriteMode::FileWritable)
+        );
     }
 
     // --- Phase 9.5b: TFP mechanics, write integration, and error path tests ---
@@ -3832,7 +3834,7 @@ mod tests {
         let _ = vhdx.flush().await;
 
         // The error message should contain something useful.
-        let result = vhdx.check_failed();
+        let result = vhdx.failed.check();
         match result {
             Err(VhdxError::Failed(msg)) => {
                 assert!(!msg.is_empty(), "poison error message should not be empty");

@@ -8,6 +8,7 @@
 //! and emits [`ReadRange`] entries describing where to find the data.
 
 use crate::AsyncFile;
+use crate::bat::BatGuard;
 use crate::bat::BlockMapping;
 use crate::bat::BlockSpan;
 use crate::bat::BlockType;
@@ -16,8 +17,6 @@ use crate::error::VhdxError;
 use crate::format::BatEntryState;
 use crate::format::MB1;
 use crate::header::WriteMode;
-use crate::io_guard::ReadIoGuard;
-use crate::io_guard::WriteIoGuard;
 use crate::open::VhdxFile;
 use crate::space::AllocateFlags;
 
@@ -27,25 +26,25 @@ use crate::space::AllocateFlags;
 /// Carried inside [`WriteIoGuard`] so that `complete()` can finalize
 /// the BAT without re-walking the block range, and `abort()` can revert
 /// without guessing which blocks were modified.
-pub(crate) struct TfpRecord {
+struct TfpRecord {
     /// Block number in the BAT.
-    pub block_number: u32,
+    block_number: u32,
     /// The block's mapping before TFP was set. Used by the abort path
     /// to revert the in-memory BAT.
-    pub original_mapping: BlockMapping,
+    original_mapping: BlockMapping,
     /// File offset of newly allocated space, if any. `None` when TFP
     /// was set on an already-allocated block (e.g. PartiallyPresent →
     /// FullyPresent promotion). The abort path releases this space back
     /// to the free pool.
-    pub allocated_offset: Option<u64>,
+    allocated_offset: Option<u64>,
 }
 
 /// Collected during [`VhdxFile::resolve_write`] and stored in the
 /// [`WriteIoGuard`]. Provides everything `complete()` and `abort()`
 /// need without re-walking the block range.
-pub(crate) struct WriteCompletionRecords {
+struct WriteCompletionRecords {
     /// Blocks that had TFP set during allocation.
-    pub tfp_records: Vec<TfpRecord>,
+    tfp_records: Vec<TfpRecord>,
 }
 
 /// Resolved range from a read operation.
@@ -116,7 +115,7 @@ impl<F: AsyncFile> VhdxFile<F> {
         &self,
         offset: u64,
         len: u32,
-    ) -> Result<crate::bat::BatGuard<'_>, VhdxError> {
+    ) -> Result<BatGuard<'_>, VhdxError> {
         self.failed.check()?;
 
         // Validate alignment to logical sector size.
@@ -669,7 +668,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     ///
     /// The abort path (write failure / guard dropped without `complete()`)
     /// is handled synchronously by [`abort_write_sync()`].
-    pub(crate) async fn complete_write_inner(
+    async fn complete_write_inner(
         &self,
         offset: u64,
         len: u32,
@@ -757,7 +756,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// [`TfpRecord::original_mapping`], releases any newly allocated space
     /// back to the free pool, and notifies allocation waiters. Does not
     /// perform any file I/O.
-    pub(crate) fn abort_write_sync(&self, records: WriteCompletionRecords) {
+    fn abort_write_sync(&self, records: WriteCompletionRecords) {
         if records.tfp_records.is_empty() {
             return;
         }
@@ -821,6 +820,150 @@ impl<F: AsyncFile> VhdxFile<F> {
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I/O guards
+// ---------------------------------------------------------------------------
+
+/// Guard for read I/O. Drop after file reads are complete.
+///
+/// Returned by [`VhdxFile::resolve_read`]. Dropping this guard decrements
+/// per-block refcounts, allowing trim to proceed.
+pub struct ReadIoGuard<'a, F: AsyncFile> {
+    // Significant drop.
+    _bat_guard: BatGuard<'a>,
+    _phantom: std::marker::PhantomData<&'a VhdxFile<F>>,
+}
+
+impl<'a, F: AsyncFile> ReadIoGuard<'a, F> {
+    /// Create a new read guard with refcount tracking.
+    fn new(bat_guard: BatGuard<'a>) -> Self {
+        Self {
+            _bat_guard: bat_guard,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            _bat_guard: BatGuard::empty(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Guard for write I/O. Call [`complete()`](Self::complete) to finalize,
+/// or drop to abort.
+///
+/// Returned by [`VhdxFile::resolve_write`]. Dropping without calling
+/// `complete()` aborts the write, reverting TFP blocks and releasing
+/// allocated space. In both cases, per-block refcounts are decremented
+/// via the owned [`ReadIoGuard`].
+pub struct WriteIoGuard<'a, F: AsyncFile> {
+    vhdx: &'a VhdxFile<F>,
+    // Significant drop.
+    _bat_guard: BatGuard<'a>,
+    /// The guest offset of the write (needed for SBM bitmap updates).
+    offset: u64,
+    /// The length of the write in bytes.
+    len: u32,
+    /// Whether `complete()` was called. If false on drop, the write is aborted.
+    completed: bool,
+    /// True when at least one TFP block was allocated from space that is
+    /// NOT safe (could contain stale data from another block). When true,
+    /// `complete_write_inner` must capture the current FSN and apply it
+    /// to the BAT pages so the log task waits for the data flush before
+    /// logging the BAT update.
+    ///
+    /// Matches C's `NeedsFlushDuringPostAllocate` flag.
+    needs_flush_before_log: bool,
+    /// TFP records collected during resolve_write, needed by complete/abort.
+    /// `None` after complete() or for zero-length writes.
+    records: Option<WriteCompletionRecords>,
+}
+
+impl<'a, F: AsyncFile> WriteIoGuard<'a, F> {
+    /// Create a new write guard that takes ownership of a [`ReadIoGuard`]
+    /// for refcount management.
+    fn new(
+        vhdx: &'a VhdxFile<F>,
+        bat_guard: BatGuard<'a>,
+        offset: u64,
+        len: u32,
+        needs_flush_before_log: bool,
+        records: WriteCompletionRecords,
+    ) -> Self {
+        Self {
+            vhdx,
+            _bat_guard: bat_guard,
+            offset,
+            len,
+            completed: false,
+            needs_flush_before_log,
+            records: Some(records),
+        }
+    }
+
+    /// Create a write guard that is already completed (for zero-length writes).
+    fn new_completed(vhdx: &'a VhdxFile<F>) -> Self {
+        Self {
+            vhdx,
+            _bat_guard: BatGuard::empty(),
+            offset: 0,
+            len: 0,
+            completed: true,
+            needs_flush_before_log: false,
+            records: None,
+        }
+    }
+
+    /// Create a write guard with no completion records (no allocation was
+    /// needed — all blocks were already FullyPresent or PartiallyPresent
+    /// with a sub-block write).
+    fn new_no_alloc(
+        vhdx: &'a VhdxFile<F>,
+        bat_guard: BatGuard<'a>,
+        offset: u64,
+        len: u32,
+    ) -> Self {
+        Self {
+            vhdx,
+            _bat_guard: bat_guard,
+            offset,
+            len,
+            completed: false,
+            needs_flush_before_log: false,
+            records: None,
+        }
+    }
+
+    /// Finalize the write after data has been written to resolved ranges.
+    ///
+    /// Commits TFP -> FullyPresent, updates sector bitmaps.
+    /// Consumes the guard. Refcounts are decremented when `self` is dropped
+    /// after this method returns.
+    pub async fn complete(mut self) -> Result<(), VhdxError> {
+        self.completed = true;
+        let records = self.records.take().unwrap_or(WriteCompletionRecords {
+            tfp_records: Vec::new(),
+        });
+        self.vhdx
+            .complete_write_inner(self.offset, self.len, records, self.needs_flush_before_log)
+            .await
+    }
+}
+
+impl<F: AsyncFile> Drop for WriteIoGuard<'_, F> {
+    fn drop(&mut self) {
+        // If complete() was not called, abort the write.
+        if !self.completed {
+            if let Some(records) = self.records.take() {
+                self.vhdx.abort_write_sync(records);
+            }
+        }
+        // Refcounts are decremented when self.bat_guard drops.
     }
 }
 

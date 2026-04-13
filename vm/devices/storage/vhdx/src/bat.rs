@@ -181,30 +181,30 @@ pub(crate) enum BlockType {
 ///
 /// I/O refcounts are stored separately on [`Bat::io_refcounts`] as atomics,
 /// outside this lock.
-pub(crate) struct BatState {
+struct BatState {
     /// One entry per payload block (indexed by block number).
-    pub payload_mappings: Vec<BlockMapping>,
+    payload_mappings: Vec<BlockMapping>,
     /// One entry per sector bitmap block (indexed by chunk number).
-    pub sector_bitmap_mappings: Vec<BlockMapping>,
+    sector_bitmap_mappings: Vec<BlockMapping>,
     /// Running count of allocated (FullyPresent or PartiallyPresent) blocks.
-    pub allocated_block_count: u32,
+    allocated_block_count: u32,
 }
 
 impl BatState {
     /// Get the in-memory mapping for a payload block.
-    pub fn get_payload_mapping(&self, block_number: u32) -> BlockMapping {
+    fn get_payload_mapping(&self, block_number: u32) -> BlockMapping {
         self.payload_mappings[block_number as usize]
     }
 
     /// Get the in-memory mapping for a sector bitmap block.
-    pub fn get_sbm_mapping(&self, chunk_number: u32) -> BlockMapping {
+    fn get_sbm_mapping(&self, chunk_number: u32) -> BlockMapping {
         self.sector_bitmap_mappings[chunk_number as usize]
     }
 
     /// Update the in-memory mapping for a payload block.
     ///
     /// Adjusts `allocated_block_count` based on the old and new states.
-    pub fn set_payload_mapping(&mut self, bat: &Bat, block_number: u32, mapping: BlockMapping) {
+    fn set_payload_mapping(&mut self, bat: &Bat, block_number: u32, mapping: BlockMapping) {
         let _ = bat; // Used for consistency; entry index needed only for dirty tracking.
         let old = self.payload_mappings[block_number as usize];
         let was_allocated = old.bat_state().is_allocated();
@@ -218,7 +218,7 @@ impl BatState {
     }
 
     /// Update the in-memory mapping for a sector bitmap block.
-    pub fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: BlockMapping) {
+    fn set_sbm_mapping(&mut self, bat: &Bat, chunk_number: u32, mapping: BlockMapping) {
         let _ = bat;
         self.sector_bitmap_mappings[chunk_number as usize] = mapping;
     }

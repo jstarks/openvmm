@@ -1,7 +1,14 @@
-use super::*;
+use crate::AsyncFile;
 use crate::create::{self, CreateParams};
+use crate::error::CorruptionType;
+use crate::error::VhdxError;
 use crate::format;
 use crate::format::BatEntry;
+use crate::format::BatEntryState;
+use crate::format::MB1;
+use crate::header::WriteMode;
+use crate::io::ReadRange;
+use crate::io::WriteRange;
 use crate::open::VhdxFile;
 use crate::region;
 use crate::tests::support::InMemoryFile;

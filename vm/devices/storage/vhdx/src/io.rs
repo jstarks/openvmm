@@ -415,203 +415,31 @@ impl<F: AsyncFile> VhdxFile<F> {
                     }
                     _ => {
                         // Unallocated block — allocate space.
-                        //
-                        // First, check if this block has a deferred release
-                        // (non-durable trim). If so, reclaim its own offset
-                        // directly — safe because same-block reclaim can only
-                        // expose the block's own old data (OwnStale).
-                        //
-                        // Next, check if the block is soft-anchored in the
-                        // FreeSpaceTracker (durable trim). Same-block reclaim
-                        // is also safe here.
-                        //
-                        // Otherwise, allocate fresh space.
                         let original = mapping;
-                        let (new_offset, space_state) = if let Some(deferred_offset) =
-                            self.deferred_releases.remove(span.block_number)
-                        {
-                            // Reclaiming our own deferred (non-durable) space.
-                            (deferred_offset, crate::space::SpaceState::OwnStale)
-                        } else if crate::trim::is_soft_anchored(mapping) {
-                            let old_file_offset = mapping.file_offset();
-                            if self
-                                .free_space
-                                .unmark_trimmed_block(
-                                    span.block_number,
-                                    old_file_offset,
-                                    self.block_size,
-                                )
-                                .is_ok()
-                            {
-                                // Reusing the soft-anchored block's own space.
-                                (old_file_offset, crate::space::SpaceState::OwnStale)
-                            } else {
-                                // Unmark failed (race) — fall through to
-                                // normal allocation.
-                                // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
-                                let r = self
-                                    .allocate_space(eof, self.block_size, AllocateFlags::new())
-                                    .await?;
-                                (r.file_offset, r.state)
-                            }
-                        } else {
-                            // LOCK AUDIT: bat_state read-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
-                            let r = self
-                                .allocate_space(eof, self.block_size, AllocateFlags::new())
-                                .await?;
-                            (r.file_offset, r.state)
-                        };
+                        let (new_offset, space_state) = self
+                            .resolve_block_space(span.block_number, mapping, eof)
+                            .await?;
 
                         if is_full_block {
-                            // Fully-covering: set TFP, defer BAT commit.
-                            let new_mapping = BlockMapping::new()
-                                .with_bat_state(mapping.bat_state())
-                                .with_transitioning_to_fully_present(true)
-                                .with_file_megabyte((new_offset / MB1) as u32);
-
-                            self.bat.set_block_mapping(span.block_number, new_mapping);
-
-                            tfp_records.push(TfpRecord {
-                                block_number: span.block_number,
-                                original_mapping: original,
-                                allocated_offset: Some(new_offset),
-                            });
-
-                            // Track unsafe allocations for flush barrier.
-                            if !space_state.is_safe() {
-                                needs_flush_before_log = true;
-                            }
-
-                            ranges.push(WriteRange::Data {
-                                guest_offset: span.virtual_offset,
-                                length: span.length,
-                                file_offset: new_offset + span.block_offset as u64,
-                            });
+                            self.allocate_full_block(
+                                span,
+                                original,
+                                new_offset,
+                                space_state,
+                                &mut tfp_records,
+                                &mut needs_flush_before_log,
+                                ranges,
+                            );
                         } else {
-                            // Partial write — commit BAT immediately.
-                            //
-                            // For differencing disks: if the block was
-                            // NotPresent (transparent to parent), allocate
-                            // as PartiallyPresent so that unwritten sectors
-                            // remain transparent. The sector bitmap will be
-                            // updated in complete_write_inner() to mark
-                            // only the written sectors as present.
-                            //
-                            // For non-diff disks or blocks in other states
-                            // (Zero, Unmapped, Undefined): allocate as
-                            // FullyPresent with zero-padding.
-                            let is_partial_present =
-                                self.has_parent && mapping.bat_state() == BatEntryState::NotPresent;
-
-                            // --- SBM block allocation for PartiallyPresent ---
-                            if is_partial_present {
-                                let chunk_number = span.block_number / self.bat.chunk_ratio;
-                                let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
-
-                                if sbm_mapping.bat_state() != BatEntryState::FullyPresent {
-                                    // Allocate 1 MiB for the SBM block.
-                                    // Zero flag ensures stale data is cleared
-                                    // (near-EOF space is already zero).
-                                    let sbm_alloc = self
-                                        .allocate_space(
-                                            eof,
-                                            crate::bat::SECTOR_BITMAP_BLOCK_SIZE,
-                                            AllocateFlags::new().with_zero(true),
-                                        )
-                                        .await?;
-
-                                    // Update in-memory SBM BAT entry.
-                                    let new_sbm = BlockMapping::new()
-                                        .with_bat_state(BatEntryState::FullyPresent)
-                                        .with_file_megabyte((sbm_alloc.file_offset / MB1) as u32);
-
-                                    self.bat.set_sector_bitmap_mapping(chunk_number, new_sbm);
-
-                                    // Persist SBM BAT entry to disk.
-                                    self.bat
-                                        .write_block_mapping(
-                                            &self.cache,
-                                            BlockType::SectorBitmap,
-                                            chunk_number,
-                                            new_sbm,
-                                            None,
-                                        )
-                                        .await?;
-                                }
-                            }
-
-                            let new_state = if is_partial_present {
-                                BatEntryState::PartiallyPresent
-                            } else {
-                                BatEntryState::FullyPresent
-                            };
-
-                            let new_mapping = BlockMapping::new()
-                                .with_bat_state(new_state)
-                                .with_transitioning_to_fully_present(false)
-                                .with_file_megabyte((new_offset / MB1) as u32);
-
-                            self.bat.set_block_mapping(span.block_number, new_mapping);
-
-                            // For non-TFP path: capture per-page FSN when
-                            // !is_safe. The FSN is captured now (before
-                            // the caller writes data), matching the C code's
-                            // FreeSpace.RequiredFsn timing. Passed into
-                            // write_block_mapping so it's set atomically
-                            // with the dirty-mark — no window for commit
-                            // to sweep the page without the FSN.
-                            let pre_log_fsn = if !space_state.is_safe() {
-                                self.log_state
-                                    .as_ref()
-                                    .map(|state| state.flush_sequencer.current_fsn())
-                            } else {
-                                None
-                            };
-
-                            // Per-entry cache write (write-through to disk).
-                            // LOCK AUDIT: bat_state write-lock dropped (end of prior block). allocation_lock held (async Mutex — OK across .await).
-                            self.bat
-                                .write_block_mapping(
-                                    &self.cache,
-                                    BlockType::Payload,
-                                    span.block_number,
-                                    new_mapping,
-                                    pre_log_fsn,
-                                )
-                                .await?;
-
-                            // Emit zero + data + zero ranges.
-                            // For PartiallyPresent blocks, skip zero-fill —
-                            // unwritten sectors are transparent to parent
-                            // (the sector bitmap tracks presence).
-                            // For FullyPresent blocks, zero-fill surround
-                            // unless the space is already safe.
-                            if !is_partial_present
-                                && span.block_offset > 0
-                                && !space_state.is_zero()
-                            {
-                                ranges.push(WriteRange::Zero {
-                                    file_offset: new_offset,
-                                    length: span.block_offset,
-                                });
-                            }
-
-                            ranges.push(WriteRange::Data {
-                                guest_offset: span.virtual_offset,
-                                length: span.length,
-                                file_offset: new_offset + span.block_offset as u64,
-                            });
-
-                            let end_offset = span.block_offset + span.length;
-                            if !is_partial_present
-                                && end_offset < self.block_size
-                                && !space_state.is_zero()
-                            {
-                                ranges.push(WriteRange::Zero {
-                                    file_offset: new_offset + end_offset as u64,
-                                    length: self.block_size - end_offset,
-                                });
-                            }
+                            self.allocate_partial_block(
+                                span,
+                                mapping,
+                                new_offset,
+                                space_state,
+                                eof,
+                                ranges,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -638,6 +466,212 @@ impl<F: AsyncFile> VhdxFile<F> {
             needs_flush_before_log,
             tfp_records,
         ))
+    }
+
+    /// Resolve space for a payload block allocation.
+    ///
+    /// Tries three sources in priority order:
+    /// 1. Deferred releases (non-durable trim) — reclaim same-block space.
+    /// 2. Soft-anchored blocks (durable trim) — reclaim same-block space.
+    /// 3. Fresh allocation via [`allocate_space`].
+    ///
+    /// Returns the file offset and [`SpaceState`] of the allocated region.
+    async fn resolve_block_space(
+        &self,
+        block_number: u32,
+        mapping: BlockMapping,
+        eof: &mut crate::space::EofState,
+    ) -> Result<(u64, crate::space::SpaceState), VhdxError> {
+        // 1. Check deferred releases (non-durable trim).
+        if let Some(deferred_offset) = self.deferred_releases.remove(block_number) {
+            return Ok((deferred_offset, crate::space::SpaceState::OwnStale));
+        }
+
+        // 2. Check soft-anchored blocks (durable trim).
+        if crate::trim::is_soft_anchored(mapping) {
+            let old_file_offset = mapping.file_offset();
+            if self
+                .free_space
+                .unmark_trimmed_block(block_number, old_file_offset, self.block_size)
+                .is_ok()
+            {
+                return Ok((old_file_offset, crate::space::SpaceState::OwnStale));
+            }
+            // Unmark failed (race) — fall through to fresh allocation.
+        }
+
+        // 3. Allocate fresh space.
+        let r = self
+            .allocate_space(eof, self.block_size, AllocateFlags::new())
+            .await?;
+        Ok((r.file_offset, r.state))
+    }
+
+    /// Handle a full-block allocation: set TFP, record for later completion,
+    /// and emit the data range.
+    fn allocate_full_block(
+        &self,
+        span: &BlockSpan,
+        original_mapping: BlockMapping,
+        new_offset: u64,
+        space_state: crate::space::SpaceState,
+        tfp_records: &mut Vec<TfpRecord>,
+        needs_flush_before_log: &mut bool,
+        ranges: &mut Vec<WriteRange>,
+    ) {
+        let new_mapping = BlockMapping::new()
+            .with_bat_state(original_mapping.bat_state())
+            .with_transitioning_to_fully_present(true)
+            .with_file_megabyte((new_offset / MB1) as u32);
+
+        self.bat.set_block_mapping(span.block_number, new_mapping);
+
+        tfp_records.push(TfpRecord {
+            block_number: span.block_number,
+            original_mapping,
+            allocated_offset: Some(new_offset),
+        });
+
+        if !space_state.is_safe() {
+            *needs_flush_before_log = true;
+        }
+
+        ranges.push(WriteRange::Data {
+            guest_offset: span.virtual_offset,
+            length: span.length,
+            file_offset: new_offset + span.block_offset as u64,
+        });
+    }
+
+    /// Handle a partial-block allocation: commit BAT immediately, allocate
+    /// SBM if needed (differencing disks), and emit data + zero-padding ranges.
+    async fn allocate_partial_block(
+        &self,
+        span: &BlockSpan,
+        mapping: BlockMapping,
+        new_offset: u64,
+        space_state: crate::space::SpaceState,
+        eof: &mut crate::space::EofState,
+        ranges: &mut Vec<WriteRange>,
+    ) -> Result<(), VhdxError> {
+        // For differencing disks: if the block was NotPresent (transparent
+        // to parent), allocate as PartiallyPresent so that unwritten sectors
+        // remain transparent. The sector bitmap will be updated in
+        // complete_write_inner() to mark only the written sectors as present.
+        //
+        // For non-diff disks or blocks in other states (Zero, Unmapped,
+        // Undefined): allocate as FullyPresent with zero-padding.
+        let is_partial_present =
+            self.has_parent && mapping.bat_state() == BatEntryState::NotPresent;
+
+        // Allocate SBM block if needed for PartiallyPresent.
+        if is_partial_present {
+            self.ensure_sbm_allocated(span.block_number, eof).await?;
+        }
+
+        let new_state = if is_partial_present {
+            BatEntryState::PartiallyPresent
+        } else {
+            BatEntryState::FullyPresent
+        };
+
+        let new_mapping = BlockMapping::new()
+            .with_bat_state(new_state)
+            .with_transitioning_to_fully_present(false)
+            .with_file_megabyte((new_offset / MB1) as u32);
+
+        self.bat.set_block_mapping(span.block_number, new_mapping);
+
+        // Capture per-page FSN when !is_safe. The FSN is captured now
+        // (before the caller writes data), matching the C code's
+        // FreeSpace.RequiredFsn timing.
+        let pre_log_fsn = if !space_state.is_safe() {
+            self.log_state
+                .as_ref()
+                .map(|state| state.flush_sequencer.current_fsn())
+        } else {
+            None
+        };
+
+        // Per-entry cache write (write-through to disk).
+        self.bat
+            .write_block_mapping(
+                &self.cache,
+                BlockType::Payload,
+                span.block_number,
+                new_mapping,
+                pre_log_fsn,
+            )
+            .await?;
+
+        // Emit zero + data + zero ranges.
+        // For PartiallyPresent blocks, skip zero-fill — unwritten sectors
+        // are transparent to parent (the sector bitmap tracks presence).
+        // For FullyPresent blocks, zero-fill surround unless the space
+        // is already safe (zeroed).
+        if !is_partial_present && span.block_offset > 0 && !space_state.is_zero() {
+            ranges.push(WriteRange::Zero {
+                file_offset: new_offset,
+                length: span.block_offset,
+            });
+        }
+
+        ranges.push(WriteRange::Data {
+            guest_offset: span.virtual_offset,
+            length: span.length,
+            file_offset: new_offset + span.block_offset as u64,
+        });
+
+        let end_offset = span.block_offset + span.length;
+        if !is_partial_present && end_offset < self.block_size && !space_state.is_zero() {
+            ranges.push(WriteRange::Zero {
+                file_offset: new_offset + end_offset as u64,
+                length: self.block_size - end_offset,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Ensure the sector bitmap block for the given payload block's chunk
+    /// is allocated. No-op if the SBM is already present.
+    async fn ensure_sbm_allocated(
+        &self,
+        block_number: u32,
+        eof: &mut crate::space::EofState,
+    ) -> Result<(), VhdxError> {
+        let chunk_number = block_number / self.bat.chunk_ratio;
+        let sbm_mapping = self.bat.get_sector_bitmap_mapping(chunk_number);
+
+        if sbm_mapping.bat_state() == BatEntryState::FullyPresent {
+            return Ok(());
+        }
+
+        let sbm_alloc = self
+            .allocate_space(
+                eof,
+                crate::bat::SECTOR_BITMAP_BLOCK_SIZE,
+                AllocateFlags::new().with_zero(true),
+            )
+            .await?;
+
+        let new_sbm = BlockMapping::new()
+            .with_bat_state(BatEntryState::FullyPresent)
+            .with_file_megabyte((sbm_alloc.file_offset / MB1) as u32);
+
+        self.bat.set_sector_bitmap_mapping(chunk_number, new_sbm);
+
+        self.bat
+            .write_block_mapping(
+                &self.cache,
+                BlockType::SectorBitmap,
+                chunk_number,
+                new_sbm,
+                None,
+            )
+            .await?;
+
+        Ok(())
     }
 
     /// Finalize a write operation (internal implementation).

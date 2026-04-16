@@ -60,7 +60,7 @@ pub async fn open_disk_type(
                 Err(err) => return Err(err.into()),
             }
         }
-        Some("vhdx") => disk_vhdx::chain::open_vhdx_chain(path, read_only).await?,
+        Some("vhdx") => disklayer_vhdx::chain::open_vhdx_chain(path, read_only).await?,
         Some("iso") if !read_only => {
             anyhow::bail!("iso file cannot be opened as read/write")
         }

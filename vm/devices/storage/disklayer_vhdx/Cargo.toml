@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 [package]
-name = "disk_vhdx"
+name = "disklayer_vhdx"
 edition.workspace = true
 rust-version.workspace = true
 

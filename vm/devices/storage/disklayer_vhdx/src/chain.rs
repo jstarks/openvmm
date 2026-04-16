@@ -52,7 +52,7 @@ pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource
 /// # Example
 ///
 /// ```no_run
-/// # use disk_vhdx::chain::open_vhdx_chain_explicit;
+/// # use disklayer_vhdx::chain::open_vhdx_chain_explicit;
 /// # use std::path::Path;
 /// let resource = open_vhdx_chain_explicit(
 ///     &[Path::new("child.vhdx"), Path::new("base.vhdx")],

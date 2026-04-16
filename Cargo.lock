@@ -1573,26 +1573,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "disk_vhdx"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blocking",
- "disk_backend",
- "disk_backend_resources",
- "disk_layered",
- "guestmem",
- "inspect",
- "pal_async",
- "scsi_buffers",
- "tempfile",
- "thiserror 2.0.16",
- "vhdx",
- "vm_resource",
-]
-
-[[package]]
 name = "disklayer_ram"
 version = "0.0.0"
 dependencies = [
@@ -1632,6 +1612,26 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "vm_resource",
+]
+
+[[package]]
+name = "disklayer_vhdx"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blocking",
+ "disk_backend",
+ "disk_backend_resources",
+ "disk_layered",
+ "guestmem",
+ "inspect",
+ "pal_async",
+ "scsi_buffers",
+ "tempfile",
+ "thiserror 2.0.16",
+ "vhdx",
  "vm_resource",
 ]
 
@@ -5476,7 +5476,7 @@ dependencies = [
  "disk_backend_resources",
  "disk_vhd1",
  "disk_vhdmp",
- "disk_vhdx",
+ "disklayer_vhdx",
  "fs-err",
  "get_resources",
  "hypervisor_resources",
@@ -5529,9 +5529,9 @@ dependencies = [
  "disk_prwrap",
  "disk_vhd1",
  "disk_vhdmp",
- "disk_vhdx",
  "disklayer_ram",
  "disklayer_sqlite",
+ "disklayer_vhdx",
  "gdma",
  "guest_crash_device",
  "guest_emulation_device",

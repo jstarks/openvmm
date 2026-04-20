@@ -391,9 +391,9 @@ impl Bat {
         let group = entry_number / group_size;
         let position = entry_number % group_size;
 
-        if self.has_parent && position == self.chunk_ratio {
-            // This is a sector bitmap entry.
-            if group < self.sector_bitmap_block_count {
+        if position == self.chunk_ratio {
+            // This is a sector bitmap / padding entry.
+            if self.has_parent && group < self.sector_bitmap_block_count {
                 Some((BlockType::SectorBitmap, group))
             } else {
                 None
@@ -1125,6 +1125,48 @@ mod tests {
         // Entry beyond all data blocks should return None.
         let beyond = bat.payload_entry_index(bat.data_block_count);
         assert_eq!(bat.entry_number_to_block_id(beyond), None);
+    }
+
+    /// Non-differencing disk with data_block_count > chunk_ratio.
+    ///
+    /// The BAT has padding entries at every chunk_ratio boundary. These
+    /// must NOT be misidentified as payload entries.
+    #[test]
+    fn entry_number_to_block_id_padding_not_payload() {
+        // Use 256 MiB blocks so chunk_ratio is small (16 with 512B sectors).
+        // 8 GiB disk → data_block_count = 32 (> chunk_ratio=16).
+        let bat = Bat::new(
+            8 * format::GB1,
+            256 * MB1 as u32,
+            512,
+            false,
+            4 * MB1 as u32, // BAT length large enough
+        )
+        .unwrap();
+        assert_eq!(bat.chunk_ratio, 16);
+        assert_eq!(bat.data_block_count, 32);
+
+        // Entry 16 is the padding entry (position == chunk_ratio in group 0).
+        // It should NOT map to payload block 16.
+        let padding_entry = bat.chunk_ratio; // entry 16
+        let result = bat.entry_number_to_block_id(padding_entry);
+        assert_eq!(
+            result, None,
+            "entry {} is a padding entry on non-diff disk and should return None, \
+             but got {:?}",
+            padding_entry, result
+        );
+
+        // Payload block 16 should be at entry 17 (payload_entry_index(16) = 16 + 16/16 = 17).
+        let real_entry = bat.payload_entry_index(16);
+        assert_eq!(real_entry, 17);
+        let result = bat.entry_number_to_block_id(real_entry);
+        assert_eq!(
+            result,
+            Some((BlockType::Payload, 16)),
+            "entry {} should map to payload block 16",
+            real_entry
+        );
     }
 
     // ---- Refcount async behavior tests ----

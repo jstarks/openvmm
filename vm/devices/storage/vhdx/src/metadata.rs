@@ -26,6 +26,7 @@ pub(crate) struct MetadataTable {
     #[expect(dead_code)]
     pub user_metadata_size: u32,
     /// Number of user metadata entries.
+    #[allow(dead_code)] // populated during parse, used in tests
     pub user_item_count: u16,
 }
 

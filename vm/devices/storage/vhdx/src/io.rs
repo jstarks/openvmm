@@ -332,8 +332,8 @@ impl<F: AsyncFile> VhdxFile<F> {
 
         // --- Allocation phase: acquire BlockAllocationLock ---
         // Wait until no blocks in our allocation set have TFP set by
-        // a concurrent allocator. This matches the C code's
-        // OverlappingAllocations serialization: if another writer is
+        // a concurrent allocator. This is the OverlappingAllocations
+        // serialization: if another writer is
         // transitioning any of our blocks, we park and wait for that
         // writer's post-allocate to clear TFP before proceeding.
         // LOCK AUDIT: No synchronous locks held entering allocation loop.
@@ -582,8 +582,8 @@ impl<F: AsyncFile> VhdxFile<F> {
             .with_file_megabyte((new_offset / MB1) as u32);
 
         // Capture per-page FSN when !is_safe. The FSN is captured now
-        // (before the caller writes data), matching the C code's
-        // FreeSpace.RequiredFsn timing.
+        // (before the caller writes data) to ensure the data flush
+        // completes before the BAT update is logged.
         let pre_log_fsn = if !space_state.is_safe() {
             self.log_state
                 .as_ref()
@@ -694,8 +694,7 @@ impl<F: AsyncFile> VhdxFile<F> {
     ) -> Result<(), VhdxError> {
         let had_tfp = !tfp_records.is_empty();
 
-        // Capture FSN after the caller's data writes (matching C's
-        // Vhd2iDereferenceReadWrite → Vhd2iGetCurrentFsn timing).
+        // Capture FSN after the caller's data writes.
         // Passed into write_block_mapping so it's stamped on the
         // cache page atomically with the dirty-mark.
         let pre_log_fsn = if needs_flush_before_log {
@@ -882,8 +881,6 @@ pub struct WriteIoGuard<'a, F: AsyncFile> {
     /// `complete_write_inner` must capture the current FSN and apply it
     /// to the BAT pages so the log task waits for the data flush before
     /// logging the BAT update.
-    ///
-    /// Matches C's `NeedsFlushDuringPostAllocate` flag.
     needs_flush_before_log: bool,
     /// TFP records collected during resolve_write, needed by complete/abort.
     /// `None` after complete() or for zero-length writes.

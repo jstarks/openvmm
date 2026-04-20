@@ -39,6 +39,7 @@ pub(crate) struct ParsedHeader {
     /// Length of the log region in bytes.
     pub log_length: u32,
     /// File format version.
+    #[allow(dead_code)] // populated during parse, used in tests
     pub version: u16,
     /// True if header 1 was chosen as the active header.
     pub first_header_current: bool,
@@ -504,7 +505,7 @@ mod tests {
         header.checksum = 0;
 
         // Write header bytes, recompute CRC.
-        let header_bytes = zerocopy::IntoBytes::as_bytes(&header);
+        let header_bytes = IntoBytes::as_bytes(&header);
         buf[..header_bytes.len()].copy_from_slice(header_bytes);
         let crc = format::compute_checksum(&buf, 4);
         buf[4..8].copy_from_slice(&crc.to_le_bytes());

@@ -5,7 +5,7 @@
 //!
 //! Tracks which megabyte-granularity regions of the file are free, in-use,
 //! or soft-anchored (from trimmed blocks). Implements a four-priority
-//! allocation strategy matching the C code in space.c:
+//! allocation strategy:
 //!
 //! 1. **Free space pool** — reuse interior free blocks
 //! 2. **Near-EOF space** — allocate from zeroed space before file end
@@ -13,7 +13,7 @@
 //! 4. **Extend EOF** — grow the file
 //!
 //! The bitmap uses 1-bit-per-megabyte granularity with SET = free / anchored
-//! and CLEAR = in-use, matching the C implementation's `RTL_BITMAP` semantics.
+//! and CLEAR = in-use.
 
 use crate::bat::Bat;
 use crate::error::CorruptionType;
@@ -26,7 +26,6 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 
 /// Default EOF extension length: 32 MiB.
-/// Matches `VHD2_DEFAULT_EXTENSION_LENGTH = 32 * VHD2_1MB`.
 const DEFAULT_EOF_EXTENSION_LENGTH: u32 = 32 * MB1 as u32;
 
 // ---------------------------------------------------------------------------
@@ -309,8 +308,6 @@ impl FreeSpaceTracker {
     /// regions as in-use.
     ///
     /// Returns both the tracker and the initial [`EofState`].
-    ///
-    /// Corresponds to `Vhd2iInitializeSpace`.
     pub fn new(
         file_length: u64,
         block_size: u32,
@@ -407,7 +404,7 @@ impl FreeSpaceTracker {
     /// Mark a file range as in-use during BAT parse.
     ///
     /// Validates that the range doesn't overlap with an already-in-use range
-    /// and doesn't extend past EOF. Corresponds to `Vhd2iMarkRangeInUseDuringParse`.
+    /// and doesn't extend past EOF.
     pub fn mark_range_in_use(
         &self,
         eof: &mut EofState,
@@ -420,8 +417,6 @@ impl FreeSpaceTracker {
     }
 
     /// Mark a trimmed block as soft-anchored during BAT parse.
-    ///
-    /// Corresponds to `Vhd2iMarkTrimmedBlockLocked`.
     pub fn mark_trimmed_block(
         &self,
         block_number: u32,
@@ -438,8 +433,6 @@ impl FreeSpaceTracker {
     /// Blocks from `ZeroOffset` to `FileLength` are "near-EOF free space"
     /// (tracked separately, not in the bitmap pool). Clear those bits from
     /// the FreeSpace bitmap.
-    ///
-    /// Corresponds to `Vhd2iCompleteSpaceInitialization`.
     pub fn complete_initialization(&self, eof: &EofState) {
         let mut inner = self.inner.lock();
         let bit_base = (eof.zero_offset / MB1) as usize;
@@ -529,15 +522,11 @@ impl FreeSpaceTracker {
     }
 
     /// Release space back to the free pool.
-    ///
-    /// Corresponds to `Vhd2ReleaseFileSpaceNoResizeFreeSpaceBitmapLocked`.
     pub fn release(&self, offset: u64, size: u32) {
         self.inner.lock().release_inner(offset, size);
     }
 
     /// Unmark a trimmed block (when its space is reclaimed).
-    ///
-    /// Corresponds to `Vhd2iUnmarkTrimmedBlockLocked`.
     pub fn unmark_trimmed_block(
         &self,
         block_number: u32,
@@ -1048,8 +1037,6 @@ impl<F: AsyncFile> VhdxFile<F> {
     ///
     /// When `flags` includes [`AllocateFlags::ALIGNED`], the allocation is
     /// aligned to `block_alignment`.
-    ///
-    /// Corresponds to `Vhd2iContinueAllocateSpace`.
     pub(crate) async fn allocate_space(
         &self,
         eof: &mut EofState,
@@ -1637,7 +1624,7 @@ mod tests {
             .mark_range_in_use(&mut eof, 4 * MB1, MB1 as u32)
             .unwrap();
         // Mark 5..7 MB in-use, then mark as soft-anchored (trimmed block 1).
-        // The C code always marks in-use first, then marks as trimmed.
+        // Always mark in-use first, then mark as trimmed.
         tracker
             .mark_range_in_use(&mut eof, 5 * MB1, 2 * MB1 as u32)
             .unwrap();
@@ -1903,7 +1890,7 @@ mod tests {
     #[test]
     fn multiple_anchored_blocks_reclaimed_one_at_a_time() {
         let (tracker, mut eof) = make_test_tracker(20, 2);
-        // Mark anchored regions in-use first (matching C code sequence),
+        // Mark anchored regions in-use first (standard sequence),
         // then mark as trimmed.
         tracker
             .mark_range_in_use(&mut eof, 6 * MB1, 2 * MB1 as u32)
@@ -1931,7 +1918,7 @@ mod tests {
         tracker.complete_initialization(&eof);
 
         // BAT with both blocks anchored.
-        let mut bat = make_test_bat_with_anchored_block(2, 6, 16);
+        let bat = make_test_bat_with_anchored_block(2, 6, 16);
         bat.set_block_mapping(
             5,
             BlockMapping::new()

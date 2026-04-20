@@ -4,8 +4,7 @@
 //! On-disk format types and constants for the VHDX file format.
 //!
 //! All structures use `#[repr(C)]` and derive zerocopy traits for safe
-//! zero-copy parsing. Type names drop the `Vhd2`/`VHD2_` prefix used
-//! in the C implementation since they live in the `vhdx::format` module.
+//! zero-copy parsing.
 
 use bitfield_struct::bitfield;
 use guid::Guid;

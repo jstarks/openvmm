@@ -180,7 +180,7 @@ pub struct VhdxFile<F: AsyncFile> {
     physical_sector_size: u32,
     pub(crate) has_parent: bool,
     is_fully_allocated: bool,
-    #[expect(dead_code)] // Phase 7+: used for disk_backend integration
+    #[expect(dead_code)] // TODO: used for disk_backend integration
     page_83_data: Guid,
 
     // Metadata table (kept for on-demand metadata reads).
@@ -208,10 +208,10 @@ pub struct VhdxFile<F: AsyncFile> {
     pub(crate) deferred_releases: DeferredReleases,
 
     // Region offsets
-    #[expect(dead_code)] // Phase 9+: used for space management
+    #[expect(dead_code)] // TODO: used for space management
     bat_length: u32,
     metadata_offset: u64,
-    #[expect(dead_code)] // Phase 9+: used for metadata writes
+    #[expect(dead_code)] // TODO: used for metadata writes
     metadata_length: u32,
 
     // Mode

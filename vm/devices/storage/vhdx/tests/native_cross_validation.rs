@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Phase 8.1: Native API cross-validation smoke tests.
+//! Native API cross-validation smoke tests.
 //!
 //! These tests exercise the first interaction between the Rust VHDX parser
 //! and the Windows native VHD stack. They are deliberately limited in scope
@@ -1034,7 +1034,7 @@ async fn trim_native_write_rust_trim_native_read(driver: DefaultDriver) {
 }
 
 // =====================================================================
-// Phase 8.3 — Differencing Disk Helpers
+// Differencing Disk Helpers
 // =====================================================================
 
 impl NativeVhdx {
@@ -1168,7 +1168,7 @@ async fn chained_read(child: &RustVhdx, parent: &RustVhdx, offset: u64, len: u32
 }
 
 // =====================================================================
-// Phase 8.3 — Differencing Disk Test Cases
+// Differencing Disk Test Cases
 // =====================================================================
 
 /// Test 14: Rust-Only Chained Read — Unwritten Child
@@ -1547,7 +1547,7 @@ async fn diff_rust_writes_and_trims(driver: DefaultDriver) {
 }
 
 // =====================================================================
-// Phase 8b — Log Replay Cross-Validation
+// Log Replay Cross-Validation
 // =====================================================================
 //
 // These tests exercise crash recovery scenarios where the Rust stack
@@ -1627,8 +1627,7 @@ async fn log_replay_rust_crash_many_blocks_native_reads(driver: DefaultDriver) {
 
     // Rust create + write all blocks + flush + abort.
     {
-        let rust =
-            RustVhdx::create(&vhdx_path, disk_size, block_size as u32, &driver).await;
+        let rust = RustVhdx::create(&vhdx_path, disk_size, block_size as u32, &driver).await;
 
         for i in 0..block_count {
             let offset = i * block_size;
@@ -1669,8 +1668,7 @@ async fn log_replay_rust_crash_rust_replay_native_reads(driver: DefaultDriver) {
 
     // Rust create + write + flush + abort.
     {
-        let rust =
-            RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+        let rust = RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
         rust.write_data(0, &test_pattern(0, 512)).await;
         rust.write_data(block_size, &test_pattern(block_size, 512))
             .await;
@@ -1704,11 +1702,7 @@ async fn log_replay_rust_crash_rust_replay_native_reads(driver: DefaultDriver) {
     let mut buf1 = vec![0u8; 512];
     let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
     assert_eq!(bytes, 512);
-    assert_eq!(
-        buf1,
-        test_pattern(block_size, 512),
-        "block 1 via native"
-    );
+    assert_eq!(buf1, test_pattern(block_size, 512), "block 1 via native");
 }
 
 /// Test 23: Rust Crash → Native Replay → Native Writes More → Rust Reads
@@ -1725,13 +1719,7 @@ async fn log_replay_lifecycle_crash_replay_more_writes(driver: DefaultDriver) {
 
     // Step 1: Rust create + write block 0 + flush + abort.
     {
-        let rust = RustVhdx::create(
-            &vhdx_path,
-            16 * 1024 * 1024,
-            block_size as u32,
-            &driver,
-        )
-        .await;
+        let rust = RustVhdx::create(&vhdx_path, 16 * 1024 * 1024, block_size as u32, &driver).await;
         rust.write_data(0, &test_pattern(0, 512)).await;
         rust.flush().await;
         rust.abort().await;
@@ -1764,11 +1752,7 @@ async fn log_replay_lifecycle_crash_replay_more_writes(driver: DefaultDriver) {
         assert_eq!(data0, test_pattern(0, 512), "block 0 via Rust");
 
         let data1 = rust.read_data(block_size, 512).await;
-        assert_eq!(
-            data1,
-            test_pattern(block_size, 512),
-            "block 1 via Rust"
-        );
+        assert_eq!(data1, test_pattern(block_size, 512), "block 1 via Rust");
 
         rust.close().await;
     }
@@ -1788,8 +1772,7 @@ async fn log_replay_rust_crash_with_trim_native_reads(driver: DefaultDriver) {
 
     // Rust create + write both blocks + trim block 1 + flush + abort.
     {
-        let rust =
-            RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+        let rust = RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
         rust.write_data(0, &test_pattern(0, 512)).await;
         rust.write_data(block_size, &test_pattern(block_size, 512))
             .await;
@@ -1837,13 +1820,7 @@ async fn log_replay_repeated_crash_cycles(driver: DefaultDriver) {
 
     // Cycle 1: Rust writes block 0 → crash.
     {
-        let rust = RustVhdx::create(
-            &vhdx_path,
-            16 * 1024 * 1024,
-            block_size as u32,
-            &driver,
-        )
-        .await;
+        let rust = RustVhdx::create(&vhdx_path, 16 * 1024 * 1024, block_size as u32, &driver).await;
         rust.write_data(0, &test_pattern(0, 512)).await;
         rust.flush().await;
         rust.abort().await;
@@ -1869,11 +1846,8 @@ async fn log_replay_repeated_crash_cycles(driver: DefaultDriver) {
     // Cycle 2: Rust opens (clean file now) → writes block 2 → crash.
     {
         let rust = RustVhdx::open(&vhdx_path, false, Some(&driver)).await;
-        rust.write_data(
-            2 * block_size,
-            &test_pattern(2 * block_size, 512),
-        )
-        .await;
+        rust.write_data(2 * block_size, &test_pattern(2 * block_size, 512))
+            .await;
         rust.flush().await;
         rust.abort().await;
     }
@@ -1889,19 +1863,12 @@ async fn log_replay_repeated_crash_cycles(driver: DefaultDriver) {
 
         let mut buf1 = vec![0u8; 512];
         raw.read_at(block_size, &mut buf1).expect("read block 1");
-        assert_eq!(
-            buf1,
-            test_pattern(block_size, 512),
-            "cycle 2: block 1"
-        );
+        assert_eq!(buf1, test_pattern(block_size, 512), "cycle 2: block 1");
 
         let mut buf2 = vec![0u8; 512];
-        raw.read_at(2 * block_size, &mut buf2).expect("read block 2");
-        assert_eq!(
-            buf2,
-            test_pattern(2 * block_size, 512),
-            "cycle 2: block 2"
-        );
+        raw.read_at(2 * block_size, &mut buf2)
+            .expect("read block 2");
+        assert_eq!(buf2, test_pattern(2 * block_size, 512), "cycle 2: block 2");
     }
 }
 
@@ -1918,8 +1885,7 @@ async fn log_replay_clean_close_no_replay_needed(driver: DefaultDriver) {
 
     // Rust create + write + flush + clean close.
     {
-        let rust =
-            RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+        let rust = RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
         rust.write_data(0, &test_pattern(0, 512)).await;
         rust.write_data(block_size, &test_pattern(block_size, 512))
             .await;
@@ -1939,9 +1905,5 @@ async fn log_replay_clean_close_no_replay_needed(driver: DefaultDriver) {
     let mut buf1 = vec![0u8; 512];
     let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
     assert_eq!(bytes, 512);
-    assert_eq!(
-        buf1,
-        test_pattern(block_size, 512),
-        "block 1"
-    );
+    assert_eq!(buf1, test_pattern(block_size, 512), "block 1");
 }

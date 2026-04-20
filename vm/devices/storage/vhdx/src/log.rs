@@ -156,6 +156,7 @@ pub struct ReplayResult {
     pub replayed: bool,
     /// Whether the region table was modified during replay
     /// (caller should re-read region tables).
+    #[allow(dead_code)] // populated during replay, used in tests
     pub region_table_modified: bool,
     /// The last file offset from the newest replayed entry.
     #[expect(dead_code)]
@@ -167,6 +168,7 @@ pub struct ReplayResult {
     #[expect(dead_code)]
     pub head: u32,
     /// Sequence number of the last replayed entry.
+    #[allow(dead_code)] // populated during replay, used in tests
     pub sequence_number: u64,
     /// Flushed file offset from the newest replayed entry.
     #[expect(dead_code)]
@@ -194,10 +196,10 @@ pub async fn replay_log<F: AsyncFile>(
     log_region: &LogRegion,
     log_guid: Guid,
 ) -> Result<ReplayResult, VhdxError> {
-    // Phase 1: find the best valid sequence.
+    // Step 1: find the best valid sequence.
     let sequence = find_log_sequence(file, log_region, &log_guid).await?;
 
-    // Phase 2: apply the sequence.
+    // Step 2: apply the sequence.
     apply_sequence(file, log_region, &log_guid, &sequence).await
 }
 
@@ -1865,7 +1867,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tail advancement tests (Phase 1)
+    // Tail advancement tests
     // -----------------------------------------------------------------------
 
     /// advance_tail reclaims space visible to free_space().
@@ -1930,7 +1932,7 @@ mod tests {
 
     /// Write entries until the log is full, advance tail, write more.
     ///
-    /// This is the core Phase 1 scenario: without advance_tail, the log
+    /// This is the core scenario: without advance_tail, the log
     /// fills up and returns LogFull. With it, space is reclaimed.
     #[async_test]
     async fn write_advance_write_more() {

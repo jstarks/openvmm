@@ -439,8 +439,7 @@ impl Bat {
     ///
     /// Produces all entries for the given page, with TFP blocks having
     /// their `file_offset_mb` masked to zero (allocation not committed
-    /// yet). Matches the C code's `Vhd2iProduceBatPageLocked` +
-    /// `Vhd2iGenerateBatEntry` behavior.
+    /// yet).
     fn produce_page(&self, page_index: usize, buf: &mut [u8; CACHE_PAGE_SIZE as usize]) {
         let base_entry = page_index as u32 * ENTRIES_PER_BAT_PAGE as u32;
         for i in 0..ENTRIES_PER_BAT_PAGE as u32 {
@@ -480,8 +479,6 @@ impl Bat {
     /// Uses `Overwrite` mode to avoid unnecessary disk reads. If the
     /// page is already cached, patches only the single entry. If not
     /// cached, builds the full page from in-memory state (no disk read).
-    ///
-    /// Matches the C code's `Vhd2iUpdateBlockStateWithNode` pattern.
     pub async fn write_block_mapping<F: AsyncFile>(
         &self,
         cache: &PageCache<F>,
@@ -523,7 +520,7 @@ impl Bat {
 
         if guard.is_overwriting() {
             // Slow path: page not cached — build from in-memory state.
-            self.produce_page(page_number, &mut *guard);
+            self.produce_page(page_number, &mut guard);
         } else {
             // Fast path: page is cached — patch just the one entry.
             let bat_entry = BatEntry::new()

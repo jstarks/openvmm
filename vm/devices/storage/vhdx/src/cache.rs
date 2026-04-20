@@ -249,6 +249,7 @@ impl LruList {
 
     /// Number of linked nodes (excludes sentinel and unlinked/free slots).
     #[cfg(test)]
+    #[allow(dead_code)] // useful for debugging
     fn len(&self) -> usize {
         let mut count = 0;
         let mut idx = self.nodes[0].next;
@@ -382,6 +383,7 @@ impl<F: AsyncFile> PageCache<F> {
     }
 
     /// Update the base file offset for a previously registered tag.
+    #[allow(dead_code)] // TODO: will be used for differencing disk parent resolution
     pub fn update_tag_offset(&self, tag: u8, new_base: u64) {
         self.pages.lock().tag_offsets[tag as usize] = new_base;
     }
@@ -865,7 +867,6 @@ impl<F: AsyncFile> PageCache<F> {
         }
 
         if committed.is_empty() {
-            drop(txn);
             return Ok(client.current_lsn());
         }
 
@@ -1025,13 +1026,13 @@ mod tests {
         let pattern: Vec<u8> = (0..PAGE_SIZE).map(|i| (i & 0xFF) as u8).collect();
         file.write_at(0, &pattern).await.unwrap();
 
-        let (mut cache, _rx) = writable_cache(InMemoryFile::new(PAGE_SIZE as u64));
+        let (_cache, _rx) = writable_cache(InMemoryFile::new(PAGE_SIZE as u64));
         // Re-create with the patterned file.
         let file = InMemoryFile::new(PAGE_SIZE as u64);
         file.write_at(0, &pattern).await.unwrap();
         let (tx, _rx) = mesh::channel::<LogRequest>();
         let permits = Arc::new(LogPermits::new(1000));
-        cache = PageCache::new(
+        let mut cache = PageCache::new(
             Arc::new(file),
             Some(LogClient::new(tx)),
             Some(CacheLogState {

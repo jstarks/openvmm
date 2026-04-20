@@ -163,11 +163,11 @@ mod tests {
         let wm = std::sync::Arc::new(LsnWatermark::new());
 
         let w = wm.clone();
-        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        let (done_tx, done_rx) = mesh::oneshot();
         let handle = std::thread::spawn(move || {
             futures::executor::block_on(async {
                 let fsn = w.wait_for(5).await.unwrap();
-                done_tx.send(fsn).unwrap();
+                done_tx.send(fsn);
             });
         });
 
@@ -197,12 +197,12 @@ mod tests {
         let wm = std::sync::Arc::new(LsnWatermark::new());
 
         let w = wm.clone();
-        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        let (done_tx, done_rx) = mesh::oneshot();
         let handle = std::thread::spawn(move || {
             futures::executor::block_on(async {
                 let result = w.wait_for(5).await;
                 assert!(result.is_err());
-                done_tx.send(()).unwrap();
+                done_tx.send(());
             });
         });
 

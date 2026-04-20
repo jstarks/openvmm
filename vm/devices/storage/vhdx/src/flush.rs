@@ -149,14 +149,14 @@ impl FlushSequencer {
         file: &impl AsyncFile,
         mut requested_fsn: Option<u64>,
     ) -> Result<u64, VhdxError> {
-        // Phase 1: find or create the Flush we'll execute.
+        // Step 1: find or create the Flush we'll execute.
         //
         // If there's an active flush covering our target FSN, wait for it.
         // When it completes, loop back — if completed_fsn >= target we're
         // done; otherwise we'll create a new flush ourselves.
         //
         // If no active flush covers our target, create one and `break` out
-        // of the loop to proceed to the I/O in phase 2.
+        // of the loop to proceed to the I/O in step 2.
         let my_flush = loop {
             let active = {
                 let mut state = self.state.lock();
@@ -186,7 +186,7 @@ impl FlushSequencer {
             active.wait_done().await;
         };
 
-        // Phase 2: perform the actual file flush and update state.
+        // Step 2: perform the actual file flush and update state.
         let r = file.flush().await;
         let completed_fsn = {
             let mut state = self.state.lock();
@@ -309,10 +309,7 @@ mod tests {
 
         async fn flush(&self) -> Result<(), std::io::Error> {
             if self.fail_flush.load(Ordering::Relaxed) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "flush failed",
-                ));
+                return Err(std::io::Error::other("flush failed"));
             }
             self.inner.flush().await
         }
@@ -385,8 +382,8 @@ mod tests {
         let (fsn1, fsn2) = futures::join!(t1, t2);
 
         // Both FSNs should be valid (1 or 2).
-        assert!(fsn1 >= 1 && fsn1 <= 2);
-        assert!(fsn2 >= 1 && fsn2 <= 2);
+        assert!((1..=2).contains(&fsn1));
+        assert!((1..=2).contains(&fsn2));
         assert_ne!(fsn1, fsn2);
 
         // Completed FSN should be at least the max of both.

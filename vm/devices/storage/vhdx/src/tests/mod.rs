@@ -365,7 +365,7 @@ mod log_task_integration {
     async fn large_write_survives_close_reopen(driver: DefaultDriver) {
         const BLOCK_COUNT: usize = 200;
         // Default block size is 2 MiB; place one 4 KiB write in each block.
-        const BLOCK_SIZE: u64 = 2 * format::MB1 as u64;
+        const BLOCK_SIZE: u64 = 2 * format::MB1;
         const WRITE_LEN: usize = 4096;
 
         let disk_size = BLOCK_SIZE * (BLOCK_COUNT as u64 + 1);
@@ -415,7 +415,7 @@ mod log_task_integration {
 
         // Write to several distinct blocks so multiple BAT pages are dirtied.
         for i in 0..10u64 {
-            let offset = i * 2 * format::MB1 as u64; // each in a different block
+            let offset = i * 2 * format::MB1; // each in a different block
             write_pattern(&vhdx, offset, 4096, (i & 0xFF) as u8).await;
         }
 
@@ -426,14 +426,14 @@ mod log_task_integration {
         // eventually block (deadlock). The fact that it completes proves
         // permits are flowing back from the apply task.
         for i in 10..20u64 {
-            let offset = i * 2 * format::MB1 as u64;
+            let offset = i * 2 * format::MB1;
             write_pattern(&vhdx, offset, 4096, (i & 0xFF) as u8).await;
         }
         vhdx.flush().await.unwrap();
 
         // Verify all data survived.
         for i in 0..20u64 {
-            let offset = i * 2 * format::MB1 as u64;
+            let offset = i * 2 * format::MB1;
             let expected = (i & 0xFF) as u8;
             let buf = read_pattern(&vhdx, offset, 4096).await;
             assert!(
@@ -451,7 +451,7 @@ mod log_task_integration {
     #[async_test]
     async fn many_commits_forward_progress(driver: DefaultDriver) {
         const BATCH_COUNT: usize = 20;
-        const BLOCK_SIZE: u64 = 2 * format::MB1 as u64;
+        const BLOCK_SIZE: u64 = 2 * format::MB1;
 
         let disk_size = BLOCK_SIZE * (BATCH_COUNT as u64 + 1);
         let file = create_test_vhdx_file(disk_size).await;
@@ -496,7 +496,7 @@ mod log_task_integration {
     #[async_test]
     async fn log_pipeline_stress(driver: DefaultDriver) {
         const BLOCK_COUNT: usize = 500;
-        const BLOCK_SIZE: u64 = 2 * format::MB1 as u64;
+        const BLOCK_SIZE: u64 = 2 * format::MB1;
         const WRITE_LEN: usize = 4096;
 
         let disk_size = BLOCK_SIZE * (BLOCK_COUNT as u64 + 1);

@@ -5,8 +5,7 @@
 //!
 //! Implements the `VhdxFile::trim()` method that transitions blocks to
 //! unmapped states, releasing file space back to the free pool or
-//! soft-anchoring it for later reuse. This module ports the C code's
-//! `Vhd2iIssueBlockTrim` / `Vhd2iContinueBlockTrim` logic.
+//! soft-anchoring it for later reuse.
 
 use crate::AsyncFile;
 use crate::bat::BlockMapping;
@@ -19,12 +18,10 @@ use crate::header::WriteMode;
 use crate::open::VhdxFile;
 
 /// Trim mode determining the target block state.
-///
-/// Maps to `VHD2_TRIM_MODE` in vhd2.h.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrimMode {
     /// Move blocks to the Unmapped (trimmed) state, keeping file offset
-    /// as a soft anchor for potential reuse. Maps to `Vhd2TrimModeFileSpace`.
+    /// as a soft anchor for potential reuse.
     ///
     /// Denied for Undefined blocks: a block that was never written
     /// should stay Undefined (preserves backup semantics — backup tools
@@ -32,23 +29,20 @@ pub enum TrimMode {
     FileSpace,
 
     /// Move blocks to the Undefined state. Soft anchor may be kept or
-    /// cleared depending on the original state. Maps to `Vhd2TrimModeFreeSpace`.
+    /// cleared depending on the original state.
     FreeSpace,
 
     /// Move blocks to the Zero state, clearing the file offset.
-    /// Maps to `Vhd2TrimModeZero`.
     Zero,
 
     /// Move blocks to the NotPresent (transparent) state, clearing the
     /// file offset. For differencing disks, reads fall through to parent.
-    /// Maps to `Vhd2TrimModeMakeTransparent`.
     ///
     /// Allowed on fully-allocated (fixed) disks.
     MakeTransparent,
 
     /// Remove soft anchors from trimmed/undefined blocks without changing
     /// their state. Clears file_megabyte if the block is soft-anchored.
-    /// Maps to `Vhd2TrimModeRemoveSoftAnchors`.
     ///
     /// Allowed on fully-allocated (fixed) disks. Does not change data
     /// content, so DataWriteGuid is not updated.
@@ -212,8 +206,6 @@ fn convert_remove_soft_anchors(old: BlockMapping) -> BlockMapping {
 /// Returns `(start_block, block_count)`. Only blocks whose entire extent
 /// falls within `[offset..offset+length)` are included. Leading and
 /// trailing partial blocks are skipped.
-///
-/// Maps to `Vhd2iIncludedBlocks` in block.c.
 fn included_blocks(offset: u64, length: u64, block_size: u64) -> (u32, u32) {
     if length == 0 {
         return (0, 0);

@@ -812,7 +812,7 @@ async fn file_writable_only_does_not_change_data_guid(driver: DefaultDriver) {
     );
 }
 
-// --- Phase 9.5b: TFP mechanics, write integration, and error path tests ---
+// --- TFP mechanics, write integration, and error path tests ---
 
 /// Interceptor with toggleable failure for mid-test fault injection.
 struct ToggleableInterceptor {
@@ -1630,7 +1630,7 @@ async fn concurrent_writes_different_blocks(driver: DefaultDriver) {
 #[async_test]
 async fn concurrent_writes_same_block(driver: DefaultDriver) {
     // This test exercises concurrent writes to the same unallocated block.
-    // The correct behavior (matching the C code) is serialization:
+    // The correct behavior is serialization:
     //   1. task_a: resolve_write → acquires allocation lock → allocates
     //      → sets TFP → returns ranges
     //   2. task_a: complete_write → clears TFP → FullyPresent → notifies
@@ -1786,7 +1786,7 @@ async fn concurrent_read_and_write_same_block(driver: DefaultDriver) {
     verify_block_pattern(&*vhdx, block_size as u64, block_size, 0xDD).await;
 }
 
-// ---- IoGuard refcount tracking tests (Phase 10.5 Step 2) ----
+// ---- IoGuard refcount tracking tests ----
 
 #[async_test]
 async fn read_guard_increments_refcount(driver: DefaultDriver) {
@@ -1972,7 +1972,7 @@ async fn concurrent_read_guards_same_block(driver: DefaultDriver) {
     assert_eq!(vhdx.bat.io_refcount(0), 0);
 }
 
-// ---- Phase 16b: Concurrent write+trim and mixed-workload stress tests ----
+// ---- Concurrent write+trim and mixed-workload stress tests ----
 
 use crate::trim::TrimMode;
 use crate::trim::TrimRequest;
@@ -2953,10 +2953,10 @@ async fn poison_error_message_preserved(driver: DefaultDriver) {
     vhdx.abort().await;
 }
 
-// ---- Phase 16: Post-Log Crash Consistency Tests ----
+// ---- Post-Log Crash Consistency Tests ----
 //
 // These tests exercise crash recovery scenarios that aren't covered by
-// the Phase 15 crash tests or Phase 16a/b concurrent tests. They focus on:
+// the basic crash tests or concurrent tests. They focus on:
 //   1. Unsafe (free-pool) allocation → flush → crash → no data teleportation
 //   2. High-volume log pipeline saturation → crash → replay
 //   3. Repeated crash-recovery cycles with writable reopen
@@ -3108,7 +3108,7 @@ async fn crash_unsafe_reuse_no_teleportation(driver: DefaultDriver) {
 #[async_test]
 async fn crash_high_volume_pipeline(driver: DefaultDriver) {
     const BLOCK_COUNT: usize = 100;
-    const BLOCK_SIZE: u64 = 2 * MB1 as u64;
+    const BLOCK_SIZE: u64 = 2 * MB1;
     const WRITE_LEN: usize = 4096;
 
     let disk_size = BLOCK_SIZE * (BLOCK_COUNT as u64 + 1);
@@ -3173,7 +3173,7 @@ async fn crash_repeated_writable_recovery_cycles(driver: DefaultDriver) {
 
     let (mem_file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
     let mut durable = mem_file.snapshot();
-    let block_size = MB1 as u64;
+    let block_size = MB1;
 
     for cycle in 0..CYCLES {
         // Open writable from the (possibly crashed) durable state.
@@ -3225,7 +3225,7 @@ async fn crash_repeated_writable_recovery_cycles(driver: DefaultDriver) {
     }
 }
 
-// ---- Phase 16: Concurrent crash tests using YieldingCrashFile ----
+// ---- Concurrent crash tests using YieldingCrashFile ----
 //
 // These tests use YieldingCrashFile to create genuine interleaving between
 // the log task, apply task, and user write tasks. The yield points cause
@@ -3432,14 +3432,14 @@ async fn interleaved_trim_write_crash(driver: DefaultDriver) {
     let vhdx = Arc::new(VhdxFile::open(file).writable(&driver).await.unwrap());
     let block_size = vhdx.block_size();
 
-    // Phase 1: Write all 8 blocks with initial data.
+    // Step 1: Write all 8 blocks with initial data.
     for i in 0..8u8 {
         let offset = i as u64 * block_size as u64;
         write_block(&*vhdx, offset, block_size, 0x10 + i).await;
     }
     vhdx.flush().await.unwrap();
 
-    // Phase 2: Concurrently trim blocks 0-3 and write blocks 4-7.
+    // Step 2: Concurrently trim blocks 0-3 and write blocks 4-7.
     let trim_futures: Vec<_> = (0..4u8)
         .map(|i| {
             let vhdx = vhdx.clone();
@@ -3512,7 +3512,7 @@ async fn interleaved_trim_write_crash(driver: DefaultDriver) {
     }
 }
 
-// ---- Phase 16: Selective durability crash tests ----
+// ---- Selective durability crash tests ----
 //
 // These tests use CrashAfterFlushFile to crash at specific points in
 // the WAL pipeline. Unlike CrashTestFile (where flush is all-or-nothing),

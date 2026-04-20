@@ -142,11 +142,11 @@ mod tests {
         assert_eq!(permits.available(), 0);
 
         let p = permits.clone();
-        let (acquired_tx, acquired_rx) = futures::channel::oneshot::channel();
+        let (acquired_tx, acquired_rx) = mesh::oneshot();
         let handle = std::thread::spawn(move || {
             futures::executor::block_on(async {
                 p.acquire(1).await.unwrap();
-                acquired_tx.send(()).unwrap();
+                acquired_tx.send(());
             });
         });
 

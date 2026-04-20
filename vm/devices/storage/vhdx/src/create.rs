@@ -167,7 +167,7 @@ pub async fn create(file: &impl AsyncFile, params: &mut CreateParams) -> Result<
     let bat_entry_count = if params.has_parent {
         sector_bitmap_block_count * (chunk_ratio as u64 + 1)
     } else {
-        data_block_count + data_block_count / chunk_ratio as u64
+        data_block_count + data_block_count.saturating_sub(1) / chunk_ratio as u64
     };
 
     if bat_entry_count > format::ABSOLUTE_MAXIMUM_BAT_ENTRY_COUNT {

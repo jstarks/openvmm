@@ -240,7 +240,6 @@ impl NativeVhdx {
     /// Attach with NO_LOCAL_HOST for raw byte-level I/O.
     /// With NO_LOCAL_HOST, no PhysicalDrive device is surfaced — instead,
     /// ReadFile/WriteFile work directly on the virtual disk handle.
-    /// Panics if attach fails (tests assume elevation).
     fn attach_raw(&mut self) -> RawDiskHandle {
         let flags = ATTACH_VIRTUAL_DISK_FLAG(
             ATTACH_VIRTUAL_DISK_FLAG_NO_LOCAL_HOST.0 | ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER.0,
@@ -513,6 +512,11 @@ impl RustVhdx {
     /// Close the VHDX (consume self).
     async fn close(self) {
         self.vhdx.close().await.expect("close");
+    }
+
+    /// Abort (crash) the VHDX — drops without clean close, leaving a dirty log.
+    async fn abort(self) {
+        self.vhdx.abort().await;
     }
 }
 
@@ -1540,4 +1544,404 @@ async fn diff_rust_writes_and_trims(driver: DefaultDriver) {
             "block 1 should be zeros after trim"
         );
     }
+}
+
+// =====================================================================
+// Phase 8b — Log Replay Cross-Validation
+// =====================================================================
+//
+// These tests exercise crash recovery scenarios where the Rust stack
+// writes data with a dirty log (via `abort()`), and the native Windows
+// VHD stack replays the log on open — or vice versa.
+//
+// The key API for simulating a crash in the Rust stack is `VhdxFile::abort()`:
+// it drops the log channel without flushing, leaving the log GUID set in
+// the header. The next open (by either stack) must replay the log before
+// the file is usable.
+//
+// The native Windows VHD stack always performs a clean close on handle drop
+// (it flushes the log and clears the log GUID), so we cannot easily create
+// a dirty log via native. Tests focus on Rust-crash → Native-replay and
+// full lifecycle interleaving scenarios.
+
+/// Test 20: Rust Crash → Native Replay
+///
+/// Rust opens writable → writes data to two blocks → flush → abort
+/// (simulated crash, log stays dirty) → native opens (replays log) →
+/// attach → raw-read → data is present and correct.
+#[pal_async::async_test]
+async fn log_replay_rust_crash_native_reads(driver: DefaultDriver) {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Rust create + write + flush + abort (crash).
+    {
+        let rust = RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+
+        // Write to blocks 0 and 1.
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.write_data(block_size, &test_pattern(block_size, 512))
+            .await;
+        rust.flush().await;
+
+        // Abort — leaves dirty log (log_guid is set in header).
+        rust.abort().await;
+    }
+
+    // Native opens — should replay the dirty log automatically.
+    let mut native = NativeVhdx::open(&vhdx_path, false);
+    let raw = native.attach_raw();
+
+    // Block 0: should have Rust's data after log replay.
+    let mut buf0 = vec![0u8; 512];
+    let bytes = raw.read_at(0, &mut buf0).expect("read block 0");
+    assert_eq!(bytes, 512);
+    assert_eq!(buf0, test_pattern(0, 512), "block 0 data after log replay");
+
+    // Block 1: should have Rust's data after log replay.
+    let mut buf1 = vec![0u8; 512];
+    let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
+    assert_eq!(bytes, 512);
+    assert_eq!(
+        buf1,
+        test_pattern(block_size, 512),
+        "block 1 data after log replay"
+    );
+}
+
+/// Test 21: Rust Crash (Multiple Blocks) → Native Replay
+///
+/// Rust opens writable → writes data to many blocks across the disk
+/// (enough to exercise multiple log entries / batch commits) → flush →
+/// abort → native opens (replays all log entries) → all data intact.
+#[pal_async::async_test]
+async fn log_replay_rust_crash_many_blocks_native_reads(driver: DefaultDriver) {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+    let block_count = 8u64;
+    let disk_size = block_size * (block_count + 1);
+
+    // Rust create + write all blocks + flush + abort.
+    {
+        let rust =
+            RustVhdx::create(&vhdx_path, disk_size, block_size as u32, &driver).await;
+
+        for i in 0..block_count {
+            let offset = i * block_size;
+            rust.write_data(offset, &test_pattern(offset, 512)).await;
+        }
+        rust.flush().await;
+        rust.abort().await;
+    }
+
+    // Native opens (replays log) → attach → read all blocks.
+    let mut native = NativeVhdx::open(&vhdx_path, false);
+    let raw = native.attach_raw();
+
+    for i in 0..block_count {
+        let offset = i * block_size;
+        let expected = test_pattern(offset, 512);
+        let mut buf = vec![0u8; 512];
+        let bytes = raw.read_at(offset, &mut buf).expect("native read");
+        assert_eq!(bytes, 512);
+        assert_eq!(
+            buf, expected,
+            "data mismatch at block {i} (offset {offset:#x})"
+        );
+    }
+}
+
+/// Test 22: Rust Crash → Rust Replay → Native Reads
+///
+/// Rust writes → flush → abort → Rust reopens writable (replays log) →
+/// clean close → native opens → data intact. This verifies Rust's own
+/// log replay produces a file the native stack accepts.
+#[pal_async::async_test]
+async fn log_replay_rust_crash_rust_replay_native_reads(driver: DefaultDriver) {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Rust create + write + flush + abort.
+    {
+        let rust =
+            RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.write_data(block_size, &test_pattern(block_size, 512))
+            .await;
+        rust.flush().await;
+        rust.abort().await;
+    }
+
+    // Rust reopens writable (replays log) → verify data → clean close.
+    {
+        let rust = RustVhdx::open(&vhdx_path, false, Some(&driver)).await;
+        let data0 = rust.read_data(0, 512).await;
+        assert_eq!(data0, test_pattern(0, 512), "block 0 after Rust replay");
+        let data1 = rust.read_data(block_size, 512).await;
+        assert_eq!(
+            data1,
+            test_pattern(block_size, 512),
+            "block 1 after Rust replay"
+        );
+        rust.close().await;
+    }
+
+    // Native opens the cleanly-closed file → data intact.
+    let mut native = NativeVhdx::open(&vhdx_path, false);
+    let raw = native.attach_raw();
+
+    let mut buf0 = vec![0u8; 512];
+    let bytes = raw.read_at(0, &mut buf0).expect("read block 0");
+    assert_eq!(bytes, 512);
+    assert_eq!(buf0, test_pattern(0, 512), "block 0 via native");
+
+    let mut buf1 = vec![0u8; 512];
+    let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
+    assert_eq!(bytes, 512);
+    assert_eq!(
+        buf1,
+        test_pattern(block_size, 512),
+        "block 1 via native"
+    );
+}
+
+/// Test 23: Rust Crash → Native Replay → Native Writes More → Rust Reads
+///
+/// Full lifecycle: Rust writes block 0 → abort (crash) → native opens
+/// (replays log) → native writes block 1 → close → Rust opens → reads
+/// both blocks → both correct.
+#[pal_async::async_test]
+async fn log_replay_lifecycle_crash_replay_more_writes(driver: DefaultDriver) {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Step 1: Rust create + write block 0 + flush + abort.
+    {
+        let rust = RustVhdx::create(
+            &vhdx_path,
+            16 * 1024 * 1024,
+            block_size as u32,
+            &driver,
+        )
+        .await;
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.flush().await;
+        rust.abort().await;
+    }
+
+    // Step 2: Native opens (replays dirty log) → writes block 1 → closes.
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+
+        // Verify block 0 survived replay.
+        let mut buf = vec![0u8; 512];
+        let bytes = raw.read_at(0, &mut buf).expect("read block 0 after replay");
+        assert_eq!(bytes, 512);
+        assert_eq!(buf, test_pattern(0, 512), "block 0 after native replay");
+
+        // Write block 1.
+        let pattern = test_pattern(block_size, 512);
+        let written = raw
+            .write_at(block_size, &pattern)
+            .expect("native write block 1");
+        assert_eq!(written, 512);
+    }
+
+    // Step 3: Rust opens → reads both blocks → verifies.
+    {
+        let rust = RustVhdx::open(&vhdx_path, true, None).await;
+
+        let data0 = rust.read_data(0, 512).await;
+        assert_eq!(data0, test_pattern(0, 512), "block 0 via Rust");
+
+        let data1 = rust.read_data(block_size, 512).await;
+        assert_eq!(
+            data1,
+            test_pattern(block_size, 512),
+            "block 1 via Rust"
+        );
+
+        rust.close().await;
+    }
+}
+
+/// Test 24: Rust Crash With Trim → Native Replay
+///
+/// Rust creates → writes blocks 0 and 1 → trims block 1 → flush → abort →
+/// native opens (replays log) → block 0 intact, block 1 is zeros.
+/// Verifies that trim state is correctly captured in the WAL and replayed.
+#[pal_async::async_test]
+async fn log_replay_rust_crash_with_trim_native_reads(driver: DefaultDriver) {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Rust create + write both blocks + trim block 1 + flush + abort.
+    {
+        let rust =
+            RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.write_data(block_size, &test_pattern(block_size, 512))
+            .await;
+        rust.flush().await;
+
+        // Trim block 1 → BAT state change (Zero or Unmapped).
+        rust.trim_range(block_size, block_size).await;
+        rust.flush().await;
+
+        rust.abort().await;
+    }
+
+    // Native opens (replays log including the trim BAT update).
+    let mut native = NativeVhdx::open(&vhdx_path, false);
+    let raw = native.attach_raw();
+
+    // Block 0: should have data.
+    let mut buf0 = vec![0u8; 512];
+    let bytes = raw.read_at(0, &mut buf0).expect("read block 0");
+    assert_eq!(bytes, 512);
+    assert_eq!(buf0, test_pattern(0, 512), "block 0 should be intact");
+
+    // Block 1: should be zeros (trimmed).
+    let mut buf1 = vec![0u8; 512];
+    let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
+    assert_eq!(bytes, 512);
+    assert!(
+        buf1.iter().all(|&b| b == 0),
+        "block 1 zeros after trim + crash + log replay"
+    );
+}
+
+/// Test 25: Multiple Crash-Recovery Cycles via Native
+///
+/// Rust writes → crash → native opens (replays) → writes more → close →
+/// Rust writes → crash → native opens (replays) → all data intact.
+/// Verifies that the log replay leaves the file in a clean state that
+/// supports another full write-crash-recovery cycle.
+#[pal_async::async_test]
+async fn log_replay_repeated_crash_cycles(driver: DefaultDriver) {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Cycle 1: Rust writes block 0 → crash.
+    {
+        let rust = RustVhdx::create(
+            &vhdx_path,
+            16 * 1024 * 1024,
+            block_size as u32,
+            &driver,
+        )
+        .await;
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.flush().await;
+        rust.abort().await;
+    }
+
+    // Cycle 1 recovery: Native opens (replays) → writes block 1 → closes.
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+
+        // Verify block 0 survived.
+        let mut buf = vec![0u8; 512];
+        raw.read_at(0, &mut buf).expect("read block 0");
+        assert_eq!(buf, test_pattern(0, 512), "cycle 1: block 0");
+
+        // Write block 1.
+        let written = raw
+            .write_at(block_size, &test_pattern(block_size, 512))
+            .expect("native write block 1");
+        assert_eq!(written, 512);
+    }
+
+    // Cycle 2: Rust opens (clean file now) → writes block 2 → crash.
+    {
+        let rust = RustVhdx::open(&vhdx_path, false, Some(&driver)).await;
+        rust.write_data(
+            2 * block_size,
+            &test_pattern(2 * block_size, 512),
+        )
+        .await;
+        rust.flush().await;
+        rust.abort().await;
+    }
+
+    // Cycle 2 recovery: Native opens (replays) → reads all 3 blocks.
+    {
+        let mut native = NativeVhdx::open(&vhdx_path, false);
+        let raw = native.attach_raw();
+
+        let mut buf0 = vec![0u8; 512];
+        raw.read_at(0, &mut buf0).expect("read block 0");
+        assert_eq!(buf0, test_pattern(0, 512), "cycle 2: block 0");
+
+        let mut buf1 = vec![0u8; 512];
+        raw.read_at(block_size, &mut buf1).expect("read block 1");
+        assert_eq!(
+            buf1,
+            test_pattern(block_size, 512),
+            "cycle 2: block 1"
+        );
+
+        let mut buf2 = vec![0u8; 512];
+        raw.read_at(2 * block_size, &mut buf2).expect("read block 2");
+        assert_eq!(
+            buf2,
+            test_pattern(2 * block_size, 512),
+            "cycle 2: block 2"
+        );
+    }
+}
+
+/// Test 26: Clean Rust File → Native Opens Without Replay
+///
+/// Rust creates → writes → flush → close (clean shutdown) → native opens →
+/// data intact. A cleanly-closed file should not trigger log replay.
+#[pal_async::async_test]
+async fn log_replay_clean_close_no_replay_needed(driver: DefaultDriver) {
+    let dir = tempfile::tempdir().unwrap();
+    let vhdx_path = dir.path().join("test.vhdx");
+
+    let block_size: u64 = 2 * 1024 * 1024;
+
+    // Rust create + write + flush + clean close.
+    {
+        let rust =
+            RustVhdx::create(&vhdx_path, 8 * 1024 * 1024, block_size as u32, &driver).await;
+        rust.write_data(0, &test_pattern(0, 512)).await;
+        rust.write_data(block_size, &test_pattern(block_size, 512))
+            .await;
+        rust.flush().await;
+        rust.close().await;
+    }
+
+    // Native opens — should succeed without needing log replay.
+    let mut native = NativeVhdx::open(&vhdx_path, false);
+    let raw = native.attach_raw();
+
+    let mut buf0 = vec![0u8; 512];
+    let bytes = raw.read_at(0, &mut buf0).expect("read block 0");
+    assert_eq!(bytes, 512);
+    assert_eq!(buf0, test_pattern(0, 512), "block 0");
+
+    let mut buf1 = vec![0u8; 512];
+    let bytes = raw.read_at(block_size, &mut buf1).expect("read block 1");
+    assert_eq!(bytes, 512);
+    assert_eq!(
+        buf1,
+        test_pattern(block_size, 512),
+        "block 1"
+    );
 }

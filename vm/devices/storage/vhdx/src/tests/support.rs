@@ -240,7 +240,6 @@ impl std::fmt::Debug for CrashTestFile {
             .field("durable_len", &inner.durable.len())
             .field("volatile_len", &inner.volatile.len())
             .field("flush_count", &inner.flush_count)
-            .field("write_log_len", &inner.write_log.len())
             .finish()
     }
 }
@@ -252,45 +251,9 @@ struct CrashTestFileInner {
     volatile: Vec<u8>,
     /// How many flush() calls have occurred.
     flush_count: u64,
-    /// Ordered log of all I/O operations, for ordering verification.
-    write_log: Vec<WriteLogEntry>,
-}
-
-/// An entry in the write log, tracking I/O operations for ordering verification.
-#[derive(Debug, Clone)]
-#[expect(dead_code)]
-pub enum WriteLogEntry {
-    /// A write operation at the given offset and length.
-    Write {
-        /// File offset of the write.
-        offset: u64,
-        /// Length of the write in bytes.
-        length: usize,
-    },
-    /// A flush operation (volatile → durable).
-    Flush,
-    /// A set_file_size operation.
-    SetFileSize {
-        /// The new file size.
-        size: u64,
-    },
 }
 
 impl CrashTestFile {
-    /// Create a new crash-test file of the given size (all zeros).
-    #[expect(dead_code)]
-    pub fn new(size: u64) -> Self {
-        let data = vec![0u8; size as usize];
-        Self {
-            inner: Mutex::new(CrashTestFileInner {
-                durable: data.clone(),
-                volatile: data,
-                flush_count: 0,
-                write_log: Vec::new(),
-            }),
-        }
-    }
-
     /// Create a CrashTestFile from existing durable data (e.g. from a crash snapshot).
     pub fn from_durable(data: Vec<u8>) -> Self {
         Self {
@@ -298,16 +261,8 @@ impl CrashTestFile {
                 volatile: data.clone(),
                 durable: data,
                 flush_count: 0,
-                write_log: Vec::new(),
             }),
         }
-    }
-
-    /// Simulate power failure. Returns the durable state.
-    /// All unflushed (volatile-only) writes are lost.
-    #[expect(dead_code)]
-    pub fn crash(self) -> Vec<u8> {
-        self.inner.into_inner().durable
     }
 
     /// Snapshot durable state without consuming the file.
@@ -318,12 +273,6 @@ impl CrashTestFile {
     /// How many flushes have occurred.
     pub fn flush_count(&self) -> u64 {
         self.inner.lock().flush_count
-    }
-
-    /// Get the write log for ordering verification.
-    #[expect(dead_code)]
-    pub fn write_log(&self) -> Vec<WriteLogEntry> {
-        self.inner.lock().write_log.clone()
     }
 }
 
@@ -450,18 +399,6 @@ impl CrashAfterFlushFile {
     /// Snapshot durable state without consuming the file.
     pub fn durable_snapshot(&self) -> Vec<u8> {
         self.inner.lock().durable.clone()
-    }
-
-    /// How many flushes have occurred.
-    #[expect(dead_code)]
-    pub fn flush_count(&self) -> u64 {
-        self.inner.lock().flush_count
-    }
-
-    /// Whether the crash has been triggered.
-    #[expect(dead_code)]
-    pub fn has_crashed(&self) -> bool {
-        self.inner.lock().crashed
     }
 }
 
@@ -631,11 +568,6 @@ impl AsyncFile for CrashTestFile {
             inner.volatile.resize(end, 0);
         }
         inner.volatile[off..end].copy_from_slice(buf);
-
-        inner.write_log.push(WriteLogEntry::Write {
-            offset,
-            length: buf.len(),
-        });
         Ok(())
     }
 
@@ -644,7 +576,6 @@ impl AsyncFile for CrashTestFile {
         // Copy volatile to durable (all unflushed writes become durable).
         inner.durable = inner.volatile.clone();
         inner.flush_count += 1;
-        inner.write_log.push(WriteLogEntry::Flush);
         Ok(())
     }
 
@@ -658,7 +589,6 @@ impl AsyncFile for CrashTestFile {
         // File size changes are immediately durable (metadata is sync).
         inner.volatile.resize(size as usize, 0);
         inner.durable.resize(size as usize, 0);
-        inner.write_log.push(WriteLogEntry::SetFileSize { size });
         Ok(())
     }
 }

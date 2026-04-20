@@ -121,12 +121,6 @@ impl SpaceBitmap {
         self.bits.fill(true);
     }
 
-    /// Clear all bits.
-    #[expect(dead_code)]
-    fn clear_all(&mut self) {
-        self.bits.fill(false);
-    }
-
     /// Resize the bitmap to `new_bit_count`. New bits are cleared.
     /// Preserves existing data up to `min(old_count, new_count)`.
     fn resize(&mut self, new_bit_count: usize) {

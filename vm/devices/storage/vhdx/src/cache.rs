@@ -246,19 +246,6 @@ impl LruList {
         self.unlink(idx);
         self.free.push(idx);
     }
-
-    /// Number of linked nodes (excludes sentinel and unlinked/free slots).
-    #[cfg(test)]
-    #[allow(dead_code)] // useful for debugging
-    fn len(&self) -> usize {
-        let mut count = 0;
-        let mut idx = self.nodes[0].next;
-        while idx != 0 {
-            count += 1;
-            idx = self.nodes[idx].next;
-        }
-        count
-    }
 }
 
 /// Number of distinct cache tags (BAT=0, METADATA=1, SBM=2).
@@ -380,12 +367,6 @@ impl<F: AsyncFile> PageCache<F> {
     /// Register a tag with its base file offset.
     pub fn register_tag(&mut self, tag: u8, base_offset: u64) {
         self.pages.lock().tag_offsets[tag as usize] = base_offset;
-    }
-
-    /// Update the base file offset for a previously registered tag.
-    #[allow(dead_code)] // TODO: will be used for differencing disk parent resolution
-    pub fn update_tag_offset(&self, tag: u8, new_base: u64) {
-        self.pages.lock().tag_offsets[tag as usize] = new_base;
     }
 
     /// Evict clean, applied pages to bring the cache back under quota.
@@ -1278,36 +1259,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&guard[..], &pattern[..]);
-    }
-
-    #[async_test]
-    async fn update_tag_offset_test() {
-        let old_base: u64 = 0x10000;
-        let new_base: u64 = 0x20000;
-        let file = InMemoryFile::new(new_base + PAGE_SIZE as u64);
-        file.write_at(old_base, &[0xAA; PAGE_SIZE]).await.unwrap();
-        file.write_at(new_base, &[0xBB; PAGE_SIZE]).await.unwrap();
-
-        let mut cache = PageCache::new(Arc::new(file), None, None, 0);
-        cache.register_tag(0, old_base);
-
-        {
-            let guard = cache
-                .acquire_read(PageKey { tag: 0, offset: 0 })
-                .await
-                .unwrap();
-            assert_eq!(guard[0], 0xAA);
-        }
-
-        let mut cache = PageCache::new(cache.file.clone(), None, None, 0);
-        cache.register_tag(0, old_base);
-        cache.update_tag_offset(0, new_base);
-
-        let guard = cache
-            .acquire_read(PageKey { tag: 0, offset: 0 })
-            .await
-            .unwrap();
-        assert_eq!(guard[0], 0xBB);
     }
 
     #[async_test]

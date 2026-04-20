@@ -14,10 +14,6 @@
 //! This module is self-contained and depends only on [`crate::format`],
 //! [`crate::error`], and external crates.
 
-// The LogWriter, DataPage, and ZeroRange types are pub(crate) and currently
-// only used from tests (open.rs tests and unit tests in this module).
-// Per-item #[expect(dead_code)] is applied on those types below.
-
 use crate::AsyncFile;
 use crate::error::CorruptionType;
 use crate::error::VhdxError;
@@ -31,8 +27,6 @@ use crate::format::LogDataDescriptor;
 use crate::format::LogDataSector;
 use crate::format::LogEntryHeader;
 use crate::format::LogZeroDescriptor;
-use crate::format::REGION_TABLE_OFFSET;
-use crate::format::REGION_TABLE_SIZE;
 use guid::Guid;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
@@ -154,25 +148,6 @@ fn entry_length(data_count: u32, zero_count: u32) -> u32 {
 pub struct ReplayResult {
     /// Whether any entries were replayed.
     pub replayed: bool,
-    /// Whether the region table was modified during replay
-    /// (caller should re-read region tables).
-    #[allow(dead_code)] // populated during replay, used in tests
-    pub region_table_modified: bool,
-    /// The last file offset from the newest replayed entry.
-    #[expect(dead_code)]
-    pub last_file_offset: u64,
-    /// Tail of the replayed sequence (log-region-relative offset).
-    #[expect(dead_code)]
-    pub tail: u32,
-    /// Head of the replayed sequence (log-region-relative offset).
-    #[expect(dead_code)]
-    pub head: u32,
-    /// Sequence number of the last replayed entry.
-    #[allow(dead_code)] // populated during replay, used in tests
-    pub sequence_number: u64,
-    /// Flushed file offset from the newest replayed entry.
-    #[expect(dead_code)]
-    pub flushed_file_offset: u64,
 }
 
 /// A validated log sequence found during scanning.
@@ -496,10 +471,7 @@ async fn apply_sequence<F: AsyncFile>(
 ) -> Result<ReplayResult, VhdxError> {
     let mut tail = sequence.tail;
     let head = sequence.head;
-    let mut region_table_modified = false;
     let mut last_file_offset: u64 = 0;
-    let mut flushed_file_offset: u64 = 0;
-    let mut last_lsn: u64 = 0;
     let mut replayed = false;
 
     let mut sector_buf = [0u8; SECTOR as usize];
@@ -516,8 +488,6 @@ async fn apply_sequence<F: AsyncFile>(
         }
 
         last_file_offset = header.last_file_offset;
-        flushed_file_offset = header.flushed_file_offset;
-        last_lsn = header.sequence_number;
 
         let desc_area_len = descriptor_area_length(header.descriptor_count);
         let mut data_sector_index: u32 = 0;
@@ -543,15 +513,9 @@ async fn apply_sequence<F: AsyncFile>(
             let desc_bytes = &sector_buf[local_off..local_off + DESCRIPTOR_SIZE as usize];
             let sig = u32::from_le_bytes(desc_bytes[0..4].try_into().unwrap());
 
-            let write_offset: u64;
-            let write_length: u64;
-
             if sig == LOG_DESCRIPTOR_ZERO_SIGNATURE {
                 let desc = LogZeroDescriptor::read_from_bytes(desc_bytes)
                     .map_err(|_| VhdxError::Corrupt(CorruptionType::BadLogEntryOnReplay))?;
-
-                write_offset = desc.file_offset;
-                write_length = desc.length;
 
                 // Write zeros.
                 let zeros = vec![0u8; desc.length as usize];
@@ -560,9 +524,6 @@ async fn apply_sequence<F: AsyncFile>(
                 let desc = LogDataDescriptor::read_from_bytes(desc_bytes)
                     .map_err(|_| VhdxError::Corrupt(CorruptionType::BadLogEntryOnReplay))?
                     .clone();
-
-                write_offset = desc.file_offset;
-                write_length = LOG_SECTOR_SIZE;
 
                 // Read the data sector from the log.
                 let data_offset = desc_area_len + data_sector_index * SECTOR;
@@ -584,13 +545,6 @@ async fn apply_sequence<F: AsyncFile>(
             } else {
                 return Err(VhdxError::Corrupt(CorruptionType::BadLogEntryOnReplay));
             }
-
-            // Check if the region table was modified.
-            let rt_start = REGION_TABLE_OFFSET;
-            let rt_end = REGION_TABLE_OFFSET + 2 * REGION_TABLE_SIZE;
-            if write_offset < rt_end && write_offset + write_length > rt_start {
-                region_table_modified = true;
-            }
         }
 
         replayed = true;
@@ -606,15 +560,7 @@ async fn apply_sequence<F: AsyncFile>(
         file.flush().await?;
     }
 
-    Ok(ReplayResult {
-        replayed,
-        region_table_modified,
-        last_file_offset,
-        tail: sequence.tail,
-        head: sequence.head,
-        sequence_number: last_lsn,
-        flushed_file_offset,
-    })
+    Ok(ReplayResult { replayed })
 }
 
 // ---------------------------------------------------------------------------
@@ -648,7 +594,6 @@ pub struct LogWriter {
     last_file_offset: u64,
 }
 
-#[expect(dead_code)]
 impl LogWriter {
     /// Create a new `LogWriter` for an empty log.
     ///
@@ -678,28 +623,6 @@ impl LogWriter {
 
     /// Create a `LogWriter` from an existing valid log sequence.
     ///
-    /// Used after replay: the caller provides the tail, head, and
-    /// last sequence number from the replayed sequence.
-    pub fn from_existing(
-        region: LogRegion,
-        log_guid: Guid,
-        tail: u32,
-        head: u32,
-        sequence_number: u64,
-        flushed_file_offset: u64,
-        last_file_offset: u64,
-    ) -> Self {
-        LogWriter {
-            region,
-            tail,
-            head,
-            sequence_number,
-            log_guid,
-            flushed_file_offset,
-            last_file_offset,
-        }
-    }
-
     /// Returns the amount of free space remaining in the log.
     pub fn free_space(&self) -> u32 {
         self.region.free_space(self.tail, self.head)
@@ -1397,7 +1320,6 @@ mod tests {
         // at offset 4*SECTOR.
         let result = replay_log(&file, &region, guid).await.unwrap();
         assert!(result.replayed);
-        assert_eq!(result.sequence_number, 11);
 
         // The data should have been applied.
         let mut read_buf = [0u8; SECTOR as usize];
@@ -1479,7 +1401,6 @@ mod tests {
         // The entry at sector 4 should still be found.
         let result = replay_log(&file, &region, guid).await.unwrap();
         assert!(result.replayed);
-        assert_eq!(result.sequence_number, 21);
     }
 
     #[async_test]
@@ -1551,35 +1472,6 @@ mod tests {
 
         // page2 should NOT be applied (it was in the torn entry).
         // The file might have whatever garbage was at that location.
-    }
-
-    #[async_test]
-    async fn replay_region_table_modified_flag() {
-        let file = test_file();
-        let region = test_region();
-        let guid = test_guid();
-
-        let mut writer = LogWriter::initialize(&file, region.clone(), guid, 4 * 1024 * 1024)
-            .await
-            .unwrap();
-
-        // Write an entry targeting the region table area.
-        let page = [0xEEu8; SECTOR as usize];
-        writer
-            .write_entry(
-                &file,
-                &[DataPage {
-                    file_offset: REGION_TABLE_OFFSET,
-                    data: &page,
-                }],
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let result = replay_log(&file, &region, guid).await.unwrap();
-        assert!(result.replayed);
-        assert!(result.region_table_modified);
     }
 
     #[async_test]
@@ -1787,7 +1679,6 @@ mod tests {
         // Replay should pick the sequence with LSN 101 over LSN 1-2.
         let result = replay_log(&file, &region, guid).await.unwrap();
         assert!(result.replayed);
-        assert_eq!(result.sequence_number, 101);
 
         // The data at LOGABLE_OFFSET should be from the newer sequence.
         let mut buf = [0u8; SECTOR as usize];

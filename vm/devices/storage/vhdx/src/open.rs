@@ -180,7 +180,6 @@ pub struct VhdxFile<F: AsyncFile> {
     physical_sector_size: u32,
     pub(crate) has_parent: bool,
     is_fully_allocated: bool,
-    #[expect(dead_code)] // TODO: used for disk_backend integration
     page_83_data: Guid,
 
     // Metadata table (kept for on-demand metadata reads).
@@ -207,12 +206,7 @@ pub struct VhdxFile<F: AsyncFile> {
     /// Uses generation-based stamping to coordinate with flush().
     pub(crate) deferred_releases: DeferredReleases,
 
-    // Region offsets
-    #[expect(dead_code)] // TODO: used for space management
-    bat_length: u32,
     metadata_offset: u64,
-    #[expect(dead_code)] // TODO: used for metadata writes
-    metadata_length: u32,
 
     // Mode
     pub(crate) read_only: bool,
@@ -406,9 +400,7 @@ impl<F: 'static + AsyncFile> VhdxFile<F> {
             free_space,
             deferred_releases: DeferredReleases::new(),
 
-            bat_length: regions.bat_length,
             metadata_offset: regions.metadata_offset,
-            metadata_length: regions.metadata_length,
             read_only,
             region_rewrite_data: regions.rewrite_data,
             failed: Arc::new(FailureFlag::new()),
@@ -681,6 +673,11 @@ impl<F: AsyncFile> VhdxFile<F> {
     /// Whether the disk was created with all blocks pre-allocated (fixed VHD).
     pub fn is_fully_allocated(&self) -> bool {
         self.is_fully_allocated
+    }
+
+    /// SCSI VPD Page 83 identifier (stable disk identity).
+    pub fn page_83_data(&self) -> Guid {
+        self.page_83_data
     }
 
     /// GUID changed on every virtual-disk data write.

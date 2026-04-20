@@ -19,15 +19,6 @@ use zerocopy::FromBytes;
 pub(crate) struct MetadataTable {
     /// The validated entries (sorted by offset for free-space scanning).
     entries: Vec<MetadataTableEntry>,
-    /// Total size of system metadata items.
-    #[expect(dead_code)]
-    pub system_metadata_size: u32,
-    /// Total size of user metadata items.
-    #[expect(dead_code)]
-    pub user_metadata_size: u32,
-    /// Number of user metadata entries.
-    #[allow(dead_code)] // populated during parse, used in tests
-    pub user_item_count: u16,
 }
 
 impl MetadataTable {
@@ -156,12 +147,7 @@ impl MetadataTable {
             return Err(CorruptionType::TotalMetadataSizeExceeded.into());
         }
 
-        Ok(MetadataTable {
-            entries,
-            system_metadata_size: system_metadata_size as u32,
-            user_metadata_size: user_metadata_size as u32,
-            user_item_count,
-        })
+        Ok(MetadataTable { entries })
     }
 
     /// Find an entry by GUID and user/system flag.
@@ -215,7 +201,6 @@ mod tests {
         // Should have 5 system entries: file params, disk size, logical sector,
         // physical sector, page 83.
         assert_eq!(table.entries.len(), 5);
-        assert_eq!(table.user_item_count, 0);
     }
 
     #[async_test]

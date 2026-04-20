@@ -38,9 +38,6 @@ pub(crate) struct ParsedHeader {
     pub log_offset: u64,
     /// Length of the log region in bytes.
     pub log_length: u32,
-    /// File format version.
-    #[allow(dead_code)] // populated during parse, used in tests
-    pub version: u16,
     /// True if header 1 was chosen as the active header.
     pub first_header_current: bool,
 }
@@ -143,7 +140,6 @@ pub(crate) async fn parse_headers(
         log_guid: header.log_guid,
         log_offset,
         log_length,
-        version: header.version,
         first_header_current,
     })
 }
@@ -417,7 +413,6 @@ mod tests {
         // Header 2 has sequence_number 1. Header 1 has 0. So header 2 wins.
         assert_eq!(parsed.sequence_number, 1);
         assert!(!parsed.first_header_current);
-        assert_eq!(parsed.version, format::VERSION_1);
         assert_eq!(parsed.log_guid, Guid::ZERO);
         assert_ne!(parsed.file_write_guid, Guid::ZERO);
         assert_ne!(parsed.data_write_guid, Guid::ZERO);

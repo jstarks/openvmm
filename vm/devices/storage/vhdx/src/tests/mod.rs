@@ -39,7 +39,6 @@ mod integration {
 
         // 1. Parse headers.
         let parsed_header = header::parse_headers(&file, file_length).await.unwrap();
-        assert_eq!(parsed_header.version, format::VERSION_1);
         assert_eq!(parsed_header.log_guid, Guid::ZERO);
         assert_ne!(parsed_header.file_write_guid, Guid::ZERO);
         assert_ne!(parsed_header.data_write_guid, Guid::ZERO);

@@ -21,6 +21,7 @@ use crate::error::VhdxError;
 use crate::format::BatEntryState;
 use crate::format::MB1;
 use bitfield_struct::bitfield;
+use bitvec::prelude::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
@@ -34,176 +35,136 @@ const DEFAULT_EOF_EXTENSION_LENGTH: u32 = 32 * MB1 as u32;
 
 /// Bitmap wrapper providing `RTL_BITMAP`-equivalent operations.
 ///
-/// Uses a `Vec<u64>` internally with LSB-first bit ordering.
+/// Uses [`BitVec`] with LSB-first bit ordering on `u64` words for
+/// word-level accelerated operations.
 /// SET bits (1) denote the property tracked by the containing structure
 /// (free, anchored, or trimmed); CLEAR bits (0) denote the opposite.
 #[derive(Clone)]
 struct SpaceBitmap {
-    /// Packed 64-bit words; bit 0 of word 0 is bit index 0.
-    words: Vec<u64>,
-    /// Number of valid bits. Bits beyond this in the last word are always 0.
-    bit_count: usize,
+    bits: BitVec<u64, Lsb0>,
 }
 
 impl SpaceBitmap {
     /// Create a new bitmap with `bit_count` bits, all initially clear.
     fn new(bit_count: usize) -> Self {
-        let word_count = bit_count.div_ceil(64);
         SpaceBitmap {
-            words: vec![0u64; word_count],
-            bit_count,
+            bits: bitvec![u64, Lsb0; 0; bit_count],
         }
     }
 
     /// Number of valid bits.
     fn len(&self) -> usize {
-        self.bit_count
+        self.bits.len()
     }
 
     /// Set a single bit.
     fn set_bit(&mut self, index: usize) {
-        debug_assert!(index < self.bit_count);
-        self.words[index / 64] |= 1u64 << (index % 64);
+        self.bits.set(index, true);
     }
 
     /// Clear a single bit.
     fn clear_bit(&mut self, index: usize) {
-        debug_assert!(index < self.bit_count);
-        self.words[index / 64] &= !(1u64 << (index % 64));
+        self.bits.set(index, false);
     }
 
     /// Check whether a single bit is set.
     fn check_bit(&self, index: usize) -> bool {
-        debug_assert!(index < self.bit_count);
-        (self.words[index / 64] >> (index % 64)) & 1 != 0
+        self.bits[index]
     }
 
     /// Set a contiguous range of bits `[start..start+count)`.
     fn set_range(&mut self, start: usize, count: usize) {
-        debug_assert!(start + count <= self.bit_count);
-        for i in start..start + count {
-            self.words[i / 64] |= 1u64 << (i % 64);
-        }
+        self.bits[start..start + count].fill(true);
     }
 
     /// Clear a contiguous range of bits `[start..start+count)`.
     fn clear_range(&mut self, start: usize, count: usize) {
-        debug_assert!(start + count <= self.bit_count);
-        for i in start..start + count {
-            self.words[i / 64] &= !(1u64 << (i % 64));
-        }
+        self.bits[start..start + count].fill(false);
     }
 
     /// Check whether all bits in `[start..start+count)` are set.
     fn are_bits_set(&self, start: usize, count: usize) -> bool {
-        if count == 0 {
-            return true;
-        }
-        debug_assert!(start + count <= self.bit_count);
-        for i in start..start + count {
-            if (self.words[i / 64] >> (i % 64)) & 1 == 0 {
-                return false;
-            }
-        }
-        true
+        count == 0 || self.bits[start..start + count].all()
     }
 
     /// Check whether all bits in `[start..start+count)` are clear.
     fn are_bits_clear(&self, start: usize, count: usize) -> bool {
-        if count == 0 {
-            return true;
-        }
-        debug_assert!(start + count <= self.bit_count);
-        for i in start..start + count {
-            if (self.words[i / 64] >> (i % 64)) & 1 != 0 {
-                return false;
-            }
-        }
-        true
+        count == 0 || self.bits[start..start + count].not_any()
     }
 
     /// Find the first contiguous run of `count` SET bits, starting the
     /// scan at `hint`. Returns `None` if no such run exists.
     ///
-    /// This is a direct port of the `RtlFindSetBits` linear scan.
+    /// Scans `[hint..len)` first, then `[0..hint)`. Uses word-level
+    /// `first_one` / `first_zero` operations for efficient run detection.
     fn find_set_bits(&self, count: usize, hint: usize) -> Option<usize> {
-        if count == 0 || count > self.bit_count {
+        let total = self.bits.len();
+        if count == 0 || count > total {
             return None;
         }
+        let hint = hint.min(total);
 
-        let total = self.bit_count;
-        let mut scanned = 0usize;
-        let mut pos = hint.min(total);
-        let mut run_start = pos;
-        let mut run_len = 0usize;
-
-        while scanned < total {
-            let idx = pos % total;
-            if self.check_bit(idx) {
-                if run_len == 0 {
-                    run_start = idx;
-                }
-                run_len += 1;
-                if run_len >= count {
-                    // Verify the run doesn't wrap around the bitmap end.
-                    if run_start + count <= total {
-                        return Some(run_start);
-                    }
-                    // Wrapped — reset and continue.
-                    run_len = 0;
-                }
-            } else {
-                run_len = 0;
-            }
-            pos += 1;
-            scanned += 1;
+        // Pass 1: [hint..total)
+        if let Some(idx) = Self::find_run(&self.bits, count, hint, total) {
+            return Some(idx);
         }
-
+        // Pass 2: [0..hint) — only the region not covered by pass 1.
+        if hint > 0 {
+            if let Some(idx) = Self::find_run(&self.bits, count, 0, hint) {
+                return Some(idx);
+            }
+        }
         None
     }
 
     /// Set all valid bits.
     fn set_all(&mut self) {
-        for w in &mut self.words {
-            *w = u64::MAX;
-        }
-        // Mask off bits beyond bit_count.
-        let tail = self.bit_count % 64;
-        if tail != 0 {
-            if let Some(last) = self.words.last_mut() {
-                *last = (1u64 << tail) - 1;
-            }
-        }
+        self.bits.fill(true);
     }
 
     /// Clear all bits.
     #[expect(dead_code)]
     fn clear_all(&mut self) {
-        for w in &mut self.words {
-            *w = 0;
-        }
+        self.bits.fill(false);
     }
 
     /// Resize the bitmap to `new_bit_count`. New bits are cleared.
     /// Preserves existing data up to `min(old_count, new_count)`.
     fn resize(&mut self, new_bit_count: usize) {
-        let new_word_count = new_bit_count.div_ceil(64);
-        self.words.resize(new_word_count, 0);
-        // Clear bits beyond new_bit_count in the last word.
-        let tail = new_bit_count % 64;
-        if tail != 0 {
-            if let Some(last) = self.words.last_mut() {
-                *last &= (1u64 << tail) - 1;
+        self.bits.resize(new_bit_count, false);
+    }
+
+    /// Find a contiguous run of `count` SET bits within `[start..end)`.
+    fn find_run(
+        bits: &BitSlice<u64, Lsb0>,
+        count: usize,
+        start: usize,
+        end: usize,
+    ) -> Option<usize> {
+        if end - start < count {
+            return None;
+        }
+        let window = &bits[start..end];
+        let mut pos = 0;
+        while pos + count <= window.len() {
+            // Skip clear bits — find next set bit.
+            let run_start = match window[pos..].first_one() {
+                Some(i) => pos + i,
+                None => return None,
+            };
+            if run_start + count > window.len() {
+                return None;
             }
+            // Find end of the set-bit run.
+            let run_end = window[run_start..]
+                .first_zero()
+                .map_or(window.len(), |i| run_start + i);
+            if run_end - run_start >= count {
+                return Some(start + run_start);
+            }
+            pos = run_end;
         }
-        // If shrinking, clear any bits in the old tail region that are now
-        // beyond the new bit_count but within existing words.
-        if new_bit_count < self.bit_count {
-            // Old bits in [new_bit_count..old_bit_count) need clearing.
-            // The resize already handled this by masking the last word above.
-            // Any words beyond new_word_count were removed by `resize()`.
-        }
-        self.bit_count = new_bit_count;
+        None
     }
 }
 
@@ -1292,6 +1253,31 @@ mod tests {
 
         // Hint past the run — should wrap and find it.
         assert_eq!(bm.find_set_bits(4, 50), Some(0));
+    }
+
+    /// Regression: find_set_bits must find a valid non-wrapping run at
+    /// the bitmap start even when the scan first encounters a wrapping
+    /// candidate that spans the bitmap end→start boundary.
+    ///
+    /// Bitmap (8 bits): [1,1,1,1,0,0,1,1]
+    ///                   ^-------^         valid run of 4 at index 0
+    ///                               ^--^  bits 6-7 set
+    ///
+    /// With hint=5, the scan visits: 5(0),6(1),7(1),0(1),1(1) — a run
+    /// of 4 starting at index 6, but it wraps (6+4=10>8). After
+    /// rejecting the wrap, bits 0-3 must still be found as a valid run.
+    #[test]
+    fn bitmap_find_set_bits_rejected_wrap_finds_later_run() {
+        let mut bm = SpaceBitmap::new(8);
+        bm.set_range(0, 4); // bits 0,1,2,3
+        bm.set_range(6, 2); // bits 6,7
+
+        // Hint=5: scan starts at 5, wraps, should find run at 0.
+        assert_eq!(
+            bm.find_set_bits(4, 5),
+            Some(0),
+            "should find non-wrapping run [0..4) after rejecting wrap at 6"
+        );
     }
 
     #[test]

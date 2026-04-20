@@ -583,7 +583,8 @@ impl Bat {
             file.read_at(bat_offset + file_pos as u64, &mut buf[..read_len])
                 .await?;
 
-            let entries_in_chunk = std::cmp::min(entries_per_chunk, total_entries - entry_num as usize);
+            let entries_in_chunk =
+                std::cmp::min(entries_per_chunk, total_entries - entry_num as usize);
             for i in 0..entries_in_chunk {
                 let byte_offset = i * size_of::<BatEntry>();
                 let entry = BatEntry::read_from_bytes(

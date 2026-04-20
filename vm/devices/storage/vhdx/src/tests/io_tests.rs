@@ -2952,3 +2952,738 @@ async fn poison_error_message_preserved(driver: DefaultDriver) {
 
     vhdx.abort().await;
 }
+
+// ---- Phase 16: Post-Log Crash Consistency Tests ----
+//
+// These tests exercise crash recovery scenarios that aren't covered by
+// the Phase 15 crash tests or Phase 16a/b concurrent tests. They focus on:
+//   1. Unsafe (free-pool) allocation → flush → crash → no data teleportation
+//   2. High-volume log pipeline saturation → crash → replay
+//   3. Repeated crash-recovery cycles with writable reopen
+
+use crate::tests::support::CrashTestFile;
+
+/// Helper: write a data pattern via the write path.
+async fn write_pattern_p16<F: AsyncFile>(vhdx: &VhdxFile<F>, offset: u64, len: usize, value: u8) {
+    let write_buf = vec![value; len];
+    let mut ranges = Vec::new();
+    let guard = vhdx
+        .resolve_write(offset, len as u32, &mut ranges)
+        .await
+        .unwrap();
+    for range in &ranges {
+        match range {
+            WriteRange::Data {
+                file_offset,
+                length,
+                ..
+            } => {
+                vhdx.file
+                    .write_at(*file_offset, &write_buf[..(*length as usize)])
+                    .await
+                    .unwrap();
+            }
+            WriteRange::Zero {
+                file_offset,
+                length,
+            } => {
+                let zeros = vec![0u8; *length as usize];
+                vhdx.file.write_at(*file_offset, &zeros).await.unwrap();
+            }
+        }
+    }
+    guard.complete().await.unwrap();
+}
+
+/// Helper: read data at a guest offset via the read path.
+async fn read_pattern_p16<F: AsyncFile>(vhdx: &VhdxFile<F>, offset: u64, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut ranges = Vec::new();
+    let _guard = vhdx
+        .resolve_read(offset, len as u32, &mut ranges)
+        .await
+        .unwrap();
+    for range in &ranges {
+        match range {
+            ReadRange::Data {
+                guest_offset,
+                file_offset,
+                length,
+            } => {
+                let start = (*guest_offset - offset) as usize;
+                let end = start + *length as usize;
+                vhdx.file
+                    .read_at(*file_offset, &mut buf[start..end])
+                    .await
+                    .unwrap();
+            }
+            ReadRange::Zero {
+                guest_offset,
+                length,
+            } => {
+                let start = (*guest_offset - offset) as usize;
+                let end = start + *length as usize;
+                buf[start..end].fill(0);
+            }
+            ReadRange::Unmapped { .. } => {}
+        }
+    }
+    buf
+}
+
+/// Unsafe (free-pool) allocation → flush → crash → no data teleportation.
+///
+/// Allocate block A, trim it to the free pool, then write block B which
+/// reuses A's freed space. Flush (so the WAL + FSN barrier are exercised),
+/// then crash and replay. Verify:
+///   - Block B has its own data (not A's old data)
+///   - Block A reads as zeros (trimmed)
+///   - No data from A "teleports" to B via stale on-disk content
+///
+/// This is the end-to-end crash test for the pre_log_fsn barrier mechanism.
+/// Existing tests verify the barrier is *set* (bat_page_has_fsn_unsafe_free_pool)
+/// and that a flush *occurs* (flush_between_data_and_wal_unsafe), but no
+/// existing test verifies that data is correct after crash+replay when
+/// the barrier was needed.
+#[async_test]
+async fn crash_unsafe_reuse_no_teleportation(driver: DefaultDriver) {
+    let (mem_file, _) = create_vhdx_with_block_size(4 * MB1, MB1 as u32).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashTestFile::from_durable(snapshot);
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size() as u64;
+
+    // Step 1: Allocate block 0 with pattern 0xAA (near-EOF, safe).
+    write_pattern_p16(&vhdx, 0, block_size as usize, 0xAA).await;
+    vhdx.flush().await.unwrap();
+
+    // Step 2: Trim block 0 with FreeSpace mode → releases to free pool.
+    let trim_req = TrimRequest::new(TrimMode::FreeSpace, 0, block_size);
+    vhdx.trim(trim_req).await.unwrap();
+    vhdx.flush().await.unwrap();
+
+    // Step 3: Write block 1 — should reuse block 0's freed space.
+    // This is the unsafe allocation (SpaceState::CrossStale) that
+    // requires a pre_log_fsn barrier.
+    write_pattern_p16(&vhdx, block_size, block_size as usize, 0xBB).await;
+    vhdx.flush().await.unwrap();
+
+    // Crash.
+    let durable = vhdx.file.durable_snapshot();
+    vhdx.abort().await;
+
+    // Recover and verify.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Block 0 should be zeros (trimmed with FreeSpace → Unmapped/Zero).
+    let buf0 = read_pattern_p16(&vhdx2, 0, block_size as usize).await;
+    assert!(
+        buf0.iter().all(|&b| b == 0),
+        "block 0 should be zeros after FreeSpace trim + crash"
+    );
+
+    // Block 1 should have 0xBB (not 0xAA — no teleportation).
+    let buf1 = read_pattern_p16(&vhdx2, block_size, block_size as usize).await;
+    assert!(
+        buf1.iter().all(|&b| b == 0xBB),
+        "block 1 should have 0xBB, not stale data from block 0"
+    );
+}
+
+/// High-volume log pipeline stress + crash + replay.
+///
+/// Writes many blocks through the full commit→log→apply pipeline (enough
+/// to trigger LogFull retry and circular buffer wrapping), then crashes
+/// and replays. Verifies all flushed data survives and the log replays
+/// correctly even after heavy use.
+///
+/// This combines the load profile of `log_pipeline_stress` (500 blocks)
+/// with CrashTestFile crash semantics, which no existing test does.
+#[async_test]
+async fn crash_high_volume_pipeline(driver: DefaultDriver) {
+    const BLOCK_COUNT: usize = 100;
+    const BLOCK_SIZE: u64 = 2 * MB1 as u64;
+    const WRITE_LEN: usize = 4096;
+
+    let disk_size = BLOCK_SIZE * (BLOCK_COUNT as u64 + 1);
+    let (mem_file, _) = create_vhdx_with_block_size(disk_size, BLOCK_SIZE as u32).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashTestFile::from_durable(snapshot);
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+
+    // Write 100 distinct blocks. The cache will trigger batch-full commits
+    // as dirty pages accumulate, and the log task will hit LogFull and
+    // retry as the circular buffer fills.
+    for i in 0..BLOCK_COUNT {
+        let offset = i as u64 * BLOCK_SIZE;
+        let pattern = (i & 0xFF) as u8;
+        write_pattern_p16(&vhdx, offset, WRITE_LEN, pattern).await;
+    }
+
+    // Flush everything — drives all batches through commit→log→apply.
+    vhdx.flush().await.unwrap();
+
+    // Crash (no clean close — log_guid remains set).
+    let durable = vhdx.file.durable_snapshot();
+    vhdx.abort().await;
+
+    // Recover with log replay.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Verify every block survived.
+    for i in 0..BLOCK_COUNT {
+        let offset = i as u64 * BLOCK_SIZE;
+        let expected = (i & 0xFF) as u8;
+        let buf = read_pattern_p16(&vhdx2, offset, WRITE_LEN).await;
+        assert!(
+            buf.iter().all(|&b| b == expected),
+            "block {i}: expected 0x{expected:02X}, got 0x{:02X}",
+            buf[0],
+        );
+    }
+}
+
+/// Repeated crash-recovery cycles with writable reopen.
+///
+/// Each cycle: open writable → write new data → flush → crash → verify.
+/// The next cycle reopens writable from the crashed state. This tests
+/// that log replay produces a file that can be opened writable again
+/// (new log set up, new sequence numbers, etc.) without corruption
+/// accumulating over multiple cycles.
+///
+/// Existing tests (`crash_recovery_then_more_writes`) do 2 rounds but
+/// always reopen read-only for verification. This test reopens writable
+/// for 5 consecutive cycles, verifying the full open-write-crash-recover
+/// lifecycle.
+#[async_test]
+async fn crash_repeated_writable_recovery_cycles(driver: DefaultDriver) {
+    const CYCLES: usize = 5;
+
+    let (mem_file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+    let mut durable = mem_file.snapshot();
+    let block_size = MB1 as u64;
+
+    for cycle in 0..CYCLES {
+        // Open writable from the (possibly crashed) durable state.
+        let crash_file = CrashTestFile::from_durable(durable);
+        let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+
+        // Write to a different block each cycle.
+        let offset = cycle as u64 * block_size;
+        let pattern = (0x10 + cycle as u8) | 0x01; // nonzero
+        write_pattern_p16(&vhdx, offset, block_size as usize, pattern).await;
+        vhdx.flush().await.unwrap();
+
+        // Verify all blocks from this and previous cycles are correct.
+        for prev in 0..=cycle {
+            let prev_offset = prev as u64 * block_size;
+            let prev_pattern = (0x10 + prev as u8) | 0x01;
+            let buf = read_pattern_p16(&vhdx, prev_offset, block_size as usize).await;
+            assert!(
+                buf.iter().all(|&b| b == prev_pattern),
+                "cycle {cycle}, block {prev}: expected 0x{prev_pattern:02x}, \
+                 got 0x{:02x}",
+                buf[0]
+            );
+        }
+
+        // Crash.
+        durable = vhdx.file.durable_snapshot();
+        vhdx.abort().await;
+    }
+
+    // Final verification: open read-only from the last crash, verify
+    // all 5 blocks from all cycles survived.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    for cycle in 0..CYCLES {
+        let offset = cycle as u64 * block_size;
+        let pattern = (0x10 + cycle as u8) | 0x01;
+        let buf = read_pattern_p16(&vhdx, offset, block_size as usize).await;
+        assert!(
+            buf.iter().all(|&b| b == pattern),
+            "final verify block {cycle}: expected 0x{pattern:02x}, got 0x{:02x}",
+            buf[0]
+        );
+    }
+}
+
+// ---- Phase 16: Concurrent crash tests using YieldingCrashFile ----
+//
+// These tests use YieldingCrashFile to create genuine interleaving between
+// the log task, apply task, and user write tasks. The yield points cause
+// the apply task to yield during write_at, allowing other tasks to make
+// progress. Crash snapshots taken at these interleaving points exercise
+// the recovery path under partial-apply conditions.
+
+use crate::tests::support::YieldingCrashFile;
+
+/// Concurrent writers with interleaved apply + crash + replay.
+///
+/// Two tasks write to different blocks concurrently while the apply task
+/// yields between its writes (via `yield_on_write`). This creates a
+/// genuine interleaving: one task's data may be at its final offset while
+/// another task's WAL entry exists but hasn't been applied yet. After
+/// crash + replay, all flushed data must be present.
+#[async_test]
+async fn concurrent_writes_interleaved_apply_crash(driver: DefaultDriver) {
+    let (mem_file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+    let snapshot = mem_file.snapshot();
+
+    // yield_on_write=true: apply task yields before each page write,
+    // allowing the log task to process another batch mid-apply.
+    let file = YieldingCrashFile::from_durable(snapshot, true, false);
+    let vhdx = Arc::new(VhdxFile::open(file).writable(&driver).await.unwrap());
+    let block_size = vhdx.block_size();
+
+    // Two concurrent writers to different blocks.
+    {
+        let vhdx_a = vhdx.clone();
+        let vhdx_b = vhdx.clone();
+        let bs = block_size;
+
+        let ((), ()) = futures::join!(
+            async {
+                write_block(&*vhdx_a, 0, bs, 0xAA).await;
+            },
+            async {
+                write_block(&*vhdx_b, bs as u64, bs, 0xBB).await;
+            }
+        );
+    }
+
+    // Flush to make everything durable.
+    vhdx.flush().await.unwrap();
+
+    // Take durable snapshot and crash.
+    let durable = vhdx.file.durable_snapshot();
+    Arc::into_inner(vhdx).expect("no other refs").abort().await;
+
+    // Recover and verify both blocks survived.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    let buf0 = read_pattern_p16(&vhdx2, 0, block_size as usize).await;
+    assert!(
+        buf0.iter().all(|&b| b == 0xAA),
+        "block 0 should have 0xAA after interleaved apply + crash"
+    );
+
+    let buf1 = read_pattern_p16(&vhdx2, block_size as u64, block_size as usize).await;
+    assert!(
+        buf1.iter().all(|&b| b == 0xBB),
+        "block 1 should have 0xBB after interleaved apply + crash"
+    );
+}
+
+/// Interleaved flush + write + crash.
+///
+/// `yield_on_flush=true` causes flush to yield, allowing a concurrent
+/// writer to make progress (its write reaches the log task) before the
+/// flush's file-level flush completes. After crash, the pre-flush data
+/// must be durable; the concurrent write may or may not survive.
+#[async_test]
+async fn interleaved_flush_and_write_crash(driver: DefaultDriver) {
+    let (mem_file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+    let snapshot = mem_file.snapshot();
+
+    // yield_on_flush=true: flush yields, allowing concurrent writer to run.
+    let file = YieldingCrashFile::from_durable(snapshot, false, true);
+    let vhdx = Arc::new(VhdxFile::open(file).writable(&driver).await.unwrap());
+    let block_size = vhdx.block_size();
+
+    // Write block 0 — this data must survive the flush.
+    write_block(&*vhdx, 0, block_size, 0xCC).await;
+
+    // Concurrent: flush (yields during file flush) + write block 1.
+    {
+        let vhdx_f = vhdx.clone();
+        let vhdx_w = vhdx.clone();
+        let bs = block_size;
+
+        let ((), ()) = futures::join!(
+            async {
+                vhdx_f.flush().await.unwrap();
+            },
+            async {
+                write_block(&*vhdx_w, bs as u64, bs, 0xDD).await;
+            }
+        );
+    }
+
+    // Final flush to ensure the concurrent write is also durable.
+    vhdx.flush().await.unwrap();
+
+    // Crash.
+    let durable = vhdx.file.durable_snapshot();
+    Arc::into_inner(vhdx).expect("no other refs").abort().await;
+
+    // Recover.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Block 0 must survive (was written before the first flush).
+    let buf0 = read_pattern_p16(&vhdx2, 0, block_size as usize).await;
+    assert!(
+        buf0.iter().all(|&b| b == 0xCC),
+        "block 0 should have 0xCC (pre-flush data must survive)"
+    );
+
+    // Block 1 should also survive (final flush made it durable).
+    let buf1 = read_pattern_p16(&vhdx2, block_size as u64, block_size as usize).await;
+    assert!(
+        buf1.iter().all(|&b| b == 0xDD),
+        "block 1 should have 0xDD after final flush"
+    );
+}
+
+/// Stress test: many interleaved writers with yielding apply + crash.
+///
+/// 8 tasks each write to a unique block with `yield_on_write=true`,
+/// creating maximum interleaving between the apply task and log task.
+/// After flush + crash + replay, all data must be intact.
+#[async_test]
+async fn stress_interleaved_apply_crash(driver: DefaultDriver) {
+    let (mem_file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+    let snapshot = mem_file.snapshot();
+
+    let file = YieldingCrashFile::from_durable(snapshot, true, false);
+    let vhdx = Arc::new(VhdxFile::open(file).writable(&driver).await.unwrap());
+    let block_size = vhdx.block_size();
+
+    // 8 concurrent writers, each to a unique block.
+    let write_futures: Vec<_> = (0..8u8)
+        .map(|i| {
+            let vhdx = vhdx.clone();
+            let bs = block_size;
+            async move {
+                let offset = i as u64 * bs as u64;
+                let pattern = 0x50 + i;
+                write_block(&*vhdx, offset, bs, pattern).await;
+            }
+        })
+        .collect();
+
+    futures::future::join_all(write_futures).await;
+
+    vhdx.flush().await.unwrap();
+
+    // Crash.
+    let durable = vhdx.file.durable_snapshot();
+    let vhdx = Arc::into_inner(vhdx).expect("no other refs");
+    vhdx.abort().await;
+
+    // Recover and verify all 8 blocks.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    for i in 0..8u8 {
+        let offset = i as u64 * block_size as u64;
+        let expected = 0x50 + i;
+        let buf = read_pattern_p16(&vhdx2, offset, block_size as usize).await;
+        assert!(
+            buf.iter().all(|&b| b == expected),
+            "block {i}: expected 0x{expected:02x}, got 0x{:02x}",
+            buf[0]
+        );
+    }
+}
+
+/// Interleaved trim + write + crash with yield points.
+///
+/// Write all blocks, flush. Then concurrently trim some blocks and write
+/// others with `yield_on_write=true`. Flush, crash, and verify the
+/// expected state (trimmed blocks are zeros, written blocks have data).
+#[async_test]
+async fn interleaved_trim_write_crash(driver: DefaultDriver) {
+    let (mem_file, _) = create_vhdx_with_block_size(8 * MB1, MB1 as u32).await;
+    let snapshot = mem_file.snapshot();
+
+    let file = YieldingCrashFile::from_durable(snapshot, true, false);
+    let vhdx = Arc::new(VhdxFile::open(file).writable(&driver).await.unwrap());
+    let block_size = vhdx.block_size();
+
+    // Phase 1: Write all 8 blocks with initial data.
+    for i in 0..8u8 {
+        let offset = i as u64 * block_size as u64;
+        write_block(&*vhdx, offset, block_size, 0x10 + i).await;
+    }
+    vhdx.flush().await.unwrap();
+
+    // Phase 2: Concurrently trim blocks 0-3 and write blocks 4-7.
+    let trim_futures: Vec<_> = (0..4u8)
+        .map(|i| {
+            let vhdx = vhdx.clone();
+            let bs = block_size;
+            async move {
+                let offset = i as u64 * bs as u64;
+                vhdx.trim(TrimRequest::new(TrimMode::FileSpace, offset, bs as u64))
+                    .await
+                    .unwrap();
+            }
+        })
+        .collect();
+
+    let write_futures: Vec<_> = (4..8u8)
+        .map(|i| {
+            let vhdx = vhdx.clone();
+            let bs = block_size;
+            async move {
+                let offset = i as u64 * bs as u64;
+                write_block(&*vhdx, offset, bs, 0x90 + i).await;
+            }
+        })
+        .collect();
+
+    let ((), ()) = futures::join!(
+        async {
+            futures::future::join_all(trim_futures).await;
+        },
+        async {
+            futures::future::join_all(write_futures).await;
+        }
+    );
+
+    vhdx.flush().await.unwrap();
+
+    // Crash.
+    let durable = vhdx.file.durable_snapshot();
+    let vhdx = Arc::into_inner(vhdx).expect("no other refs");
+    vhdx.abort().await;
+
+    // Recover.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Blocks 0-3: trimmed → zeros.
+    for i in 0..4u8 {
+        let offset = i as u64 * block_size as u64;
+        let buf = read_pattern_p16(&vhdx2, offset, block_size as usize).await;
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "block {i}: expected zeros (trimmed), got 0x{:02x}",
+            buf[0]
+        );
+    }
+
+    // Blocks 4-7: overwritten with new data.
+    for i in 4..8u8 {
+        let offset = i as u64 * block_size as u64;
+        let expected = 0x90 + i;
+        let buf = read_pattern_p16(&vhdx2, offset, block_size as usize).await;
+        assert!(
+            buf.iter().all(|&b| b == expected),
+            "block {i}: expected 0x{expected:02x}, got 0x{:02x}",
+            buf[0]
+        );
+    }
+}
+
+// ---- Phase 16: Selective durability crash tests ----
+//
+// These tests use CrashAfterFlushFile to crash at specific points in
+// the WAL pipeline. Unlike CrashTestFile (where flush is all-or-nothing),
+// CrashAfterFlushFile can be armed to fail after N more flushes,
+// simulating crashes between the WAL flush and the apply flush.
+
+use crate::tests::support::CrashAfterFlushFile;
+
+/// Write + flush with crash armed after 1 flush.
+///
+/// The VhdxFile::flush() path does: commit → log task writes WAL →
+/// flush_sequencer.flush() (1 file.flush()) → apply task writes BAT.
+///
+/// With arm(1), the flush_sequencer's flush succeeds (WAL + user data
+/// durable), but a subsequent flush (or the apply write itself) fails.
+/// The apply task's BAT write may or may not succeed in volatile, but
+/// the BAT is NOT durable. On recovery, WAL replay must restore the
+/// BAT page.
+#[async_test]
+async fn crash_wal_durable_apply_lost(driver: DefaultDriver) {
+    let (mem_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashAfterFlushFile::new(snapshot);
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size() as usize;
+
+    // Write one block.
+    write_pattern_p16(&vhdx, 0, block_size, 0xAB).await;
+
+    // Arm the crash: allow 1 more flush (the flush_sequencer's flush
+    // that makes WAL + user data durable), then fail everything.
+    vhdx.file.arm(1);
+
+    // Flush — the WAL flush succeeds; subsequent ops fail.
+    // This may return Ok (if the crash hits after the sequencer flush)
+    // or Err (if the apply task races and triggers the error).
+    let _ = vhdx.flush().await;
+
+    // Take the durable snapshot. The WAL entry and user data should be
+    // durable. The BAT page may NOT be at its final offset.
+    let durable = vhdx.file.durable_snapshot();
+
+    // Don't call abort() — the file is poisoned, tasks may be in error state.
+    // Just drop everything and recover from durable state.
+    drop(vhdx);
+
+    // Recover: open with replay. The WAL should restore the BAT page.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Verify the data survived via WAL replay.
+    let buf = read_pattern_p16(&vhdx2, 0, block_size).await;
+    assert!(
+        buf.iter().all(|&b| b == 0xAB),
+        "data should survive via WAL replay when apply is lost: got 0x{:02x}",
+        buf[0]
+    );
+}
+
+/// Write + flush with crash armed after 0 flushes.
+///
+/// The next flush fails immediately. Nothing new is durable.
+/// Recovery should see the original empty state.
+#[async_test]
+async fn crash_before_wal_flush_data_lost(driver: DefaultDriver) {
+    let (mem_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashAfterFlushFile::new(snapshot.clone());
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size() as usize;
+
+    // Write a block.
+    write_pattern_p16(&vhdx, 0, block_size, 0xCD).await;
+
+    // Arm: next flush fails. The WAL flush won't succeed, so nothing
+    // new is durable.
+    vhdx.file.arm(0);
+
+    // Flush will fail.
+    let result = vhdx.flush().await;
+    assert!(result.is_err(), "flush should fail with armed crash");
+
+    // Durable state should be the pre-write state.
+    let durable = vhdx.file.durable_snapshot();
+    drop(vhdx);
+
+    // Recover and verify data is NOT present (was never durable).
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    let buf = read_pattern_p16(&vhdx2, 0, block_size).await;
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "data should be lost when WAL flush fails: got 0x{:02x}",
+        buf[0]
+    );
+}
+
+/// Multiple writes, flush, then arm and write more.
+///
+/// First batch: write blocks 0-2, flush (all durable). Second batch:
+/// write blocks 3-4, arm(1), flush (WAL durable, apply may fail).
+/// Recovery should see blocks 0-2 (clean) and blocks 3-4 (via replay).
+#[async_test]
+async fn crash_partial_pipeline_multi_batch(driver: DefaultDriver) {
+    let (mem_file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+    let snapshot = mem_file.snapshot();
+
+    let crash_file = CrashAfterFlushFile::new(snapshot);
+    let vhdx = VhdxFile::open(crash_file).writable(&driver).await.unwrap();
+    let block_size = vhdx.block_size() as u64;
+
+    // Batch 1: write blocks 0-2, flush normally (unarmed).
+    for i in 0..3u8 {
+        let offset = i as u64 * block_size;
+        write_pattern_p16(&vhdx, offset, block_size as usize, 0x10 + i).await;
+    }
+    vhdx.flush().await.unwrap();
+
+    // Batch 2: write blocks 3-4, arm, flush.
+    for i in 3..5u8 {
+        let offset = i as u64 * block_size;
+        write_pattern_p16(&vhdx, offset, block_size as usize, 0x20 + i).await;
+    }
+
+    // Arm: 1 more flush (WAL flush succeeds), then crash.
+    vhdx.file.arm(1);
+    let _ = vhdx.flush().await;
+
+    let durable = vhdx.file.durable_snapshot();
+    drop(vhdx);
+
+    // Recover.
+    let recovered = InMemoryFile::from_snapshot(durable);
+    let vhdx2 = VhdxFile::open(recovered)
+        .allow_replay(true)
+        .read_only()
+        .await
+        .unwrap();
+
+    // Blocks 0-2: from batch 1 (fully durable before arm).
+    for i in 0..3u8 {
+        let offset = i as u64 * block_size;
+        let expected = 0x10 + i;
+        let buf = read_pattern_p16(&vhdx2, offset, block_size as usize).await;
+        assert!(
+            buf.iter().all(|&b| b == expected),
+            "batch 1 block {i}: expected 0x{expected:02x}, got 0x{:02x}",
+            buf[0]
+        );
+    }
+
+    // Blocks 3-4: from batch 2 (WAL durable, may need replay).
+    for i in 3..5u8 {
+        let offset = i as u64 * block_size;
+        let expected = 0x20 + i;
+        let buf = read_pattern_p16(&vhdx2, offset, block_size as usize).await;
+        assert!(
+            buf.iter().all(|&b| b == expected),
+            "batch 2 block {i}: expected 0x{expected:02x}, got 0x{:02x}",
+            buf[0]
+        );
+    }
+}

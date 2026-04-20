@@ -327,6 +327,283 @@ impl CrashTestFile {
     }
 }
 
+/// A crash-test file that yields during `write_at` and/or `flush`,
+/// allowing other tasks to interleave.
+///
+/// This combines `CrashTestFile`'s durable/volatile split with
+/// `YieldingFile`'s yield-point mechanism. When a yield is configured,
+/// the file yields (returns Pending once) at the start of the operation,
+/// allowing other spawned tasks to run. This creates genuine interleaving
+/// between the log task, apply task, and user write tasks.
+///
+/// # Use cases
+///
+/// - **`yield_on_write = true`**: The apply task yields before each
+///   `write_at`, allowing the log task to process another commit. This
+///   creates a crash point where one batch's applies are in progress
+///   while another batch is being logged.
+///
+/// - **`yield_on_flush = true`**: The flush path yields, allowing
+///   concurrent writes to reach the log task before the flush completes.
+pub struct YieldingCrashFile {
+    inner: Mutex<CrashTestFileYieldInner>,
+}
+
+struct CrashTestFileYieldInner {
+    durable: Vec<u8>,
+    volatile: Vec<u8>,
+    flush_count: u64,
+    yield_on_write: bool,
+    yield_on_flush: bool,
+}
+
+impl YieldingCrashFile {
+    /// Create a `YieldingCrashFile` from existing durable data.
+    pub fn from_durable(data: Vec<u8>, yield_on_write: bool, yield_on_flush: bool) -> Self {
+        Self {
+            inner: Mutex::new(CrashTestFileYieldInner {
+                volatile: data.clone(),
+                durable: data,
+                flush_count: 0,
+                yield_on_write,
+                yield_on_flush,
+            }),
+        }
+    }
+
+    /// Snapshot durable state without consuming the file.
+    pub fn durable_snapshot(&self) -> Vec<u8> {
+        self.inner.lock().durable.clone()
+    }
+}
+
+/// A crash-test file where the crash point is armed dynamically.
+///
+/// Before arming, the file behaves like a normal `CrashTestFile`: writes
+/// go to volatile, flush copies volatile→durable.
+///
+/// After [`arm(n)`](Self::arm) is called, the file will allow exactly `n`
+/// more flushes to succeed (making data durable), then start failing all
+/// writes and flushes with I/O errors. The durable state is frozen at
+/// the last successful flush.
+///
+/// # Typical usage
+///
+/// ```ignore
+/// // Create and open writable (flushes during open are unaffected).
+/// let file = CrashAfterFlushFile::new(snapshot);
+/// let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
+///
+/// // Do some writes.
+/// write_block(&vhdx, 0, bs, 0xAA).await;
+///
+/// // Arm: allow 1 more flush (the WAL flush), then crash.
+/// vhdx.file.arm(1);
+///
+/// // This flush will: commit → log task writes WAL → flush_sequencer
+/// // calls file.flush() (succeeds, armed count decrements to 0) →
+/// // apply task tries to write → I/O error → file poisoned.
+/// let _ = vhdx.flush().await; // may fail if apply races
+/// ```
+pub struct CrashAfterFlushFile {
+    inner: Mutex<CrashAfterFlushInner>,
+}
+
+struct CrashAfterFlushInner {
+    /// Data that has survived flush — survives power failure.
+    durable: Vec<u8>,
+    /// Data as seen by reads — includes unflushed writes.
+    volatile: Vec<u8>,
+    /// How many flushes have occurred.
+    flush_count: u64,
+    /// When Some(n), allow n more flushes then crash. None = not armed.
+    remaining_flushes: Option<u64>,
+    /// Whether the crash has been triggered.
+    crashed: bool,
+}
+
+impl CrashAfterFlushFile {
+    /// Create a new crash-armed file from existing data.
+    /// The file starts unarmed; call [`arm()`](Self::arm) to set the crash point.
+    pub fn new(data: Vec<u8>) -> Self {
+        Self {
+            inner: Mutex::new(CrashAfterFlushInner {
+                volatile: data.clone(),
+                durable: data,
+                flush_count: 0,
+                remaining_flushes: None,
+                crashed: false,
+            }),
+        }
+    }
+
+    /// Arm the crash: allow `n` more successful flushes, then fail.
+    ///
+    /// - `arm(0)` — the next flush fails immediately.
+    /// - `arm(1)` — the next flush succeeds (makes data durable), then
+    ///   the one after that fails.
+    pub fn arm(&self, remaining_flushes: u64) {
+        let mut inner = self.inner.lock();
+        inner.remaining_flushes = Some(remaining_flushes);
+    }
+
+    /// Snapshot durable state without consuming the file.
+    pub fn durable_snapshot(&self) -> Vec<u8> {
+        self.inner.lock().durable.clone()
+    }
+
+    /// How many flushes have occurred.
+    #[expect(dead_code)]
+    pub fn flush_count(&self) -> u64 {
+        self.inner.lock().flush_count
+    }
+
+    /// Whether the crash has been triggered.
+    #[expect(dead_code)]
+    pub fn has_crashed(&self) -> bool {
+        self.inner.lock().crashed
+    }
+}
+
+impl AsyncFile for CrashAfterFlushFile {
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), std::io::Error> {
+        let inner = self.inner.lock();
+        let offset = offset as usize;
+        let file_len = inner.volatile.len();
+        for (i, byte) in buf.iter_mut().enumerate() {
+            let pos = offset + i;
+            *byte = if pos < file_len {
+                inner.volatile[pos]
+            } else {
+                0
+            };
+        }
+        Ok(())
+    }
+
+    async fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
+        let mut inner = self.inner.lock();
+        if inner.crashed {
+            return Err(std::io::Error::other("crash: disk unavailable"));
+        }
+        let off = offset as usize;
+        let end = off + buf.len();
+        if end > inner.volatile.len() {
+            inner.volatile.resize(end, 0);
+        }
+        inner.volatile[off..end].copy_from_slice(buf);
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), std::io::Error> {
+        let mut inner = self.inner.lock();
+        if inner.crashed {
+            return Err(std::io::Error::other("crash: disk unavailable"));
+        }
+        // Check if armed and out of remaining flushes.
+        if let Some(ref remaining) = inner.remaining_flushes {
+            if *remaining == 0 {
+                // Crash NOW — don't make data durable, fail the flush.
+                inner.crashed = true;
+                return Err(std::io::Error::other("crash: disk unavailable"));
+            }
+        }
+        // Make data durable.
+        inner.durable = inner.volatile.clone();
+        inner.flush_count += 1;
+        // Decrement remaining flushes.
+        if let Some(ref mut remaining) = inner.remaining_flushes {
+            *remaining -= 1;
+        }
+        Ok(())
+    }
+
+    async fn file_size(&self) -> Result<u64, std::io::Error> {
+        Ok(self.inner.lock().volatile.len() as u64)
+    }
+
+    async fn set_file_size(&self, size: u64) -> Result<(), std::io::Error> {
+        let mut inner = self.inner.lock();
+        if inner.crashed {
+            return Err(std::io::Error::other("crash: disk unavailable"));
+        }
+        inner.volatile.resize(size as usize, 0);
+        inner.durable.resize(size as usize, 0);
+        Ok(())
+    }
+}
+
+/// Yield once to allow other tasks to run, then resume.
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if !yielded {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+}
+
+impl AsyncFile for YieldingCrashFile {
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), std::io::Error> {
+        let inner = self.inner.lock();
+        let offset = offset as usize;
+        let file_len = inner.volatile.len();
+        for (i, byte) in buf.iter_mut().enumerate() {
+            let pos = offset + i;
+            *byte = if pos < file_len {
+                inner.volatile[pos]
+            } else {
+                0
+            };
+        }
+        Ok(())
+    }
+
+    async fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
+        let should_yield = self.inner.lock().yield_on_write;
+        if should_yield {
+            yield_once().await;
+        }
+
+        let mut inner = self.inner.lock();
+        let off = offset as usize;
+        let end = off + buf.len();
+        if end > inner.volatile.len() {
+            inner.volatile.resize(end, 0);
+        }
+        inner.volatile[off..end].copy_from_slice(buf);
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), std::io::Error> {
+        let should_yield = self.inner.lock().yield_on_flush;
+        if should_yield {
+            yield_once().await;
+        }
+
+        let mut inner = self.inner.lock();
+        inner.durable = inner.volatile.clone();
+        inner.flush_count += 1;
+        Ok(())
+    }
+
+    async fn file_size(&self) -> Result<u64, std::io::Error> {
+        Ok(self.inner.lock().volatile.len() as u64)
+    }
+
+    async fn set_file_size(&self, size: u64) -> Result<(), std::io::Error> {
+        let mut inner = self.inner.lock();
+        inner.volatile.resize(size as usize, 0);
+        inner.durable.resize(size as usize, 0);
+        Ok(())
+    }
+}
+
 impl AsyncFile for CrashTestFile {
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), std::io::Error> {
         let inner = self.inner.lock();

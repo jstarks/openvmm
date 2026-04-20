@@ -99,7 +99,7 @@ impl LayerIo for VhdxLayer {
     }
 
     fn disk_id(&self) -> Option<[u8; 16]> {
-        Some(self.vhdx.data_write_guid().into())
+        Some(self.vhdx.page_83_data().into())
     }
 
     fn physical_sector_size(&self) -> u32 {

@@ -68,9 +68,9 @@ struct BarDirectMap {
     /// BAR index this sub-region belongs to.
     bar_index: u8,
     /// The memory range within the BAR.
-    range: MemoryRange,
+    bar_range: MemoryRange,
     /// Whether this sub-region is currently mapped into guest GPA space.
-    mapped: bool,
+    mapping: Option<MemoryRange>,
 }
 
 /// MSI-X emulation state, discovered from the physical device's capabilities.
@@ -323,8 +323,8 @@ impl VfioAssignedPciDevice {
                 bar_direct_maps.push(BarDirectMap {
                     memory,
                     bar_index: i as u8,
-                    range: area,
-                    mapped: false,
+                    bar_range: area,
+                    mapping: None,
                 });
             }
         }
@@ -472,9 +472,9 @@ impl VfioAssignedPciDevice {
                 .active_bars
                 .get(dm.bar_index)
                 .expect("BAR with direct map must have an active mapping");
-            let gpa = bar_base + dm.range.start();
+            let gpa = bar_base + dm.bar_range.start();
             match dm.memory.map_to_guest(gpa, true) {
-                Ok(()) => dm.mapped = true,
+                Ok(()) => dm.mapping = Some(MemoryRange::new(gpa..gpa + dm.bar_range.len())),
                 Err(e) => {
                     tracelimit::error_ratelimited!(
                         bar = dm.bar_index,
@@ -493,7 +493,7 @@ impl VfioAssignedPciDevice {
         // MMIO intercepts.
         for dm in &mut self.bar_direct_maps {
             dm.memory.unmap_from_guest();
-            dm.mapped = false;
+            dm.mapping = None;
         }
         for control in self.bar_mmio_controls.iter_mut().flatten() {
             control.unmap();

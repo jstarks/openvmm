@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+use crate::log_task::LogTaskError;
 use thiserror::Error;
 
 /// The VHDX write pipeline has been poisoned by a previous fatal error.
@@ -73,7 +74,7 @@ impl VhdxIoError {
             VhdxIoErrorInner::ReadOnly => VhdxIoErrorKind::ReadOnly,
             VhdxIoErrorInner::UnalignedIo => VhdxIoErrorKind::InvalidInput,
             VhdxIoErrorInner::BeyondEndOfDisk => VhdxIoErrorKind::InvalidSector,
-            VhdxIoErrorInner::Io(_) => VhdxIoErrorKind::Other,
+            _ => VhdxIoErrorKind::Other,
         }
     }
 }
@@ -99,9 +100,17 @@ pub(crate) enum VhdxIoErrorInner {
     #[error("I/O error")]
     Io(#[from] std::io::Error),
 
+    /// The write pipeline failed permanently.
+    #[error("VHDX file failed")]
+    Failed(#[source] PipelineFailed),
+
     /// The file was opened read-only.
     #[error("VHDX file is opened read-only")]
     ReadOnly,
+
+    /// The log task failed during graceful shutdown.
+    #[error("failed to close log task")]
+    LogClose(#[source] LogTaskError),
 
     /// The request is not aligned to the logical sector size.
     #[error("I/O request is not aligned to logical sector size")]

@@ -5,22 +5,9 @@
 
 #![allow(dead_code)]
 
-use crate::{error::PipelineFailed, flush::Fsn};
+use crate::{error::PipelineFailed, flush::Fsn, log_task::Lsn};
 use event_listener::Event;
 use parking_lot::Mutex;
-
-/// Log sequence number published by the later log and apply tasks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Lsn(u64);
-
-impl Lsn {
-    pub const ZERO: Lsn = Lsn(0);
-
-    #[cfg(test)]
-    pub(crate) const fn new(value: u64) -> Self {
-        Self(value)
-    }
-}
 
 /// A shared monotonic `(lsn, fsn)` counter with async waiting and poisoning.
 pub(crate) struct LsnWatermark {

@@ -195,8 +195,8 @@ pub(crate) async fn parse_region_tables<F: AsyncFile>(
 
 /// Write the region table to both on-disk slots via the write-ahead log.
 ///
-/// Called during writable open when one region table was corrupt or the two
-/// copies didn't match. Acquires
+/// Called during [`VhdxBuilder::writable`](crate::open::VhdxBuilder::writable)
+/// when one region table was corrupt or the two copies didn't match. Acquires
 /// log permits, sends the pages through [`PageCache::commit_raw`], and returns
 /// the LSN. The caller must wait for the LSN and flush to make the writes
 /// durable.
@@ -231,6 +231,7 @@ mod tests {
     use super::*;
     use crate::AsyncFileExt;
     use crate::error::OpenErrorInner;
+    use crate::open::VhdxFile;
     use crate::tests::support::InMemoryFile;
     use pal_async::async_test;
     use zerocopy::IntoBytes;
@@ -483,5 +484,41 @@ mod tests {
                 CorruptionType::OffsetOrLengthInRegionTable
             )))
         ));
+    }
+
+    #[async_test]
+    async fn rewrite_repairs_corrupt_table(driver: pal_async::DefaultDriver) {
+        let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+
+        let mut buf = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        file.read_at(format::REGION_TABLE_OFFSET, &mut buf)
+            .await
+            .unwrap();
+        buf[10] ^= 0xff;
+        file.write_at(format::REGION_TABLE_OFFSET, &buf)
+            .await
+            .unwrap();
+
+        let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
+        let file_ref = vhdx.file.clone();
+        vhdx.close().await.unwrap();
+
+        let regions = parse_region_tables(&*file_ref).await.unwrap();
+        assert!(
+            regions.rewrite_data.is_none(),
+            "tables should match after rewrite"
+        );
+
+        let mut table1 = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        let mut table2 = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        file_ref
+            .read_at(format::REGION_TABLE_OFFSET, &mut table1)
+            .await
+            .unwrap();
+        file_ref
+            .read_at(format::ALT_REGION_TABLE_OFFSET, &mut table2)
+            .await
+            .unwrap();
+        assert_eq!(table1, table2);
     }
 }

@@ -23,6 +23,7 @@ use crate::log::DataPage;
 use crate::log::LogWriter;
 use crate::log_permits::LogPermits;
 use crate::lsn_watermark::LsnWatermark;
+use crate::open::FailureFlag;
 use mesh::rpc::Rpc;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -189,6 +190,7 @@ pub(crate) struct LogTask<F: AsyncFile> {
     applied_lsn: Arc<LsnWatermark>,
     apply_tx: mesh::Sender<ApplyBatch<F::Buffer>>,
     pending_tails: VecDeque<PendingTail>,
+    failure_flag: Arc<FailureFlag>,
 }
 
 impl<F: AsyncFile> LogTask<F> {
@@ -201,6 +203,7 @@ impl<F: AsyncFile> LogTask<F> {
         logged_lsn: Arc<LsnWatermark>,
         applied_lsn: Arc<LsnWatermark>,
         apply_tx: mesh::Sender<ApplyBatch<F::Buffer>>,
+        failure_flag: Arc<FailureFlag>,
     ) -> Self {
         Self {
             file,
@@ -211,6 +214,7 @@ impl<F: AsyncFile> LogTask<F> {
             applied_lsn,
             apply_tx,
             pending_tails: VecDeque::new(),
+            failure_flag,
         }
     }
 
@@ -234,6 +238,7 @@ impl<F: AsyncFile> LogTask<F> {
                         let message = err.to_string();
                         self.log_permits.fail(message.clone());
                         self.logged_lsn.fail(message);
+                        self.failure_flag.set(&err);
                         break;
                     }
                 }
@@ -357,6 +362,7 @@ mod tests {
     use crate::AsyncFileExt;
     use crate::apply_task;
     use crate::log::LogRegion;
+    use crate::open::FailureFlag;
     use crate::tests::support::InMemoryFile;
     use pal_async::async_test;
     use pal_async::task::Spawn;
@@ -408,6 +414,7 @@ mod tests {
         let log_permits = Arc::new(LogPermits::new(permit_count));
         let logged_lsn = Arc::new(LsnWatermark::new());
         let applied_lsn = Arc::new(LsnWatermark::new());
+        let failure_flag = Arc::new(FailureFlag::new());
 
         let (apply_tx, apply_rx) = mesh::channel::<ApplyBatch<Vec<u8>>>();
         let (log_tx, log_rx) = mesh::channel::<LogRequest<Vec<u8>>>();
@@ -420,6 +427,7 @@ mod tests {
                 flush_sequencer.clone(),
                 applied_lsn.clone(),
                 log_permits.clone(),
+                failure_flag.clone(),
             ),
         );
 
@@ -433,6 +441,7 @@ mod tests {
                 logged_lsn.clone(),
                 applied_lsn.clone(),
                 apply_tx,
+                failure_flag,
             )
             .run(log_rx),
         );

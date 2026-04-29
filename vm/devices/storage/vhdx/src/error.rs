@@ -116,6 +116,10 @@ pub(crate) enum VhdxIoErrorInner {
     #[error("failed to commit cache")]
     CommitCache(#[source] CacheError),
 
+    /// Failed to read a sector bitmap page.
+    #[error("failed to read sector bitmap")]
+    ReadSectorBitmap(#[source] CacheError),
+
     /// Failed to zero newly allocated file space.
     #[error("failed to zero block at file offset {file_offset:#x}")]
     ZeroBlock {
@@ -143,6 +147,14 @@ pub(crate) enum VhdxIoErrorInner {
     /// Failed to access a cached BAT page.
     #[error("failed to access BAT page cache")]
     BatCache(#[source] CacheError),
+
+    /// Failed to access a cached sector bitmap page.
+    #[error("failed to access sector bitmap page cache")]
+    SectorBitmapCache(#[source] CacheError),
+
+    /// Failed to flush the backing file.
+    #[error("failed to flush")]
+    Flush(#[source] std::io::Error),
 
     /// The write pipeline failed permanently.
     #[error("VHDX file failed")]

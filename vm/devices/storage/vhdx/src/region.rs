@@ -6,8 +6,6 @@
 //! Reads both region tables, validates their signatures and CRC-32C checksums,
 //! identifies BAT and metadata regions, and checks for overlaps and duplicates.
 
-#![allow(dead_code)]
-
 use crate::AsyncFile;
 use crate::cache::PageCache;
 use crate::error::CorruptionType;
@@ -233,6 +231,7 @@ mod tests {
     use crate::error::OpenErrorInner;
     use crate::open::VhdxFile;
     use crate::tests::support::InMemoryFile;
+    use pal_async::DefaultDriver;
     use pal_async::async_test;
     use zerocopy::IntoBytes;
 
@@ -487,38 +486,42 @@ mod tests {
     }
 
     #[async_test]
-    async fn rewrite_repairs_corrupt_table(driver: pal_async::DefaultDriver) {
+    async fn rewrite_repairs_corrupt_table(driver: DefaultDriver) {
         let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
 
+        // Corrupt the first region table.
         let mut buf = vec![0u8; format::REGION_TABLE_SIZE as usize];
         file.read_at(format::REGION_TABLE_OFFSET, &mut buf)
             .await
             .unwrap();
-        buf[10] ^= 0xff;
+        buf[10] ^= 0xFF;
         file.write_at(format::REGION_TABLE_OFFSET, &buf)
             .await
             .unwrap();
 
+        // Opening writable should detect and repair the mismatch via the log.
         let vhdx = VhdxFile::open(file).writable(&driver).await.unwrap();
         let file_ref = vhdx.file.clone();
         vhdx.close().await.unwrap();
 
-        let regions = parse_region_tables(&*file_ref).await.unwrap();
+        // Parse again — both should match now.
+        let regions2 = parse_region_tables(&*file_ref).await.unwrap();
         assert!(
-            regions.rewrite_data.is_none(),
+            regions2.rewrite_data.is_none(),
             "tables should match after rewrite"
         );
 
-        let mut table1 = vec![0u8; format::REGION_TABLE_SIZE as usize];
-        let mut table2 = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        // Verify both on-disk copies are identical.
+        let mut t1 = vec![0u8; format::REGION_TABLE_SIZE as usize];
+        let mut t2 = vec![0u8; format::REGION_TABLE_SIZE as usize];
         file_ref
-            .read_at(format::REGION_TABLE_OFFSET, &mut table1)
+            .read_at(format::REGION_TABLE_OFFSET, &mut t1)
             .await
             .unwrap();
         file_ref
-            .read_at(format::ALT_REGION_TABLE_OFFSET, &mut table2)
+            .read_at(format::ALT_REGION_TABLE_OFFSET, &mut t2)
             .await
             .unwrap();
-        assert_eq!(table1, table2);
+        assert_eq!(t1, t2, "both region tables should be identical");
     }
 }

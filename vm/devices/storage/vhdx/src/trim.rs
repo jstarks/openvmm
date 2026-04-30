@@ -123,11 +123,13 @@ fn convert_mapping(mode: TrimMode, old: BlockMapping) -> BlockMapping {
 /// All other states are no-ops.
 fn convert_file_space(state: BatEntryState, old: BlockMapping) -> BlockMapping {
     match state {
-        BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => BlockMapping::new()
-            .with_bat_state(BatEntryState::Unmapped)
-            .with_transitioning_to_fully_present(false)
-            .with_file_megabyte(old.file_megabyte()),
-        _ => old,
+        BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => {
+            BlockMapping::new()
+                .with_bat_state(BatEntryState::Unmapped)
+                .with_transitioning_to_fully_present(false)
+                .with_file_megabyte(old.file_megabyte()) // keep as soft anchor
+        }
+        _ => old, // NotPresent, Undefined, Zero, Unmapped → no change
     }
 }
 
@@ -137,26 +139,32 @@ fn convert_file_space(state: BatEntryState, old: BlockMapping) -> BlockMapping {
 /// Others → no change.
 fn convert_free_space(state: BatEntryState, old: BlockMapping) -> BlockMapping {
     match state {
-        BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => BlockMapping::new()
-            .with_bat_state(BatEntryState::Undefined)
-            .with_transitioning_to_fully_present(false)
-            .with_file_megabyte(0),
+        BatEntryState::FullyPresent | BatEntryState::PartiallyPresent => {
+            // Release space — clear file offset.
+            BlockMapping::new()
+                .with_bat_state(BatEntryState::Undefined)
+                .with_transitioning_to_fully_present(false)
+                .with_file_megabyte(0)
+        }
         BatEntryState::Zero => BlockMapping::new()
             .with_bat_state(BatEntryState::Undefined)
             .with_transitioning_to_fully_present(false)
             .with_file_megabyte(0),
-        BatEntryState::Unmapped => BlockMapping::new()
-            .with_bat_state(BatEntryState::Undefined)
-            .with_transitioning_to_fully_present(false)
-            .with_file_megabyte(old.file_megabyte()),
-        _ => old,
+        BatEntryState::Unmapped => {
+            // Keep soft anchor if present.
+            BlockMapping::new()
+                .with_bat_state(BatEntryState::Undefined)
+                .with_transitioning_to_fully_present(false)
+                .with_file_megabyte(old.file_megabyte())
+        }
+        _ => old, // NotPresent, Undefined → no change
     }
 }
 
 /// Zero: any state → Zero (clear file offset).
 fn convert_zero(state: BatEntryState, old: BlockMapping) -> BlockMapping {
     match state {
-        BatEntryState::Zero if old.file_megabyte() == 0 => old,
+        BatEntryState::Zero if old.file_megabyte() == 0 => old, // already Zero with no offset
         _ => {
             debug_assert!(
                 !old.transitioning_to_fully_present(),
@@ -173,7 +181,7 @@ fn convert_zero(state: BatEntryState, old: BlockMapping) -> BlockMapping {
 /// MakeTransparent: any state → NotPresent (clear file offset).
 fn convert_make_transparent(state: BatEntryState, old: BlockMapping) -> BlockMapping {
     match state {
-        BatEntryState::NotPresent if old.file_megabyte() == 0 => old,
+        BatEntryState::NotPresent if old.file_megabyte() == 0 => old, // already NotPresent
         _ => BlockMapping::new()
             .with_bat_state(BatEntryState::NotPresent)
             .with_transitioning_to_fully_present(false)
@@ -202,7 +210,9 @@ fn included_blocks(offset: u64, length: u64, block_size: u64) -> (u32, u32) {
     if length == 0 {
         return (0, 0);
     }
+    // First fully-included block: round UP to next block boundary.
     let start = offset.div_ceil(block_size) as u32;
+    // First block NOT included: round DOWN.
     let end = ((offset + length) / block_size) as u32;
     if end <= start {
         (start, 0)
@@ -236,33 +246,43 @@ impl<F: AsyncFile> VhdxFile<F> {
             skip_write_guid_change,
         } = request;
 
-        if self.is_read_only() {
+        // 1. Check read-only.
+        if self.read_only {
             return Err(VhdxIoErrorInner::ReadOnly.into());
         }
 
+        // 2. Zero-length — immediate success.
         if length == 0 {
             return Ok(());
         }
 
-        if !offset.is_multiple_of(self.logical_sector_size() as u64)
-            || !length.is_multiple_of(self.logical_sector_size() as u64)
+        // 3. Validate alignment to logical sector size.
+        if !offset.is_multiple_of(self.logical_sector_size as u64)
+            || !length.is_multiple_of(self.logical_sector_size as u64)
         {
             return Err(VhdxIoErrorInner::UnalignedIo.into());
         }
 
+        // 4. Validate bounds (unless skipped).
         if !skip_disk_size_check {
             if offset
                 .checked_add(length)
-                .is_none_or(|end| end > self.disk_size())
+                .is_none_or(|end| end > self.disk_size)
             {
                 return Err(VhdxIoErrorInner::BeyondEndOfDisk.into());
             }
         }
 
+        // 5. If fully-allocated (fixed) disk and mode doesn't allow it: no-op.
         if self.is_fully_allocated() && !mode_allowed_on_fixed(mode) {
             return Ok(());
         }
 
+        // 6. Enable write mode.
+        // All trim modes modify the file (BAT entries), so FileWritable
+        // is always needed. DataWritable is additionally needed when the
+        // mode changes user-visible data (everything except
+        // RemoveSoftAnchors) and the caller hasn't opted out.
         if !skip_write_guid_change && !mode_skips_write_guid(mode) {
             self.enable_write_mode(WriteMode::DataWritable)
                 .await
@@ -273,37 +293,54 @@ impl<F: AsyncFile> VhdxFile<F> {
                 .map_err(VhdxIoErrorInner::WriteHeader)?;
         }
 
-        let effective_length = if !skip_disk_size_check && offset + length == self.disk_size() {
-            let block_size = self.block_size() as u64;
-            let full_disk_size = crate::create::round_up(self.disk_size(), block_size);
+        // 7. Compute effective length: if trim extends to exactly disk_size,
+        //    round up to cover the full last block.
+        let effective_length = if !skip_disk_size_check && offset + length == self.disk_size {
+            let block_size = self.block_size as u64;
+            let full_disk_size = crate::create::round_up(self.disk_size, block_size);
             full_disk_size - offset
         } else {
             length
         };
 
+        // 8. Compute included blocks.
         let (start_block, block_count) =
-            included_blocks(offset, effective_length, self.block_size() as u64);
+            included_blocks(offset, effective_length, self.block_size as u64);
         if block_count == 0 {
             return Ok(());
         }
         let end_block = start_block + block_count;
 
+        // 9. Main trim loop.
+        //
+        // For each block, we atomically claim it (CAS 0 → SENTINEL),
+        // preventing any new I/O from reading stale mappings. Then we
+        // read + convert the mapping, write the BAT, handle space
+        // management, and release the claim.
         let mut current_block = start_block;
         loop {
             if current_block >= end_block {
                 return Ok(());
             }
 
+            // 9a. Claim the block: set trim-pending to block new I/O,
+            //     wait for in-flight I/Os to drain, then take exclusive
+            //     ownership.
             let claim = self.bat.claim_for_trim(current_block).await;
 
+            // 9b. Block is claimed — no new I/O can start on it.
+            //     Read the mapping and compute the trim conversion.
             let old_mapping = self.bat.get_block_mapping(current_block);
             let new_mapping = convert_mapping(mode, old_mapping);
 
             if old_mapping == new_mapping {
+                // No-op — release claim and advance.
                 current_block += 1;
                 continue;
             }
 
+            // 9c. Write BAT entry to cache (also updates in-memory BAT atomically).
+            // LOCK AUDIT: Trim claim held (not a sync lock). Safe to await.
             self.bat
                 .write_block_mapping(
                     &self.cache,
@@ -314,16 +351,23 @@ impl<F: AsyncFile> VhdxFile<F> {
                 )
                 .await?;
 
+            // 9e. Handle space management based on old→new transition.
+            //
+            // Space releases are deferred until the BAT change is durable
+            // on disk. Without deferral, a crash could teleport data from
+            // a new block into the old block's offset.
             let old_anchored = old_mapping.is_soft_anchored();
             let new_anchored = new_mapping.is_soft_anchored();
             let old_file_mb = old_mapping.file_megabyte();
             let new_file_mb = new_mapping.file_megabyte();
             let old_file_offset = old_file_mb as u64 * MB1;
-            let block_size = self.block_size();
+            let block_size = self.block_size;
 
             if old_anchored && new_anchored {
+                // Same anchor — assert same file offset, no space management.
                 debug_assert_eq!(old_file_mb, new_file_mb);
             } else if old_anchored && !new_anchored {
+                // Was soft-anchored → no longer: unmark/cancel + defer release.
                 let was_deferred = self.deferred_releases.cancel(current_block);
                 if !was_deferred {
                     assert!(
@@ -338,15 +382,25 @@ impl<F: AsyncFile> VhdxFile<F> {
                 self.deferred_releases
                     .insert(current_block, old_file_offset, block_size, false);
             } else if !old_anchored && new_anchored {
+                // Was not anchored → now soft-anchored: defer the anchor.
                 self.deferred_releases
                     .insert(current_block, old_file_offset, block_size, true);
-            } else if old_file_mb != 0 {
-                self.deferred_releases
-                    .insert(current_block, old_file_offset, block_size, false);
+            } else {
+                // Neither was nor becomes anchored.
+                if old_file_mb != 0 {
+                    self.deferred_releases.insert(
+                        current_block,
+                        old_file_offset,
+                        block_size,
+                        false,
+                    );
+                }
             }
 
+            // 9f. Release the trim claim — I/O can resume on this block.
             drop(claim);
 
+            // Quota check: force flush if too many deferred releases.
             if self.deferred_releases.needs_flush() {
                 self.flush().await?;
             }
@@ -360,8 +414,11 @@ impl<F: AsyncFile> VhdxFile<F> {
 mod tests {
     use super::*;
 
+    // ---- included_blocks unit tests ----
+
     #[test]
     fn included_blocks_full_coverage() {
+        // Range exactly covers blocks 0..3 (3 blocks).
         let block_size = 2 * MB1;
         let (start, count) = included_blocks(0, 3 * block_size, block_size);
         assert_eq!(start, 0);
@@ -370,10 +427,11 @@ mod tests {
 
     #[test]
     fn included_blocks_partial_edges() {
+        // Start mid-block-0, end mid-block-2 → only block 1 included.
         let block_size = 2 * MB1;
         let (start, count) = included_blocks(MB1, 2 * block_size, block_size);
-        assert_eq!(start, 1);
-        assert_eq!(count, 1);
+        assert_eq!(start, 1); // block 0 is partial
+        assert_eq!(count, 1); // only block 1 fully covered
     }
 
     #[test]
@@ -385,13 +443,17 @@ mod tests {
 
     #[test]
     fn included_blocks_too_small() {
+        // Range is less than one block → no blocks included.
         let block_size = 2 * MB1;
         let (_start, count) = included_blocks(MB1, MB1, block_size);
         assert_eq!(count, 0);
     }
 
+    // ---- Conversion function unit tests ----
+
     #[test]
     fn convert_file_space_mappings() {
+        // FullyPresent → Unmapped (keep offset)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
@@ -399,12 +461,14 @@ mod tests {
         assert_eq!(r.bat_state(), BatEntryState::Unmapped);
         assert_eq!(r.file_megabyte(), 4);
 
+        // Undefined → Undefined (no change)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Undefined)
             .with_file_megabyte(0);
         let r = convert_mapping(TrimMode::FileSpace, m);
         assert_eq!(r, m);
 
+        // Unmapped → Unmapped (no change)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
@@ -414,6 +478,7 @@ mod tests {
 
     #[test]
     fn convert_free_space_mappings() {
+        // FullyPresent → Undefined (clear offset)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
@@ -421,6 +486,7 @@ mod tests {
         assert_eq!(r.bat_state(), BatEntryState::Undefined);
         assert_eq!(r.file_megabyte(), 0);
 
+        // Unmapped → Undefined (keep anchor)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
@@ -431,6 +497,7 @@ mod tests {
 
     #[test]
     fn convert_zero_mappings() {
+        // FullyPresent → Zero (clear offset)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
@@ -438,6 +505,7 @@ mod tests {
         assert_eq!(r.bat_state(), BatEntryState::Zero);
         assert_eq!(r.file_megabyte(), 0);
 
+        // Zero (no offset) → Zero (no change)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Zero)
             .with_file_megabyte(0);
@@ -447,6 +515,7 @@ mod tests {
 
     #[test]
     fn convert_make_transparent_mappings() {
+        // FullyPresent → NotPresent
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
@@ -454,6 +523,7 @@ mod tests {
         assert_eq!(r.bat_state(), BatEntryState::NotPresent);
         assert_eq!(r.file_megabyte(), 0);
 
+        // NotPresent → NotPresent (no change)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::NotPresent)
             .with_file_megabyte(0);
@@ -463,6 +533,7 @@ mod tests {
 
     #[test]
     fn convert_remove_soft_anchors_mappings() {
+        // Unmapped with offset → clear offset
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
@@ -470,6 +541,7 @@ mod tests {
         assert_eq!(r.bat_state(), BatEntryState::Unmapped);
         assert_eq!(r.file_megabyte(), 0);
 
+        // FullyPresent → no change (not soft-anchored)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);
@@ -479,21 +551,25 @@ mod tests {
 
     #[test]
     fn is_soft_anchored_checks() {
+        // Unmapped with offset → anchored
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(5);
         assert!(m.is_soft_anchored());
 
+        // Undefined with offset → anchored
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Undefined)
             .with_file_megabyte(3);
         assert!(m.is_soft_anchored());
 
+        // Unmapped with no offset → not anchored
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::Unmapped)
             .with_file_megabyte(0);
         assert!(!m.is_soft_anchored());
 
+        // FullyPresent with offset → not anchored (wrong state)
         let m = BlockMapping::new()
             .with_bat_state(BatEntryState::FullyPresent)
             .with_file_megabyte(4);

@@ -204,6 +204,7 @@ pub fn build_pcie_acpi_tables(
             cxl: bridge.cxl.is_some(),
             vnode: bridge.vnode,
             preserve_bars: bridge.preserve_bars,
+            preserve_boot_config: bridge.preserve_boot_config,
         });
 
         if let Some(cxl) = &bridge.cxl {
@@ -1350,6 +1351,7 @@ mod test {
                 cxl: None,
                 vnode: None,
                 preserve_bars: false,
+                preserve_boot_config: false,
             },
             PcieHostBridge {
                 index: 1,
@@ -1362,6 +1364,7 @@ mod test {
                 cxl: None,
                 vnode: None,
                 preserve_bars: false,
+                preserve_boot_config: false,
             },
         ];
 
@@ -1461,6 +1464,7 @@ mod test {
                 cxl: None,
                 vnode: None,
                 preserve_bars: false,
+                preserve_boot_config: false,
             },
             PcieHostBridge {
                 index: 7,
@@ -1473,6 +1477,7 @@ mod test {
                 cxl: None,
                 vnode: None,
                 preserve_bars: false,
+                preserve_boot_config: false,
             },
         ];
         let builder = new_aarch64_builder(&mem, &topology, &pcie_host_bridges);
@@ -1534,6 +1539,7 @@ mod test {
             cxl: None,
             vnode: None,
             preserve_bars: false,
+            preserve_boot_config: false,
         }];
         let builder = new_builder(&mem, &topology, &pcie_host_bridges);
         assert!(builder.build_iort().is_none());
@@ -1566,6 +1572,7 @@ mod test {
             cxl: None,
             vnode: None,
             preserve_bars: false,
+            preserve_boot_config: false,
         }];
         let builder = new_aarch64_builder(&mem, &topology, &pcie_host_bridges);
 
@@ -1628,6 +1635,7 @@ mod test {
             }),
             vnode: None,
             preserve_bars: false,
+            preserve_boot_config: false,
         }];
         let builder = new_builder(&mem, &topology, &pcie_host_bridges);
 
@@ -1653,6 +1661,7 @@ mod test {
             cxl: None,
             vnode: None,
             preserve_bars: false,
+            preserve_boot_config: false,
         }];
         let builder = new_aarch64_builder_with_smmu(&mem, &topology, &pcie_host_bridges, smmu_base);
 
@@ -1731,6 +1740,7 @@ mod test {
                 cxl: None,
                 vnode: None,
                 preserve_bars: false,
+                preserve_boot_config: false,
             },
             PcieHostBridge {
                 index: 1,
@@ -1743,6 +1753,7 @@ mod test {
                 cxl: None,
                 vnode: None,
                 preserve_bars: false,
+                preserve_boot_config: false,
             },
         ];
         let builder = new_aarch64_builder_with_smmu(&mem, &topology, &pcie_host_bridges, smmu_base);
@@ -1796,6 +1807,7 @@ mod test {
             cxl: None,
             vnode: None,
             preserve_bars: false,
+            preserve_boot_config: false,
         }];
         let builder = new_aarch64_builder(&mem, &topology, &pcie_host_bridges);
 
@@ -1830,6 +1842,7 @@ mod test {
             cxl: None,
             vnode: None,
             preserve_bars: false,
+            preserve_boot_config: false,
         }];
         let builder = new_aarch64_builder_with_smmu(&mem, &topology, &pcie_host_bridges, smmu_base);
 

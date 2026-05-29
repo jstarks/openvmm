@@ -1899,7 +1899,7 @@ impl InitializedVm {
         }
         let mut deferred_msi_conns: Vec<DeferredMsiConn> = Vec::new();
 
-        let (pcie_host_bridges, pcie_root_complexes) = {
+        let (mut pcie_host_bridges, pcie_root_complexes) = {
             let mut pcie_host_bridges = Vec::new();
             let mut pcie_root_complexes = Vec::new();
 
@@ -2022,6 +2022,7 @@ impl InitializedVm {
                     cxl,
                     vnode: rc.vnode,
                     preserve_bars: rc.preserve_bars,
+                    preserve_boot_config: false,
                 });
 
                 pcie_root_complexes.push(root_complex.clone());
@@ -2219,6 +2220,21 @@ impl InitializedVm {
             }
             .wrap_msi()
             .connect_to(&deferred.msi_conn);
+        }
+
+        // Mark root complexes with IORT RMR entries so the SSDT emits a
+        // PCI Firmware _DSM (function 5, preserve boot config). Linux
+        // skips RMR entries for root complexes without this flag.
+        #[cfg(guest_arch = "aarch64")]
+        for smmu_cfg in &smmu_configs {
+            if !smmu_cfg.reserved_iova_ranges.is_empty() {
+                if let Some(bridge) = pcie_host_bridges
+                    .iter_mut()
+                    .find(|b| b.index == smmu_cfg.rc_index)
+                {
+                    bridge.preserve_boot_config = true;
+                }
+            }
         }
 
         // Resolve PCIe devices concurrently.

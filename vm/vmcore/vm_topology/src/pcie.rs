@@ -39,4 +39,9 @@ pub struct PcieHostBridge {
     /// When true, treat non-zero BAR values found during probing as pinned
     /// addresses. Used for P2P DMA with GPA = HPA.
     pub preserve_bars: bool,
+    /// When true, emit a PCI Firmware _DSM (function 5) returning 0 to tell
+    /// the OS to preserve the boot-time PCI resource configuration. Required
+    /// when IORT RMR nodes reference this root complex, because Linux skips
+    /// RMR entries for root complexes where `preserve_config` is not set.
+    pub preserve_boot_config: bool,
 }

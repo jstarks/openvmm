@@ -63,6 +63,12 @@ pub struct PcieHostBridgeEntry {
     /// When true, emit a `_DSM` method instructing the OS to preserve
     /// firmware-assigned BAR values. Used for P2P DMA with GPA = HPA.
     pub preserve_bars: bool,
+    /// When true, emit a PCI Firmware `_DSM` (function 5) returning 0 to
+    /// tell the OS to preserve the boot-time PCI resource configuration.
+    /// Required when IORT RMR nodes reference this root complex, because
+    /// Linux skips RMR entries for root complexes where `preserve_config`
+    /// is not set.
+    pub preserve_boot_config: bool,
 }
 
 impl Ssdt {
@@ -152,6 +158,7 @@ impl Ssdt {
             cxl,
             vnode,
             preserve_bars,
+            preserve_boot_config,
         } = entry;
         let mut pcie = Device::new(encode_pcie_name(index).as_slice());
         if cxl {
@@ -311,18 +318,20 @@ impl Ssdt {
 
         pcie.add_object(&osc_method);
 
-        // _DSM: Device Specific Method for preserving firmware BAR assignments.
+        // _DSM: Device Specific Method for the PCI/PCIe host bridge.
         //
         // UUID {E5C937D0-3553-4D7A-9117-EA4D19C3434D} is the PCI/PCIe host
         // bridge _DSM defined in the PCI Firmware Specification §4.6.
         //
-        // Function 0: returns a buffer with supported function bitmask
-        // Function 5: returns 0 to indicate firmware-assigned BAR values
-        //             should be preserved by the OS
+        // Function 0: returns a buffer with the supported function bitmask
+        // Function 5: returns 0 to tell the OS to preserve the boot-time PCI
+        //             resource configuration (firmware-assigned BAR values).
         //
-        // When preserve_bars is false, no _DSM is emitted and the guest
-        // OS is free to reprogram BARs.
-        if preserve_bars {
+        // Emitted when either `preserve_bars` (P2P DMA with GPA = HPA) or
+        // `preserve_boot_config` (so Linux honors IORT RMR entries — see
+        // ARM DEN 0049E §3.1.1.5) is set. Otherwise no _DSM is emitted and
+        // the guest OS is free to reprogram BARs.
+        if preserve_bars || preserve_boot_config {
             let mut dsm_method = Method::new(b"_DSM");
             dsm_method.set_arg_count(4);
 
@@ -494,6 +503,7 @@ mod tests {
             cxl: false,
             vnode,
             preserve_bars: false,
+            preserve_boot_config: false,
         }
     }
 

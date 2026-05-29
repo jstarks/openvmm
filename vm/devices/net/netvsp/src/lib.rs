@@ -2620,7 +2620,6 @@ impl<T: RingMem> NetChannel<T> {
                 // The offset must be set if we're handling checksums; we already know from the above logic
                 // that the L4 checksum-type will match the L4 protocol.
                 metadata.l3_len = if metadata.transport_header_offset == 0 {
-                    tracelimit::warn_ratelimited!("metadata.transport_header_offset was unset");
                     if metadata.flags.is_ipv4() {
                         net_backend::IPV4_MIN_HEADER_LEN
                     } else if metadata.flags.is_ipv6() {

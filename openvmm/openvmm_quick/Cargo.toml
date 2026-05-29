@@ -1,0 +1,31 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "openvmm-quick"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pipette_client.workspace = true
+
+pal_async.workspace = true
+unix_socket.workspace = true
+
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+fatfs = { workspace = true, features = ["std", "alloc"] }
+fs-err.workspace = true
+fscommon.workspace = true
+gptman.workspace = true
+guid.workspace = true
+tempfile.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+which.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.xtask.house-rules]
+# emits a binary, where kebab-case is more natural
+allow-dash-in-name = true

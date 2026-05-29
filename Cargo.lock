@@ -5409,6 +5409,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "openvmm-quick"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fatfs",
+ "fs-err",
+ "fscommon",
+ "gptman",
+ "guid",
+ "pal_async",
+ "pipette_client",
+ "tempfile",
+ "tracing-subscriber",
+ "unix_socket",
+ "which 8.0.0",
+]
+
+[[package]]
 name = "openvmm_core"
 version = "0.0.0"
 dependencies = [

@@ -632,6 +632,89 @@ async fn test_tcp_bind_port_forward(driver: DefaultDriver) {
     assert_eq!(tcp.control, TcpControl::Syn);
 }
 
+/// Test that when a loopback connection is forwarded to the guest, the source
+/// IP is rewritten from loopback to a virtual address within the subnet (not
+/// the raw 127.0.0.1), ensuring the guest routes its reply through the virtual
+/// adapter.
+#[pal_async::async_test]
+async fn test_tcp_port_forward_loopback_src_rewritten(driver: DefaultDriver) {
+    let mut consomme = Consomme::new(ConsommeParams::new().unwrap());
+    let mut client = TestClient::new(driver.clone());
+
+    let guest_port = 9999;
+    let received = client.received_packets.clone();
+    let client_ip = consomme.params_mut().client_ip;
+
+    // Create and bind a TCP socket on loopback.
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let host_addr = socket.local_addr().unwrap().as_socket().unwrap();
+
+    {
+        let mut access = consomme.access(&mut client);
+        access
+            .bind_tcp_port(socket, guest_port)
+            .expect("bind should succeed");
+    }
+
+    // Connect from localhost to trigger the listener.
+    let connector = std::net::TcpStream::connect(host_addr).unwrap();
+    connector.set_nonblocking(true).unwrap();
+
+    // Poll until consomme delivers a SYN to the guest.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        std::future::poll_fn(|cx| {
+            consomme.access(&mut client).poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        let has_syn = received.lock().iter().any(|p| {
+            TcpTestHarness::is_tcp_packet(p)
+                .is_some_and(|t| t.control == TcpControl::Syn && t.dst_port == guest_port)
+        });
+        if has_syn {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for forwarded TCP SYN"
+        );
+        pal_async::timer::PolledTimer::new(&driver)
+            .sleep(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    // Verify the source IP of the forwarded SYN is NOT loopback and NOT the
+    // guest's own IP (it should be a virtual address in the subnet).
+    let packets = received.lock();
+    let syn_pkt = packets
+        .iter()
+        .find(|p| {
+            TcpTestHarness::is_tcp_packet(p)
+                .is_some_and(|t| t.control == TcpControl::Syn && t.dst_port == guest_port)
+        })
+        .expect("should have received a SYN");
+    let (src_ip, dst_ip, _tcp) = parse_tcp_packet(syn_pkt);
+
+    // The destination should be the guest.
+    assert_eq!(dst_ip, client_ip);
+    // The source must not be loopback (127.x.x.x) since that would cause the
+    // guest to route the reply via its own loopback interface.
+    assert!(
+        !src_ip.is_loopback(),
+        "forwarded SYN source IP should not be loopback, got {src_ip}"
+    );
+    // The source must not be the guest's own IP either.
+    assert_ne!(
+        src_ip, client_ip,
+        "forwarded SYN source IP should not be the guest's own IP"
+    );
+}
+
 /// Test that binding the same guest port twice returns `PortAlreadyBound`.
 #[pal_async::async_test]
 async fn test_tcp_bind_duplicate_port(driver: DefaultDriver) {
@@ -811,7 +894,6 @@ async fn test_tcp_window_scale_activation(driver: DefaultDriver) {
     let dst_port = std_listener.local_addr().unwrap().port();
     let mut listener = PolledSocket::new(&driver, std_listener).unwrap();
 
-    // Guest sends SYN with window_scale=7.
     let syn = TcpRepr {
         src_port: guest_port,
         dst_port,
@@ -819,13 +901,6 @@ async fn test_tcp_window_scale_activation(driver: DefaultDriver) {
         seq_number: guest_isn,
         ack_number: None,
         window_len: 512, // Small unscaled window in the SYN
-        window_scale: Some(7),
-        max_seg_size: Some(1460),
-        sack_permitted: false,
-        sack_ranges: [None, None, None],
-        timestamp: None,
-        payload: &[],
-    };
     let len = build_tcp_packet(&mut buf, guest_mac, gateway_mac, guest_ip, dst_ip, &syn);
     consomme
         .access(&mut client)

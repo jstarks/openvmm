@@ -572,9 +572,9 @@ fn build_openvmm_args(
     // Hyper-V enlightenments (needed for VMBus / vsock / IMC).
     args.push("--hv".into());
 
-    // Disable the serial console so openvmm doesn't put the terminal into
-    // raw mode (which eats Ctrl+C).
-    args.extend(["--com1".into(), "none".into()]);
+    // Send serial output to stderr for boot diagnostics, but don't use
+    // "console" mode which puts the terminal into raw mode.
+    args.extend(["--com1".into(), "stderr".into()]);
 
     // Boot disk.
     let disk_spec = boot_disk_spec(opts);

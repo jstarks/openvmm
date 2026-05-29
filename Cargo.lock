@@ -5414,9 +5414,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ctrlc",
  "fatfs",
  "fs-err",
  "fscommon",
+ "futures",
  "gptman",
  "guid",
  "pal_async",

@@ -71,6 +71,10 @@ struct Options {
     #[clap(long)]
     winrm_port: Option<u16>,
 
+    /// Listen address for port forwarding (default: 127.0.0.1).
+    #[clap(long, default_value = "127.0.0.1")]
+    listen_address: String,
+
     /// Number of virtual processors.
     #[clap(long, short = 'p', default_value = "4")]
     processors: u32,
@@ -95,6 +99,14 @@ struct Options {
     /// Guest writes go here. Defaults to the current directory.
     #[clap(long)]
     work_dir: Option<PathBuf>,
+
+    /// Delete the existing disk diff and start fresh.
+    #[clap(long)]
+    fresh: bool,
+
+    /// SSH public key file to inject (default: auto-detect from ~/.ssh/).
+    #[clap(long)]
+    ssh_key: Option<PathBuf>,
 
     /// Only print the openvmm command line without running it.
     #[clap(long)]
@@ -151,10 +163,13 @@ fn dry_run(opts: &Options) -> anyhow::Result<()> {
         }
     };
 
-    let host_port = pick_port(match opts.shell {
-        ShellType::Ssh => opts.ssh_port,
-        ShellType::Winrm => opts.winrm_port,
-    })?;
+    let host_port = pick_port(
+        &opts.listen_address,
+        match opts.shell {
+            ShellType::Ssh => opts.ssh_port,
+            ShellType::Winrm => opts.winrm_port,
+        },
+    )?;
     let guest_port = match opts.shell {
         ShellType::Ssh => 22,
         ShellType::Winrm => 5985,
@@ -170,7 +185,7 @@ fn dry_run(opts: &Options) -> anyhow::Result<()> {
         &vsock_path,
         host_port,
         guest_port,
-    );
+    )?;
     println!("{} {}", openvmm_path.display(), args.join(" "));
     eprintln!();
     eprintln!("NOTE: temp files are in {}", temp_dir.path().display());
@@ -209,10 +224,13 @@ async fn run(driver: DefaultDriver, opts: Options) -> anyhow::Result<()> {
         }
     };
 
-    let host_port = pick_port(match opts.shell {
-        ShellType::Ssh => opts.ssh_port,
-        ShellType::Winrm => opts.winrm_port,
-    })?;
+    let host_port = pick_port(
+        &opts.listen_address,
+        match opts.shell {
+            ShellType::Ssh => opts.ssh_port,
+            ShellType::Winrm => opts.winrm_port,
+        },
+    )?;
     let guest_port = match opts.shell {
         ShellType::Ssh => 22,
         ShellType::Winrm => 5985,
@@ -227,7 +245,7 @@ async fn run(driver: DefaultDriver, opts: Options) -> anyhow::Result<()> {
         &vsock_path,
         host_port,
         guest_port,
-    );
+    )?;
 
     // Set up the pipette vsock listener before launching openvmm.
     let pipette_vsock_port = pipette_client::PIPETTE_VSOCK_PORT;
@@ -244,7 +262,8 @@ async fn run(driver: DefaultDriver, opts: Options) -> anyhow::Result<()> {
     cmd.args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // Pipe stderr so openvmm doesn't see a TTY and won't set raw mode.
+        .stderr(Stdio::piped());
 
     // Set OPENVMM_AUTO_CACHE_PATH for HTTP-based images.
     if is_http_url(&opts.image) {
@@ -255,6 +274,16 @@ async fn run(driver: DefaultDriver, opts: Options) -> anyhow::Result<()> {
     }
 
     let mut child = cmd.spawn().context("failed to launch openvmm")?;
+
+    // Relay openvmm's stderr to ours on a background thread.
+    if let Some(child_stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(
+                &mut std::io::BufReader::new(child_stderr),
+                &mut std::io::stderr(),
+            );
+        });
+    }
 
     // Set up a self-pipe for Ctrl+C notification. The signal handler writes
     // to the pipe, waking the async loop immediately.
@@ -351,7 +380,7 @@ async fn run(driver: DefaultDriver, opts: Options) -> anyhow::Result<()> {
 
     // Bootstrap the requested shell type.
     match opts.shell {
-        ShellType::Ssh => bootstrap_ssh(&client, host_port).await?,
+        ShellType::Ssh => bootstrap_ssh(&client, host_port, opts.ssh_key.as_deref()).await?,
         ShellType::Winrm => bootstrap_winrm(&client, host_port).await?,
     }
 
@@ -412,7 +441,11 @@ async fn run(driver: DefaultDriver, opts: Options) -> anyhow::Result<()> {
 }
 
 /// Bootstrap OpenSSH Server inside the Windows guest via pipette.
-async fn bootstrap_ssh(client: &PipetteClient, host_port: u16) -> anyhow::Result<()> {
+async fn bootstrap_ssh(
+    client: &PipetteClient,
+    host_port: u16,
+    ssh_key: Option<&Path>,
+) -> anyhow::Result<()> {
     let shell = client.windows_shell();
 
     eprintln!("  Installing OpenSSH Server...");
@@ -477,7 +510,16 @@ async fn bootstrap_ssh(client: &PipetteClient, host_port: u16) -> anyhow::Result
         .context("sshd is not listening on port 22 -- SSH setup may have failed")?;
 
     // Try to inject the user's SSH public key.
-    if let Some(pubkey) = find_ssh_pubkey() {
+    let pubkey = match ssh_key {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read SSH key from {}", path.display()))?
+                .trim()
+                .to_string(),
+        ),
+        None => find_ssh_pubkey(),
+    };
+    if let Some(pubkey) = &pubkey {
         eprintln!("  Injecting SSH public key...");
         let script = format!(
             "$ErrorActionPreference='Stop'; \
@@ -499,7 +541,7 @@ async fn bootstrap_ssh(client: &PipetteClient, host_port: u16) -> anyhow::Result
     eprintln!();
     eprintln!("SSH is ready. Connect with:");
     eprintln!("  ssh -p {host_port} Administrator@localhost");
-    if find_ssh_pubkey().is_none() {
+    if pubkey.is_none() {
         eprintln!();
         eprintln!("  No SSH public key found in ~/.ssh/. You'll need the Administrator password.");
     }
@@ -555,7 +597,7 @@ fn build_openvmm_args(
     vsock_path: &Path,
     host_port: u16,
     guest_port: u16,
-) -> Vec<String> {
+) -> anyhow::Result<Vec<String>> {
     let mut args = Vec::new();
 
     // Processors and memory.
@@ -572,12 +614,12 @@ fn build_openvmm_args(
     // Hyper-V enlightenments (needed for VMBus / vsock / IMC).
     args.push("--hv".into());
 
-    // Send serial output to stderr for boot diagnostics, but don't use
-    // "console" mode which puts the terminal into raw mode.
+    // Send serial output to stderr. openvmm's stderr is piped (not a TTY),
+    // so term::raw_stderr() won't corrupt our terminal.
     args.extend(["--com1".into(), "stderr".into()]);
 
     // Boot disk.
-    let disk_spec = boot_disk_spec(opts);
+    let disk_spec = boot_disk_spec(opts)?;
     args.extend(["--disk".into(), disk_spec]);
 
     // CIDATA disk with pipette (becomes LUN 1).
@@ -598,10 +640,13 @@ fn build_openvmm_args(
     // Networking with port forwarding.
     args.extend([
         "--net".into(),
-        format!("consomme:hostfwd=tcp::{host_port}-:{guest_port}"),
+        format!(
+            "consomme:hostfwd=tcp:{listen_addr}:{host_port}-:{guest_port}",
+            listen_addr = opts.listen_address
+        ),
     ]);
 
-    args
+    Ok(args)
 }
 
 /// Returns true if the image string looks like an HTTP(S) URL.
@@ -612,22 +657,44 @@ fn is_http_url(image: &str) -> bool {
 /// Construct the boot disk `--disk` spec.
 ///
 /// For local files: `memdiff:file:<path>` (or `file:<path>` if overlay is off).
-/// For HTTP URLs: `sqldiff:<work_dir>/disk-diff.sqlite;create:autocache::blob:vhd1:<url>`
-fn boot_disk_spec(opts: &Options) -> String {
+/// For HTTP URLs: uses sqldiff on top of autocached HTTP blob. If the diff file
+/// already exists, reattaches to it; if `--fresh` was passed, deletes it first.
+fn boot_disk_spec(opts: &Options) -> anyhow::Result<String> {
     if is_http_url(&opts.image) {
         let work_dir = opts.work_dir.clone().unwrap_or_else(|| PathBuf::from("."));
         let diff_path = work_dir.join("disk-diff.sqlite");
+
+        if opts.fresh {
+            // Remove existing diff files (sqlite + WAL + SHM).
+            for suffix in ["", "-wal", "-shm"] {
+                let p = PathBuf::from(format!("{}{suffix}", diff_path.display()));
+                if p.exists() {
+                    std::fs::remove_file(&p)
+                        .with_context(|| format!("failed to remove {}", p.display()))?;
+                }
+            }
+            eprintln!("Removed existing disk diff.");
+        }
+
+        let create = if diff_path.exists() {
+            eprintln!("Reattaching to existing disk diff: {}", diff_path.display());
+            ""
+        } else {
+            eprintln!("Creating new disk diff: {}", diff_path.display());
+            ";create"
+        };
+
         // sqldiff writable layer on top of autocached HTTP blob.
         // autocache:: (empty key) means "derive cache key from VHD footer UUID".
-        format!(
-            "sqldiff:{};create:autocache::blob:vhd1:{}",
+        Ok(format!(
+            "sqldiff:{}{create}:autocache::blob:vhd1:{}",
             diff_path.display(),
             opts.image
-        )
+        ))
     } else if opts.overlay {
-        format!("memdiff:file:{}", opts.image)
+        Ok(format!("memdiff:file:{}", opts.image))
     } else {
-        format!("file:{}", opts.image)
+        Ok(format!("file:{}", opts.image))
     }
 }
 
@@ -642,10 +709,10 @@ fn resolve_cache_dir(explicit: &Option<PathBuf>) -> PathBuf {
 }
 
 /// Find a free TCP port, or verify the requested one is available.
-fn pick_port(requested: Option<u16>) -> anyhow::Result<u16> {
+fn pick_port(listen_addr: &str, requested: Option<u16>) -> anyhow::Result<u16> {
     let port = requested.unwrap_or(0);
     let listener =
-        TcpListener::bind(("127.0.0.1", port)).context("failed to bind to requested port")?;
+        TcpListener::bind((listen_addr, port)).context("failed to bind to requested port")?;
     let actual = listener
         .local_addr()
         .context("failed to get local address")?

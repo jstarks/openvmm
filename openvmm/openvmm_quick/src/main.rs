@@ -332,51 +332,63 @@ async fn run(driver: DefaultDriver, opts: Options) -> anyhow::Result<()> {
         PolledSocket::new(&driver, child_exit_read).context("failed to poll child exit")?;
     let mut child_exit_reader = futures::io::BufReader::new(child_exit_sock);
 
-    let accept_fut = std::pin::pin!(listener.accept());
-    let mut sigint_buf = [0u8; 1];
-    let sigint_wait = std::pin::pin!(futures::AsyncReadExt::read(
-        &mut sigint_reader,
-        &mut sigint_buf
-    ));
-    let mut child_exit_buf = [0u8; 1];
-    let child_exit_wait = std::pin::pin!(futures::AsyncReadExt::read(
-        &mut child_exit_reader,
-        &mut child_exit_buf
-    ));
-    let conn = futures::select! {
-        result = accept_fut.fuse() => {
-            result.context("failed to accept pipette connection")?.0
-        }
-        _ = sigint_wait.fuse() => {
-            eprintln!("Interrupted during boot.");
-            // Recover child from the waiter thread and kill it.
-            if let Ok((mut child, _)) = child_recv.recv() {
-                let _ = child.kill();
-                let _ = child.wait();
+    // Accept pipette connections in a loop to handle guest reboots.
+    // The Windows Server 2025 image reboots on first boot, so we need to
+    // reconnect pipette after the reboot before bootstrapping SSH/WinRM.
+    let output_dir = temp_dir.path().join("pipette-output");
+    std::fs::create_dir_all(&output_dir)?;
+    let client = loop {
+        let accept_fut = std::pin::pin!(listener.accept());
+        let mut sigint_buf = [0u8; 1];
+        let sigint_wait = std::pin::pin!(futures::AsyncReadExt::read(
+            &mut sigint_reader,
+            &mut sigint_buf
+        ));
+        let mut child_exit_buf = [0u8; 1];
+        let child_exit_wait = std::pin::pin!(futures::AsyncReadExt::read(
+            &mut child_exit_reader,
+            &mut child_exit_buf
+        ));
+        let conn = futures::select! {
+            result = accept_fut.fuse() => {
+                result.context("failed to accept pipette connection")?.0
             }
-            return Ok(());
-        }
-        _ = child_exit_wait.fuse() => {
-            let (_, status) = child_recv.recv().context("child waiter thread died")?;
-            let status = status.context("failed to wait for openvmm")?;
-            anyhow::bail!("openvmm exited early with status: {status}");
+            _ = sigint_wait.fuse() => {
+                eprintln!("Interrupted during boot.");
+                if let Ok((mut child, _)) = child_recv.recv() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Ok(());
+            }
+            _ = child_exit_wait.fuse() => {
+                let (_, status) = child_recv.recv().context("child waiter thread died")?;
+                let status = status.context("failed to wait for openvmm")?;
+                anyhow::bail!("openvmm exited early with status: {status}");
+            }
+        };
+
+        let conn = PolledSocket::new(&driver, conn).context("failed to poll pipette connection")?;
+
+        match PipetteClient::new(&driver, conn, &output_dir).await {
+            Ok(client) => {
+                eprintln!("Connected to pipette.");
+                // Ping to verify the connection is alive.
+                match client.ping().await {
+                    Ok(()) => break client,
+                    Err(e) => {
+                        eprintln!("Pipette connection failed ({e}), waiting for reconnect...");
+                    }
+                }
+            }
+            Err(e) => {
+                // Handshake failed — stale connection from before a reboot.
+                eprintln!("Pipette handshake failed ({e}), waiting for reconnect...");
+            }
         }
     };
 
-    // We got a pipette connection. The child waiter thread is still running;
-    // set up a new waiter for the post-bootstrap phase. We need `child` back
-    // from the boot waiter thread — but it's still blocked in wait(). Instead,
-    // reuse the same child_exit_reader and child_recv for the running phase.
-
-    let conn = PolledSocket::new(&driver, conn).context("failed to poll pipette connection")?;
-
-    let output_dir = temp_dir.path().join("pipette-output");
-    std::fs::create_dir_all(&output_dir)?;
-    let client = PipetteClient::new(&driver, conn, &output_dir)
-        .await
-        .context("failed to connect to pipette")?;
-
-    eprintln!("Connected to pipette. Bootstrapping remote access...");
+    eprintln!("Bootstrapping remote access...");
 
     // Bootstrap the requested shell type.
     match opts.shell {

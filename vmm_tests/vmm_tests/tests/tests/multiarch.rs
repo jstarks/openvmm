@@ -477,8 +477,9 @@ async fn reboot_into_guest_vsm<T: PetriVmmBackend>(
     Ok(())
 }
 
-/// Enable the Hyper-V role in a Windows guest and verify the hypervisor
-/// management service is running after reboot.
+/// Enable the Hyper-V role in a Windows guest, verify the hypervisor
+/// management service is running after reboot, and start a small L2 VM
+/// to confirm nested virtualization works.
 #[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64)))]
 async fn boot_hyperv_role(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
@@ -486,25 +487,36 @@ async fn boot_hyperv_role(
     let (mut vm, agent) = config.run().await?;
     let shell = agent.windows_shell();
 
-    // Install the Hyper-V role. DISM returns exit code 3010 when a restart
-    // is required, which is expected.
-    let output = cmd!(shell, "dism.exe")
-        .args([
-            "/online",
-            "/enable-feature",
-            "/featurename:Microsoft-Hyper-V",
-            "/all",
-            "/norestart",
-        ])
-        .ignore_status()
-        .output()
+    // Install the Hyper-V role and management tools. DISM returns exit code
+    // 3010 when a restart is required, which is expected.
+    for feature in [
+        "Microsoft-Hyper-V",
+        "Microsoft-Hyper-V-Management-PowerShell",
+    ] {
+        let output = cmd!(shell, "dism.exe")
+            .args([
+                "/online",
+                "/enable-feature",
+                &format!("/featurename:{feature}"),
+                "/all",
+                "/norestart",
+            ])
+            .ignore_status()
+            .output()
+            .await?;
+        let exit_code = output.status.code().context("dism terminated by signal")?;
+        anyhow::ensure!(
+            exit_code == 0 || exit_code == 3010,
+            "dism /enable-feature {feature} failed with exit code {exit_code}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Ensure the hypervisor launches on next boot.
+    cmd!(shell, "bcdedit.exe")
+        .args(["/set", "hypervisorlaunchtype", "auto"])
+        .run()
         .await?;
-    let exit_code = output.status.code().context("dism terminated by signal")?;
-    anyhow::ensure!(
-        exit_code == 0 || exit_code == 3010,
-        "dism failed with exit code {exit_code}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 
     // Reboot to start the hypervisor.
     agent.reboot().await?;
@@ -517,6 +529,186 @@ async fn boot_hyperv_role(
         output.contains("RUNNING"),
         "vmms service is not running: {output}"
     );
+
+    // Diagnostic: check hypervisor status, BCD config, and installed features.
+    let systeminfo = cmd!(shell, "systeminfo").read().await?;
+    tracing::info!("systeminfo (hypervisor section):");
+    for line in systeminfo.lines() {
+        if line.contains("Hyper-V")
+            || line.contains("hypervisor")
+            || line.contains("Virtualization")
+        {
+            tracing::info!("  {line}");
+        }
+    }
+    let bcd = cmd!(shell, "bcdedit.exe").ignore_status().read().await?;
+    tracing::info!("bcdedit output:\n{bcd}");
+    let features = cmd!(shell, "dism.exe")
+        .args(["/online", "/get-features", "/format:table"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("Hyper-V features:");
+    for line in features.lines() {
+        if line.contains("Hyper-V") {
+            tracing::info!("  {line}");
+        }
+    }
+    let wmi = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WmiObject -Namespace root\\virtualization\\v2 -Class Msvm_VirtualSystemManagementService -ErrorAction SilentlyContinue | Select-Object Name,Started"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("WMI virtualization namespace query: {wmi}");
+
+    // Check if the Windows hypervisor actually loaded.
+    let hvlog = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WinEvent -LogName 'Microsoft-Windows-Hyper-V-Hypervisor-Admin' -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated,Id,LevelDisplayName,Message"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("Hyper-V Hypervisor event log:\n{hvlog}");
+    let hvstatus = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WinEvent -LogName System -MaxEvents 50 -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -match 'Hyper-V' -or $_.Message -match 'hypervisor' } | Format-List TimeCreated,Id,ProviderName,LevelDisplayName,Message"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("System log Hyper-V entries:\n{hvstatus}");
+
+    // Check VID driver and VMMS service details.
+    let vid = cmd!(shell, "sc.exe")
+        .args(["query", "vid"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("vid driver status: {vid}");
+    let vmms_detail = cmd!(shell, "sc.exe")
+        .args(["qc", "vmms"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("vmms service config: {vmms_detail}");
+    let vmcompute = cmd!(shell, "sc.exe")
+        .args(["query", "vmcompute"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("vmcompute service status: {vmcompute}");
+    let wmi_ns = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WmiObject -Namespace root\\virtualization\\v2 -List -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Msvm' } | Select-Object -First 10 Name"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("WMI v2 namespace Msvm classes:\n{wmi_ns}");
+
+    // Deep diagnostics: check hypervisor driver load, VMMS logs, and VM worker logs.
+    let hv_drivers = cmd!(shell, "driverquery.exe")
+        .args(["/v"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("Hyper-V related drivers:");
+    for line in hv_drivers.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("hv")
+            || lower.contains("vid")
+            || lower.contains("vmbus")
+            || lower.contains("hypervisor")
+            || lower.contains("virt")
+        {
+            tracing::info!("  {line}");
+        }
+    }
+
+    let vmms_log = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WinEvent -LogName 'Microsoft-Windows-Hyper-V-VMMS-Admin' -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated,Id,LevelDisplayName,Message"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("VMMS event log:\n{vmms_log}");
+
+    // Check why vmbusr is not running.
+    let vmbusr_status = cmd!(shell, "sc.exe")
+        .args(["query", "vmbusr"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("vmbusr service status: {vmbusr_status}");
+    let vmbusr_start = cmd!(shell, "sc.exe")
+        .args(["start", "vmbusr"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("vmbusr manual start attempt: {vmbusr_start}");
+    let vmbusr_deps = cmd!(shell, "sc.exe")
+        .args(["qc", "vmbusr"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("vmbusr config: {vmbusr_deps}");
+    let system_errors = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue | Where-Object { $_.LevelDisplayName -eq 'Error' -or $_.LevelDisplayName -eq 'Warning' } | Format-List TimeCreated,Id,ProviderName,LevelDisplayName,Message"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("System log errors/warnings:\n{system_errors}");
+
+    let worker_log = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WinEvent -LogName 'Microsoft-Windows-Hyper-V-Worker-Admin' -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated,Id,LevelDisplayName,Message"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("Hyper-V Worker event log:\n{worker_log}");
+
+    let compute_log = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WinEvent -LogName 'Microsoft-Windows-Hyper-V-Compute-Admin' -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated,Id,LevelDisplayName,Message"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("Hyper-V Compute event log:\n{compute_log}");
+
+    // List all Hyper-V event logs that have events.
+    let all_hv_logs = cmd!(shell, "powershell.exe")
+        .args(["-Command", "Get-WinEvent -ListLog *Hyper-V* -ErrorAction SilentlyContinue | Where-Object { $_.RecordCount -gt 0 } | Format-Table LogName,RecordCount -AutoSize"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("All Hyper-V event logs with entries:\n{all_hv_logs}");
+
+    // Check if the hypervisor is actually running via CPUID/firmware.
+    let firmware_type = cmd!(shell, "powershell.exe")
+        .args(["-Command", "[System.Environment]::Is64BitOperatingSystem; (Get-CimInstance Win32_ComputerSystem).HypervisorPresent; (Get-CimInstance Win32_OperatingSystem).Caption"])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("System info: {firmware_type}");
+
+    // Create and start a small L2 VM to verify nested virtualization works.
+    // VMMS may still be initializing its WMI provider after the first boot
+    // with Hyper-V enabled, so retry New-VM a few times.
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            "$attempt = 0; while ($attempt -lt 10) { try { New-VM -Name TestL2 -MemoryStartupBytes 64MB -Generation 2 -NoVHD -ErrorAction Stop; break } catch { $attempt++; if ($attempt -ge 10) { throw }; Start-Sleep -Seconds 5 } }",
+        ])
+        .run()
+        .await?;
+    cmd!(shell, "powershell.exe")
+        .args(["-Command", "Start-VM -Name TestL2"])
+        .run()
+        .await?;
+    let state = cmd!(shell, "powershell.exe")
+        .args(["-Command", "(Get-VM -Name TestL2).State"])
+        .read()
+        .await?;
+    assert!(state.contains("Running"), "L2 VM is not running: {state}");
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            "Stop-VM -Name TestL2 -TurnOff -Force; Remove-VM -Name TestL2 -Force",
+        ])
+        .run()
+        .await?;
 
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;

@@ -146,6 +146,15 @@ impl SimpleFlowNode for Node {
 
         let target_triple = target.as_triple();
         let arch = target.common_arch().unwrap();
+
+        // When cross-compiling Windows binaries (pipette, etc.) from a Linux
+        // host, use the GNU toolchain instead of MSVC.
+        let windows_platform = if matches!(ctx.platform(), FlowPlatform::Linux(_)) {
+            CommonPlatform::WindowsGnu
+        } else {
+            CommonPlatform::WindowsMsvc
+        };
+
         let arch_tag = match arch {
             CommonArch::X86_64 => "x64",
             CommonArch::Aarch64 => "aarch64",
@@ -342,7 +351,7 @@ impl SimpleFlowNode for Node {
             let output = ctx.reqv(|v| crate::build_pipette::Request {
                 target: CommonTriple::Common {
                     arch,
-                    platform: CommonPlatform::WindowsMsvc,
+                    platform: windows_platform,
                 },
                 profile: CommonProfile::from_release(release),
                 pipette: v,
@@ -413,7 +422,7 @@ impl SimpleFlowNode for Node {
             let output = ctx.reqv(|v| crate::build_tpm_guest_tests::Request {
                 target: CommonTriple::Common {
                     arch,
-                    platform: CommonPlatform::WindowsMsvc,
+                    platform: windows_platform,
                 },
                 profile: CommonProfile::from_release(release),
                 tpm_guest_tests: v,
@@ -461,7 +470,7 @@ impl SimpleFlowNode for Node {
             let output = ctx.reqv(|v| crate::build_test_igvm_agent_rpc_server::Request {
                 target: CommonTriple::Common {
                     arch,
-                    platform: CommonPlatform::WindowsMsvc,
+                    platform: windows_platform,
                 },
                 profile: CommonProfile::from_release(release),
                 test_igvm_agent_rpc_server: v,
@@ -480,7 +489,7 @@ impl SimpleFlowNode for Node {
             let output = ctx.reqv(|v| crate::build_tmk_vmm::Request {
                 target: CommonTriple::Common {
                     arch,
-                    platform: CommonPlatform::WindowsMsvc,
+                    platform: windows_platform,
                 },
                 profile: CommonProfile::from_release(release),
                 tmk_vmm: v,
@@ -534,7 +543,7 @@ impl SimpleFlowNode for Node {
         let register_prep_steps = needs_prep_steps.then(|| {
             let (prep_steps_bin, platform) = match target_triple.operating_system {
                 target_lexicon::OperatingSystem::Windows => {
-                    (Path::new("prep_steps.exe"), CommonPlatform::WindowsMsvc)
+                    (Path::new("prep_steps.exe"), windows_platform)
                 }
                 target_lexicon::OperatingSystem::Linux => {
                     (Path::new("prep_steps"), CommonPlatform::LinuxGnu)

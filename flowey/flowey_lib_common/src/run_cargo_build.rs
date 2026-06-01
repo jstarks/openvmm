@@ -394,7 +394,18 @@ fn rename_output(
         CargoCrateType::Bin => {
             if find_source(&format!("{out_name}.exe")).is_some() {
                 let exe = do_rename("exe", false)?;
-                let pdb = do_rename("pdb", true)?;
+                // GNU toolchain doesn't produce PDB files; create a
+                // placeholder so downstream code that expects the path can
+                // still copy/ignore it without special-casing.
+                let pdb = match do_rename("pdb", true) {
+                    Ok(pdb) => pdb,
+                    Err(_) => {
+                        let pdb_name = format!("{}.pdb", out_name.replace('-', "_"));
+                        let pdb_path = out_dir.join(&pdb_name);
+                        fs_err::write(&pdb_path, b"")?;
+                        pdb_path
+                    }
+                };
                 CargoBuildOutput::WindowsBin { exe, pdb }
             } else if find_source(&format!("{out_name}.efi")).is_some() {
                 let efi = do_rename("efi", false)?;

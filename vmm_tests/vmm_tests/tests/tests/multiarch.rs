@@ -477,6 +477,52 @@ async fn reboot_into_guest_vsm<T: PetriVmmBackend>(
     Ok(())
 }
 
+/// Enable the Hyper-V role in a Windows guest and verify the hypervisor
+/// management service is running after reboot.
+#[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64)))]
+async fn boot_hyperv_role(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> Result<(), anyhow::Error> {
+    let (mut vm, agent) = config.run().await?;
+    let shell = agent.windows_shell();
+
+    // Install the Hyper-V role. DISM returns exit code 3010 when a restart
+    // is required, which is expected.
+    let output = cmd!(shell, "dism.exe")
+        .args([
+            "/online",
+            "/enable-feature",
+            "/featurename:Microsoft-Hyper-V",
+            "/all",
+            "/norestart",
+        ])
+        .ignore_status()
+        .output()
+        .await?;
+    let exit_code = output.status.code().context("dism terminated by signal")?;
+    anyhow::ensure!(
+        exit_code == 0 || exit_code == 3010,
+        "dism failed with exit code {exit_code}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Reboot to start the hypervisor.
+    agent.reboot().await?;
+    let agent = vm.wait_for_reset().await?;
+    let shell = agent.windows_shell();
+
+    // Verify the Hyper-V Virtual Machine Management service is running.
+    let output = cmd!(shell, "sc.exe").args(["query", "vmms"]).read().await?;
+    assert!(
+        output.contains("RUNNING"),
+        "vmms service is not running: {output}"
+    );
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
 /// Basic boot test with secure boot enabled and a valid template.
 #[vmm_test(
     openvmm_uefi_aarch64(vhd(ubuntu_2404_server_aarch64)),

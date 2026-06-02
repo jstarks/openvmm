@@ -487,6 +487,20 @@ async fn boot_hyperv_role(
     let (mut vm, agent) = config.run().await?;
     let shell = agent.windows_shell();
 
+    // Check guest CPU virtualization capabilities.
+    let cpu_info = cmd!(shell, "powershell.exe")
+        .args(["-Command", r#"
+            $p = Get-CimInstance Win32_Processor | Select-Object -First 1
+            Write-Host "VMMonitorModeExtensions: $($p.VMMonitorModeExtensions)"
+            Write-Host "VirtualizationFirmwareEnabled: $($p.VirtualizationFirmwareEnabled)"
+            Write-Host "HypervisorPresent: $((Get-CimInstance Win32_ComputerSystem).HypervisorPresent)"
+            Write-Host "Processor: $($p.Name)"
+        "#])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("Guest CPU info:\n{cpu_info}");
+
     // Install the Hyper-V role and management tools. DISM returns exit code
     // 3010 when a restart is required, which is expected.
     for feature in [

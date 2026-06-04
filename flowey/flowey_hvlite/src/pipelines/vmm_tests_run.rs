@@ -109,6 +109,17 @@ pub struct VmmTestsRunCli {
     /// `disabled` in the IGVM manifest.
     #[clap(long)]
     pub disable_secure_avic: bool,
+
+    /// Run tests inside an emulated hosting VM using the given profile.
+    ///
+    /// The profile is a TOML file describing the emulated platform
+    /// (e.g., AArch64 with SMMUv3). When set, the build target is
+    /// automatically overridden to match the profile's architecture,
+    /// artifacts are cross-compiled, and tests run inside the hosting VM.
+    ///
+    /// Example: `--hosting-vm petri/hosting_vm/profiles/arm-smmu-nested.toml`
+    #[clap(long)]
+    hosting_vm: Option<PathBuf>,
 }
 
 struct CargoNextestListRequest<'a> {
@@ -165,7 +176,14 @@ impl IntoPipeline for VmmTestsRunCli {
             ci_profile,
             no_reuse_prepped_vhds,
             disable_secure_avic,
+            hosting_vm,
         } = self;
+
+        // When --hosting-vm is set, --target must also be specified
+        // to indicate the cross-compilation target for the hosting VM.
+        if hosting_vm.is_some() && target.is_none() {
+            anyhow::bail!("--hosting-vm requires --target (e.g., --target linux-aarch64-musl)");
+        }
 
         let target = resolve_target(target, backend_hint)?;
         let target_os = target.as_triple().operating_system;
@@ -358,6 +376,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     },
                     reuse_prepped_vhds: !no_reuse_prepped_vhds,
                     disable_secure_avic,
+                    hosting_vm_profile: hosting_vm,
                     done: ctx.new_done_handle(),
                 }
             });
@@ -531,6 +550,8 @@ enum VmmTestTargetCli {
     WindowsX64,
     /// Linux X64
     LinuxX64,
+    /// Linux Aarch64 (musl, for hosting VM cross-compilation)
+    LinuxAarch64Musl,
 }
 
 /// Resolve a CLI target option to a CommonTriple, defaulting to the host.
@@ -556,6 +577,7 @@ fn resolve_target(
         VmmTestTargetCli::WindowsAarch64 => CommonTriple::AARCH64_WINDOWS_MSVC,
         VmmTestTargetCli::WindowsX64 => CommonTriple::X86_64_WINDOWS_MSVC,
         VmmTestTargetCli::LinuxX64 => CommonTriple::X86_64_LINUX_GNU,
+        VmmTestTargetCli::LinuxAarch64Musl => CommonTriple::AARCH64_LINUX_MUSL,
     })
 }
 

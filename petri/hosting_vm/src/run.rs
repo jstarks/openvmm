@@ -49,7 +49,6 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
 
     let init_script = format!(
         "#!/bin/sh\n\
-         set -e\n\
          /bin/busybox --install /bin 2>/dev/null\n\
          mount -t devtmpfs none /dev\n\
          mount -t proc none /proc\n\
@@ -61,8 +60,7 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
          mkdir -p /root\n\
          cd /share\n\
          {cmd}\n\
-         EXIT_CODE=$?\n\
-         echo $EXIT_CODE > /share/.hosting-vm-exit-code\n\
+         echo $? > /share/.hosting-vm-exit-code\n\
          poweroff -f\n",
         cmd = config.guest_command,
     );

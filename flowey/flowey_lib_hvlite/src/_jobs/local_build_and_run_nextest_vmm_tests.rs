@@ -87,6 +87,10 @@ flowey_request! {
 
         pub disable_secure_avic: bool,
 
+        /// Optional: hosting VM profile path. When set, tests run inside
+        /// an emulated VM instead of on the host.
+        pub hosting_vm_profile: Option<PathBuf>,
+
         pub done: WriteVar<SideEffect>,
     }
 }
@@ -137,6 +141,7 @@ impl SimpleFlowNode for Node {
             nextest_profile,
             reuse_prepped_vhds,
             disable_secure_avic,
+            hosting_vm_profile,
             done,
         } = request;
 
@@ -827,7 +832,65 @@ impl SimpleFlowNode for Node {
             }
         }));
 
-        if build_only {
+        if let Some(profile_path) = hosting_vm_profile {
+            // Hosting VM mode: build everything, then launch the hosting VM
+            // with the test content dir as the share. The hosting_vm binary
+            // runs nextest inside the emulated VM.
+            if let Some((prep_steps, _)) = register_prep_steps {
+                prep_steps.claim_unused(ctx);
+            }
+
+            let profile_path = profile_path
+                .absolute()
+                .context("failed to resolve hosting VM profile path")?;
+
+            ctx.emit_rust_step("run tests in hosting VM", |ctx| {
+                done.claim(ctx);
+                side_effects.claim(ctx);
+                move |rt| {
+                    let nextest_bin_name = if cfg!(windows) {
+                        "cargo-nextest.exe"
+                    } else {
+                        "cargo-nextest"
+                    };
+                    let guest_cmd = format!(
+                        "/share/{nextest_bin} nextest run \
+                         --archive-file /share/{archive} \
+                         --workspace-remap /share \
+                         --filter-expr '{filter}'",
+                        nextest_bin = nextest_bin_name,
+                        archive = nextest_archive_file.file_name().unwrap().to_string_lossy(),
+                        filter = nextest_filter_expr,
+                    );
+
+                    log::info!(
+                        "Launching hosting VM with profile: {}",
+                        profile_path.display()
+                    );
+                    log::info!("Guest command: {}", guest_cmd);
+
+                    let status = std::process::Command::new("cargo")
+                        .arg("run")
+                        .arg("-p")
+                        .arg("hosting_vm")
+                        .arg("--")
+                        .arg("--profile")
+                        .arg(&profile_path)
+                        .arg("--share")
+                        .arg(&test_content_dir)
+                        .arg("--")
+                        .arg(&guest_cmd)
+                        .status()
+                        .context("failed to launch hosting VM")?;
+
+                    if !status.success() {
+                        anyhow::bail!("hosting VM exited with code: {:?}", status.code());
+                    }
+
+                    Ok(())
+                }
+            });
+        } else if build_only {
             ctx.emit_side_effect_step(side_effects, [done]);
             if let Some((prep_steps, _)) = register_prep_steps {
                 prep_steps.claim_unused(ctx);

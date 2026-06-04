@@ -1,0 +1,15 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Hosting VM profile: AArch64 with SMMUv3 and nested virtualization
+#
+# Provides an emulated ARM platform with KVM + SMMUv3 for testing
+# SMMU s1 acceleration in OpenVMM/OpenHCL.
+
+[emulator]
+type = "qemu-tcg"
+binary = "qemu-system-aarch64"
+machine = "virt,virtualization=on,iommu=smmuv3"
+cpu = "max"
+memory = "4G"
+smp = "2"

@@ -1,0 +1,17 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "hosting_vm"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+petri.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml_edit = { workspace = true, features = ["serde"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

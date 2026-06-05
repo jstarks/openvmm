@@ -3,12 +3,13 @@
 
 //! Integration tests for aarch64 guests.
 
+use anyhow::Context;
 use petri::PetriVmBuilder;
 use petri::PetriVmmBackend;
 use petri::openvmm::OpenVmmPetriBackend;
 use petri::pipette::cmd;
-// TODO: re-enable when boot_dt test is re-enabled
-// use vmm_test_macros::openvmm_test;
+use vm_resource::IntoResource;
+use vmm_test_macros::openvmm_test;
 use vmm_test_macros::vmm_test;
 
 /// Boot Linux and verify the PMU interrupt is available.
@@ -74,6 +75,35 @@ async fn boot_dt(config: PetriVmBuilder<OpenVmmPetriBackend>) -> Result<(), anyh
         !output.status.success(),
         "ACPI tables should not exist in DT-only mode"
     );
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
+/// Boot an aarch64 guest with no VMBus via linux direct boot.
+///
+/// This test is intended to run inside a QEMU TCG hosting VM with KVM,
+/// validating that the basic aarch64 KVM boot path works.
+///
+/// Assigned to the `aarch64-tcg` nextest test group.
+#[openvmm_test(linux_direct_aarch64)]
+async fn boot_no_vmbus_pcie_aarch64_tcg(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    let (vm, agent) = config
+        .with_no_vmbus()
+        .with_memory(petri::MemoryConfig {
+            startup_bytes: 1024 * 1024 * 1024,
+            ..Default::default()
+        })
+        .modify_backend(|b| b.with_pcie_root_topology(1, 1, 3))
+        .run()
+        .await?;
+
+    let sh = agent.unix_shell();
+    let uname = cmd!(sh, "uname -r").read().await?;
+    tracing::info!(uname = %uname, "guest booted successfully");
 
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;

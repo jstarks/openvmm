@@ -6,11 +6,15 @@
 // UNSAFETY: Required for termios raw mode (tcgetattr, tcsetattr, cfmakeraw).
 #![expect(unsafe_code)]
 
+use crate::profile::DeviceConfig;
 use crate::profile::EmulatorConfig;
 use crate::profile::HostingVmProfile;
 use crate::qemu;
 use anyhow::Context;
+use futures_concurrency::future::Race;
+use pal_async::process::PolledChild;
 use petri::cpio;
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -109,6 +113,7 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
 
     let mut cmd = qemu::build_qemu_command(
         qemu_config,
+        &config.profile.devices,
         &config.kernel,
         &patched_initrd_path,
         virtiofsd.socket_path(),
@@ -126,129 +131,178 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     ));
     cmd.stderr(std::process::Stdio::inherit());
 
-    let mut qemu_child = cmd.spawn().context("failed to launch QEMU")?;
+    let qemu_child = cmd.spawn().context("failed to launch QEMU")?;
 
-    // --- connect to pipette over TCP ---
+    // --- run everything inside the async executor ---
 
-    let result = run_via_pipette(host_port, &config);
+    let result: anyhow::Result<_> = pal_async::DefaultPool::run_with(|driver| async move {
+        let mut qemu_child = PolledChild::<std::process::Child>::new(&driver, qemu_child)
+            .context("failed to create PolledChild")?;
 
-    // --- tear down ---
+        let result = run_via_pipette(&driver, host_port, &config, &mut qemu_child).await;
 
-    let exit_code = match result {
-        Ok(code) => Some(code),
-        Err(e) => {
-            tracing::error!("pipette session failed: {e:#}");
-            None
-        }
-    };
-
-    // On success, pipette sent a power_off so QEMU should exit soon.
-    // On failure, QEMU is still running — kill it.
-    if exit_code.is_none() {
-        let _ = qemu_child.kill();
-    }
-    let _ = qemu_child.wait();
-    drop(virtiofsd);
-
-    let elapsed = start.elapsed();
-
-    Ok(HostingVmOutput { exit_code, elapsed })
-}
-
-/// Connect to pipette inside the VM over TCP and execute the command.
-fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i32> {
-    pal_async::DefaultPool::run_with(|driver| async move {
-        // Retry connecting until pipette is ready (VM is still booting)
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], host_port));
-        tracing::info!(%addr, "waiting for pipette");
-        let conn = retry_tcp_connect(&driver, addr, config.timeout).await?;
-
-        let output_dir = config.share_dir.join("test_results");
-        std::fs::create_dir_all(&output_dir).ok();
-
-        let client = pipette_client::PipetteClient::new(&driver, conn, &output_dir)
-            .await
-            .context("failed to connect to pipette")?;
-
-        tracing::info!("connected to pipette");
-        client.ping().await.context("ping failed")?;
-        tracing::info!("ping OK, executing command");
-
-        let (program, args) = config
-            .guest_command
-            .split_first()
-            .context("empty guest command")?;
-
-        let use_pty = std::io::stdin().is_terminal();
-
-        let mut cmd = client.command(program);
-        cmd.args(args);
-        cmd.env("VMM_TESTS_CONTENT_DIR", "/share");
-        cmd.env("HOME", "/root");
-        cmd.current_dir("/share");
-
-        if use_pty {
-            cmd.pty(true);
-        }
-
-        // Put the host terminal into raw mode so that Ctrl-C, etc.
-        // flow through to the guest PTY instead of being handled locally.
-        #[cfg(unix)]
-        let raw_guard = if use_pty {
-            Some(RawModeGuard::enter().context("failed to enter raw mode")?)
-        } else {
-            None
+        let exit_code = match result {
+            Ok(code) => Some(code),
+            Err(e) => {
+                tracing::error!("pipette session failed: {e:#}");
+                None
+            }
         };
 
-        let result = async {
-            let mut child = cmd
-                .spawn()
-                .await
-                .context("failed to spawn command in guest")?;
-            child.wait().await.context("failed to wait for command")
+        // On success, pipette sent a power_off so QEMU should exit soon.
+        // On failure, QEMU is still running — kill it.
+        let child = qemu_child.get_mut();
+        if exit_code.is_none() {
+            let _ = child.kill();
         }
-        .await;
-
-        // Restore terminal before printing anything.
-        #[cfg(unix)]
-        drop(raw_guard);
-
-        let status = result?;
-        tracing::info!(%status, "command exited");
-
-        let exit_code = if let Some(code) = status.code() {
-            code
-        } else if let Some(signal) = status.signal() {
-            tracing::warn!("command killed by signal {signal}");
-            128 + signal
-        } else {
-            tracing::warn!("command exited with unknown status");
-            1
-        };
-
-        // Power off the VM
-        let _ = client.power_off().await;
+        let _ = child.wait();
 
         Ok(exit_code)
+    });
+
+    drop(virtiofsd);
+    let elapsed = start.elapsed();
+
+    Ok(HostingVmOutput {
+        exit_code: result?,
+        elapsed,
     })
 }
 
-/// Retry async TCP connection to pipette until it succeeds or timeout expires.
+/// Connect to pipette inside the VM over TCP and execute the command.
+async fn run_via_pipette(
+    driver: &pal_async::DefaultDriver,
+    host_port: u16,
+    config: &HostingVmConfig,
+    qemu_child: &mut PolledChild<std::process::Child>,
+) -> anyhow::Result<i32> {
+    // Retry connecting until pipette is ready (VM is still booting),
+    // or QEMU exits early (e.g., bad arguments).
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], host_port));
+    tracing::info!(%addr, "waiting for pipette");
+    let conn = retry_tcp_connect(driver, addr, config.timeout, qemu_child).await?;
+
+    let output_dir = config.share_dir.join("test_results");
+    std::fs::create_dir_all(&output_dir).ok();
+
+    let client = pipette_client::PipetteClient::new(&driver, conn, &output_dir)
+        .await
+        .context("failed to connect to pipette")?;
+
+    tracing::info!("connected to pipette");
+    client.ping().await.context("ping failed")?;
+    tracing::info!("ping OK");
+
+    // Set up VFIO devices before running the guest command.
+    let vfio_env = setup_vfio_devices(&client, &config.profile.devices).await?;
+
+    tracing::info!("executing command");
+
+    let (program, args) = config
+        .guest_command
+        .split_first()
+        .context("empty guest command")?;
+
+    let use_pty = std::io::stdin().is_terminal();
+
+    let mut cmd = client.command(program);
+    cmd.args(args);
+    cmd.env("VMM_TESTS_CONTENT_DIR", "/share");
+    cmd.env("HOME", "/root");
+    cmd.current_dir("/share");
+
+    // Pass VFIO device BDFs as environment variables
+    for (key, value) in &vfio_env {
+        cmd.env(key, value);
+    }
+
+    if use_pty {
+        cmd.pty(true);
+    }
+
+    // Put the host terminal into raw mode so that Ctrl-C, etc.
+    // flow through to the guest PTY instead of being handled locally.
+    #[cfg(unix)]
+    let raw_guard = if use_pty {
+        Some(RawModeGuard::enter().context("failed to enter raw mode")?)
+    } else {
+        None
+    };
+
+    let result = async {
+        let mut child = cmd
+            .spawn()
+            .await
+            .context("failed to spawn command in guest")?;
+        child.wait().await.context("failed to wait for command")
+    }
+    .await;
+
+    // Restore terminal before printing anything.
+    #[cfg(unix)]
+    drop(raw_guard);
+
+    let status = result?;
+    tracing::info!(%status, "command exited");
+
+    let exit_code = if let Some(code) = status.code() {
+        code
+    } else if let Some(signal) = status.signal() {
+        tracing::warn!("command killed by signal {signal}");
+        128 + signal
+    } else {
+        tracing::warn!("command exited with unknown status");
+        1
+    };
+
+    // Power off the VM
+    let _ = client.power_off().await;
+
+    Ok(exit_code)
+}
+
+/// Retry async TCP connection to pipette until it succeeds, timeout
+/// expires, or the QEMU process exits.
 async fn retry_tcp_connect(
     driver: &impl pal_async::driver::Driver,
     addr: std::net::SocketAddr,
     timeout: Duration,
+    qemu_child: &mut PolledChild<std::process::Child>,
 ) -> anyhow::Result<pal_async::socket::PolledSocket<std::net::TcpStream>> {
     let deadline = Instant::now() + timeout;
-    let mut timer = pal_async::timer::PolledTimer::new(driver);
     loop {
-        match pal_async::socket::PolledSocket::connect_tcp(driver, addr).await {
-            Ok(conn) => return Ok(conn),
-            Err(_) if Instant::now() < deadline => {
-                timer.sleep(Duration::from_millis(500)).await;
+        enum Event {
+            Connected(pal_async::socket::PolledSocket<std::net::TcpStream>),
+            ConnectFailed,
+            QemuExited(std::process::ExitStatus),
+        }
+
+        let event = (
+            async {
+                match pal_async::socket::PolledSocket::connect_tcp(driver, addr).await {
+                    Ok(conn) => Event::Connected(conn),
+                    Err(_) => Event::ConnectFailed,
+                }
+            },
+            async {
+                match qemu_child.wait().await {
+                    Ok(status) => Event::QemuExited(status),
+                    Err(_) => Event::QemuExited(std::process::ExitStatus::default()),
+                }
+            },
+        )
+            .race()
+            .await;
+
+        match event {
+            Event::Connected(conn) => return Ok(conn),
+            Event::QemuExited(status) => {
+                anyhow::bail!("QEMU exited before pipette connected (status: {status})");
             }
-            Err(e) => {
-                anyhow::bail!("timed out connecting to pipette on {addr}: {e}");
+            Event::ConnectFailed => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("timed out connecting to pipette on {addr}");
+                }
             }
         }
     }
@@ -263,6 +317,108 @@ fn pick_free_port() -> anyhow::Result<u16> {
         .context("failed to get local addr")?
         .port();
     Ok(port)
+}
+
+/// Set up VFIO devices inside the hosting VM.
+///
+/// Each extra device in the profile sits behind its own PCIe root port
+/// at a known PCI device number (see [`qemu::EXTRA_DEVICE_ADDR_BASE`]). This
+/// function discovers the child device's BDF by finding the bridge at
+/// that slot in sysfs, then unbinds the child from its driver and binds
+/// it to vfio-pci.
+///
+/// Returns a map of environment variables to set for the guest command,
+/// e.g., `HOSTING_VM_VFIO_BDF_TEST_DISK=0000:01:00.0`.
+async fn setup_vfio_devices(
+    client: &pipette_client::PipetteClient,
+    devices: &[DeviceConfig],
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+
+    // Collect (device_index, config) for devices that need VFIO binding.
+    let vfio_devices: Vec<_> = devices
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| match d {
+            DeviceConfig::VirtioBlk(cfg) if cfg.vfio => Some((i, cfg)),
+            DeviceConfig::VirtioBlk(_) => None,
+        })
+        .collect();
+
+    if vfio_devices.is_empty() {
+        return Ok(env);
+    }
+
+    tracing::info!("setting up {} VFIO device(s)", vfio_devices.len());
+
+    let sh = client.unix_shell();
+
+    for (device_index, cfg) in &vfio_devices {
+        let addr = qemu::EXTRA_DEVICE_ADDR_BASE + device_index;
+
+        // The root port BDF is deterministic: 0000:00:{addr:02x}.0
+        // Find the first child device on the secondary bus behind it.
+        let rp_bdf = format!("0000:00:{addr:02x}.0");
+        let bdf = sh
+            .cmd("sh")
+            .arg("-c")
+            .arg(format!(
+                concat!(
+                    "bridge=/sys/bus/pci/devices/{rp}; ",
+                    "if [ ! -d \"$bridge/pci_bus\" ]; then echo NOTFOUND; exit 0; fi; ",
+                    "bus=$(ls $bridge/pci_bus/ | head -1); ",
+                    "child=$(ls -d /sys/bus/pci/devices/$bus:* 2>/dev/null | head -1); ",
+                    "if [ -n \"$child\" ]; then basename $child; else echo NOTFOUND; fi",
+                ),
+                rp = rp_bdf,
+            ))
+            .read()
+            .await?;
+
+        let bdf = bdf.trim().to_string();
+        if bdf == "NOTFOUND" || bdf.is_empty() {
+            anyhow::bail!(
+                "could not find child device behind root port at addr {} for device '{}'",
+                addr,
+                cfg.name
+            );
+        }
+
+        tracing::info!(name = %cfg.name, %bdf, %addr, "binding device to vfio-pci");
+
+        // Unbind from current driver
+        let _ = client
+            .write_file(
+                format!("/sys/bus/pci/devices/{bdf}/driver/unbind"),
+                bdf.as_bytes(),
+            )
+            .await;
+
+        // Set driver override to vfio-pci
+        client
+            .write_file(
+                format!("/sys/bus/pci/devices/{bdf}/driver_override"),
+                b"vfio-pci".as_slice(),
+            )
+            .await
+            .context("failed to set driver_override")?;
+
+        // Bind to vfio-pci
+        client
+            .write_file("/sys/bus/pci/drivers/vfio-pci/bind", bdf.as_bytes())
+            .await
+            .context("failed to bind to vfio-pci")?;
+
+        // Export env var: name "test-disk" → HOSTING_VM_VFIO_BDF_TEST_DISK
+        let env_name = format!(
+            "HOSTING_VM_VFIO_BDF_{}",
+            cfg.name.to_uppercase().replace('-', "_")
+        );
+        tracing::info!(%env_name, %bdf, "VFIO device ready");
+        env.insert(env_name, bdf);
+    }
+
+    Ok(env)
 }
 
 /// RAII guard that puts stdin into raw mode and restores it on drop.

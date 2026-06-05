@@ -92,9 +92,6 @@ impl SimpleFlowNode for Node {
                     "Launching hosting VM with profile: {}",
                     profile_path.display()
                 );
-                log::info!("Kernel:  {}", kernel.display());
-                log::info!("Initrd:  {}", initrd.display());
-                log::info!("Share:   {}", share_dir.display());
 
                 let mut cmd = std::process::Command::new(&hosting_vm_bin);
                 cmd.arg("--profile")

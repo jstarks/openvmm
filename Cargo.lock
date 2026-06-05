@@ -3293,6 +3293,7 @@ name = "hosting_vm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "futures-concurrency",
  "libc",
  "pal_async",
  "petri",
@@ -10360,6 +10361,7 @@ dependencies = [
  "tmk_tests",
  "tracing",
  "unix_socket",
+ "vfio_assigned_device_resources",
  "virtio_resources",
  "vm_resource",
  "vmgs_resources",

@@ -12,6 +12,9 @@ use std::path::Path;
 pub struct HostingVmProfile {
     /// Emulator configuration.
     pub emulator: EmulatorConfig,
+    /// Extra devices to add to the emulated platform.
+    #[serde(default)]
+    pub devices: Vec<DeviceConfig>,
 }
 
 /// Emulator-specific configuration, tagged by `type`.
@@ -20,6 +23,33 @@ pub struct HostingVmProfile {
 pub enum EmulatorConfig {
     /// QEMU TCG emulation.
     QemuTcg(QemuTcgConfig),
+}
+
+/// A device to add to the emulated platform.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DeviceConfig {
+    /// A virtio-blk disk device.
+    VirtioBlk(VirtioBlkDeviceConfig),
+}
+
+/// Configuration for a virtio-blk device added to the hosting VM.
+#[derive(Debug, Deserialize)]
+pub struct VirtioBlkDeviceConfig {
+    /// Name for this device (used in env var names, e.g., "test-disk" →
+    /// `HOSTING_VM_VFIO_BDF_TEST_DISK`).
+    pub name: String,
+    /// Size of the RAM-backed disk (e.g., "64M").
+    #[serde(default = "default_disk_size")]
+    pub size: String,
+    /// If true, bind the device to vfio-pci after boot, making it available
+    /// for passthrough into the L2 guest.
+    #[serde(default)]
+    pub vfio: bool,
+}
+
+fn default_disk_size() -> String {
+    "64M".to_string()
 }
 
 /// QEMU TCG configuration parsed from the profile.
@@ -82,16 +112,33 @@ mod tests {
 [emulator]
 type = "qemu-tcg"
 binary = "qemu-system-aarch64"
-machine = "virt,virtualization=on,iommu=smmuv3"
+machine = "virt,virtualization=on,iommu=smmuv3,gic-version=3"
 cpu = "max"
 memory = "4G"
 smp = "2"
+
+[[devices]]
+type = "virtio-blk"
+name = "test-disk"
+size = "64M"
+vfio = true
 "#;
         let profile = HostingVmProfile::from_toml(toml).unwrap();
         match &profile.emulator {
             EmulatorConfig::QemuTcg(cfg) => {
-                assert_eq!(cfg.machine, "virt,virtualization=on,iommu=smmuv3");
+                assert_eq!(
+                    cfg.machine,
+                    "virt,virtualization=on,iommu=smmuv3,gic-version=3"
+                );
                 assert_eq!(cfg.cpu, "max");
+            }
+        }
+        assert_eq!(profile.devices.len(), 1);
+        match &profile.devices[0] {
+            DeviceConfig::VirtioBlk(cfg) => {
+                assert_eq!(cfg.name, "test-disk");
+                assert_eq!(cfg.size, "64M");
+                assert!(cfg.vfio);
             }
         }
     }

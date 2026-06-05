@@ -11,11 +11,16 @@ use crate::profile::EmulatorConfig;
 use crate::profile::HostingVmProfile;
 use crate::qemu;
 use anyhow::Context;
+use futures::AsyncReadExt;
 use futures_concurrency::future::Race;
+use pal_async::pipe::PolledPipe;
 use pal_async::process::PolledChild;
+use pal_async::task::Spawn;
 use petri::cpio;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -72,7 +77,7 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
         mount -t sysfs none /sys\n\
         mkdir -p /dev/pts /share /root /tmp /etc\n\
         mount -t devpts devpts /dev/pts\n\
-        mount -t virtiofs hostshare /share\n\
+        mount -t 9p -o trans=virtio,version=9p2000.L hostshare /share\n\
         ip link set eth0 up\n\
         ip addr add 10.0.2.15/24 dev eth0\n\
         ip route add default via 10.0.2.2\n\
@@ -99,12 +104,6 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     std::fs::write(&patched_initrd_path, &patched_initrd)
         .context("failed to write patched initrd")?;
 
-    // --- start virtiofsd ---
-
-    let sock = config.share_dir.join(".hosting-vm-virtiofs.sock");
-    let virtiofsd =
-        qemu::Virtiofsd::start(&config.share_dir, &sock).context("failed to start virtiofsd")?;
-
     // --- launch QEMU ---
 
     let EmulatorConfig::QemuTcg(ref qemu_config) = config.profile.emulator;
@@ -116,30 +115,43 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
         &config.profile.devices,
         &config.kernel,
         &patched_initrd_path,
-        virtiofsd.socket_path(),
+        &config.share_dir,
         host_port,
         kernel_cmdline,
     );
 
-    // QEMU runs in the background. Serial console goes to a log file
-    // (kernel dmesg + pipette stderr); pipette handles all command I/O over TCP.
+    // QEMU runs in the background. Serial console goes to a pipe;
+    // an async task copies output to a log file and signals when
+    // pipette prints its readiness marker.
     let serial_log = config.share_dir.join("hosting-vm-serial.log");
     tracing::info!(path = %serial_log.display(), "serial log");
     cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::from(
-        std::fs::File::create(&serial_log).context("failed to create serial log")?,
-    ));
+    cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::inherit());
 
-    let qemu_child = cmd.spawn().context("failed to launch QEMU")?;
+    let mut qemu_child = cmd.spawn().context("failed to launch QEMU")?;
+    let qemu_stdout = qemu_child.stdout.take().expect("stdout should be piped");
 
     // --- run everything inside the async executor ---
 
-    let result: anyhow::Result<_> = pal_async::DefaultPool::run_with(|driver| async move {
+    let result: anyhow::Result<_> = pal_async::DefaultPool::run_with(async |driver| {
         let mut qemu_child = PolledChild::<std::process::Child>::new(&driver, qemu_child)
             .context("failed to create PolledChild")?;
 
-        let result = run_via_pipette(&driver, host_port, &config, &mut qemu_child).await;
+        // Relay serial output to the log file in a spawned task.
+        // Sends a signal when pipette's "PIPETTE READY" marker appears.
+        let (ready_tx, ready_rx) = mesh::oneshot::<()>();
+        let serial_pipe = PolledPipe::new(
+            &driver,
+            std::fs::File::from(std::os::unix::io::OwnedFd::from(qemu_stdout)),
+        )
+        .context("failed to create polled pipe for serial output")?;
+        let serial_log_path = serial_log.clone();
+        let relay_task = driver.spawn("serial-relay", async move {
+            relay_serial_output(serial_pipe, &serial_log_path, ready_tx).await;
+        });
+
+        let result = run_via_pipette(&driver, host_port, &config, &mut qemu_child, ready_rx).await;
 
         let exit_code = match result {
             Ok(code) => Some(code),
@@ -157,10 +169,12 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
         }
         let _ = child.wait();
 
+        // Wait for the serial relay to finish flushing.
+        relay_task.await;
+
         Ok(exit_code)
     });
 
-    drop(virtiofsd);
     let elapsed = start.elapsed();
 
     Ok(HostingVmOutput {
@@ -175,12 +189,18 @@ async fn run_via_pipette(
     host_port: u16,
     config: &HostingVmConfig,
     qemu_child: &mut PolledChild<std::process::Child>,
+    ready_rx: mesh::OneshotReceiver<()>,
 ) -> anyhow::Result<i32> {
-    // Retry connecting until pipette is ready (VM is still booting),
-    // or QEMU exits early (e.g., bad arguments).
+    // Wait for pipette to print its readiness marker on the serial
+    // console, or for QEMU to exit (indicating a boot failure).
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], host_port));
-    tracing::info!(%addr, "waiting for pipette");
-    let conn = retry_tcp_connect(driver, addr, config.timeout, qemu_child).await?;
+    tracing::info!(%addr, "waiting for pipette ready signal");
+    wait_for_pipette_ready(driver, config.timeout, qemu_child, ready_rx).await?;
+
+    tracing::info!("pipette ready, connecting");
+    let conn = pal_async::socket::PolledSocket::connect_tcp(driver, addr)
+        .await
+        .context("failed to connect to pipette")?;
 
     let output_dir = config.share_dir.join("test_results");
     std::fs::create_dir_all(&output_dir).ok();
@@ -261,47 +281,99 @@ async fn run_via_pipette(
     Ok(exit_code)
 }
 
-/// Retry async TCP connection to pipette until it succeeds, timeout
-/// expires, or the QEMU process exits.
-async fn retry_tcp_connect(
+/// Wait for pipette to signal readiness via the serial console relay
+/// thread. Races against QEMU exit and a timeout.
+async fn wait_for_pipette_ready(
     driver: &impl pal_async::driver::Driver,
-    addr: std::net::SocketAddr,
     timeout: Duration,
     qemu_child: &mut PolledChild<std::process::Child>,
-) -> anyhow::Result<pal_async::socket::PolledSocket<std::net::TcpStream>> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        enum Event {
-            Connected(pal_async::socket::PolledSocket<std::net::TcpStream>),
-            ConnectFailed,
-            QemuExited(std::process::ExitStatus),
-        }
+    ready_rx: mesh::OneshotReceiver<()>,
+) -> anyhow::Result<()> {
+    enum Event {
+        Ready,
+        QemuExited(std::process::ExitStatus),
+        Timeout,
+    }
 
-        let event = (
-            async {
-                match pal_async::socket::PolledSocket::connect_tcp(driver, addr).await {
-                    Ok(conn) => Event::Connected(conn),
-                    Err(_) => Event::ConnectFailed,
-                }
-            },
-            async {
-                match qemu_child.wait().await {
-                    Ok(status) => Event::QemuExited(status),
-                    Err(_) => Event::QemuExited(std::process::ExitStatus::default()),
-                }
-            },
-        )
-            .race()
-            .await;
-
-        match event {
-            Event::Connected(conn) => return Ok(conn),
-            Event::QemuExited(status) => {
-                anyhow::bail!("QEMU exited before pipette connected (status: {status})");
+    let event = (
+        async {
+            match ready_rx.await {
+                Ok(()) => Event::Ready,
+                // Sender dropped without sending — relay thread exited
+                // without seeing the marker (QEMU likely crashed).
+                Err(_) => Event::QemuExited(std::process::ExitStatus::default()),
             }
-            Event::ConnectFailed => {
-                if Instant::now() >= deadline {
-                    anyhow::bail!("timed out connecting to pipette on {addr}");
+        },
+        async {
+            match qemu_child.wait().await {
+                Ok(status) => Event::QemuExited(status),
+                Err(_) => Event::QemuExited(std::process::ExitStatus::default()),
+            }
+        },
+        async {
+            pal_async::timer::PolledTimer::new(driver)
+                .sleep(timeout)
+                .await;
+            Event::Timeout
+        },
+    )
+        .race()
+        .await;
+
+    match event {
+        Event::Ready => Ok(()),
+        Event::QemuExited(status) => {
+            anyhow::bail!("QEMU exited before pipette was ready (status: {status})");
+        }
+        Event::Timeout => {
+            anyhow::bail!("timed out waiting for pipette ready signal");
+        }
+    }
+}
+
+/// Relay QEMU serial output to a log file, signaling when
+/// pipette's readiness marker appears.
+async fn relay_serial_output(
+    mut stdout: PolledPipe,
+    log_path: &Path,
+    ready_tx: mesh::OneshotSender<()>,
+) {
+    let mut log = match std::fs::File::create(log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create serial log");
+            return;
+        }
+    };
+
+    let mut ready_tx = Some(ready_tx);
+    let mut buf = vec![0u8; 4096];
+    let mut line = Vec::new();
+
+    loop {
+        let n = match stdout.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+
+        let chunk = &buf[..n];
+        let _ = log.write_all(chunk);
+
+        // Scan for the readiness marker, line by line.
+        if ready_tx.is_some() {
+            for &byte in chunk {
+                if byte == b'\n' {
+                    if line
+                        .windows(b"PIPETTE READY".len())
+                        .any(|w| w == b"PIPETTE READY")
+                    {
+                        if let Some(tx) = ready_tx.take() {
+                            tx.send(());
+                        }
+                    }
+                    line.clear();
+                } else {
+                    line.push(byte);
                 }
             }
         }

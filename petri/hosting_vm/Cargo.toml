@@ -8,8 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 futures-concurrency.workspace = true
 libc.workspace = true
+mesh.workspace = true
 pal_async.workspace = true
 petri.workspace = true
 pipette_client.workspace = true

@@ -853,21 +853,16 @@ impl SimpleFlowNode for Node {
                     } else {
                         "cargo-nextest"
                     };
-                    let guest_cmd = format!(
-                        "/share/{nextest_bin} nextest run \
-                         --archive-file /share/{archive} \
-                         --workspace-remap /share \
-                         --filter-expr '{filter}'",
-                        nextest_bin = nextest_bin_name,
-                        archive = nextest_archive_file.file_name().unwrap().to_string_lossy(),
-                        filter = nextest_filter_expr,
+                    let nextest_bin = format!("/share/{nextest_bin_name}");
+                    let archive = format!(
+                        "/share/{}",
+                        nextest_archive_file.file_name().unwrap().to_string_lossy()
                     );
 
                     log::info!(
                         "Launching hosting VM with profile: {}",
                         profile_path.display()
                     );
-                    log::info!("Guest command: {}", guest_cmd);
 
                     let status = std::process::Command::new("cargo")
                         .arg("run")
@@ -879,7 +874,15 @@ impl SimpleFlowNode for Node {
                         .arg("--share")
                         .arg(&test_content_dir)
                         .arg("--")
-                        .arg(&guest_cmd)
+                        .arg(&nextest_bin)
+                        .arg("nextest")
+                        .arg("run")
+                        .arg("--archive-file")
+                        .arg(&archive)
+                        .arg("--workspace-remap")
+                        .arg("/share")
+                        .arg("--filter-expr")
+                        .arg(&nextest_filter_expr)
                         .status()
                         .context("failed to launch hosting VM")?;
 

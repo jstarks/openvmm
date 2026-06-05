@@ -87,13 +87,11 @@ fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| find_aarch64_initrd().expect("could not find aarch64 initrd"));
 
-    let guest_command = guest_cmd_parts.join(" ");
-
     eprintln!("Profile: {profile_path}");
     eprintln!("Kernel:  {}", kernel.display());
     eprintln!("Initrd:  {}", initrd.display());
     eprintln!("Share:   {share_dir}");
-    eprintln!("Command: {guest_command}");
+    eprintln!("Command: {guest_cmd_parts:?}");
     eprintln!();
 
     let output = hosting_vm::run_in_hosting_vm(hosting_vm::HostingVmConfig {
@@ -101,7 +99,7 @@ fn main() -> anyhow::Result<()> {
         kernel,
         initrd,
         share_dir: std::path::PathBuf::from(share_dir),
-        guest_command,
+        guest_command: guest_cmd_parts,
         timeout: std::time::Duration::from_secs(timeout_secs),
     })?;
 

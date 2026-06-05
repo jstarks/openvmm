@@ -3293,10 +3293,13 @@ name = "hosting_vm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "pal_async",
  "petri",
+ "pipette_client",
  "serde",
  "tempfile",
  "toml_edit",
+ "tracing",
 ]
 
 [[package]]

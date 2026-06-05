@@ -91,6 +91,7 @@ pub fn build_qemu_command(
     kernel: &Path,
     initrd: &Path,
     virtiofsd_socket: &Path,
+    host_pipette_port: u16,
     kernel_cmdline: &str,
 ) -> Command {
     let mut cmd = Command::new(&config.binary);
@@ -116,7 +117,14 @@ pub fn build_qemu_command(
     ));
     cmd.arg("-numa").arg("node,memdev=mem");
 
-    // Console on serial
+    // User-mode networking with port forwarding for pipette TCP
+    cmd.arg("-netdev").arg(format!(
+        "user,id=net0,hostfwd=tcp::{host_pipette_port}-:{guest_port}",
+        guest_port = pipette_client::PIPETTE_PORT,
+    ));
+    cmd.arg("-device").arg("virtio-net-pci,netdev=net0");
+
+    // Console on serial (diagnostic only)
     cmd.arg("-serial").arg("mon:stdio");
 
     cmd

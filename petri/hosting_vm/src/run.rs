@@ -8,6 +8,7 @@ use crate::profile::HostingVmProfile;
 use crate::qemu;
 use anyhow::Context;
 use petri::cpio;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -22,8 +23,8 @@ pub struct HostingVmConfig {
     pub initrd: PathBuf,
     /// Directory to share into the VM at `/share`.
     pub share_dir: PathBuf,
-    /// The command to run inside the VM.
-    pub guest_command: String,
+    /// The command to run inside the VM: program followed by arguments.
+    pub guest_command: Vec<String>,
     /// Timeout for the entire run (boot + command + shutdown).
     pub timeout: Duration,
 }
@@ -39,31 +40,39 @@ pub struct HostingVmOutput {
 /// Run a command inside a hosting VM.
 ///
 /// Boots an emulated VM according to the profile, mounts `share_dir` at
-/// `/share` inside the guest, runs `guest_command`, and returns the exit
-/// code. Console output streams to the host's stdout in real time.
+/// `/share` inside the guest, connects to pipette over TCP, executes the
+/// command, and returns the exit code. Stdout/stderr are relayed to the
+/// host process in real time.
 pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOutput> {
     let start = Instant::now();
     let work_dir = tempfile::tempdir().context("failed to create temp dir")?;
 
-    // --- build the init script ---
+    // --- pick a host port for pipette TCP forwarding ---
 
-    let init_script = format!(
-        "#!/bin/sh\n\
-         /bin/busybox --install /bin 2>/dev/null\n\
-         mount -t devtmpfs none /dev\n\
-         mount -t proc none /proc\n\
-         mount -t sysfs none /sys\n\
-         mkdir -p /share\n\
-         mount -t virtiofs hostshare /share\n\
-         export VMM_TESTS_CONTENT_DIR=/share\n\
-         export HOME=/root\n\
-         mkdir -p /root\n\
-         cd /share\n\
-         {cmd}\n\
-         echo $? > /share/.hosting-vm-exit-code\n\
-         poweroff -f\n",
-        cmd = config.guest_command,
-    );
+    let host_port = pick_free_port().context("failed to find a free port")?;
+
+    // --- build the init script ---
+    // Sets up the environment, mounts virtio-fs, brings up networking,
+    // and launches pipette in TCP mode. Pipette then waits for the host
+    // to connect and send commands.
+
+    // QEMU user-mode networking defaults: guest is 10.0.2.15/24, gateway 10.0.2.2
+    let init_script = "\
+        #!/bin/sh\n\
+        /bin/busybox --install /bin 2>/dev/null\n\
+        mount -t devtmpfs none /dev\n\
+        mount -t proc none /proc\n\
+        mount -t sysfs none /sys\n\
+        mkdir -p /share /root /tmp\n\
+        mount -t virtiofs hostshare /share\n\
+        ip link set eth0 up\n\
+        ip addr add 10.0.2.15/24 dev eth0\n\
+        ip route add default via 10.0.2.2\n\
+        export VMM_TESTS_CONTENT_DIR=/share\n\
+        export HOME=/root\n\
+        cd /share\n\
+        exec /share/pipette --transport tcp\n"
+        .to_string();
 
     // --- inject init script into initrd ---
 
@@ -80,11 +89,6 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     let patched_initrd_path = work_dir.path().join("initrd.gz");
     std::fs::write(&patched_initrd_path, &patched_initrd)
         .context("failed to write patched initrd")?;
-
-    // --- clean stale exit code ---
-
-    let exit_code_path = config.share_dir.join(".hosting-vm-exit-code");
-    let _ = std::fs::remove_file(&exit_code_path);
 
     // --- start virtiofsd ---
 
@@ -103,34 +107,126 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
         &config.kernel,
         &patched_initrd_path,
         virtiofsd.socket_path(),
+        host_port,
         kernel_cmdline,
     );
 
-    // Inherit stdio so console streams to the host in real time
+    // QEMU runs in the background. Serial console goes to a log file
+    // (kernel dmesg only); pipette handles all command I/O over TCP.
+    let serial_log = work_dir.path().join("serial.log");
     cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::from(
+        std::fs::File::create(&serial_log).context("failed to create serial log")?,
+    ));
     cmd.stderr(std::process::Stdio::inherit());
 
-    let status = cmd.status().context("failed to launch QEMU")?;
+    let mut qemu_child = cmd.spawn().context("failed to launch QEMU")?;
+
+    // --- connect to pipette over TCP ---
+
+    let result = run_via_pipette(host_port, &config);
+
+    // --- tear down ---
+
+    let exit_code = match result {
+        Ok(code) => Some(code),
+        Err(e) => {
+            tracing::error!("pipette session failed: {e:#}");
+            None
+        }
+    };
+
+    // Wait for QEMU to exit (it should exit after pipette powers off the VM)
+    let _ = qemu_child.wait();
+    drop(virtiofsd);
 
     let elapsed = start.elapsed();
 
-    // --- virtiofsd cleanup happens on drop ---
-
-    drop(virtiofsd);
-
-    // --- read exit code ---
-
-    let exit_code = if exit_code_path.exists() {
-        let code_str =
-            std::fs::read_to_string(&exit_code_path).context("failed to read guest exit code")?;
-        code_str.trim().parse::<i32>().ok()
-    } else if !status.success() {
-        // QEMU itself failed (timeout, crash, etc.)
-        status.code()
-    } else {
-        None
-    };
-
     Ok(HostingVmOutput { exit_code, elapsed })
+}
+
+/// Connect to pipette inside the VM over TCP and execute the command.
+fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i32> {
+    pal_async::DefaultPool::run_with(|driver| async move {
+        // Retry connecting until pipette is ready (VM is still booting)
+        eprintln!("Waiting for pipette on port {host_port}...");
+        let conn = retry_tcp_connect(host_port, config.timeout).await?;
+        eprintln!("TCP connected, wrapping in PolledSocket...");
+        let conn =
+            pal_async::socket::PolledSocket::new(&driver, conn).context("failed to poll socket")?;
+
+        let output_dir = config.share_dir.join("test_results");
+        std::fs::create_dir_all(&output_dir).ok();
+
+        eprintln!("Creating PipetteClient...");
+        let client = pipette_client::PipetteClient::new(&driver, conn, &output_dir)
+            .await
+            .context("failed to connect to pipette")?;
+
+        eprintln!("Connected to pipette, executing command");
+
+        let (program, args) = config
+            .guest_command
+            .split_first()
+            .context("empty guest command")?;
+
+        let mut cmd = client.command(program);
+        cmd.args(args);
+        cmd.env("VMM_TESTS_CONTENT_DIR", "/share");
+        cmd.env("HOME", "/root");
+        cmd.current_dir("/share");
+
+        let child = cmd
+            .spawn()
+            .await
+            .context("failed to spawn command in guest")?;
+        let output = child.wait_with_output().await.context("command failed")?;
+
+        let exit_code = if let Some(code) = output.status.code() {
+            code
+        } else if let Some(signal) = output.status.signal() {
+            tracing::warn!("command killed by signal {signal}");
+            128 + signal
+        } else {
+            tracing::warn!("command exited with unknown status");
+            1
+        };
+
+        // Power off the VM
+        let _ = client.power_off().await;
+
+        Ok(exit_code)
+    })
+}
+
+/// Retry TCP connection to pipette until it succeeds or timeout expires.
+async fn retry_tcp_connect(port: u16, timeout: Duration) -> anyhow::Result<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => {
+                stream
+                    .set_nodelay(true)
+                    .context("failed to set TCP_NODELAY")?;
+                return Ok(stream);
+            }
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                anyhow::bail!("timed out connecting to pipette on port {port}: {e}");
+            }
+        }
+    }
+}
+
+/// Find a free TCP port by binding to port 0 and reading the assigned port.
+fn pick_free_port() -> anyhow::Result<u16> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral port")?;
+    let port = listener
+        .local_addr()
+        .context("failed to get local addr")?
+        .port();
+    Ok(port)
 }

@@ -11,6 +11,7 @@ use crate::profile::HostingVmProfile;
 use crate::qemu;
 use anyhow::Context;
 use petri::cpio;
+use std::io::IsTerminal;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -65,7 +66,8 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
         mount -t devtmpfs none /dev\n\
         mount -t proc none /proc\n\
         mount -t sysfs none /sys\n\
-        mkdir -p /share /root /tmp\n\
+        mkdir -p /dev/pts /share /root /tmp\n\
+        mount -t devpts devpts /dev/pts\n\
         mount -t virtiofs hostshare /share\n\
         ip link set eth0 up\n\
         ip addr add 10.0.2.15/24 dev eth0\n\
@@ -175,12 +177,7 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
             .split_first()
             .context("empty guest command")?;
 
-        // TODO: PTY support. The current open_pty implementation conflicts
-        // with Command's piped stdio — pre_exec dup2 overwrites the piped fds,
-        // orphaning the mesh relay. Needs a different approach: either use
-        // Stdio::from(slave) (which broke mesh WritePipe flushing) or relay
-        // PTY master ↔ piped child stdio at the OS level.
-        let use_pty = false;
+        let use_pty = std::io::stdin().is_terminal();
 
         let mut cmd = client.command(program);
         cmd.args(args);
@@ -194,8 +191,11 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
 
         // Put the host terminal into raw mode so that Ctrl-C, etc.
         // flow through to the guest PTY instead of being handled locally.
-        // TODO: re-enable once PTY output is confirmed working
-        let _raw_guard: Option<RawModeGuard> = None;
+        let _raw_guard = if use_pty {
+            Some(RawModeGuard::enter().context("failed to enter raw mode")?)
+        } else {
+            None
+        };
 
         eprintln!("Spawning command (pty={use_pty})...");
         let mut child = cmd

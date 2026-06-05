@@ -58,19 +58,21 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     // and launches pipette in TCP mode. Pipette then waits for the host
     // to connect and send commands.
 
-    // QEMU user-mode networking defaults: guest is 10.0.2.15/24, gateway 10.0.2.2
+    // QEMU user-mode networking defaults: guest is 10.0.2.15/24, gateway 10.0.2.2,
+    // DNS forwarder at 10.0.2.3.
     let init_script = "\
         #!/bin/sh\n\
         /bin/busybox --install /bin 2>/dev/null\n\
         mount -t devtmpfs none /dev\n\
         mount -t proc none /proc\n\
         mount -t sysfs none /sys\n\
-        mkdir -p /dev/pts /share /root /tmp\n\
+        mkdir -p /dev/pts /share /root /tmp /etc\n\
         mount -t devpts devpts /dev/pts\n\
         mount -t virtiofs hostshare /share\n\
         ip link set eth0 up\n\
         ip addr add 10.0.2.15/24 dev eth0\n\
         ip route add default via 10.0.2.2\n\
+        echo 'nameserver 10.0.2.3' > /etc/resolv.conf\n\
         export VMM_TESTS_CONTENT_DIR=/share\n\
         export HOME=/root\n\
         cd /share\n\

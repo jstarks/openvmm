@@ -1660,8 +1660,7 @@ impl IntoPipeline for CheckinGatesCli {
 
         // Emit aarch64 TCG hosting VM test job.
         // Runs aarch64-linux tests inside QEMU TCG on an x86_64 Linux CI runner.
-        // Not available on ADO (no pool configured).
-        if !matches!(backend_hint, PipelineBackendHint::Ado) {
+        {
             let test_label = "aarch64-linux-tcg-vmm-tests".to_string();
             let resolve_tcg = vmm_tests_artifacts_linux_aarch64_tcg;
 
@@ -1677,7 +1676,8 @@ impl IntoPipeline for CheckinGatesCli {
                     FlowArch::X86_64,
                     "run vmm-tests [aarch64-linux-tcg]",
                 )
-                .gh_set_pool(gh_pools::default_linux());
+                .gh_set_pool(gh_pools::default_linux())
+                .ado_set_pool(ado_pools::default_linux());
 
             vmm_tests_run_job = vmm_tests_run_job.dep_on(|ctx| {
                 let (dep_artifact_dirs, hosting_vm_params) = resolve_tcg(ctx);

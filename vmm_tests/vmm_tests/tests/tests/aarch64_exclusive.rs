@@ -97,7 +97,13 @@ async fn boot_no_vmbus_pcie_aarch64_tcg(
             startup_bytes: 1024 * 1024 * 1024,
             ..Default::default()
         })
-        .modify_backend(|b| b.with_pcie_root_topology(1, 1, 3))
+        .modify_backend(|b| {
+            b.with_pcie_root_topology(1, 1, 3).with_custom_config(|c| {
+                // KVM/aarch64 does not support the synthetic hypervisor
+                // interface (--hv).
+                c.hypervisor.with_hv = false;
+            })
+        })
         .run()
         .await?;
 

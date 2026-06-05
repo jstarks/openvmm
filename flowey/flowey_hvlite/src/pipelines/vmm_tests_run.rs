@@ -117,7 +117,7 @@ pub struct VmmTestsRunCli {
     /// automatically overridden to match the profile's architecture,
     /// artifacts are cross-compiled, and tests run inside the hosting VM.
     ///
-    /// Example: `--hosting-vm petri/hosting_vm/profiles/arm-smmu-nested.toml`
+    /// Example: `--hosting-vm petri/hosting_vm/profiles/aarch64-pcie.toml`
     #[clap(long)]
     hosting_vm: Option<PathBuf>,
 }

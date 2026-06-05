@@ -1687,7 +1687,7 @@ impl IntoPipeline for CheckinGatesCli {
                         .use_typed_artifact(&use_vmm_tests_archive_linux_aarch64),
                     target: target_lexicon::triple!("aarch64-unknown-linux-gnu"),
                     nextest_profile: flowey_lib_hvlite::run_cargo_nextest_run::NextestProfile::Ci,
-                    nextest_filter_expr: Some("test(smmu)".to_string()),
+                    nextest_filter_expr: Some("group(aarch64-tcg)".to_string()),
                     dep_artifact_dirs,
                     test_artifacts: vec![
                         KnownTestArtifacts::Alpine323Aarch64Vhd,
@@ -2065,7 +2065,7 @@ mod vmm_tests_artifact_builders {
 
             Ok(Box::new(move |ctx| {
                 let profile_content =
-                    include_str!("../../../../petri/hosting_vm/profiles/arm-smmu-nested.toml")
+                    include_str!("../../../../petri/hosting_vm/profiles/aarch64-pcie.toml")
                         .to_string();
 
                 let dep_artifacts = VmmTestsDepArtifacts {

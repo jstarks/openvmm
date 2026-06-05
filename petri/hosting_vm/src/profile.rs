@@ -77,7 +77,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_arm_smmu_profile() {
+    fn parse_aarch64_pcie_profile() {
         let toml = r#"
 [emulator]
 type = "qemu-tcg"

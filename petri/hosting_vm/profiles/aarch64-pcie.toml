@@ -1,10 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# Hosting VM profile: AArch64 with SMMUv3 and nested virtualization
+# Hosting VM profile: AArch64 with PCIe (SMMUv3, KVM)
 #
-# Provides an emulated ARM platform with KVM + SMMUv3 for testing
-# SMMU s1 acceleration in OpenVMM/OpenHCL.
+# Provides an emulated ARM platform with KVM, SMMUv3, and PCIe
+# topology for testing IOMMU, device assignment, and PCIe device
+# emulation in OpenVMM/OpenHCL.
 
 [emulator]
 type = "qemu-tcg"

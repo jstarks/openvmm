@@ -12,7 +12,6 @@ use crate::qemu;
 use anyhow::Context;
 use petri::cpio;
 use std::io::IsTerminal;
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -118,7 +117,7 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     // QEMU runs in the background. Serial console goes to a log file
     // (kernel dmesg + pipette stderr); pipette handles all command I/O over TCP.
     let serial_log = config.share_dir.join("hosting-vm-serial.log");
-    eprintln!("Serial log: {}", serial_log.display());
+    tracing::info!(path = %serial_log.display(), "serial log");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::from(
         std::fs::File::create(&serial_log).context("failed to create serial log")?,
@@ -136,7 +135,7 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     let exit_code = match result {
         Ok(code) => Some(code),
         Err(e) => {
-            eprintln!("pipette session failed: {e:#}");
+            tracing::error!("pipette session failed: {e:#}");
             None
         }
     };
@@ -158,23 +157,20 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
 fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i32> {
     pal_async::DefaultPool::run_with(|driver| async move {
         // Retry connecting until pipette is ready (VM is still booting)
-        eprintln!("Waiting for pipette on port {host_port}...");
-        let conn = retry_tcp_connect(host_port, config.timeout).await?;
-        eprintln!("TCP connected, wrapping in PolledSocket...");
-        let conn =
-            pal_async::socket::PolledSocket::new(&driver, conn).context("failed to poll socket")?;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], host_port));
+        tracing::info!(%addr, "waiting for pipette");
+        let conn = retry_tcp_connect(&driver, addr, config.timeout).await?;
 
         let output_dir = config.share_dir.join("test_results");
         std::fs::create_dir_all(&output_dir).ok();
 
-        eprintln!("Creating PipetteClient...");
         let client = pipette_client::PipetteClient::new(&driver, conn, &output_dir)
             .await
             .context("failed to connect to pipette")?;
 
-        eprintln!("Connected to pipette, pinging...");
+        tracing::info!("connected to pipette");
         client.ping().await.context("ping failed")?;
-        eprintln!("Ping OK, executing command");
+        tracing::info!("ping OK, executing command");
 
         let (program, args) = config
             .guest_command
@@ -195,6 +191,7 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
 
         // Put the host terminal into raw mode so that Ctrl-C, etc.
         // flow through to the guest PTY instead of being handled locally.
+        #[cfg(unix)]
         let raw_guard = if use_pty {
             Some(RawModeGuard::enter().context("failed to enter raw mode")?)
         } else {
@@ -211,10 +208,11 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
         .await;
 
         // Restore terminal before printing anything.
+        #[cfg(unix)]
         drop(raw_guard);
 
         let status = result?;
-        eprintln!("Command exited: {status}");
+        tracing::info!(%status, "command exited");
 
         let exit_code = if let Some(code) = status.code() {
             code
@@ -233,22 +231,22 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
     })
 }
 
-/// Retry TCP connection to pipette until it succeeds or timeout expires.
-async fn retry_tcp_connect(port: u16, timeout: Duration) -> anyhow::Result<TcpStream> {
+/// Retry async TCP connection to pipette until it succeeds or timeout expires.
+async fn retry_tcp_connect(
+    driver: &impl pal_async::driver::Driver,
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> anyhow::Result<pal_async::socket::PolledSocket<std::net::TcpStream>> {
     let deadline = Instant::now() + timeout;
+    let mut timer = pal_async::timer::PolledTimer::new(driver);
     loop {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => {
-                stream
-                    .set_nodelay(true)
-                    .context("failed to set TCP_NODELAY")?;
-                return Ok(stream);
-            }
+        match pal_async::socket::PolledSocket::connect_tcp(driver, addr).await {
+            Ok(conn) => return Ok(conn),
             Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(500));
+                timer.sleep(Duration::from_millis(500)).await;
             }
             Err(e) => {
-                anyhow::bail!("timed out connecting to pipette on port {port}: {e}");
+                anyhow::bail!("timed out connecting to pipette on {addr}: {e}");
             }
         }
     }

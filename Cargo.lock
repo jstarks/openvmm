@@ -3300,6 +3300,7 @@ dependencies = [
  "serde",
  "toml_edit",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

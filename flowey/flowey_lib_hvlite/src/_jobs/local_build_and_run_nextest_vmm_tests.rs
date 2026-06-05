@@ -102,6 +102,7 @@ impl SimpleFlowNode for Node {
 
     fn imports(ctx: &mut ImportCtx<'_>) {
         ctx.import::<crate::build_guest_test_uefi::Node>();
+        ctx.import::<crate::build_hosting_vm::Node>();
         ctx.import::<crate::build_nextest_vmm_tests::Node>();
         ctx.import::<crate::build_openhcl_igvm_from_recipe::Node>();
         ctx.import::<crate::build_openvmm::Node>();
@@ -123,6 +124,9 @@ impl SimpleFlowNode for Node {
         ctx.import::<flowey_lib_common::download_cargo_nextest::Node>();
         ctx.import::<flowey_lib_common::gen_cargo_nextest_run_cmd::Node>();
         ctx.import::<crate::install_vmm_tests_deps::Node>();
+        ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
+        ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
+        ctx.import::<crate::run_in_hosting_vm::Node>();
         ctx.import::<crate::run_prep_steps::Node>();
         ctx.import::<crate::build_vmgstool::Node>();
     }
@@ -844,52 +848,65 @@ impl SimpleFlowNode for Node {
                 .absolute()
                 .context("failed to resolve hosting VM profile path")?;
 
-            ctx.emit_rust_step("run tests in hosting VM", |ctx| {
+            let host_arch = match ctx.arch() {
+                FlowArch::X86_64 => CommonArch::X86_64,
+                FlowArch::Aarch64 => CommonArch::Aarch64,
+                other => anyhow::bail!("unsupported host architecture for hosting VM: {other:?}"),
+            };
+            let hosting_vm_target = CommonTriple::Common {
+                arch: host_arch,
+                platform: CommonPlatform::LinuxGnu,
+            };
+            let hosting_vm_bin = ctx.reqv(|v| crate::build_hosting_vm::Request {
+                target: hosting_vm_target,
+                profile: if release {
+                    CommonProfile::Release
+                } else {
+                    CommonProfile::Debug
+                },
+                hosting_vm: v,
+            });
+
+            let hosting_vm_bin = hosting_vm_bin.map(ctx, |o| o.bin);
+
+            let kernel = ctx.reqv(|v| {
+                crate::resolve_openvmm_test_linux_kernel::Request::Get(
+                    crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
+                    arch,
+                    crate::resolve_openvmm_test_linux_kernel::DEFAULT_LINUX_TEST_KERNEL_VERSION,
+                    v,
+                )
+            });
+            let initrd = ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
+
+            let archive_name = nextest_archive_file
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+
+            let results = ctx.reqv(|v| crate::run_in_hosting_vm::Request {
+                hosting_vm_bin,
+                profile_path: ReadVar::from_static(profile_path),
+                kernel,
+                initrd,
+                share_dir: ReadVar::from_static(test_content_dir),
+                nextest_archive_name: ReadVar::from_static(archive_name),
+                nextest_filter_expr: Some(nextest_filter_expr),
+                nextest_profile,
+                extra_env: Some(extra_env),
+                pre_run_deps: side_effects,
+                results: v,
+            });
+
+            ctx.emit_rust_step("report hosting VM results", |ctx| {
                 done.claim(ctx);
-                side_effects.claim(ctx);
+                let results = results.claim(ctx);
                 move |rt| {
-                    let nextest_bin_name = if cfg!(windows) {
-                        "cargo-nextest.exe"
-                    } else {
-                        "cargo-nextest"
-                    };
-                    let nextest_bin = format!("/share/{nextest_bin_name}");
-                    let archive = format!(
-                        "/share/{}",
-                        nextest_archive_file.file_name().unwrap().to_string_lossy()
-                    );
-
-                    log::info!(
-                        "Launching hosting VM with profile: {}",
-                        profile_path.display()
-                    );
-
-                    let status = std::process::Command::new("cargo")
-                        .arg("run")
-                        .arg("-p")
-                        .arg("hosting_vm")
-                        .arg("--")
-                        .arg("--profile")
-                        .arg(&profile_path)
-                        .arg("--share")
-                        .arg(&test_content_dir)
-                        .arg("--")
-                        .arg(&nextest_bin)
-                        .arg("nextest")
-                        .arg("run")
-                        .arg("--archive-file")
-                        .arg(&archive)
-                        .arg("--workspace-remap")
-                        .arg("/share")
-                        .arg("--filter-expr")
-                        .arg(&nextest_filter_expr)
-                        .status()
-                        .context("failed to launch hosting VM")?;
-
-                    if !status.success() {
-                        anyhow::bail!("hosting VM exited with code: {:?}", status.code());
+                    let results = rt.read(results);
+                    if !results.all_tests_passed {
+                        anyhow::bail!("hosting VM tests failed");
                     }
-
                     Ok(())
                 }
             });

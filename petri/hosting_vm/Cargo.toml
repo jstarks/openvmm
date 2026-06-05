@@ -8,12 +8,12 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+libc.workspace = true
 pal_async.workspace = true
 petri.workspace = true
 pipette_client.workspace = true
 serde = { workspace = true, features = ["derive"] }
 toml_edit = { workspace = true, features = ["serde"] }
-tempfile.workspace = true
 tracing.workspace = true
 
 [lints]

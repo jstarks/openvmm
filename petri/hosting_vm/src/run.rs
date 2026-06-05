@@ -3,6 +3,9 @@
 
 //! Top-level API to run a command inside a hosting VM.
 
+// UNSAFETY: Required for termios raw mode (tcgetattr, tcsetattr, cfmakeraw).
+#![expect(unsafe_code)]
+
 use crate::profile::EmulatorConfig;
 use crate::profile::HostingVmProfile;
 use crate::qemu;
@@ -45,7 +48,6 @@ pub struct HostingVmOutput {
 /// host process in real time.
 pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOutput> {
     let start = Instant::now();
-    let work_dir = tempfile::tempdir().context("failed to create temp dir")?;
 
     // --- pick a host port for pipette TCP forwarding ---
 
@@ -86,13 +88,13 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     )
     .context("failed to inject init script into initrd")?;
 
-    let patched_initrd_path = work_dir.path().join("initrd.gz");
+    let patched_initrd_path = config.share_dir.join(".hosting-vm-initrd.gz");
     std::fs::write(&patched_initrd_path, &patched_initrd)
         .context("failed to write patched initrd")?;
 
     // --- start virtiofsd ---
 
-    let sock = work_dir.path().join("virtiofs.sock");
+    let sock = config.share_dir.join(".hosting-vm-virtiofs.sock");
     let virtiofsd =
         qemu::Virtiofsd::start(&config.share_dir, &sock).context("failed to start virtiofsd")?;
 
@@ -112,8 +114,9 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     );
 
     // QEMU runs in the background. Serial console goes to a log file
-    // (kernel dmesg only); pipette handles all command I/O over TCP.
-    let serial_log = work_dir.path().join("serial.log");
+    // (kernel dmesg + pipette stderr); pipette handles all command I/O over TCP.
+    let serial_log = config.share_dir.join("hosting-vm-serial.log");
+    eprintln!("Serial log: {}", serial_log.display());
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::from(
         std::fs::File::create(&serial_log).context("failed to create serial log")?,
@@ -163,12 +166,21 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
             .await
             .context("failed to connect to pipette")?;
 
-        eprintln!("Connected to pipette, executing command");
+        eprintln!("Connected to pipette, pinging...");
+        client.ping().await.context("ping failed")?;
+        eprintln!("Ping OK, executing command");
 
         let (program, args) = config
             .guest_command
             .split_first()
             .context("empty guest command")?;
+
+        // TODO: PTY support. The current open_pty implementation conflicts
+        // with Command's piped stdio — pre_exec dup2 overwrites the piped fds,
+        // orphaning the mesh relay. Needs a different approach: either use
+        // Stdio::from(slave) (which broke mesh WritePipe flushing) or relay
+        // PTY master ↔ piped child stdio at the OS level.
+        let use_pty = false;
 
         let mut cmd = client.command(program);
         cmd.args(args);
@@ -176,15 +188,27 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
         cmd.env("HOME", "/root");
         cmd.current_dir("/share");
 
-        let child = cmd
+        if use_pty {
+            cmd.pty(true);
+        }
+
+        // Put the host terminal into raw mode so that Ctrl-C, etc.
+        // flow through to the guest PTY instead of being handled locally.
+        // TODO: re-enable once PTY output is confirmed working
+        let _raw_guard: Option<RawModeGuard> = None;
+
+        eprintln!("Spawning command (pty={use_pty})...");
+        let mut child = cmd
             .spawn()
             .await
             .context("failed to spawn command in guest")?;
-        let output = child.wait_with_output().await.context("command failed")?;
+        eprintln!("Spawn OK, waiting for exit...");
+        let status = child.wait().await.context("failed to wait for command")?;
+        eprintln!("Command exited: {status}");
 
-        let exit_code = if let Some(code) = output.status.code() {
+        let exit_code = if let Some(code) = status.code() {
             code
-        } else if let Some(signal) = output.status.signal() {
+        } else if let Some(signal) = status.signal() {
             tracing::warn!("command killed by signal {signal}");
             128 + signal
         } else {
@@ -229,4 +253,47 @@ fn pick_free_port() -> anyhow::Result<u16> {
         .context("failed to get local addr")?
         .port();
     Ok(port)
+}
+
+/// RAII guard that puts stdin into raw mode and restores it on drop.
+#[cfg(unix)]
+struct RawModeGuard {
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn enter() -> anyhow::Result<Self> {
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd;
+
+        let fd = std::io::stdin().as_raw_fd();
+        let mut original = MaybeUninit::zeroed();
+        // SAFETY: tcgetattr writes to the provided pointer.
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            anyhow::bail!("tcgetattr failed: {}", std::io::Error::last_os_error());
+        }
+        // SAFETY: tcgetattr succeeded, so original is initialized.
+        let original = unsafe { original.assume_init() };
+
+        let mut raw = original;
+        // SAFETY: cfmakeraw modifies the termios struct in place.
+        unsafe { libc::cfmakeraw(&mut raw) };
+        // SAFETY: tcsetattr applies the termios settings.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            anyhow::bail!("tcsetattr failed: {}", std::io::Error::last_os_error());
+        }
+
+        Ok(Self { original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        // SAFETY: restoring the original termios settings.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.original) };
+    }
 }

@@ -13,7 +13,7 @@ binary = "/home/jostarks/src/qemu/build/qemu-system-aarch64"
 machine = "virt,virtualization=on,iommu=smmuv3,gic-version=3"
 cpu = "max"
 memory = "4G"
-smp = "1"
+smp = "2"
 
 [[devices]]
 type = "virtio-blk"

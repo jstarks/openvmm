@@ -136,12 +136,16 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     let exit_code = match result {
         Ok(code) => Some(code),
         Err(e) => {
-            tracing::error!("pipette session failed: {e:#}");
+            eprintln!("pipette session failed: {e:#}");
             None
         }
     };
 
-    // Wait for QEMU to exit (it should exit after pipette powers off the VM)
+    // On success, pipette sent a power_off so QEMU should exit soon.
+    // On failure, QEMU is still running — kill it.
+    if exit_code.is_none() {
+        let _ = qemu_child.kill();
+    }
     let _ = qemu_child.wait();
     drop(virtiofsd);
 
@@ -191,19 +195,25 @@ fn run_via_pipette(host_port: u16, config: &HostingVmConfig) -> anyhow::Result<i
 
         // Put the host terminal into raw mode so that Ctrl-C, etc.
         // flow through to the guest PTY instead of being handled locally.
-        let _raw_guard = if use_pty {
+        let raw_guard = if use_pty {
             Some(RawModeGuard::enter().context("failed to enter raw mode")?)
         } else {
             None
         };
 
-        eprintln!("Spawning command (pty={use_pty})...");
-        let mut child = cmd
-            .spawn()
-            .await
-            .context("failed to spawn command in guest")?;
-        eprintln!("Spawn OK, waiting for exit...");
-        let status = child.wait().await.context("failed to wait for command")?;
+        let result = async {
+            let mut child = cmd
+                .spawn()
+                .await
+                .context("failed to spawn command in guest")?;
+            child.wait().await.context("failed to wait for command")
+        }
+        .await;
+
+        // Restore terminal before printing anything.
+        drop(raw_guard);
+
+        let status = result?;
         eprintln!("Command exited: {status}");
 
         let exit_code = if let Some(code) = status.code() {

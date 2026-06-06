@@ -23,7 +23,7 @@ pub fn build_qemu_command(
     cmd.arg("-machine").arg(&config.machine);
     cmd.arg("-cpu").arg(&config.cpu);
     cmd.arg("-m").arg(&config.memory);
-    //    cmd.arg("-smp").arg(&config.smp);
+    cmd.arg("-smp").arg(&config.smp);
     cmd.arg("-nographic");
     cmd.arg("-kernel").arg(kernel);
     cmd.arg("-initrd").arg(initrd);
@@ -65,7 +65,7 @@ pub fn build_qemu_command(
                 cmd.arg("-blockdev")
                     .arg(format!("null-co,node-name={node_name},size={size_bytes}"));
                 cmd.arg("-device")
-                    .arg(format!("virtio-blk-pci,drive={node_name},bus={rp_id}"));
+                    .arg(format!("virtio-blk-pci,drive={node_name},bus={rp_id},iommu_platform=on,disable-legacy=on"));
             }
         }
     }

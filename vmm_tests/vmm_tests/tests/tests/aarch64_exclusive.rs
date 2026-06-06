@@ -136,6 +136,13 @@ async fn boot_no_vmbus_pcie_aarch64_tcg(
         .modify_backend(move |b| {
             b.with_pcie_root_topology(1, 1, 3).with_custom_config(|c| {
                 c.hypervisor.with_hv = false;
+                // Enable private memory and THP for performance under TCG.
+                for node in &mut c.numa.nodes {
+                    if let Some(ref mut mem) = node.mem {
+                        mem.private_memory = true;
+                        //mem.transparent_hugepages = true;
+                    }
+                }
                 c.pcie_devices.push(openvmm_defs::config::PcieDeviceConfig {
                     port_name: "s0rc0rp1".into(),
                     resource: vfio_assigned_device_resources::VfioCdevDeviceHandle {

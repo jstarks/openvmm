@@ -3857,6 +3857,7 @@ dependencies = [
  "tracelimit",
  "tracing",
  "vmcore",
+ "x86defs",
  "zerocopy",
 ]
 

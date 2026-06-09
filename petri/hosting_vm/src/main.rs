@@ -2,11 +2,31 @@
 // Licensed under the MIT License.
 
 //! Standalone CLI for testing the hosting VM launcher.
-//!
-//! Usage:
-//!   cargo run -p hosting_vm -- --profile <profile.toml> \
-//!       --kernel <Image> --initrd <initrd> --share <dir> \
-//!       -- <command>
+
+use clap::Parser;
+
+/// Standalone CLI for testing the hosting VM launcher.
+#[derive(Parser)]
+struct Args {
+    /// Path to a TOML profile file.
+    #[clap(long)]
+    profile: String,
+    /// Path to the kernel image (auto-detected if omitted).
+    #[clap(long)]
+    kernel: Option<std::path::PathBuf>,
+    /// Path to the initrd (auto-detected if omitted).
+    #[clap(long)]
+    initrd: Option<std::path::PathBuf>,
+    /// Directory to share with the guest.
+    #[clap(long)]
+    share: String,
+    /// Timeout in seconds.
+    #[clap(long, default_value_t = 1800)]
+    timeout: u64,
+    /// Command to run in the guest.
+    #[clap(last = true, required = true)]
+    command: Vec<String>,
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -17,98 +37,31 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
+    let args = Args::parse();
 
-    let mut profile_path = None;
-    let mut kernel = None;
-    let mut initrd = None;
-    let mut share_dir = None;
-    let mut timeout_secs: u64 = 1800;
-    let mut guest_cmd_parts = Vec::new();
-    let mut after_dashdash = false;
+    let profile = hosting_vm::HostingVmProfile::from_file(std::path::Path::new(&args.profile))?;
 
-    let mut i = 1;
-    while i < args.len() {
-        if after_dashdash {
-            guest_cmd_parts.push(args[i].clone());
-            i += 1;
-            continue;
-        }
-        match args[i].as_str() {
-            "--" => {
-                after_dashdash = true;
-                i += 1;
-            }
-            "--profile" => {
-                profile_path = Some(args.get(i + 1).expect("--profile requires a value").clone());
-                i += 2;
-            }
-            "--kernel" => {
-                kernel = Some(args.get(i + 1).expect("--kernel requires a value").clone());
-                i += 2;
-            }
-            "--initrd" => {
-                initrd = Some(args.get(i + 1).expect("--initrd requires a value").clone());
-                i += 2;
-            }
-            "--share" => {
-                share_dir = Some(args.get(i + 1).expect("--share requires a value").clone());
-                i += 2;
-            }
-            "--timeout" => {
-                timeout_secs = args
-                    .get(i + 1)
-                    .expect("--timeout requires a value")
-                    .parse()
-                    .expect("--timeout must be a number");
-                i += 2;
-            }
-            other => {
-                eprintln!("Unknown argument: {other}");
-                print_usage();
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let profile_path = profile_path.unwrap_or_else(|| {
-        print_usage();
-        std::process::exit(1);
-    });
-    let share_dir = share_dir.unwrap_or_else(|| {
-        print_usage();
-        std::process::exit(1);
-    });
-
-    if guest_cmd_parts.is_empty() {
-        eprintln!("Error: command required after --");
-        print_usage();
-        std::process::exit(1);
-    }
-
-    let profile = hosting_vm::HostingVmProfile::from_file(std::path::Path::new(&profile_path))?;
-
-    let kernel = kernel
-        .map(std::path::PathBuf::from)
+    let kernel = args
+        .kernel
         .unwrap_or_else(|| find_aarch64_kernel().expect("could not find aarch64 kernel"));
-    let initrd = initrd
-        .map(std::path::PathBuf::from)
+    let initrd = args
+        .initrd
         .unwrap_or_else(|| find_aarch64_initrd().expect("could not find aarch64 initrd"));
 
-    eprintln!("Profile: {profile_path}");
+    eprintln!("Profile: {}", args.profile);
     eprintln!("Kernel:  {}", kernel.display());
     eprintln!("Initrd:  {}", initrd.display());
-    eprintln!("Share:   {share_dir}");
-    eprintln!("Command: {guest_cmd_parts:?}");
+    eprintln!("Share:   {}", args.share);
+    eprintln!("Command: {:?}", args.command);
     eprintln!();
 
     let output = hosting_vm::run_in_hosting_vm(hosting_vm::HostingVmConfig {
         profile,
         kernel,
         initrd,
-        share_dir: std::path::PathBuf::from(share_dir),
-        guest_command: guest_cmd_parts,
-        timeout: std::time::Duration::from_secs(timeout_secs),
+        share_dir: std::path::PathBuf::from(args.share),
+        guest_command: args.command,
+        timeout: std::time::Duration::from_secs(args.timeout),
     })?;
 
     eprintln!();
@@ -119,12 +72,6 @@ fn main() -> anyhow::Result<()> {
     );
 
     std::process::exit(output.exit_code.unwrap_or(1));
-}
-
-fn print_usage() {
-    eprintln!(
-        "Usage: hosting-vm --profile <profile.toml> --share <dir> [--kernel <Image>] [--initrd <initrd>] [--timeout <secs>] -- <command...>"
-    );
 }
 
 /// Search for an aarch64 kernel in the openvmm deps directory.

@@ -754,6 +754,9 @@ impl PetriVmInspector for OpenVmmInspector {
     async fn inspect_all(&self) -> anyhow::Result<inspect::Node> {
         Ok(self.worker.inspect_all().await)
     }
+    async fn inspect_path(&self, path: &str) -> anyhow::Result<inspect::Node> {
+        Ok(self.worker.inspect_path(path).await)
+    }
 }
 
 /// Interface to the OpenVMM framebuffer

@@ -98,7 +98,7 @@ const ECAP_VALUE: u64 = EcapReg::new()
     .with_c(true)
     .with_qi(true)
     .with_ir(true)
-    .with_eim(false) // TODO: Enable once KVM x2APIC + synic timer issue is resolved
+    .with_eim(true) // Testing: x2APIC + VT-d with EIM enabled
     .with_pt(true)
     .with_sc(true)
     .with_iro(Reg::IVA.0 / 16)

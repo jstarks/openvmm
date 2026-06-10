@@ -5,10 +5,13 @@
 
 use anyhow::Context;
 use futures::StreamExt;
+use petri::ApicMode;
 use petri::EfiDiagnosticsLogLevel;
 use petri::MemoryConfig;
 use petri::PetriHaltReason;
 use petri::PetriVmBuilder;
+use petri::PetriVmInspector;
+use petri::PetriVmRuntime;
 use petri::PetriVmmBackend;
 use petri::ProcessorTopology;
 use petri::SIZE_1_GB;
@@ -98,6 +101,73 @@ async fn boot<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Result<(
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;
     Ok(())
+}
+
+/// Boot a Windows guest with x2APIC mode enabled at reset and an Intel VT-d
+/// IOMMU advertising EIM=1 (Extended Interrupt Mode). The APIC starts in
+/// x2APIC mode, so there is no dynamic xAPIC→x2APIC transition. This tests
+/// whether VT-d + x2APIC works when the transition is avoided.
+///
+/// If KVM's synic timer stops delivering interrupts, Windows will hang in
+/// `HalpTimerInitializeClock` and the test will time out.
+#[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64)))]
+async fn boot_x2apic(config: PetriVmBuilder<OpenVmmPetriBackend>) -> Result<(), anyhow::Error> {
+    let (mut vm, agent) = config
+        .with_processor_topology(ProcessorTopology {
+            vp_count: 4,
+            apic_mode: Some(ApicMode::X2apicEnabled),
+            ..Default::default()
+        })
+        .with_boot_device_type(petri::BootDeviceType::PcieNvme)
+        .modify_backend(|b| {
+            b.with_pcie_root_topology(1, 1, 2)
+                .with_intel_vtd(&["s0rc0"])
+        })
+        .run()
+        .await?;
+
+    // Verify x2APIC is active by inspecting the APIC base MSR from the VMM.
+    // Bit 10 of IA32_APIC_BASE is the x2APIC enable bit.
+    {
+        let inspector = vm.backend().inspector().context("no inspector")?;
+        let node = inspector.inspect_path("partition/vp/0").await?;
+        let apic_base = find_inspect_value(&node, "apic_base")
+            .context("apic_base not found in inspect tree")?;
+        tracing::info!("apic_base = {:#x}", apic_base);
+        assert!(
+            apic_base & (1 << 10) != 0,
+            "x2APIC not enabled: apic_base = {:#x} (bit 10 not set)",
+            apic_base
+        );
+    }
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
+/// Recursively search an inspect node tree for a value with the given name.
+fn find_inspect_value(node: &inspect::Node, name: &str) -> Option<u64> {
+    match node {
+        inspect::Node::Dir(entries) => {
+            for entry in entries {
+                if entry.name == name {
+                    if let inspect::Node::Value(v) = &entry.node {
+                        return match &v.kind {
+                            inspect::ValueKind::Unsigned(x) => Some(*x),
+                            inspect::ValueKind::Signed(x) => Some(*x as u64),
+                            _ => None,
+                        };
+                    }
+                }
+                if let Some(v) = find_inspect_value(&entry.node, name) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Basic boot test using virtio vsock instead of vmbus hvsocket.

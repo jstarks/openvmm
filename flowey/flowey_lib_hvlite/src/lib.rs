@@ -57,6 +57,7 @@ pub mod install_openvmm_rust_build_essential;
 pub mod install_vmm_tests_deps;
 pub mod resolve_openhcl_kernel_package;
 pub mod resolve_openvmm_deps;
+pub mod resolve_openvmm_qemu;
 pub mod resolve_openvmm_test_initrd;
 pub mod resolve_openvmm_test_linux_kernel;
 pub mod resolve_openvmm_test_virtio_win;

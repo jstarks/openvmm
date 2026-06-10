@@ -33,6 +33,8 @@ flowey_request! {
         pub nextest_profile: NextestProfile,
         /// Additional environment variables.
         pub extra_env: Option<ReadVar<BTreeMap<String, String>>>,
+        /// Path to the QEMU binary (overrides the profile's binary setting).
+        pub qemu_binary: Option<ReadVar<PathBuf>>,
         /// Wait for specified side-effects before running.
         pub pre_run_deps: Vec<ReadVar<SideEffect>>,
         /// Results of running the tests.
@@ -58,6 +60,7 @@ impl SimpleFlowNode for Node {
             nextest_filter_expr,
             nextest_profile,
             extra_env,
+            qemu_binary,
             pre_run_deps,
             results,
         } = request;
@@ -70,6 +73,7 @@ impl SimpleFlowNode for Node {
             let share_dir = share_dir.claim(ctx);
             let nextest_archive_name = nextest_archive_name.claim(ctx);
             let extra_env = extra_env.claim(ctx);
+            let qemu_binary = qemu_binary.claim(ctx);
             let results = results.claim(ctx);
             for dep in pre_run_deps {
                 dep.claim(ctx);
@@ -83,6 +87,7 @@ impl SimpleFlowNode for Node {
                 let share_dir = rt.read(share_dir);
                 let archive_name = rt.read(nextest_archive_name);
                 let extra_env = extra_env.map(|v| rt.read(v));
+                let qemu_binary = qemu_binary.map(|v| rt.read(v));
 
                 let nextest_bin_name = "cargo-nextest";
                 let guest_nextest = format!("/share/{nextest_bin_name}");
@@ -101,8 +106,13 @@ impl SimpleFlowNode for Node {
                     .arg("--initrd")
                     .arg(&initrd)
                     .arg("--share")
-                    .arg(&share_dir)
-                    .arg("--")
+                    .arg(&share_dir);
+
+                if let Some(ref qemu_binary) = qemu_binary {
+                    cmd.arg("--qemu-binary").arg(qemu_binary);
+                }
+
+                cmd.arg("--")
                     .arg(&guest_nextest)
                     .arg("nextest")
                     .arg("run")

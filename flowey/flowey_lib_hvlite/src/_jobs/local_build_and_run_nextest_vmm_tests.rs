@@ -879,6 +879,14 @@ impl SimpleFlowNode for Node {
             });
             let initrd = ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
 
+            let qemu_binary = ctx.reqv(|v| {
+                crate::resolve_openvmm_qemu::Request::Get(
+                    crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
+                    host_arch,
+                    v,
+                )
+            });
+
             let archive_name = nextest_archive_file
                 .file_name()
                 .unwrap()
@@ -895,6 +903,7 @@ impl SimpleFlowNode for Node {
                 nextest_filter_expr: Some(nextest_filter_expr),
                 nextest_profile,
                 extra_env: Some(extra_env),
+                qemu_binary: Some(qemu_binary),
                 pre_run_deps: side_effects,
                 results: v,
             });

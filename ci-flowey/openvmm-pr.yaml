@@ -3943,12 +3943,14 @@ jobs:
     displayName: unpack mu_msvm package (aarch64)
   - bash: $(FLOWEY_BIN) e 20 flowey_lib_hvlite::resolve_openvmm_test_virtio_win 0
     displayName: unpack openvmm-test-virtio-win archive
+  - bash: $(FLOWEY_BIN) e 20 flowey_lib_hvlite::init_vmm_tests_env 0
+    displayName: setting up vmm_tests env
   - bash: |-
       set -e
-      $(FLOWEY_BIN) e 20 flowey_lib_hvlite::init_vmm_tests_env 0
+      $(FLOWEY_BIN) e 20 flowey_lib_hvlite::resolve_openvmm_qemu 0
       $(FLOWEY_BIN) e 20 flowey_core::pipeline::artifact::resolve 6
       $(FLOWEY_BIN) e 20 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 1
-    displayName: setting up vmm_tests env
+    displayName: unpack QEMU archive
   - bash: |-
       set -e
       $(FLOWEY_BIN) e 20 flowey_lib_hvlite::run_in_hosting_vm 0

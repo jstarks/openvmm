@@ -53,7 +53,7 @@ fn default_disk_size() -> String {
 }
 
 /// QEMU TCG configuration parsed from the profile.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QemuTcgConfig {
     /// Path or name of the QEMU binary (e.g., "qemu-system-aarch64").
     #[serde(default = "default_qemu_binary")]

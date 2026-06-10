@@ -95,6 +95,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::init_openvmm_magicpath_uefi_mu_msvm::Node>();
         ctx.import::<crate::install_vmm_tests_deps::Node>();
         ctx.import::<crate::init_vmm_tests_env::Node>();
+        ctx.import::<crate::resolve_openvmm_qemu::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
         ctx.import::<crate::run_in_hosting_vm::Node>();
@@ -260,6 +261,15 @@ impl SimpleFlowNode for Node {
             });
             let initrd = ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
 
+            let host_arch: crate::common::CommonArch = ctx.arch().try_into()?;
+            let qemu_binary = ctx.reqv(|v| {
+                crate::resolve_openvmm_qemu::Request::Get(
+                    crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
+                    host_arch,
+                    v,
+                )
+            });
+
             // Write the profile content to a file and prepare the archive
             // in the share directory.
             let hosting_vm_bin = hosting_vm_bin.map(ctx, |o| o.bin);
@@ -323,6 +333,7 @@ impl SimpleFlowNode for Node {
                 nextest_filter_expr: nextest_filter_expr.clone(),
                 nextest_profile,
                 extra_env: Some(extra_env),
+                qemu_binary: Some(qemu_binary),
                 pre_run_deps: Vec::new(),
                 results: v,
             })

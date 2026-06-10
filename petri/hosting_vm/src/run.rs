@@ -39,6 +39,8 @@ pub struct HostingVmConfig {
     pub guest_command: Vec<String>,
     /// Timeout for the entire run (boot + command + shutdown).
     pub timeout: Duration,
+    /// If set, override the QEMU binary path specified in the profile.
+    pub qemu_binary_override: Option<PathBuf>,
 }
 
 /// Result of a hosting VM run.
@@ -107,6 +109,18 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     // --- launch QEMU ---
 
     let EmulatorConfig::QemuTcg(ref qemu_config) = config.profile.emulator;
+
+    // Apply QEMU binary override if specified.
+    let qemu_config_override;
+    let qemu_config = if let Some(ref qemu_binary) = config.qemu_binary_override {
+        qemu_config_override = crate::profile::QemuTcgConfig {
+            binary: qemu_binary.display().to_string(),
+            ..qemu_config.clone()
+        };
+        &qemu_config_override
+    } else {
+        qemu_config
+    };
 
     let kernel_cmdline = "console=ttyAMA0 rdinit=/tcg-init.sh";
 

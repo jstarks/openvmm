@@ -20,6 +20,9 @@ struct Args {
     /// Directory to share with the guest.
     #[clap(long)]
     share: String,
+    /// Override the QEMU binary path from the profile.
+    #[clap(long)]
+    qemu_binary: Option<std::path::PathBuf>,
     /// Timeout in seconds.
     #[clap(long, default_value_t = 1800)]
     timeout: u64,
@@ -62,6 +65,7 @@ fn main() -> anyhow::Result<()> {
         share_dir: std::path::PathBuf::from(args.share),
         guest_command: args.command,
         timeout: std::time::Duration::from_secs(args.timeout),
+        qemu_binary_override: args.qemu_binary,
     })?;
 
     eprintln!();

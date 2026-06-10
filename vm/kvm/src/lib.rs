@@ -1717,7 +1717,7 @@ impl<'a> Processor<'a> {
         unsafe {
             ioctl::kvm_set_nested_state(
                 self.get().vcpu.as_raw_fd(),
-                &*std::ptr::from_ref(&buffer).cast::<kvm_nested_state>(),
+                &*std::ptr::from_ref(buffer).cast::<kvm_nested_state>(),
             )
             .map_err(Error::SetNestedState)?;
         }

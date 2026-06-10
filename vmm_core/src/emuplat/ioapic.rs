@@ -9,10 +9,12 @@ impl<T: ?Sized + virt::irqcon::IoApicRouting> chipset_resources::ioapic::IoApicR
     for IoApicRouting<T>
 {
     fn assert(&self, index: u8) {
+        tracing::debug!(index, "ioapic assert");
         self.0.assert_irq(index);
     }
 
     fn set_route(&self, index: u8, request: Option<(u64, u32)>) {
+        tracing::debug!(index, ?request, "ioapic set_route");
         self.0.set_irq_route(
             index,
             request.map(|(address, data)| virt::irqcon::MsiRequest { address, data }),

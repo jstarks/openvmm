@@ -951,10 +951,14 @@ impl iommu_common::IommuTranslator for VtdTranslator {
             .shared
             .translate_locked(&state, bus, devfn, iova, write)
         {
-            Ok(gpa) => gpa,
+            Ok(gpa) => {
+                tracing::debug!(rid, iova, gpa, write, "vtd translate ok");
+                gpa
+            }
             Err(fault) => {
                 // Drop the read lock before acquiring write lock for fault recording.
                 drop(state);
+                tracing::debug!(rid, iova, write, ?fault, "vtd translate fault");
                 fault.record(&self.shared, write);
                 return Err(iommu_common::TranslationFault { iova, error: fault });
             }
@@ -984,6 +988,7 @@ impl SignalMsi for VtdSignalMsi {
         let Some(device_id) = devid else {
             // No source ID — drop the MSI. Without a BDF, source validation
             // and IRTE lookup are impossible.
+            tracing::debug!(address, data, "vtd signal_msi: no devid, dropped");
             return;
         };
         let source_id = device_id as u16;
@@ -994,6 +999,14 @@ impl SignalMsi for VtdSignalMsi {
             .remap_msi_locked(&state, source_id, address, data)
         {
             Ok((new_address, new_data)) => {
+                tracing::debug!(
+                    source_id,
+                    address,
+                    data,
+                    new_address,
+                    new_data,
+                    "vtd msi remap ok"
+                );
                 drop(state);
                 self.inner.signal_msi(devid, new_address, new_data);
             }
@@ -1148,7 +1161,7 @@ impl IntelVtdDevice {
     /// write. No register requires atomic writes across both DWORDs.
     fn write_register_dword(&self, offset: u16, value: u32) {
         let mut state = self.shared.state.write();
-        tracing::trace!(offset, value, "vtd mmio_write_dword");
+        tracing::debug!(offset, value, "vtd mmio_write_dword");
 
         /// Merge a DWORD write into the lo or hi half of a 64-bit value.
         fn write_lo(old: u64, value: u32) -> u64 {
@@ -1321,6 +1334,7 @@ impl IntelVtdDevice {
     fn process_gcmd(&self, state: &mut VtdState, value: u32) {
         let gcmd = GcmdReg::from(value);
         let mut gsts = state.gsts;
+        tracing::debug!(?gcmd, ?gsts, "vtd process_gcmd");
 
         // -- One-shot: Set Root Table Pointer (SRTP) --
         if gcmd.srtp() {

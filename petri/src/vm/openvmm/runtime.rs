@@ -667,18 +667,18 @@ impl PetriVmInner {
                     match c.until_cancelled(handshake).await {
                         Ok(Ok(client)) => break client,
                         Ok(Err(e)) => {
-                            tracing::warn!(
+                            tracing::trace!(
                                 error = &e as &dyn std::error::Error,
                                 "pipette TCP handshake failed, retrying"
                             );
                         }
                         Err(_) => {
-                            tracing::warn!("pipette TCP handshake timed out, reconnecting");
+                            tracing::trace!("pipette TCP handshake timed out, reconnecting");
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::trace!(
                         error = &e as &dyn std::error::Error,
                         "TCP connect failed, guest not ready yet"
                     );

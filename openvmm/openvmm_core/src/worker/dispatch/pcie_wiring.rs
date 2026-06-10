@@ -36,10 +36,17 @@ pub(super) struct PcieMsiPlatform<'a> {
     /// Processor topology (determines ITS wrapping on aarch64).
     #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
     pub processor_topology: &'a ProcessorTopology,
-    /// AMD IOMMU shared state for interrupt remapping, or `None` if this
-    /// entity is not behind an AMD IOMMU.
+    /// x86 IOMMU shared state for interrupt remapping, or `None` if this
+    /// entity is not behind an IOMMU.
     #[cfg(guest_arch = "x86_64")]
-    pub iommu: Option<&'a Arc<amd_iommu::IommuSharedState>>,
+    pub iommu: Option<X86IommuSharedState<'a>>,
+}
+
+/// Enum dispatching between AMD IOMMU and Intel VT-d shared state on x86_64.
+#[cfg(guest_arch = "x86_64")]
+pub(super) enum X86IommuSharedState<'a> {
+    AmdVi(&'a Arc<amd_iommu::IommuSharedState>),
+    IntelVtd(&'a Arc<intel_vtd::VtdSharedState>),
 }
 
 /// Wrapped `SignalMsi` and `IrqFd` for a PCIe entity.
@@ -96,7 +103,7 @@ impl PcieMsiPlatform<'_> {
             irqfd = irqfd.map(|fd| Arc::new(pcie::its::ItsIrqFd::new(fd, self.segment)) as _);
         }
 
-        // x86_64 AMD IOMMU: wrap with interrupt remapping.
+        // x86_64 IOMMU: wrap with interrupt remapping.
         //
         // TODO: irqfd is disabled because kernel-mediated MSI routes
         // bypass our emulated interrupt remapping. We could support
@@ -104,8 +111,15 @@ impl PcieMsiPlatform<'_> {
         // and push the remapped address/data to the kernel, then
         // re-pushing on INVALIDATE_INTERRUPT_TABLE commands.
         #[cfg(guest_arch = "x86_64")]
-        if let Some(shared) = &self.iommu {
-            signal_msi = signal_msi.map(|s| shared.wrap_signal_msi(s) as _);
+        if let Some(iommu_state) = &self.iommu {
+            match iommu_state {
+                X86IommuSharedState::AmdVi(shared) => {
+                    signal_msi = signal_msi.map(|s| shared.wrap_signal_msi(s) as _);
+                }
+                X86IommuSharedState::IntelVtd(shared) => {
+                    signal_msi = signal_msi.map(|s| shared.wrap_signal_msi(s) as _);
+                }
+            }
             irqfd = None;
         }
 
@@ -190,17 +204,30 @@ pub(super) fn build_device_wiring(params: PcieDeviceWiringParams<'_>) -> PcieDev
         };
     }
 
-    // x86_64 AMD IOMMU: wrap GuestMemory with DMA translation.
+    // x86_64 IOMMU: wrap GuestMemory with DMA translation.
     // MSI interrupt remapping was already applied by wrap_msi().
     #[cfg(guest_arch = "x86_64")]
-    if let Some(shared) = params.msi_platform.iommu {
-        let translator = shared.translator();
-        let translating_gm = iommu_common::TranslatingMemory::new_guest_memory(
-            "amd-iommu-translating",
-            translator,
-            params.bus_range.clone(),
-            params.guest_memory.clone(),
-        );
+    if let Some(iommu_state) = &params.msi_platform.iommu {
+        let translating_gm = match iommu_state {
+            X86IommuSharedState::AmdVi(shared) => {
+                let translator = shared.translator();
+                iommu_common::TranslatingMemory::new_guest_memory(
+                    "amd-iommu-translating",
+                    translator,
+                    params.bus_range.clone(),
+                    params.guest_memory.clone(),
+                )
+            }
+            X86IommuSharedState::IntelVtd(shared) => {
+                let translator = shared.translator();
+                iommu_common::TranslatingMemory::new_guest_memory(
+                    "intel-vtd-translating",
+                    translator,
+                    params.bus_range.clone(),
+                    params.guest_memory.clone(),
+                )
+            }
+        };
         return PcieDeviceWiring {
             guest_memory: translating_gm,
             msi,

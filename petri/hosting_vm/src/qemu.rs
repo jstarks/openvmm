@@ -43,7 +43,8 @@ pub fn build_qemu_command(
         "user,id=net0,hostfwd=tcp::{host_pipette_port}-:{guest_port}",
         guest_port = pipette_client::PIPETTE_PORT,
     ));
-    cmd.arg("-device").arg("virtio-net-pci,netdev=net0");
+    cmd.arg("-device")
+        .arg("virtio-net-pci,netdev=net0,romfile=");
 
     // Console on serial (diagnostic only)
     cmd.arg("-serial").arg("mon:stdio");
@@ -65,7 +66,7 @@ pub fn build_qemu_command(
                 cmd.arg("-blockdev")
                     .arg(format!("null-co,node-name={node_name},size={size_bytes}"));
                 cmd.arg("-device")
-                    .arg(format!("virtio-blk-pci,drive={node_name},bus={rp_id},iommu_platform=on,disable-legacy=on"));
+                    .arg(format!("virtio-blk-pci,drive={node_name},bus={rp_id},iommu_platform=on,disable-legacy=on,romfile="));
             }
         }
     }

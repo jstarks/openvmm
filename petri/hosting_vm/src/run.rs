@@ -141,10 +141,11 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
     tracing::info!(path = %serial_log.display(), "serial log");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::piped());
 
     let mut qemu_child = cmd.spawn().context("failed to launch QEMU")?;
     let qemu_stdout = qemu_child.stdout.take().expect("stdout should be piped");
+    let qemu_stderr = qemu_child.stderr.take().expect("stderr should be piped");
 
     // --- run everything inside the async executor ---
 
@@ -163,6 +164,19 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
         let serial_log_path = serial_log.clone();
         let relay_task = driver.spawn("serial-relay", async move {
             relay_serial_output(serial_pipe, &serial_log_path, ready_tx).await;
+        });
+
+        // Capture QEMU stderr for diagnostics.
+        let stderr_pipe = PolledPipe::new(
+            &driver,
+            std::fs::File::from(std::os::unix::io::OwnedFd::from(qemu_stderr)),
+        )
+        .context("failed to create polled pipe for stderr")?;
+        let stderr_task = driver.spawn("qemu-stderr", async move {
+            let mut buf = Vec::new();
+            let mut pipe = stderr_pipe;
+            let _ = pipe.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
         });
 
         let result = run_via_pipette(&driver, host_port, &config, &mut qemu_child, ready_rx).await;
@@ -185,6 +199,12 @@ pub fn run_in_hosting_vm(config: HostingVmConfig) -> anyhow::Result<HostingVmOut
 
         // Wait for the serial relay to finish flushing.
         relay_task.await;
+
+        // Log any QEMU stderr output.
+        let stderr_output = stderr_task.await;
+        if !stderr_output.is_empty() {
+            tracing::warn!(stderr = %stderr_output, "QEMU stderr output");
+        }
 
         Ok(exit_code)
     });

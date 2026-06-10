@@ -137,12 +137,25 @@ pub struct IntelVtdAcpiConfig {
 /// Identifies a device on the root complex's start bus by its PCI
 /// devfn and scope type.
 #[derive(Clone, Debug)]
-pub struct IntelVtdDeviceScope {
-    /// PCI device/function on the root bus, encoded as `(device << 3) | function`.
-    pub devfn: u8,
-    /// Whether this is a PCI bridge (root port, type 0x02) or an
-    /// endpoint (RCiEP, type 0x01).
-    pub is_bridge: bool,
+pub enum IntelVtdDeviceScope {
+    /// PCI endpoint (RCiEP, type 0x01).
+    PciEndpoint {
+        /// PCI device/function on the root bus, encoded as `(device << 3) | function`.
+        devfn: u8,
+    },
+    /// PCI bridge / root port (type 0x02).
+    PciBridge {
+        /// PCI device/function on the root bus, encoded as `(device << 3) | function`.
+        devfn: u8,
+    },
+    /// IOAPIC (type 0x03).
+    IoApic {
+        /// IOAPIC ID as reported in the MADT.
+        ioapic_id: u8,
+        /// PCI device/function on the root bus, encoded as `(device << 3) | function`.
+        /// Use 0 if the IOAPIC is not behind a PCI device.
+        devfn: u8,
+    },
 }
 
 /// DMAR-level configuration for Intel VT-d ACPI table generation.
@@ -815,18 +828,24 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
             dmar_extra.extend_from_slice(drhd.as_bytes());
 
             for scope in &config.device_scopes {
-                let scope_type = if scope.is_bridge {
-                    dmar::DEVICE_SCOPE_PCI_SUB_HIERARCHY
-                } else {
-                    dmar::DEVICE_SCOPE_PCI_ENDPOINT
+                let (scope_type, enumeration_id, devfn) = match *scope {
+                    IntelVtdDeviceScope::PciEndpoint { devfn } => {
+                        (dmar::DEVICE_SCOPE_PCI_ENDPOINT, 0, devfn)
+                    }
+                    IntelVtdDeviceScope::PciBridge { devfn } => {
+                        (dmar::DEVICE_SCOPE_PCI_SUB_HIERARCHY, 0, devfn)
+                    }
+                    IntelVtdDeviceScope::IoApic { ioapic_id, devfn } => {
+                        (dmar::DEVICE_SCOPE_IOAPIC, ioapic_id, devfn)
+                    }
                 };
-                dmar_extra.extend_from_slice(
-                    dmar::DmarDeviceScope::new(scope_type, config.start_bus).as_bytes(),
-                );
+                let mut ds = dmar::DmarDeviceScope::new(scope_type, config.start_bus);
+                ds.enumeration_id = enumeration_id;
+                dmar_extra.extend_from_slice(ds.as_bytes());
                 dmar_extra.extend_from_slice(
                     DmarDevicePath {
-                        device: scope.devfn >> 3,
-                        function: scope.devfn & 0x7,
+                        device: devfn >> 3,
+                        function: devfn & 0x7,
                     }
                     .as_bytes(),
                 );
@@ -2161,13 +2180,11 @@ mod test {
                 pci_segment: 0,
                 start_bus: 0,
                 device_scopes: vec![
-                    IntelVtdDeviceScope {
+                    IntelVtdDeviceScope::PciBridge {
                         devfn: 0x00,
-                        is_bridge: true,
                     },
-                    IntelVtdDeviceScope {
+                    IntelVtdDeviceScope::PciBridge {
                         devfn: 0x01,
-                        is_bridge: true,
                     },
                 ],
             }],
@@ -2248,9 +2265,8 @@ mod test {
                 mmio_base: 0xFED9_0000,
                 pci_segment: 0,
                 start_bus: 0,
-                device_scopes: vec![IntelVtdDeviceScope {
+                device_scopes: vec![IntelVtdDeviceScope::PciBridge {
                     devfn: 0x00,
-                    is_bridge: true,
                 }],
             }],
         );
@@ -2272,18 +2288,16 @@ mod test {
                     mmio_base: 0xFED9_0000,
                     pci_segment: 0,
                     start_bus: 0,
-                    device_scopes: vec![IntelVtdDeviceScope {
+                    device_scopes: vec![IntelVtdDeviceScope::PciBridge {
                         devfn: 0x00,
-                        is_bridge: true,
                     }],
                 },
                 IntelVtdAcpiConfig {
                     mmio_base: 0xFED9_1000,
                     pci_segment: 1,
                     start_bus: 128,
-                    device_scopes: vec![IntelVtdDeviceScope {
+                    device_scopes: vec![IntelVtdDeviceScope::PciBridge {
                         devfn: 0x00,
-                        is_bridge: true,
                     }],
                 },
             ],

@@ -1593,10 +1593,12 @@ impl MmioIntercept for IntelVtdDevice {
                 let lo = self.read_register_dword_locked(&state, offset as u16);
                 let hi = self.read_register_dword_locked(&state, (offset + 4) as u16);
                 let val = lo as u64 | ((hi as u64) << 32);
+                tracing::debug!(offset, val, "vtd mmio_read u64");
                 data.copy_from_slice(&val.to_le_bytes());
             }
             4 => {
                 let val = self.read_register_dword(offset as u16);
+                tracing::debug!(offset, val, "vtd mmio_read u32");
                 data.copy_from_slice(&val.to_le_bytes());
             }
             _ => {

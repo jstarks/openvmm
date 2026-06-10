@@ -3059,6 +3059,7 @@ impl LoadedVmInner {
                 let slit = acpi_builder.build_slit();
                 let mcfg = (!self.pcie_host_bridges.is_empty()).then(|| acpi_builder.build_mcfg());
                 let pptt = cache_topology.is_some().then(|| acpi_builder.build_pptt());
+                let dmar = acpi_builder.build_dmar();
                 let load_settings = super::vm_loaders::uefi::UefiLoadSettings {
                     debugging: enable_debugging,
                     memory_protections: enable_memory_protections,
@@ -3087,6 +3088,7 @@ impl LoadedVmInner {
                         slit: slit.as_deref(),
                         mcfg: mcfg.as_deref(),
                         pptt: pptt.as_deref(),
+                        dmar: dmar.as_deref(),
                     })?;
 
                 (regs, Vec::new())

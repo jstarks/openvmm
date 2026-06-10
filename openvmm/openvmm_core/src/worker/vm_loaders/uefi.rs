@@ -64,6 +64,7 @@ pub struct LoadUefiParams<'a> {
     pub slit: Option<&'a [u8]>,
     pub mcfg: Option<&'a [u8]>,
     pub pptt: Option<&'a [u8]>,
+    pub dmar: Option<&'a [u8]>,
 }
 
 /// Loads the UEFI firmware.
@@ -81,6 +82,7 @@ pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
         slit,
         mcfg,
         pptt,
+        dmar,
     } = *params;
 
     let mut loaded_image;
@@ -200,6 +202,10 @@ pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
 
     if let Some(pptt) = pptt {
         cfg.add_raw(config::BlobStructureType::Pptt, pptt);
+    }
+
+    if let Some(dmar) = dmar {
+        cfg.add_raw(config::BlobStructureType::AcpiTable, dmar);
     }
 
     if !pcie_host_bridges.is_empty() {

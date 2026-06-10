@@ -56,9 +56,8 @@ pub(super) fn resolve_vtd_resources(
                 .ports
                 .iter()
                 .enumerate()
-                .map(|(i, _)| vmm_core::acpi_builder::IntelVtdDeviceScope {
+                .map(|(i, _)| vmm_core::acpi_builder::IntelVtdDeviceScope::PciBridge {
                     devfn: i as u8,
-                    is_bridge: true,
                 })
                 .collect();
 
@@ -130,11 +129,25 @@ pub(super) fn setup_intel_vtd(
         let shared = vtd_dev.lock().shared_state().clone();
         shared_states[rc_pos] = Some(shared);
 
+        let mut device_scopes = res.device_scopes.clone();
+
+        // Add the IOAPIC device scope to the first VT-d unit's DRHD so
+        // that the guest IOMMU driver (and the Windows hypervisor) can
+        // find all IOAPICs accounted for in the DMAR table.
+        if acpi_configs.is_empty() {
+            device_scopes.push(
+                vmm_core::acpi_builder::IntelVtdDeviceScope::IoApic {
+                    ioapic_id: 0,
+                    devfn: 0,
+                },
+            );
+        }
+
         acpi_configs.push(vmm_core::acpi_builder::IntelVtdAcpiConfig {
             mmio_base,
             pci_segment: hb.segment,
             start_bus: hb.start_bus,
-            device_scopes: res.device_scopes.clone(),
+            device_scopes,
         });
     }
 

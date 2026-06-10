@@ -445,9 +445,28 @@ async fn boot_hyperv_role(
         .with_boot_device_type(petri::BootDeviceType::PcieNvme)
         .with_default_boot_always_attempt(true)
         .modify_backend(|b| {
+            // Root ports:
+            //   s0rc0rp0 — boot NVMe (auto)
+            //   s0rc0rp1 — cidata NVMe (auto)
+            //   s0rc0rp2 — TCP pipette NIC
+            //   s0rc0rp3 — extra NVMe for DDA to L2
             b.with_nested_virt()
-                .with_pcie_root_topology(1, 1, 3)
+                .with_pcie_root_topology(1, 1, 4)
+                .with_intel_vtd(&["s0rc0"])
+                .with_pcie_nvme(
+                    "s0rc0rp3",
+                    guid::guid!("a1b2c3d4-e5f6-7890-abcd-ef0123456789"),
+                )
                 .with_tcp_pipette_nic("s0rc0rp2")
+                .with_custom_config(|c| {
+                    // Set ACS capability bits on root ports for proper IOMMU
+                    // group isolation (SV + RR + CR + UF).
+                    for rc in &mut c.pcie_root_complexes {
+                        for port in &mut rc.ports {
+                            port.acs_capabilities_supported = Some(0x5D);
+                        }
+                    }
+                })
         })
         .run()
         .await?;
@@ -686,6 +705,219 @@ async fn boot_hyperv_role(
         .args([
             "-Command",
             "Stop-VM -Name TestL2 -TurnOff -Force; Remove-VM -Name TestL2 -Force",
+        ])
+        .run()
+        .await?;
+
+    // --- DDA (Discrete Device Assignment) test ---
+    //
+    // Find the extra NVMe controller on root port s0rc0rp3, dismount it
+    // from the L1 host, assign it to a new L2 VM, and verify the L2 starts.
+
+    // Diagnostic: check if the L1 hypervisor exposes DDA / IOMMU support.
+    let dda_diag = cmd!(shell, "powershell.exe")
+        .args(["-Command", r#"
+            Write-Host "=== DDA / IOMMU Diagnostics ==="
+
+            # Check VMHost DDA support
+            $vmHost = Get-VMHost -ErrorAction SilentlyContinue
+            Write-Host "IovSupport: $($vmHost.IovSupport)"
+            Write-Host "IovSupportReasons: $($vmHost.IovSupportReasons)"
+
+            # Check pcip.sys driver status
+            $pcip = Get-PnpDevice -FriendlyName '*pcip*' -ErrorAction SilentlyContinue
+            if (-not $pcip) { $pcip = sc.exe query pcip 2>&1 }
+            Write-Host "pcip driver: $pcip"
+
+            # Check if pcip.sys file exists
+            $pcipPath = "$env:SystemRoot\System32\drivers\pcip.sys"
+            Write-Host "pcip.sys exists: $(Test-Path $pcipPath)"
+
+            # Try loading pcip manually
+            $loadResult = sc.exe start pcip 2>&1
+            Write-Host "pcip start attempt: $loadResult"
+
+            # Check ACPI DMAR table visibility from the hypervisor
+            $dmar = Test-Path "/sys/firmware/acpi/tables/DMAR" -ErrorAction SilentlyContinue
+            Write-Host "DMAR table check: $dmar"
+
+            # Check IOMMU-related registry keys
+            $iommuReg = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\HAL" -ErrorAction SilentlyContinue
+            Write-Host "HAL reg: $($iommuReg | Format-List | Out-String)"
+
+            # Check hypervisor features via WMI
+            $hvInfo = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementServiceSettingData -ErrorAction SilentlyContinue
+            Write-Host "VMMS settings: $($hvInfo | Select-Object * | Format-List | Out-String)"
+
+            # List system devices related to IOMMU/DMA remapping
+            $iommuDevs = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+                $_.FriendlyName -match 'IOMMU|DMA|DMAR|Remap|Intel.*VT' -or
+                $_.InstanceId -match 'IOMMU|DMAR|ACPI\\INTL'
+            }
+            Write-Host "IOMMU-related devices:"
+            $iommuDevs | Format-List InstanceId,FriendlyName,Class,Status | Out-Host
+
+            # Check hypervisor CPUID for IOMMU support (leaf 0x40000006)
+            # This isn't directly queryable from PowerShell, but the event
+            # log may have clues.
+            $hvEvents = Get-WinEvent -LogName 'Microsoft-Windows-Hyper-V-Hypervisor-Admin' -MaxEvents 50 -ErrorAction SilentlyContinue
+            foreach ($e in $hvEvents) {
+                if ($e.Message -match 'IOMMU|DMA|remap|assign|partition') {
+                    Write-Host "HV event: $($e.TimeCreated) $($e.Id) $($e.Message)"
+                }
+            }
+
+            # Check system event log for pcip errors
+            $pcipEvents = Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProviderName -match 'pcip|pci' -or $_.Message -match 'pcip' }
+            foreach ($e in $pcipEvents) {
+                Write-Host "PCI event: $($e.TimeCreated) $($e.Id) [$($e.ProviderName)] $($e.LevelDisplayName): $($e.Message)"
+            }
+        "#])
+        .ignore_status()
+        .read()
+        .await?;
+    tracing::info!("DDA diagnostics:\n{dda_diag}");
+
+    //
+    // The OpenVMM NVMe emulator has PCI vendor 1414 (Microsoft), device
+    // c03e. We find all matching controllers, pick the one on the
+    // highest-numbered root port (our DDA target), and capture both its
+    // PnP instance ID (for Disable-PnpDevice) and PCI location path
+    // (for the DDA cmdlets).
+    let dda_info = cmd!(shell, "powershell.exe")
+        .args(["-Command", r#"
+            $devs = Get-PnpDevice -InstanceId 'PCI\VEN_1414&DEV_C03E*' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Status -eq 'OK' }
+            if (-not $devs -or @($devs).Count -lt 2) {
+                # Diagnostic: show all PCI devices
+                Get-PnpDevice -ErrorAction SilentlyContinue |
+                    Where-Object { $_.InstanceId -match '^PCI\\' } |
+                    Format-List InstanceId,Class,FriendlyName,Status | Out-Host
+                Write-Error "Expected at least 2 NVMe controllers (VEN_1414&DEV_C03E), found $(@($devs).Count)"
+                exit 1
+            }
+            # Pick the controller on the highest-numbered root port.
+            $best = $null
+            $bestPath = $null
+            foreach ($d in @($devs)) {
+                $paths = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName DEVPKEY_Device_LocationPaths -ErrorAction SilentlyContinue).Data
+                foreach ($p in $paths) {
+                    if ($p -match 'PCIROOT' -and ($bestPath -eq $null -or $p -gt $bestPath)) {
+                        $best = $d
+                        $bestPath = $p
+                    }
+                }
+            }
+            if (-not $best) {
+                Write-Error "Could not find PCI location path for any NVMe controller"
+                exit 1
+            }
+            # Output instance ID on line 1, location path on line 2.
+            Write-Output $best.InstanceId
+            Write-Output $bestPath
+        "#])
+        .read()
+        .await?;
+    let mut lines = dda_info.lines().filter(|l| !l.trim().is_empty());
+    let dda_instance_id = lines
+        .next()
+        .context("missing instance ID in DDA discovery output")?
+        .trim();
+    let dda_location_path = lines
+        .next()
+        .context("missing location path in DDA discovery output")?
+        .trim();
+    tracing::info!("DDA target: instance={dda_instance_id} location={dda_location_path}");
+
+    // Disable the device before dismounting.
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            &format!(
+                "Disable-PnpDevice -InstanceId '{}' -Confirm:$false",
+                dda_instance_id
+            ),
+        ])
+        .run()
+        .await?;
+
+    // Dismount the device from the host so it can be assigned to a VM.
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            &format!(
+                "Dismount-VMHostAssignableDevice -LocationPath '{}' -Force",
+                dda_location_path
+            ),
+        ])
+        .run()
+        .await?;
+
+    // Create a Gen2 VM and assign the device to it.
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            "$attempt = 0; while ($attempt -lt 10) { try { New-VM -Name TestL2DDA -MemoryStartupBytes 512MB -Generation 2 -NoVHD -ErrorAction Stop; break } catch { $attempt++; if ($attempt -ge 10) { throw }; Start-Sleep -Seconds 5 } }",
+        ])
+        .run()
+        .await?;
+
+    // Set the automatic stop action to TurnOff to avoid save-state issues
+    // with assigned devices.
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            "Set-VM -Name TestL2DDA -AutomaticStopAction TurnOff",
+        ])
+        .run()
+        .await?;
+
+    // Assign the device to the VM.
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            &format!(
+                "Add-VMAssignableDevice -VMName TestL2DDA -LocationPath '{}'",
+                dda_location_path
+            ),
+        ])
+        .run()
+        .await?;
+
+    // Verify the device is listed as assigned.
+    let assigned_devs = cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            "Get-VMAssignableDevice -VMName TestL2DDA | Format-List",
+        ])
+        .read()
+        .await?;
+    tracing::info!("Assigned devices on TestL2DDA:\n{assigned_devs}");
+    assert!(
+        !assigned_devs.trim().is_empty(),
+        "No devices assigned to TestL2DDA"
+    );
+
+    // Start the L2 VM with the assigned device.
+    cmd!(shell, "powershell.exe")
+        .args(["-Command", "Start-VM -Name TestL2DDA"])
+        .run()
+        .await?;
+    let state = cmd!(shell, "powershell.exe")
+        .args(["-Command", "(Get-VM -Name TestL2DDA).State"])
+        .read()
+        .await?;
+    assert!(
+        state.contains("Running"),
+        "L2 DDA VM is not running: {state}"
+    );
+
+    // Clean up.
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-Command",
+            "Stop-VM -Name TestL2DDA -TurnOff -Force; Remove-VM -Name TestL2DDA -Force",
         ])
         .run()
         .await?;

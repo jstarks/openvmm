@@ -136,6 +136,12 @@ impl Worker {
         inspection.results()
     }
 
+    pub(crate) async fn inspect_path(&self, path: &str) -> inspect::Node {
+        let mut inspection = inspect::inspect(path, &self.handle);
+        inspection.resolve().await;
+        inspection.results()
+    }
+
     pub(crate) async fn shutdown(mut self) -> anyhow::Result<()> {
         self.handle.stop();
         self.handle.join().await?;

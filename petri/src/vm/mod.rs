@@ -2121,6 +2121,8 @@ pub trait PetriVmRuntime: Send + Sync + 'static {
 pub trait PetriVmInspector: Send + Sync + 'static {
     /// Get information about the state of the VM
     async fn inspect_all(&self) -> anyhow::Result<inspect::Node>;
+    /// Get information about the state of the VM at a specific path
+    async fn inspect_path(&self, path: &str) -> anyhow::Result<inspect::Node>;
 }
 
 /// Use this for the associated type if not supported
@@ -2128,6 +2130,9 @@ pub struct NoPetriVmInspector;
 #[async_trait]
 impl PetriVmInspector for NoPetriVmInspector {
     async fn inspect_all(&self) -> anyhow::Result<inspect::Node> {
+        unreachable!()
+    }
+    async fn inspect_path(&self, _path: &str) -> anyhow::Result<inspect::Node> {
         unreachable!()
     }
 }

@@ -133,12 +133,17 @@ pub(super) fn setup_intel_vtd(
 
         // Add the IOAPIC device scope to the first VT-d unit's DRHD so
         // that the guest IOMMU driver (and the Windows hypervisor) can
-        // find all IOAPICs accounted for in the DMAR table.
+        // find all IOAPICs accounted for in the DMAR table. The IOAPIC
+        // isn't a real PCI device, but the DMAR spec requires it to
+        // have a RID (bus:device:function) for interrupt remapping
+        // lookup. Use devfn 0xF8 (device 31, function 0) — the
+        // traditional LPC/PCH bridge slot — to avoid conflicts with
+        // root ports which start at devfn 0.
         if acpi_configs.is_empty() {
             device_scopes.push(
                 vmm_core::acpi_builder::IntelVtdDeviceScope::IoApic {
                     ioapic_id: 0,
-                    devfn: 0,
+                    devfn: 0xF8,
                 },
             );
         }

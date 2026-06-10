@@ -214,7 +214,11 @@ impl IntoPipeline for VmmTestsRunCli {
             // When using build-only mode, we need to enumerate tests that could be
             // run on any system so that we build all necessary dependencies. By default
             // petri marks incompatible tests as ignored.
-            include_ignored: build_only,
+            //
+            // When using a hosting VM, the host's context is irrelevant — the VM's
+            // context determines which tests can run. Include ignored tests so they
+            // are discovered for artifact resolution and re-evaluated inside the VM.
+            include_ignored: build_only || hosting_vm.is_some(),
         })?;
 
         if suites.is_empty() {

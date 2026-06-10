@@ -126,6 +126,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::install_vmm_tests_deps::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
+        ctx.import::<crate::resolve_openvmm_qemu::Node>();
         ctx.import::<crate::run_in_hosting_vm::Node>();
         ctx.import::<crate::run_prep_steps::Node>();
         ctx.import::<crate::build_vmgstool::Node>();

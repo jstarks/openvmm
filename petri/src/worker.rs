@@ -125,6 +125,11 @@ impl Worker {
         Ok(())
     }
 
+    pub(crate) async fn dump_state(&self, file: std::fs::File) -> anyhow::Result<()> {
+        self.rpc.call_failable(VmRpc::DumpState, file).await?;
+        Ok(())
+    }
+
     pub(crate) async fn inspect_all(&self) -> inspect::Node {
         let mut inspection = inspect::inspect("", &self.handle);
         inspection.resolve().await;

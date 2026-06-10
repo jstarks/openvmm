@@ -337,6 +337,11 @@ impl PetriVmOpenVmm {
         pub async fn resume(&mut self) -> anyhow::Result<()>
     );
     petri_vm_fn!(
+        /// Dump VM state to a `.vmrs` file that WinDbg can open.
+        /// The VM is paused internally during the dump.
+        pub async fn dump_state(&mut self, path: &std::path::Path) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
         /// Perform a pulse save/restore cycle: pause the VM, save all state,
         /// reset, restore, and resume. Useful for verifying that device state
         /// survives a save/restore round-trip.
@@ -698,6 +703,12 @@ impl PetriVmInner {
 
     async fn resume(&self) -> anyhow::Result<()> {
         self.worker.resume().await?;
+        Ok(())
+    }
+
+    async fn dump_state(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let file = std::fs::File::create(path)?;
+        self.worker.dump_state(file).await?;
         Ok(())
     }
 

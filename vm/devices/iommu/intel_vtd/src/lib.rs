@@ -98,7 +98,7 @@ const ECAP_VALUE: u64 = EcapReg::new()
     .with_c(true)
     .with_qi(true)
     .with_ir(true)
-    .with_eim(true)
+    .with_eim(false) // TODO: Enable once KVM x2APIC + synic timer issue is resolved
     .with_pt(true)
     .with_sc(true)
     .with_iro(Reg::IVA.0 / 16)
@@ -994,6 +994,10 @@ impl iommu_common::IommuTranslator for VtdTranslator {
             Err(fault) => {
                 // Drop the read lock before acquiring write lock for fault recording.
                 drop(state);
+<<<<<<< HEAD
+=======
+                tracelimit::warn_ratelimited!(rid, iova, write, ?fault, "vtd translate fault");
+>>>>>>> b5fac505b (bunch of bullshit)
                 fault.record(&self.shared, write);
                 return Err(iommu_common::TranslationFault { iova, error: fault });
             }
@@ -1173,7 +1177,11 @@ impl IntelVtdDevice {
             Reg::CCMD => lo(state.ccmd.into_bits()),
             Reg::CCMD_HI => hi(state.ccmd.into_bits()),
             Reg::FSTS => self.read_fsts(state),
-            Reg::FECTL => state.fectl.into_bits(),
+            Reg::FECTL => {
+                let val = state.fectl.into_bits();
+                tracing::info!(val, "vtd FECTL read");
+                val
+            }
             Reg::FEDATA => state.fedata,
             Reg::FEADDR => state.feaddr,
             Reg::FEUADDR => state.feuaddr,
@@ -1224,8 +1232,11 @@ impl IntelVtdDevice {
     /// write. No register requires atomic writes across both DWORDs.
     fn write_register_dword(&self, offset: u16, value: u32) {
         let mut state = self.shared.state.write();
+<<<<<<< HEAD
         let mut retranslate_interrupts = false;
         tracing::trace!(offset, value, "vtd mmio_write_dword");
+=======
+>>>>>>> b5fac505b (bunch of bullshit)
 
         /// Merge a DWORD write into the lo or hi half of a 64-bit value.
         fn write_lo(old: u64, value: u32) -> u64 {
@@ -1249,7 +1260,11 @@ impl IntelVtdDevice {
             | Reg::FRCD_DW1
             | Reg::FRCD_DW2 => {}
 
-            Reg::GCMD => self.process_gcmd(&mut state, value),
+            Reg::GCMD => {
+                tracing::info!(value, "vtd GCMD write");
+                self.process_gcmd(&mut state, value);
+                tracing::info!(gsts = state.gsts.into_bits(), "vtd GSTS after GCMD");
+            }
 
             Reg::RTADDR => {
                 state.rtaddr = RtaddrReg::from(write_lo(state.rtaddr.into_bits(), value));
@@ -1286,6 +1301,7 @@ impl IntelVtdDevice {
             }
 
             Reg::FECTL => {
+                tracing::info!(value, "vtd FECTL write");
                 let new = FectlReg::from(value);
                 let old = state.fectl;
                 state.fectl = FectlReg::new().with_im(new.im()).with_ip(old.ip());
@@ -1295,16 +1311,35 @@ impl IntelVtdDevice {
                 }
             }
 
-            Reg::FEDATA => state.fedata = value,
-            Reg::FEADDR => state.feaddr = value,
-            Reg::FEUADDR => state.feuaddr = value,
+            Reg::FEDATA => {
+                tracing::info!(value, "vtd FEDATA write");
+                state.fedata = value;
+            }
+            Reg::FEADDR => {
+                tracing::info!(value, "vtd FEADDR write");
+                state.feaddr = value;
+            }
+            Reg::FEUADDR => {
+                tracing::info!(value, "vtd FEUADDR write");
+                state.feuaddr = value;
+            }
 
             Reg::IQT => {
                 // Trigger queue processing on lo DWORD write.
                 let full = write_lo(state.iqt.into_bits(), value);
                 let iqt = IqtReg::from(full);
                 state.iqt = IqtReg::new().with_qt(iqt.qt());
+<<<<<<< HEAD
                 retranslate_interrupts = self.process_invalidation_queue(&mut state);
+=======
+                tracing::info!(
+                    tail = state.iqt.tail_offset(),
+                    head = state.iqh.head_offset(),
+                    "vtd IQT write, processing queue"
+                );
+                self.process_invalidation_queue(&mut state);
+                tracing::info!(new_head = state.iqh.head_offset(), "vtd IQ processed");
+>>>>>>> b5fac505b (bunch of bullshit)
             }
             Reg::IQT_HI => {
                 state.iqt = IqtReg::from(write_hi(state.iqt.into_bits(), value));
@@ -1582,6 +1617,16 @@ impl IntelVtdDevice {
             let desc = spec::invalidation::InvalidationDescriptor::read_from_bytes(&descriptor)
                 .expect("descriptor is 16 bytes");
 
+            tracing::info!(
+                entry_addr,
+                dw0 = desc.dw0,
+                dw1 = desc.dw1,
+                dw2 = desc.dw2,
+                dw3 = desc.dw3,
+                dt = desc.descriptor_type().0,
+                "vtd: IQ descriptor"
+            );
+
             match desc.descriptor_type() {
                 DescriptorType::CONTEXT_CACHE_INVALIDATE => {} // no-op
                 DescriptorType::IOTLB_INVALIDATE => {}         // no-op
@@ -1629,13 +1674,19 @@ impl IntelVtdDevice {
 
         if lo.sw() {
             let status_address = hi.status_address();
+            let status_data = lo.status_data();
 
+            tracing::info!(
+                status_address,
+                status_data,
+                "vtd: invalidation wait status write"
+            );
             if let Err(e) = self
                 .shared
                 .guest_memory
-                .write_at(status_address, &lo.status_data().to_le_bytes())
+                .write_at(status_address, &status_data.to_le_bytes())
             {
-                tracelimit::warn_ratelimited!(
+                tracing::warn!(
                     error = &e as &dyn std::error::Error,
                     addr = status_address,
                     "vtd: failed to write invalidation wait status"

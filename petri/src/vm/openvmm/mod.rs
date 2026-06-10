@@ -156,6 +156,7 @@ pub struct PetriVmConfigOpenVmm {
     // Direct configuration related information.
     runtime_config: PetriVmRuntimeConfig,
     arch: MachineArch,
+    hypervisor: Option<String>,
     host_log_levels: Option<OpenvmmLogConfig>,
     config: Config,
 

@@ -116,6 +116,10 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     reserved_vps_per_socket: u32,
 
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    nested_state_format: kvm::NestedStateFormat,
+
     /// The GIC device fd, kept alive for the VM lifetime.
     #[cfg(guest_arch = "aarch64")]
     #[inspect(skip)]

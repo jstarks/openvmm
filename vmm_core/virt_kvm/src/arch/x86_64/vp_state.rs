@@ -36,6 +36,16 @@ impl KvmVpStateAccess<'_> {
         self.partition.kvm.vp(self.vp_info.apic_id)
     }
 
+    pub(crate) fn clear_nested_state(&self) -> Result<(), KvmError> {
+        if !self.partition.caps.nested_virt {
+            return Ok(());
+        }
+
+        self.kvm()
+            .clear_nested_state(self.partition.nested_state_format)?;
+        Ok(())
+    }
+
     pub(crate) fn set_register_state<T, const N: usize>(&self, value: &T) -> Result<(), KvmError>
     where
         T: HvRegisterState<HvX64RegisterName, N>,
@@ -610,10 +620,17 @@ impl AccessVpState for KvmVpStateAccess<'_> {
     }
 
     fn nested_state(&mut self) -> Result<vp::NestedState, Self::Error> {
-        Err(KvmError::NotSupported)
+        Ok(vp::NestedState {
+            data: self.kvm().get_nested_state()?,
+        })
     }
 
-    fn set_nested_state(&mut self, _value: &vp::NestedState) -> Result<(), Self::Error> {
-        Err(KvmError::NotSupported)
+    fn set_nested_state(&mut self, value: &vp::NestedState) -> Result<(), Self::Error> {
+        if value.data.is_empty() {
+            self.clear_nested_state()?;
+        } else {
+            self.kvm().set_nested_state(&value.data)?;
+        }
+        Ok(())
     }
 }

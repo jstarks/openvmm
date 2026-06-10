@@ -240,6 +240,19 @@ impl PetriVmConfigOpenVmm {
         self
     }
 
+    /// Request nested virtualization support from the host hypervisor.
+    pub fn with_nested_virt(mut self) -> Self {
+        let spec = if cfg!(windows) {
+            "whp:nested_virt"
+        } else if cfg!(target_os = "linux") {
+            "kvm:nested_virt"
+        } else {
+            panic!("nested virtualization is not supported on this host OS")
+        };
+        self.hypervisor = Some(spec.to_string());
+        self
+    }
+
     /// Enable a synthnic for the VM backed by the Windows vmswitch
     /// DirectIO (`-net dio`) backend.
     ///

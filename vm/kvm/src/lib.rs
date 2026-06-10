@@ -99,6 +99,10 @@ mod ioctl {
     ioctl_read!(kvm_arm_preferred_target, KVMIO, 0xaf, kvm_vcpu_init);
     ioctl_write_ptr!(kvm_ioeventfd, KVMIO, 0x79, kvm_ioeventfd);
     ioctl_write_ptr!(kvm_set_guest_debug, KVMIO, 0x9b, kvm_guest_debug);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(kvm_get_nested_state, KVMIO, 0xbe, kvm_nested_state);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_set_nested_state, KVMIO, 0xbf, kvm_nested_state);
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
 }
@@ -175,6 +179,12 @@ pub enum Error {
     SetVcpuEvents(#[source] nix::Error),
     #[error("TranslateGva")]
     TranslateGva(#[source] nix::Error),
+    #[error("GetNestedState")]
+    GetNestedState(#[source] nix::Error),
+    #[error("SetNestedState")]
+    SetNestedState(#[source] nix::Error),
+    #[error("invalid nested state size {0}")]
+    InvalidNestedStateSize(usize),
     #[error("unknown exit {0:#x}")]
     UnknownExit(u32),
     #[error("unknown Hyper-V exit {0:#x}")]
@@ -194,6 +204,41 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Copy, Clone)]
+pub enum NestedStateFormat {
+    Vmx,
+    Svm,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl NestedStateFormat {
+    fn as_kvm_format(self) -> u16 {
+        match self {
+            Self::Vmx => KVM_STATE_NESTED_FORMAT_VMX as u16,
+            Self::Svm => KVM_STATE_NESTED_FORMAT_SVM as u16,
+        }
+    }
+
+    fn reset_vmx_header(self) -> Option<kvm_vmx_nested_state_hdr> {
+        match self {
+            Self::Vmx => Some(kvm_vmx_nested_state_hdr {
+                vmxon_pa: u64::MAX,
+                vmcs12_pa: u64::MAX,
+                ..Default::default()
+            }),
+            Self::Svm => None,
+        }
+    }
+
+    fn reset_flags(self) -> u16 {
+        match self {
+            Self::Vmx => 0,
+            Self::Svm => KVM_STATE_NESTED_GIF_SET as u16,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Vp {
@@ -1160,6 +1205,90 @@ impl<'a> Processor<'a> {
         }
 
         Ok(translation)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get_nested_state(&self) -> Result<Vec<u8>> {
+        let mut state = nested::KvmNestedStateBuffer::empty();
+
+        // SAFETY: The buffer starts with the fixed KVM nested-state header,
+        // and its size field describes the full allocation available to KVM.
+        // The ioctl request code is intentionally generated from the fixed
+        // header type because the nested data is a flexible array.
+        unsafe {
+            ioctl::kvm_get_nested_state(
+                self.get().vcpu.as_raw_fd(),
+                &mut *std::ptr::from_mut(&mut state).cast::<kvm_nested_state>(),
+            )
+            .map_err(Error::GetNestedState)?;
+        }
+
+        let size = state.size as usize;
+        if size > size_of::<nested::KvmNestedStateBuffer>() {
+            return Err(Error::InvalidNestedStateSize(size));
+        }
+
+        // SAFETY: `size` was validated against the initialized stack buffer.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&state).cast::<u8>(), size) };
+        Ok(bytes.to_vec())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_nested_state(&self, state: &[u8]) -> Result<()> {
+        let mut buffer = nested::KvmNestedStateBuffer::empty();
+
+        if state.len() < size_of::<kvm_nested_state>()
+            || state.len() > size_of::<nested::KvmNestedStateBuffer>()
+        {
+            return Err(Error::InvalidNestedStateSize(state.len()));
+        }
+
+        // SAFETY: `state` length was validated against `buffer` above, and
+        // the regions do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                state.as_ptr(),
+                std::ptr::from_mut(&mut buffer).cast::<u8>(),
+                state.len(),
+            );
+        }
+
+        let size = buffer.size as usize;
+        if size < size_of::<kvm_nested_state>() || size > state.len() {
+            return Err(Error::InvalidNestedStateSize(size));
+        }
+
+        self.set_nested_state_buffer(&buffer)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn clear_nested_state(&self, format: NestedStateFormat) -> Result<()> {
+        let mut buffer = nested::KvmNestedStateBuffer::empty();
+        buffer.flags = format.reset_flags();
+        buffer.format = format.as_kvm_format();
+        buffer.size = size_of::<kvm_nested_state>() as u32;
+        if let Some(vmx) = format.reset_vmx_header() {
+            buffer.hdr.vmx = vmx;
+        }
+
+        self.set_nested_state_buffer(&buffer)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_nested_state_buffer(&self, buffer: &nested::KvmNestedStateBuffer) -> Result<()> {
+        // SAFETY: The buffer starts with the fixed KVM nested-state header.
+        // The ioctl request code is intentionally generated from the fixed
+        // header type because the nested data is a flexible array.
+        unsafe {
+            ioctl::kvm_set_nested_state(
+                self.get().vcpu.as_raw_fd(),
+                &*std::ptr::from_ref(&buffer).cast::<kvm_nested_state>(),
+            )
+            .map_err(Error::SetNestedState)?;
+        }
+
+        Ok(())
     }
 
     /// Sets the guest debugging state: `control` bits `KVM_GUESTDBG_*`, `db`

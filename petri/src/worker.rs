@@ -22,14 +22,20 @@ pub(crate) struct Worker {
 impl Worker {
     pub(crate) async fn launch(
         host: &WorkerHost,
+        hypervisor: Option<String>,
         cfg: Config,
         shared_memory: Option<openvmm_defs::worker::SharedMemoryFd>,
     ) -> anyhow::Result<(Self, mesh::Receiver<HaltReason>)> {
         let (vm_rpc, rpc_recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
 
+        let hypervisor = match hypervisor {
+            Some(spec) => openvmm_helpers::hypervisor::hypervisor_resource(&spec)?,
+            None => openvmm_helpers::hypervisor::choose_hypervisor()?,
+        };
+
         let params = VmWorkerParameters {
-            hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
+            hypervisor,
             cfg,
             saved_state: None,
             shared_memory,

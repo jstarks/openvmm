@@ -56,9 +56,11 @@ pub(super) fn resolve_vtd_resources(
                 .ports
                 .iter()
                 .enumerate()
-                .map(|(i, _)| vmm_core::acpi_builder::IntelVtdDeviceScope::PciBridge {
-                    devfn: i as u8,
-                })
+                .map(
+                    |(i, _)| vmm_core::acpi_builder::IntelVtdDeviceScope::PciBridge {
+                        devfn: i as u8,
+                    },
+                )
                 .collect();
 
             ResolvedVtdResources {
@@ -140,12 +142,10 @@ pub(super) fn setup_intel_vtd(
         // traditional LPC/PCH bridge slot — to avoid conflicts with
         // root ports which start at devfn 0.
         if acpi_configs.is_empty() {
-            device_scopes.push(
-                vmm_core::acpi_builder::IntelVtdDeviceScope::IoApic {
-                    ioapic_id: 0,
-                    devfn: 0xF8,
-                },
-            );
+            device_scopes.push(vmm_core::acpi_builder::IntelVtdDeviceScope::IoApic {
+                ioapic_id: 0,
+                devfn: 0xF8,
+            });
         }
 
         acpi_configs.push(vmm_core::acpi_builder::IntelVtdAcpiConfig {

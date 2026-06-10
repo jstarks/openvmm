@@ -439,8 +439,10 @@ async fn reboot_into_guest_vsm<T: PetriVmmBackend>(
 #[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64_no_vmbus_prepped)))]
 async fn boot_hyperv_role(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (): (),
+    driver: pal_async::DefaultDriver,
 ) -> Result<(), anyhow::Error> {
-    let (mut vm, agent) = config
+    let mut vm = config
         .with_no_vmbus()
         .with_boot_device_type(petri::BootDeviceType::PcieNvme)
         .with_default_boot_always_attempt(true)
@@ -468,8 +470,19 @@ async fn boot_hyperv_role(
                     }
                 })
         })
-        .run()
+        .run_without_agent()
         .await?;
+
+    // Wait for the guest to initialize VT-d and potentially hang, then dump.
+    pal_async::timer::PolledTimer::new(&driver)
+        .sleep(std::time::Duration::from_secs(10))
+        .await;
+    let dump_path = std::path::Path::new("/tmp/vtd-hang.vmrs");
+    tracing::info!("Dumping VM state to {}", dump_path.display());
+    vm.backend().dump_state(dump_path).await?;
+    anyhow::bail!("dumped state to {}", dump_path.display());
+
+    let agent = vm.wait_for_agent().await?;
     let shell = agent.windows_shell();
 
     // Check guest CPU virtualization capabilities.

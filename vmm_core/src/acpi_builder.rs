@@ -2180,12 +2180,8 @@ mod test {
                 pci_segment: 0,
                 start_bus: 0,
                 device_scopes: vec![
-                    IntelVtdDeviceScope::PciBridge {
-                        devfn: 0x00,
-                    },
-                    IntelVtdDeviceScope::PciBridge {
-                        devfn: 0x01,
-                    },
+                    IntelVtdDeviceScope::PciBridge { devfn: 0x00 },
+                    IntelVtdDeviceScope::PciBridge { devfn: 0x01 },
                 ],
             }],
         );
@@ -2265,9 +2261,7 @@ mod test {
                 mmio_base: 0xFED9_0000,
                 pci_segment: 0,
                 start_bus: 0,
-                device_scopes: vec![IntelVtdDeviceScope::PciBridge {
-                    devfn: 0x00,
-                }],
+                device_scopes: vec![IntelVtdDeviceScope::PciBridge { devfn: 0x00 }],
             }],
         );
 
@@ -2288,17 +2282,13 @@ mod test {
                     mmio_base: 0xFED9_0000,
                     pci_segment: 0,
                     start_bus: 0,
-                    device_scopes: vec![IntelVtdDeviceScope::PciBridge {
-                        devfn: 0x00,
-                    }],
+                    device_scopes: vec![IntelVtdDeviceScope::PciBridge { devfn: 0x00 }],
                 },
                 IntelVtdAcpiConfig {
                     mmio_base: 0xFED9_1000,
                     pci_segment: 1,
                     start_bus: 128,
-                    device_scopes: vec![IntelVtdDeviceScope::PciBridge {
-                        devfn: 0x00,
-                    }],
+                    device_scopes: vec![IntelVtdDeviceScope::PciBridge { devfn: 0x00 }],
                 },
             ],
         );

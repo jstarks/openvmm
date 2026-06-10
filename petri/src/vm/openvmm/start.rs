@@ -30,6 +30,7 @@ impl PetriVmConfigOpenVmm {
         let Self {
             runtime_config,
             arch,
+            hypervisor,
             host_log_levels,
             mut config,
 
@@ -119,7 +120,7 @@ impl PetriVmConfigOpenVmm {
             })
             .transpose()?;
 
-        let (worker, halt_notif) = Worker::launch(&host, config, shared_memory)
+        let (worker, halt_notif) = Worker::launch(&host, hypervisor, config, shared_memory)
             .await
             .context("failed to launch vm worker")?;
 

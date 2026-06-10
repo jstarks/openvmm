@@ -480,11 +480,21 @@ async fn reboot_into_guest_vsm<T: PetriVmmBackend>(
 /// Enable the Hyper-V role in a Windows guest, verify the hypervisor
 /// management service is running after reboot, and start a small L2 VM
 /// to confirm nested virtualization works.
-#[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64)))]
+#[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64_no_vmbus_prepped)))]
 async fn boot_hyperv_role(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
 ) -> Result<(), anyhow::Error> {
-    let (mut vm, agent) = config.run().await?;
+    let (mut vm, agent) = config
+        .with_no_vmbus()
+        .with_boot_device_type(petri::BootDeviceType::PcieNvme)
+        .with_default_boot_always_attempt(true)
+        .modify_backend(|b| {
+            b.with_nested_virt()
+                .with_pcie_root_topology(1, 1, 3)
+                .with_tcp_pipette_nic("s0rc0rp2")
+        })
+        .run()
+        .await?;
     let shell = agent.windows_shell();
 
     // Check guest CPU virtualization capabilities.

@@ -162,6 +162,11 @@ impl virt::Hypervisor for Kvm {
         if !vendor.is_intel_compatible() && !vendor.is_amd_compatible() {
             return Err(KvmError::UnsupportedCpuVendor);
         }
+        let nested_state_format = if vendor.is_amd_compatible() {
+            kvm::NestedStateFormat::Svm
+        } else {
+            kvm::NestedStateFormat::Vmx
+        };
 
         let mut cpuid_entries = supported_cpuid
             .into_iter()
@@ -360,6 +365,7 @@ impl virt::Hypervisor for Kvm {
             config,
             cpuid: cpuid_entries,
             nested_virt: self.nested_virt,
+            nested_state_format,
         })
     }
 }
@@ -370,6 +376,7 @@ pub struct KvmProtoPartition<'a> {
     config: ProtoPartitionConfig<'a>,
     cpuid: CpuidLeafSet,
     nested_virt: bool,
+    nested_state_format: kvm::NestedStateFormat,
 }
 
 impl ProtoPartition for KvmProtoPartition<'_> {
@@ -484,6 +491,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
             caps,
             cpuid,
             reserved_vps_per_socket: self.config.processor_topology.reserved_vps_per_socket(),
+            nested_state_format: self.nested_state_format,
             synic_ports: Default::default(),
         });
 

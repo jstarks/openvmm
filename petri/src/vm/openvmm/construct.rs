@@ -677,6 +677,7 @@ impl PetriVmConfigOpenVmm {
         Ok(Self {
             runtime_config: firmware.into_runtime_config(vmbus_storage_controllers),
             arch,
+            hypervisor: None,
             host_log_levels,
             config,
             mesh,

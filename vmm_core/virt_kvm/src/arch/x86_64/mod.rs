@@ -21,6 +21,7 @@ use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
 use guestmem::GuestMemoryError;
 use hv1_emulator::message_queues::MessageQueues;
+use hv1_emulator::pages::OverlayPage;
 use hvdef::HV_PAGE_SIZE;
 use hvdef::HvError;
 use hvdef::HvMessage;
@@ -809,6 +810,8 @@ impl virt::BindProcessor for KvmProcessorBinder {
             scontrol: HvSynicScontrol::new().with_enabled(true),
             siefp: 0.into(),
             simp: 0.into(),
+            simp_overlay: OverlayPage::default(),
+            siefp_overlay: OverlayPage::default(),
             vmtime: &mut self.vmtime,
         };
 
@@ -855,6 +858,15 @@ pub struct KvmProcessor<'a> {
     siefp: HvSynicSimpSiefp,
     #[inspect(hex, with = "|&x| u64::from(x)")]
     simp: HvSynicSimpSiefp,
+    /// Backing for the synic message page (SIMP) overlay. Holds a zeroed
+    /// VMM-owned page while the overlay is disabled, and tracks the locked
+    /// guest page while enabled, copying contents across transitions to match
+    /// hypervisor overlay semantics (notably, a freshly enabled page starts
+    /// zeroed rather than exposing stale guest RAM to KVM's in-kernel synic).
+    simp_overlay: OverlayPage,
+    /// Backing for the synic event flags page (SIEFP) overlay. See
+    /// [`Self::simp_overlay`].
+    siefp_overlay: OverlayPage,
 }
 
 impl KvmProcessor<'_> {
@@ -923,6 +935,60 @@ impl KvmProcessor<'_> {
         self.partition.gm.write_at(simp + 4, &msg.as_bytes()[4..])?;
         self.partition.gm.write_plain(simp, &msg.header.typ)?;
         Ok(true)
+    }
+
+    /// Updates a synic overlay page (SIMP or SIEFP) in response to a guest MSR
+    /// write, preserving the overlay's logical contents across map, move, and
+    /// unmap transitions.
+    ///
+    /// KVM (with `KVM_CAP_HYPERV_SYNIC2`) places the live page directly in
+    /// guest RAM and does not zero it when the guest enables the overlay. The
+    /// hypervisor contract is that the overlay is logically separate from guest
+    /// RAM: its contents are zeroed once and then follow the overlay as it is
+    /// mapped or moved. Mirroring that here (via [`OverlayPage`]) ensures a
+    /// freshly enabled page is zeroed rather than exposing stale guest memory,
+    /// which the in-kernel synic would otherwise treat as a pending (occupied)
+    /// message and refuse to deliver into.
+    fn update_synic_overlay(
+        overlay: &mut OverlayPage,
+        old: HvSynicSimpSiefp,
+        new: HvSynicSimpSiefp,
+        gm: &GuestMemory,
+    ) {
+        let mut prot = KvmNoVtlProtections(gm);
+        if new.enabled() && (!old.enabled() || new.base_gpn() != old.base_gpn()) {
+            if let Err(err) = overlay.remap(new.base_gpn(), &mut prot) {
+                tracelimit::warn_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    gpn = new.base_gpn(),
+                    "failed to map synic overlay page"
+                );
+            }
+        } else if !new.enabled() {
+            overlay.unmap(&mut prot);
+        }
+    }
+}
+
+/// A no-op [`VtlProtectAccess`] implementation for use without VTL protections,
+/// as is the case for KVM. Locking a page simply pins it in guest memory;
+/// unlocking is a no-op.
+struct KvmNoVtlProtections<'a>(&'a GuestMemory);
+
+impl hv1_emulator::VtlProtectAccess for KvmNoVtlProtections<'_> {
+    fn check_modify_and_lock_overlay_page(
+        &mut self,
+        gpn: u64,
+        _check_perms: hvdef::HvMapGpaFlags,
+        _new_perms: Option<hvdef::HvMapGpaFlags>,
+    ) -> Result<guestmem::LockedPages, HvError> {
+        self.0
+            .lock_gpns(false, &[gpn])
+            .map_err(|_| HvError::OperationDenied)
+    }
+
+    fn unlock_overlay_page(&mut self, _gpn: u64) -> Result<(), HvError> {
+        Ok(())
     }
 }
 
@@ -1414,6 +1480,21 @@ impl Processor for KvmProcessor<'_> {
                         siefp,
                         simp,
                     } => {
+                        // Preserve the overlay contents across this guest MSR
+                        // write. This must happen before updating the tracked
+                        // register values below, since it diffs old vs new.
+                        Self::update_synic_overlay(
+                            &mut self.simp_overlay,
+                            self.simp,
+                            simp.into(),
+                            &self.partition.gm,
+                        );
+                        Self::update_synic_overlay(
+                            &mut self.siefp_overlay,
+                            self.siefp,
+                            siefp.into(),
+                            &self.partition.gm,
+                        );
                         self.scontrol = control.into();
                         self.siefp = siefp.into();
                         self.simp = simp.into();

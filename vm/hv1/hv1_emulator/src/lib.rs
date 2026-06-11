@@ -18,7 +18,8 @@ pub mod cpuid;
 pub mod hv;
 pub mod hypercall;
 pub mod message_queues;
-mod pages;
+/// Overlay page management for synthetic registers backed by guest pages.
+pub mod pages;
 pub mod synic;
 pub mod x86;
 

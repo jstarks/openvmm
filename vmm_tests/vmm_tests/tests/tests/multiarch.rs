@@ -105,25 +105,19 @@ async fn boot<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Result<(
 
 /// Boot a Windows guest with x2APIC mode enabled at reset and an Intel VT-d
 /// IOMMU advertising EIM=1 (Extended Interrupt Mode). The APIC starts in
-/// x2APIC mode, so there is no dynamic xAPIC→x2APIC transition. This tests
-/// whether VT-d + x2APIC works when the transition is avoided.
+/// x2APIC mode, so there is no dynamic xAPIC→x2APIC transition.
 ///
-/// If KVM's synic timer stops delivering interrupts, Windows will hang in
-/// `HalpTimerInitializeClock`. To capture state at the hang, this boots
-/// without waiting for the agent (UEFI boot-success fires before the kernel
-/// hang), waits for the guest to reach early kernel init, then dumps the
-/// synic / synic timer / APIC state for every VP so the failure can be
-/// diagnosed offline even when the guest never reaches the agent.
+/// This is a regression test for a KVM synic SIMP overlay bug. When the guest
+/// enabled the synic message page, OpenVMM did not zero it (KVM with
+/// `KVM_CAP_HYPERV_SYNIC2` leaves the page in guest RAM), so a stale message
+/// type in the SINT 3 slot caused KVM's in-kernel synic to treat the slot as
+/// occupied and never deliver the Hyper-V synic timer interrupt. Windows then
+/// hung in `HalpTimerInitializeClock` (`TimerProblemInterruptsNotFiring`).
 #[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64)))]
-async fn boot_x2apic(
-    config: PetriVmBuilder<OpenVmmPetriBackend>,
-    (): (),
-    driver: pal_async::DefaultDriver,
-) -> Result<(), anyhow::Error> {
-    let vp_count = 4;
-    let config = config
+async fn boot_x2apic(config: PetriVmBuilder<OpenVmmPetriBackend>) -> Result<(), anyhow::Error> {
+    let (mut vm, agent) = config
         .with_processor_topology(ProcessorTopology {
-            vp_count,
+            vp_count: 4,
             apic_mode: Some(ApicMode::X2apicEnabled),
             ..Default::default()
         })
@@ -131,71 +125,25 @@ async fn boot_x2apic(
         .modify_backend(|b| {
             b.with_pcie_root_topology(1, 1, 2)
                 .with_intel_vtd(&["s0rc0"])
-        });
-    // Capture the log output directory before the builder is consumed so the
-    // state dump can be written alongside the other test artifacts.
-    let dump_path = config.log_source().output_dir().join("synic-hang.vmrs");
-    let mut vm = config.run_without_agent().await?;
+        })
+        .run()
+        .await?;
 
-    // Give the guest time to load the kernel and reach (and hang in)
-    // HalpTimerInitializeClock. UEFI boot-success has already fired by the
-    // time run_without_agent returns, so the kernel is now executing.
-    pal_async::timer::PolledTimer::new(&driver)
-        .sleep(std::time::Duration::from_secs(30))
-        .await;
+    // Verify x2APIC is active by inspecting the APIC base MSR from the VMM.
+    // Bit 10 of IA32_APIC_BASE is the x2APIC enable bit.
+    let node = vm
+        .backend()
+        .inspector()
+        .context("no inspector")?
+        .inspect_path("partition/vp/0")
+        .await?;
+    let apic_base =
+        find_inspect_value(&node, "apic_base").context("apic_base not found in inspect tree")?;
+    assert!(
+        apic_base & (1 << 10) != 0,
+        "x2APIC not enabled: apic_base = {apic_base:#x} (bit 10 not set)",
+    );
 
-    // Dump the synic / synic-timer / APIC state for every VP. The clock is
-    // the Hyper-V synic STIMER (SINT 3, message mode), which is delivered by
-    // KVM's in-kernel synic and is independent of the VT-d interrupt
-    // remapping path. These fields reveal whether the timer is still armed,
-    // whether SINT 3 is masked, and whether the clock vector is stuck in the
-    // APIC (e.g. pending in IRR while a higher-priority vector sits in ISR).
-    {
-        let inspector = vm.backend().inspector().context("no inspector")?;
-        for vp in 0..vp_count {
-            let path = format!("partition/vp/{vp}/vtl0");
-            match inspector.inspect_path(&path).await {
-                Ok(node) => {
-                    for field in ["synic", "synic_timers", "apic", "simp"] {
-                        if let Some(child) = find_inspect_node(&node, field) {
-                            tracing::info!(vp, field, "{}", child.json());
-                        } else {
-                            tracing::warn!(vp, field, "field not found in inspect tree");
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(vp, error = %err, "failed to inspect vp state");
-                }
-            }
-        }
-
-        // Verify x2APIC is active by inspecting the APIC base MSR from the VMM.
-        // Bit 10 of IA32_APIC_BASE is the x2APIC enable bit.
-        let node = inspector.inspect_path("partition/vp/0").await?;
-        let apic_base = find_inspect_value(&node, "apic_base")
-            .context("apic_base not found in inspect tree")?;
-        tracing::info!("apic_base = {:#x}", apic_base);
-        assert!(
-            apic_base & (1 << 10) != 0,
-            "x2APIC not enabled: apic_base = {:#x} (bit 10 not set)",
-            apic_base
-        );
-    }
-
-    // Dump full VM state as well (the `simp` inspect field above shows which
-    // message slots are occupied; the dump captures the full page contents)
-    // so the SINT 3 message slot can be examined offline if needed.
-    tracing::info!("dumping VM state to {}", dump_path.display());
-    if let Err(err) = vm.backend().dump_state(&dump_path).await {
-        tracing::warn!(error = %err, "failed to dump VM state");
-    }
-
-    // Now wait for the agent. If the synic timer stopped firing, the guest is
-    // hung in HalpTimerInitializeClock and this will time out (and the test
-    // fails) after the diagnostics above have been captured. If the bug is
-    // fixed, the guest boots and the test passes.
-    let agent = vm.wait_for_agent().await?;
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;
     Ok(())
@@ -221,17 +169,6 @@ fn find_inspect_value(node: &inspect::Node, name: &str) -> Option<u64> {
             }
             None
         }
-        _ => None,
-    }
-}
-
-/// Find the first immediate child of a directory node with the given name.
-fn find_inspect_node<'a>(node: &'a inspect::Node, name: &str) -> Option<&'a inspect::Node> {
-    match node {
-        inspect::Node::Dir(entries) => entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| &entry.node),
         _ => None,
     }
 }

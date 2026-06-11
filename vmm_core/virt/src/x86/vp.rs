@@ -1862,12 +1862,36 @@ impl StateElement<X86PartitionCapabilities, X86VpInfo> for SynicMessageQueues {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Protobuf, Inspect)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Protobuf)]
 #[mesh(package = "virt.x86")]
-#[inspect(skip)]
 pub struct SynicMessagePage {
     #[mesh(1)]
     pub data: [u8; 4096],
+}
+
+impl Inspect for SynicMessagePage {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        // The page holds 16 per-SINT message slots of 256 bytes each. A slot
+        // is occupied when its message type (the first u32) is non-zero. Emit
+        // a bitmap of occupied slots plus per-slot details, rather than the
+        // raw 4096 bytes, so a stuck/undelivered message is easy to spot.
+        let mut resp = req.respond();
+        let mut occupied = 0u16;
+        for sint in 0..hvdef::NUM_SINTS {
+            let slot = &self.data[sint * HV_MESSAGE_SIZE..][..HV_MESSAGE_SIZE];
+            let typ = u32::from_ne_bytes(slot[0..4].try_into().unwrap());
+            if typ != 0 {
+                occupied |= 1 << sint;
+                // Byte 5 is HvMessageFlags; bit 0 is message_pending.
+                let message_pending = slot[5] & 1 != 0;
+                resp.field(
+                    &format!("slot{sint}"),
+                    format!("type={typ:#x} pending={message_pending}"),
+                );
+            }
+        }
+        resp.hex("occupied_bitmap", occupied);
+    }
 }
 
 impl StateElement<X86PartitionCapabilities, X86VpInfo> for SynicMessagePage {

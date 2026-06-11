@@ -75,6 +75,37 @@ impl KvmVpStateAccess<'_> {
         msrs.set_values(values.into_iter().map(|v| v.into()));
         Ok(msrs)
     }
+
+    /// Reads a synic overlay page (SIMP or SIEFP) from guest memory.
+    ///
+    /// With `KVM_CAP_HYPERV_SYNIC2`, KVM places the message and event flags
+    /// pages directly in guest RAM at the GPA programmed via the SIMP/SIEFP
+    /// MSR, rather than keeping a private copy retrievable via an ioctl. So
+    /// the live page contents are simply read from guest memory at that GPA.
+    ///
+    /// Returns a zeroed page if the overlay is not enabled. On a guest memory
+    /// read failure the read is treated as best-effort (zeroed page + warning)
+    /// so that save/restore is not broken by a transient/invalid mapping.
+    fn read_synic_overlay_page(&self, msr: u32) -> Result<[u8; 4096], KvmError> {
+        let mut value = [0u64; 1];
+        self.kvm().get_msrs(&[msr], &mut value)?;
+        let reg = hvdef::HvSynicSimpSiefp::from(value[0]);
+        let mut page = [0u8; 4096];
+        if !reg.enabled() {
+            return Ok(page);
+        }
+        let gpa = reg.base_gpn() << hvdef::HV_PAGE_SHIFT;
+        if let Err(err) = self.partition.gm.read_at(gpa, &mut page) {
+            tracing::warn!(
+                msr,
+                gpa,
+                error = &err as &dyn std::error::Error,
+                "failed to read synic overlay page from guest memory"
+            );
+            return Ok([0u8; 4096]);
+        }
+        Ok(page)
+    }
 }
 
 fn seg_reg(reg: SegmentRegister) -> kvm::kvm_segment {
@@ -520,30 +551,35 @@ impl AccessVpState for KvmVpStateAccess<'_> {
     }
 
     fn synic_message_page(&mut self) -> Result<vp::SynicMessagePage, Self::Error> {
-        // TODO
-        Ok(vp::SynicMessagePage { data: [0; 4096] })
+        let data = self.read_synic_overlay_page(hvdef::HV_X64_MSR_SIMP)?;
+        Ok(vp::SynicMessagePage { data })
     }
 
     fn set_synic_message_page(&mut self, _value: &vp::SynicMessagePage) -> Result<(), Self::Error> {
-        // TODO
+        // The message page lives in guest RAM (KVM_CAP_HYPERV_SYNIC2); KVM and
+        // the guest own its contents, so there is nothing to restore here. The
+        // SIMP MSR (restored via synic_msrs) is what re-establishes the page.
         Ok(())
     }
 
     fn synic_event_flags_page(&mut self) -> Result<vp::SynicEventFlagsPage, Self::Error> {
-        // TODO
-        Ok(vp::SynicEventFlagsPage { data: [0; 4096] })
+        let data = self.read_synic_overlay_page(hvdef::HV_X64_MSR_SIEFP)?;
+        Ok(vp::SynicEventFlagsPage { data })
     }
 
     fn set_synic_event_flags_page(
         &mut self,
         _value: &vp::SynicEventFlagsPage,
     ) -> Result<(), Self::Error> {
-        // TODO
+        // See set_synic_message_page: the page lives in guest RAM and is
+        // re-established by restoring the SIEFP MSR.
         Ok(())
     }
 
     fn synic_message_queues(&mut self) -> Result<vp::SynicMessageQueues, Self::Error> {
-        // TODO
+        // KVM's in-kernel synic owns any messages that have not yet been
+        // written to the guest's SIMP page, and exposes no ioctl to retrieve
+        // them. Messages already delivered are visible via synic_message_page.
         Ok(Default::default())
     }
 
@@ -551,7 +587,8 @@ impl AccessVpState for KvmVpStateAccess<'_> {
         &mut self,
         _value: &vp::SynicMessageQueues,
     ) -> Result<(), Self::Error> {
-        // TODO
+        // KVM provides no way to inject pending synic messages; see
+        // synic_message_queues.
         Ok(())
     }
 

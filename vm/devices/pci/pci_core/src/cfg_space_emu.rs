@@ -737,7 +737,16 @@ impl<const N: usize> ConfigSpaceCommonHeaderEmulator<N> {
                     *value = result;
                     CommonHeaderResult::Handled
                 } else {
-                    *value = 0xffffffff;
+                    // No extended capability backs this offset. Per the PCIe
+                    // spec, a function that implements extended config space
+                    // but has no (further) extended capabilities must return
+                    // an all-zero header here, signaling the end of the list.
+                    // Returning all-ones (the convention for an absent
+                    // function) would instead be decoded as a malformed
+                    // capability whose next-pointer is 0xFFF, causing guests
+                    // that walk the list (e.g. Windows' pcip.sys DDA proxy) to
+                    // chase a bogus pointer off the end of config space.
+                    *value = 0;
                     CommonHeaderResult::Handled
                 }
             } else {
@@ -2372,13 +2381,15 @@ mod tests {
             CommonHeaderResult::Failed(IoError::InvalidRegister)
         ));
 
-        // Test reading extended capabilities - PCIe device should return 0xffffffff
+        // Test reading extended capabilities - a PCIe device with no extended
+        // capabilities must return an all-zero header at EXT_CAP_START, marking
+        // the end of the list (not all-ones, which would be a malformed cap).
         let mut value = 0;
         assert!(matches!(
             common_emu_pcie.read_extended_capabilities(EXT_CAP_START, &mut value),
             CommonHeaderResult::Handled
         ));
-        assert_eq!(value, 0xffffffff);
+        assert_eq!(value, 0);
 
         // Test writing extended capabilities - non-PCIe device should return error
         assert!(matches!(

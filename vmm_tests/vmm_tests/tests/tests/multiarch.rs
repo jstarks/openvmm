@@ -512,8 +512,6 @@ async fn reboot_into_guest_vsm<T: PetriVmmBackend>(
 #[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64_no_vmbus_prepped)))]
 async fn boot_hyperv_role(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
-    (): (),
-    driver: pal_async::DefaultDriver,
 ) -> Result<(), anyhow::Error> {
     let mut vm = config
         .with_no_vmbus()
@@ -545,15 +543,6 @@ async fn boot_hyperv_role(
         })
         .run_without_agent()
         .await?;
-
-    // Wait for the guest to initialize VT-d and potentially hang, then dump.
-    pal_async::timer::PolledTimer::new(&driver)
-        .sleep(std::time::Duration::from_secs(10))
-        .await;
-    let dump_path = std::path::Path::new("/tmp/vtd-hang.vmrs");
-    tracing::info!("Dumping VM state to {}", dump_path.display());
-    vm.backend().dump_state(dump_path).await?;
-    anyhow::bail!("dumped state to {}", dump_path.display());
 
     let agent = vm.wait_for_agent().await?;
     let shell = agent.windows_shell();
@@ -928,8 +917,32 @@ async fn boot_hyperv_role(
         .run()
         .await?;
 
+    // Start an ETW trace session on pcip's TraceLogging provider before the
+    // dismount. pcip.sys routes every internal TraceEvents() through a
+    // self-describing TraceLogging provider (Microsoft.Windows.HyperV.PCIP,
+    // GUID b044715a-60d2-5a5c-3bbc-1183b020d91d) emitting source/line/message
+    // fields, including a TRACE_LEVEL_ERROR trace at each PcipPrepareHardware
+    // failure point. Self-describing events decode without TMF/PDB files, so a
+    // plain Get-WinEvent on the .etl reveals exactly which start step failed.
+    cmd!(shell, "logman.exe")
+        .args([
+            "create",
+            "trace",
+            "PcipDiag",
+            "-p",
+            "{b044715a-60d2-5a5c-3bbc-1183b020d91d}",
+            "0xffffffffffffffff",
+            "0xff",
+            "-o",
+            r"C:\pcip.etl",
+            "-ets",
+        ])
+        .ignore_status()
+        .run()
+        .await?;
+
     // Dismount the device from the host so it can be assigned to a VM.
-    cmd!(shell, "powershell.exe")
+    let dismount = cmd!(shell, "powershell.exe")
         .args([
             "-Command",
             &format!(
@@ -937,8 +950,107 @@ async fn boot_hyperv_role(
                 dda_location_path
             ),
         ])
+        .ignore_status()
+        .output()
+        .await?;
+
+    // Stop the trace session (always, so it is cleaned up on success too).
+    cmd!(shell, "logman.exe")
+        .args(["stop", "PcipDiag", "-ets"])
+        .ignore_status()
         .run()
         .await?;
+
+    if !dismount.status.success() {
+        tracing::error!(
+            stderr = %String::from_utf8_lossy(&dismount.stderr),
+            "Dismount-VMHostAssignableDevice failed; capturing pcip PnP diagnostics"
+        );
+
+        // Decode pcip's TraceLogging events from the captured ETL. The fields
+        // are positional: [0]=source (function), [1]=line, [2]=message. The
+        // last ERROR-level event names the exact PcipPrepareHardware step that
+        // returned failure (e.g. ProcessMmioResource, GetFunctionAndDeviceNumber).
+        // The session captured only the pcip provider, so dump every event
+        // (do not filter by ProviderName — TraceLogging events read from an
+        // ETL often resolve the provider to its GUID rather than the name).
+        let pcip_trace = cmd!(shell, "powershell.exe")
+            .args([
+                "-Command",
+                r#"
+                $events = Get-WinEvent -Path 'C:\pcip.etl' -Oldest -ErrorAction SilentlyContinue
+                Write-Host "pcip.etl event count: $(@($events).Count)"
+                $events | ForEach-Object {
+                    $p = $_.Properties
+                    $src = if ($p.Count -gt 0) { $p[0].Value } else { '' }
+                    $ln  = if ($p.Count -gt 1) { $p[1].Value } else { '' }
+                    $msg = if ($p.Count -gt 2) { $p[2].Value } else { '' }
+                    "{0} [{1}] {2}:{3} {4}" -f $_.TimeCreated, $_.LevelDisplayName, $src, $ln, $msg
+                }
+                # Fallback: tracerpt decodes self-describing TraceLogging to XML
+                # even when Get-WinEvent cannot enumerate the events.
+                Write-Host "=== tracerpt XML ==="
+                tracerpt 'C:\pcip.etl' -o 'C:\pcip.xml' -of XML -y 2>&1 | Out-Null
+                if (Test-Path 'C:\pcip.xml') { Get-Content 'C:\pcip.xml' -Raw }
+            "#,
+            ])
+            .ignore_status()
+            .read()
+            .await?;
+        tracing::info!("pcip TraceLogging events:\n{pcip_trace}");
+
+        // VMMS raises MSVM_VMMS_PROXY_FAILED_LOAD when, after the dismount
+        // IOCTL succeeds and the devnode is re-enumerated, pcip.sys fails to
+        // finish PnP-starting and publish its DDA device interface within the
+        // install timeout. The dismount itself succeeded, so this is a pcip
+        // PrepareHardware failure, not a reset-capability rejection. Capture
+        // the re-enumerated PCIP devnode's problem code and the pcip / PnP
+        // event logs to pinpoint which PrepareHardware step failed.
+        let pnp_diag = cmd!(shell, "powershell.exe")
+            .args(["-Command", r#"
+                Write-Host "=== pcip PnP devnode state ==="
+                Get-PnpDevice -ErrorAction SilentlyContinue |
+                    Where-Object { $_.InstanceId -match '^PCIP\\' -or $_.InstanceId -match 'VEN_1414&DEV_C03E' } |
+                    ForEach-Object {
+                        Write-Host "InstanceId: $($_.InstanceId)"
+                        Write-Host "  Status: $($_.Status)  Class: $($_.Class)  FriendlyName: $($_.FriendlyName)"
+                        $problem = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
+                        $problemStatus = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_ProblemStatus' -ErrorAction SilentlyContinue).Data
+                        Write-Host "  ProblemCode: $problem  ProblemStatus: $problemStatus"
+                        $svc = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_Service' -ErrorAction SilentlyContinue).Data
+                        Write-Host "  Service: $svc"
+                    }
+
+                Write-Host "=== System log: pcip / PnP / VMMS errors (last 100) ==="
+                Get-WinEvent -LogName System -MaxEvents 100 -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.ProviderName -match 'pcip|Pnp|Kernel-PnP|vpci' -or
+                        $_.Message -match 'pcip|PCIP|proxy|assignable'
+                    } |
+                    Format-List TimeCreated,Id,ProviderName,LevelDisplayName,Message |
+                    Out-String -Width 4096
+
+                Write-Host "=== Kernel-PnP Admin/Config logs ==="
+                foreach ($log in @(
+                    'Microsoft-Windows-Kernel-PnP/Configuration',
+                    'Microsoft-Windows-Hyper-V-VMMS-Admin'
+                )) {
+                    Write-Host "--- $log ---"
+                    Get-WinEvent -LogName $log -MaxEvents 30 -ErrorAction SilentlyContinue |
+                        Format-List TimeCreated,Id,LevelDisplayName,Message |
+                        Out-String -Width 4096
+                }
+            "#])
+            .ignore_status()
+            .read()
+            .await?;
+        tracing::info!("pcip PnP diagnostics:\n{pnp_diag}");
+
+        anyhow::bail!(
+            "Dismount-VMHostAssignableDevice failed: {}",
+            String::from_utf8_lossy(&dismount.stderr)
+        );
+    }
 
     // Create a Gen2 VM and assign the device to it.
     cmd!(shell, "powershell.exe")

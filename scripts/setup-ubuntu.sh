@@ -171,15 +171,26 @@ To boot with OpenVMM (from the openvmm repo root):
     --uefi \\
     --com1 console \\
     --uefi-console-mode com1 \\
-    --disk file:${ABSDIR}/disk.raw \\
-    --disk file:${ABSDIR}/cidata.img,ro \\
-    --net consomme \\
+    --pcie-root-complex rc0,segment=0,start_bus=0,end_bus=255,low_mmio=256M,high_mmio=512G \\
+    --pcie-root-port rc0:disk \\
+    --pcie-root-port rc0:cidata \\
+    --pcie-root-port rc0:net \\
+    --nvme-pci id=nvme-disk,pcie_port=disk \\
+    --nvme-pci id=nvme-cidata,pcie_port=cidata \\
+    --disk file:${ABSDIR}/disk.raw,on=nvme-disk \\
+    --disk file:${ABSDIR}/cidata.img,ro,on=nvme-cidata \\
+    --virtio-net pcie_port=net:consomme \\
     --default-boot-always-attempt \\
     -m 2G \\
     -p 2 \\
     --hv
 
 Notes:
+  * The root disk and the cloud-init seed are attached as NVMe namespaces on
+    emulated PCIe controllers (no VMBus SCSI). UEFI enumerates the PCIe NVMe
+    controllers and boots from the root disk.
+  * Networking is provided by a virtio-net device on the PCIe root complex
+    (no VMBus NIC), backed by the user-mode 'consomme' NAT stack.
   * Running via 'cargo run' picks up the mu_msvm UEFI firmware automatically
     from .cargo/config.toml (after 'cargo xflowey restore-packages'). If you
     run the openvmm binary directly, add:

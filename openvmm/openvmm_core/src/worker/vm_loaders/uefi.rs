@@ -48,6 +48,11 @@ pub struct UefiLoadSettings {
     /// but the high MMIO range will be empty. The firmware must support this
     /// mode.
     pub vmbus: bool,
+    /// Whether the hypervisor (HV#1) enlightenments are exposed to the guest.
+    /// When `false`, the firmware's `hv_disabled` flag is set so that the
+    /// firmware does not attempt to use hypervisor-specific facilities. This
+    /// is required to boot UEFI without hypervisor support (e.g. aarch64 KVM).
+    pub hv: bool,
 }
 
 /// All inputs needed by [`load_uefi`].
@@ -140,6 +145,7 @@ pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
         )
         .with_default_boot_always_attempt(settings.default_boot_always_attempt)
         .with_vmbus_disabled(!settings.vmbus)
+        .with_hv_disabled(!settings.hv)
         .with_pci_resources_pre_assigned(true);
 
     let mut cfg = config::Blob::new();

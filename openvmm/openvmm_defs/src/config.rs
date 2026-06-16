@@ -136,6 +136,7 @@ pub enum LoadMode {
         default_boot_always_attempt: bool,
         bios_guid: Guid,
         enable_vmbus: bool,
+        enable_hv: bool,
     },
     Pcat {
         firmware: RomFileLocation,

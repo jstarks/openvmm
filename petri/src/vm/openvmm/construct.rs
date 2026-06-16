@@ -905,6 +905,7 @@ impl PetriVmConfigSetupCore<'_> {
                     default_boot_always_attempt: *default_boot_always_attempt,
                     bios_guid: Guid::new_random(),
                     enable_vmbus: !self.no_vmbus,
+                    enable_hv: true,
                 }
             }
             (

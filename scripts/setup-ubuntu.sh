@@ -125,7 +125,8 @@ write_files:
   - path: /etc/default/grub.d/99-openvmm-serial.cfg
     permissions: '0644'
     content: |
-      GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 console=${SERIAL_TTY},115200"
+      GRUB_CMDLINE_LINUX="rootwait rd.multipath=0 nvme_core.multipath=0"
+      GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 console=${SERIAL_TTY},115200 rootwait rd.multipath=0 nvme_core.multipath=0"
 runcmd:
   - [ systemctl, enable, --now, "serial-getty@${SERIAL_TTY}.service" ]
   - [ update-grub ]
@@ -171,14 +172,14 @@ To boot with OpenVMM (from the openvmm repo root):
     --uefi \\
     --com1 console \\
     --uefi-console-mode com1 \\
+    --efi-diagnostics-log-level info \\
     --pcie-root-complex rc0,segment=0,start_bus=0,end_bus=255,low_mmio=256M,high_mmio=512G \\
     --pcie-root-port rc0:disk \\
     --pcie-root-port rc0:cidata \\
     --pcie-root-port rc0:net \\
     --nvme-pci id=nvme-disk,pcie_port=disk \\
-    --nvme-pci id=nvme-cidata,pcie_port=cidata \\
     --disk file:${ABSDIR}/disk.raw,on=nvme-disk \\
-    --disk file:${ABSDIR}/cidata.img,ro,on=nvme-cidata \\
+    --virtio-blk file:${ABSDIR}/cidata.img,ro,pcie_port=cidata \\
     --virtio-net pcie_port=net:consomme \\
     --default-boot-always-attempt \\
     -m 2G \\
@@ -186,11 +187,13 @@ To boot with OpenVMM (from the openvmm repo root):
     --hv
 
 Notes:
-  * The root disk and the cloud-init seed are attached as NVMe namespaces on
-    emulated PCIe controllers (no VMBus SCSI). UEFI enumerates the PCIe NVMe
-    controllers and boots from the root disk.
+  * The root disk is attached as NVMe on emulated PCIe (no VMBus SCSI).
+    The cloud-init seed disk is attached as virtio-blk on PCIe to keep the
+    boot path simple while preserving NVMe root-disk coverage.
   * Networking is provided by a virtio-net device on the PCIe root complex
     (no VMBus NIC), backed by the user-mode 'consomme' NAT stack.
+  * EFI diagnostics are enabled (INFO level) so COM1 shows firmware device
+    enumeration and default-boot decisions.
   * Running via 'cargo run' picks up the mu_msvm UEFI firmware automatically
     from .cargo/config.toml (after 'cargo xflowey restore-packages'). If you
     run the openvmm binary directly, add:

@@ -377,6 +377,7 @@ impl PetriVmConfigOpenVmm {
                         hotplug: true,
                         acs_capabilities_supported: Some(0),
                         cxl: false,
+                        gi_node: None,
                     })
                     .collect();
 

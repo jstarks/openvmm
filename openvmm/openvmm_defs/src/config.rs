@@ -243,6 +243,11 @@ pub struct PcieRootPortConfig {
     /// Runtime port construction derives required BAR/subregion layout from
     /// this flag (currently CXL component registers for BAR0).
     pub cxl: bool,
+    /// Declares that the device directly behind this root port is a generic
+    /// initiator (GI) for the given NUMA node. Used to generate an SRAT
+    /// Generic Initiator Affinity structure so the guest attaches the
+    /// device's memory to that (typically CPU-less) proximity domain.
+    pub gi_node: Option<u32>,
 }
 
 #[derive(Debug, MeshPayload)]

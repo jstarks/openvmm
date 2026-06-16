@@ -1064,12 +1064,18 @@ Examples:
     # Attach root port rc0rp1 to root complex rc0 with hotplug support
     --pcie-root-port rc0:rc0rp1,hotplug
 
+    # Declare the device behind rc0rp2 as a generic initiator for NUMA node 2
+    # (node 2 should be a CPU-less node created via --numa)
+    --pcie-root-port rc0:rc0rp2,gi_node=2
+
 Syntax: <root_complex_name>:<name>[,opt,opt=arg,...]
 
 Options:
     `hotplug`                      enable hotplug support for this root port
     `acs=<mask>`                   ACS capability bitmask (u16, decimal or 0x-prefixed hex)
     `cxl`                          configure this root port as CXL-capable
+    `gi_node=<node>`               expose the device behind this port as an SRAT
+                                   generic initiator for the given NUMA node
 "#)]
     #[clap(long, conflicts_with("pcat"))]
     pub pcie_root_port: Vec<PcieRootPortCli>,
@@ -3071,6 +3077,7 @@ pub struct PcieRootPortCli {
     pub hotplug: bool,
     pub acs_capabilities_supported: Option<u16>,
     pub cxl: bool,
+    pub gi_node: Option<u32>,
 }
 
 impl FromStr for PcieRootPortCli {
@@ -3094,6 +3101,7 @@ impl FromStr for PcieRootPortCli {
         let mut hotplug = false;
         let mut acs_capabilities_supported = None;
         let mut cxl = false;
+        let mut gi_node = None;
 
         // Parse optional flags
         for opt in opts {
@@ -3121,6 +3129,15 @@ impl FromStr for PcieRootPortCli {
                     }
                     cxl = true;
                 }
+                "gi_node" => {
+                    let value = value.context("gi_node option requires a value")?;
+                    if kv.next().is_some() {
+                        anyhow::bail!("gi_node option expects a single value")
+                    }
+                    gi_node = Some(
+                        u32::from_str(value).context("failed to parse gi_node NUMA node number")?,
+                    );
+                }
                 _ => anyhow::bail!("unexpected option: '{opt}'"),
             }
         }
@@ -3131,6 +3148,7 @@ impl FromStr for PcieRootPortCli {
             hotplug,
             acs_capabilities_supported,
             cxl,
+            gi_node,
         })
     }
 }
@@ -4524,6 +4542,7 @@ mod tests {
                 hotplug: false,
                 acs_capabilities_supported: None,
                 cxl: false,
+                gi_node: None,
             }
         );
 
@@ -4535,6 +4554,7 @@ mod tests {
                 hotplug: false,
                 acs_capabilities_supported: None,
                 cxl: false,
+                gi_node: None,
             }
         );
 
@@ -4547,6 +4567,7 @@ mod tests {
                 hotplug: true,
                 acs_capabilities_supported: None,
                 cxl: false,
+                gi_node: None,
             }
         );
 
@@ -4558,6 +4579,7 @@ mod tests {
                 hotplug: false,
                 acs_capabilities_supported: Some(0),
                 cxl: false,
+                gi_node: None,
             }
         );
 
@@ -4569,6 +4591,7 @@ mod tests {
                 hotplug: false,
                 acs_capabilities_supported: Some(0x005f),
                 cxl: false,
+                gi_node: None,
             }
         );
 
@@ -4580,6 +4603,19 @@ mod tests {
                 hotplug: false,
                 acs_capabilities_supported: None,
                 cxl: true,
+                gi_node: None,
+            }
+        );
+
+        assert_eq!(
+            PcieRootPortCli::from_str("my_rc:port5,gi_node=2").unwrap(),
+            PcieRootPortCli {
+                root_complex_name: "my_rc".to_string(),
+                name: "port5".to_string(),
+                hotplug: false,
+                acs_capabilities_supported: None,
+                cxl: false,
+                gi_node: Some(2),
             }
         );
 

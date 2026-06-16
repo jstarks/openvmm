@@ -840,6 +840,7 @@ async fn vm_config_from_command_line(
                 hotplug: port_cli.hotplug,
                 acs_capabilities_supported: port_cli.acs_capabilities_supported,
                 cxl: port_cli.cxl,
+                gi_node: port_cli.gi_node,
             })
             .collect();
 

@@ -142,6 +142,7 @@ use vmcore::vmtime::VmTimeSource;
 use vmgs_resources::GuestStateEncryptionPolicy;
 use vmgs_resources::VmgsResource;
 use vmm_core::acpi_builder::AcpiTablesBuilder;
+use vmm_core::acpi_builder::GenericInitiator;
 use vmm_core::acpi_builder::SlitInfo;
 use vmm_core::device_builder::VpciBusConfig;
 use vmm_core::input_distributor::InputDistributor;
@@ -756,6 +757,10 @@ struct LoadedVmInner {
     amd_iommu_acpi_configs: Vec<vmm_core::acpi_builder::AmdIommuAcpiConfig>,
     pcie_host_bridges: Vec<PcieHostBridge>,
     pcie_root_complexes: Vec<Arc<closeable_mutex::CloseableMutex<GenericPcieRootComplex>>>,
+    /// Sources for SRAT generic-initiator entries, one per root port annotated
+    /// with `gi_node=N`. Each holds the port's live bus-range handle, read at
+    /// ACPI-build time (after PCI resource assignment) to derive the device bus.
+    generic_initiator_sources: Vec<GenericInitiatorSource>,
     /// SMMU configurations, one per instance.
     #[cfg(guest_arch = "aarch64")]
     smmu_configs: Vec<vmm_core::acpi_builder::AcpiSmmuConfig>,
@@ -873,6 +878,28 @@ fn build_root_port_definition(rp_cfg: &PcieRootPortConfig) -> GenericPcieRootPor
     }
 }
 
+/// A source for an SRAT generic-initiator entry.
+///
+/// A root port annotated with `gi_node=N` declares that the device directly
+/// behind it (device 0, function 0 on the port's secondary bus) is a generic
+/// initiator for NUMA node `N`. This attaches passthrough device memory (e.g.
+/// an NVIDIA Grace GPU's coherent aperture) to a CPU-less NUMA node so the
+/// guest driver can online it.
+///
+/// Rather than predict the device's bus number, this holds the root port's
+/// live [`AssignedBusRange`](pci_core::bus_range::AssignedBusRange) handle —
+/// the same atomic the config-space emulator updates when bridge bus-number
+/// registers are written. The secondary bus is read from it at ACPI-build
+/// time, after PCI resource assignment has run.
+struct GenericInitiatorSource {
+    /// Shared bus-range handle of the root port the device sits behind.
+    bus_range: pci_core::bus_range::AssignedBusRange,
+    /// PCI segment of the root complex.
+    segment: u16,
+    /// Proximity domain (NUMA node) the device is a generic initiator for.
+    vnode: u32,
+}
+
 impl InitializedVm {
     /// Creates and initializes a VM using the given backend.
     async fn new(
@@ -970,6 +997,30 @@ impl InitializedVm {
         )
         .context("invalid NUMA topology")?;
         processor_topology.set_vnodes(&vp_to_vnode);
+
+        // Validate that NUMA node references in the PCIe topology point at
+        // nodes that actually exist.
+        let num_nodes = cfg.numa.nodes.len() as u32;
+        for rc in &cfg.pcie_root_complexes {
+            if let Some(vnode) = rc.vnode
+                && vnode >= num_nodes
+            {
+                anyhow::bail!(
+                    "PCIe root complex '{}' references NUMA node {vnode} which does not exist (num_nodes={num_nodes})",
+                    rc.name
+                );
+            }
+            for port in &rc.ports {
+                if let Some(vnode) = port.gi_node
+                    && vnode >= num_nodes
+                {
+                    anyhow::bail!(
+                        "PCIe root port '{}' gi_node references NUMA node {vnode} which does not exist (num_nodes={num_nodes})",
+                        port.name
+                    );
+                }
+            }
+        }
 
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
@@ -1442,6 +1493,9 @@ impl InitializedVm {
                             cache_topology: None,
                             pcie_host_bridges: &Vec::new(),
                             slit_info: pcat_slit_info.as_ref(),
+                            // PCAT BIOS is mutually exclusive with PCIe root
+                            // ports (the only source of generic initiators).
+                            generic_initiators: &[],
                             arch: vmm_core::acpi_builder::AcpiArchConfig::X86 {
                                 with_ioapic: cfg.chipset_capabilities.with_ioapic,
                                 with_pic: cfg.chipset_capabilities.with_pic,
@@ -2138,6 +2192,29 @@ impl InitializedVm {
             chipset_builder.register_weak_mutex_pcie_enumerator(bus_id, Box::new(switch_device));
         }
 
+        // Collect SRAT generic-initiator sources for any root port annotated
+        // with `gi_node=N`. We capture the port's live bus-range handle here
+        // rather than predict a bus number; the actual secondary bus is read
+        // from it at ACPI-build time, after PCI resource assignment runs.
+        let mut generic_initiator_sources = Vec::new();
+        for rc in &cfg.pcie_root_complexes {
+            for port in &rc.ports {
+                if let Some(vnode) = port.gi_node {
+                    let pi = port_info.get(port.name.as_str()).with_context(|| {
+                        format!(
+                            "root port '{}' (gi_node) not found in PCIe topology",
+                            port.name
+                        )
+                    })?;
+                    generic_initiator_sources.push(GenericInitiatorSource {
+                        bus_range: pi.bus_range.clone(),
+                        segment: pi.segment,
+                        vnode,
+                    });
+                }
+            }
+        }
+
         // Register the VFIO resolver, which spawns a container manager task
         // internally to share containers across assigned devices.
         #[cfg(target_os = "linux")]
@@ -2803,6 +2880,7 @@ impl InitializedVm {
                 amd_iommu_acpi_configs,
                 pcie_host_bridges,
                 pcie_root_complexes,
+                generic_initiator_sources,
                 pcie_hotplug_devices: Vec::new(),
                 #[cfg(guest_arch = "aarch64")]
                 smmu_configs,
@@ -2818,8 +2896,12 @@ impl InitializedVm {
                 .await
                 .context("loadedvm restore failed")?;
         } else {
-            this.inner.load_firmware(false).await?;
+            // Assign PCI bus numbers/BARs before building firmware so that the
+            // ACPI tables (specifically the SRAT generic-initiator entries) can
+            // read the assigned secondary bus numbers from the root ports'
+            // bridge registers.
             this.assign_pci_resources().await?;
+            this.inner.load_firmware(false).await?;
         }
 
         Ok(this)
@@ -2853,12 +2935,31 @@ impl LoadedVmInner {
             None
         };
         let slit_info = self.slit_info();
+        // Resolve each generic-initiator source to its assigned PCI bus now that
+        // PCI resource assignment has programmed the root ports' bridge
+        // bus-number registers. The device is function 0 of device 0 on the
+        // port's secondary bus.
+        let generic_initiators: Vec<GenericInitiator> = self
+            .generic_initiator_sources
+            .iter()
+            .map(|s| {
+                let (secondary_bus, _subordinate) = s.bus_range.bus_range();
+                GenericInitiator {
+                    segment: s.segment,
+                    bus: secondary_bus,
+                    device: 0,
+                    function: 0,
+                    vnode: s.vnode,
+                }
+            })
+            .collect();
         let acpi_builder = AcpiTablesBuilder {
             processor_topology: &self.processor_topology,
             mem_layout: &self.mem_layout,
             cache_topology: cache_topology.as_ref(),
             pcie_host_bridges: &self.pcie_host_bridges,
             slit_info: slit_info.as_ref(),
+            generic_initiators: &generic_initiators,
             #[cfg(guest_arch = "x86_64")]
             arch: vmm_core::acpi_builder::AcpiArchConfig::X86 {
                 with_ioapic: self.chipset_capabilities.with_ioapic,
@@ -3732,8 +3833,10 @@ impl LoadedVm {
 
         // Load again
         if reload_firmware {
-            self.inner.load_firmware(false).await?;
+            // Assign PCI resources before rebuilding firmware so the ACPI
+            // tables reflect the freshly assigned bus numbers.
             self.assign_pci_resources().await?;
+            self.inner.load_firmware(false).await?;
         }
 
         if resume {

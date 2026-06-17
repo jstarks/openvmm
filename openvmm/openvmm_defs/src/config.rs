@@ -29,6 +29,7 @@ pub struct Config {
     pub pcie_root_complexes: Vec<PcieRootComplexConfig>,
     pub pcie_devices: Vec<PcieDeviceConfig>,
     pub pcie_switches: Vec<PcieSwitchConfig>,
+    pub pcie_generic_initiators: Vec<PcieGenericInitiatorConfig>,
     pub vpci_devices: Vec<VpciDeviceConfig>,
     pub numa: NumaTopology,
     pub processor_topology: ProcessorTopologyConfig,
@@ -243,11 +244,6 @@ pub struct PcieRootPortConfig {
     /// Runtime port construction derives required BAR/subregion layout from
     /// this flag (currently CXL component registers for BAR0).
     pub cxl: bool,
-    /// Declares that the device directly behind this root port is a generic
-    /// initiator (GI) for the given NUMA node. Used to generate an SRAT
-    /// Generic Initiator Affinity structure so the guest attaches the
-    /// device's memory to that (typically CPU-less) proximity domain.
-    pub gi_node: Option<u32>,
 }
 
 #[derive(Debug, MeshPayload)]
@@ -257,6 +253,24 @@ pub struct PcieSwitchConfig {
     pub parent_port: String,
     pub hotplug: bool,
     pub acs_capabilities_supported: Option<u16>,
+}
+
+/// Declares that the device directly behind a named PCIe port (a root port or
+/// a switch downstream port) is a generic initiator (GI) for the given NUMA
+/// node. Used to generate an SRAT Generic Initiator Affinity structure so the
+/// guest attaches the device's memory to that (typically CPU-less) proximity
+/// domain.
+///
+/// The port is resolved against the live topology by port name after switch
+/// downstream ports have been enumerated, so it can target devices that sit
+/// behind a switch.
+#[derive(Debug, MeshPayload)]
+pub struct PcieGenericInitiatorConfig {
+    /// Name of the PCIe port (root port or switch downstream port) behind
+    /// which the generic-initiator device resides.
+    pub port_name: String,
+    /// NUMA node the device is a generic initiator for.
+    pub node: u32,
 }
 
 #[derive(Debug, MeshPayload)]

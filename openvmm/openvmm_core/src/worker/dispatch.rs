@@ -1086,13 +1086,14 @@ impl InitializedVm {
         // one `--iommu`, even with no VFIO devices attached), since that is the
         // only case where the doorbell IOVA reservation matters.
         let (ram_start_address, low_ram_window_size) = if cfg!(guest_arch = "aarch64") {
-            if matches!(cfg.load_mode, LoadMode::Linux { .. }) {
-                (1024 * 1024 * 1024, 0) // 1 GiB, no low window
+            let start = 1024 * 1024 * 1024; // 1 GB for the bulk of RAM, for good memory alignment.
+            let low_window = if matches!(cfg.load_mode, LoadMode::Linux { .. }) {
+                0
             } else {
-                // Start small; grow as testing shows how much firmware needs
-                // below the doorbell hole.
-                (1024 * 1024 * 1024, 16 * 1024 * 1024) // 1 GiB, 16 MiB window
-            }
+                // 32MB low window for UEFI to load.
+                32 * 1024 * 1024
+            };
+            (start, low_window)
         } else {
             (0, 0)
         };

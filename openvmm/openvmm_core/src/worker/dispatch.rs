@@ -1083,8 +1083,8 @@ impl InitializedVm {
             let low_window = if matches!(cfg.load_mode, LoadMode::Linux { .. }) {
                 0
             } else {
-                // 32MB low window for UEFI to load.
-                32 * 1024 * 1024
+                // 9MB low window for UEFI to load.
+                9 * 1024 * 1024
             };
             (start, low_window)
         } else {

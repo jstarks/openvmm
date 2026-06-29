@@ -994,10 +994,6 @@ impl iommu_common::IommuTranslator for VtdTranslator {
             Err(fault) => {
                 // Drop the read lock before acquiring write lock for fault recording.
                 drop(state);
-<<<<<<< HEAD
-=======
-                tracelimit::warn_ratelimited!(rid, iova, write, ?fault, "vtd translate fault");
->>>>>>> b5fac505b (bunch of bullshit)
                 fault.record(&self.shared, write);
                 return Err(iommu_common::TranslationFault { iova, error: fault });
             }
@@ -1232,11 +1228,8 @@ impl IntelVtdDevice {
     /// write. No register requires atomic writes across both DWORDs.
     fn write_register_dword(&self, offset: u16, value: u32) {
         let mut state = self.shared.state.write();
-<<<<<<< HEAD
         let mut retranslate_interrupts = false;
         tracing::trace!(offset, value, "vtd mmio_write_dword");
-=======
->>>>>>> b5fac505b (bunch of bullshit)
 
         /// Merge a DWORD write into the lo or hi half of a 64-bit value.
         fn write_lo(old: u64, value: u32) -> u64 {
@@ -1329,17 +1322,7 @@ impl IntelVtdDevice {
                 let full = write_lo(state.iqt.into_bits(), value);
                 let iqt = IqtReg::from(full);
                 state.iqt = IqtReg::new().with_qt(iqt.qt());
-<<<<<<< HEAD
                 retranslate_interrupts = self.process_invalidation_queue(&mut state);
-=======
-                tracing::info!(
-                    tail = state.iqt.tail_offset(),
-                    head = state.iqh.head_offset(),
-                    "vtd IQT write, processing queue"
-                );
-                self.process_invalidation_queue(&mut state);
-                tracing::info!(new_head = state.iqh.head_offset(), "vtd IQ processed");
->>>>>>> b5fac505b (bunch of bullshit)
             }
             Reg::IQT_HI => {
                 state.iqt = IqtReg::from(write_hi(state.iqt.into_bits(), value));

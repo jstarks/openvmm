@@ -952,6 +952,12 @@ impl MmioIntercept for VirtioPciDevice {
             return IoResult::Err(IoError::InvalidRegister);
         };
         let offset = offset as u16;
+        // Diagnostic: BAR0 is the virtio common/notify/ISR/device-config region.
+        // Any KDNET access to the device maps and reads BAR0 first, so this
+        // shows whether the boot-time transport touches the device at all.
+        if bar == 0 {
+            tracing::debug!(offset, len = data.len(), "virtio bar0 mmio read");
+        }
         if bar == 0 && offset >= BAR0_DEVICE_CFG_OFFSET {
             return defer_config_read(
                 &self.core.device_sender,
@@ -1039,15 +1045,22 @@ impl MmioIntercept for VirtioPciDevice {
 impl PciConfigSpace for VirtioPciDevice {
     fn pci_cfg_read(&mut self, offset: u16, value: &mut u32) -> IoResult {
         if offset == self.pci.pci_cfg_data_offset {
+            // Diagnostic: the `VIRTIO_PCI_CAP_PCI_CFG` window is the alternate
+            // access path KDNET uses when it cannot map the device BARs.
+            tracing::debug!("virtio pci_cfg_data window read");
             return self.read_pci_cfg_data(value);
         }
-        self.pci.config_space.read_u32(offset, value)
+        let r = self.pci.config_space.read_u32(offset, value);
+        tracing::debug!(offset, value = *value, "virtio pci cfg read");
+        r
     }
 
     fn pci_cfg_write(&mut self, offset: u16, value: u32) -> IoResult {
         if offset == self.pci.pci_cfg_data_offset {
+            tracing::debug!(value, "virtio pci_cfg_data window write");
             return self.write_pci_cfg_data(value);
         }
+        tracing::debug!(offset, value, "virtio pci cfg write");
         self.pci.config_space.write_u32(offset, value)
     }
 }

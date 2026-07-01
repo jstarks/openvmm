@@ -23,7 +23,6 @@ mesh.workspace = true
 pal_event.workspace = true
 pal_async.workspace = true
 tracelimit.workspace = true
-tracing.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

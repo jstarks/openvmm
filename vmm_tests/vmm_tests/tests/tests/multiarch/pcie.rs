@@ -1094,7 +1094,6 @@ async fn virtio_net_kdnet_windows(
     _: (),
     driver: DefaultDriver,
 ) -> anyhow::Result<()> {
-    let log_source = config.log_source().clone();
     let (mut vm, agent) = config
         .modify_backend(|b| {
             b.with_pcie_root_topology(1, 1, 1)
@@ -1151,35 +1150,6 @@ async fn virtio_net_kdnet_windows(
         "unexpected busparams format: {busparams:?}"
     );
 
-    // Diagnostic: enumerate the KDNET extensibility modules present in the
-    // image. The virtio transport module is `kd_02_1af4.dll` (named from PCI
-    // base class 0x02 + vendor 0x1af4); if it is absent, KDNET cannot bind the
-    // device regardless of configuration.
-    let kd_modules = cmd!(sh, "cmd.exe /c dir /b C:\\Windows\\System32\\kd_*.dll")
-        .ignore_status()
-        .read()
-        .await;
-    tracing::info!(?kd_modules, "KDNET extensibility modules in System32");
-
-    // Diagnostic: the `FORCEHVTONOTSHAREDEBUGDEVICE` escape that lets KDNET use a
-    // PCI NIC instead of the synthetic device was only added to the boot loader
-    // in 2021 ("KD support for QEMU in paravirtualized mode"), which is right at
-    // the WS2022 fork boundary. osloader/debug.c matches it with an ANSI
-    // `strstr`, so if the feature is compiled into this build the literal string
-    // is present in winload.efi. `findstr /m` reports the file name on a match,
-    // nothing on no match.
-    let winload_has_forcehv = cmd!(
-        sh,
-        "cmd.exe /c findstr /m /c:FORCEHVTONOTSHAREDEBUGDEVICE C:\\Windows\\System32\\winload.efi"
-    )
-    .ignore_status()
-    .read()
-    .await;
-    tracing::info!(
-        ?winload_has_forcehv,
-        "winload.efi FORCEHVTONOTSHAREDEBUGDEVICE present?"
-    );
-
     // Enable KDNET over the virtio-net device. The debugger host IP is set to
     // the consomme gateway (10.0.0.1); no debugger is actually connected.
     cmd!(
@@ -1206,107 +1176,11 @@ async fn virtio_net_kdnet_windows(
     .run()
     .await?;
 
-    // Diagnostic: capture winload's boot-debugger init result across the
-    // reboot. The events BOOT_DEBUGGER_ENABLED / BOOT_DEBUGGER_INIT_FAILURE (the
-    // latter carries the `DebuggerStatus` reason) come from the
-    // `Microsoft-Windows-Kernel-Boot` provider
-    // ({15CA44FF-4D7A-4BAA-BBA5-0998955E531E}) and are not written to any
-    // event-log channel, so a boot autologger is the only way to see them. WPR
-    // proved unreliable at actually arming the provider, so configure a boot
-    // autologger directly via the registry. Written as a .cmd because the
-    // provider-GUID registry key contains braces, which the `cmd!` macro would
-    // treat as interpolation.
-    const AUTOLOGGER_CMD: &str = concat!(
-        "@echo off\r\n",
-        "set K=HKLM\\SYSTEM\\CurrentControlSet\\Control\\WMI\\Autologger\\KdnetBoot\r\n",
-        "reg add \"%K%\" /v Start /t REG_DWORD /d 1 /f\r\n",
-        "reg add \"%K%\" /v GUID /t REG_SZ /d \"{b7a3c5d1-9e2f-4a6b-8c1d-3f5a7b9d2e4c}\" /f\r\n",
-        "reg add \"%K%\" /v FileName /t REG_SZ /d \"C:\\kdnetboot.etl\" /f\r\n",
-        "reg add \"%K%\" /v LogFileMode /t REG_DWORD /d 1 /f\r\n",
-        "reg add \"%K%\" /v BufferSize /t REG_DWORD /d 1024 /f\r\n",
-        "reg add \"%K%\" /v MaximumBuffers /t REG_DWORD /d 64 /f\r\n",
-        "reg add \"%K%\\{15CA44FF-4D7A-4BAA-BBA5-0998955E531E}\" /v Enabled /t REG_DWORD /d 1 /f\r\n",
-        "reg add \"%K%\\{15CA44FF-4D7A-4BAA-BBA5-0998955E531E}\" /v EnableLevel /t REG_DWORD /d 5 /f\r\n",
-        "reg add \"%K%\\{15CA44FF-4D7A-4BAA-BBA5-0998955E531E}\" /v MatchAnyKeyword /t REG_QWORD /d 0xffffffffffffffff /f\r\n",
-    );
-    agent
-        .write_file(
-            "C:/setup_kdnet_autologger.cmd",
-            futures::io::Cursor::new(AUTOLOGGER_CMD.as_bytes().to_vec()),
-        )
-        .await
-        .context("failed to write autologger setup script")?;
-    let autologger_setup = cmd!(sh, "cmd.exe /c C:\\setup_kdnet_autologger.cmd")
-        .ignore_status()
-        .read()
-        .await;
-    tracing::info!(?autologger_setup, "kdnet boot autologger setup");
-
     // Reboot so KDNET binds the NIC on the next boot, then reconnect to pipette
     // (which runs over VMBus, independent of the virtio NIC).
     agent.reboot().await?;
     let agent = vm.wait_for_reset().await?;
     let sh = agent.windows_shell();
-
-    // Diagnostic: stop the boot autologger (running since early boot), decode
-    // its ETL, and extract any boot-debugger events (BOOT_DEBUGGER_ENABLED on
-    // success, BOOT_DEBUGGER_INIT_FAILURE with a `DebuggerStatus` reason).
-    let logman_stop = cmd!(sh, "cmd.exe /c logman stop KdnetBoot -ets 2>&1")
-        .ignore_status()
-        .read()
-        .await;
-    tracing::info!(?logman_stop, "kdnet boot autologger stop");
-    // `-lr` (less restricted) avoids dropping events that don't match the strict
-    // schema, which can include the boot-debugger failure event.
-    let tracerpt = cmd!(
-        sh,
-        "tracerpt.exe C:\\kdnetboot.etl -o C:\\boot.xml -of XML -lr -y"
-    )
-    .ignore_status()
-    .read()
-    .await;
-    tracing::info!(?tracerpt, "tracerpt decode");
-    let dbg_events = cmd!(
-        sh,
-        "cmd.exe /c findstr /i \"BOOT_DEBUGGER Kernel-Boot DebuggerStatus BdInitFailure BdInitSuccess kdnet 1af4\" C:\\boot.xml"
-    )
-    .ignore_status()
-    .read()
-    .await;
-    tracing::info!(?dbg_events, "boot-trace debugger events");
-    // Exfiltrate the full decoded boot trace so it can be inspected offline; the
-    // inline `findstr` above is only a summary.
-    match agent.read_file("C:/boot.xml").await {
-        Ok(data) => {
-            if let Err(e) = log_source.write_attachment("boot.xml", &data[..]) {
-                tracing::warn!(error = %e, "failed to save boot.xml attachment");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "failed to read boot.xml from guest"),
-    }
-
-    // Diagnostic: the `Microsoft-Windows-Kernel-Boot/Operational` event log is
-    // written by an always-on boot autologger during boot, so it captures the
-    // boot-loader phase events (including the boot-debugger init result) without
-    // any WPR setup. Dump it as text and save it for offline inspection.
-    let kernelboot_log = cmd!(
-        sh,
-        "wevtutil.exe qe Microsoft-Windows-Kernel-Boot/Operational /c:500 /rd:true /f:text"
-    )
-    .ignore_status()
-    .read()
-    .await;
-    match &kernelboot_log {
-        Ok(text) => {
-            tracing::info!(bytes = text.len(), "kernel-boot operational log captured");
-            if let Err(e) =
-                log_source.write_attachment("kernel-boot-operational.log", text.as_bytes())
-            {
-                tracing::warn!(error = %e, "failed to save kernel-boot operational log");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "failed to query kernel-boot operational log"),
-    }
 
     // Confirm KDNET is configured for NET debugging.
     let dbgsettings = cmd!(sh, "bcdedit.exe /dbgsettings").read().await?;
@@ -1315,12 +1189,6 @@ async fn virtio_net_kdnet_windows(
         dbgsettings.to_lowercase().contains("net"),
         "expected NET debug type in dbgsettings: {dbgsettings}"
     );
-
-    // Diagnostic: confirm the boot entry settings actually persisted across the
-    // reboot (loadoptions FORCEHVTONOTSHAREDEBUGDEVICE, hypervisorlaunchtype /
-    // vsmlaunchtype off, debug Yes).
-    let bcd_enum = cmd!(sh, "bcdedit.exe /enum").ignore_status().read().await;
-    tracing::info!(?bcd_enum, "bcdedit enum after reboot");
 
     // The Microsoft Kernel Debug Network Adapter (kdnic) should now be present
     // and, once DHCP completes, obtain the consomme client address (10.0.0.2).

@@ -277,13 +277,6 @@ impl VirtioTransportCore {
             "caller must not write STATUS while busy"
         );
 
-        // Diagnostic: device-status transitions are the clearest signal that a
-        // guest driver (including the boot-time KDNET transport) is bringing
-        // the device up. Both the mapped-BAR MMIO path and the
-        // `VIRTIO_PCI_CAP_PCI_CFG` window funnel through here.
-        let new_status = VirtioDeviceStatus::from(val);
-        tracing::debug!(?new_status, "virtio device status write");
-
         if val == 0 {
             if self.device_status.as_u32() == 0 {
                 return;
@@ -300,6 +293,7 @@ impl VirtioTransportCore {
             return;
         }
 
+        let new_status = VirtioDeviceStatus::from(val);
         if new_status.acknowledge() {
             self.device_status.set_acknowledge(true);
         }

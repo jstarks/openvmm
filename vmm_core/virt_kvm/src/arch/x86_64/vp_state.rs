@@ -81,12 +81,12 @@ impl KvmVpStateAccess<'_, '_> {
     }
 
     fn clear_nested_state(&self) -> Result<(), KvmError> {
-        if !self.partition.caps.nested_virt {
+        if !self.vp.partition.caps.nested_virt {
             return Ok(());
         }
 
         self.kvm()
-            .clear_nested_state(self.partition.nested_state_format)?;
+            .clear_nested_state(self.vp.partition.nested_state_format)?;
         Ok(())
     }
 

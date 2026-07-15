@@ -2877,6 +2877,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gic_its"
+version = "0.0.0"
+dependencies = [
+ "chipset_device",
+ "inspect",
+ "virt",
+ "vmcore",
+]
+
+[[package]]
 name = "gic_v2m"
 version = "0.0.0"
 dependencies = [
@@ -5584,6 +5594,7 @@ dependencies = [
  "futures-concurrency",
  "get_resources",
  "getrandom 0.4.2",
+ "gic_its",
  "gic_v2m",
  "guestmem",
  "guid",

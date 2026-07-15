@@ -12,78 +12,13 @@
 //! VM-wide `GicV2mDevice` (a full MMIO chipset device) is created.
 
 use crate::partition::HvlitePartition;
-use chipset_device::ChipsetDevice;
-use chipset_device::mmio::MmioIntercept;
+use gic_its::GicItsDevice;
 use hvdef::Vtl;
-use inspect::InspectMut;
 use memory_range::MemoryRange;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use virt::aarch64::gic_its::GicItsBackend;
-use vmcore::device_state::ChangeDeviceState;
-use vmcore::save_restore::NoSavedState;
-use vmcore::save_restore::RestoreError;
-use vmcore::save_restore::SaveError;
-use vmcore::save_restore::SaveRestore;
 use vmotherboard::ChipsetBuilder;
-
-/// A headless chipset device representing one GICv3 ITS instance.
-///
-/// On KVM the in-kernel vITS owns its MMIO register block, so this device
-/// registers no MMIO (`supports_mmio` returns `None`). It exists to give the
-/// ITS a save/restore identity in the device model; the routing surface is
-/// consumed directly from the [`GicItsBackend`].
-#[derive(InspectMut)]
-pub(super) struct GicItsDevice {
-    segment: u16,
-    its_id: u32,
-    #[inspect(hex)]
-    base: u64,
-    #[inspect(skip)]
-    backend: Arc<dyn GicItsBackend>,
-}
-
-impl GicItsDevice {
-    fn new(segment: u16, its_id: u32, base: u64, backend: Arc<dyn GicItsBackend>) -> Self {
-        Self {
-            segment,
-            its_id,
-            base,
-            backend,
-        }
-    }
-}
-
-impl ChangeDeviceState for GicItsDevice {
-    fn start(&mut self) {}
-
-    async fn stop(&mut self) {}
-
-    async fn reset(&mut self) {}
-}
-
-impl ChipsetDevice for GicItsDevice {
-    fn supports_mmio(&mut self) -> Option<&mut dyn MmioIntercept> {
-        // The in-kernel vITS owns its MMIO block; no userspace interception.
-        None
-    }
-}
-
-impl SaveRestore for GicItsDevice {
-    // TODO: delegate to `backend.save()`/`backend.restore()` once the KVM
-    // vITS state marshaling (KVM_DEV_ARM_ITS_SAVE_TABLES + the ITS register
-    // block) is implemented. KVM aarch64 save/restore is greenfield today.
-    type SavedState = NoSavedState;
-
-    fn save(&mut self) -> Result<Self::SavedState, SaveError> {
-        let _ = &self.backend;
-        Ok(NoSavedState)
-    }
-
-    fn restore(&mut self, NoSavedState: Self::SavedState) -> Result<(), RestoreError> {
-        Ok(())
-    }
-}
 
 /// Result of [`setup_its`].
 pub(super) struct ItsDevicesResult {

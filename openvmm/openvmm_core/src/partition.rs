@@ -82,6 +82,14 @@ pub trait HvlitePartition: Inspect + Send + Sync + RequestYield {
     #[cfg(guest_arch = "aarch64")]
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic>;
 
+    /// Creates a new GICv3 ITS instance backend at the given MMIO base.
+    #[cfg(guest_arch = "aarch64")]
+    fn new_its(&self, base: u64) -> anyhow::Result<Arc<dyn virt::aarch64::gic_its::GicItsBackend>>;
+
+    /// Returns a generic SPI irqfd routing interface, if supported.
+    #[cfg(guest_arch = "aarch64")]
+    fn spi_irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>>;
+
     /// Gets the [`DoorbellRegistration`] interface for a particular VTL.
     fn into_doorbell_registration(
         self: Arc<Self>,
@@ -214,6 +222,16 @@ where
     #[cfg(guest_arch = "aarch64")]
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic> {
         self.control_gic(vtl)
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn new_its(&self, base: u64) -> anyhow::Result<Arc<dyn virt::aarch64::gic_its::GicItsBackend>> {
+        self.new_its(base)
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn spi_irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
+        self.spi_irqfd()
     }
 
     fn into_doorbell_registration(

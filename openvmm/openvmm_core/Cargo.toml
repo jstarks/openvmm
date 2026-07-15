@@ -73,6 +73,7 @@ pci_resource_assignment.workspace = true
 pci_resources.workspace = true
 pcie.workspace = true
 smmu.workspace = true
+gic_v2m.workspace = true
 scsi_core.workspace = true
 scsidisk.workspace = true
 serial_16550_resources.workspace = true

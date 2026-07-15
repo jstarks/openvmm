@@ -1,0 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "gic_v2m"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aarch64defs.workspace = true
+anyhow.workspace = true
+chipset_device.workspace = true
+inspect.workspace = true
+pal_event.workspace = true
+pci_core.workspace = true
+tracelimit.workspace = true
+virt.workspace = true
+vmcore.workspace = true
+
+[lints]
+workspace = true

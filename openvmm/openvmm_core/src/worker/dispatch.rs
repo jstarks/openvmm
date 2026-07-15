@@ -6,6 +6,7 @@ mod dump;
 mod ecam_config_access;
 mod intel_vtd_wiring;
 mod ioapic_iommu_wiring;
+mod its_wiring;
 mod pcie_topology;
 mod pcie_wiring;
 mod smmu_wiring;
@@ -464,6 +465,16 @@ pub(crate) struct InitializedVm {
     chipset_mmio: ChipsetMmioRanges,
     vtl2_framebuffer_gpa_base: Option<u64>,
     resolved_iommu: ResolvedIommu,
+    /// Sorted distinct PCI segments needing a GICv3 ITS (aarch64 ITS mode).
+    #[cfg(guest_arch = "aarch64")]
+    its_segments: Vec<u16>,
+    /// Allocator-assigned ITS MMIO ranges, parallel to `its_segments`.
+    #[cfg(guest_arch = "aarch64")]
+    its_ranges: Vec<MemoryRange>,
+    /// GICv2m frame parameters `(frame_base, spi_base, spi_count)` when v2m
+    /// MSI delivery is in use; `None` in ITS mode.
+    #[cfg(guest_arch = "aarch64")]
+    v2m_frame: Option<(u64, u32, u32)>,
     processor_topology: ProcessorTopology,
     igvm_file: Option<IgvmFile>,
     driver_source: VmTaskDriverSource,
@@ -565,6 +576,8 @@ impl ExtractTopologyConfig for ProcessorTopology<Aarch64Topology> {
 struct Aarch64TopologyResult {
     processor_topology: ProcessorTopology<Aarch64Topology>,
     spi_layout: super::spi_layout::ResolvedSpiLayout,
+    /// v2m SPI count when v2m MSI delivery is in use; `None` in ITS mode.
+    v2m_spi_count: Option<u32>,
 }
 
 #[cfg(guest_arch = "aarch64")]
@@ -574,10 +587,8 @@ fn build_aarch64_topology(
     smmu_count: usize,
 ) -> anyhow::Result<Aarch64TopologyResult> {
     use openvmm_defs::config::GicMsiConfig;
+    use vm_topology::processor::aarch64::Aarch64GicMsiConfig;
     use vm_topology::processor::aarch64::Aarch64PlatformConfig;
-    use vm_topology::processor::aarch64::GicItsInfo;
-    use vm_topology::processor::aarch64::GicMsiController;
-    use vm_topology::processor::aarch64::GicV2mInfo;
 
     const DEFAULT_GIC_V2M_SPI_COUNT: u32 = 64;
 
@@ -681,20 +692,14 @@ fn build_aarch64_topology(
         smmu_count,
     })?;
 
-    // Build the GIC MSI controller from resolved SPIs.
-    let gic_msi = if let Some(count) = v2m_spi_count {
-        GicMsiController::V2m(GicV2mInfo {
-            frame_base: openvmm_defs::config::DEFAULT_GIC_V2M_MSI_FRAME_BASE,
-            doorbell_base: openvmm_defs::config::DEFAULT_GIC_V2M_DOORBELL_BASE,
-            spi_base: spi_layout
-                .v2m_spi_base
-                .expect("v2m base must be allocated when v2m_spi_count is Some"),
-            spi_count: count,
-        })
-    } else {
-        GicMsiController::Its(GicItsInfo {
-            its_base: openvmm_defs::config::DEFAULT_GIC_ITS_BASE,
-        })
+    // Build the GIC MSI config from the resolved mode. Only the LPI-support
+    // flag and the physical passthrough MSI doorbell are construction-time
+    // concerns; the v2m frame details and per-segment ITS bases are assigned
+    // later (by the memory-layout allocator) and live with the MSI-controller
+    // devices and the ACPI/DT description.
+    let gic_msi = Aarch64GicMsiConfig {
+        passthrough_msi_doorbell: openvmm_defs::config::DEFAULT_GIC_V2M_DOORBELL_BASE,
+        lpi_enabled: v2m_spi_count.is_none(),
     };
 
     let platform = Aarch64PlatformConfig {
@@ -718,6 +723,7 @@ fn build_aarch64_topology(
     Ok(Aarch64TopologyResult {
         processor_topology: builder.build(config.proc_count)?,
         spi_layout,
+        v2m_spi_count,
     })
 }
 
@@ -794,6 +800,16 @@ struct LoadedVmInner {
     /// Instantiated IOMMU devices (ACPI configs + per-RC shared state),
     /// keyed by IOMMU type. `IommuDevices::None` when no IOMMU is configured.
     iommu_devices: IommuDevices,
+    /// Per-segment GICv3 ITS backends for PCIe MSI wiring, including for
+    /// hotplugged devices (aarch64 ITS mode).
+    #[cfg(guest_arch = "aarch64")]
+    its_backends: std::collections::BTreeMap<u16, Arc<dyn virt::aarch64::gic_its::GicItsBackend>>,
+    /// The VM-wide GICv2m frame device routing surface (aarch64 v2m mode).
+    #[cfg(guest_arch = "aarch64")]
+    v2m_device: Option<its_wiring::V2mDeviceResult>,
+    /// ACPI IORT/MADT config for each GICv3 ITS instance (aarch64 ITS mode).
+    #[cfg(guest_arch = "aarch64")]
+    its_acpi_configs: Vec<vmm_core::acpi_builder::AcpiItsConfig>,
     /// IOAPIC PCIe Requester ID when x86 IOMMU interrupt remapping is active.
     /// For AMD this is threaded into IVRS at firmware-load time; for Intel
     /// the matching DMAR device scope is carried by the per-unit ACPI config.
@@ -845,6 +861,30 @@ fn smmu_for_rc(iommu_devices: &IommuDevices, rc_idx: usize) -> Option<&Arc<smmu:
     match iommu_devices {
         IommuDevices::Smmu(devices) => devices.shared_states.get(rc_idx).and_then(|s| s.as_ref()),
         IommuDevices::None => None,
+    }
+}
+
+/// Selects the aarch64 GIC MSI routing source for a PCIe entity on `segment`:
+/// the VM-wide v2m frame (v2m mode), this segment's ITS backend (ITS mode), or
+/// none.
+#[cfg(guest_arch = "aarch64")]
+fn aarch64_msi_source<'a>(
+    its_backends: &'a std::collections::BTreeMap<
+        u16,
+        Arc<dyn virt::aarch64::gic_its::GicItsBackend>,
+    >,
+    v2m_device: &'a Option<its_wiring::V2mDeviceResult>,
+    segment: u16,
+) -> pcie_wiring::Aarch64MsiSource<'a> {
+    if let Some(v2m) = v2m_device {
+        pcie_wiring::Aarch64MsiSource::V2m {
+            signal_msi: &v2m.signal_msi,
+            irqfd: v2m.irqfd.as_ref(),
+        }
+    } else if let Some(backend) = its_backends.get(&segment) {
+        pcie_wiring::Aarch64MsiSource::Its(backend)
+    } else {
+        pcie_wiring::Aarch64MsiSource::None
     }
 }
 
@@ -1014,7 +1054,7 @@ impl InitializedVm {
         };
 
         #[cfg(guest_arch = "aarch64")]
-        let (mut processor_topology, spi_layout) = {
+        let (mut processor_topology, spi_layout, v2m_spi_count) = {
             let smmu_count = cfg
                 .pcie_root_complexes
                 .iter()
@@ -1022,7 +1062,11 @@ impl InitializedVm {
                 .count();
             let result =
                 build_aarch64_topology(&cfg.processor_topology, &platform_info, smmu_count)?;
-            (result.processor_topology, result.spi_layout)
+            (
+                result.processor_topology,
+                result.spi_layout,
+                result.v2m_spi_count,
+            )
         };
         #[cfg(not(guest_arch = "aarch64"))]
         let mut processor_topology = {
@@ -1135,11 +1179,30 @@ impl InitializedVm {
         } else {
             0
         };
+        // In ITS mode, allocate one ITS MMIO region per distinct PCI segment
+        // that has a root complex. Sorted + deduped for a deterministic layout.
+        #[cfg(guest_arch = "aarch64")]
+        let its_segments: Vec<u16> = if v2m_spi_count.is_none() {
+            let mut segs: Vec<u16> = cfg
+                .pcie_root_complexes
+                .iter()
+                .map(|rc| rc.segment)
+                .collect();
+            segs.sort_unstable();
+            segs.dedup();
+            segs
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(guest_arch = "aarch64"))]
+        let its_segments: Vec<u16> = Vec::new();
+
         let resolved_layout = resolve_memory_layout(MemoryLayoutInput {
             node_mem_sizes: &node_mem_sizes,
             layout: cfg.layout.clone(),
             pcie_root_complexes: &cfg.pcie_root_complexes,
             virtio_mmio_count,
+            its_segments: &its_segments,
             vtl2_layout,
             ram_start_address,
             vtl2_framebuffer_size,
@@ -1150,6 +1213,8 @@ impl InitializedVm {
         let resolved_pcie_root_complex_ranges = resolved_layout.pcie_root_complex_ranges;
         let virtio_mmio_region = resolved_layout.virtio_mmio_region;
         let chipset_mmio = resolved_layout.chipset_mmio;
+        #[cfg(guest_arch = "aarch64")]
+        let its_ranges = resolved_layout.its_ranges;
 
         // Combine the IOMMU RC configs with the MMIO ranges from the layout
         // engine into the resolved per-instance resources. A VM has at most one
@@ -1345,6 +1410,20 @@ impl InitializedVm {
             chipset_mmio,
             vtl2_framebuffer_gpa_base: resolved_layout.vtl2_framebuffer_gpa_base,
             resolved_iommu,
+            #[cfg(guest_arch = "aarch64")]
+            its_segments,
+            #[cfg(guest_arch = "aarch64")]
+            its_ranges,
+            #[cfg(guest_arch = "aarch64")]
+            v2m_frame: v2m_spi_count.map(|count| {
+                (
+                    openvmm_defs::config::DEFAULT_GIC_V2M_MSI_FRAME_BASE,
+                    spi_layout
+                        .v2m_spi_base
+                        .expect("v2m base must be allocated in v2m mode"),
+                    count,
+                )
+            }),
             processor_topology,
             igvm_file,
             driver_source,
@@ -1376,6 +1455,12 @@ impl InitializedVm {
             chipset_mmio,
             vtl2_framebuffer_gpa_base,
             resolved_iommu,
+            #[cfg(guest_arch = "aarch64")]
+            its_segments,
+            #[cfg(guest_arch = "aarch64")]
+            its_ranges,
+            #[cfg(guest_arch = "aarch64")]
+            v2m_frame,
             processor_topology,
             igvm_file,
             driver_source,
@@ -1982,6 +2067,7 @@ impl InitializedVm {
         // can be applied when an AMD IOMMU covers the root complex.
         struct DeferredMsiConn {
             msi_conn: pci_core::msi::MsiConnection,
+            #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
             segment: u16,
             #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
             rc_idx: usize,
@@ -2346,6 +2432,32 @@ impl InitializedVm {
             )?
         };
 
+        // Instantiate the GIC MSI controller devices: one GICv3 ITS per PCI
+        // segment (ITS mode) or the single GICv2m frame (v2m mode). These
+        // provide the SignalMsi/irqfd routing surface consumed by the PCIe
+        // wiring, and the ACPI IORT/MADT configuration.
+        #[cfg(guest_arch = "aarch64")]
+        let (its_backends, its_acpi_configs, v2m_device) = {
+            if let Some((frame_base, spi_base, spi_count)) = v2m_frame {
+                let v2m = its_wiring::setup_v2m(
+                    frame_base,
+                    spi_base,
+                    spi_count,
+                    &chipset_builder,
+                    partition.as_ref(),
+                )?;
+                (std::collections::BTreeMap::new(), Vec::new(), Some(v2m))
+            } else {
+                let result = its_wiring::setup_its(
+                    &its_segments,
+                    &its_ranges,
+                    &chipset_builder,
+                    partition.as_ref(),
+                )?;
+                (result.backends, result.configs, None)
+            }
+        };
+
         // Instantiate an AMD IOMMU on each root complex listed in
         // --amd-iommu. Each IOMMU is an RCiEP at device 0, function 0 on
         // its root complex's start bus with a distinct MMIO base address.
@@ -2422,8 +2534,8 @@ impl InitializedVm {
             let iommu = x86_iommu_for_rc(&iommu_devices, deferred.rc_idx);
             pcie_wiring::PcieMsiPlatform {
                 partition: partition.as_ref(),
-                segment: deferred.segment,
-                processor_topology: &processor_topology,
+                #[cfg(guest_arch = "aarch64")]
+                msi_source: aarch64_msi_source(&its_backends, &v2m_device, deferred.segment),
                 #[cfg(guest_arch = "x86_64")]
                 iommu,
             }
@@ -2451,8 +2563,11 @@ impl InitializedVm {
             let partition = &partition;
             let mapper = &mapper;
             let port_info = &port_info;
-            let processor_topology = &processor_topology;
             let iommu_devices = &iommu_devices;
+            #[cfg(guest_arch = "aarch64")]
+            let its_backends = &its_backends;
+            #[cfg(guest_arch = "aarch64")]
+            let v2m_device = &v2m_device;
             async move {
                 let port_name: Arc<str> = dev_cfg.port_name.into();
                 let pi = port_info.get(&port_name).ok_or_else(|| {
@@ -2468,8 +2583,8 @@ impl InitializedVm {
                     pcie_wiring::build_device_wiring(pcie_wiring::PcieDeviceWiringParams {
                         msi_platform: pcie_wiring::PcieMsiPlatform {
                             partition: partition.as_ref(),
-                            segment: pi.segment,
-                            processor_topology,
+                            #[cfg(guest_arch = "aarch64")]
+                            msi_source: aarch64_msi_source(its_backends, v2m_device, pi.segment),
                             #[cfg(guest_arch = "x86_64")]
                             iommu: x86_iommu_for_rc(iommu_devices, pi.rc_idx),
                         },
@@ -2979,6 +3094,12 @@ impl InitializedVm {
                 automatic_guest_reset: cfg.automatic_guest_reset,
                 chipset: chipset.chipset.clone(),
                 iommu_devices,
+                #[cfg(guest_arch = "aarch64")]
+                its_backends,
+                #[cfg(guest_arch = "aarch64")]
+                v2m_device,
+                #[cfg(guest_arch = "aarch64")]
+                its_acpi_configs,
                 #[cfg(guest_arch = "x86_64")]
                 ioapic_iommu_rid,
                 pcie_host_bridges,
@@ -3100,6 +3221,8 @@ impl LoadedVmInner {
                     IommuDevices::Smmu(devices) => devices.configs.clone(),
                     IommuDevices::None => Vec::new(),
                 },
+                its: self.its_acpi_configs.clone(),
+                v2m: self.v2m_device.as_ref().map(|v| v.config),
             },
         };
 
@@ -3207,6 +3330,8 @@ impl LoadedVmInner {
                     &self.processor_topology,
                     &self.pcie_host_bridges,
                     smmu_configs,
+                    &self.its_acpi_configs,
+                    self.v2m_device.as_ref().map(|v| v.config),
                     &self.chipset_mmio,
                     build_acpi,
                 )?
@@ -3670,6 +3795,7 @@ impl LoadedVm {
                                 .expect("port was just found above")
                                 .bus_range;
 
+                            #[cfg(guest_arch = "aarch64")]
                             let segment = self.inner.pcie_host_bridges[rc_idx].segment;
                             let msi_conn = pci_core::msi::MsiConnection::new();
 
@@ -3677,8 +3803,12 @@ impl LoadedVm {
                                 pcie_wiring::PcieDeviceWiringParams {
                                     msi_platform: pcie_wiring::PcieMsiPlatform {
                                         partition: self.inner.partition.as_ref(),
-                                        segment,
-                                        processor_topology: &self.inner.processor_topology,
+                                        #[cfg(guest_arch = "aarch64")]
+                                        msi_source: aarch64_msi_source(
+                                            &self.inner.its_backends,
+                                            &self.inner.v2m_device,
+                                            segment,
+                                        ),
                                         #[cfg(guest_arch = "x86_64")]
                                         iommu: x86_iommu_for_rc(
                                             &self.inner.iommu_devices,

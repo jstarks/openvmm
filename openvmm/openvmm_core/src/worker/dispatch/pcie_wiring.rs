@@ -15,10 +15,10 @@
 
 use crate::partition::HvlitePartition;
 use guestmem::GuestMemory;
+#[cfg(guest_arch = "x86_64")]
 use hvdef::Vtl;
 use pci_core::dma::DmaTarget;
 use std::sync::Arc;
-use vm_topology::processor::ProcessorTopology;
 
 /// Platform-specific MSI wrapping context for PCIe entities.
 ///
@@ -29,18 +29,35 @@ use vm_topology::processor::ProcessorTopology;
 ///
 /// [`wrap_msi`]: PcieMsiPlatform::wrap_msi
 pub(super) struct PcieMsiPlatform<'a> {
-    /// The partition providing base `SignalMsi` and `IrqFd`.
+    /// The partition providing base `SignalMsi` and `IrqFd` (x86).
+    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
     pub partition: &'a dyn HvlitePartition,
-    /// PCIe segment number (for ITS device ID composition on aarch64).
-    #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
-    pub segment: u16,
-    /// Processor topology (determines ITS wrapping on aarch64).
-    #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
-    pub processor_topology: &'a ProcessorTopology,
+    /// aarch64 GIC MSI source for this entity (per-segment ITS or the VM-wide
+    /// v2m frame).
+    #[cfg(guest_arch = "aarch64")]
+    pub msi_source: Aarch64MsiSource<'a>,
     /// x86 IOMMU shared state for interrupt remapping, or `None` if this
     /// entity is not behind an IOMMU.
     #[cfg(guest_arch = "x86_64")]
     pub iommu: Option<X86IommuSharedState<'a>>,
+}
+
+/// The aarch64 GIC MSI routing source for a PCIe entity.
+///
+/// In ITS mode this is the ITS backend for the entity's PCI segment; in v2m
+/// mode it is the shared v2m frame's routing surface.
+#[cfg(guest_arch = "aarch64")]
+pub(super) enum Aarch64MsiSource<'a> {
+    /// No MSI controller (no routing).
+    None,
+    /// GICv3 ITS for this entity's PCI segment. MSIs use plain 16-bit RID
+    /// device IDs; the ITS is selected by its doorbell address.
+    Its(&'a Arc<dyn virt::aarch64::gic_its::GicItsBackend>),
+    /// The VM-wide GICv2m frame's routing surface.
+    V2m {
+        signal_msi: &'a Arc<dyn pci_core::msi::SignalMsi>,
+        irqfd: Option<&'a Arc<dyn vmcore::irqfd::IrqFd>>,
+    },
 }
 
 /// Enum dispatching between AMD IOMMU and Intel VT-d shared state on x86_64.
@@ -89,20 +106,26 @@ impl PcieMsiPlatform<'_> {
     /// is disabled because kernel-mediated MSI routes bypass emulated
     /// interrupt remapping.
     pub fn wrap_msi(&self) -> PcieMsiRouting {
+        // aarch64: the MSI source is the GIC MSI controller device (per-segment
+        // ITS with plain-RID device IDs, or the VM-wide v2m frame), not the
+        // partition.
+        #[cfg(guest_arch = "aarch64")]
+        let (signal_msi, irqfd): (
+            Option<Arc<dyn pci_core::msi::SignalMsi>>,
+            Option<Arc<dyn vmcore::irqfd::IrqFd>>,
+        ) = match &self.msi_source {
+            Aarch64MsiSource::None => (None, None),
+            Aarch64MsiSource::Its(backend) => (Some(backend.as_signal_msi()), backend.irqfd()),
+            Aarch64MsiSource::V2m { signal_msi, irqfd } => {
+                (Some((*signal_msi).clone()), irqfd.cloned())
+            }
+        };
+
+        #[cfg(guest_arch = "x86_64")]
         let mut signal_msi: Option<Arc<dyn pci_core::msi::SignalMsi>> =
             self.partition.as_signal_msi(Vtl::Vtl0);
+        #[cfg(guest_arch = "x86_64")]
         let mut irqfd: Option<Arc<dyn vmcore::irqfd::IrqFd>> = self.partition.irqfd();
-
-        // aarch64 ITS: wrap with segment-based device ID composition.
-        #[cfg(guest_arch = "aarch64")]
-        if matches!(
-            self.processor_topology.gic_msi(),
-            vm_topology::processor::aarch64::GicMsiController::Its(_)
-        ) {
-            signal_msi =
-                signal_msi.map(|s| Arc::new(pcie::its::ItsSignalMsi::new(s, self.segment)) as _);
-            irqfd = irqfd.map(|fd| Arc::new(pcie::its::ItsIrqFd::new(fd, self.segment)) as _);
-        }
 
         // x86_64 IOMMU: wrap with interrupt remapping.
         //

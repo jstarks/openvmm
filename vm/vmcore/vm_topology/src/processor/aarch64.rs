@@ -71,8 +71,8 @@ pub struct Aarch64PlatformConfig {
     pub gic_distributor_base: u64,
     /// GIC version and version-specific addresses.
     pub gic_version: GicVersion,
-    /// MSI controller for PCIe interrupt delivery.
-    pub gic_msi: GicMsiController,
+    /// GIC MSI delivery configuration for PCIe interrupts.
+    pub gic_msi: Aarch64GicMsiConfig,
     /// Performance Monitor Unit GSIV (GIC INTID). `None` if not available.
     pub pmu_gsiv: Option<u32>,
     /// Virtual timer PPI (GIC INTID, e.g. 20 for PPI 4).
@@ -84,44 +84,27 @@ pub struct Aarch64PlatformConfig {
     pub gic_nr_irqs: u32,
 }
 
-/// GIC v2m MSI frame parameters.
+/// Construction-time GIC MSI configuration.
+///
+/// Carries only the two orthogonal pieces of information that must be baked
+/// into partition construction: the physical passthrough MSI doorbell address
+/// and whether the GIC exposes LPI support. The concrete MSI-controller
+/// instance data (v2m frame details, per-segment ITS MMIO bases) is *not*
+/// part of the topology — it is assigned after `build()` by the memory-layout
+/// allocator and lives with the device-land MSI controller objects and the
+/// ACPI/DT description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "inspect", derive(inspect::Inspect))]
-pub struct GicV2mInfo {
-    /// Physical base address of the guest-visible v2m MSI frame.
+pub struct Aarch64GicMsiConfig {
+    /// Physical base of the passthrough MSI doorbell. The hypervisor traps
+    /// assigned-device MSI writes here and injects them (mshv registers it as
+    /// `GitsTranslaterBaseAddress`; WHP uses it as the physical remap base).
+    /// Always present, independent of LPI support.
     #[cfg_attr(feature = "inspect", inspect(hex))]
-    pub frame_base: u64,
-    /// Physical base address of the v2m MSI doorbell registered with the
-    /// hypervisor for PCI passthrough (GITS translater base). May differ from
-    /// `frame_base`; consumed only by the MSHV root/arm64 backend.
-    #[cfg_attr(feature = "inspect", inspect(hex))]
-    pub doorbell_base: u64,
-    /// First GIC interrupt ID in the SPI range owned by this frame.
-    pub spi_base: u32,
-    /// Number of SPIs owned by this frame.
-    pub spi_count: u32,
-}
-
-/// GICv3 ITS (Interrupt Translation Service) parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "inspect", derive(inspect::Inspect))]
-pub struct GicItsInfo {
-    /// Physical base address of the ITS MMIO region (must be 64 KiB aligned).
-    #[cfg_attr(feature = "inspect", inspect(hex))]
-    pub its_base: u64,
-}
-
-/// MSI controller configuration for PCIe interrupt delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "inspect", derive(inspect::Inspect))]
-#[cfg_attr(feature = "inspect", inspect(external_tag))]
-pub enum GicMsiController {
-    /// No MSI controller configured.
-    None,
-    /// GICv2m — maps MSI writes to a fixed pool of SPIs.
-    V2m(GicV2mInfo),
-    /// GICv3 ITS — routes MSIs via LPIs using (DeviceID, EventID) lookup.
-    Its(GicItsInfo),
+    pub passthrough_msi_doorbell: u64,
+    /// Whether the GIC exposes LPI support (`GICD_TYPER.LPIS`). `false` for
+    /// v2m/SPI delivery, `true` for ITS.
+    pub lpi_enabled: bool,
 }
 
 /// ARM64 specific VP info.
@@ -274,7 +257,7 @@ impl ProcessorTopology<Aarch64Topology> {
     }
 
     /// Returns the MSI controller configuration.
-    pub fn gic_msi(&self) -> GicMsiController {
+    pub fn gic_msi(&self) -> Aarch64GicMsiConfig {
         self.arch.platform.gic_msi
     }
 

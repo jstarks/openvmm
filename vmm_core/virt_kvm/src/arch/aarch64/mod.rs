@@ -21,7 +21,6 @@ use crate::gsi::MsiRouteBuilder;
 use crate::memory::KvmMemoryBackingMode;
 use aarch64defs::SystemReg;
 use aarch64defs::Vendor;
-use aarch64defs::gic::GicV2mRegister;
 use bitfield_struct::bitfield;
 use core::panic;
 use hvdef::Vtl;
@@ -58,7 +57,6 @@ use virt::vp::Registers;
 use virt::vp::SystemRegisters;
 use virt::x86::DebugState;
 use vm_topology::processor::aarch64::Aarch64VpInfo;
-use vm_topology::processor::aarch64::GicMsiController;
 use vmcore::reference_time::ReferenceTimeSource;
 use vmcore::vmtime::VmTimeAccess;
 
@@ -699,44 +697,6 @@ impl KvmProtoPartition<'_> {
         Ok(gicv2)
     }
 
-    fn add_its(&mut self, its_base: u64) -> Result<kvm::Device, KvmError> {
-        const ITS_ALIGNMENT: u64 = 0x10000;
-        if !its_base.is_multiple_of(ITS_ALIGNMENT) {
-            return Err(KvmError::Misaligned);
-        }
-
-        let its = self
-            .vm
-            .create_device(kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_ITS, 0)
-            .map_err(kvm::Error::CreateDevice)?;
-
-        // SAFETY: passing the right type for the attribute.
-        unsafe {
-            its.set_device_attr::<u64>(
-                KVM_DEV_ARM_VGIC_GRP_ADDR,
-                KVM_VGIC_ITS_ADDR_TYPE,
-                &its_base,
-                0,
-            )
-            .map_err(kvm::Error::SetDeviceAttr)?;
-        }
-
-        // Initialize the ITS device.
-        //
-        // SAFETY: passing the right type for the attribute.
-        unsafe {
-            its.set_device_attr::<()>(
-                KVM_DEV_ARM_VGIC_GRP_CTRL,
-                KVM_DEV_ARM_VGIC_CTRL_INIT,
-                &(),
-                0,
-            )
-            .map_err(kvm::Error::SetDeviceAttr)?;
-        }
-
-        Ok(its)
-    }
-
     fn set_timer_ppis(&mut self, virt: u32, phys: u32) -> Result<(), KvmError> {
         // SAFETY: passing the right type for the attribute.
         unsafe {
@@ -795,13 +755,11 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             GicVersion::V2 { cpu_interface_base } => self.add_gicv2(cpu_interface_base)?,
         };
 
-        // Create the ITS device after the GIC, if configured.
-        let gic_msi = self.config.processor_topology.gic_msi();
-        let its_device = if let GicMsiController::Its(its_info) = &gic_msi {
-            Some(self.add_its(its_info.its_base)?)
-        } else {
-            None
-        };
+        // The GIC ITS (if any) is created after `build()` as a post-build side
+        // device via `Aarch64Partition::new_its`, once the memory-layout
+        // allocator has assigned per-segment ITS MMIO bases. KVM allows
+        // creating + initializing an ITS after the vGIC `CTRL_INIT` (this code
+        // already did so previously), so no split GIC init is needed.
 
         // Configure the virtual timer PPI from topology. KVM also requires
         // a physical timer PPI, but we don't expose it to the guest.
@@ -854,8 +812,6 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             gsi_routing: Mutex::new(GsiRouting::new()),
             caps,
             _gic_device: gic_device,
-            _its_device: its_device,
-            gic_msi,
             gic_nr_irqs: self.config.processor_topology.gic_nr_irqs(),
         });
 
@@ -900,26 +856,18 @@ impl virt::Partition for KvmPartition {
     }
 
     fn as_signal_msi(&self, _minimum_vtl: Vtl) -> Option<Arc<dyn pci_core::msi::SignalMsi>> {
-        match &self.inner.gic_msi {
-            GicMsiController::Its(its) => Some(Arc::new(GicItsSignalMsi {
-                kvm: self.inner.clone(),
-                translater_addr: its.its_base + GITS_TRANSLATER_OFFSET,
-            })),
-            GicMsiController::V2m(v2m) => {
-                let irqcon = self.inner.clone() as Arc<dyn virt::irqcon::ControlGic>;
-                Some(Arc::new(virt::aarch64::gic_v2m::GicV2mSignalMsi::new(
-                    v2m, irqcon,
-                )))
-            }
-            GicMsiController::None => None,
-        }
+        // On aarch64 the MSI target is provided by the GIC MSI controller
+        // device (per-segment `GicItsDevice` in ITS mode, or the single
+        // `GicV2mDevice` in v2m mode), not by the partition. See the ITS
+        // backend (`Aarch64Partition::new_its`) and the v2m device.
+        None
     }
 
     fn irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
-        if matches!(self.inner.gic_msi, GicMsiController::None) {
-            return None;
-        }
-        Some(self.irqfd_state.clone())
+        // As with `as_signal_msi`, aarch64 irqfd routing is provided by the
+        // GIC MSI controller device: the ITS backend's `new_irqfd_route` for
+        // ITS mode, or the v2m device wrapping `spi_irqfd` for v2m mode.
+        None
     }
 
     fn request_yield(&self, vp_index: VpIndex) {
@@ -988,30 +936,150 @@ impl virt::Aarch64Partition for KvmPartition {
         assert!(vtl == Vtl::Vtl0);
         self.inner.clone()
     }
+
+    fn new_its(&self, base: u64) -> anyhow::Result<Arc<dyn virt::aarch64::gic_its::GicItsBackend>> {
+        let its_device = create_its_device(&self.inner.kvm, base)
+            .map_err(|e| anyhow::anyhow!(e).context("failed to create KVM vITS"))?;
+        Ok(Arc::new(KvmGicItsBackend {
+            inner: self.inner.clone(),
+            irqfd_state: self.irqfd_state.clone(),
+            _its_device: its_device,
+            translater_addr: base + GITS_TRANSLATER_OFFSET,
+        }))
+    }
+
+    fn spi_irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
+        Some(Arc::new(KvmSpiIrqFd {
+            state: self.irqfd_state.clone(),
+        }))
+    }
 }
 
-struct KvmGicV2mRouteBuilder;
+/// Creates and initializes an in-kernel vITS at `its_base`.
+///
+/// KVM permits creating + `CTRL_INIT`ing an ITS after the vGIC `CTRL_INIT`
+/// and VP creation, so this runs as a post-build side device.
+fn create_its_device(vm: &kvm::Partition, its_base: u64) -> Result<kvm::Device, KvmError> {
+    const ITS_ALIGNMENT: u64 = 0x10000;
+    if !its_base.is_multiple_of(ITS_ALIGNMENT) {
+        return Err(KvmError::Misaligned);
+    }
 
-impl MsiRouteBuilder for KvmGicV2mRouteBuilder {
+    let its = vm
+        .create_device(kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_ITS, 0)
+        .map_err(kvm::Error::CreateDevice)?;
+
+    // SAFETY: passing the right type for the attribute.
+    unsafe {
+        its.set_device_attr::<u64>(
+            KVM_DEV_ARM_VGIC_GRP_ADDR,
+            KVM_VGIC_ITS_ADDR_TYPE,
+            &its_base,
+            0,
+        )
+        .map_err(kvm::Error::SetDeviceAttr)?;
+    }
+
+    // Initialize the ITS device.
+    //
+    // SAFETY: passing the right type for the attribute.
+    unsafe {
+        its.set_device_attr::<()>(
+            KVM_DEV_ARM_VGIC_GRP_CTRL,
+            KVM_DEV_ARM_VGIC_CTRL_INIT,
+            &(),
+            0,
+        )
+        .map_err(kvm::Error::SetDeviceAttr)?;
+    }
+
+    Ok(its)
+}
+
+/// KVM backend for a single GICv3 ITS instance — a thin proxy over the
+/// in-kernel vITS.
+struct KvmGicItsBackend {
+    inner: Arc<KvmPartitionInner>,
+    irqfd_state: Arc<KvmIrqFdState>,
+    /// The ITS device fd, kept alive for the ITS lifetime.
+    _its_device: kvm::Device,
+    /// GITS_TRANSLATER physical address for this ITS.
+    translater_addr: u64,
+}
+
+impl virt::aarch64::gic_its::GicItsBackend for KvmGicItsBackend {
+    fn as_signal_msi(&self) -> Arc<dyn pci_core::msi::SignalMsi> {
+        Arc::new(GicItsSignalMsi {
+            kvm: self.inner.clone(),
+            translater_addr: self.translater_addr,
+        })
+    }
+
+    fn irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
+        Some(Arc::new(KvmItsIrqFd {
+            state: self.irqfd_state.clone(),
+            translater_addr: self.translater_addr,
+        }))
+    }
+
+    fn translater_addr(&self) -> u64 {
+        self.translater_addr
+    }
+
+    fn save(&self) -> anyhow::Result<virt::aarch64::gic_its::ItsSavedState> {
+        // TODO: marshal in-kernel vITS state (KVM_DEV_ARM_ITS_SAVE_TABLES plus
+        // the GITS_CTLR/CBASER/CREADR/BASER block via ITS_REGS).
+        anyhow::bail!("KVM vITS save/restore not yet implemented")
+    }
+
+    fn restore(&self, _state: virt::aarch64::gic_its::ItsSavedState) -> anyhow::Result<()> {
+        anyhow::bail!("KVM vITS save/restore not yet implemented")
+    }
+}
+
+/// An [`IrqFd`](virt::irqfd::IrqFd) factory producing ITS-routed irqfd routes
+/// bound to a single ITS's `GITS_TRANSLATER`.
+struct KvmItsIrqFd {
+    state: Arc<KvmIrqFdState>,
+    translater_addr: u64,
+}
+
+impl virt::irqfd::IrqFd for KvmItsIrqFd {
+    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn virt::irqfd::IrqFdRoute>> {
+        Ok(Box::new(self.state.new_irqfd_route(
+            KvmItsRouteBuilder {
+                translater_addr: self.translater_addr,
+            },
+        )?))
+    }
+}
+
+/// Generic SPI irqfd: routes an irqfd to a GIC SPI (Irqchip pin `data - 32`).
+/// Used by the GICv2m device for passthrough MSI delivery.
+struct KvmSpiIrqFd {
+    state: Arc<KvmIrqFdState>,
+}
+
+impl virt::irqfd::IrqFd for KvmSpiIrqFd {
+    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn virt::irqfd::IrqFdRoute>> {
+        Ok(Box::new(self.state.new_irqfd_route(KvmSpiRouteBuilder)?))
+    }
+}
+
+/// Generic SPI MSI route builder. Interprets `data` as the GIC SPI interrupt
+/// ID and produces the corresponding Irqchip routing entry. Address/range
+/// validation is performed by the caller (the v2m device wrapper).
+struct KvmSpiRouteBuilder;
+
+impl MsiRouteBuilder for KvmSpiRouteBuilder {
     fn routing_entry(
         &self,
-        partition: &KvmPartitionInner,
-        address: u64,
+        _partition: &KvmPartitionInner,
+        _address: u64,
         data: u32,
         _devid: Option<u32>,
     ) -> Option<kvm::RoutingEntry> {
-        let v2m = match &partition.gic_msi {
-            GicMsiController::V2m(v2m) => v2m,
-            _ => panic!("partition does not expose a GICv2m MSI frame"),
-        };
-        let setspi_addr = v2m.frame_base + GicV2mRegister::SETSPI_NS.0 as u64;
-        if address != setspi_addr {
-            return None;
-        }
-        if !(v2m.spi_base..v2m.spi_base + v2m.spi_count).contains(&data) {
-            return None;
-        }
-        // KVM expects the data to be the GIC SPI number, not the interrupt ID.
+        // KVM expects the GIC SPI number, not the interrupt ID.
         // TODO: centralize this constant.
         Some(kvm::RoutingEntry::Irqchip { pin: data - 32 })
     }
@@ -1088,22 +1156,6 @@ impl pci_core::msi::SignalMsi for GicItsSignalMsi {
                 err = &err as &dyn std::error::Error,
                 "failed to signal MSI via ITS"
             );
-        }
-    }
-}
-
-impl virt::irqfd::IrqFd for KvmIrqFdState {
-    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn virt::irqfd::IrqFdRoute>> {
-        match &self.partition.gic_msi {
-            GicMsiController::Its(its) => {
-                Ok(Box::new(self.new_irqfd_route(KvmItsRouteBuilder {
-                    translater_addr: its.its_base + GITS_TRANSLATER_OFFSET,
-                })?))
-            }
-            GicMsiController::V2m(_) => Ok(Box::new(self.new_irqfd_route(KvmGicV2mRouteBuilder)?)),
-            GicMsiController::None => {
-                anyhow::bail!("no MSI controller configured for irqfd")
-            }
         }
     }
 }

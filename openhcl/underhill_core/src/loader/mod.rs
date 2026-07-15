@@ -465,6 +465,8 @@ pub fn write_uefi_config(
                 hypervisor_vendor_identity: 0,
                 virt_timer_ppi: processor_topology.virt_timer_ppi(),
                 smmu: Vec::new(),
+                its: Vec::new(),
+                v2m: None,
             },
         };
 

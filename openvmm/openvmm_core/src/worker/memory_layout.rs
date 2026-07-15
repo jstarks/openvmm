@@ -38,6 +38,9 @@ const GB: u64 = 1024 * 1024 * 1024;
 /// SMMUv3 MMIO region size: two 64 KiB pages (page 0 + page 1).
 const SMMU_SIZE: u64 = 0x2_0000;
 
+/// GICv3 ITS MMIO region size (`KVM_VGIC_V3_ITS_SIZE`): two 64 KiB pages.
+const ITS_SIZE: u64 = 0x2_0000;
+
 /// PCIe ECAM: 32 devices * 8 functions * 4 KiB config space = 1 MB per bus.
 const PCIE_ECAM_BYTES_PER_BUS: u64 = 32 * 8 * 4096;
 
@@ -81,6 +84,11 @@ pub(super) struct ResolvedMemoryLayout {
     /// type is configured per VM, so this is keyed by type rather than stored
     /// as three independent fields.
     pub iommu_ranges: ResolvedIommuRanges,
+    /// Resolved GICv3 ITS MMIO ranges (aarch64 ITS mode), one `ITS_SIZE`-byte
+    /// range per distinct PCI segment with a root complex, ordered to match
+    /// the sorted `its_segments` input. Empty when not in ITS mode.
+    #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
+    pub its_ranges: Vec<MemoryRange>,
 }
 
 /// Resolved MMIO ranges for the VM's IOMMU, keyed by IOMMU type.
@@ -127,6 +135,11 @@ pub(super) struct MemoryLayoutInput<'a> {
     /// Number of virtio-mmio device slots to allocate in 32-bit MMIO space.
     /// A single contiguous region of `count * 4 KiB` is allocated.
     pub virtio_mmio_count: usize,
+    /// Sorted, distinct PCI segments that need a GICv3 ITS (aarch64 ITS mode
+    /// with at least one root complex on the segment). One `ITS_SIZE`-byte
+    /// MMIO region is allocated per entry. Empty in v2m mode or when no ITS
+    /// is configured.
+    pub its_segments: &'a [u16],
     /// Optional IGVM VTL2 private-memory request. This is allocated after all
     /// VTL0-visible RAM and MMIO and is carried separately from ordinary RAM.
     pub vtl2_layout: Option<Vtl2MemoryLayoutRequest>,
@@ -357,6 +370,21 @@ pub(super) fn resolve_memory_layout(
         }
     }
 
+    // GICv3 ITS: one MMIO region per distinct PCI segment with a root complex
+    // (aarch64 ITS mode). Allocated in sorted-segment order so the layout is
+    // deterministic. Each segment's ITS owns a full 16-bit RID device-ID
+    // space; the guest selects the target ITS by doorbell address.
+    let mut its_ranges = vec![MemoryRange::EMPTY; input.its_segments.len()];
+    for (idx, range) in its_ranges.iter_mut().enumerate() {
+        builder.request(
+            format!("its-{}", input.its_segments[idx]),
+            range,
+            ITS_SIZE,
+            ITS_SIZE,
+            Placement::Mmio32,
+        );
+    }
+
     // RAM request order is part of the NUMA compatibility contract: the first
     // request maps to vnode 0, the second to vnode 1, and so on. Memory-less
     // nodes (size 0) are skipped so the layout allocator never sees a
@@ -545,6 +573,7 @@ pub(super) fn resolve_memory_layout(
             Some(vtl2_framebuffer_range.start())
         },
         iommu_ranges,
+        its_ranges,
     })
 }
 
@@ -635,6 +664,7 @@ mod tests {
             layout: DEFAULT_LAYOUT,
             pcie_root_complexes: &[],
             virtio_mmio_count: 0,
+            its_segments: &[],
             vtl2_layout,
             ram_start_address: 0,
             vtl2_framebuffer_size: 0,

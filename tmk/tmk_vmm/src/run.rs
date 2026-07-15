@@ -222,7 +222,10 @@ impl CommonState {
                 gic_version: vm_topology::processor::aarch64::GicVersion::V3 {
                     redistributors_base: 0xff020000,
                 },
-                gic_msi: vm_topology::processor::aarch64::GicMsiController::None,
+                gic_msi: vm_topology::processor::aarch64::Aarch64GicMsiConfig {
+                    passthrough_msi_doorbell: 0,
+                    lpi_enabled: false,
+                },
                 pmu_gsiv: None,
                 virt_timer_ppi: 20, // DEFAULT_VIRT_TIMER_PPI
                 gic_nr_irqs: 256,

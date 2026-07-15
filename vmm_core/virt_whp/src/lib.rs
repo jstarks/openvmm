@@ -119,9 +119,6 @@ struct WhpPartitionInner {
     monitor_page: MonitorPage,
     hvstate: Hv1State,
     isolation: IsolationType,
-    #[cfg(guest_arch = "aarch64")]
-    #[inspect(skip)]
-    gic_msi: vm_topology::processor::aarch64::GicMsiController,
     synic_ports: virt::synic::SynicPortMap,
 }
 
@@ -624,15 +621,11 @@ impl virt::Partition for WhpPartition {
     }
 
     #[cfg(guest_arch = "aarch64")]
-    fn as_signal_msi(&self, minimum_vtl: Vtl) -> Option<Arc<dyn pci_core::msi::SignalMsi>> {
-        let v2m = match &self.inner.gic_msi {
-            vm_topology::processor::aarch64::GicMsiController::V2m(v2m) => v2m,
-            _ => return None,
-        };
-        let irqcon = self.with_vtl(minimum_vtl).clone() as Arc<dyn virt::irqcon::ControlGic>;
-        Some(Arc::new(virt::aarch64::gic_v2m::GicV2mSignalMsi::new(
-            v2m, irqcon,
-        )))
+    fn as_signal_msi(&self, _minimum_vtl: Vtl) -> Option<Arc<dyn pci_core::msi::SignalMsi>> {
+        // On aarch64 the MSI target is provided by the GIC MSI controller
+        // device (the `GicV2mDevice` in v2m mode, which uses `control_gic`),
+        // not by the partition.
+        None
     }
 
     fn request_msi(&self, vtl: Vtl, request: MsiRequest) {
@@ -1288,8 +1281,6 @@ impl WhpPartitionInner {
             monitor_page: MonitorPage::new(),
             hvstate,
             isolation: proto_config.isolation,
-            #[cfg(guest_arch = "aarch64")]
-            gic_msi: proto_config.processor_topology.gic_msi(),
             synic_ports: Default::default(),
         };
 
@@ -1502,17 +1493,14 @@ impl VtlPartition {
                     GicdBaseAddress: config.processor_topology.gic_distributor_base(),
                     GitsTranslatorBaseAddress: 0,
                     Reserved: 0,
-                    // When v2m is configured, disable LPI support
-                    // (GICD_TYPER.LPIS=0) so Linux uses the GICv2m MSI frame
-                    // instead of ITS for PCIe MSIs. Otherwise keep LPI
-                    // enabled (1 ID bit minimum).
-                    GicLpiIntIdBits: if matches!(
-                        config.processor_topology.gic_msi(),
-                        vm_topology::processor::aarch64::GicMsiController::V2m(_)
-                    ) {
-                        0
-                    } else {
+                    // Disable LPI support (GICD_TYPER.LPIS=0) when the GIC
+                    // does not expose LPIs (v2m mode), so Linux uses the
+                    // GICv2m MSI frame instead of ITS for PCIe MSIs. Otherwise
+                    // keep LPI enabled (1 ID bit minimum).
+                    GicLpiIntIdBits: if config.processor_topology.gic_msi().lpi_enabled {
                         1
+                    } else {
+                        0
                     },
                     GicPpiOverflowInterruptFromCntv: config.processor_topology.virt_timer_ppi(),
                     GicPpiPerformanceMonitorsInterrupt: 0x17,

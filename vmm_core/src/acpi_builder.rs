@@ -31,9 +31,8 @@ pub struct AcpiSmmuConfig {
     /// `PcieHostBridge.index`). Used to route each RC's IORT ID mapping
     /// to its specific SMMU node.
     pub rc_index: u32,
-    /// PCIe segment number of the root complex this SMMU covers. Used as
-    /// the output_base in the SMMU→ITS ID mapping to produce globally
-    /// unique ITS device IDs: `(segment << 16) | BDF`.
+    /// PCIe segment number of the root complex this SMMU covers. Used to
+    /// route the SMMU→ITS ID mapping to the ITS group for this segment.
     pub segment: u16,
     /// MMIO base address of the SMMU.
     pub base: u64,
@@ -41,6 +40,34 @@ pub struct AcpiSmmuConfig {
     pub event_gsiv: u32,
     /// GIC SPI INTID for the global error interrupt.
     pub gerr_gsiv: u32,
+}
+
+/// Configuration for a single GICv3 ITS IORT ITS Group node and MADT GIC ITS
+/// entry.
+///
+/// One per PCI segment that has a root complex. The guest selects the target
+/// ITS by the doorbell (`GITS_TRANSLATER`) address derived from `its_base`;
+/// device IDs are plain 16-bit RIDs within the segment.
+#[derive(Debug, Clone, Copy)]
+pub struct AcpiItsConfig {
+    /// PCI segment this ITS serves.
+    pub segment: u16,
+    /// ITS identifier used by the MADT GIC ITS entry and the IORT ITS Group
+    /// node. Conventionally equal to `segment`.
+    pub its_id: u32,
+    /// Physical base address of the ITS MMIO region.
+    pub its_base: u64,
+}
+
+/// Configuration for the single VM-wide GICv2m MSI frame.
+#[derive(Debug, Clone, Copy)]
+pub struct AcpiV2mConfig {
+    /// Physical base address of the guest-visible v2m MSI frame.
+    pub frame_base: u64,
+    /// First GIC interrupt ID in the SPI range owned by this frame.
+    pub spi_base: u32,
+    /// Number of SPIs owned by this frame.
+    pub spi_count: u32,
 }
 
 /// Binary ACPI tables constructed by [`AcpiTablesBuilder`].
@@ -236,6 +263,12 @@ pub enum AcpiArchConfig {
         /// SMMUv3 instances. Each entry adds an SMMUv3 IORT node for the
         /// specified PCI segment. Empty means no SMMU.
         smmu: Vec<AcpiSmmuConfig>,
+        /// GICv3 ITS instances, one per PCI segment with a root complex.
+        /// Each entry adds an IORT ITS Group node and a MADT GIC ITS entry.
+        /// Empty means no ITS (v2m or no MSI).
+        its: Vec<AcpiItsConfig>,
+        /// The single VM-wide GICv2m MSI frame, if v2m delivery is in use.
+        v2m: Option<AcpiV2mConfig>,
     },
 }
 
@@ -329,12 +362,6 @@ pub trait AcpiTopology: ArchTopology + Inspect + Sized {
     fn extend_madt(topology: &ProcessorTopology<Self>, madt: &mut Vec<u8>);
     fn needs_iort(_topology: &ProcessorTopology<Self>) -> bool {
         false
-    }
-    /// If the platform has an ITS, return its identifier for the IORT ITS
-    /// Group node. Returns `None` when no ITS is present (root complex
-    /// nodes will have no ID mappings).
-    fn iort_its_id(_topology: &ProcessorTopology<Self>) -> Option<u32> {
-        None
     }
 }
 
@@ -437,34 +464,13 @@ impl AcpiTopology for Aarch64Topology {
             madt.extend_from_slice(gicc.as_bytes());
         }
 
-        // GIC v2m MSI frame for PCIe MSI support.
-        if let vm_topology::processor::aarch64::GicMsiController::V2m(v2m) = topology.gic_msi() {
-            madt.extend_from_slice(
-                acpi_spec::madt::MadtGicMsiFrame::new(
-                    0,
-                    v2m.frame_base,
-                    v2m.spi_base as u16,
-                    v2m.spi_count as u16,
-                )
-                .as_bytes(),
-            );
-        }
-
-        // GICv3 ITS for PCIe MSI routing via LPIs.
-        if let vm_topology::processor::aarch64::GicMsiController::Its(its) = topology.gic_msi() {
-            madt.extend_from_slice(acpi_spec::madt::MadtGicIts::new(0, its.its_base).as_bytes());
-        }
+        // The GICv2m MSI frame and GIC ITS MADT entries are emitted by
+        // `with_madt` from the arch config (`AcpiArchConfig::Aarch64`), since
+        // that instance data no longer lives in the processor topology.
     }
 
     fn needs_iort(_topology: &ProcessorTopology<Self>) -> bool {
         true
-    }
-
-    fn iort_its_id(topology: &ProcessorTopology<Self>) -> Option<u32> {
-        match topology.gic_msi() {
-            vm_topology::processor::aarch64::GicMsiController::Its(_) => Some(0),
-            _ => None,
-        }
     }
 }
 
@@ -581,6 +587,28 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
 
         T::extend_madt(self.processor_topology, &mut madt_extra);
 
+        // aarch64: emit the GICv2m MSI frame and per-segment GIC ITS entries
+        // from the arch config, whose instance data no longer lives in the
+        // processor topology.
+        if let AcpiArchConfig::Aarch64 { its, v2m, .. } = &self.arch {
+            if let Some(v2m) = v2m {
+                madt_extra.extend_from_slice(
+                    acpi_spec::madt::MadtGicMsiFrame::new(
+                        0,
+                        v2m.frame_base,
+                        v2m.spi_base as u16,
+                        v2m.spi_count as u16,
+                    )
+                    .as_bytes(),
+                );
+            }
+            for its in its {
+                madt_extra.extend_from_slice(
+                    acpi_spec::madt::MadtGicIts::new(its.its_id, its.its_base).as_bytes(),
+                );
+            }
+        }
+
         let (apic_addr, flags) = match self.arch {
             AcpiArchConfig::X86 { with_pic, .. } => (
                 APIC_BASE_ADDRESS,
@@ -646,51 +674,55 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
     {
         use acpi_spec::iort;
 
-        let its_id = T::iort_its_id(self.processor_topology);
-        let has_its = its_id.is_some();
-        let smmu_configs: &[AcpiSmmuConfig] = match &self.arch {
-            AcpiArchConfig::Aarch64 { smmu, .. } => smmu.as_slice(),
-            _ => &[],
+        let (smmu_configs, its_configs): (&[AcpiSmmuConfig], &[AcpiItsConfig]) = match &self.arch {
+            AcpiArchConfig::Aarch64 { smmu, its, .. } => (smmu.as_slice(), its.as_slice()),
+            _ => (&[], &[]),
         };
-        let its_node_count: u32 = if has_its { 1 } else { 0 };
+        let its_node_count = its_configs.len() as u32;
         let smmu_node_count = smmu_configs.len() as u32;
         let node_count = its_node_count + smmu_node_count + self.pcie_host_bridges.len() as u32;
 
         let mut iort_extra: Vec<u8> = Vec::new();
 
-        // ITS Group node comes first so other nodes can reference it.
-        // The ITS Group node offset (from table start) is IORT_NODE_OFFSET.
-        let its_group_offset = iort::IORT_NODE_OFFSET;
-        if let Some(id) = its_id {
+        // ITS Group nodes come first so other nodes can reference them. One
+        // ITS Group per PCI segment; build a map from segment → node offset
+        // (from table start). The guest selects the target ITS by which group
+        // a device's RID maps to (i.e. which doorbell it writes), so device
+        // IDs are plain 16-bit RIDs with no segment prefix.
+        let mut its_group_offsets: Vec<(u16, u32)> = Vec::new();
+        for its in its_configs {
+            let offset = iort::IORT_NODE_OFFSET + iort_extra.len() as u32;
+            its_group_offsets.push((its.segment, offset));
             iort_extra.extend_from_slice(iort::IortItsGroup::new(0, 1).as_bytes());
-            // Followed by the ITS identifier (u32).
-            iort_extra.extend_from_slice(&id.to_ne_bytes());
+            // Followed by the single ITS identifier (u32) for this segment.
+            iort_extra.extend_from_slice(&its.its_id.to_ne_bytes());
         }
+        let its_group_for_segment = |segment: u16| -> Option<u32> {
+            its_group_offsets
+                .iter()
+                .find(|(s, _)| *s == segment)
+                .map(|(_, o)| *o)
+        };
 
-        // SMMUv3 nodes come after ITS Group (if present).
+        // SMMUv3 nodes come after the ITS Group nodes.
         // Build a map from RC index → SMMU node offset for RC routing.
         let mut smmu_rc_offsets: Vec<(u32, u32)> = Vec::new();
         for cfg in smmu_configs {
             let smmu_node_offset = iort::IORT_NODE_OFFSET + iort_extra.len() as u32;
             smmu_rc_offsets.push((cfg.rc_index, smmu_node_offset));
 
-            if has_its {
+            if let Some(its_group_offset) = its_group_for_segment(cfg.segment) {
                 // The SMMUv3 node needs two ID mappings when ITS is present:
                 //
                 // [0] Range mapping: translates PCI device stream IDs through
-                //     the SMMU to the ITS. Used by iort_node_map_id() during
-                //     RC → SMMUv3 → ITS traversal for PCI MSI domain discovery.
+                //     the SMMU to the segment's ITS. Used by iort_node_map_id()
+                //     during RC → SMMUv3 → ITS traversal for PCI MSI domain
+                //     discovery.
                 //
                 // [1] Single mapping: identifies the ITS group for the SMMU's
                 //     own MSI domain lookup. Referenced by
                 //     device_id_mapping_index. Linux's iort_set_device_domain()
                 //     requires IORT_ID_SINGLE_MAPPING flag on this entry.
-                //
-                // Both mappings are needed even though the SMMU uses wired SPIs
-                // (IDR0.MSI=0, GSIVs populated) for its own interrupts. The
-                // device_id_mapping is required for Linux's IORT MSI domain
-                // resolution infrastructure, which is independent of the
-                // SMMU's actual interrupt delivery mechanism.
                 let smmu = iort::IortSmmuV3::new_with_device_id_mapping(
                     cfg.rc_index,
                     cfg.base,
@@ -702,16 +734,16 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
                 iort_extra.extend_from_slice(smmu.as_bytes());
 
                 // Mapping [0]: range mapping for PCI device stream IDs.
-                // The output_base applies the segment offset so the ITS
-                // receives globally unique device IDs: (segment << 16) | BDF.
-                // Stream IDs within this SMMU are plain BDFs (0-based).
+                // output_base is 0 — stream IDs are plain RIDs and the segment
+                // is selected by which ITS group this maps to, not by an
+                // embedded segment prefix in the device ID.
                 iort_extra.extend_from_slice(
                     iort::IortIdMapping::new(
-                        0,                          // input_base
-                        0xFFFF,                     // id_count (16-bit BDF range)
-                        (cfg.segment as u32) << 16, // output_base
-                        its_group_offset,           // output_reference → ITS group
-                        0,                          // flags
+                        0,                // input_base
+                        0xFFFF,           // id_count (16-bit RID range)
+                        0,                // output_base
+                        its_group_offset, // output_reference → segment's ITS group
+                        0,                // flags
                     )
                     .as_bytes(),
                 );
@@ -737,41 +769,34 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
         for bridge in self.pcie_host_bridges {
             // Determine the target node for this RC's ID mapping:
             // - If this RC has an SMMU, route to the SMMU node.
-            // - Otherwise, if an ITS is present, route directly to the ITS.
+            // - Otherwise, if the RC's segment has an ITS, route directly to
+            //   the segment's ITS group.
             // - Otherwise, no mapping (mapping_count = 0).
             let smmu_offset = smmu_rc_offsets
                 .iter()
                 .find(|(idx, _)| *idx == bridge.index)
                 .map(|(_, off)| *off);
 
-            let (rc_mapping_count, rc_target_offset, rc_has_smmu) = if let Some(off) = smmu_offset {
-                (1, off, true)
-            } else if has_its {
-                (1, its_group_offset, false)
+            let (rc_mapping_count, rc_target_offset) = if let Some(off) = smmu_offset {
+                (1, off)
+            } else if let Some(off) = its_group_for_segment(bridge.segment) {
+                (1, off)
             } else {
-                (0, 0, false)
+                (0, 0)
             };
 
             let rc = iort::IortPciRootComplex::new(bridge.index, bridge.segment, rc_mapping_count);
             iort_extra.extend_from_slice(rc.as_bytes());
 
             if rc_mapping_count > 0 {
-                // When the RC has an SMMU, output_base is 0 because stream
-                // IDs are plain BDFs within the per-RC SMMU. The segment
-                // offset is applied in the SMMU→ITS mapping instead.
-                // When the RC goes directly to the ITS, output_base embeds
-                // the segment for globally unique ITS device IDs.
-                let output_base = if rc_has_smmu {
-                    0
-                } else {
-                    (bridge.segment as u32) << 16
-                };
-
+                // output_base is 0 in all cases: device IDs are plain RIDs and
+                // the segment selects the ITS via the doorbell address (which
+                // ITS group the RID maps to), not via an embedded prefix.
                 iort_extra.extend_from_slice(
                     iort::IortIdMapping::new(
                         0,                // input_base
-                        0xFFFF,           // id_count (full 16-bit BDF range)
-                        output_base,      // output_base
+                        0xFFFF,           // id_count (full 16-bit RID range)
+                        0,                // output_base
                         rc_target_offset, // output_reference
                         0,                // flags
                     )
@@ -1571,9 +1596,8 @@ mod test {
     }
 
     fn new_aarch64_its_topology() -> ProcessorTopology<Aarch64Topology> {
+        use vm_topology::processor::aarch64::Aarch64GicMsiConfig;
         use vm_topology::processor::aarch64::Aarch64PlatformConfig;
-        use vm_topology::processor::aarch64::GicItsInfo;
-        use vm_topology::processor::aarch64::GicMsiController;
         use vm_topology::processor::aarch64::GicVersion;
 
         TopologyBuilder::new_aarch64(Aarch64PlatformConfig {
@@ -1581,15 +1605,32 @@ mod test {
             gic_version: GicVersion::V3 {
                 redistributors_base: 0xefff0000,
             },
-            gic_msi: GicMsiController::Its(GicItsInfo {
-                its_base: 0xeffc0000,
-            }),
+            gic_msi: Aarch64GicMsiConfig {
+                passthrough_msi_doorbell: 0xeff68000,
+                lpi_enabled: true,
+            },
             pmu_gsiv: None,
             virt_timer_ppi: 20,
             gic_nr_irqs: 992,
         })
         .build(2)
         .unwrap()
+    }
+
+    /// Generates one `AcpiItsConfig` per distinct PCI segment among the given
+    /// bridges (mirroring the per-segment ITS wiring): `its_id == segment` and
+    /// a deterministic MMIO base.
+    fn its_configs_for_bridges(bridges: &[PcieHostBridge]) -> Vec<AcpiItsConfig> {
+        let mut segs: Vec<u16> = bridges.iter().map(|b| b.segment).collect();
+        segs.sort_unstable();
+        segs.dedup();
+        segs.into_iter()
+            .map(|s| AcpiItsConfig {
+                segment: s,
+                its_id: s as u32,
+                its_base: 0xeffc_0000 + (s as u64) * 0x2_0000,
+            })
+            .collect()
     }
 
     fn new_aarch64_builder<'a>(
@@ -1608,6 +1649,8 @@ mod test {
                 hypervisor_vendor_identity: 0,
                 virt_timer_ppi: 20,
                 smmu: vec![],
+                its: its_configs_for_bridges(pcie_host_bridges),
+                v2m: None,
             },
         }
     }
@@ -1668,39 +1711,43 @@ mod test {
         assert_eq!(u32_at(&data, 4) as usize, data.len());
         assert_eq!(checksum(&data), 0);
 
-        // 3 nodes: 1 ITS Group + 2 Root Complexes
-        assert_eq!(u32_at(&data, 36), 3);
+        // 4 nodes: one ITS Group per segment (0 and 3) + 2 Root Complexes.
+        assert_eq!(u32_at(&data, 36), 4);
         assert_eq!(u32_at(&data, 40), iort::IORT_NODE_OFFSET);
 
-        // First node: ITS Group at IORT_NODE_OFFSET
-        let its_node = iort::IORT_NODE_OFFSET as usize;
-        assert_eq!(data[its_node], iort::IORT_NODE_TYPE_ITS_GROUP);
-        // its_count = 1
-        assert_eq!(u32_at(&data, its_node + 16), 1);
-        // ITS identifier = 0
-        assert_eq!(u32_at(&data, its_node + 20), 0);
+        let its_group_size = 24usize; // 20-byte struct + 4-byte ITS ID
 
-        // Second node: Root Complex 0 (after ITS Group: 20 + 4 = 24 bytes)
-        let rc0 = its_node + 24;
+        // First node: ITS Group for segment 0 (its_id = 0).
+        let its0 = iort::IORT_NODE_OFFSET as usize;
+        assert_eq!(data[its0], iort::IORT_NODE_TYPE_ITS_GROUP);
+        assert_eq!(u32_at(&data, its0 + 16), 1); // its_count = 1
+        assert_eq!(u32_at(&data, its0 + 20), 0); // ITS identifier = segment 0
+
+        // Second node: ITS Group for segment 3 (its_id = 3).
+        let its3 = its0 + its_group_size;
+        assert_eq!(data[its3], iort::IORT_NODE_TYPE_ITS_GROUP);
+        assert_eq!(u32_at(&data, its3 + 20), 3); // ITS identifier = segment 3
+
+        // Third node: Root Complex 0 (segment 0) → segment 0's ITS group.
+        let rc0 = its3 + its_group_size;
         assert_eq!(data[rc0], iort::IORT_NODE_TYPE_PCI_ROOT_COMPLEX);
         assert_eq!(u32_at(&data, rc0 + 4), 0); // identifier
         assert_eq!(u32_at(&data, rc0 + 8), 1); // mapping_count
-        // pci_segment_number at offset 28 from node start
-        assert_eq!(u32_at(&data, rc0 + 28), 0);
-        // ID mapping follows the root complex node (36 bytes in)
+        assert_eq!(u32_at(&data, rc0 + 28), 0); // pci_segment_number
         let mapping0 = rc0 + 36;
         assert_eq!(u32_at(&data, mapping0), 0); // input_base
         assert_eq!(u32_at(&data, mapping0 + 4), 0xFFFF); // id_count
-        assert_eq!(u32_at(&data, mapping0 + 8), 0); // output_base (seg 0 << 16)
-        assert_eq!(u32_at(&data, mapping0 + 12), iort::IORT_NODE_OFFSET); // -> ITS group
+        assert_eq!(u32_at(&data, mapping0 + 8), 0); // output_base (plain RID)
+        assert_eq!(u32_at(&data, mapping0 + 12), its0 as u32); // → seg 0 ITS group
 
-        // Third node: Root Complex 7
+        // Fourth node: Root Complex 7 (segment 3) → segment 3's ITS group.
         let rc1 = mapping0 + 20;
         assert_eq!(data[rc1], iort::IORT_NODE_TYPE_PCI_ROOT_COMPLEX);
         assert_eq!(u32_at(&data, rc1 + 4), 7); // identifier
         assert_eq!(u32_at(&data, rc1 + 28), 3); // pci_segment_number
         let mapping1 = rc1 + 36;
-        assert_eq!(u32_at(&data, mapping1 + 8), 3 << 16); // output_base (seg 3 << 16)
+        assert_eq!(u32_at(&data, mapping1 + 8), 0); // output_base (plain RID)
+        assert_eq!(u32_at(&data, mapping1 + 12), its3 as u32); // → seg 3 ITS group
     }
 
     #[test]
@@ -1783,6 +1830,8 @@ mod test {
                     event_gsiv: 35,
                     gerr_gsiv: 36,
                 }],
+                its: its_configs_for_bridges(pcie_host_bridges),
+                v2m: None,
             },
         }
     }
@@ -1939,18 +1988,26 @@ mod test {
 
         let data = builder.build_iort().unwrap();
 
-        // 4 nodes: ITS + SMMUv3 + 2 RCs
-        assert_eq!(u32_at(&data, 36), 4);
+        // 5 nodes: one ITS Group per segment (0 and 2) + SMMUv3 + 2 RCs.
+        assert_eq!(u32_at(&data, 36), 5);
         assert_eq!(checksum(&data), 0);
 
-        // ITS Group
-        let its_node = iort::IORT_NODE_OFFSET as usize;
         let its_group_size = 24usize;
 
-        // SMMUv3 node
-        let smmu_node = its_node + its_group_size;
+        // ITS Group for segment 0, then segment 2.
+        let its0 = iort::IORT_NODE_OFFSET as usize;
+        let its2 = its0 + its_group_size;
+        assert_eq!(data[its0], iort::IORT_NODE_TYPE_ITS_GROUP);
+        assert_eq!(u32_at(&data, its2 + 20), 2); // segment 2 ITS identifier
+
+        // SMMUv3 node (after both ITS groups).
+        let smmu_node = its2 + its_group_size;
         assert_eq!(data[smmu_node], iort::IORT_NODE_TYPE_SMMUV3);
         let smmu_node_len = u16_at(&data, smmu_node + 1) as usize;
+        // SMMU maps to segment 0's ITS group.
+        let smmu_mapping_0 = smmu_node + 68;
+        assert_eq!(u32_at(&data, smmu_mapping_0 + 8), 0); // output_base (plain RID)
+        assert_eq!(u32_at(&data, smmu_mapping_0 + 12), its0 as u32); // → seg 0 ITS group
 
         // RC 0: segment 0 → SMMUv3
         let rc0 = smmu_node + smmu_node_len;
@@ -1959,13 +2016,13 @@ mod test {
         assert_eq!(u32_at(&data, rc0_mapping + 8), 0); // output_base (0: has SMMU)
         assert_eq!(u32_at(&data, rc0_mapping + 12), smmu_node as u32); // → SMMUv3
 
-        // RC 1: segment 2 → ITS directly (only segment 0 uses SMMU)
+        // RC 1: segment 2 → segment 2's ITS group directly.
         let rc0_len = u16_at(&data, rc0 + 1) as usize;
         let rc1 = rc0 + rc0_len;
         assert_eq!(data[rc1], iort::IORT_NODE_TYPE_PCI_ROOT_COMPLEX);
         let rc1_mapping = rc1 + 36;
-        assert_eq!(u32_at(&data, rc1_mapping + 8), 2 << 16); // output_base seg 2
-        assert_eq!(u32_at(&data, rc1_mapping + 12), its_node as u32); // → ITS group
+        assert_eq!(u32_at(&data, rc1_mapping + 8), 0); // output_base (plain RID)
+        assert_eq!(u32_at(&data, rc1_mapping + 12), its2 as u32); // → seg 2 ITS group
     }
 
     #[test]

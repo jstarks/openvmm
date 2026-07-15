@@ -59,8 +59,8 @@ pub struct PlatformInfo {
     /// GICv2 is available (e.g., Raspberry Pi 5 with GIC-400).
     pub supports_gic_v3: bool,
     /// Whether the hypervisor supports an in-kernel GICv3 ITS for
-    /// MSI delivery via LPIs. When `true`, the topology can include
-    /// a `GicItsInfo` and the backend will create/manage the ITS device.
+    /// MSI delivery via LPIs. When `true`, the backend can create and
+    /// manage per-segment ITS devices via [`Aarch64Partition::new_its`].
     pub supports_its: bool,
 }
 
@@ -421,6 +421,41 @@ pub trait X86Partition: Partition {
 pub trait Aarch64Partition: Partition {
     /// Returns an interface for accessing the GIC interrupt controller for `vtl`.
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn ControlGic>;
+
+    /// Creates a new GICv3 ITS instance backend at the given MMIO base.
+    ///
+    /// Called after `build()`, once the memory-layout allocator has assigned
+    /// per-segment ITS MMIO bases — one call per PCI segment. The returned
+    /// backend owns the routing surface and save/restore for that ITS.
+    ///
+    /// Backends that do not support a guest vITS return an error.
+    fn new_its(
+        &self,
+        base: u64,
+    ) -> anyhow::Result<Arc<dyn crate::aarch64::gic_its::GicItsBackend>> {
+        let _ = base;
+        anyhow::bail!("guest vITS not supported by this backend")
+    }
+
+    /// Returns an irqfd routing interface whose routes deliver as GIC SPIs.
+    ///
+    /// Used by the GICv2m device to deliver passthrough-device MSIs as SPI
+    /// assertions. The route's `data` is interpreted as the SPI interrupt ID.
+    ///
+    /// Not all backends support this.
+    fn spi_irqfd(&self) -> Option<Arc<dyn IrqFd>> {
+        None
+    }
+
+    /// Completes GIC initialization after all post-build side devices (ITSes)
+    /// have been created.
+    ///
+    /// Backends that defer the vGIC init/enable until after ITS creation
+    /// (split-init) perform it here. The default is a no-op for backends that
+    /// fully initialize the GIC during `build()`.
+    fn finalize_gic(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Extension trait for accepting initial pages.

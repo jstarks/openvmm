@@ -2877,6 +2877,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gic_v2m"
+version = "0.0.0"
+dependencies = [
+ "aarch64defs",
+ "anyhow",
+ "chipset_device",
+ "inspect",
+ "pal_event",
+ "pci_core",
+ "tracelimit",
+ "virt",
+ "vmcore",
+]
+
+[[package]]
 name = "gimli"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5569,6 +5584,7 @@ dependencies = [
  "futures-concurrency",
  "get_resources",
  "getrandom 0.4.2",
+ "gic_v2m",
  "guestmem",
  "guid",
  "hvdef",
@@ -6229,7 +6245,6 @@ dependencies = [
  "memory_range",
  "mesh",
  "pal_async",
- "pal_event",
  "parking_lot",
  "pci_bus",
  "pci_core",

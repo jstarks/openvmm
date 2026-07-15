@@ -139,6 +139,8 @@ fn build_dt(
     processor_topology: &ProcessorTopology<Aarch64Topology>,
     pcie_host_bridges: &[PcieHostBridge],
     smmu_configs: &[vmm_core::acpi_builder::AcpiSmmuConfig],
+    its_configs: &[vmm_core::acpi_builder::AcpiItsConfig],
+    v2m_config: Option<vmm_core::acpi_builder::AcpiV2mConfig>,
     chipset_low_mmio: MemoryRange,
     chipset_high_mmio: MemoryRange,
     initrd_start: u64,
@@ -156,7 +158,6 @@ fn build_dt(
 
     let num_cpus = processor_topology.vps().len();
 
-    use vm_topology::processor::aarch64::GicMsiController;
     use vm_topology::processor::aarch64::GicVersion;
 
     let gic_dist_base: u64 = processor_topology.gic_distributor_base();
@@ -236,7 +237,9 @@ fn build_dt(
     const PHANDLE_GIC: u32 = 1;
     const PHANDLE_APB_PCLK: u32 = 2;
     const PHANDLE_V2M: u32 = 3;
-    const PHANDLE_ITS: u32 = 4;
+    /// Per-segment ITS phandle base. ITS for segment `s` gets `base + s`.
+    /// Placed well above the SMMU phandle range to avoid collisions.
+    const PHANDLE_ITS_BASE: u32 = 0x1000;
     // SMMU phandles start at 5: SMMU instance N gets phandle 5 + N.
     const PHANDLE_SMMU_BASE: u32 = 5;
 
@@ -313,9 +316,8 @@ fn build_dt(
 
     // ARM64 Generic Interrupt Controller.
     // GICv3 uses "arm,gic-v3"; GICv2 uses "arm,cortex-a15-gic".
-    // GICv3 can have an ITS child for LPI-based MSIs; v2m is the
+    // GICv3 can have per-segment ITS children for LPI-based MSIs; v2m is the
     // fallback for SPI-based MSIs (GICv2 or GICv3 without ITS).
-    let gic_msi = processor_topology.gic_msi();
     let gic_compatible = match processor_topology.gic_version() {
         GicVersion::V3 { .. } => "arm,gic-v3",
         GicVersion::V2 { .. } => "arm,cortex-a15-gic",
@@ -338,16 +340,22 @@ fn build_dt(
         .add_null(p_interrupt_controller)?
         .add_u32(p_phandle, PHANDLE_GIC)?
         .add_null(p_ranges)?;
-    root_builder = match gic_msi {
-        GicMsiController::Its(its) => gic_node
+
+    // Emit one ITS child node per PCI segment (ITS mode), each with a distinct
+    // phandle so PCIe root complexes can point their `msi-parent` at the ITS
+    // for their segment. In v2m mode, emit the single v2m frame node instead.
+    let mut gic_node = gic_node;
+    for its in its_configs {
+        gic_node = gic_node
             .start_node(format!("its@{:x}", its.its_base).as_str())?
             .add_str(p_compatible, "arm,gic-v3-its")?
             .add_null(p_msi_controller)?
             .add_u64_array(p_reg, &[its.its_base, openvmm_defs::config::GIC_ITS_SIZE])?
-            .add_u32(p_phandle, PHANDLE_ITS)?
-            .end_node()?
-            .end_node()?,
-        GicMsiController::V2m(v2m) => gic_node
+            .add_u32(p_phandle, PHANDLE_ITS_BASE + its.segment as u32)?
+            .end_node()?;
+    }
+    if let Some(v2m) = &v2m_config {
+        gic_node = gic_node
             .start_node(format!("v2m@{:x}", v2m.frame_base).as_str())?
             .add_str(p_compatible, "arm,gic-v2m-frame")?
             .add_null(p_msi_controller)?
@@ -358,10 +366,9 @@ fn build_dt(
             .add_u32(p_arm_msi_base_spi, v2m.spi_base)?
             .add_u32(p_arm_msi_num_spis, v2m.spi_count)?
             .add_u32(p_phandle, PHANDLE_V2M)?
-            .end_node()?
-            .end_node()?,
-        GicMsiController::None => gic_node.end_node()?,
-    };
+            .end_node()?;
+    }
+    root_builder = gic_node.end_node()?;
 
     // SMMUv3 nodes (one per configured instance).
     // Build a lookup from RC index → phandle for the iommu-map entries below.
@@ -482,14 +489,10 @@ fn build_dt(
             .add_u32(p_size_cells, 2)?
             .add_u32(p_interrupt_parent, PHANDLE_GIC)?
             .add_u32_array(p_ranges, &ranges)?;
-        match gic_msi {
-            GicMsiController::Its(_) => {
-                node = node.add_u32(p_msi_parent, PHANDLE_ITS)?;
-            }
-            GicMsiController::V2m(_) => {
-                node = node.add_u32(p_msi_parent, PHANDLE_V2M)?;
-            }
-            GicMsiController::None => {}
+        if v2m_config.is_some() {
+            node = node.add_u32(p_msi_parent, PHANDLE_V2M)?;
+        } else if its_configs.iter().any(|i| i.segment == bridge.segment) {
+            node = node.add_u32(p_msi_parent, PHANDLE_ITS_BASE + bridge.segment as u32)?;
         }
         if let Some((_, phandle)) = smmu_phandles.iter().find(|(idx, _)| *idx == bridge.index) {
             // iommu-map: <rid_base> <&smmu_phandle> <stream_id_base> <length>
@@ -852,6 +855,8 @@ pub fn load_linux_arm64(
     processor_topology: &ProcessorTopology<Aarch64Topology>,
     pcie_host_bridges: &[PcieHostBridge],
     smmu_configs: &[vmm_core::acpi_builder::AcpiSmmuConfig],
+    its_configs: &[vmm_core::acpi_builder::AcpiItsConfig],
+    v2m_config: Option<vmm_core::acpi_builder::AcpiV2mConfig>,
     chipset_mmio: &ChipsetMmioRanges,
     build_acpi: Option<impl FnOnce(u64) -> vmm_core::acpi_builder::BuiltAcpiTables>,
 ) -> Result<InitialLoad<Aarch64Register>, Error> {
@@ -914,6 +919,8 @@ pub fn load_linux_arm64(
             processor_topology,
             pcie_host_bridges,
             smmu_configs,
+            its_configs,
+            v2m_config,
             chipset_mmio.low,
             chipset_mmio.high,
             initrd_start,

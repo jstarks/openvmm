@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+pub mod gic_its;
 pub mod gic_software_device;
-pub mod gic_v2m;
 pub mod vm;
 pub mod vp;
 

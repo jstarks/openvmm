@@ -5,7 +5,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod its;
 pub(crate) mod port;
 pub use port::GenericPciePortDefinition;
 pub use port::PciePortSettings;

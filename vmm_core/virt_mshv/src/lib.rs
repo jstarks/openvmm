@@ -262,11 +262,6 @@ struct MshvPartitionInner {
     /// Set to `true` when partition time is frozen (e.g. during reset).
     /// The first VP to enter `run_vp` after a freeze will thaw time.
     time_frozen: Mutex<bool>,
-    /// aarch64 GIC MSI controller config, used to decode PCIe MSIs into SPI
-    /// assertions via a v2m frame.
-    #[cfg(guest_arch = "aarch64")]
-    #[inspect(skip)]
-    gic_msi: vm_topology::processor::aarch64::GicMsiController,
 }
 
 struct MshvVpInner {

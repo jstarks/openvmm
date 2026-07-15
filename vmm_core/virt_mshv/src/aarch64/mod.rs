@@ -106,34 +106,30 @@ impl virt::Hypervisor for LinuxMshv {
         )
         .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
 
-        // When a GICv2m MSI frame is configured, disable LPI support
-        // (GICD_TYPER.LPIS=0) so Linux routes PCIe MSIs through the v2m frame
+        // The GIC MSI config carries the LPI-support flag and the physical
+        // passthrough MSI doorbell base, independent of whether MSIs are
+        // ultimately delivered via v2m (SPI) or ITS (LPI).
+        let gic_msi = config.processor_topology.gic_msi();
+
+        // Disable LPI support (GICD_TYPER.LPIS=0) when the GIC does not expose
+        // LPIs (v2m mode), so Linux routes PCIe MSIs through the v2m frame
         // (SPI-based) instead of looking for an ITS. Mirrors the WHP backend.
-        let v2m_doorbell_base = match config.processor_topology.gic_msi() {
-            vm_topology::processor::aarch64::GicMsiController::V2m(v2m) => Some(v2m.doorbell_base),
-            _ => None,
-        };
-        let gic_lpi_int_id_bits = if v2m_doorbell_base.is_some() {
-            0u64
-        } else {
-            1u64
-        };
+        let gic_lpi_int_id_bits = if gic_msi.lpi_enabled { 1u64 } else { 0u64 };
         vmfd.set_partition_property(
             HvPartitionPropertyCode::GicLpiIntIdBits.0,
             gic_lpi_int_id_bits,
         )
         .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
 
-        // Register the v2m MSI doorbell base with the hypervisor as the
-        // GITS translater base, so an assigned device's DMA MSI-X write is
-        // trapped and injected as a guest SPI.
-        if let Some(doorbell_base) = v2m_doorbell_base {
-            vmfd.set_partition_property(
-                HvPartitionPropertyCode::GitsTranslaterBaseAddress.0,
-                doorbell_base,
-            )
-            .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
-        }
+        // Register the passthrough MSI doorbell base with the hypervisor as
+        // the GITS translater base, so an assigned device's DMA MSI-X write is
+        // trapped and injected. This is the physical trap address for any
+        // passthrough MSI (v2m or ITS).
+        vmfd.set_partition_property(
+            HvPartitionPropertyCode::GitsTranslaterBaseAddress.0,
+            gic_msi.passthrough_msi_doorbell,
+        )
+        .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
 
         // Set the PMU PPI if the topology provides one.
         if let Some(pmu_gsiv) = config.processor_topology.pmu_gsiv() {
@@ -182,7 +178,6 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             caps,
             synic_ports: Default::default(),
             time_frozen: false.into(),
-            gic_msi: self.config.processor_topology.gic_msi(),
             gsi_states: parking_lot::Mutex::new(Box::new(
                 [crate::irqfd::GsiState::Unallocated; crate::irqfd::NUM_GSIS],
             )),
@@ -233,14 +228,10 @@ impl virt::Partition for MshvPartition {
     }
 
     fn as_signal_msi(&self, _vtl: Vtl) -> Option<Arc<dyn SignalMsi>> {
-        let v2m = match &self.inner.gic_msi {
-            vm_topology::processor::aarch64::GicMsiController::V2m(v2m) => v2m,
-            _ => return None,
-        };
-        let irqcon = self.inner.clone() as Arc<dyn virt::irqcon::ControlGic>;
-        Some(Arc::new(virt::aarch64::gic_v2m::GicV2mSignalMsi::new(
-            v2m, irqcon,
-        )))
+        // On aarch64 the MSI target is provided by the GIC MSI controller
+        // device (the `GicV2mDevice` in v2m mode, which uses `control_gic`),
+        // not by the partition.
+        None
     }
 
     fn irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
@@ -274,6 +265,12 @@ impl virt::ResetPartition for MshvPartition {
 impl virt::Aarch64Partition for MshvPartition {
     fn control_gic(&self, _vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic> {
         self.inner.clone()
+    }
+
+    fn spi_irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
+        // v2m passthrough MSIs are delivered via the mshv irqfd; the hypervisor
+        // traps writes to the registered doorbell base and injects them.
+        Some(Arc::new(crate::irqfd::MshvIrqFd::new(self.inner.clone())))
     }
 }
 

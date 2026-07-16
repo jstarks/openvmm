@@ -317,6 +317,28 @@ impl VirtioQueue {
             .map(VirtioQueueCallbackWork::new))
     }
 
+    /// Rebuild a [`VirtioQueueCallbackWork`] from a raw descriptor **head**
+    /// index, re-walking the descriptor chain without reading or advancing the
+    /// available ring.
+    ///
+    /// Used by save/restore to reconstruct an outstanding descriptor (one the
+    /// device consumed but has not yet completed) whose head index was captured
+    /// at save time. The returned work must be completed exactly once via
+    /// [`complete`](Self::complete) — either to re-deliver it (receive) or to
+    /// return it to the guest without resending (transmit drop).
+    ///
+    /// Split rings only; returns an error on packed rings.
+    pub fn work_from_descriptor_index(
+        &mut self,
+        descriptor_index: u16,
+    ) -> Result<VirtioQueueCallbackWork, Error> {
+        let work = self
+            .core
+            .work_from_descriptor_index(descriptor_index)
+            .map_err(Error::other)?;
+        Ok(VirtioQueueCallbackWork::new(work))
+    }
+
     /// Peek at the next available descriptor without advancing the available
     /// index. Returns a [`PeekedWork`] that holds the descriptor payload and
     /// a mutable reference to this queue.

@@ -23,6 +23,7 @@ vmcore.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bitfield-struct.workspace = true
+mesh.workspace = true
 open_enum.workspace = true
 thiserror.workspace = true
 tracelimit.workspace = true

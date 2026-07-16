@@ -54,6 +54,9 @@ use virtio::VirtioQueue;
 use virtio::VirtioQueueCallbackWork;
 use virtio::queue::QueueState;
 use virtio::spec::VirtioDeviceFeatures;
+use vmcore::save_restore::RestoreError;
+use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 use vmcore::vm_task::VmTaskDriver;
 use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::FromBytes;
@@ -217,6 +220,43 @@ const fn header_size() -> usize {
     offset_of!(VirtioNetHeader, hash_value)
 }
 
+/// Device-level saved state: the in-flight descriptor set that cannot be
+/// reconstructed from the transport's queue cursors because virtio-net
+/// completes descriptors out of order.
+mod saved_state {
+    use mesh::payload::Protobuf;
+    use vmcore::save_restore::SavedStateRoot;
+
+    #[derive(Protobuf, SavedStateRoot)]
+    #[mesh(package = "virtio.net")]
+    pub struct SavedState {
+        /// One entry per queue pair, in pair-index order.
+        #[mesh(1)]
+        pub pairs: Vec<QueuePairInflight>,
+    }
+
+    /// The outstanding descriptor set for a single queue pair.
+    #[derive(Protobuf, Default, Clone)]
+    #[mesh(package = "virtio.net")]
+    pub struct QueuePairInflight {
+        /// Descriptor head indices of RX buffers the guest posted and the
+        /// device consumed but has not completed. Rebuilt and re-posted on
+        /// restore.
+        #[mesh(1)]
+        pub rx_descriptor_indices: Vec<u16>,
+        /// Descriptor head indices of TX packets in flight in the backend at
+        /// save time. Completed (dropped) without resending on restore.
+        #[mesh(2)]
+        pub tx_descriptor_indices: Vec<u16>,
+    }
+
+    impl QueuePairInflight {
+        pub fn is_empty(&self) -> bool {
+            self.rx_descriptor_indices.is_empty() && self.tx_descriptor_indices.is_empty()
+        }
+    }
+}
+
 struct Adapter {
     driver: VmTaskDriver,
     max_queue_pairs: u16,
@@ -232,6 +272,13 @@ pub struct Device {
     driver_source: VmTaskDriverSource,
     /// Per-pair state tracking.
     pairs: Vec<QueuePairState>,
+    /// Whether the guest negotiated packed virtqueues. Set on the first
+    /// `start_queue`. In-flight save/restore is only implemented for split
+    /// rings, so `save` reports no device state when packed.
+    ring_packed: bool,
+    /// Outstanding descriptor set parsed from a restore blob, applied per pair
+    /// when that pair's queues start. `None` outside of a restore.
+    restore_inflight: Option<Vec<saved_state::QueuePairInflight>>,
 }
 
 /// Tracks the state of a queue pair through the start_queue lifecycle.
@@ -322,6 +369,7 @@ impl VirtioDevice for Device {
     ) -> anyhow::Result<()> {
         let guest_memory = resources.guest_memory.clone();
         let queue_size = resources.params.size;
+        self.ring_packed = features.ring_packed();
         let queue_event = PolledWait::new(&self.adapter.driver, resources.event)
             .context("failed creating queue event")?;
         let queue = VirtioQueue::new(
@@ -394,19 +442,38 @@ impl VirtioDevice for Device {
                     self.insert_coordinator(self.pairs.len() as u16);
                 }
 
-                let virtio_state = VirtioState {
+                let mut virtio_state = VirtioState {
                     rx_queue,
                     rx_queue_size,
                     tx_queue,
                     tx_queue_size,
                 };
+
+                // Determine the worker's initial in-flight state. In order of
+                // precedence: an `ActiveState` preserved in memory across an
+                // in-process pause (`saved`); a set of outstanding descriptor
+                // indices supplied by a true restore (`restore_inflight`),
+                // which we reconstruct into a fresh `ActiveState`; or nothing
+                // (a fresh start).
+                let active_state = if let Some(saved) = saved {
+                    Some(*saved)
+                } else if let Some(inflight) = self.take_restore_inflight(pair_idx) {
+                    Some(reconstruct_active_state(
+                        &mut virtio_state,
+                        &guest_memory,
+                        inflight,
+                    )?)
+                } else {
+                    None
+                };
+
                 self.insert_worker(
                     virtio_state,
                     pair_idx,
                     &guest_memory,
                     negotiated_features,
                     negotiated_features_bank1,
-                    saved.map(|saved| *saved),
+                    active_state,
                 );
 
                 if first_pair {
@@ -533,11 +600,115 @@ impl VirtioDevice for Device {
         // correct: a device reset means the guest is starting over, so the next
         // start builds fresh queues.
         self.pairs.fill_with(|| QueuePairState::Empty { saved: None });
+        self.restore_inflight = None;
     }
 
     fn supports_save_restore(&self) -> bool {
         true
     }
+
+    fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        // In-flight save/restore is implemented for split rings only. For
+        // packed rings the outstanding descriptor set cannot be rebuilt from a
+        // head index, so report no device-specific state (falling back to the
+        // transport's queue cursors). Tracked as an open item.
+        if self.ring_packed {
+            tracelimit::warn_ratelimited!(
+                "virtio-net in-flight state not saved: packed virtqueues unsupported"
+            );
+            return Ok(None);
+        }
+
+        // `save` runs after all queues have been stopped, so each pair holds
+        // its preserved `ActiveState`. Collect the outstanding descriptor
+        // indices from it.
+        let mut pairs = Vec::with_capacity(self.pairs.len());
+        let mut any = false;
+        for pair in &self.pairs {
+            let active = match pair {
+                QueuePairState::Empty { saved: Some(s) } => Some(s.as_ref()),
+                QueuePairState::HalfOpen { saved: Some(s), .. } => Some(s.as_ref()),
+                _ => None,
+            };
+            let inflight = if let Some(active) = active {
+                saved_state::QueuePairInflight {
+                    rx_descriptor_indices: active
+                        .pending_rx_packets
+                        .outstanding_descriptor_indices(),
+                    tx_descriptor_indices: active
+                        .pending_tx_packets
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, p)| p.is_some().then_some(i as u16))
+                        .collect(),
+                }
+            } else {
+                saved_state::QueuePairInflight::default()
+            };
+            any |= !inflight.is_empty();
+            pairs.push(inflight);
+        }
+
+        if !any {
+            return Ok(None);
+        }
+        Ok(Some(SavedStateBlob::new(saved_state::SavedState { pairs })))
+    }
+
+    fn restore(&mut self, state: SavedStateBlob) -> Result<(), RestoreError> {
+        let saved: saved_state::SavedState = state.parse()?;
+        // Stash the outstanding descriptor set; it is reconstructed into a
+        // fresh `ActiveState` when each pair's queues start.
+        self.restore_inflight = Some(saved.pairs);
+        Ok(())
+    }
+}
+
+/// Reconstruct a worker's `ActiveState` from a saved outstanding descriptor
+/// set (a true restore, where no in-memory `ActiveState` survived).
+///
+/// Receive buffers are rebuilt from their descriptor head indices and
+/// repopulated into the pool; `restart_queues` re-posts them to the fresh
+/// backend queue. In-flight transmit descriptors are completed without
+/// resending (returned to the guest via the used ring), which drops the
+/// packets — an already-sent packet is reported done, a not-yet-sent one is
+/// dropped and the guest/TCP retransmits. This avoids both duplicate transmits
+/// and leaked descriptors.
+fn reconstruct_active_state(
+    virtio_state: &mut VirtioState,
+    guest_memory: &GuestMemory,
+    inflight: saved_state::QueuePairInflight,
+) -> anyhow::Result<ActiveState> {
+    let mut active = ActiveState::new(
+        guest_memory.clone(),
+        virtio_state.rx_queue_size,
+        virtio_state.tx_queue_size,
+    );
+
+    for idx in inflight.rx_descriptor_indices {
+        let work = virtio_state
+            .rx_queue
+            .work_from_descriptor_index(idx)
+            .with_context(|| format!("rebuilding restored RX descriptor {idx}"))?;
+        if let Err(work) = active.pending_rx_packets.queue_work(work) {
+            // Should not happen for a well-formed saved state (each index
+            // appears once and was a valid RX buffer). Complete the rebuilt
+            // work rather than dropping it, so the descriptor is not leaked.
+            tracelimit::warn_ratelimited!(idx, "dropping restored RX buffer");
+            virtio_state.rx_queue.complete(work, 0);
+        }
+    }
+
+    for idx in inflight.tx_descriptor_indices {
+        let work = virtio_state
+            .tx_queue
+            .work_from_descriptor_index(idx)
+            .with_context(|| format!("rebuilding restored TX descriptor {idx}"))?;
+        // Complete without resending: drop the in-flight transmit.
+        virtio_state.tx_queue.complete(work, 0);
+    }
+
+    Ok(active)
 }
 
 #[derive(InspectMut)]
@@ -673,6 +844,8 @@ impl NicBuilder {
             pairs: (0..max_queue_pairs)
                 .map(|_| QueuePairState::Empty { saved: None })
                 .collect(),
+            ring_packed: false,
+            restore_inflight: None,
         }
     }
 }
@@ -692,6 +865,17 @@ impl InspectMut for Device {
 }
 
 impl Device {
+    /// Take the outstanding descriptor set staged by a restore for the given
+    /// pair, if any. Returns `None` when there is no restore in progress or the
+    /// pair had no in-flight descriptors, so a fresh `ActiveState` is built.
+    fn take_restore_inflight(&mut self, pair_idx: usize) -> Option<saved_state::QueuePairInflight> {
+        let inflight = self.restore_inflight.as_mut()?.get_mut(pair_idx)?;
+        if inflight.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(inflight))
+    }
+
     fn insert_coordinator(&mut self, num_queues: u16) {
         self.coordinator.insert(
             &self.adapter.driver,

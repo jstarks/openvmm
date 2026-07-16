@@ -29,6 +29,7 @@ use std::task::Poll;
 use vmcore::interrupt::Interrupt;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 
 /// Per-queue transport data shared between PCI and MMIO.
 #[derive(Inspect)]
@@ -89,6 +90,24 @@ pub(crate) struct VirtioTransportCore {
     pub supports_save_restore: bool,
     #[inspect(skip)]
     pub guest_memory: GuestMemory,
+    /// Device-specific in-flight state blob captured during `stop()`, consumed
+    /// by the transport's synchronous `save()`. `None` when the device has no
+    /// such state.
+    #[inspect(with = "Option::is_some")]
+    pub device_saved_state: Option<SavedStateBlob>,
+    /// Error string from the most recent device `save()` during `stop()`, if it
+    /// failed. Surfaced by the transport's synchronous `save()` so a device
+    /// that cannot serialize its in-flight state fails the save rather than
+    /// silently dropping it. Cleared on a successful save.
+    #[inspect(with = "Option::is_some")]
+    pub device_save_error: Option<String>,
+    /// Device-specific in-flight state blob staged by `restore_device()`, to be
+    /// delivered to the device (via `DeviceCommand::Restore`) immediately before
+    /// its queues start. Distinct from `device_saved_state` so an in-process
+    /// pause/resume — which preserves the device's `ActiveState` in memory and
+    /// needs no blob — never spuriously re-delivers captured state.
+    #[inspect(with = "Option::is_some")]
+    pub device_restore_state: Option<SavedStateBlob>,
     #[inspect(with = "Option::is_some")]
     pub pending_status_deferred: Option<DeferredWrite>,
     #[inspect(with = "Vec::len")]
@@ -151,6 +170,9 @@ impl VirtioTransportCore {
             doorbells: VirtioDoorbells::new(doorbell_registration),
             supports_save_restore,
             guest_memory,
+            device_saved_state: None,
+            device_save_error: None,
+            device_restore_state: None,
             pending_status_deferred: None,
             stalled_io: Vec::new(),
         })
@@ -208,6 +230,9 @@ impl VirtioTransportCore {
             driver_feature_select,
             queue_select,
             queues,
+            device_saved_state,
+            device_save_error,
+            device_restore_state,
         } = self;
 
         drop(pending_status_deferred.take());
@@ -215,6 +240,9 @@ impl VirtioTransportCore {
 
         doorbells.clear();
         *device_status = VirtioDeviceStatus::new();
+        *device_saved_state = None;
+        *device_save_error = None;
+        *device_restore_state = None;
         *config_generation = 0;
         ops.reset_interrupts();
 
@@ -394,6 +422,17 @@ impl VirtioTransportCore {
 
             let params = StartParams { queues, features };
 
+            // If a device-specific in-flight blob was staged by a restore,
+            // deliver it before Start so the device can apply it as its queues
+            // start. Both are fire-and-forget on the same ordered channel, so
+            // Restore always precedes Start. Only a true restore stages this;
+            // an in-process pause/resume preserves the device's state in memory
+            // and leaves it `None`.
+            if let Some(blob) = self.device_restore_state.take() {
+                self.device_sender
+                    .send(DeviceCommand::Restore(Rpc::detached(blob)));
+            }
+
             // Fire and forget — start() is sync, can't await.
             self.device_sender
                 .send(DeviceCommand::Start(Rpc::detached(params)));
@@ -415,6 +454,33 @@ impl VirtioTransportCore {
             .expect("device task is gone");
         for (i, state) in states.into_iter().enumerate() {
             self.queues[i].saved_state = state;
+        }
+
+        // Capture any device-specific in-flight state now that all queues are
+        // stopped, so a synchronous `save()` can serialize it. Mirrors how the
+        // per-queue cursors above are cached for `save_queue_common`. A save
+        // failure is recorded so `save()` can surface it rather than silently
+        // dropping the device's in-flight state.
+        if self.supports_save_restore {
+            match self
+                .device_sender
+                .call(DeviceCommand::Save, ())
+                .await
+                .expect("device task is gone")
+            {
+                Ok(blob) => {
+                    self.device_saved_state = blob;
+                    self.device_save_error = None;
+                }
+                Err(err) => {
+                    tracelimit::error_ratelimited!(
+                        error = &err as &dyn std::error::Error,
+                        "failed to save virtio device in-flight state"
+                    );
+                    self.device_saved_state = None;
+                    self.device_save_error = Some(err.to_string());
+                }
+            }
         }
     }
 
@@ -458,6 +524,32 @@ impl VirtioTransportCore {
             used_addr: qd.params.used_addr,
             queue_state: qd.saved_state,
         }
+    }
+
+    /// Take the device-specific in-flight blob captured during [`stop`](Self::stop),
+    /// returning an error if the capture failed.
+    ///
+    /// Returns `Ok(None)` if the device produced no device-specific state.
+    /// Called by the transport's synchronous `save()` so a device that could
+    /// not serialize its in-flight state fails the save rather than silently
+    /// dropping it.
+    pub fn take_device_saved_state(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        if let Some(msg) = self.device_save_error.take() {
+            // Drop any partial blob alongside the error.
+            self.device_saved_state = None;
+            return Err(SaveError::Other(anyhow::anyhow!(msg)));
+        }
+        Ok(self.device_saved_state.take())
+    }
+
+    /// Stage a device-specific in-flight blob to be delivered to the device on
+    /// the next [`start`](Self::start). Called by the transport's `restore()`.
+    ///
+    /// Always overwrites any previously staged state (including clearing it when
+    /// `blob` is `None`) so a restored snapshot fully determines what the device
+    /// reconstructs.
+    pub fn restore_device(&mut self, blob: Option<SavedStateBlob>) {
+        self.device_restore_state = blob;
     }
 
     /// Restore the transport-agnostic portion of the common configuration.

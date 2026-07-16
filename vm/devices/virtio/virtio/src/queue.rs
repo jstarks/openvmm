@@ -62,6 +62,8 @@ pub enum QueueError {
     TooLong,
     #[error("Invalid queue size {0}. Must be a power of 2.")]
     InvalidQueueSize(u16),
+    #[error("rebuilding work from a descriptor index is not supported on packed queues")]
+    RebuildUnsupportedForPacked,
 }
 
 pub struct QueueDescriptor {
@@ -308,6 +310,32 @@ impl QueueCoreGetWork {
                 descriptor_index: index,
             })
         }
+    }
+
+    /// Rebuild a [`QueueWork`] from a raw descriptor **head** index, re-walking
+    /// the descriptor chain from guest memory without reading or advancing the
+    /// available ring.
+    ///
+    /// Used by save/restore to reconstruct outstanding (already-consumed but
+    /// not-yet-completed) descriptors whose head indices were captured
+    /// explicitly at save time. Split rings only — the resulting work can be
+    /// completed by index. Packed rings are not supported (their completion
+    /// context cannot be reconstructed from an index alone).
+    pub(crate) fn work_from_descriptor_index(
+        &mut self,
+        descriptor_index: u16,
+    ) -> Result<QueueWork, QueueError> {
+        let QueueGetWorkInner::Split(_) = &self.inner else {
+            return Err(QueueError::RebuildUnsupportedForPacked);
+        };
+        let payload = self
+            .reader(descriptor_index)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(QueueWork {
+            descriptor_index,
+            context: QueueCompletionContext::Split,
+            payload,
+        })
     }
 
     fn reader(&mut self, descriptor_index: u16) -> DescriptorReader<'_> {

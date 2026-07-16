@@ -26,6 +26,7 @@ use mesh::rpc::RpcSend;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+use vmcore::save_restore::SavedStateBlob;
 
 /// Commands sent from the transport to the device task.
 pub enum DeviceCommand {
@@ -41,6 +42,11 @@ pub enum DeviceCommand {
     Start(FailableRpc<StartParams, ()>),
     /// ChangeDeviceState::reset() — stop queues, reset device.
     Reset(Rpc<(), ()>),
+    /// Save device-specific in-flight state to an opaque blob.
+    Save(FailableRpc<(), Option<SavedStateBlob>>),
+    /// Restore device-specific in-flight state from a blob. Delivered before
+    /// the following `Start` so the device can apply it as its queues start.
+    Restore(FailableRpc<SavedStateBlob, ()>),
     /// Config register read at byte offset with byte length.
     ReadConfig {
         offset: u16,
@@ -283,6 +289,24 @@ pub async fn run_device_task(
             }
             DeviceCommand::Reset(rpc) => {
                 rpc.handle(async |()| task.reset().await).await;
+            }
+            DeviceCommand::Save(rpc) => {
+                rpc.handle_failable_sync(|()| task.device.save());
+            }
+            DeviceCommand::Restore(rpc) => {
+                let (blob, rpc) = rpc.split();
+                let result = task.device.restore(blob);
+                if let Err(err) = &result {
+                    // The Restore is delivered fire-and-forget before Start
+                    // (start() is synchronous), so the error cannot abort the
+                    // start. Log it loudly: the queues will start with restored
+                    // cursors but without reconstructed in-flight state.
+                    tracelimit::error_ratelimited!(
+                        error = err as &dyn std::error::Error,
+                        "failed to restore virtio device in-flight state"
+                    );
+                }
+                rpc.complete(result.map_err(mesh::error::RemoteError::new));
             }
             DeviceCommand::ReadConfig {
                 offset,

@@ -833,6 +833,10 @@ mod saved_state {
             pub queues: Vec<SavedQueueState>,
             #[mesh(4)]
             pub interrupt_status: u32,
+            /// Device-specific in-flight state blob (e.g. virtio-net's
+            /// outstanding descriptor set). `None` when the device has none.
+            #[mesh(5)]
+            pub device_state: Option<vmcore::save_restore::SavedStateBlob>,
         }
 
         #[derive(Protobuf, SavedStateRoot)]
@@ -868,6 +872,7 @@ mod saved_state {
                     })
                     .collect(),
                 interrupt_status: *self.pci.interrupt_status.lock(),
+                device_state: self.core.take_device_saved_state()?,
             })
         }
 
@@ -882,6 +887,8 @@ mod saved_state {
                     .map(|sq| (sq.common, sq.msix_vector)),
                 saved_queue_count,
             )?;
+
+            self.core.restore_device(state.device_state);
 
             // Restore PCI-specific interrupt state.
             *self.pci.interrupt_status.lock() = state.interrupt_status;

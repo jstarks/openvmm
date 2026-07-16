@@ -45,6 +45,19 @@ impl VirtioWorkPool {
         }
     }
 
+    /// Returns the guest descriptor indices of all currently-held (outstanding)
+    /// RX buffers — those the guest posted and the device consumed into the pool
+    /// but has not yet completed. Used to serialize in-flight state for
+    /// save/restore. The pool is keyed by descriptor index, so a slot's index is
+    /// its descriptor index.
+    pub fn outstanding_descriptor_indices(&self) -> Vec<u16> {
+        self.rx_packets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.is_some().then_some(i as u16))
+            .collect()
+    }
+
     /// Returns a reference to the guest memory.
     pub fn mem(&self) -> &GuestMemory {
         &self.mem

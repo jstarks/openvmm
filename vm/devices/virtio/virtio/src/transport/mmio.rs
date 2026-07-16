@@ -410,6 +410,10 @@ mod saved_state {
             pub queues: Vec<SavedQueueState>,
             #[mesh(3)]
             pub interrupt_status: u32,
+            /// Device-specific in-flight state blob (e.g. virtio-net's
+            /// outstanding descriptor set). `None` when the device has none.
+            #[mesh(4)]
+            pub device_state: Option<vmcore::save_restore::SavedStateBlob>,
         }
     }
 
@@ -428,6 +432,7 @@ mod saved_state {
                     })
                     .collect(),
                 interrupt_status: self.mmio.interrupt_state.lock().status,
+                device_state: self.core.take_device_saved_state()?,
             })
         }
 
@@ -442,6 +447,8 @@ mod saved_state {
                 state.queues.into_iter().map(|sq| (sq.common, 0)),
                 saved_queue_count,
             )?;
+
+            self.core.restore_device(state.device_state);
 
             // Restore MMIO-specific interrupt state.
             {

@@ -613,6 +613,91 @@ impl TestHarness {
             .expect("channel closed")
     }
 
+    /// Perform a true save/restore cycle: stop both queues (capturing cursors),
+    /// serialize the device's in-flight state to a blob, **destroy the device
+    /// object**, build a fresh device sharing the same guest memory (as a live
+    /// migration would), restore the blob into it, and start both queues from
+    /// the saved cursors. Returns the new backend queue handle.
+    ///
+    /// Unlike `pause_and_resume`, the in-memory `ActiveState` does not survive,
+    /// so correct behavior depends entirely on the serialized blob.
+    async fn save_drop_restore(&mut self, features: VirtioDeviceFeatures) -> MockQueueHandle {
+        let tx_state = self.device.stop_queue(1).await;
+        let rx_state = self.device.stop_queue(0).await;
+
+        let blob = self
+            .device
+            .save()
+            .expect("virtio-net save should succeed for split rings");
+
+        // Build a fresh device sharing the same guest memory, mirroring a
+        // device reconstructed from a snapshot on the destination.
+        let (queue_tx, queue_handle_rx) = mesh::channel();
+        let endpoint = MockEndpoint { queue_tx };
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(self.driver.clone()));
+        let mac = MacAddress::new([0x00, 0x15, 0x5d, 0xaa, 0xbb, 0xcc]);
+        self.device = Device::builder().build(&driver_source, Box::new(endpoint), mac);
+        self.queue_handle_rx = queue_handle_rx;
+
+        if let Some(blob) = blob {
+            self.device
+                .restore(blob)
+                .expect("virtio-net restore should succeed");
+        }
+
+        let rx_interrupt = Interrupt::from_event(self.rx_interrupt_event.clone());
+        let tx_interrupt = Interrupt::from_event(self.tx_interrupt_event.clone());
+
+        self.device
+            .start_queue(
+                0,
+                QueueResources {
+                    params: QueueParams {
+                        size: QUEUE_SIZE,
+                        enable: true,
+                        desc_addr: RX_DESC_ADDR,
+                        avail_addr: RX_AVAIL_ADDR,
+                        used_addr: RX_USED_ADDR,
+                    },
+                    notify: rx_interrupt,
+                    event: self.rx_event.clone(),
+                    guest_memory: self.mem.clone(),
+                },
+                &features,
+                rx_state,
+            )
+            .await
+            .unwrap();
+
+        self.device
+            .start_queue(
+                1,
+                QueueResources {
+                    params: QueueParams {
+                        size: QUEUE_SIZE,
+                        enable: true,
+                        desc_addr: TX_DESC_ADDR,
+                        avail_addr: TX_AVAIL_ADDR,
+                        used_addr: TX_USED_ADDR,
+                    },
+                    notify: tx_interrupt,
+                    event: self.tx_event.clone(),
+                    guest_memory: self.mem.clone(),
+                },
+                &features,
+                tx_state,
+            )
+            .await
+            .unwrap();
+
+        mesh::CancelContext::new()
+            .with_timeout(Duration::from_secs(5))
+            .until_cancelled(self.queue_handle_rx.next())
+            .await
+            .expect("timed out waiting for mock queue handle")
+            .expect("channel closed")
+    }
+
     /// Allocate a data region in guest memory and return its GPA.
     fn alloc_data(&mut self, size: u32) -> u64 {
         let gpa = self.next_data_offset;
@@ -1780,12 +1865,90 @@ async fn pause_resume_preserves_rx_buffers(driver: DefaultDriver) {
     harness.device.reset().await;
 }
 
-/// Regression test: stopping the queues of an active pair must return each
-/// queue's progress cursor (available/used indices) so a later `start_queue`
-/// resumes the queue in place instead of restarting at index 0. Previously
-/// `stop_queue` always returned `None`, which desynced the device from the
-/// guest on restart and manifested as spurious duplicate-descriptor drops on
-/// the guest's next transmit.
+/// True save/restore of the receive pool: RX buffers the guest posted and the
+/// device consumed into its in-flight pool must survive serialization to a
+/// blob, destruction of the device, and reconstruction into a fresh device —
+/// then still deliver a received packet. This is the migration/VHR analogue of
+/// `pause_resume_preserves_rx_buffers`; here the in-memory `ActiveState` is
+/// gone, so delivery depends entirely on the saved outstanding descriptor set.
+#[async_test]
+async fn save_restore_preserves_rx_buffers(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    let mut handle = harness.enable_and_get_handle().await;
+
+    // Guest posts two RX buffers; the device consumes them into its in-flight
+    // pool (advancing the available index) but does not complete them.
+    let gpa0 = harness.post_rx_buffer_and_signal(0, 512);
+    let _gpa1 = harness.post_rx_buffer_and_signal(1, 512);
+    handle.wait_for_rx_pending().await;
+    handle.wait_for_rx_pending().await;
+
+    // Save to a blob, destroy the device, restore into a fresh one.
+    let handle = harness.save_drop_restore(VirtioDeviceFeatures::new()).await;
+
+    // A packet received after restore must land in a rebuilt buffer and
+    // complete to the guest.
+    let payload = b"after-restore";
+    handle.inject_rx_packet(payload);
+    let (used_id, used_len) = harness.wait_for_rx_used().await;
+    assert_eq!(used_id, 0, "first rebuilt RX buffer should be used");
+    assert_eq!(used_len, NET_HEADER_SIZE + payload.len() as u32);
+
+    let mut readback = vec![0u8; payload.len()];
+    harness
+        .mem
+        .read_at(gpa0 + NET_HEADER_SIZE as u64, &mut readback)
+        .unwrap();
+    assert_eq!(
+        &readback, payload,
+        "received data should land in the rebuilt guest buffer"
+    );
+
+    harness.device.stop_queue(1).await;
+    harness.device.stop_queue(0).await;
+    harness.device.reset().await;
+}
+
+/// True save/restore of in-flight transmits: a TX packet consumed by the device
+/// and still pending in the backend at save time must, on restore into a fresh
+/// device, be returned to the guest via the used ring (dropped, not resent).
+/// This verifies the "drop on restore = complete" policy — the descriptor is
+/// not leaked (used index advances) and the packet is not re-transmitted (the
+/// fresh backend receives no `tx_avail`).
+#[async_test]
+async fn save_restore_drops_inflight_tx(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    let mut handle = harness.enable_and_get_handle().await;
+
+    // Async completion so the packet stays in-flight in the backend.
+    handle.tx_avail_behavior.lock().sync = false;
+
+    // Guest posts a TX packet; the device consumes it (head descriptor 0) and
+    // forwards it to the backend, which does not complete it.
+    harness.post_tx_and_signal(0, 64);
+    handle.wait_for_tx_avail().await;
+    assert_eq!(handle.take_tx_avail_log().len(), 1, "packet reached backend");
+
+    // Save to a blob, destroy the device, restore into a fresh one.
+    let handle = harness.save_drop_restore(VirtioDeviceFeatures::new()).await;
+
+    // The in-flight TX descriptor must be returned to the guest (dropped) on
+    // restore: a used-ring entry for descriptor 0 with zero bytes written.
+    let (used_id, used_len) = harness.wait_for_used().await;
+    assert_eq!(used_id, 0, "in-flight TX descriptor returned to guest");
+    assert_eq!(used_len, 0, "dropped TX reports zero bytes");
+
+    // The fresh backend must not have received the packet again (no duplicate
+    // transmit).
+    assert!(
+        handle.take_tx_avail_log().is_empty(),
+        "dropped TX must not be resent to the restored backend"
+    );
+
+    harness.device.stop_queue(1).await;
+    harness.device.stop_queue(0).await;
+    harness.device.reset().await;
+}
 #[async_test]
 async fn stop_queue_returns_progress(driver: DefaultDriver) {
     let mut harness = TestHarness::new(&driver);

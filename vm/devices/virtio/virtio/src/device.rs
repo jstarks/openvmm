@@ -14,6 +14,9 @@ use inspect::InspectMut;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use vmcore::save_restore::RestoreError;
+use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 
 /// Per-queue virtio device trait. Ergonomic async fn — not object-safe.
 ///
@@ -114,6 +117,30 @@ pub trait VirtioDevice: InspectMut + Send {
     fn supports_save_restore(&self) -> bool {
         false
     }
+
+    /// Save device-specific in-flight state to an opaque blob.
+    ///
+    /// Called after all queues have been stopped (the transport has already
+    /// captured each queue's `QueueState` cursor). Returns `None` if the
+    /// device has no state to serialize beyond those cursors — the default.
+    ///
+    /// Devices whose in-flight bookkeeping cannot be reconstructed from the
+    /// queue cursors alone (e.g. virtio-net's out-of-order receive pool)
+    /// override this to serialize the outstanding descriptor set.
+    fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        Ok(None)
+    }
+
+    /// Restore device-specific in-flight state from a blob produced by
+    /// [`save`](Self::save).
+    ///
+    /// Called before the device's queues are started, so implementations
+    /// should stash the state and apply it as their queues start. The default
+    /// rejects any blob, since a device that returns `None` from `save` never
+    /// produces one.
+    fn restore(&mut self, _state: SavedStateBlob) -> Result<(), RestoreError> {
+        Err(RestoreError::SavedStateNotSupported)
+    }
 }
 
 /// Object-safe wrapper for [`VirtioDevice`].
@@ -166,6 +193,12 @@ pub trait DynVirtioDevice: InspectMut + Send {
 
     /// Whether the device supports save/restore.
     fn supports_save_restore(&self) -> bool;
+
+    /// Save device-specific in-flight state to an opaque blob.
+    fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError>;
+
+    /// Restore device-specific in-flight state from a blob.
+    fn restore(&mut self, state: SavedStateBlob) -> Result<(), RestoreError>;
 }
 
 impl<T: VirtioDevice> DynVirtioDevice for T {
@@ -228,5 +261,13 @@ impl<T: VirtioDevice> DynVirtioDevice for T {
 
     fn supports_save_restore(&self) -> bool {
         VirtioDevice::supports_save_restore(self)
+    }
+
+    fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        VirtioDevice::save(self)
+    }
+
+    fn restore(&mut self, state: SavedStateBlob) -> Result<(), RestoreError> {
+        VirtioDevice::restore(self, state)
     }
 }

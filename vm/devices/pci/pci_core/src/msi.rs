@@ -4,22 +4,12 @@
 //! Traits for working with MSI interrupts.
 
 use crate::bus_range::AssignedBusRange;
+pub use chipset_device::msi::SignalMsi;
 use pal_event::Event;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use vmcore::irqfd::IrqFd;
 use vmcore::irqfd::IrqFdRoute;
-
-/// An object that can signal MSI interrupts.
-pub trait SignalMsi: Send + Sync {
-    /// Signals a message-signaled interrupt at the specified address with the specified data.
-    ///
-    /// `devid` is an optional device identity. Its meaning is layer-dependent:
-    /// at the device layer it is a BDF for multi-function devices (`None` for
-    /// single-function); at the ITS wrapper layer it is the fully composed ITS
-    /// device ID; backends that don't need it ignore it.
-    fn signal_msi(&self, devid: Option<u32>, address: u64, data: u32);
-}
 
 /// A kernel-mediated MSI interrupt route for a single vector.
 ///

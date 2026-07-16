@@ -14,6 +14,7 @@ pub use self::builder::DynamicDeviceUnit;
 
 use self::io_ranges::IoRanges;
 use self::io_ranges::LookupResult;
+use self::io_ranges::LookupTarget;
 use crate::DebugEventHandler;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
@@ -63,6 +64,18 @@ impl IoType<'_> {
 }
 
 impl Chipset {
+    /// Returns the arch-neutral MSI-sink map as a [`SignalMsi`] router.
+    ///
+    /// A device's outbound MSI path connects to this router (directly on ARM,
+    /// or as the fallback of the x86 root-complex backing): a signal is an
+    /// address lookup into the doorbell sinks of the generalized MMIO map,
+    /// then dispatch to the matched sink.
+    ///
+    /// [`SignalMsi`]: chipset_device::msi::SignalMsi
+    pub fn msi_sink_router(&self) -> Arc<dyn chipset_device::msi::SignalMsi> {
+        self.mmio_ranges.as_msi_router()
+    }
+
     async fn handle_io_result(
         &self,
         lookup: LookupResult,
@@ -166,12 +179,18 @@ impl Chipset {
     /// Dispatch a MMIO read to the given address.
     pub async fn mmio_read(&self, vp: u32, address: u64, data: &mut [u8]) {
         let lookup = self.mmio_ranges.lookup(address, true);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_mmio()
-            .expect("objects on the mmio bus support mmio")
-            .mmio_read(address, data);
+        let r = match &lookup.target {
+            LookupTarget::Device(dev) => dev
+                .lock()
+                .supports_mmio()
+                .expect("objects on the mmio bus support mmio")
+                .mmio_read(address, data),
+            LookupTarget::MsiSink(_) => {
+                // Doorbells are write-only; a read returns all-ones.
+                data.fill(!0);
+                IoResult::Ok
+            }
+        };
 
         self.handle_io_result(
             lookup,
@@ -188,12 +207,20 @@ impl Chipset {
     /// Dispatch a MMIO write to the given address.
     pub async fn mmio_write(&self, vp: u32, address: u64, data: &[u8]) {
         let lookup = self.mmio_ranges.lookup(address, false);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_mmio()
-            .expect("objects on the mmio bus support mmio")
-            .mmio_write(address, data);
+        let r = match &lookup.target {
+            LookupTarget::Device(dev) => dev
+                .lock()
+                .supports_mmio()
+                .expect("objects on the mmio bus support mmio")
+                .mmio_write(address, data),
+            LookupTarget::MsiSink(sink) => {
+                if let Ok(v) = data.try_into() {
+                    sink.signal
+                        .signal_msi(None, address, u32::from_ne_bytes(v));
+                }
+                IoResult::Ok
+            }
+        };
 
         self.handle_io_result(
             lookup,
@@ -215,12 +242,15 @@ impl Chipset {
     /// Dispatch a Port IO read to the given address.
     pub async fn io_read(&self, vp: u32, port: u16, data: &mut [u8]) {
         let lookup = self.pio_ranges.lookup(port, true);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_pio()
-            .expect("objects on the pio bus support pio")
-            .io_read(port, data);
+        let r = match &lookup.target {
+            LookupTarget::Device(dev) => dev
+                .lock()
+                .supports_pio()
+                .expect("objects on the pio bus support pio")
+                .io_read(port, data),
+            // PIO ranges never carry MSI sinks (the sink API is u64-only).
+            LookupTarget::MsiSink(_) => unreachable!("pio ranges never contain msi sinks"),
+        };
 
         self.handle_io_result(
             lookup,
@@ -237,12 +267,15 @@ impl Chipset {
     /// Dispatch a Port IO write to the given address.
     pub async fn io_write(&self, vp: u32, port: u16, data: &[u8]) {
         let lookup = self.pio_ranges.lookup(port, false);
-        let r = lookup
-            .dev
-            .lock()
-            .supports_pio()
-            .expect("objects on the pio bus support pio")
-            .io_write(port, data);
+        let r = match &lookup.target {
+            LookupTarget::Device(dev) => dev
+                .lock()
+                .supports_pio()
+                .expect("objects on the pio bus support pio")
+                .io_write(port, data),
+            // PIO ranges never carry MSI sinks (the sink API is u64-only).
+            LookupTarget::MsiSink(_) => unreachable!("pio ranges never contain msi sinks"),
+        };
 
         self.handle_io_result(
             lookup,

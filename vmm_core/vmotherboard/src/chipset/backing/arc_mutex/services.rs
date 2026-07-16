@@ -187,6 +187,14 @@ impl<'a, 'b> ArcMutexChipsetServices<'a, 'b> {
         }
     }
 
+    pub fn register_msi_sink(&self) -> crate::chipset::io_ranges::MsiSinkRegistrar {
+        let inner = self.builder.inner.lock();
+        crate::chipset::io_ranges::MsiSinkRegistrar::new(
+            self.dev_name.clone(),
+            inner.vm_chipset.mmio_ranges.clone(),
+        )
+    }
+
     pub fn register_static_pci(&mut self, bus_id: BusIdPci, bdf: (u8, u8, u8)) {
         self.builder.register_weak_mutex_pci_device(
             bus_id,

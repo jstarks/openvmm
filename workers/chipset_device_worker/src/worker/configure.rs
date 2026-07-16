@@ -48,3 +48,16 @@ impl RegisterPortIoIntercept for RemoteRegisterPio {
         todo!()
     }
 }
+
+pub(super) struct RemoteRegisterMsiSink {}
+
+impl chipset_device::msi::RegisterMsiSink for RemoteRegisterMsiSink {
+    fn claim(
+        &mut self,
+        _region_name: &str,
+        _range: std::ops::RangeInclusive<u64>,
+        _sink: chipset_device::msi::MsiSink,
+    ) {
+        todo!()
+    }
+}

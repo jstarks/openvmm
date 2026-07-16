@@ -32,6 +32,15 @@ pub(super) struct PcieMsiPlatform<'a> {
     /// The partition providing base `SignalMsi` and `IrqFd` (x86).
     #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
     pub partition: &'a dyn HvlitePartition,
+    /// The chipset's arch-neutral MSI-sink map router — the generic downstream
+    /// decode a device's outbound MSI falls through to.
+    ///
+    /// On x86 it is the fallback of the root-complex `0xFEE` decode (see
+    /// [`X86RootComplexMsi`]); the map holds no MSI sinks there today. On
+    /// aarch64 the ITS/v2m path is still selected via `msi_source` (Phase 3
+    /// moves ITS/v2m onto this router), so it is currently unused.
+    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+    pub msi_router: Arc<dyn pci_core::msi::SignalMsi>,
     /// aarch64 GIC MSI source for this entity (per-segment ITS or the VM-wide
     /// v2m frame).
     #[cfg(guest_arch = "aarch64")]
@@ -65,6 +74,40 @@ pub(super) enum Aarch64MsiSource<'a> {
 pub(super) enum X86IommuSharedState<'a> {
     AmdVi(&'a Arc<amd_iommu::IommuSharedState>),
     IntelVtd(&'a Arc<intel_vtd::VtdSharedState>),
+}
+
+/// The x86 PCIe root complex's outbound MSI decode.
+///
+/// Models how the root complex recognizes writes to the `0xFEE` interrupt-
+/// message window on a device's outbound path and converts them into
+/// interrupt messages to the LAPIC — here, via the partition `injector`, with
+/// IOMMU interrupt remapping already applied when the device is behind an
+/// IOMMU. Every other address falls through to the `generic` downstream MMIO
+/// decode (the chipset MSI-sink map router).
+///
+/// On x86 that map holds no MSI sinks, so the fallback drops today; since every
+/// device MSI targets `0xFEE`, the injector branch is taken in practice. The
+/// fallback is the seam for the deferred peer-to-peer DMA path.
+#[cfg(guest_arch = "x86_64")]
+struct X86RootComplexMsi {
+    /// Receives writes to the `0xFEE` interrupt-message window (the partition
+    /// injector, IOMMU-remapped when applicable).
+    injector: Arc<dyn pci_core::msi::SignalMsi>,
+    /// The generic downstream decode: the chipset MSI-sink map router.
+    generic: Arc<dyn pci_core::msi::SignalMsi>,
+}
+
+#[cfg(guest_arch = "x86_64")]
+impl pci_core::msi::SignalMsi for X86RootComplexMsi {
+    fn signal_msi(&self, devid: Option<u32>, address: u64, data: u32) {
+        // The interrupt-message window is `0xFEE0_0000..=0xFEEF_FFFF`
+        // (address bits [31:20] == 0xFEE).
+        if address >> 20 == 0xFEE {
+            self.injector.signal_msi(devid, address, data);
+        } else {
+            self.generic.signal_msi(devid, address, data);
+        }
+    }
 }
 
 /// Wrapped `SignalMsi` and `IrqFd` for a PCIe entity.
@@ -146,6 +189,20 @@ impl PcieMsiPlatform<'_> {
             }
             irqfd = None;
         }
+
+        // x86: model the PCIe root complex's outbound MSI decode. The
+        // (IOMMU-remapped) partition injector receives writes to the `0xFEE`
+        // interrupt-message window; everything else falls through to the
+        // generic downstream MMIO decode (the chipset MSI-sink map router).
+        // Behaviorally identical to routing straight to the injector today,
+        // since every x86 device MSI targets `0xFEE`.
+        #[cfg(guest_arch = "x86_64")]
+        let signal_msi = signal_msi.map(|injector| {
+            Arc::new(X86RootComplexMsi {
+                injector,
+                generic: self.msi_router.clone(),
+            }) as Arc<dyn pci_core::msi::SignalMsi>
+        });
 
         PcieMsiRouting { signal_msi, irqfd }
     }

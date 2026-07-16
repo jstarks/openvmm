@@ -215,8 +215,7 @@ impl Chipset {
                 .mmio_write(address, data),
             LookupTarget::MsiSink(sink) => {
                 if let Ok(v) = data.try_into() {
-                    sink.signal
-                        .signal_msi(None, address, u32::from_ne_bytes(v));
+                    sink.signal.signal_msi(None, address, u32::from_ne_bytes(v));
                 }
                 IoResult::Ok
             }

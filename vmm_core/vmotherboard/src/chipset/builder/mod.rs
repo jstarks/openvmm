@@ -174,6 +174,19 @@ impl<'a> ChipsetBuilder<'a> {
         }
     }
 
+    /// Returns the arch-neutral MSI-sink map as a [`SignalMsi`] router.
+    ///
+    /// Mirrors [`Chipset::msi_sink_router`](crate::chipset::Chipset::msi_sink_router),
+    /// but is exposed on the builder so a device's outbound MSI path can be
+    /// wired to the (live) map before the chipset is finalized. The returned
+    /// `Arc` tracks the same underlying map, so sinks registered after this
+    /// call remain visible through it.
+    ///
+    /// [`SignalMsi`]: chipset_device::msi::SignalMsi
+    pub fn msi_sink_router(&self) -> Arc<dyn chipset_device::msi::SignalMsi> {
+        self.inner.lock().vm_chipset.msi_sink_router()
+    }
+
     pub(crate) fn register_weak_mutex_pci_bus(
         &self,
         bus_id: BusIdPci,

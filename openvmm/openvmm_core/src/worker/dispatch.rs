@@ -2529,11 +2529,13 @@ impl InitializedVm {
         // Wire deferred root complex and switch MSI connections now that
         // IOMMU setup is complete. On x86_64, this applies IOMMU
         // interrupt remapping when the segment is covered.
+        let msi_router = chipset_builder.msi_sink_router();
         for deferred in deferred_msi_conns {
             #[cfg(guest_arch = "x86_64")]
             let iommu = x86_iommu_for_rc(&iommu_devices, deferred.rc_idx);
             pcie_wiring::PcieMsiPlatform {
                 partition: partition.as_ref(),
+                msi_router: msi_router.clone(),
                 #[cfg(guest_arch = "aarch64")]
                 msi_source: aarch64_msi_source(&its_backends, &v2m_device, deferred.segment),
                 #[cfg(guest_arch = "x86_64")]
@@ -2564,6 +2566,7 @@ impl InitializedVm {
             let mapper = &mapper;
             let port_info = &port_info;
             let iommu_devices = &iommu_devices;
+            let msi_router = &msi_router;
             #[cfg(guest_arch = "aarch64")]
             let its_backends = &its_backends;
             #[cfg(guest_arch = "aarch64")]
@@ -2583,6 +2586,7 @@ impl InitializedVm {
                     pcie_wiring::build_device_wiring(pcie_wiring::PcieDeviceWiringParams {
                         msi_platform: pcie_wiring::PcieMsiPlatform {
                             partition: partition.as_ref(),
+                            msi_router: msi_router.clone(),
                             #[cfg(guest_arch = "aarch64")]
                             msi_source: aarch64_msi_source(its_backends, v2m_device, pi.segment),
                             #[cfg(guest_arch = "x86_64")]
@@ -3803,6 +3807,7 @@ impl LoadedVm {
                                 pcie_wiring::PcieDeviceWiringParams {
                                     msi_platform: pcie_wiring::PcieMsiPlatform {
                                         partition: self.inner.partition.as_ref(),
+                                        msi_router: self.inner.chipset.msi_sink_router(),
                                         #[cfg(guest_arch = "aarch64")]
                                         msi_source: aarch64_msi_source(
                                             &self.inner.its_backends,

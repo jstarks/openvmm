@@ -237,14 +237,18 @@ pub struct Device {
 /// Tracks the state of a queue pair through the start_queue lifecycle.
 #[expect(clippy::large_enum_variant)]
 enum QueuePairState {
-    /// No queues started for this pair.
-    Empty,
-    /// One queue started, waiting for its partner.
+    /// No queues started for this pair. `saved` carries in-flight state
+    /// preserved from a previous stop (a pause), reused on the next start; it
+    /// is `None` before the pair has ever run.
+    Empty { saved: Option<Box<ActiveState>> },
+    /// One queue started, waiting for its partner. `saved` carries the pair's
+    /// preserved in-flight state during a stop/start (`None` on a fresh start).
     HalfOpen {
         queue: VirtioQueue,
         queue_size: u16,
         /// true if this is the RX queue (even index), false if TX (odd).
         is_rx: bool,
+        saved: Option<Box<ActiveState>>,
     },
     /// Both queues started, worker running.
     Active,
@@ -336,12 +340,20 @@ impl VirtioDevice for Device {
         let is_rx = idx.is_multiple_of(2);
 
         match &self.pairs[pair_idx] {
-            QueuePairState::Empty => {
-                // First queue of the pair — buffer it.
+            QueuePairState::Empty { .. } => {
+                // First queue of the pair — buffer it, carrying any preserved
+                // in-flight state (from a prior stop) forward.
+                let QueuePairState::Empty { saved } = std::mem::replace(
+                    &mut self.pairs[pair_idx],
+                    QueuePairState::Empty { saved: None },
+                ) else {
+                    unreachable!()
+                };
                 self.pairs[pair_idx] = QueuePairState::HalfOpen {
                     queue,
                     queue_size,
                     is_rx,
+                    saved,
                 };
             }
             QueuePairState::HalfOpen {
@@ -366,6 +378,7 @@ impl VirtioDevice for Device {
                     queue: pending_queue,
                     queue_size: pending_queue_size,
                     is_rx: pending_is_rx,
+                    saved,
                 } = prev
                 else {
                     unreachable!()
@@ -393,6 +406,7 @@ impl VirtioDevice for Device {
                     &guest_memory,
                     negotiated_features,
                     negotiated_features_bank1,
+                    saved.map(|saved| *saved),
                 );
 
                 if first_pair {
@@ -415,12 +429,21 @@ impl VirtioDevice for Device {
 
         // Take ownership of the pair state so we can inspect owned data (such
         // as a pending queue) without holding a borrow on `self.pairs`.
-        match std::mem::replace(&mut self.pairs[pair_idx], QueuePairState::Empty) {
-            QueuePairState::Empty => None,
+        match std::mem::replace(
+            &mut self.pairs[pair_idx],
+            QueuePairState::Empty { saved: None },
+        ) {
+            QueuePairState::Empty { saved } => {
+                // Both queues already stopped; keep any preserved state for the
+                // eventual resume.
+                self.pairs[pair_idx] = QueuePairState::Empty { saved };
+                None
+            }
             QueuePairState::HalfOpen {
                 queue,
                 queue_size,
                 is_rx,
+                saved,
             } => {
                 let stopping_rx = idx.is_multiple_of(2);
                 if is_rx != stopping_rx {
@@ -431,12 +454,15 @@ impl VirtioDevice for Device {
                         queue,
                         queue_size,
                         is_rx,
+                        saved,
                     };
                     return None;
                 }
                 // Capture the cursor from the pending queue so a later
                 // start_queue resumes at the right available/used index instead
-                // of restarting at 0. (`self.pairs[pair_idx]` is already Empty.)
+                // of restarting at 0, carrying any preserved in-flight state on
+                // to that resume.
+                self.pairs[pair_idx] = QueuePairState::Empty { saved };
                 Some(queue.queue_state())
             }
             QueuePairState::Active => {
@@ -444,25 +470,37 @@ impl VirtioDevice for Device {
                 // rx and tx queues, so stopping either queue tears the worker
                 // down. Stop the coordinator (the parent task that would
                 // otherwise keep driving/restarting the worker) and reclaim the
-                // worker's queues.
+                // worker.
                 let stopping_rx = idx.is_multiple_of(2);
                 self.coordinator.stop().await;
                 let mut coordinator = self.coordinator.remove();
-                let worker = &mut coordinator.workers[pair_idx];
-                worker.stop().await;
+                let worker_tc = &mut coordinator.workers[pair_idx];
+                worker_tc.stop().await;
+
+                // Preserve the worker's in-flight state (the RX buffer pool and
+                // pending TX) so the next start doesn't strand the guest's
+                // posted RX buffers. The backend queue is intentionally dropped
+                // and rebuilt on resume; `restart_queues` re-posts the RX pool
+                // to the fresh queue.
+                let Worker {
+                    active_state,
+                    virtio_state,
+                    ..
+                } = worker_tc.remove();
+                let saved = Some(Box::new(active_state));
                 let VirtioState {
                     rx_queue,
                     rx_queue_size,
                     tx_queue,
                     tx_queue_size,
-                } = worker.remove().virtio_state;
+                } = virtio_state;
 
                 // Only the requested queue is being stopped; keep the partner
-                // queue live and drop the pair back to `HalfOpen` so it can be
-                // re-paired by a later `start_queue`, or have its own cursor
-                // captured by its own `stop_queue`. Return the stopped queue's
-                // cursor so a later start_queue resumes at the right
-                // available/used index.
+                // queue live (carrying the preserved state) and drop the pair
+                // back to `HalfOpen` so its own `stop_queue` captures its cursor
+                // and hands the preserved state on to the resume. Return the
+                // stopped queue's cursor so a later start_queue resumes at the
+                // right available/used index.
                 let (stopped_state, partner) = if stopping_rx {
                     (
                         rx_queue.queue_state(),
@@ -470,6 +508,7 @@ impl VirtioDevice for Device {
                             queue: tx_queue,
                             queue_size: tx_queue_size,
                             is_rx: false,
+                            saved,
                         },
                     )
                 } else {
@@ -479,6 +518,7 @@ impl VirtioDevice for Device {
                             queue: rx_queue,
                             queue_size: rx_queue_size,
                             is_rx: true,
+                            saved,
                         },
                     )
                 };
@@ -489,7 +529,10 @@ impl VirtioDevice for Device {
     }
 
     async fn reset(&mut self) {
-        self.pairs.fill_with(|| QueuePairState::Empty);
+        // Clearing the pairs drops any preserved in-flight state, which is
+        // correct: a device reset means the guest is starting over, so the next
+        // start builds fresh queues.
+        self.pairs.fill_with(|| QueuePairState::Empty { saved: None });
     }
 
     fn supports_save_restore(&self) -> bool {
@@ -628,7 +671,7 @@ impl NicBuilder {
             adapter,
             driver_source: driver_source.clone(),
             pairs: (0..max_queue_pairs)
-                .map(|_| QueuePairState::Empty)
+                .map(|_| QueuePairState::Empty { saved: None })
                 .collect(),
         }
     }
@@ -665,7 +708,11 @@ impl Device {
 
     /// Allocates and inserts a worker.
     ///
-    /// The coordinator must be stopped.
+    /// The coordinator must be stopped. If `saved` is provided (a resume), the
+    /// worker reuses the preserved `ActiveState` (RX buffer pool and pending
+    /// TX) instead of building a fresh one, so no in-flight state is lost. The
+    /// coordinator's `restart_queues` fetches a fresh backend queue and
+    /// re-posts the preserved RX pool to it.
     fn insert_worker(
         &mut self,
         virtio_state: VirtioState,
@@ -673,6 +720,7 @@ impl Device {
         guest_memory: &GuestMemory,
         negotiated_features: NetworkFeaturesBank0,
         negotiated_features_bank1: NetworkFeaturesBank1,
+        saved: Option<ActiveState>,
     ) {
         let mut builder = self.driver_source.builder();
         // TODO: set this correctly
@@ -684,11 +732,13 @@ impl Device {
         builder.run_on_target(!self.adapter.tx_fast_completions);
         let driver = builder.build("virtio-net");
 
-        let active_state = ActiveState::new(
-            guest_memory.clone(),
-            virtio_state.rx_queue_size,
-            virtio_state.tx_queue_size,
-        );
+        let active_state = saved.unwrap_or_else(|| {
+            ActiveState::new(
+                guest_memory.clone(),
+                virtio_state.rx_queue_size,
+                virtio_state.tx_queue_size,
+            )
+        });
         let worker = Worker {
             virtio_state,
             active_state,

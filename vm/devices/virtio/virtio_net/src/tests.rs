@@ -553,6 +553,66 @@ impl TestHarness {
             .expect("channel closed")
     }
 
+    /// Pause the device (stop both queues, capturing cursors) and resume it
+    /// (start both queues with those cursors), returning the new queue handle
+    /// produced by the resumed backend. Mirrors a VM pause/resume.
+    async fn pause_and_resume(&mut self, features: VirtioDeviceFeatures) -> MockQueueHandle {
+        let tx_state = self.device.stop_queue(1).await;
+        let rx_state = self.device.stop_queue(0).await;
+
+        let rx_interrupt = Interrupt::from_event(self.rx_interrupt_event.clone());
+        let tx_interrupt = Interrupt::from_event(self.tx_interrupt_event.clone());
+
+        self.device
+            .start_queue(
+                0,
+                QueueResources {
+                    params: QueueParams {
+                        size: QUEUE_SIZE,
+                        enable: true,
+                        desc_addr: RX_DESC_ADDR,
+                        avail_addr: RX_AVAIL_ADDR,
+                        used_addr: RX_USED_ADDR,
+                    },
+                    notify: rx_interrupt,
+                    event: self.rx_event.clone(),
+                    guest_memory: self.mem.clone(),
+                },
+                &features,
+                rx_state,
+            )
+            .await
+            .unwrap();
+
+        self.device
+            .start_queue(
+                1,
+                QueueResources {
+                    params: QueueParams {
+                        size: QUEUE_SIZE,
+                        enable: true,
+                        desc_addr: TX_DESC_ADDR,
+                        avail_addr: TX_AVAIL_ADDR,
+                        used_addr: TX_USED_ADDR,
+                    },
+                    notify: tx_interrupt,
+                    event: self.tx_event.clone(),
+                    guest_memory: self.mem.clone(),
+                },
+                &features,
+                tx_state,
+            )
+            .await
+            .unwrap();
+
+        mesh::CancelContext::new()
+            .with_timeout(Duration::from_secs(5))
+            .until_cancelled(self.queue_handle_rx.next())
+            .await
+            .expect("timed out waiting for mock queue handle")
+            .expect("channel closed")
+    }
+
     /// Allocate a data region in guest memory and return its GPA.
     fn alloc_data(&mut self, size: u32) -> u64 {
         let gpa = self.next_data_offset;
@@ -1678,6 +1738,47 @@ async fn rx_offload_data_valid_validated_but_wrong(driver: DefaultDriver) {
 }
 
 // --- Feature Negotiation Tests ---
+
+/// Reproduces the pause/resume receive stall: RX buffers the guest posted and
+/// the device consumed into its in-flight pool must survive a pause and still
+/// deliver packets after resume. Before preserving `ActiveState` across the
+/// stop, the pool was rebuilt empty on resume, stranding those buffers so no
+/// received packet (e.g. a ping reply) could ever be delivered again.
+#[async_test]
+async fn pause_resume_preserves_rx_buffers(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    let mut handle = harness.enable_and_get_handle().await;
+
+    // Guest posts two RX buffers; the device consumes them into its in-flight
+    // pool (advancing the available index) but does not complete them yet.
+    let gpa0 = harness.post_rx_buffer_and_signal(0, 512);
+    let _gpa1 = harness.post_rx_buffer_and_signal(1, 512);
+    handle.wait_for_rx_pending().await;
+    handle.wait_for_rx_pending().await;
+
+    // Pause and resume. The resumed backend gets a fresh queue, and the
+    // preserved RX pool is re-posted to it.
+    let handle = harness.pause_and_resume(VirtioDeviceFeatures::new()).await;
+
+    // A packet received after resume must be delivered into one of the
+    // preserved buffers and completed to the guest.
+    let payload = b"after-resume";
+    handle.inject_rx_packet(payload);
+    let (used_id, used_len) = harness.wait_for_rx_used().await;
+    assert_eq!(used_id, 0, "first preserved RX buffer should be used");
+    assert_eq!(used_len, NET_HEADER_SIZE + payload.len() as u32);
+
+    let mut readback = vec![0u8; payload.len()];
+    harness
+        .mem
+        .read_at(gpa0 + NET_HEADER_SIZE as u64, &mut readback)
+        .unwrap();
+    assert_eq!(&readback, payload, "received data should land in guest buffer");
+
+    harness.device.stop_queue(1).await;
+    harness.device.stop_queue(0).await;
+    harness.device.reset().await;
+}
 
 /// Regression test: stopping the queues of an active pair must return each
 /// queue's progress cursor (available/used indices) so a later `start_queue`

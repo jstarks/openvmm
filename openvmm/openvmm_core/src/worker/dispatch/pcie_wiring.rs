@@ -60,8 +60,10 @@ pub(super) struct PcieMsiPlatform<'a> {
 pub(super) enum Aarch64MsiSource<'a> {
     /// No MSI controller (no routing).
     None,
-    /// GICv3 ITS for this entity's PCI segment. MSIs use plain 16-bit RID
-    /// device IDs; the ITS is selected by its doorbell address.
+    /// GICv3 ITS for this entity's PCI segment. Emulated-device MSIs are
+    /// decoded by the chipset map router (the ITS registered its
+    /// `GITS_TRANSLATER` doorbell there); only the passthrough irqfd is carried
+    /// here.
     Its(&'a Arc<dyn virt::aarch64::gic_its::GicItsBackend>),
     /// The VM-wide GICv2m frame. Emulated-device MSIs are decoded by the
     /// chipset map router (the frame registered its `SETSPI_NS` doorbell
@@ -160,7 +162,7 @@ impl PcieMsiPlatform<'_> {
             Option<Arc<dyn vmcore::irqfd::IrqFd>>,
         ) = match &self.msi_source {
             Aarch64MsiSource::None => (None, None),
-            Aarch64MsiSource::Its(backend) => (Some(backend.as_signal_msi()), backend.irqfd()),
+            Aarch64MsiSource::Its(backend) => (Some(self.msi_router.clone()), backend.irqfd()),
             Aarch64MsiSource::V2m { irqfd } => (Some(self.msi_router.clone()), irqfd.cloned()),
         };
 

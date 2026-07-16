@@ -2882,6 +2882,7 @@ version = "0.0.0"
 dependencies = [
  "chipset_device",
  "inspect",
+ "tracelimit",
  "virt",
  "vmcore",
 ]

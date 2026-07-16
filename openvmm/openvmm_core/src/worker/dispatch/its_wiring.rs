@@ -7,9 +7,10 @@
 //!
 //! Mirrors the SMMU wiring mechanism: MMIO bases come from the memory-layout
 //! allocator, and the MSI controllers are registered as chipset devices. In
-//! ITS mode one `GicItsDevice` (headless, no MMIO — the in-kernel vITS owns
-//! its register block) is created per PCI segment. In v2m mode the single
-//! VM-wide `GicV2mDevice` (a full MMIO chipset device) is created.
+//! ITS mode one `GicItsDevice` is created per PCI segment; each registers its
+//! MMIO frame and layers its `GITS_TRANSLATER` doorbell into the chipset MSI
+//! map (the in-kernel vITS still services the register block). In v2m mode the
+//! single VM-wide `GicV2mDevice` (a full MMIO chipset device) is created.
 
 use crate::partition::HvlitePartition;
 use gic_its::GicItsDevice;
@@ -52,7 +53,15 @@ pub(super) fn setup_its(
         let device_backend = backend.clone();
         chipset_builder
             .arc_mutex_device(format!("its:seg{segment}"))
-            .add(|_services| GicItsDevice::new(segment, its_id, base, device_backend))?;
+            .add(|services| {
+                GicItsDevice::new(
+                    &mut services.register_mmio(),
+                    segment,
+                    its_id,
+                    base,
+                    device_backend,
+                )
+            })?;
 
         backends.insert(segment, backend);
         configs.push(vmm_core::acpi_builder::AcpiItsConfig {

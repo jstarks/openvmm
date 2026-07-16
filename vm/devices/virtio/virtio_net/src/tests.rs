@@ -33,6 +33,7 @@ use test_with_tracing::test;
 use virtio::QueueResources;
 use virtio::VirtioDevice;
 use virtio::queue::QueueParams;
+use virtio::queue::QueueState;
 use virtio::spec::VirtioDeviceFeatures;
 use virtio::spec::queue::DescriptorFlags;
 use virtio::test_helpers::init_avail_ring;
@@ -1677,6 +1678,118 @@ async fn rx_offload_data_valid_validated_but_wrong(driver: DefaultDriver) {
 }
 
 // --- Feature Negotiation Tests ---
+
+/// Regression test: stopping the queues of an active pair must return each
+/// queue's progress cursor (available/used indices) so a later `start_queue`
+/// resumes the queue in place instead of restarting at index 0. Previously
+/// `stop_queue` always returned `None`, which desynced the device from the
+/// guest on restart and manifested as spurious duplicate-descriptor drops on
+/// the guest's next transmit.
+#[async_test]
+async fn stop_queue_returns_progress(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    let _handle = harness.enable_and_get_handle().await;
+
+    // Post three TX packets (head descriptors 0, 2, 4 — each packet uses a
+    // header + data descriptor) and wait for each to complete, advancing the
+    // available and used indices to 3.
+    for i in 0..3u16 {
+        harness.post_tx_and_signal(i * 2, 100);
+        harness.wait_for_used().await;
+    }
+
+    // Stopping the TX queue (index 1) must report its cursor.
+    let tx_state = harness.device.stop_queue(1).await;
+    assert_eq!(
+        tx_state,
+        Some(QueueState {
+            avail_index: 3,
+            used_index: 3,
+        }),
+        "TX queue cursor should reflect the three processed packets"
+    );
+
+    // Stopping the RX queue (index 0) must also report a cursor (not `None`),
+    // even though no RX traffic was processed.
+    let rx_state = harness.device.stop_queue(0).await;
+    assert_eq!(
+        rx_state,
+        Some(QueueState {
+            avail_index: 0,
+            used_index: 0,
+        }),
+        "RX queue cursor should be reported even with no RX traffic"
+    );
+
+    harness.device.reset().await;
+}
+
+/// The `VirtioDevice` contract permits stopping a queue and starting it again.
+/// Verify the pair resumes correctly from the saved cursor, continuing the
+/// used ring rather than restarting at 0.
+#[async_test]
+async fn stop_then_restart_queue(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    let _handle = harness.enable_and_get_handle().await;
+
+    // Process two TX packets, advancing the cursor to 2.
+    for i in 0..2u16 {
+        harness.post_tx_and_signal(i * 2, 100);
+        harness.wait_for_used().await;
+    }
+
+    // Stop just the TX queue and capture its cursor. The RX queue is left up.
+    let tx_state = harness
+        .device
+        .stop_queue(1)
+        .await
+        .expect("TX queue cursor");
+    assert_eq!(tx_state.avail_index, 2);
+    assert_eq!(tx_state.used_index, 2);
+
+    // Restart the TX queue with the saved cursor, re-pairing with the still
+    // live RX queue.
+    let tx_interrupt = Interrupt::from_event(harness.tx_interrupt_event.clone());
+    harness
+        .device
+        .start_queue(
+            1,
+            QueueResources {
+                params: QueueParams {
+                    size: QUEUE_SIZE,
+                    enable: true,
+                    desc_addr: TX_DESC_ADDR,
+                    avail_addr: TX_AVAIL_ADDR,
+                    used_addr: TX_USED_ADDR,
+                },
+                notify: tx_interrupt,
+                event: harness.tx_event.clone(),
+                guest_memory: harness.mem.clone(),
+            },
+            &VirtioDeviceFeatures::new(),
+            Some(tx_state),
+        )
+        .await
+        .unwrap();
+
+    // Re-pairing triggers a queue restart; consume the new mock queue handle.
+    let _handle = mesh::CancelContext::new()
+        .with_timeout(Duration::from_secs(5))
+        .until_cancelled(harness.queue_handle_rx.next())
+        .await
+        .expect("timed out waiting for mock queue handle")
+        .expect("channel closed");
+
+    // A further TX packet must be processed, continuing the used ring from
+    // index 2 (i.e. the restarted queue resumed at the saved cursor).
+    harness.post_tx_and_signal(4, 100);
+    let (used_id, _len) = harness.wait_for_used().await;
+    assert_eq!(used_id, 4, "restarted TX queue should process new packets");
+
+    harness.device.stop_queue(1).await;
+    harness.device.stop_queue(0).await;
+    harness.device.reset().await;
+}
 
 /// Verify that the device advertises CSUM, HOST_TSO, and HOST_USO features
 /// when the endpoint supports TCP/UDP/TSO/USO offloads.

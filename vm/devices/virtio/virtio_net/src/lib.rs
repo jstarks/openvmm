@@ -409,31 +409,83 @@ impl VirtioDevice for Device {
     async fn stop_queue(&mut self, idx: u16) -> Option<QueueState> {
         let pair_idx = (idx / 2) as usize;
 
-        if pair_idx < self.pairs.len() {
-            if let QueuePairState::HalfOpen { is_rx, .. } = self.pairs[pair_idx] {
-                let stopping_rx = idx.is_multiple_of(2);
-                if is_rx != stopping_rx {
-                    // The caller is stopping the queue that wasn't started;
-                    // leave the pending half intact.
-                    return None;
-                }
-                // Drop the pending half-open queue.
-                self.pairs[pair_idx] = QueuePairState::Empty;
-            } else if matches!(self.pairs[pair_idx], QueuePairState::Active) {
-                // Stop the coordinator (which stops all workers).
-                self.coordinator.stop().await;
-                if let Some(coordinator) = self.coordinator.state_mut() {
-                    for worker in &mut coordinator.workers {
-                        worker.stop().await;
-                    }
-                }
-                let _ = self.coordinator.remove();
-                self.pairs[pair_idx] = QueuePairState::Empty;
-            }
+        if pair_idx >= self.pairs.len() {
+            return None;
         }
 
-        // We don't support save/restore of virtio-net queue state yet.
-        None
+        // Take ownership of the pair state so we can inspect owned data (such
+        // as a pending queue) without holding a borrow on `self.pairs`.
+        match std::mem::replace(&mut self.pairs[pair_idx], QueuePairState::Empty) {
+            QueuePairState::Empty => None,
+            QueuePairState::HalfOpen {
+                queue,
+                queue_size,
+                is_rx,
+            } => {
+                let stopping_rx = idx.is_multiple_of(2);
+                if is_rx != stopping_rx {
+                    // The caller is stopping the queue that wasn't started (or
+                    // whose partner is still up); put the pending half back and
+                    // leave it intact.
+                    self.pairs[pair_idx] = QueuePairState::HalfOpen {
+                        queue,
+                        queue_size,
+                        is_rx,
+                    };
+                    return None;
+                }
+                // Capture the cursor from the pending queue so a later
+                // start_queue resumes at the right available/used index instead
+                // of restarting at 0. (`self.pairs[pair_idx]` is already Empty.)
+                Some(queue.queue_state())
+            }
+            QueuePairState::Active => {
+                // A queue pair is served by a single worker that owns both the
+                // rx and tx queues, so stopping either queue tears the worker
+                // down. Stop the coordinator (the parent task that would
+                // otherwise keep driving/restarting the worker) and reclaim the
+                // worker's queues.
+                let stopping_rx = idx.is_multiple_of(2);
+                self.coordinator.stop().await;
+                let mut coordinator = self.coordinator.remove();
+                let worker = &mut coordinator.workers[pair_idx];
+                worker.stop().await;
+                let VirtioState {
+                    rx_queue,
+                    rx_queue_size,
+                    tx_queue,
+                    tx_queue_size,
+                } = worker.remove().virtio_state;
+
+                // Only the requested queue is being stopped; keep the partner
+                // queue live and drop the pair back to `HalfOpen` so it can be
+                // re-paired by a later `start_queue`, or have its own cursor
+                // captured by its own `stop_queue`. Return the stopped queue's
+                // cursor so a later start_queue resumes at the right
+                // available/used index.
+                let (stopped_state, partner) = if stopping_rx {
+                    (
+                        rx_queue.queue_state(),
+                        QueuePairState::HalfOpen {
+                            queue: tx_queue,
+                            queue_size: tx_queue_size,
+                            is_rx: false,
+                        },
+                    )
+                } else {
+                    (
+                        tx_queue.queue_state(),
+                        QueuePairState::HalfOpen {
+                            queue: rx_queue,
+                            queue_size: rx_queue_size,
+                            is_rx: true,
+                        },
+                    )
+                };
+                self.pairs[pair_idx] = partner;
+                Some(stopped_state)
+            }
+        }
     }
 
     async fn reset(&mut self) {

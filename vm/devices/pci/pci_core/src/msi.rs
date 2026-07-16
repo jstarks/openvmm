@@ -361,8 +361,12 @@ impl MsiTarget {
     pub fn new_route(&self) -> Option<anyhow::Result<MsiRoute>> {
         let inner = self.inner.read();
         inner.irqfd.as_ref().map(|fd| {
+            // The MSI layer owns the fd (rather than the backend minting it), so
+            // that a single fd can later be rebound across backends as the guest
+            // reprograms the address. Today it is handed straight down.
+            let event = Event::new();
             Ok(MsiRoute {
-                inner: fd.new_irqfd_route()?,
+                inner: fd.new_irqfd_route(event)?,
                 default_rid: self.default_rid.clone(),
             })
         })
@@ -452,12 +456,9 @@ mod tests {
             routes: Mutex<Vec<Arc<Mutex<Vec<RouteCall>>>>>,
         }
         impl IrqFd for MockIrqFd {
-            fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn IrqFdRoute>> {
+            fn new_irqfd_route(&self, event: Event) -> anyhow::Result<Box<dyn IrqFdRoute>> {
                 let calls = self.routes.lock().remove(0);
-                Ok(Box::new(MockIrqFdRoute {
-                    event: Event::new(),
-                    calls,
-                }))
+                Ok(Box::new(MockIrqFdRoute { event, calls }))
             }
         }
 

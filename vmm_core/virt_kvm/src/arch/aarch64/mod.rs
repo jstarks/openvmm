@@ -1141,8 +1141,12 @@ struct KvmItsIrqFd {
 }
 
 impl virt::irqfd::IrqFd for KvmItsIrqFd {
-    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn virt::irqfd::IrqFdRoute>> {
+    fn new_irqfd_route(
+        &self,
+        event: pal_event::Event,
+    ) -> anyhow::Result<Box<dyn virt::irqfd::IrqFdRoute>> {
         Ok(Box::new(self.state.new_irqfd_route(
+            event,
             KvmItsRouteBuilder {
                 translater_addr: self.translater_addr,
             },
@@ -1157,8 +1161,13 @@ struct KvmSpiIrqFd {
 }
 
 impl virt::irqfd::IrqFd for KvmSpiIrqFd {
-    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn virt::irqfd::IrqFdRoute>> {
-        Ok(Box::new(self.state.new_irqfd_route(KvmSpiRouteBuilder)?))
+    fn new_irqfd_route(
+        &self,
+        event: pal_event::Event,
+    ) -> anyhow::Result<Box<dyn virt::irqfd::IrqFdRoute>> {
+        Ok(Box::new(
+            self.state.new_irqfd_route(event, KvmSpiRouteBuilder)?,
+        ))
     }
 }
 

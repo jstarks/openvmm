@@ -650,8 +650,8 @@ pub struct SmmuIrqFd {
 }
 
 impl IrqFd for SmmuIrqFd {
-    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn IrqFdRoute>> {
-        let inner_route = self.inner.new_irqfd_route()?;
+    fn new_irqfd_route(&self, event: Event) -> anyhow::Result<Box<dyn IrqFdRoute>> {
+        let inner_route = self.inner.new_irqfd_route(event)?;
         Ok(Box::new(SmmuIrqFdRoute {
             shared: self.shared.clone(),
             stream_id_base: self.stream_id_base,

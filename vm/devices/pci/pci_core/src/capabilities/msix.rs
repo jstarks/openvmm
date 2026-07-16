@@ -723,12 +723,12 @@ mod tests {
             routes: Mutex<Vec<Arc<Mutex<Vec<RouteCall>>>>>,
         }
         impl vmcore::irqfd::IrqFd for MockIrqFd {
-            fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn vmcore::irqfd::IrqFdRoute>> {
+            fn new_irqfd_route(
+                &self,
+                event: Event,
+            ) -> anyhow::Result<Box<dyn vmcore::irqfd::IrqFdRoute>> {
                 let calls = self.routes.lock().remove(0);
-                Ok(Box::new(MockIrqFdRoute {
-                    event: Event::new(),
-                    calls,
-                }))
+                Ok(Box::new(MockIrqFdRoute { event, calls }))
             }
         }
 

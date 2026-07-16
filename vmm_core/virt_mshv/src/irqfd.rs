@@ -186,7 +186,7 @@ impl MshvIrqFd {
 }
 
 impl IrqFd for MshvIrqFd {
-    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn IrqFdRoute>> {
+    fn new_irqfd_route(&self, event: Event) -> anyhow::Result<Box<dyn IrqFdRoute>> {
         let gsi = self
             .partition
             .alloc_gsi()
@@ -198,7 +198,6 @@ impl IrqFd for MshvIrqFd {
         // time and does not retarget on a later routing change, so the routing
         // must be in place *before* the irqfd is armed. Arming lazily also
         // works for x86_64 (enable() arms after setting the route).
-        let event = Event::new();
         Ok(Box::new(MshvIrqFdRoute {
             partition: self.partition.clone(),
             gsi,

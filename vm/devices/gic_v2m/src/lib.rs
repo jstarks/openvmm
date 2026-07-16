@@ -259,9 +259,9 @@ struct GicV2mIrqFd {
 }
 
 impl IrqFd for GicV2mIrqFd {
-    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn IrqFdRoute>> {
+    fn new_irqfd_route(&self, event: Event) -> anyhow::Result<Box<dyn IrqFdRoute>> {
         Ok(Box::new(GicV2mIrqFdRoute {
-            inner: self.inner.new_irqfd_route()?,
+            inner: self.inner.new_irqfd_route(event)?,
             setspi_addr: self.setspi_addr,
             spi_range: self.spi_range.clone(),
         }))

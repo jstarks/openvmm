@@ -18,18 +18,21 @@ use pal_event::Event;
 /// event is signaled, the kernel looks up the GSI routing and injects the
 /// configured MSI into the guest without a usermode transition.
 pub trait IrqFd: Send + Sync {
-    /// Creates a new irqfd route.
+    /// Creates a new irqfd route bound to the caller-supplied `event`.
     ///
-    /// Allocates a GSI, creates an event, and registers the event with the
-    /// hypervisor so that signaling it injects the configured MSI into the
-    /// guest.
+    /// Allocates a GSI and (for backends that arm eagerly) registers `event`
+    /// with the hypervisor so that signaling it injects the configured MSI into
+    /// the guest. The caller owns `event` and passes a clone here; the same
+    /// event is returned by [`IrqFdRoute::event`] for VFIO or other interrupt
+    /// sources.
     ///
-    /// The caller retrieves the event via [`IrqFdRoute::event`] to pass to
-    /// VFIO or other interrupt sources.
+    /// The caller owning the event (rather than the route minting it) is what
+    /// lets a single fd be rebound across backends as the guest reprograms the
+    /// MSI address.
     ///
     /// When the route is dropped, the irqfd is unregistered and the GSI is
     /// freed.
-    fn new_irqfd_route(&self) -> anyhow::Result<Box<dyn IrqFdRoute>>;
+    fn new_irqfd_route(&self, event: Event) -> anyhow::Result<Box<dyn IrqFdRoute>>;
 }
 
 /// A handle to a registered irqfd route.

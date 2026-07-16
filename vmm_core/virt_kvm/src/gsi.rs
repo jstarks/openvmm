@@ -185,9 +185,9 @@ impl KvmIrqFdState {
 
     pub fn new_irqfd_route<T: MsiRouteBuilder>(
         &self,
+        event: Event,
         builder: T,
     ) -> anyhow::Result<KvmIrqFdRoute<T>> {
-        let event = Event::new();
         let route = self
             .partition
             .new_route(Some(event.clone()))

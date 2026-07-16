@@ -136,7 +136,6 @@ impl<T: RemoteDynamicResolvers> Worker for RemoteChipsetDeviceWorker<T> {
                             configure: &mut configure::RemoteConfigureChipsetDevice {},
                             register_mmio: &mut configure::RemoteRegisterMmio {},
                             register_pio: &mut configure::RemoteRegisterPio {},
-                            register_msi_sink: &mut configure::RemoteRegisterMsiSink {},
                         },
                     )
                     .await

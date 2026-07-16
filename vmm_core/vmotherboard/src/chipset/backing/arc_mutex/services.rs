@@ -187,14 +187,6 @@ impl<'a, 'b> ArcMutexChipsetServices<'a, 'b> {
         }
     }
 
-    pub fn register_msi_sink(&self) -> crate::chipset::io_ranges::MsiSinkRegistrar {
-        let inner = self.builder.inner.lock();
-        crate::chipset::io_ranges::MsiSinkRegistrar::new(
-            self.dev_name.clone(),
-            inner.vm_chipset.mmio_ranges.clone(),
-        )
-    }
-
     pub fn register_static_pci(&mut self, bus_id: BusIdPci, bdf: (u8, u8, u8)) {
         self.builder.register_weak_mutex_pci_device(
             bus_id,
@@ -268,6 +260,7 @@ mod device_range {
     use chipset_device::ChipsetDevice;
     use chipset_device::mmio::ControlMmioIntercept;
     use chipset_device::mmio::RegisterMmioIntercept;
+    use chipset_device::msi::DoorbellTarget;
     use chipset_device::pio::ControlPortIoIntercept;
     use chipset_device::pio::RegisterPortIoIntercept;
     use closeable_mutex::CloseableMutex;
@@ -282,6 +275,15 @@ mod device_range {
         pub(super) ranges: IoRanges<T>,
     }
 
+    /// A doorbell layered onto a [`DeviceRange`], stored offset-relative so it
+    /// follows the region across map/unmap/remap.
+    struct DoorbellSpec<T> {
+        offset: T,
+        len: T,
+        region_name: Arc<str>,
+        target: DoorbellTarget,
+    }
+
     // Implementation detail - the concrete type returned by DeviceRangeMapper's
     // `new_io_region` implementation
     struct DeviceRange<T> {
@@ -291,6 +293,7 @@ mod device_range {
         addr: Option<T>,
         dev: Weak<CloseableMutex<dyn ChipsetDevice>>,
         dev_name: Arc<str>,
+        doorbells: Vec<DoorbellSpec<T>>,
     }
 
     macro_rules! impl_device_range {
@@ -304,6 +307,7 @@ mod device_range {
                         addr: None,
                         dev: self.dev.clone(),
                         dev_name: self.dev_name.clone(),
+                        doorbells: Vec::new(),
                     })
                 }
             }
@@ -328,6 +332,24 @@ mod device_range {
                     ) {
                         Ok(()) => {
                             self.addr = Some(addr);
+                            // Nest each layered doorbell into the just-registered
+                            // frame at its offset-relative address (MMIO-first is
+                            // structural: the frame is inserted immediately above).
+                            for db in &self.doorbells {
+                                let start = addr
+                                    .checked_add(db.offset)
+                                    .expect("doorbell offset lies within the region");
+                                let end = start
+                                    .checked_add(db.len - 1)
+                                    .expect("doorbell end lies within the region");
+                                self.ranges.register_doorbell(
+                                    start,
+                                    end,
+                                    db.region_name.clone(),
+                                    self.dev_name.clone(),
+                                    db.target.clone(),
+                                );
+                            }
                         }
                         Err(conflict) => {
                             // TODO?: switch behavior such that incoming mappings
@@ -339,6 +361,39 @@ mod device_range {
                             );
                         }
                     }
+                }
+
+                fn add_doorbell(
+                    &mut self,
+                    offset: $addr,
+                    len: $addr,
+                    target: DoorbellTarget,
+                ) {
+                    let region_name: Arc<str> =
+                        format!("{}/doorbell@{:#x}", self.region_name, offset).into();
+                    // If the region is already mapped, materialize the doorbell
+                    // now; otherwise it is registered when the region is mapped.
+                    if let Some(base) = self.addr {
+                        let start = base
+                            .checked_add(offset)
+                            .expect("doorbell offset lies within the region");
+                        let end = start
+                            .checked_add(len - 1)
+                            .expect("doorbell end lies within the region");
+                        self.ranges.register_doorbell(
+                            start,
+                            end,
+                            region_name.clone(),
+                            self.dev_name.clone(),
+                            target.clone(),
+                        );
+                    }
+                    self.doorbells.push(DoorbellSpec {
+                        offset,
+                        len,
+                        region_name,
+                        target,
+                    });
                 }
 
                 fn unmap(&mut self) {

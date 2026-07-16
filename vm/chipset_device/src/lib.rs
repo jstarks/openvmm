@@ -118,6 +118,22 @@ macro_rules! io_region {
             /// assert_eq!(foo_region.offset_of(0x1003), None);
             /// ```
             fn offset_of(&self, addr: $addr) -> Option<$addr>;
+
+            /// Layer a doorbell at `offset` (length `len` bytes) within this
+            /// region: a write to that sub-range is delivered directly to
+            /// `target` instead of the device's intercept.
+            ///
+            /// Doorbells are offset-relative, so they follow the region across
+            /// [`map`](Self::map)/[`unmap`](Self::unmap)/remap. The default is a
+            /// no-op: only MMIO regions carry doorbells (PIO never does).
+            fn add_doorbell(
+                &mut self,
+                offset: $addr,
+                len: $addr,
+                target: crate::msi::DoorbellTarget,
+            ) {
+                let _ = (offset, len, target);
+            }
         }
 
         // DEVNOTE: we explicitly want to implement Inspect using trait method

@@ -70,10 +70,6 @@ pub struct ResolveChipsetDeviceHandleParams<'a> {
     pub register_mmio: &'a mut (dyn chipset_device::mmio::RegisterMmioIntercept + Send),
     /// Object to register for PIO intercepts.
     pub register_pio: &'a mut (dyn chipset_device::pio::RegisterPortIoIntercept + Send),
-    /// Object to register MSI doorbell sinks (the device's downstream MSI
-    /// decode target). Mirrors [`Self::register_mmio`]: a device claims a
-    /// doorbell address range and hands over its sink handler at resolve time.
-    pub register_msi_sink: &'a mut (dyn chipset_device::msi::RegisterMsiSink + Send),
 }
 
 /// A trait for configuring a chipset device's connection to the platform.

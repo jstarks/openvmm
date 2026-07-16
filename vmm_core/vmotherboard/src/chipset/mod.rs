@@ -185,10 +185,11 @@ impl Chipset {
                 .supports_mmio()
                 .expect("objects on the mmio bus support mmio")
                 .mmio_read(address, data),
-            LookupTarget::MsiSink(_) => {
-                // Doorbells are write-only; a read returns all-ones.
-                data.fill(!0);
-                IoResult::Ok
+            // Reads never resolve to a doorbell: doorbells are write-only, so
+            // `lookup` sends reads to the owning device, which services the
+            // frame's readable registers.
+            LookupTarget::Doorbell(_) => {
+                unreachable!("doorbell reads resolve to the owning device")
             }
         };
 
@@ -213,9 +214,12 @@ impl Chipset {
                 .supports_mmio()
                 .expect("objects on the mmio bus support mmio")
                 .mmio_write(address, data),
-            LookupTarget::MsiSink(sink) => {
+            LookupTarget::Doorbell(target) => {
+                // A CPU write to a doorbell sub-range is itself a doorbell
+                // access (tier 2): deliver it without locking the owning
+                // device. CPU accesses carry no requester ID.
                 if let Ok(v) = data.try_into() {
-                    sink.signal.signal_msi(None, address, u32::from_ne_bytes(v));
+                    target.signal(None, address, u32::from_ne_bytes(v));
                 }
                 IoResult::Ok
             }
@@ -247,8 +251,8 @@ impl Chipset {
                 .supports_pio()
                 .expect("objects on the pio bus support pio")
                 .io_read(port, data),
-            // PIO ranges never carry MSI sinks (the sink API is u64-only).
-            LookupTarget::MsiSink(_) => unreachable!("pio ranges never contain msi sinks"),
+            // PIO ranges never carry doorbells (the doorbell API is u64-only).
+            LookupTarget::Doorbell(_) => unreachable!("pio ranges never contain doorbells"),
         };
 
         self.handle_io_result(
@@ -272,8 +276,8 @@ impl Chipset {
                 .supports_pio()
                 .expect("objects on the pio bus support pio")
                 .io_write(port, data),
-            // PIO ranges never carry MSI sinks (the sink API is u64-only).
-            LookupTarget::MsiSink(_) => unreachable!("pio ranges never contain msi sinks"),
+            // PIO ranges never carry doorbells (the doorbell API is u64-only).
+            LookupTarget::Doorbell(_) => unreachable!("pio ranges never contain doorbells"),
         };
 
         self.handle_io_result(

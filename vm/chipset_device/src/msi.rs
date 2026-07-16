@@ -10,13 +10,16 @@
 //! component) writes to.
 //!
 //! On ARM the doorbell is a real downstream MMIO block (the GICv3 ITS or a
-//! GICv2m frame); those blocks register their doorbell range as an [`MsiSink`]
-//! in the platform's arch-neutral MSI-sink map via [`RegisterMsiSink`]. On x86
-//! there is no MSI "device": the root complex recognizes the `0xFEE` window on
-//! a device's outbound path and converts it in place, so the map holds no
-//! sinks. Either way the fabric decodes an address to a downstream target.
+//! GICv2m frame); those blocks layer their doorbell onto the MMIO region they
+//! already own, via
+//! [`ControlMmioIntercept::add_doorbell`](crate::mmio::ControlMmioIntercept::add_doorbell),
+//! which delivers matching writes to an [`MsiSink`] wrapped in a
+//! [`DoorbellTarget`]. On x86 there is no MSI "device": the root complex
+//! recognizes the `0xFEE` window on a device's outbound path and converts it in
+//! place, so the map holds no sinks. Either way the fabric decodes an address to
+//! a downstream target.
 
-use std::ops::RangeInclusive;
+use inspect::Inspect;
 use std::sync::Arc;
 use vmcore::irqfd::IrqFd;
 
@@ -55,15 +58,29 @@ impl std::fmt::Debug for MsiSink {
     }
 }
 
-/// A trait to register device MSI doorbell ranges (sinks) with the platform's
-/// arch-neutral MSI-sink map.
+/// What a doorbell write is delivered to.
 ///
-/// This mirrors [`RegisterMmioIntercept`](crate::mmio::RegisterMmioIntercept):
-/// a device claims a downstream address range at resolve time. Unlike MMIO —
-/// where dispatch calls back into the device under lock — the sink handler is
-/// stored directly, so the MSI hot path never re-enters the device.
-pub trait RegisterMsiSink: Send {
-    /// Claims an MSI doorbell address range, routing MSI writes whose address
-    /// falls within `range` to `sink`.
-    fn claim(&mut self, region_name: &str, range: RangeInclusive<u64>, sink: MsiSink);
+/// A doorbell is a sub-range of an MMIO region whose writes are recognized and
+/// delivered directly to a downstream target instead of falling through to the
+/// owning device's MMIO intercept. A device layers one onto its MMIO region via
+/// [`ControlMmioIntercept::add_doorbell`](crate::mmio::ControlMmioIntercept::add_doorbell).
+/// Today the only flavor is [`Msi`](DoorbellTarget::Msi).
+#[derive(Inspect, Clone)]
+#[inspect(tag = "kind")]
+pub enum DoorbellTarget {
+    /// A message-carrying MSI doorbell (RID + data). Bundles the pre-registered
+    /// route (irqfd) form.
+    Msi(#[inspect(rename = "has_irqfd", with = "|x| x.irqfd.is_some()")] MsiSink),
+}
+
+impl DoorbellTarget {
+    /// Delivers a write that landed on this doorbell.
+    ///
+    /// `devid` is the requester ID (`DeviceID`) when the write is a bus-master
+    /// MSI on the outbound path, or `None` for a CPU access.
+    pub fn signal(&self, devid: Option<u32>, address: u64, data: u32) {
+        match self {
+            DoorbellTarget::Msi(sink) => sink.signal.signal_msi(devid, address, data),
+        }
+    }
 }

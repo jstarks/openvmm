@@ -310,7 +310,6 @@ impl<'a> BaseChipsetBuilder<'a> {
                                 task_driver_source: driver_source,
                                 register_mmio: &mut services.register_mmio(),
                                 register_pio: &mut services.register_pio(),
-                                register_msi_sink: &mut services.register_msi_sink(),
                                 configure: services,
                             },
                         )
@@ -604,7 +603,6 @@ impl<'a> BaseChipsetBuilder<'a> {
                                 task_driver_source: driver_source,
                                 register_mmio: &mut services.register_mmio(),
                                 register_pio: &mut services.register_pio(),
-                                register_msi_sink: &mut services.register_msi_sink(),
                                 configure: services,
                             },
                         )

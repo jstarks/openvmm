@@ -57,7 +57,7 @@ pub struct GicItsDevice {
     /// registered for the lifetime of the device.
     #[inspect(skip)]
     _control: Box<dyn ControlMmioIntercept>,
-    #[inspect(skip)]
+    #[inspect(with = "|b| inspect::adhoc(|req| b.inspect(req))")]
     backend: Arc<dyn GicItsBackend>,
 }
 
@@ -146,7 +146,6 @@ impl SaveRestore for GicItsDevice {
     type SavedState = NoSavedState;
 
     fn save(&mut self) -> Result<Self::SavedState, SaveError> {
-        let _ = &self.backend;
         Ok(NoSavedState)
     }
 

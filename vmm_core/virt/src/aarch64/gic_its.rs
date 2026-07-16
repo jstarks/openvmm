@@ -65,6 +65,14 @@ pub trait GicItsBackend: Send + Sync {
     /// description and MSI-address validation.
     fn translater_addr(&self) -> u64;
 
+    /// Adds backend-specific ITS state to an inspection request.
+    ///
+    /// The default surfaces nothing; backends override to expose their
+    /// implementation kind and any cheaply-readable identity/configuration.
+    /// Implementations must not perform operations that disturb a running VM
+    /// (e.g. reads that quiesce all VPs).
+    fn inspect(&self, _req: inspect::Request<'_>) {}
+
     /// Marshals this ITS's state for save.
     fn save(&self) -> anyhow::Result<ItsSavedState>;
 

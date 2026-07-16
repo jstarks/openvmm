@@ -126,6 +126,7 @@ mod ioctl {
     );
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
+    ioctl_write_ptr!(kvm_get_device_attr, KVMIO, 0xe2, kvm_device_attr);
     ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
     #[cfg(target_arch = "aarch64")]
     ioctl_readwrite_bad!(
@@ -1196,6 +1197,34 @@ impl Device {
                     group,
                     attr: attr as u64,
                     addr: std::ptr::from_ref(addr) as u64,
+                    flags,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reads a device attribute into `addr`.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must point to the appropriate output storage for the attribute
+    /// being read.
+    pub unsafe fn get_device_attr<T>(
+        &self,
+        group: u32,
+        attr: u32,
+        addr: &mut T,
+        flags: u32,
+    ) -> nix::Result<()> {
+        // SAFETY: caller guaranteed.
+        unsafe {
+            ioctl::kvm_get_device_attr(
+                self.0.as_raw_fd(),
+                &kvm_device_attr {
+                    group,
+                    attr: attr as u64,
+                    addr: std::ptr::from_mut(addr) as u64,
                     flags,
                 },
             )?;

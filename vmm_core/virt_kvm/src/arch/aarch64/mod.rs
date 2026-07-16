@@ -943,7 +943,7 @@ impl virt::Aarch64Partition for KvmPartition {
         Ok(Arc::new(KvmGicItsBackend {
             inner: self.inner.clone(),
             irqfd_state: self.irqfd_state.clone(),
-            _its_device: its_device,
+            its_device,
             translater_addr: base + GITS_TRANSLATER_OFFSET,
         }))
     }
@@ -1001,10 +1001,57 @@ fn create_its_device(vm: &kvm::Partition, its_base: u64) -> Result<kvm::Device, 
 struct KvmGicItsBackend {
     inner: Arc<KvmPartitionInner>,
     irqfd_state: Arc<KvmIrqFdState>,
-    /// The ITS device fd, kept alive for the ITS lifetime.
-    _its_device: kvm::Device,
+    /// The ITS device fd: kept alive for the ITS lifetime, and used to read
+    /// the live register block for inspection.
+    its_device: kvm::Device,
     /// GITS_TRANSLATER physical address for this ITS.
     translater_addr: u64,
+}
+
+/// Offsets of the ITS control-frame registers, relative to the ITS base,
+/// as accessed via `KVM_DEV_ARM_VGIC_GRP_ITS_REGS`. See the Arm GICv3/v4
+/// architecture specification (IHI 0069) §12.
+mod gits_reg {
+    /// `GITS_CTLR` (control).
+    pub const CTLR: u32 = 0x0000;
+    /// `GITS_IIDR` (implementation identification).
+    pub const IIDR: u32 = 0x0004;
+    /// `GITS_TYPER` (features).
+    pub const TYPER: u32 = 0x0008;
+    /// `GITS_CBASER` (command queue base).
+    pub const CBASER: u32 = 0x0080;
+    /// `GITS_CWRITER` (command queue write pointer).
+    pub const CWRITER: u32 = 0x0088;
+    /// `GITS_CREADR` (command queue read pointer).
+    pub const CREADR: u32 = 0x0090;
+    /// `GITS_BASER<n>` (table descriptors), at `BASER + 8*n`.
+    pub const BASER: u32 = 0x0100;
+    /// Number of `GITS_BASER<n>` registers.
+    pub const BASER_COUNT: u32 = 8;
+}
+
+impl KvmGicItsBackend {
+    /// Reads a single ITS register from the in-kernel vITS via
+    /// `KVM_DEV_ARM_VGIC_GRP_ITS_REGS`.
+    ///
+    /// The kernel locks all vCPUs to service this, so it returns `EBUSY` while
+    /// the guest is running; callers surface that as "unavailable". Per the
+    /// KVM ABI, the value out-param is always a `u64` regardless of the
+    /// register's architectural width.
+    fn read_its_reg(&self, offset: u32) -> anyhow::Result<u64> {
+        let mut value = 0u64;
+        // SAFETY: ITS_REGS reads a single u64 out-param for any register width,
+        // and `value` is a valid u64 for the duration of the call.
+        unsafe {
+            self.its_device.get_device_attr(
+                kvm::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                offset,
+                &mut value,
+                0,
+            )?;
+        }
+        Ok(value)
+    }
 }
 
 impl virt::aarch64::gic_its::GicItsBackend for KvmGicItsBackend {
@@ -1024,6 +1071,55 @@ impl virt::aarch64::gic_its::GicItsBackend for KvmGicItsBackend {
 
     fn translater_addr(&self) -> u64 {
         self.translater_addr
+    }
+
+    fn inspect(&self, req: inspect::Request<'_>) {
+        let mut resp = req.respond();
+        resp.field("backend", "kvm-in-kernel-vits")
+            .hex("translater_addr", self.translater_addr);
+
+        // Surface the live in-kernel vITS register block. Reading it via
+        // `KVM_DEV_ARM_VGIC_GRP_ITS_REGS` locks all vCPUs in the kernel, so it
+        // fails with `EBUSY` while the guest is running; the register values
+        // are therefore only available when the VM is quiesced (e.g. during a
+        // debug stop or servicing), which is exactly when this state is worth
+        // inspecting. Probe `GITS_CTLR` first and, on any read failure,
+        // short-circuit rather than churning the vCPU locks for every register.
+        match self.read_its_reg(gits_reg::CTLR) {
+            Ok(ctlr) => {
+                resp.child("registers", |req| {
+                    let mut resp = req.respond();
+                    resp.hex("gits_ctlr", ctlr);
+                    for (name, offset) in [
+                        ("gits_iidr", gits_reg::IIDR),
+                        ("gits_typer", gits_reg::TYPER),
+                        ("gits_cbaser", gits_reg::CBASER),
+                        ("gits_cwriter", gits_reg::CWRITER),
+                        ("gits_creadr", gits_reg::CREADR),
+                    ] {
+                        if let Ok(value) = self.read_its_reg(offset) {
+                            resp.hex(name, value);
+                        }
+                    }
+                    // GITS_BASER<n> table descriptors; unimplemented entries
+                    // read as zero, so only surface the populated ones.
+                    for n in 0..gits_reg::BASER_COUNT {
+                        match self.read_its_reg(gits_reg::BASER + n * 8) {
+                            Ok(value) if value != 0 => {
+                                resp.hex(&format!("gits_baser{n}"), value);
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                resp.field(
+                    "registers",
+                    format!("unavailable (guest running or unreadable: {err})"),
+                );
+            }
+        }
     }
 
     fn save(&self) -> anyhow::Result<virt::aarch64::gic_its::ItsSavedState> {

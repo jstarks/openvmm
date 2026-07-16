@@ -37,9 +37,10 @@ pub(super) struct PcieMsiPlatform<'a> {
     ///
     /// On x86 it is the fallback of the root-complex `0xFEE` decode (see
     /// [`X86RootComplexMsi`]); the map holds no MSI sinks there today. On
-    /// aarch64 the ITS/v2m path is still selected via `msi_source` (Phase 3
-    /// moves ITS/v2m onto this router), so it is currently unused.
-    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+    /// aarch64 in v2m mode it is the device's outbound MSI path: the v2m frame
+    /// registers its `SETSPI_NS` doorbell into the map, and a device's write is
+    /// decoded there. (ITS mode still selects the backend via `msi_source`;
+    /// Phase 3 task 9 moves it onto this router too.)
     pub msi_router: Arc<dyn pci_core::msi::SignalMsi>,
     /// aarch64 GIC MSI source for this entity (per-segment ITS or the VM-wide
     /// v2m frame).
@@ -62,9 +63,10 @@ pub(super) enum Aarch64MsiSource<'a> {
     /// GICv3 ITS for this entity's PCI segment. MSIs use plain 16-bit RID
     /// device IDs; the ITS is selected by its doorbell address.
     Its(&'a Arc<dyn virt::aarch64::gic_its::GicItsBackend>),
-    /// The VM-wide GICv2m frame's routing surface.
+    /// The VM-wide GICv2m frame. Emulated-device MSIs are decoded by the
+    /// chipset map router (the frame registered its `SETSPI_NS` doorbell
+    /// there); only the passthrough irqfd is carried here.
     V2m {
-        signal_msi: &'a Arc<dyn pci_core::msi::SignalMsi>,
         irqfd: Option<&'a Arc<dyn vmcore::irqfd::IrqFd>>,
     },
 }
@@ -159,9 +161,7 @@ impl PcieMsiPlatform<'_> {
         ) = match &self.msi_source {
             Aarch64MsiSource::None => (None, None),
             Aarch64MsiSource::Its(backend) => (Some(backend.as_signal_msi()), backend.irqfd()),
-            Aarch64MsiSource::V2m { signal_msi, irqfd } => {
-                (Some((*signal_msi).clone()), irqfd.cloned())
-            }
+            Aarch64MsiSource::V2m { irqfd } => (Some(self.msi_router.clone()), irqfd.cloned()),
         };
 
         #[cfg(guest_arch = "x86_64")]

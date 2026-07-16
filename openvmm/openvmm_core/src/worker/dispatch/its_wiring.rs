@@ -67,8 +67,6 @@ pub(super) fn setup_its(
 
 /// Result of [`setup_v2m`].
 pub(super) struct V2mDeviceResult {
-    /// MSI target for emulated-device delivery through the v2m frame.
-    pub signal_msi: Arc<dyn pci_core::msi::SignalMsi>,
     /// irqfd for passthrough-device delivery through the v2m frame, if the
     /// backend supports SPI irqfd routing.
     pub irqfd: Option<Arc<dyn vmcore::irqfd::IrqFd>>,
@@ -77,6 +75,10 @@ pub(super) struct V2mDeviceResult {
 }
 
 /// Instantiate the single VM-wide GICv2m MSI frame device (v2m mode).
+///
+/// The device registers its MMIO frame and layers its `SETSPI_NS` doorbell into
+/// the chipset MSI map, so emulated-device MSIs are decoded by the map router;
+/// only the passthrough irqfd is surfaced here.
 pub(super) fn setup_v2m(
     frame_base: u64,
     spi_base: u32,
@@ -89,17 +91,20 @@ pub(super) fn setup_v2m(
 
     let device = chipset_builder
         .arc_mutex_device("gic_v2m")
-        .add(|_services| {
-            gic_v2m::GicV2mDevice::new(frame_base, spi_base, spi_count, irqcon, spi_irqfd)
+        .add(|services| {
+            gic_v2m::GicV2mDevice::new(
+                &mut services.register_mmio(),
+                frame_base,
+                spi_base,
+                spi_count,
+                irqcon,
+                spi_irqfd,
+            )
         })?;
 
-    let (signal_msi, irqfd) = {
-        let dev = device.lock();
-        (dev.signal_msi(), dev.irqfd())
-    };
+    let irqfd = device.lock().irqfd();
 
     Ok(V2mDeviceResult {
-        signal_msi,
         irqfd,
         config: vmm_core::acpi_builder::AcpiV2mConfig {
             frame_base,

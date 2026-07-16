@@ -878,7 +878,6 @@ fn aarch64_msi_source<'a>(
 ) -> pcie_wiring::Aarch64MsiSource<'a> {
     if let Some(v2m) = v2m_device {
         pcie_wiring::Aarch64MsiSource::V2m {
-            signal_msi: &v2m.signal_msi,
             irqfd: v2m.irqfd.as_ref(),
         }
     } else if let Some(backend) = its_backends.get(&segment) {

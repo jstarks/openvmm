@@ -27,7 +27,6 @@ use chipset_device::mmio::ControlMmioIntercept;
 use chipset_device::mmio::MmioIntercept;
 use chipset_device::mmio::RegisterMmioIntercept;
 use chipset_device::msi::DoorbellTarget;
-use chipset_device::msi::MsiSink;
 use inspect::InspectMut;
 use pal_event::Event;
 use pci_core::msi::SignalMsi;
@@ -36,7 +35,8 @@ use std::sync::Arc;
 use virt::irqcon::ControlGic;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::irqfd::IrqFd;
-use vmcore::irqfd::IrqFdRoute;
+use vmcore::irqfd::IrqFdBinding;
+use vmcore::irqfd::KernelMsiBinding;
 use vmcore::save_restore::NoSavedState;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
@@ -47,8 +47,8 @@ use vmcore::save_restore::SaveRestore;
 /// Owns the 4 KiB MSI frame MMIO region. MSIs are delivered as GIC SPI
 /// assertions: emulated-device and direct-guest writes to `SETSPI_NS` are
 /// recognized by the frame's doorbell (layered onto the MMIO region at
-/// construction) and dispatched via [`ControlGic`], while passthrough devices
-/// use the irqfd returned by [`GicV2mDevice::irqfd`].
+/// construction) and dispatched via [`ControlGic`]; passthrough devices bind
+/// their fd through the doorbell sink's [`SignalMsi::bind_msi`].
 #[derive(InspectMut)]
 pub struct GicV2mDevice {
     /// Keeps the frame's MMIO region (and its nested `SETSPI_NS` doorbell)
@@ -63,10 +63,6 @@ pub struct GicV2mDevice {
     spi_count: u32,
     #[inspect(skip)]
     irqcon: Arc<dyn ControlGic>,
-    /// Wrapped SPI irqfd used for passthrough-device MSI delivery, if the
-    /// backend supports it.
-    #[inspect(skip)]
-    passthrough_irqfd: Option<Arc<dyn IrqFd>>,
 }
 
 impl GicV2mDevice {
@@ -78,7 +74,7 @@ impl GicV2mDevice {
     /// without locking this device. `frame_base` is the guest-visible frame
     /// base address (one 4 KiB page), `spi_base`/`spi_count` describe the SPI
     /// range the frame owns, `irqcon` asserts the SPIs, and `spi_irqfd` (if
-    /// any) delivers passthrough MSIs.
+    /// any) is the backend's generic SPI irqfd used to bind passthrough MSIs.
     pub fn new(
         register_mmio: &mut dyn RegisterMmioIntercept,
         frame_base: u64,
@@ -91,24 +87,15 @@ impl GicV2mDevice {
         let spi_range = spi_base..spi_base + spi_count;
 
         // Build the doorbell sink: the userspace `SignalMsi` fast path (always
-        // present) plus, for backends that support it, a pre-registered SPI
-        // irqfd route for passthrough devices.
-        let signal: Arc<dyn SignalMsi> = Arc::new(GicV2mSignalMsi {
+        // present, delivers the SPI via `irqcon`) plus, for backends that
+        // support it, a pre-registered kernel SPI route (`bind_msi`) for
+        // passthrough devices.
+        let sink: Arc<dyn SignalMsi> = Arc::new(GicV2mSignalMsi {
             setspi_addr,
             spi_range: spi_range.clone(),
             irqcon: irqcon.clone(),
+            spi_irqfd,
         });
-        let passthrough_irqfd = spi_irqfd.map(|inner| {
-            Arc::new(GicV2mIrqFd {
-                inner,
-                setspi_addr,
-                spi_range: spi_range.clone(),
-            }) as Arc<dyn IrqFd>
-        });
-        let sink = MsiSink {
-            signal,
-            irqfd: passthrough_irqfd.clone(),
-        };
 
         // Register the frame's MMIO region and layer the `SETSPI_NS` doorbell
         // onto it (offset-relative, so it follows the region). MMIO-first is
@@ -128,18 +115,11 @@ impl GicV2mDevice {
             spi_base,
             spi_count,
             irqcon,
-            passthrough_irqfd,
         }
     }
 
     fn spi_range(&self) -> Range<u32> {
         self.spi_base..self.spi_base + self.spi_count
-    }
-
-    /// Returns an [`IrqFd`] for passthrough-device MSI delivery through this
-    /// frame, or `None` if the backend does not support SPI irqfd routing.
-    pub fn irqfd(&self) -> Option<Arc<dyn IrqFd>> {
-        self.passthrough_irqfd.clone()
     }
 }
 
@@ -234,6 +214,11 @@ struct GicV2mSignalMsi {
     setspi_addr: u64,
     spi_range: Range<u32>,
     irqcon: Arc<dyn ControlGic>,
+    /// The backend's generic SPI irqfd, used to bind passthrough-device fds.
+    /// Its route programs the underlying kernel SPI route (e.g. a KVM GIC
+    /// `Irqchip` route). `None` if the backend has no kernel SPI routing
+    /// (delivery then stays on the usermode `signal_msi` leg).
+    spi_irqfd: Option<Arc<dyn IrqFd>>,
 }
 
 impl SignalMsi for GicV2mSignalMsi {
@@ -248,57 +233,34 @@ impl SignalMsi for GicV2mSignalMsi {
         }
         deliver_spi(&*self.irqcon, &self.spi_range, data);
     }
-}
 
-/// An [`IrqFd`] wrapper that validates the v2m SETSPI address and delivers the
-/// route through the backend's generic SPI irqfd.
-struct GicV2mIrqFd {
-    inner: Arc<dyn IrqFd>,
-    setspi_addr: u64,
-    spi_range: Range<u32>,
-}
-
-impl IrqFd for GicV2mIrqFd {
-    fn new_irqfd_route(&self, event: Event) -> anyhow::Result<Box<dyn IrqFdRoute>> {
-        Ok(Box::new(GicV2mIrqFdRoute {
-            inner: self.inner.new_irqfd_route(event)?,
-            setspi_addr: self.setspi_addr,
-            spi_range: self.spi_range.clone(),
-        }))
-    }
-}
-
-/// An [`IrqFdRoute`] that validates the v2m SETSPI address on `enable` and
-/// programs the underlying generic SPI route with the SPI interrupt ID.
-struct GicV2mIrqFdRoute {
-    inner: Box<dyn IrqFdRoute>,
-    setspi_addr: u64,
-    spi_range: Range<u32>,
-}
-
-impl IrqFdRoute for GicV2mIrqFdRoute {
-    fn event(&self) -> &Event {
-        self.inner.event()
-    }
-
-    fn enable(&self, address: u64, data: u32, _devid: Option<u32>) {
+    fn bind_msi(
+        &self,
+        fd: &Event,
+        _devid: Option<u32>,
+        address: u64,
+        data: u32,
+    ) -> Option<Box<dyn KernelMsiBinding>> {
+        // Validate the v2m SETSPI decode before handing the fd to the kernel
+        // SPI route. A mismatch means the address does not resolve to this
+        // frame; return `None` so the caller falls back to `signal_msi`.
         if address != self.setspi_addr {
             tracelimit::warn_ratelimited!(
                 address,
                 data,
-                "unexpected v2m irqfd MSI address (expected SETSPI_NS)"
+                "unexpected v2m bind_msi address (expected SETSPI_NS)"
             );
-            return;
+            return None;
         }
         if !self.spi_range.contains(&data) {
-            tracelimit::warn_ratelimited!(data, "v2m irqfd SPI ID outside frame range");
-            return;
+            tracelimit::warn_ratelimited!(data, "v2m bind_msi SPI ID outside frame range");
+            return None;
         }
         // The generic SPI route interprets `data` as the SPI interrupt ID.
-        self.inner.enable(address, data, None);
-    }
-
-    fn disable(&self) {
-        self.inner.disable();
+        let route = self.spi_irqfd.as_ref()?.new_irqfd_route(fd.clone()).ok()?;
+        if !route.enable(address, data, None) {
+            return None;
+        }
+        Some(Box::new(IrqFdBinding(route)))
     }
 }

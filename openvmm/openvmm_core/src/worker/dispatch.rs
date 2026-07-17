@@ -864,26 +864,23 @@ fn smmu_for_rc(iommu_devices: &IommuDevices, rc_idx: usize) -> Option<&Arc<smmu:
     }
 }
 
-/// Selects the aarch64 GIC MSI routing source for a PCIe entity on `segment`:
-/// the VM-wide v2m frame (v2m mode), this segment's ITS backend (ITS mode), or
-/// none.
+/// Whether the aarch64 GIC MSI controller for `segment` supports
+/// kernel-mediated (passthrough) MSI routes: the VM-wide v2m frame's SPI irqfd
+/// (v2m mode) or this segment's ITS irqfd (ITS mode). Emulated-device MSIs
+/// always work through the chipset map router; this only gates whether a
+/// passthrough device can bind its fd.
 #[cfg(guest_arch = "aarch64")]
-fn aarch64_msi_source<'a>(
-    its_backends: &'a std::collections::BTreeMap<
-        u16,
-        Arc<dyn virt::aarch64::gic_its::GicItsBackend>,
-    >,
-    v2m_device: &'a Option<its_wiring::V2mDeviceResult>,
+fn aarch64_msi_routes_supported(
+    its_backends: &std::collections::BTreeMap<u16, Arc<dyn virt::aarch64::gic_its::GicItsBackend>>,
+    v2m_device: &Option<its_wiring::V2mDeviceResult>,
     segment: u16,
-) -> pcie_wiring::Aarch64MsiSource<'a> {
+) -> bool {
     if let Some(v2m) = v2m_device {
-        pcie_wiring::Aarch64MsiSource::V2m {
-            irqfd: v2m.irqfd.as_ref(),
-        }
+        v2m.supports_routes
     } else if let Some(backend) = its_backends.get(&segment) {
-        pcie_wiring::Aarch64MsiSource::Its(backend)
+        backend.irqfd().is_some()
     } else {
-        pcie_wiring::Aarch64MsiSource::None
+        false
     }
 }
 
@@ -2535,8 +2532,13 @@ impl InitializedVm {
             pcie_wiring::PcieMsiPlatform {
                 partition: partition.as_ref(),
                 msi_router: msi_router.clone(),
+                driver: Arc::new(driver_source.simple()) as Arc<dyn pal_async::driver::SpawnDriver>,
                 #[cfg(guest_arch = "aarch64")]
-                msi_source: aarch64_msi_source(&its_backends, &v2m_device, deferred.segment),
+                supports_routes: aarch64_msi_routes_supported(
+                    &its_backends,
+                    &v2m_device,
+                    deferred.segment,
+                ),
                 #[cfg(guest_arch = "x86_64")]
                 iommu,
             }
@@ -2586,8 +2588,14 @@ impl InitializedVm {
                         msi_platform: pcie_wiring::PcieMsiPlatform {
                             partition: partition.as_ref(),
                             msi_router: msi_router.clone(),
+                            driver: Arc::new(driver_source.simple())
+                                as Arc<dyn pal_async::driver::SpawnDriver>,
                             #[cfg(guest_arch = "aarch64")]
-                            msi_source: aarch64_msi_source(its_backends, v2m_device, pi.segment),
+                            supports_routes: aarch64_msi_routes_supported(
+                                its_backends,
+                                v2m_device,
+                                pi.segment,
+                            ),
                             #[cfg(guest_arch = "x86_64")]
                             iommu: x86_iommu_for_rc(iommu_devices, pi.rc_idx),
                         },
@@ -3807,8 +3815,10 @@ impl LoadedVm {
                                     msi_platform: pcie_wiring::PcieMsiPlatform {
                                         partition: self.inner.partition.as_ref(),
                                         msi_router: self.inner.chipset.msi_sink_router(),
+                                        driver: Arc::new(self.inner.driver_source.simple())
+                                            as Arc<dyn pal_async::driver::SpawnDriver>,
                                         #[cfg(guest_arch = "aarch64")]
-                                        msi_source: aarch64_msi_source(
+                                        supports_routes: aarch64_msi_routes_supported(
                                             &self.inner.its_backends,
                                             &self.inner.v2m_device,
                                             segment,

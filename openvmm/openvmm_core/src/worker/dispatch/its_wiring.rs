@@ -76,9 +76,11 @@ pub(super) fn setup_its(
 
 /// Result of [`setup_v2m`].
 pub(super) struct V2mDeviceResult {
-    /// irqfd for passthrough-device delivery through the v2m frame, if the
-    /// backend supports SPI irqfd routing.
-    pub irqfd: Option<Arc<dyn vmcore::irqfd::IrqFd>>,
+    /// Whether the v2m frame supports kernel-mediated (passthrough) MSI routes,
+    /// i.e. the backend provides an SPI irqfd. Emulated-device MSIs always work
+    /// through the chipset map router; this gates whether passthrough devices
+    /// can bind their fd through the frame's doorbell sink.
+    pub supports_routes: bool,
     /// ACPI MADT configuration for the v2m frame.
     pub config: vmm_core::acpi_builder::AcpiV2mConfig,
 }
@@ -87,7 +89,9 @@ pub(super) struct V2mDeviceResult {
 ///
 /// The device registers its MMIO frame and layers its `SETSPI_NS` doorbell into
 /// the chipset MSI map, so emulated-device MSIs are decoded by the map router;
-/// only the passthrough irqfd is surfaced here.
+/// passthrough devices bind their fd through the frame's doorbell sink
+/// ([`SignalMsi::bind_msi`](pci_core::msi::SignalMsi::bind_msi)), which the
+/// device holds via the SPI irqfd passed in here.
 pub(super) fn setup_v2m(
     frame_base: u64,
     spi_base: u32,
@@ -97,8 +101,9 @@ pub(super) fn setup_v2m(
 ) -> anyhow::Result<V2mDeviceResult> {
     let irqcon = partition.control_gic(Vtl::Vtl0);
     let spi_irqfd = partition.spi_irqfd();
+    let supports_routes = spi_irqfd.is_some();
 
-    let device = chipset_builder
+    let _device = chipset_builder
         .arc_mutex_device("gic_v2m")
         .add(|services| {
             gic_v2m::GicV2mDevice::new(
@@ -111,10 +116,8 @@ pub(super) fn setup_v2m(
             )
         })?;
 
-    let irqfd = device.lock().irqfd();
-
     Ok(V2mDeviceResult {
-        irqfd,
+        supports_routes,
         config: vmm_core::acpi_builder::AcpiV2mConfig {
             frame_base,
             spi_base,

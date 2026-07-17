@@ -22,11 +22,15 @@ use chipset_device::mmio::ControlMmioIntercept;
 use chipset_device::mmio::MmioIntercept;
 use chipset_device::mmio::RegisterMmioIntercept;
 use chipset_device::msi::DoorbellTarget;
-use chipset_device::msi::MsiSink;
+use chipset_device::msi::SignalMsi;
 use inspect::InspectMut;
+use pal_event::Event;
 use std::sync::Arc;
 use virt::aarch64::gic_its::GicItsBackend;
 use vmcore::device_state::ChangeDeviceState;
+use vmcore::irqfd::IrqFd;
+use vmcore::irqfd::IrqFdBinding;
+use vmcore::irqfd::KernelMsiBinding;
 use vmcore::save_restore::NoSavedState;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
@@ -79,10 +83,11 @@ impl GicItsDevice {
         // Build the doorbell sink from the backend's routing surface: the
         // ioctl-backed `SignalMsi` fast path plus, for backends that support
         // it, the pre-registered irqfd route for passthrough devices.
-        let sink = MsiSink {
+        let sink: Arc<dyn SignalMsi> = Arc::new(GicItsSink {
             signal: backend.as_signal_msi(),
             irqfd: backend.irqfd(),
-        };
+            translater_addr: backend.translater_addr(),
+        });
 
         // Register the ITS's MMIO frame and layer its `GITS_TRANSLATER`
         // doorbell onto it (offset-relative, so it follows the frame).
@@ -104,6 +109,41 @@ impl GicItsDevice {
             _control: control,
             backend,
         }
+    }
+}
+
+/// The ITS doorbell sink: a [`SignalMsi`] that delivers emulated-device MSIs
+/// through the backend's ioctl fast path, and binds passthrough-device fds
+/// through the backend's irqfd route.
+struct GicItsSink {
+    signal: Arc<dyn SignalMsi>,
+    irqfd: Option<Arc<dyn IrqFd>>,
+    translater_addr: u64,
+}
+
+impl SignalMsi for GicItsSink {
+    fn signal_msi(&self, devid: Option<u32>, address: u64, data: u32) {
+        self.signal.signal_msi(devid, address, data);
+    }
+
+    fn bind_msi(
+        &self,
+        fd: &Event,
+        devid: Option<u32>,
+        address: u64,
+        data: u32,
+    ) -> Option<Box<dyn KernelMsiBinding>> {
+        // Only writes to this ITS's `GITS_TRANSLATER` are kernel-serviceable
+        // here; a mismatch means the address resolves to a different sink, so
+        // fall back to the usermode `signal_msi` leg.
+        if address != self.translater_addr {
+            return None;
+        }
+        let route = self.irqfd.as_ref()?.new_irqfd_route(fd.clone()).ok()?;
+        if !route.enable(address, data, devid) {
+            return None;
+        }
+        Some(Box::new(IrqFdBinding(route)))
     }
 }
 

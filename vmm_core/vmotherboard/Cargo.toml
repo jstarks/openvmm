@@ -19,6 +19,7 @@ chipset_device_resources.workspace = true
 
 state_unit.workspace = true
 guestmem.workspace = true
+pal_event.workspace = true
 vmcore.workspace = true
 vm_resource.workspace = true
 

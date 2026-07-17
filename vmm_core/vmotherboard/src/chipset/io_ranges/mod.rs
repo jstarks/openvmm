@@ -430,6 +430,21 @@ impl SignalMsi for LockedRanges<u64> {
             }
         }
     }
+
+    fn bind_msi(
+        &self,
+        fd: &pal_event::Event,
+        devid: Option<u32>,
+        address: u64,
+        data: u32,
+    ) -> Option<Box<dyn vmcore::irqfd::KernelMsiBinding>> {
+        // Same address decode as `signal_msi`, but pre-register the fd for
+        // kernel-mediated delivery. A miss, or a doorbell target that is not
+        // kernel-serviceable, returns `None`; the caller then falls back to the
+        // usermode `signal_msi` leg.
+        let target = self.read().lookup_doorbell(address)?;
+        target.bind(fd, devid, address, data)
+    }
 }
 
 /// What a [`LookupResult`] resolves an address to.

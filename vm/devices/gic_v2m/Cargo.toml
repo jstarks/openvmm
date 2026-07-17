@@ -8,7 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 aarch64defs.workspace = true
-anyhow.workspace = true
 chipset_device.workspace = true
 inspect.workspace = true
 pal_event.workspace = true

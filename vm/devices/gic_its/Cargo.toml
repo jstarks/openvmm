@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 chipset_device.workspace = true
 inspect.workspace = true
+pal_event.workspace = true
 tracelimit.workspace = true
 virt.workspace = true
 vmcore.workspace = true

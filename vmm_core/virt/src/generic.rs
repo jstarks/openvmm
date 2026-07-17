@@ -446,16 +446,6 @@ pub trait Aarch64Partition: Partition {
     fn spi_irqfd(&self) -> Option<Arc<dyn IrqFd>> {
         None
     }
-
-    /// Completes GIC initialization after all post-build side devices (ITSes)
-    /// have been created.
-    ///
-    /// Backends that defer the vGIC init/enable until after ITS creation
-    /// (split-init) perform it here. The default is a no-op for backends that
-    /// fully initialize the GIC during `build()`.
-    fn finalize_gic(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 /// Extension trait for accepting initial pages.

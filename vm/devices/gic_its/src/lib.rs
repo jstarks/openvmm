@@ -84,6 +84,7 @@ impl GicItsDevice {
         // ioctl-backed `SignalMsi` fast path plus, for backends that support
         // it, the pre-registered irqfd route for passthrough devices.
         let sink: Arc<dyn SignalMsi> = Arc::new(GicItsSink {
+            segment,
             signal: backend.as_signal_msi(),
             irqfd: backend.irqfd(),
             translater_addr: backend.translater_addr(),
@@ -115,15 +116,56 @@ impl GicItsDevice {
 /// The ITS doorbell sink: a [`SignalMsi`] that delivers emulated-device MSIs
 /// through the backend's ioctl fast path, and binds passthrough-device fds
 /// through the backend's irqfd route.
+///
+/// A device's outbound MSI carries a *global* SBDF device ID (the source
+/// segment in the upper 16 bits, the segment-local BDF in the lower 16). The
+/// ITS's DeviceID space is per-segment and reused across segments, so a device
+/// may only deliver to *its own* segment's ITS: this sink translates the SBDF
+/// to a local DeviceID when the source segment matches, or drops the MSI when
+/// it does not (a device reprogrammed to target a foreign ITS). Delivering a
+/// foreign 16-bit BDF unchecked could hit a *real* device at the same BDF in
+/// this segment.
 struct GicItsSink {
+    /// This ITS's PCI segment. A source device may only deliver here if its
+    /// SBDF's segment matches.
+    segment: u16,
     signal: Arc<dyn SignalMsi>,
     irqfd: Option<Arc<dyn IrqFd>>,
     translater_addr: u64,
 }
 
+impl GicItsSink {
+    /// Translates a global SBDF device ID to this ITS's local (segment-scoped)
+    /// DeviceID, or `None` if the source segment does not match this ITS (no
+    /// such translation exists — the MSI must be dropped).
+    ///
+    /// `None` device IDs (no source identity) pass through unchanged.
+    fn translate_devid(&self, devid: Option<u32>) -> Result<Option<u32>, u16> {
+        let Some(sbdf) = devid else {
+            return Ok(None);
+        };
+        let source_segment = (sbdf >> 16) as u16;
+        if source_segment != self.segment {
+            return Err(source_segment);
+        }
+        Ok(Some(sbdf & 0xFFFF))
+    }
+}
+
 impl SignalMsi for GicItsSink {
     fn signal_msi(&self, devid: Option<u32>, address: u64, data: u32) {
-        self.signal.signal_msi(devid, address, data);
+        let local_devid = match self.translate_devid(devid) {
+            Ok(local) => local,
+            Err(source_segment) => {
+                tracelimit::warn_ratelimited!(
+                    source_segment,
+                    its_segment = self.segment,
+                    "dropped MSI: source segment does not match this ITS"
+                );
+                return;
+            }
+        };
+        self.signal.signal_msi(local_devid, address, data);
     }
 
     fn bind_msi(
@@ -139,8 +181,12 @@ impl SignalMsi for GicItsSink {
         if address != self.translater_addr {
             return None;
         }
+        // Reject a source from a foreign segment: its local BDF is meaningless
+        // (or dangerous) in this ITS. Returning `None` here also prevents a
+        // usermode fallback binding, since the same check drops in `signal_msi`.
+        let local_devid = self.translate_devid(devid).ok()?;
         let route = self.irqfd.as_ref()?.new_irqfd_route(fd.clone()).ok()?;
-        if !route.enable(address, data, devid) {
+        if !route.enable(address, data, local_devid) {
             return None;
         }
         Some(Box::new(IrqFdBinding(route)))
@@ -191,5 +237,49 @@ impl SaveRestore for GicItsDevice {
 
     fn restore(&mut self, NoSavedState: Self::SavedState) -> Result<(), RestoreError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A no-op [`SignalMsi`] for constructing a [`GicItsSink`] in tests.
+    struct NoopSignalMsi;
+    impl SignalMsi for NoopSignalMsi {
+        fn signal_msi(&self, _devid: Option<u32>, _address: u64, _data: u32) {}
+    }
+
+    fn sink(segment: u16) -> GicItsSink {
+        GicItsSink {
+            segment,
+            signal: Arc::new(NoopSignalMsi),
+            irqfd: None,
+            translater_addr: 0x1000,
+        }
+    }
+
+    #[test]
+    fn translate_matching_segment_strips_to_local_bdf() {
+        // Segment 2, BDF 0x0300: SBDF = 0x0002_0300 -> local 0x0300.
+        let sink2 = sink(2);
+        assert_eq!(sink2.translate_devid(Some(0x0002_0300)), Ok(Some(0x0300)));
+        // Segment 0 with a plain BDF is unchanged.
+        let sink0 = sink(0);
+        assert_eq!(sink0.translate_devid(Some(0x00AB)), Ok(Some(0x00AB)));
+    }
+
+    #[test]
+    fn translate_foreign_segment_is_rejected() {
+        // A device in segment 1 targeting this segment-2 ITS must be dropped,
+        // reported with the offending source segment.
+        let sink2 = sink(2);
+        assert_eq!(sink2.translate_devid(Some(0x0001_0300)), Err(1));
+    }
+
+    #[test]
+    fn translate_none_passes_through() {
+        let sink5 = sink(5);
+        assert_eq!(sink5.translate_devid(None), Ok(None));
     }
 }

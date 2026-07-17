@@ -2539,6 +2539,8 @@ impl InitializedVm {
                     &v2m_device,
                     deferred.segment,
                 ),
+                #[cfg(guest_arch = "aarch64")]
+                segment: deferred.segment,
                 #[cfg(guest_arch = "x86_64")]
                 iommu,
             }
@@ -2596,6 +2598,8 @@ impl InitializedVm {
                                 v2m_device,
                                 pi.segment,
                             ),
+                            #[cfg(guest_arch = "aarch64")]
+                            segment: pi.segment,
                             #[cfg(guest_arch = "x86_64")]
                             iommu: x86_iommu_for_rc(iommu_devices, pi.rc_idx),
                         },
@@ -3823,6 +3827,8 @@ impl LoadedVm {
                                             &self.inner.v2m_device,
                                             segment,
                                         ),
+                                        #[cfg(guest_arch = "aarch64")]
+                                        segment,
                                         #[cfg(guest_arch = "x86_64")]
                                         iommu: x86_iommu_for_rc(
                                             &self.inner.iommu_devices,

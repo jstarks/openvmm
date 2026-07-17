@@ -56,6 +56,13 @@ pub(super) struct PcieMsiPlatform<'a> {
     /// gates whether passthrough routes are enabled.
     #[cfg(guest_arch = "aarch64")]
     pub supports_routes: bool,
+    /// aarch64: the PCI segment this entity lives in. Used to augment the
+    /// RC-local requester ID into a global SBDF (segment + BDF) as the MSI
+    /// leaves the device's identity space and enters the platform fabric, so
+    /// the destination ITS can validate the source segment (see
+    /// [`SegmentTagSignalMsi`]).
+    #[cfg(guest_arch = "aarch64")]
+    pub segment: u16,
     /// x86 IOMMU shared state for interrupt remapping, or `None` if this
     /// entity is not behind an IOMMU.
     #[cfg(guest_arch = "x86_64")]
@@ -131,6 +138,54 @@ impl pci_core::msi::SignalMsi for X86RootComplexMsi {
     }
 }
 
+/// Augments an RC-local requester ID into a global SBDF on the outbound MSI
+/// path.
+///
+/// The device layer ([`MsiTarget`](pci_core::msi::MsiTarget)) composes a
+/// requester ID that is only unique *within* the device's PCI segment (a 16-bit
+/// BDF). But a device's MSI can be reprogrammed to target any ITS in the
+/// platform, and the ITS DeviceID space is per-segment and reused, so a bare
+/// BDF is ambiguous across segments. This wrapper stamps the device's home
+/// segment into the upper 16 bits — `(segment << 16) | (bdf & 0xFFFF)` — as the
+/// message leaves the device's identity space and enters the fabric, so the
+/// destination ITS can validate that the source belongs to it (and translate
+/// back to a local DeviceID) or drop it.
+///
+/// Downstream consumers that only need the local BDF (SMMU stream IDs, x86
+/// IOMMU IRTE lookups) already mask to the low 16 bits, so the augmented value
+/// is transparent to them. Mirrors the other outbound-path `SignalMsi` wrappers
+/// (`SmmuSignalMsi`, `X86RootComplexMsi`).
+#[cfg(guest_arch = "aarch64")]
+struct SegmentTagSignalMsi {
+    segment: u16,
+    inner: Arc<dyn pci_core::msi::SignalMsi>,
+}
+
+#[cfg(guest_arch = "aarch64")]
+impl SegmentTagSignalMsi {
+    /// Composes the global SBDF from an RC-local requester ID.
+    fn tag(&self, devid: Option<u32>) -> Option<u32> {
+        devid.map(|bdf| ((self.segment as u32) << 16) | (bdf & 0xFFFF))
+    }
+}
+
+#[cfg(guest_arch = "aarch64")]
+impl pci_core::msi::SignalMsi for SegmentTagSignalMsi {
+    fn signal_msi(&self, devid: Option<u32>, address: u64, data: u32) {
+        self.inner.signal_msi(self.tag(devid), address, data);
+    }
+
+    fn bind_msi(
+        &self,
+        fd: &pal_event::Event,
+        devid: Option<u32>,
+        address: u64,
+        data: u32,
+    ) -> Option<Box<dyn vmcore::irqfd::KernelMsiBinding>> {
+        self.inner.bind_msi(fd, self.tag(devid), address, data)
+    }
+}
+
 /// Wrapped `SignalMsi` for a PCIe entity, plus whether passthrough routes are
 /// supported.
 ///
@@ -186,7 +241,13 @@ impl PcieMsiPlatform<'_> {
         let (signal_msi, supports_routes): (
             Option<Arc<dyn pci_core::msi::SignalMsi>>,
             bool,
-        ) = (Some(self.msi_router.clone()), self.supports_routes);
+        ) = (
+            Some(Arc::new(SegmentTagSignalMsi {
+                segment: self.segment,
+                inner: self.msi_router.clone(),
+            }) as Arc<dyn pci_core::msi::SignalMsi>),
+            self.supports_routes,
+        );
 
         #[cfg(guest_arch = "x86_64")]
         let mut signal_msi: Option<Arc<dyn pci_core::msi::SignalMsi>> =
@@ -338,5 +399,39 @@ pub(super) fn build_device_wiring(params: PcieDeviceWiringParams<'_>) -> PcieDev
             params.msi,
         ),
         msi,
+    }
+}
+
+#[cfg(all(test, guest_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use pci_core::msi::SignalMsi;
+
+    /// Records the `devid`s forwarded downstream so tests can observe the SBDF
+    /// composed by [`SegmentTagSignalMsi`].
+    struct RecordingSignalMsi(parking_lot::Mutex<Vec<Option<u32>>>);
+    impl SignalMsi for RecordingSignalMsi {
+        fn signal_msi(&self, devid: Option<u32>, _address: u64, _data: u32) {
+            self.0.lock().push(devid);
+        }
+    }
+
+    #[test]
+    fn segment_tag_composes_global_sbdf() {
+        let inner = Arc::new(RecordingSignalMsi(parking_lot::Mutex::new(Vec::new())));
+        let tag = SegmentTagSignalMsi {
+            segment: 3,
+            inner: inner.clone(),
+        };
+        // Segment 3, BDF 0x0100 -> SBDF 0x0003_0100.
+        tag.signal_msi(Some(0x0100), 0, 0);
+        // Only the low 16 bits of the incoming RID are kept.
+        tag.signal_msi(Some(0xDEAD_0200), 0, 0);
+        // `None` passes through unchanged.
+        tag.signal_msi(None, 0, 0);
+        assert_eq!(
+            *inner.0.lock(),
+            vec![Some(0x0003_0100), Some(0x0003_0200), None]
+        );
     }
 }

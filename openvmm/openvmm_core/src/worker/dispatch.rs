@@ -2424,6 +2424,7 @@ impl InitializedVm {
                 partition: partition.as_ref(),
                 segment: deferred.segment,
                 processor_topology: &processor_topology,
+                driver: Arc::new(driver_source.simple()) as Arc<dyn pal_async::driver::SpawnDriver>,
                 #[cfg(guest_arch = "x86_64")]
                 iommu,
             }
@@ -2470,6 +2471,8 @@ impl InitializedVm {
                             partition: partition.as_ref(),
                             segment: pi.segment,
                             processor_topology,
+                            driver: Arc::new(driver_source.simple())
+                                as Arc<dyn pal_async::driver::SpawnDriver>,
                             #[cfg(guest_arch = "x86_64")]
                             iommu: x86_iommu_for_rc(iommu_devices, pi.rc_idx),
                         },
@@ -3673,6 +3676,8 @@ impl LoadedVm {
                                         partition: self.inner.partition.as_ref(),
                                         segment,
                                         processor_topology: &self.inner.processor_topology,
+                                        driver: Arc::new(self.inner.driver_source.simple())
+                                            as Arc<dyn pal_async::driver::SpawnDriver>,
                                         #[cfg(guest_arch = "x86_64")]
                                         iommu: x86_iommu_for_rc(
                                             &self.inner.iommu_devices,

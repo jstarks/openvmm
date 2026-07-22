@@ -987,6 +987,7 @@ impl PetriVmConfigSetupCore<'_> {
                     force_dma_bounce: *force_dma_bounce,
                     enable_hv: !self.no_hv,
                     hibernation_enabled: self.hibernation_enabled,
+                    force_firmware_version: false,
                 }
             }
             (

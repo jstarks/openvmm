@@ -3405,6 +3405,7 @@ impl LoadedVmInner {
                 force_dma_bounce,
                 enable_hv,
                 hibernation_enabled,
+                force_firmware_version,
             } => {
                 let acpi_tables = [
                     // MADT
@@ -3443,6 +3444,7 @@ impl LoadedVmInner {
                     force_dma_bounce,
                     hv: enable_hv,
                     hibernation: hibernation_enabled,
+                    force_firmware_version,
                 };
                 let regs =
                     super::vm_loaders::uefi::load_uefi(&super::vm_loaders::uefi::LoadUefiParams {

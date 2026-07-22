@@ -166,6 +166,7 @@ pub enum LoadMode {
         enable_hv: bool,
         /// Whether the guest firmware should enable hibernation (S4) support.
         hibernation_enabled: bool,
+        force_firmware_version: bool,
     },
     Pcat {
         firmware: RomFileLocation,

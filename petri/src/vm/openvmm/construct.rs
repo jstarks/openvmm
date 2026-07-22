@@ -917,6 +917,7 @@ impl PetriVmConfigSetupCore<'_> {
                     bios_guid: Guid::new_random(),
                     enable_vmbus: !self.no_vmbus,
                     force_dma_bounce: *force_dma_bounce,
+                    force_firmware_version: false,
                 }
             }
             (

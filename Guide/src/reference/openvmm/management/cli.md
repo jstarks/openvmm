@@ -82,8 +82,18 @@ as well as the generated CLI help (via `cargo run -- --help`).
   as Virtual Secure Mode (VSM), which can hurt performance and interfere with
   VMBus devices; nested virt cannot currently be combined with `--hv`/VMBus or
   `--hypervisor whp:user_mode_apic`.
-* `--uefi`: Boot using `mu_msvm` UEFI
-* `--uefi-firmware <FILE>`: Path to the UEFI firmware file (`MSVM.fd`). When `--uefi` is specified, this option is required only if you do not set the environment variable `OPENVMM_UEFI_FIRMWARE` (or the architecture-specific variants `X86_64_OPENVMM_UEFI_FIRMWARE`, or `AARCH64_OPENVMM_UEFI_FIRMWARE`). If omitted, the default is read from `OPENVMM_UEFI_FIRMWARE` first, then falls back to the architecture-specific variables.
+* `--uefi [OPTIONS]`: Boot using `mu_msvm` UEFI. Options are comma-separated:
+  * `firmware=<FILE>`: Path to the UEFI firmware file (`MSVM.fd`). If omitted, the default is read from `OPENVMM_UEFI_FIRMWARE`, then from `X86_64_OPENVMM_UEFI_FIRMWARE` or `AARCH64_OPENVMM_UEFI_FIRMWARE`.
+  * `debug`: Enable UEFI debugging on COM1.
+  * `enable_memory_protections`: Enable UEFI memory protections.
+  * `force_dma_bounce`: Force UEFI to bounce-buffer all DMA traffic.
+  * `force_firmware_version`: Continue when a present version record is malformed or declares an incompatible interface version. A missing record only produces a warning.
+  * `disable_frontpage`: Shut down instead of showing the UEFI front page.
+  * `console=<default|com1|com2|none>`: Select the UEFI console.
+  * `diagnostics=<default|info|full>`: Select the EFI diagnostics log level.
+  * `default_boot_always_attempt`: Attempt the default boot path even if configured boot entries exist and fail.
+
+  The previous standalone UEFI options remain accepted but are deprecated.
 * `--pcat`: Boot using the Microsoft Hyper-V PCAT BIOS
 * `--vmbus-scsi id=<name>[,sub_channels=<N>][,vtl2]`: Creates a
   named VMBus SCSI controller. Use with `--disk ...,on=<name>` to
@@ -232,10 +242,9 @@ status code as `exit:<code>` (0-255); a bare `exit` uses 0:
 A bare `exit` exits with status 0; `exit:<code>` exits with that code instead, so
 a supervisor can tell the exit reasons apart.
 
-`--disable-frontpage`: when booting UEFI, power the VM off instead of showing the
-firmware frontpage (the menu shown when there is no bootable device). Combined
-with `--guest-shutdown-action exit`, a guest with no boot device exits the VMM.
-Requires `--uefi`.
+The `--uefi disable_frontpage` option powers the VM off instead of showing the
+firmware frontpage when there is no bootable device. Combined with
+`--guest-shutdown-action exit`, a guest with no boot device exits the VMM.
 
 ## PCIe Device Support
 

@@ -18,6 +18,31 @@ const SECTOR_SIZE: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 const ESP_GUID: Guid = guid::guid!("C12A7328-F81F-11D2-BA4B-00A0C93EC93B");
 
+#[derive(Debug)]
+struct ImageTimeProvider;
+
+impl fatfs::TimeProvider for ImageTimeProvider {
+    fn get_current_date(&self) -> fatfs::Date {
+        fatfs::Date {
+            year: 1980,
+            month: 1,
+            day: 1,
+        }
+    }
+
+    fn get_current_date_time(&self) -> fatfs::DateTime {
+        fatfs::DateTime {
+            date: self.get_current_date(),
+            time: fatfs::Time {
+                hour: 0,
+                min: 0,
+                sec: 0,
+                millis: 0,
+            },
+        }
+    }
+}
+
 /// Inputs for a disposable boot disk. No installed Linux root filesystem is
 /// required; the initramfs must supply `/init`.
 pub struct MshvImage<'a> {
@@ -107,7 +132,12 @@ impl MshvImage<'_> {
                 .volume_label(*b"MSHV_BOOT  "),
         )?;
         partition.rewind()?;
-        let fs = fatfs::FileSystem::new(partition, fatfs::FsOptions::new())?;
+        // Without chrono, fatfs defaults to invalid month/day zero. Use a valid
+        // fixed FAT epoch for all files and directories instead of host time.
+        let fs = fatfs::FileSystem::new(
+            partition,
+            fatfs::FsOptions::new().time_provider(&ImageTimeProvider),
+        )?;
         {
             let root = fs.root_dir();
             for (destination, source) in &files {
@@ -281,6 +311,7 @@ mod tests {
         )?;
         let fs = fatfs::FileSystem::new(partition, fatfs::FsOptions::new())?;
         assert_eq!(fs.fat_type(), fatfs::FatType::Fat32);
+        assert_valid_timestamps(&fs.root_dir())?;
         for path in [
             "EFI/BOOT/BOOTX64.EFI",
             "EFI/BOOT/grubx64.efi",
@@ -308,6 +339,24 @@ mod tests {
         fs_err::remove_file(payload.join("Windows/System32/hvix64.exe"))?;
         assert!(inputs.build(&dir.path().join("missing.img")).is_err());
         assert!(!dir.path().join("missing.img").exists());
+        Ok(())
+    }
+
+    fn assert_valid_timestamps<T: fatfs::ReadWriteSeek>(
+        directory: &fatfs::Dir<'_, T>,
+    ) -> anyhow::Result<()> {
+        use fatfs::TimeProvider;
+
+        for entry in directory.iter() {
+            let entry = entry?;
+            let expected = ImageTimeProvider.get_current_date_time();
+            assert_eq!(entry.created(), expected, "{}", entry.file_name());
+            assert_eq!(entry.modified(), expected, "{}", entry.file_name());
+            assert_eq!(entry.accessed(), expected.date, "{}", entry.file_name());
+            if entry.is_dir() && !matches!(entry.file_name().as_str(), "." | "..") {
+                assert_valid_timestamps(&entry.to_dir())?;
+            }
+        }
         Ok(())
     }
 

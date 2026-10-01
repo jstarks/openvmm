@@ -641,6 +641,7 @@ rusqlite = "0.37"
 # --- Binary parsing ---
 elfcore = "2.0.1"
 object = { version = "0.37.3", default-features = false }
+rpm = { version = "0.29", default-features = false }
 
 # --- Virtualization / hypervisor / firmware ---
 # iced has negative features, which aren't how features are supposed to work, but disable them here along with default features.

@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod mshv_image;
 mod path_mapping;
 mod profile;
 mod qemu;

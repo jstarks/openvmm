@@ -1,5 +1,9 @@
 # Incubator
 
+For the experimental standalone mshv image composer, see
+[Minimal mshv boot image](mshv-boot-image.md). It does not yet add an execution
+backend to Incubator.
+
 Incubator runs cross-compiled test executables inside a QEMU-emulated Linux
 environment when the host cannot provide the required architecture or hardware
 model.

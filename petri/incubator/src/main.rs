@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! QEMU-backed runner for executing test commands in an emulated Linux guest.
+//! Runner for executing test commands in a disposable Linux guest.
 //!
-//! Incubator reads a TOML hardware profile, boots a QEMU TCG VM with a shared
+//! Incubator reads a TOML hardware profile, boots a VM with a shared
 //! host directory, connects to the in-guest Pipette agent, and returns the
 //! requested command's exit status. It is used for configurations such as
 //! AArch64 PCIe, IOMMU, and device-assignment tests that need hardware models
@@ -65,7 +65,7 @@ struct Args {
     /// runner, where raw mode would interfere with nextest's Ctrl-C handling.
     #[clap(long, env = "INCUBATOR_NO_PTY")]
     no_pty: bool,
-    /// Timeout in seconds.
+    /// Timeout in seconds: boot for QEMU, boot and command for OpenVMM/mshv.
     #[clap(long, env = "INCUBATOR_TIMEOUT", default_value_t = 300)]
     timeout: u64,
     /// Command to run in the guest: the program followed by its arguments.
@@ -98,6 +98,15 @@ fn main() -> anyhow::Result<()> {
     let arch = profile.incubator.arch();
     let kernel = match args.kernel {
         Some(kernel) => kernel,
+        None if matches!(
+            profile.incubator,
+            incubator::IncubatorBackend::OpenvmmMshv(_)
+        ) =>
+        {
+            anyhow::bail!(
+                "openvmm-mshv requires an explicit --kernel / INCUBATOR_KERNEL with mshv EFI launch support"
+            )
+        }
         None => kernel_or_initrd_from_env(arch, "OPENVMM_LINUX_DIRECT_KERNEL")?,
     };
     let initrd = match args.initrd {

@@ -244,10 +244,19 @@ fn create_file<'a, T: fatfs::ReadWriteSeek>(
 
 fn grub_config(cmdline: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
-        !cmdline.chars().any(|c| c.is_control() || c == '\''),
-        "kernel command line must not contain control characters or single quotes"
+        !cmdline
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\'' | '"')),
+        "kernel command line must not contain control characters or quotes"
     );
-    // Single quoting preserves $, backslashes, and other GRUB metacharacters.
+    // GRUB re-quotes arguments containing spaces when building the Linux
+    // command line. Pass each option separately, not the entire line as one.
+    let cmdline = cmdline
+        .split(' ')
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| format!("'{arg}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
     Ok(format!(
         "set timeout=0\n\
          set default=0\n\
@@ -255,7 +264,7 @@ fn grub_config(cmdline: &str) -> anyhow::Result<String> {
          search --no-floppy --set=root --file /HvLoader.efi\n\
          if chainloader /HvLoader.efi lxhvloader.dll 'MSHV_ROOT=\\Windows' MSHV_ENABLE=TRUE MSHV_SCHEDULER_TYPE=ROOT MSHV_X2APIC_POLICY=ENABLE MSHV_FORCE_NESTED=TRUE; then\n\
            if boot; then\n\
-             if linux /bzImage '{cmdline}'; then\n\
+             if linux /bzImage {cmdline}; then\n\
                if initrd /initramfs.cpio; then\n\
                  boot\n\
                fi\n\
@@ -363,8 +372,8 @@ mod tests {
     #[test]
     fn command_line_is_literal() -> anyhow::Result<()> {
         let config = grub_config("rdinit=/init x=$root;halt")?;
-        assert!(config.contains("linux /bzImage 'rdinit=/init x=$root;halt'"));
-        for invalid in ["x\nhalt", "x\rhalt", "x\0halt", "x'"] {
+        assert!(config.contains("linux /bzImage 'rdinit=/init' 'x=$root;halt'"));
+        for invalid in ["x\nhalt", "x\rhalt", "x\0halt", "x'", "x=\"a b\""] {
             assert!(grub_config(invalid).is_err());
         }
         Ok(())

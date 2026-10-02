@@ -132,8 +132,16 @@ impl SimpleFlowNode for Node {
                 let repo_root = rt.read(repo_root).absolute()?;
                 let incubator_bin = rt.read(incubator).bin.absolute()?;
                 let profile_path = incubator_profile.resolve(&repo_root).absolute()?;
-                let kernel = kernel.map(|v| rt.read(v).absolute()).transpose()?;
-                let initrd = initrd.map(|v| rt.read(v).absolute()).transpose()?;
+                let kernel = std::env::var_os("INCUBATOR_KERNEL")
+                    .map(PathBuf::from)
+                    .or_else(|| kernel.map(|v| rt.read(v)))
+                    .map(|p| p.absolute())
+                    .transpose()?;
+                let initrd = std::env::var_os("INCUBATOR_INITRD")
+                    .map(PathBuf::from)
+                    .or_else(|| initrd.map(|v| rt.read(v)))
+                    .map(|p| p.absolute())
+                    .transpose()?;
                 let test_content_dir = rt.read(test_content_dir).absolute()?;
                 let extra_share_paths = rt
                     .read(extra_share_paths)

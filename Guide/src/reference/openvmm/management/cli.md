@@ -19,6 +19,10 @@ describes the source definitions.
   `MAJOR.MINOR.PATCH`. On Windows, the executable's `VERSIONINFO` uses the
   product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
+* `--headless`: Disables the interactive terminal and REPL while retaining
+  VM lifecycle handling and configured serial output. Use
+  `--guest-shutdown-action exit` and `--guest-reset-action exit:1` for an
+  automated cold-boot runner. The default remains interactive.
 * `--memory <SPEC>`: Configure guest RAM. Defaults to `size=1G`.
   `SPEC` can be a size-only shorthand, such as `--memory 4G`, or a
   comma-separated key/value list:

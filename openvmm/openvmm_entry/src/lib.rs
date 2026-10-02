@@ -3039,6 +3039,7 @@ async fn run_control_inner(
     // Run the REPL with shareable resources.
     let repl_result = repl::run_repl(
         driver,
+        opt.headless,
         repl::ReplResources {
             vm_rpc,
             vm_controller: vm_controller_send,

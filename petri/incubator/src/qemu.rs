@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! QEMU process management.
+//! QEMU launch configuration and shared guest bootstrap/process helpers.
 
 use crate::GUEST_SHARE_ROOT;
 use crate::profile::DeviceConfig;
@@ -10,7 +10,6 @@ use anyhow::Context;
 use futures::AsyncReadExt;
 use futures_concurrency::future::Race;
 use pal_async::pipe::PolledPipe;
-use pal_async::process::PolledChild;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
@@ -21,7 +20,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 /// Filename of the injected init script, run by the kernel as `rdinit`.
-const INIT_SCRIPT_NAME: &str = "tcg-init.sh";
+pub(crate) const INIT_SCRIPT_NAME: &str = "tcg-init.sh";
 /// Filename of the host CA bundle injected into the initrd.
 const CA_CERTIFICATES_NAME: &str = "incubator-ca-certificates.crt";
 
@@ -165,7 +164,7 @@ fn parse_size(s: &str) -> anyhow::Result<u64> {
 /// Sets up the environment, mounts the virtio-9p share, brings up networking,
 /// and launches pipette in TCP mode. Pipette then waits for the host to
 /// connect and send commands.
-fn build_init_script(guest_pipette_path: &str) -> String {
+pub(crate) fn build_init_script(guest_pipette_path: &str) -> String {
     let guest_pipette_path = shell_single_quote(guest_pipette_path);
     let guest_share_root = shell_single_quote(GUEST_SHARE_ROOT);
     let host_epoch_seconds = SystemTime::now()
@@ -197,17 +196,17 @@ fn build_init_script(guest_pipette_path: &str) -> String {
     )
 }
 
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Prepare the boot initrd by injecting the init script into the base initrd.
+/// Prepare the boot initrd by injecting a backend-specific init script.
 ///
 /// Reads the gzip-compressed base initrd, injects the `rdinit` script (see
 /// [`build_init_script`]) under [`INIT_SCRIPT_NAME`], and writes the patched
 /// initrd to a uniquely-named temporary file under `scratch_dir`. The returned
 /// [`tempfile::TempPath`] deletes the file when dropped, so the caller must
-/// keep it alive for as long as QEMU needs to read the initrd.
+/// keep it alive for as long as the backend needs to read the initrd.
 ///
 /// A unique temp file (rather than a fixed name) is required because multiple
 /// incubator processes run concurrently under nextest and share the same
@@ -215,14 +214,14 @@ fn shell_single_quote(s: &str) -> String {
 pub fn prepare_initrd(
     base_initrd: &Path,
     scratch_dir: &Path,
-    guest_pipette_path: &str,
+    script: &str,
 ) -> anyhow::Result<tempfile::TempPath> {
     let initrd_data = std::fs::read(base_initrd).context("failed to read initrd")?;
 
     let patched_initrd = initrd_cpio::inject_into_initrd(
         &initrd_data,
         INIT_SCRIPT_NAME,
-        build_init_script(guest_pipette_path).as_bytes(),
+        script.as_bytes(),
         0o100755, // regular file, rwxr-xr-x
     )
     .context("failed to inject init script into initrd")?;
@@ -275,52 +274,45 @@ fn host_ca_certificates_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Wait for pipette to signal readiness via the serial console relay
-/// task. Races against QEMU exit and a timeout.
+/// task. Races against VMM exit and a timeout.
 pub async fn wait_for_pipette_ready(
     driver: &impl pal_async::driver::Driver,
     timeout: Duration,
-    qemu_child: &mut PolledChild<std::process::Child>,
+    qemu_child: &mut std::process::Child,
     ready_rx: mesh::OneshotReceiver<()>,
 ) -> anyhow::Result<()> {
-    enum Event {
-        Ready,
-        QemuExited(std::process::ExitStatus),
-        Timeout,
-    }
-
-    let event = (
+    (
         async {
-            match ready_rx.await {
-                Ok(()) => Event::Ready,
-                // Sender dropped without sending — relay task exited
-                // without seeing the marker (QEMU likely crashed).
-                Err(_) => Event::QemuExited(std::process::ExitStatus::default()),
-            }
+            ready_rx
+                .await
+                .context("serial stream ended before Pipette was ready")
         },
         async {
-            match qemu_child.wait().await {
-                Ok(status) => Event::QemuExited(status),
-                Err(_) => Event::QemuExited(std::process::ExitStatus::default()),
-            }
+            let status = wait_for_exit(driver, qemu_child).await?;
+            anyhow::bail!("VMM exited before Pipette was ready: {status}")
         },
         async {
             pal_async::timer::PolledTimer::new(driver)
                 .sleep(timeout)
                 .await;
-            Event::Timeout
+            anyhow::bail!("timed out waiting for Pipette ready signal")
         },
     )
         .race()
-        .await;
+        .await
+}
 
-    match event {
-        Event::Ready => Ok(()),
-        Event::QemuExited(status) => {
-            anyhow::bail!("QEMU exited before pipette was ready (status: {status})");
+/// Wait without blocking the executor or taking ownership of the child.
+pub(crate) async fn wait_for_exit(
+    driver: &impl pal_async::driver::Driver,
+    child: &mut std::process::Child,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let mut timer = pal_async::timer::PolledTimer::new(driver);
+    loop {
+        if let Some(status) = child.try_wait().context("waiting for incubator VMM")? {
+            return Ok(status);
         }
-        Event::Timeout => {
-            anyhow::bail!("timed out waiting for pipette ready signal");
-        }
+        timer.sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -330,14 +322,8 @@ pub async fn relay_serial_output(
     mut stdout: PolledPipe,
     log_path: &Path,
     ready_tx: mesh::OneshotSender<()>,
-) {
-    let mut log = match std::fs::File::create(log_path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create serial log");
-            return;
-        }
-    };
+) -> anyhow::Result<()> {
+    let mut log = fs_err::File::create(log_path)?;
 
     let mut ready_tx = Some(ready_tx);
     let mut buf = vec![0u8; 4096];
@@ -349,13 +335,16 @@ pub async fn relay_serial_output(
     let mut window = Vec::new();
 
     loop {
-        let n = match stdout.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
+        let n = stdout
+            .read(&mut buf)
+            .await
+            .context("reading VMM serial output")?;
+        if n == 0 {
+            break;
+        }
 
         let chunk = &buf[..n];
-        let _ = log.write_all(chunk);
+        log.write_all(chunk).context("writing VMM serial log")?;
 
         // Scan for the readiness marker. This does not depend on the marker
         // being newline-terminated: we append the new bytes and look for the
@@ -374,6 +363,7 @@ pub async fn relay_serial_output(
             }
         }
     }
+    Ok(())
 }
 
 /// Convert a child process's stdout/stderr pipe into a [`std::fs::File`] so it

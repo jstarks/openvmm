@@ -23,6 +23,8 @@ pub struct IncubatorProfile {
 pub enum IncubatorBackend {
     /// QEMU TCG emulation.
     QemuTcg(QemuTcgConfig),
+    /// OpenVMM/KVM hosting an x86-64 mshv root partition.
+    OpenvmmMshv(OpenvmmMshvConfig),
 }
 
 impl IncubatorBackend {
@@ -30,8 +32,25 @@ impl IncubatorBackend {
     pub fn arch(&self) -> Arch {
         match self {
             IncubatorBackend::QemuTcg(config) => config.arch,
+            IncubatorBackend::OpenvmmMshv(_) => Arch::X86_64,
         }
     }
+}
+
+/// Explicit local inputs for the experimental mshv environment.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OpenvmmMshvConfig {
+    /// Native host OpenVMM executable, independent of the guest test build.
+    pub binary: std::path::PathBuf,
+    /// MSVM x64 UEFI firmware.
+    pub firmware: std::path::PathBuf,
+    /// Extracted artifact directory containing `boot/`.
+    pub boot_artifacts: std::path::PathBuf,
+    /// Outer VM memory size.
+    pub memory: String,
+    /// Outer VM processor count.
+    pub processors: u32,
 }
 
 /// Guest architecture emulated by an incubator backend.

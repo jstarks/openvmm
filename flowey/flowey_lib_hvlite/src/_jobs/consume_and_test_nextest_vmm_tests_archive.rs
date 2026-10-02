@@ -290,23 +290,29 @@ impl SimpleFlowNode for Node {
 
             let arch = crate::common::CommonArch::from_architecture(target.architecture)?;
 
-            let kernel = ctx.reqv(|v| {
-                crate::resolve_openvmm_test_linux_kernel::Request::Get(
+            // The x64 mshv environment requires an explicitly supplied kernel
+            // with EFI launch support; do not substitute a stock test kernel.
+            let kernel = (arch == crate::common::CommonArch::Aarch64).then(|| {
+                ctx.reqv(|v| {
+                    crate::resolve_openvmm_test_linux_kernel::Request::Get(
                     crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
                     arch,
                     crate::resolve_openvmm_test_linux_kernel::INCUBATOR_LINUX_TEST_KERNEL_VERSION,
                     v,
                 )
+                })
             });
             let initrd = ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
 
             let host_arch: crate::common::CommonArch = ctx.arch().try_into()?;
-            let qemu_binary = ctx.reqv(|v| {
-                crate::resolve_openvmm_qemu::Request::Get(
-                    crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
-                    host_arch,
-                    v,
-                )
+            let qemu_binary = (arch == crate::common::CommonArch::Aarch64).then(|| {
+                ctx.reqv(|v| {
+                    crate::resolve_openvmm_qemu::Request::Get(
+                        crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
+                        host_arch,
+                        v,
+                    )
+                })
             });
 
             let nextest_archive = nextest_vmm_tests_archive
@@ -316,13 +322,13 @@ impl SimpleFlowNode for Node {
             ctx.reqv(|v| crate::write_incubator_target_runner::Request {
                 incubator,
                 incubator_profile,
-                kernel: Some(kernel),
+                kernel,
                 initrd: Some(initrd),
                 repo_root: openvmm_repo_path.clone(),
                 test_content_dir: test_content_dir.clone(),
                 extra_share_paths: vec![nextest_archive, nextest_config_file.clone()],
                 extra_env: Some(extra_env),
-                qemu_binary: Some(qemu_binary),
+                qemu_binary,
                 target: target.clone(),
                 nextest_env: v,
             })

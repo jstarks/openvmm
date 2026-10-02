@@ -927,6 +927,10 @@ Examples:
     #[clap(long)]
     pub single_process: bool,
 
+    /// run without an interactive terminal; use guest power actions to exit
+    #[clap(long)]
+    pub headless: bool,
+
     /// device to assign (can be passed multiple times)
     #[cfg(windows)]
     #[clap(long, value_name = "PATH")]
@@ -5551,6 +5555,16 @@ mod tests {
         assert!(
             Options::try_parse_from(["openvmm", "--uefi", "--no-hv", "--no-vmbus", "--hv"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn headless_is_opt_in() {
+        assert!(!Options::try_parse_from(["openvmm"]).unwrap().headless);
+        assert!(
+            Options::try_parse_from(["openvmm", "--headless"])
+                .unwrap()
+                .headless
         );
     }
 

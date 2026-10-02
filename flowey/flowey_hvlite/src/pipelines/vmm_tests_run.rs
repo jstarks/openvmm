@@ -683,6 +683,8 @@ pub(crate) enum VmmTestTargetCli {
     WindowsX64,
     /// Linux X64
     LinuxX64,
+    /// Linux X64 (musl, for mshv Incubator and Dom0)
+    LinuxX64Musl,
     /// Linux Aarch64 (musl, for incubator cross-compilation)
     LinuxAarch64Musl,
 }
@@ -710,6 +712,7 @@ pub(crate) fn resolve_target(
         VmmTestTargetCli::WindowsAarch64 => CommonTriple::AARCH64_WINDOWS_MSVC,
         VmmTestTargetCli::WindowsX64 => CommonTriple::X86_64_WINDOWS_MSVC,
         VmmTestTargetCli::LinuxX64 => CommonTriple::X86_64_LINUX_GNU,
+        VmmTestTargetCli::LinuxX64Musl => CommonTriple::X86_64_LINUX_MUSL,
         VmmTestTargetCli::LinuxAarch64Musl => CommonTriple::AARCH64_LINUX_MUSL,
     })
 }

@@ -443,6 +443,7 @@ pub(crate) struct ReplResources {
 /// Run the interactive REPL.
 pub(crate) async fn run_repl(
     driver: &DefaultDriver,
+    headless: bool,
     resources: ReplResources,
 ) -> anyhow::Result<i32> {
     let ReplResources {
@@ -457,6 +458,25 @@ pub(crate) async fn run_repl(
         console_in,
         has_vtl2,
     } = resources;
+
+    if headless {
+        while let Some(event) = vm_controller_events.next().await {
+            match event {
+                VmControllerEvent::ExitRequested { code } => return Ok(code),
+                VmControllerEvent::WorkerStopped { error } => {
+                    if let Some(error) = error {
+                        anyhow::bail!("vm worker stopped: {error}");
+                    }
+                    return Ok(0);
+                }
+                VmControllerEvent::GuestHalt(reason) => {
+                    tracing::info!(reason = reason.as_str(), "guest halted");
+                }
+                VmControllerEvent::VncWorkerStopped { .. } => {}
+            }
+        }
+        anyhow::bail!("VM controller closed without an exit event");
+    }
 
     let (console_command_send, console_command_recv) = mesh::channel();
     let (inspect_completion_engine_send, inspect_completion_engine_recv) = mesh::channel();

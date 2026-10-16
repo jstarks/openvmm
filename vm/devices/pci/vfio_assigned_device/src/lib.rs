@@ -523,6 +523,15 @@ impl VfioAssignedPciDevice {
                 .device
                 .region_mmap_areas(i as u32)
                 .with_context(|| format!("failed to query VFIO mmap areas for BAR {i}"))?;
+            tracing::debug!(
+                pci_id = pci_id.as_str(),
+                bar = i,
+                size = info.size,
+                vfio_offset = info.offset,
+                flags = ?info.flags,
+                mmap_areas = ?bar_mmap_areas[i],
+                "queried VFIO BAR region"
+            );
         }
 
         // Walk both the standard and extended PCI capability chains in a
@@ -556,6 +565,17 @@ impl VfioAssignedPciDevice {
         // the mmap areas so they remain trap-and-emulate.
         if let Some(msix) = &msix {
             subtract_msix_regions(&mut bar_mmap_areas, msix);
+        }
+        for (bar, region) in bar_regions.iter().enumerate() {
+            if let Some(region) = region {
+                tracing::debug!(
+                    pci_id = pci_id.as_str(),
+                    bar,
+                    size = region.size,
+                    direct_map_areas = ?bar_mmap_areas[bar],
+                    "configured VFIO BAR direct mappings"
+                );
+            }
         }
 
         // Create direct BAR mappings for mmappable regions. Each
@@ -880,6 +900,15 @@ impl VfioAssignedPciDevice {
             if new_addr == Some(old.base_address) {
                 continue;
             }
+            tracing::debug!(
+                pci_id = self.pci_id.as_str(),
+                bar = old.index,
+                gpa = old.base_address,
+                size = old.len,
+                mmio_enabled = self.mmio_enabled,
+                in_d0 = self.in_d0,
+                "unmapping VFIO BAR"
+            );
             // Address changed or BAR disappeared — tear down old mapping.
             if let Some(control) = self.bar_mmio_controls[old.index as usize].as_mut() {
                 control.unmap();
@@ -887,6 +916,12 @@ impl VfioAssignedPciDevice {
             for dm in &mut self.bar_direct_maps {
                 if dm.bar_index == old.index {
                     dm.memory.unmap_from_guest();
+                    tracing::debug!(
+                        pci_id = self.pci_id.as_str(),
+                        bar = dm.bar_index,
+                        mapping = ?dm.mapping,
+                        "unmapped VFIO BAR direct mapping"
+                    );
                     dm.mapping = None;
                 }
             }
@@ -898,6 +933,13 @@ impl VfioAssignedPciDevice {
             if old_addr == Some(new.base_address) {
                 continue;
             }
+            tracing::debug!(
+                pci_id = self.pci_id.as_str(),
+                bar = new.index,
+                gpa = new.base_address,
+                size = new.len,
+                "mapping VFIO BAR"
+            );
             // New or moved — set up mapping.
             self.bar_mmio_controls[new.index as usize]
                 .as_mut()
@@ -910,11 +952,21 @@ impl VfioAssignedPciDevice {
                     match dm.memory.map_to_guest(gpa, true) {
                         Ok(()) => {
                             dm.mapping = Some(MemoryRange::new(gpa..gpa + dm.bar_range.len()));
+                            tracing::debug!(
+                                pci_id = self.pci_id.as_str(),
+                                bar = dm.bar_index,
+                                gpa,
+                                bar_offset = dm.bar_range.start(),
+                                size = dm.bar_range.len(),
+                                "registered VFIO BAR direct mapping"
+                            );
                         }
                         Err(e) => {
                             tracelimit::error_ratelimited!(
                                 bar = dm.bar_index,
                                 gpa,
+                                bar_offset = dm.bar_range.start(),
+                                size = dm.bar_range.len(),
                                 error = &e as &dyn std::error::Error,
                                 pci_id = self.pci_id.as_str(),
                                 "failed to direct-map BAR region to guest"
@@ -1693,6 +1745,12 @@ impl PciConfigSpace for VfioAssignedPciDevice {
     }
 
     fn pci_cfg_write(&mut self, offset: u16, value: ByteEnabledDwordWrite) -> IoResult {
+        tracing::trace!(
+            pci_id = self.pci_id.as_str(),
+            offset,
+            ?value,
+            "VFIO config space write"
+        );
         match HeaderType00(offset) {
             // Command register: track MMIO enable/disable.
             HeaderType00::STATUS_COMMAND => {
@@ -1792,10 +1850,11 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                         // Leaving D0: unmap BARs first, then forward.
                         self.write_phys_config(offset, value);
                     }
-                    if new_in_d0 && !old_in_d0 {
+                    if new_in_d0 != old_in_d0 {
                         tracing::debug!(
                             pci_id = self.pci_id.as_str(),
                             power_state,
+                            was_in_d0 = old_in_d0,
                             in_d0 = new_in_d0,
                             "PM power state changed by guest"
                         );

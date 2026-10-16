@@ -994,6 +994,14 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
         )
         .entered();
         let mapped = self.isolation.map_user_memory(&self.vmfd, mem_region)?;
+        tracing::debug!(
+            gpa = addr,
+            size,
+            writable,
+            exec,
+            kernel_registered = mapped,
+            "registered mshv memory range"
+        );
         state.ranges[slot_to_use] = Some(MshvMemoryRange {
             region: mem_region,
             mapped,
@@ -1041,6 +1049,12 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
                 if range.mapped {
                     self.vmfd.unmap_user_memory(*region)?;
                 }
+                tracing::debug!(
+                    gpa = region.guest_pfn << HV_PAGE_SHIFT,
+                    size = region.size,
+                    kernel_registered = range.mapped,
+                    "unregistered mshv memory range"
+                );
                 *entry = None;
             }
         }

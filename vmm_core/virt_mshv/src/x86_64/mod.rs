@@ -970,6 +970,37 @@ impl MshvProcessor<'_> {
     ) -> Result<(), VpHaltReason> {
         let info = message.as_message::<hvdef::HvX64MemoryInterceptMessage>();
         let interruption_pending = info.header.execution_state.interruption_pending();
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let gpa = info.guest_physical_address;
+            let mapping = self
+                .partition
+                .memory
+                .lock()
+                .ranges
+                .iter()
+                .flatten()
+                .find(|mapping| {
+                    let start = mapping.region.guest_pfn << hvdef::HV_PAGE_SHIFT;
+                    gpa >= start && gpa - start < mapping.region.size
+                })
+                .copied();
+            tracing::debug!(
+                vp = self.vpindex.index(),
+                exit_type = ?message.header.typ,
+                access_type = ?info.header.intercept_access_type,
+                rip = info.header.rip,
+                gpa,
+                gva = info.memory_access_info.gva_gpa_valid().then_some(info.guest_virtual_address),
+                ?interruption_pending,
+                instruction_bytes = ?&info.instruction_bytes[..info.instruction_byte_count as usize],
+                registered_gpa_base = mapping.map(|m| m.region.guest_pfn << hvdef::HV_PAGE_SHIFT),
+                registered_size = mapping.map(|m| m.region.size),
+                registered_flags = mapping.map(|m| m.region.flags),
+                kernel_registered = mapping.map(|m| m.mapped),
+                mmio_handler = devices.is_mmio(gpa),
+                "emulating mshv memory intercept"
+            );
+        }
         self.emulate(message, devices, interruption_pending).await
     }
 

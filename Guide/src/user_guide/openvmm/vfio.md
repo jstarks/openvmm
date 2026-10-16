@@ -310,6 +310,43 @@ Run OpenVMM with `sudo`, or add your user to the `vfio` group and set appropriat
 - Verify the `--vfio` port name matches a `--pcie-root-port` name
 - Check OpenVMM log output for errors during VFIO device initialization
 
+### Unexpected MMIO emulation or a crash during driver installation
+
+Capture BAR configuration and memory mapping events from VM startup through
+the failure. For the MSHV backend, set these environment variables on the
+OpenVMM process:
+
+```bash
+export OPENVMM_LOG=info,vfio_assigned_device=trace,virt_mshv=debug
+export OPENVMM_LOG="$OPENVMM_LOG,membacking=debug,framebuffer=debug"
+```
+
+The VFIO events identify each host device and BAR, its guest address and size,
+the kernel-reported mmap areas, and the direct-map areas remaining after
+MSI-X exclusions. Mapping events record registration and removal of those
+areas. Config-space writes include the device identity, register offset,
+value, and byte enables, including memory-decode and power-state changes.
+
+On x86 MSHV, `emulating mshv memory intercept` records the VP, RIP,
+instruction bytes, GPA, valid GVA, access type, and hypervisor exit type.
+It also records the containing memory registration, if any, and whether an
+MMIO handler exists. Correlate its GPA with the VFIO BAR mapping events to
+identify the device, BAR, and offset without inferring them from the
+instruction alone. The registration is a snapshot taken when the intercept
+is handled; it can differ from the state when the access faulted.
+
+A successful MSHV memory registration does not prove that the hypervisor
+has populated the native BAR mapping. The kernel can populate MMIO mappings
+on demand and return an intercept to OpenVMM if that fails. Save the Linux
+host kernel log alongside the OpenVMM log:
+
+```bash
+sudo journalctl -k -b > path/to/host-kernel.log
+```
+
+Retain the kernel version, OpenVMM version, and VM launch arguments. See
+[OpenVMM Logging](../../reference/openvmm/logging.md) for log filtering.
+
 ### Hugepage allocation fails
 
 If OpenVMM fails while allocating guest RAM with `hugepages=on`, verify that

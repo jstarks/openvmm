@@ -35,6 +35,8 @@ pub enum LinuxTestKernelVersion {
     CcaV15,
     /// The x86_64-only SEV-SNP guest kernel used by the SNP Linux-direct IGVM.
     SnpGuest,
+    /// Module-free x86_64 mshv root kernel, distinct from the child test kernel.
+    MshvTest,
 }
 
 impl LinuxTestKernelVersion {
@@ -46,18 +48,19 @@ impl LinuxTestKernelVersion {
             Self::Linux6_18 => "6.18",
             Self::CcaV15 => "cca-v15",
             Self::SnpGuest => "snp-guest",
+            Self::MshvTest => "mshv-test",
         }
     }
 
     /// Whether this kernel version is published for the given architecture.
     ///
     /// Most versions ship for both architectures; `cca-v15` is aarch64-only
-    /// and `snp-guest` is x86_64-only.
+    /// and `snp-guest` and `mshv-test` are x86_64-only.
     pub fn is_available_for(self, arch: CommonArch) -> bool {
         match self {
             Self::Linux6_1 | Self::Linux6_18 => true,
             Self::CcaV15 => matches!(arch, CommonArch::Aarch64),
-            Self::SnpGuest => matches!(arch, CommonArch::X86_64),
+            Self::SnpGuest | Self::MshvTest => matches!(arch, CommonArch::X86_64),
         }
     }
 }

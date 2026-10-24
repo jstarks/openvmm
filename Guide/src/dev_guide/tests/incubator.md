@@ -36,6 +36,45 @@ Profile devices are provisioned for VFIO before the command runs.
 
 ## OpenVMM commands
 
+### Provision an mshv environment
+
+On an x64 Linux host with KVM and nested virtualization enabled:
+
+```bash
+cargo xflowey incubator --kernel /path/to/mshv/bzImage -- \
+  /bin/sh -c 'test -c /dev/mshv && uname -a'
+```
+
+This builds the native OpenVMM/Incubator pair, static x64 Pipette, and EFI host
+boot application; downloads pinned firmware, the shared test initrd, and
+verified hypervisor/loader RPMs; then boots and executes the command
+non-interactively. It never checks out, configures, patches, or builds a kernel.
+`--kernel` currently is required: the minimal `mshv-test` dependency kernel is
+awaiting publication. It selects only the root kernel, not a child VM's kernel.
+
+The writable share defaults to this checkout. `--share` selects a different
+workspace; `--dir` defaults to `target/incubator` within that share and must
+remain beneath it so Incubator can read the staged Pipette. Preparation writes
+`profile.toml` and keeps content-addressed runtime snapshots, including the
+protocol-compatible native pair, so later Flowey jobs do not invalidate direct
+runs. Unchanged binaries are reused across kernel edits. Per-run logs remain
+in `results/incubator-*`; do not use the same provisioning directory concurrently.
+
+Use `--prepare-only` without a guest command to prepare everything and print
+a direct Incubator command for `/bin/sh`. Run that printed command for an
+interactive shell without going through Flowey again. Copy the generated
+profile before customizing it. `--kernel-cmdline` and `--hypervisor-cmdline`
+override the checked-in profile's boot options without rebuilding EFI code.
+
+`--initrd`, `--firmware`, and `--boot-artifacts` accept explicit local inputs.
+`--rpm-cache` reuses an existing RPM cache; `--offline` prohibits only mshv RPM
+downloads, not Rust or other dependency downloads. Cached RPMs and extracted
+payloads are checked on reuse; corrupt caches fail rather than being trusted.
+Packaged licenses and source URLs/hashes are retained with the extracted
+payloads. No RPM is installed and no package script runs.
+
+### Supply artifacts manually
+
 Build the native launcher and Incubator from the same checkout for protocol
 compatibility, and build a static guest agent:
 
@@ -103,12 +142,12 @@ The root kernel needs the mshv EFI-launch patches, `CONFIG_EFI_STUB=y`,
 devtmpfs, and initramfs support. Disable modules and reuse the OpenVMM test
 initrd. A stock upstream test kernel cannot launch this environment.
 
-The public `rolling-lts/kata/6.18.34.mshv2` kernel needs corrections for root
-IRQ mapping lifecycle and the build-26100 two-bank `CreatePartition` ABI.
-See the development
-[IRQ fix](https://github.com/jstarks/OHCL-Linux-Kernel/commit/4178badb4e34) and
-[ABI fix](https://github.com/jstarks/OHCL-Linux-Kernel/commit/88ec03f5e6fc);
-these do not guarantee compatibility with other kernel or hypervisor versions.
+The `mshv-test` dependency recipe targets released
+`rolling-lts/kata/6.18.34.mshv4` plus the root
+[IO-APIC IRQ-lifecycle fix](https://github.com/jstarks/OHCL-Linux-Kernel/commit/4178badb4e34).
+That release already restores the two-bank partition-feature ABI; the older
+mshv2 development kernel needed a separate compatibility patch. Kernel build
+and source selection remain independent of OpenVMM provisioning.
 
 To compose an image without launching it:
 

@@ -54,11 +54,10 @@ awaiting publication. It selects only the root kernel, not a child VM's kernel.
 
 The writable share defaults to this checkout. `--share` selects a different
 workspace; `--dir` defaults to `target/incubator` within that share and must
-remain beneath it so Incubator can read the staged Pipette. Preparation writes
-`profile.toml` and keeps content-addressed runtime snapshots, including the
-protocol-compatible native pair, so later Flowey jobs do not invalidate direct
-runs. Unchanged binaries are reused across kernel edits. Per-run logs remain
-in `results/incubator-*`; do not use the same provisioning directory concurrently.
+remain beneath it so Incubator can read the staged Pipette. Preparation updates
+`profile.toml` and retains compatible binaries for direct reuse after other
+Flowey jobs. Unchanged binaries are reused across kernel edits. Per-run logs
+remain in `results/incubator-*`; do not use the same directory concurrently.
 
 Use `--prepare-only` without a guest command to prepare everything and print
 a direct Incubator command for `/bin/sh`. Run that printed command for an
@@ -209,13 +208,17 @@ disabling verification. Its clock is initialized from the host.
 
 Each invocation creates an `incubator-*` directory beneath `--output-dir`, with
 serial logs (`uefi.log` or `guest.log`), VMM logs (`openvmm.log` or `qemu.log`),
-and `petri.jsonl`. Guest stdout/stderr remain separate from runner diagnostics.
-Use `--guest-env` or `INCUBATOR_ENV` for guest environment overrides.
+and `petri.jsonl`. Direct Incubator keeps guest stdout/stderr separate from
+runner diagnostics; xflowey also prints provisioning logs. Use the prepared
+direct command when stdout must contain only guest output. Use `--guest-env`
+or `INCUBATOR_ENV` for guest environment overrides.
 
 `--timeout` / `INCUBATOR_TIMEOUT` bounds boot for Linux-direct and boot plus
 command execution for mshv. Graceful shutdown and teardown each have a
 ten-second deadline. OpenVMM cleanup is best-effort: startup cancellation or
 an unresponsive VMM can leave a host process requiring manual termination.
-Guest exit codes propagate; unexpected VM exit/reset and timeouts fail.
+Direct Incubator invocations preserve the guest exit code. Through xflowey,
+a nonzero guest exit fails the pipeline with Flowey's failure status instead.
+Unexpected VM exit/reset and timeouts fail.
 SIGINT/SIGTERM attempt cleanup; SIGKILL cannot. Temporary boot files are removed
 on normal teardown and handled errors; logs remain on the host.

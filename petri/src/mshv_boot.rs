@@ -24,7 +24,7 @@ pub struct MshvBoot {
     pub initrd: PetriInitrd,
     /// Extracted artifact directory containing `boot/`.
     pub boot_artifacts: ResolvedArtifact,
-    /// Linux options; Petri appends the prepared initrd's entry point.
+    /// Linux options; Petri appends the initrd entry point and vsock driver selection.
     pub kernel_cmdline: String,
     /// Hypervisor options for HvLoader, without the loader DLL path.
     pub hypervisor_cmdline: String,
@@ -35,7 +35,7 @@ impl MshvBoot {
     ///
     /// Copies the prepared initrd unchanged. This neither prepares the guest
     /// userspace nor selects its agent, network, or trust store.
-    pub(crate) fn build(&self) -> anyhow::Result<Disk> {
+    pub(crate) fn build(&self, use_virtio_vsock: bool) -> anyhow::Result<Disk> {
         let image = tempfile::NamedTempFile::new()?.into_temp_path();
         fs_err::remove_file(&image)?;
         let boot = self.boot_artifacts.get().join("boot");
@@ -45,8 +45,10 @@ impl MshvBoot {
             kernel: self.kernel.get(),
             initrd: self.initrd.path.as_ref(),
             kernel_cmdline: &format!(
-                "{} rdinit={}",
-                self.kernel_cmdline, self.initrd.rdinit_param
+                "{} {} rdinit={}",
+                self.kernel_cmdline,
+                crate::vm::linux_vsock_blacklist(use_virtio_vsock),
+                self.initrd.rdinit_param
             ),
             hypervisor_cmdline: &self.hypervisor_cmdline,
         }
@@ -92,7 +94,7 @@ mod tests {
             kernel_cmdline: mshv_host_boot::DEFAULT_KERNEL_CMDLINE.into(),
             hypervisor_cmdline: mshv_host_boot::DEFAULT_HYPERVISOR_CMDLINE.into(),
         }
-        .build()?;
+        .build(true)?;
         let Disk::Temporary(path) = &disk else {
             panic!("expected owned temporary disk")
         };
@@ -120,6 +122,7 @@ mod tests {
             .open_file(mshv_host_boot::KERNEL_CMDLINE_FILE)?
             .read_to_string(&mut config)?;
         assert!(config.contains("rdinit=/caller-init"));
+        assert!(config.contains("initcall_blacklist=hv_sock_init"));
         fs.unmount()?;
         assert_eq!(fs_err::read(&initrd_path)?, prepared);
         drop(disk);

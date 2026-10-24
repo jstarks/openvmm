@@ -12,7 +12,7 @@ pub const HYPERVISOR_CMDLINE_FILE: &str = "hvloader.cmdline";
 /// Maximum size of either command-line file, in bytes.
 pub const MAX_CMDLINE_SIZE: usize = 16 * 1024;
 /// Default Linux options; the composer supplies the initrd and entry point.
-pub const DEFAULT_KERNEL_CMDLINE: &str = "console=ttyS0 panic=-1";
+pub const DEFAULT_KERNEL_CMDLINE: &str = "console=hvc0 panic=-1";
 /// Default hypervisor options for the nested root-partition environment.
 pub const DEFAULT_HYPERVISOR_CMDLINE: &str = "MSHV_ROOT=\\Windows MSHV_ENABLE=TRUE MSHV_SCHEDULER_TYPE=ROOT MSHV_X2APIC_POLICY=ENABLE MSHV_FORCE_NESTED=TRUE";
 

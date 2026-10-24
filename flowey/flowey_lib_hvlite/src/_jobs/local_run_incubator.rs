@@ -79,7 +79,11 @@ impl SimpleFlowNode for Node {
         });
         let incubator = ctx.reqv(|incubator| crate::build_incubator::Request {
             target: CommonTriple::X86_64_LINUX_GNU,
-            profile,
+            profile: if profile.to_release() {
+                crate::run_cargo_build::BuildProfile::Release
+            } else {
+                crate::run_cargo_build::BuildProfile::Light
+            },
             incubator,
         });
         let pipette = ctx.reqv(|pipette| crate::build_pipette::Request {

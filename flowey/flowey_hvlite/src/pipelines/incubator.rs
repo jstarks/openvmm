@@ -58,7 +58,7 @@ pub struct IncubatorCli {
     #[arg(long, conflicts_with = "command")]
     prepare_only: bool,
 
-    /// Build optimized host binaries, agent, and EFI bootstrap.
+    /// Release VMM, agent, and EFI builds (Incubator otherwise uses light).
     #[arg(long)]
     release: bool,
 

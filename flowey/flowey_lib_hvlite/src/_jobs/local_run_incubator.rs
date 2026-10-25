@@ -12,7 +12,7 @@ use sha2::Digest as _;
 flowey_request! {
     pub struct Params {
         pub profile: CommonProfile,
-        pub kernel: PathBuf,
+        pub kernel: Option<PathBuf>,
         pub initrd: Option<PathBuf>,
         pub firmware: Option<PathBuf>,
         pub boot_artifacts: Option<PathBuf>,
@@ -41,6 +41,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::build_mshv_host_boot::Node>();
         ctx.import::<crate::resolve_mshv_boot_artifacts::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
+        ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
         ctx.import::<crate::download_uefi_mu_msvm::Node>();
         ctx.import::<crate::git_checkout_openvmm_repo::Node>();
     }
@@ -97,6 +98,16 @@ impl SimpleFlowNode for Node {
             arch: CommonArch::X86_64,
             artifacts,
         });
+        let kernel = kernel.map(ReadVar::from_static).unwrap_or_else(|| {
+            ctx.reqv(|kernel| {
+                crate::resolve_openvmm_test_linux_kernel::Request::Get(
+                    crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::BzImage,
+                    CommonArch::X86_64,
+                    crate::resolve_openvmm_test_linux_kernel::LinuxTestKernelVersion::MshvTest,
+                    kernel,
+                )
+            })
+        });
         let initrd = initrd.map(ReadVar::from_static).unwrap_or_else(|| {
             ctx.reqv(|initrd| {
                 crate::resolve_openvmm_test_initrd::Request::Get(CommonArch::X86_64, initrd)
@@ -117,6 +128,7 @@ impl SimpleFlowNode for Node {
             let pipette = pipette.claim(ctx);
             let host_boot = host_boot.claim(ctx);
             let artifacts = artifacts.claim(ctx);
+            let kernel = kernel.claim(ctx);
             let initrd = initrd.claim(ctx);
             let firmware = firmware.claim(ctx);
             done.claim(ctx);
@@ -135,6 +147,7 @@ impl SimpleFlowNode for Node {
                 };
                 let host_boot = rt.read(host_boot).efi;
                 let artifacts = rt.read(artifacts);
+                let kernel = rt.read(kernel);
                 let firmware = rt.read(firmware);
                 let initrd = rt.read(initrd);
                 fs_err::create_dir_all(&dir)?;

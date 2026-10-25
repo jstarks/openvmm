@@ -117,7 +117,9 @@ flowey_config! {
     pub struct Config {
         /// Specify version of the github release to pull from
         pub version: Option<String>,
-        /// Temporary explicit bzImage override until mshv-test is published.
+        /// Override the mshv-test release independently of other test kernels.
+        pub mshv_version: Option<String>,
+        /// Use an explicit mshv root bzImage instead of the published kernel.
         pub local_mshv_kernel: Option<ConfigVar<PathBuf>>,
         /// Use locally downloaded openvmm-test-linux contents, keyed by
         /// (architecture, kernel version)
@@ -155,6 +157,7 @@ impl FlowNodeWithConfig for Node {
     ) -> anyhow::Result<()> {
         let Config {
             version,
+            mshv_version,
             local_paths,
             local_mshv_kernel,
         } = config;
@@ -184,9 +187,7 @@ impl FlowNodeWithConfig for Node {
                             "{file:?} is not available in the openvmm-test-linux archive for {arch:?}"
                         );
                     }
-                    if kver == LinuxTestKernelVersion::MshvTest
-                        && !local_paths.contains_key(&(arch, kver))
-                    {
+                    if kver == LinuxTestKernelVersion::MshvTest && local_mshv_kernel.is_some() {
                         anyhow::ensure!(
                             file == OpenvmmTestKernelFile::BzImage,
                             "the local mshv root override must be a bzImage"
@@ -200,7 +201,8 @@ impl FlowNodeWithConfig for Node {
         }
 
         if !mshv_outputs.is_empty() {
-            let ConfigVar(kernel) = local_mshv_kernel.context("mshv-test is not published; provide --mshv-kernel with the CI-produced or locally built bzImage")?;
+            let ConfigVar(kernel) =
+                local_mshv_kernel.context("missing local mshv root kernel override")?;
             ctx.emit_rust_step("use explicit mshv root kernel", |ctx| {
                 let kernel = kernel.claim(ctx);
                 let outputs = mshv_outputs.claim(ctx);
@@ -224,15 +226,7 @@ impl FlowNodeWithConfig for Node {
             anyhow::bail!("Cannot specify both Version and LocalPath requests");
         }
 
-        if version.is_none() && local_paths.is_empty() {
-            anyhow::bail!("Must specify a Version or LocalPath request");
-        }
-
         // -- end of req processing -- //
-
-        if deps.is_empty() {
-            return Ok(());
-        }
 
         if !local_paths.is_empty() {
             ctx.emit_rust_step("use local openvmm-test-linux", |ctx| {
@@ -268,10 +262,15 @@ impl FlowNodeWithConfig for Node {
         // archive), so dedupe download + extract on `(arch, kver)`.
         let needed_archives: BTreeSet<(CommonArch, LinuxTestKernelVersion)> =
             deps.keys().map(|(_, arch, kver)| (*arch, *kver)).collect();
-        let version = version.context("missing openvmm-test-linux version")?;
-
         let mut archives = BTreeMap::new();
         for (arch, kver) in needed_archives {
+            let version = if kver == LinuxTestKernelVersion::MshvTest {
+                mshv_version.as_ref().or(version.as_ref())
+            } else {
+                version.as_ref()
+            }
+            .with_context(|| format!("missing openvmm-test-linux version for {kver:?}"))?
+            .clone();
             let arch_str = match arch {
                 CommonArch::X86_64 => "x86_64",
                 CommonArch::Aarch64 => "aarch64",
@@ -285,21 +284,23 @@ impl FlowNodeWithConfig for Node {
                 file_name: format!("openvmm-test-linux-{kver_str}.{arch_str}.{version}.tar.gz"),
                 path: v,
             });
-            archives.insert((arch, kver), archive);
+            archives.insert((arch, kver), (archive, version));
         }
 
         let persistent_dir = ctx.persistent_dir();
 
         ctx.emit_rust_step("unpack openvmm-test-linux archives", |ctx| {
             let persistent_dir = persistent_dir.claim(ctx);
-            let archives = archives.claim(ctx);
+            let archives: BTreeMap<_, _> = archives
+                .into_iter()
+                .map(|(key, (archive, version))| (key, (archive.claim(ctx), version)))
+                .collect();
             let deps = deps.claim(ctx);
-            let version = version.clone();
             move |rt| {
                 let persistent_dir = persistent_dir.map(|d| rt.read(d));
 
                 let mut extract_dirs = BTreeMap::new();
-                for (key, archive) in archives {
+                for (key, (archive, version)) in archives {
                     let file = rt.read(archive);
                     let dir = flowey_lib_common::_util::extract::extract_tar_gz_if_new(
                         rt,

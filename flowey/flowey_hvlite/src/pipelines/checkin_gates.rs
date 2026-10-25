@@ -867,6 +867,8 @@ impl IntoPipeline for CheckinGatesCli {
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-musl-vmm-perf-runner"));
             let snp_igvm_artifact = matches!(arch, CommonArch::X86_64)
                 .then(|| pipeline.new_typed_artifact("x64-linux-snp-linux-direct-igvm"));
+            let mshv_host_boot_artifact = matches!(arch, CommonArch::X86_64)
+                .then(|| pipeline.new_typed_artifact("x64-mshv-host-boot"));
 
             // skim off interesting artifacts required by the VMM tests job
             match arch {
@@ -896,6 +898,11 @@ impl IntoPipeline for CheckinGatesCli {
                         Some(use_snp_igvm.clone());
                     vmm_tests_artifacts_linux_musl_x86.use_snp_linux_direct_igvm_x64 =
                         Some(use_snp_igvm.clone());
+                    let (_, use_mshv_host_boot) = mshv_host_boot_artifact.as_ref().unwrap();
+                    vmm_tests_artifacts_linux_x86.use_mshv_host_boot_x64 =
+                        Some(use_mshv_host_boot.clone());
+                    vmm_tests_artifacts_linux_musl_x86.use_mshv_host_boot_x64 =
+                        Some(use_mshv_host_boot.clone());
                     use_vmm_perf_runner_gnu_x64 = Some(use_vmm_perf_gnu);
                     use_vmm_perf_runner_musl_x64 = Some(use_vmm_perf_musl);
                     use_vmm_perf_openvmm_gnu_x64 = Some(use_openvmm.clone());
@@ -1096,6 +1103,16 @@ impl IntoPipeline for CheckinGatesCli {
                 job.publish(pub_snp_igvm, |snp_linux_direct_igvm| {
                     flowey_lib_hvlite::build_snp_linux_direct_igvm::Request {
                         snp_linux_direct_igvm,
+                    }
+                })
+            } else {
+                job
+            };
+            let job = if let Some((pub_host_boot, _)) = mshv_host_boot_artifact {
+                job.publish(pub_host_boot, |host_boot| {
+                    flowey_lib_hvlite::build_mshv_host_boot::Request {
+                        profile: CommonProfile::from_release(release),
+                        host_boot,
                     }
                 })
             } else {
@@ -1886,6 +1903,8 @@ impl IntoPipeline for CheckinGatesCli {
                 target.as_triple().operating_system,
                 target_lexicon::OperatingSystem::Linux
             );
+            let needs_mshv_root =
+                target_is_linux && matches!(target_architecture, CommonArch::X86_64);
             let prebuilt_artifacts = VmmTestsPreBuiltArtifactsSelections {
                 test_linux_initrd_x64: matches!(target_architecture, CommonArch::X86_64),
                 test_linux_kernel_x64: matches!(target_architecture, CommonArch::X86_64),
@@ -1899,8 +1918,8 @@ impl IntoPipeline for CheckinGatesCli {
                 uefi_x64: matches!(target_architecture, CommonArch::X86_64),
                 uefi_aarch64: matches!(target_architecture, CommonArch::Aarch64) || target_is_linux,
                 qemu_system_aarch64_linux_x64: target_is_linux,
-                mshv_test_kernel_x64: false,
-                mshv_boot_artifacts_x64: false,
+                mshv_test_kernel_x64: needs_mshv_root,
+                mshv_boot_artifacts_x64: needs_mshv_root,
             };
 
             vmm_tests_run_job = vmm_tests_run_job.dep_on(|ctx| {

@@ -926,6 +926,7 @@ pub mod vmm_tests_artifact_builders {
             // windows build machine
             pipette_windows_x64 => PipetteOutput,
             // linux build machine
+            mshv_host_boot_x64 => MshvHostBootOutput,
             nextest_vmm_tests_archive_linux_x64 => NextestVmmTestsArchive,
             nextest_vmm_tests_archive_linux_musl_x64 => NextestVmmTestsArchive,
             openvmm_linux_x64 => OpenvmmOutput,
@@ -951,6 +952,7 @@ pub mod vmm_tests_artifact_builders {
             // windows build machine
             pipette_windows_x64 => PipetteOutput,
             // linux build machine
+            mshv_host_boot_x64 => MshvHostBootOutput,
             nextest_vmm_tests_archive_linux_musl_x64 => NextestVmmTestsArchive,
             openvmm_linux_musl_x64 => OpenvmmOutput,
             openvmm_vhost_linux_musl_x64 => OpenvmmVhostOutput,

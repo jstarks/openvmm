@@ -93,8 +93,7 @@ async fn frontpage<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Res
     ),
     nested(
         (vm_host_mshv, openvmm_uefi_x64(mshv)),
-        (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_X64_MUSL, "tests", "multiarch",
-            ignore(reason = "mshv-test kernel is not published; prepare with --mshv-kernel and run explicitly", openvmm_linux_direct_x64)),
+        (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_X64_MUSL, "tests", "multiarch", openvmm_linux_direct_x64),
     ),
     openvmm_linux_direct_aarch64,
     qemu_linux_direct_aarch64,

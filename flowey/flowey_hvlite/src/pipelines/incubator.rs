@@ -12,11 +12,9 @@ use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct IncubatorCli {
-    /// Root bzImage with mshv EFI-launch support, not the child VM's kernel.
-    ///
-    /// Required until the minimal mshv-test openvmm-deps kernel is published.
+    /// Override the pinned mshv root bzImage, not the child VM's kernel.
     #[arg(long)]
-    kernel: PathBuf,
+    kernel: Option<PathBuf>,
 
     /// Override the pinned shared x64 test initrd.
     #[arg(long)]
@@ -91,7 +89,7 @@ impl IntoPipeline for IncubatorCli {
                 && matches!(FlowArch::host(backend_hint), FlowArch::X86_64),
             "incubator provisioning currently requires a local x64 Linux host with KVM"
         );
-        let kernel = existing_file(&self.kernel)?;
+        let kernel = self.kernel.as_deref().map(existing_file).transpose()?;
         let initrd = self.initrd.as_deref().map(existing_file).transpose()?;
         let firmware = self.firmware.as_deref().map(existing_file).transpose()?;
         let boot_artifacts = self

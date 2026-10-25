@@ -41,19 +41,19 @@ Profile devices are provisioned for VFIO before the command runs.
 On an x64 Linux host with KVM and nested virtualization enabled:
 
 ```bash
-cargo xflowey incubator --kernel /path/to/mshv/bzImage -- \
+cargo xflowey incubator -- \
   /bin/sh -c 'test -c /dev/mshv && uname -a'
 ```
 
 This builds the native OpenVMM/Incubator pair, static x64 Pipette, and EFI host
-boot application; downloads pinned firmware, the shared test initrd, and
-verified hypervisor/loader RPMs; then boots and executes the command
-non-interactively. Incubator uses the `light` build profile by default.
+boot application; downloads the pinned mshv root kernel, firmware, shared
+test initrd, and verified hypervisor/loader RPMs; then boots and executes the
+command non-interactively. Incubator uses the `light` build profile by default.
 `--release` selects release builds for all components; the normal VMM/agent
 build profile remains independent of the optimized launcher. It never checks
-out, configures, patches, or builds a kernel. `--kernel` currently is required:
-the minimal `mshv-test` dependency kernel is awaiting publication. It selects
-only the root kernel, not a child VM's kernel.
+out, configures, patches, or builds a kernel. `--kernel /path/to/mshv/bzImage`
+overrides the published `mshv-test` kernel. It selects only the root kernel,
+not a child VM's kernel.
 
 The writable share defaults to this checkout. `--share` selects a different
 workspace; `--dir` defaults to `target/incubator` within that share and must

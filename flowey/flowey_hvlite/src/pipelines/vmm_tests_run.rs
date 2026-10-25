@@ -99,6 +99,11 @@ pub struct VmmTestsRunCli {
     /// Optional: custom kernel image
     #[clap(long)]
     custom_kernel: Option<PathBuf>,
+    /// Explicit mshv root bzImage, independent of the nested child's kernel.
+    ///
+    /// Required for mshv tests until the mshv-test dependency is published.
+    #[clap(long)]
+    mshv_kernel: Option<PathBuf>,
     /// Optional: custom UEFI firmware (MSVM.fd) to use instead of the
     /// downloaded release. Path to a locally-built MSVM.fd file.
     #[clap(long)]
@@ -213,6 +218,7 @@ impl IntoPipeline for VmmTestsRunCli {
             no_lazy_fetch,
             custom_kernel_modules,
             custom_kernel,
+            mshv_kernel,
             custom_uefi_firmware,
             ci_profile,
             no_reuse_prepped_vhds,
@@ -443,6 +449,19 @@ impl IntoPipeline for VmmTestsRunCli {
         );
 
         job = job.dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request::Init);
+        if let Some(path) = mshv_kernel {
+            anyhow::ensure!(
+                path.is_file(),
+                "mshv root kernel is not a file: {}",
+                path.display()
+            );
+            let path = std::path::absolute(path)?;
+            job = job.dep_on(move |_| {
+                flowey_lib_hvlite::_jobs::cfg_versions::Request::LocalMshvKernel(
+                    ReadVar::from_static(path),
+                )
+            });
+        }
 
         // Override kernel with local paths if both kernel and modules are specified
         if let (Some(kernel_path), Some(modules_path)) =

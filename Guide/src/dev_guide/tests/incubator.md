@@ -122,9 +122,11 @@ configures nested virtualization and the required devices.
 OpenVMM guests use virtio-console (`console=hvc0`) for Linux output and
 guest-initiated virtio-vsock for Pipette. The host listener exists before boot;
 agent connection does not poll TCP readiness. The network remains available for
-guest workloads. UEFI/host-boot/HvLoader output stays on the 16550 UART. For
-early Linux diagnostics, explicitly select `console=ttyS0` in the mshv kernel
-options; selecting both consoles duplicates Linux output. QEMU keeps its
+guest workloads. UEFI/host-boot/HvLoader output stays on the 16550 UART. The
+mshv default disables Linux UART initialization with `8250.nr_uarts=0`; this
+does not affect firmware output. For early Linux UART diagnostics, select
+`console=ttyS0` and replace that option with `8250.nr_uarts=2` in the mshv
+kernel options. Selecting both consoles duplicates Linux output. QEMU keeps its
 existing TCP agent transport.
 
 For OpenVMM **without mshv**, use

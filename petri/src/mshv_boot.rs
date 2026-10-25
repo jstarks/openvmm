@@ -123,6 +123,7 @@ mod tests {
             .read_to_string(&mut config)?;
         assert!(config.contains("rdinit=/caller-init"));
         assert!(config.contains("initcall_blacklist=hv_sock_init"));
+        assert!(config.contains("8250.nr_uarts=0"));
         fs.unmount()?;
         assert_eq!(fs_err::read(&initrd_path)?, prepared);
         drop(disk);

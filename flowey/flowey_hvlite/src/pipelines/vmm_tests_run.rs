@@ -99,9 +99,7 @@ pub struct VmmTestsRunCli {
     /// Optional: custom kernel image
     #[clap(long)]
     custom_kernel: Option<PathBuf>,
-    /// Explicit mshv root bzImage, independent of the nested child's kernel.
-    ///
-    /// Required for mshv tests until the mshv-test dependency is published.
+    /// Override the pinned mshv root bzImage, independent of the child's kernel.
     #[clap(long)]
     mshv_kernel: Option<PathBuf>,
     /// Optional: custom UEFI firmware (MSVM.fd) to use instead of the

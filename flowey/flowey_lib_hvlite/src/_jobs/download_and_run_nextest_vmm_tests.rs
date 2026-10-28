@@ -130,6 +130,7 @@ impl SimpleFlowNode for Node {
                 target: target.as_triple(),
                 nextest_profile: NextestProfile::Ci,
                 nextest_filter_expr: Some(nextest_filter_expr),
+                run_ignored: false,
                 test_content_config: TestContentConfig::Uninitialized {
                     test_content_dir: None,
                     built_artifacts,
@@ -146,6 +147,7 @@ impl SimpleFlowNode for Node {
                         qemu_system_aarch64_linux_x64: false,
                         mshv_test_kernel_x64: false,
                         mshv_boot_artifacts_x64: false,
+                        ..Default::default()
                     },
                     uefi_firmware_flavor: None,
                     needs_virtio_win_drivers: true,

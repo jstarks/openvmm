@@ -33,6 +33,9 @@ pub struct VmmTestsRunTargetCli {
     /// Test filter (nextest filter expression)
     #[clap(long, default_value = "all()")]
     filter: String,
+    /// Include ignored tests matching the filter.
+    #[clap(long)]
+    run_ignored: bool,
 
     /// The test artifacts to download.
     #[clap(long, value_delimiter = ',', value_parser = parse_vmm_test_image)]
@@ -86,6 +89,7 @@ impl IntoPipeline for VmmTestsRunTargetCli {
             target,
             dir,
             filter,
+            run_ignored,
             artifacts,
             prep_steps,
             verbose,
@@ -147,6 +151,7 @@ impl IntoPipeline for VmmTestsRunTargetCli {
                     target,
                     test_content_dir: dir,
                     filter,
+                    run_ignored,
                     downloaded_artifacts: artifacts,
                     external_deps,
                     prep_steps_variants: prep_steps,

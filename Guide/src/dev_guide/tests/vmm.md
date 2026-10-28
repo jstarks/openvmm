@@ -104,6 +104,11 @@ libtest's `#[ignore]`. Like `unstable`, every `ignore` marker requires a `reason
 string (ideally referencing a tracking issue). Ignored tests are skipped unless
 explicitly requested.
 
+With `cargo xflowey vmm-tests-run`, pass `--run-ignored` to include ignored
+tests in both artifact discovery and execution. A filter alone does not
+override ignored status. Use a precise filter: generated nested inner tests
+are ignored deliberately and must not run directly on the development host.
+
 To ignore a single variant, wrap it in `ignore(reason = "...", <config>)`:
 
 ```rust,ignore
@@ -200,6 +205,45 @@ application during preparation. See
 requirements](incubator.md#mshv-boot-artifacts-and-kernel) for the compatible
 kernel/payload contract and development-only trust model.
 
+#### ARM64 QEMU-TCG MSHV
+
+`qemu_uefi_aarch64(mshv)` boots an ARM64 root on Linux x64 or ARM64 using
+TCG, SBSA paired firmware, 8 GiB, and one vCPU. Its host helper applies
+`with_mshv_platform()`. Root Pipette uses QEMU user networking/TCP; the
+nested archive and results use the normal shared 9p directories.
+
+The ignored `boot_mshv_qemu_tcg` smoke checks `/dev/mshv`, runs an ARM64
+OpenVMM Linux child explicitly selecting the MSHV backend, executes a Pipette
+command, and shuts down both VMs. It requires a matching, user-provided ARM64
+Hyper-V runtime and `lxhvloader.dll`; ordinary test runs do not request these
+inputs. See [Incubator](incubator.md#provision-an-arm64-mshv-environment) for
+the input layout and development firmware warning.
+
+Until the public ARM64 support packages and kernel are published and pinned,
+use extracted dependency CI packages and a local root kernel. Select only the
+outer test:
+
+```bash
+filter='test(=multiarch::openvmm_linux_aarch64_boot_mshv_qemu_tcg_on_qemu_uefi_aarch64_mshv_vm_host_mshv_qemu)'
+cargo xflowey vmm-tests-run --run-ignored --ci-profile --filter "$filter" \
+  --mshv-boot-artifacts path/to/arm64-runtime \
+  --mshv-kernel path/to/mshv/Image \
+  --mshv-sbsa-firmware path/to/extracted-sbsa-package \
+  --mshv-hvloader path/to/extracted-hvloader-package
+```
+
+TCG boot is slow; use the VMM `ci` timeout profile shown above, not the
+unit-test `agent` profile. Results and root serial/QEMU logs are written
+beneath `target/vmm_tests` with the normal Petri logs.
+
+On x64 hosts, nested artifact discovery executes the ARM64 musl test binary
+outside the VM. Install and register static QEMU user-mode emulation with
+`binfmt_misc` before running discovery; installing `qemu-system-aarch64` alone
+is insufficient. Both host architectures need `tar` and `zstd` to extract
+nested archives. The native test executable still targets the host; do not
+pass `--target linux-aarch64` merely to select an ARM64 guest on an x64 host.
+Firmware flash1 is copied per run and the input runtime stays unchanged.
+
 ## Running VMM Tests (Flowey)
 
 The easiest way to run VMM tests locally is `cargo xflowey vmm-tests-run`. It
@@ -223,6 +267,7 @@ build for a different platform. The supported targets are:
 | `windows-x64` | Windows x86_64 (Hyper-V / WHP) |
 | `windows-aarch64` | Windows ARM64 (Hyper-V / WHP) |
 | `linux-x64` | Linux x86_64 |
+| `linux-aarch64` | Linux ARM64 |
 
 **Cross-compiling for Windows from WSL2** is fully supported, you can build
 and run Windows VMM tests directly from your WSL2 shell. This requires the

@@ -51,8 +51,12 @@ flowey_request! {
         },
         /// Override UEFI mu_msvm with a local MSVM.fd path for this architecture
         LocalUefi(CommonArch, ReadVar<PathBuf>),
-        /// Override the mshv root bzImage, separate from child kernels.
-        LocalMshvKernel(ReadVar<PathBuf>),
+        /// Override the mshv root kernel, separate from child kernels.
+        LocalMshvKernel(CommonArch, ReadVar<PathBuf>),
+        /// Use an extracted public ARM64 support package from dependency CI.
+        LocalMshvSupport(crate::resolve_mshv_support::MshvSupport, ReadVar<PathBuf>),
+        /// Local Hyper-V/loader runtime directory for selected MSHV tests.
+        LocalMshvBootArtifacts(ReadVar<PathBuf>),
     }
 }
 
@@ -67,6 +71,8 @@ impl FlowNode for Node {
         ctx.import::<crate::resolve_openvmm_qemu::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
+        ctx.import::<crate::resolve_mshv_support::Node>();
+        ctx.import::<crate::resolve_mshv_boot_artifacts::Node>();
         ctx.import::<crate::resolve_openvmm_test_virtio_win::Node>();
         ctx.import::<crate::download_uefi_mu_msvm::Node>();
         ctx.import::<crate::cfg_rustup_version::Node>();
@@ -90,7 +96,9 @@ impl FlowNode for Node {
         let mut local_protoc: Option<ReadVar<PathBuf>> = None;
         let mut local_kernel: BTreeMap<CommonArch, (ReadVar<PathBuf>, ReadVar<PathBuf>)> = BTreeMap::new();
         let mut local_uefi: BTreeMap<CommonArch, ReadVar<PathBuf>> = BTreeMap::new();
-        let mut local_mshv_kernel = None;
+        let mut local_mshv_kernels = BTreeMap::new();
+        let mut local_mshv_support = BTreeMap::new();
+        let mut local_mshv_boot_artifacts = None;
 
         for req in requests {
             match req {
@@ -130,13 +138,25 @@ impl FlowNode for Node {
                     }
                     local_uefi.insert(arch, path);
                 }
-                Request::LocalMshvKernel(path) => {
-                    anyhow::ensure!(local_mshv_kernel.replace(path).is_none(), "mshv kernel override specified more than once");
+                Request::LocalMshvKernel(arch, path) => {
+                    anyhow::ensure!(local_mshv_kernels.insert(arch, ConfigVar(path)).is_none(), "mshv kernel override specified more than once for {arch:?}");
+                }
+                Request::LocalMshvSupport(package, path) => {
+                    anyhow::ensure!(local_mshv_support.insert(package, ConfigVar(path)).is_none(), "MSHV support override specified more than once for {package:?}");
+                }
+                Request::LocalMshvBootArtifacts(path) => {
+                    anyhow::ensure!(local_mshv_boot_artifacts.replace(ConfigVar(path)).is_none(), "MSHV boot artifacts override specified more than once");
                 }
             }
         }
 
         // Track whether we have local paths for openvmm_deps and protoc
+        if let Some(local_path) = local_mshv_boot_artifacts {
+            ctx.config(crate::resolve_mshv_boot_artifacts::Config {
+                local_path: Some(local_path),
+                ..Default::default()
+            });
+        }
         let has_local_openvmm_deps = !local_openvmm_deps.is_empty();
         let has_local_protoc = local_protoc.is_some();
         let has_local_kernel = !local_kernel.is_empty();
@@ -223,11 +243,16 @@ impl FlowNode for Node {
         ctx.config(crate::resolve_openvmm_test_linux_kernel::Config {
             version: Some(OPENVMM_DEPS.into()),
             mshv_version: Some(OPENVMM_MSHV_TEST_KERNEL.into()),
-            local_mshv_kernel: local_mshv_kernel.map(ConfigVar),
+            local_mshv_kernels,
             ..Default::default()
         });
         ctx.config(crate::resolve_openvmm_test_initrd::Config {
             version: Some(OPENVMM_DEPS.into()),
+            ..Default::default()
+        });
+        // Set a release version here once the ARM64 support packages are published.
+        ctx.config(crate::resolve_mshv_support::Config {
+            local_paths: local_mshv_support,
             ..Default::default()
         });
         ctx.config(crate::resolve_openvmm_test_virtio_win::Config {

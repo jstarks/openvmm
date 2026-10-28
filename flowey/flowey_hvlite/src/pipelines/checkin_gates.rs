@@ -1111,6 +1111,7 @@ impl IntoPipeline for CheckinGatesCli {
             let job = if let Some((pub_host_boot, _)) = mshv_host_boot_artifact {
                 job.publish(pub_host_boot, |host_boot| {
                     flowey_lib_hvlite::build_mshv_host_boot::Request {
+                        arch: CommonArch::X86_64,
                         profile: CommonProfile::from_release(release),
                         host_boot,
                     }
@@ -1920,6 +1921,7 @@ impl IntoPipeline for CheckinGatesCli {
                 qemu_system_aarch64_linux_x64: target_is_linux,
                 mshv_test_kernel_x64: needs_mshv_root,
                 mshv_boot_artifacts_x64: needs_mshv_root,
+                ..Default::default()
             };
 
             vmm_tests_run_job = vmm_tests_run_job.dep_on(|ctx| {
@@ -1928,6 +1930,7 @@ impl IntoPipeline for CheckinGatesCli {
                     target: target.as_triple(),
                     nextest_profile: flowey_lib_hvlite::run_cargo_nextest_run::NextestProfile::Ci,
                     nextest_filter_expr: Some(nextest_filter_expr),
+                    run_ignored: false,
                     test_content_config: TestContentConfig::Uninitialized {
                         test_content_dir: None,
                         built_artifacts: resolve_vmm_tests_artifacts(ctx),

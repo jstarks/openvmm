@@ -268,6 +268,10 @@ define_vmm_tests_built_artifacts!(
             (FloweyHvliteOutput::LinuxBin { bin, dbg}, bin, dbg),
             host_tools::FLOWEY_HVLITE_LINUX_X64
         ),
+        linux_aarch64(
+            (FloweyHvliteOutput::LinuxBin { bin, dbg}, bin, dbg),
+            host_tools::FLOWEY_HVLITE_LINUX_AARCH64
+        ),
     ) => FloweyHvliteOutput,
     nextest_vmm_tests_archive(
         windows_x64(
@@ -312,6 +316,10 @@ define_vmm_tests_built_artifacts!(
         x64(
             (MshvHostBootOutput { efi, pdb }, efi, pdb),
             loadable::MSHV_HOST_BOOT_X64
+        ),
+        aarch64(
+            (MshvHostBootOutput { efi, pdb }, efi, pdb),
+            loadable::MSHV_HOST_BOOT_AARCH64
         ),
     ) => MshvHostBootOutput,
     // Artifacts used internally by petri.
@@ -576,9 +584,17 @@ define_vmm_tests_built_artifacts!(
     ) => PathBuf,
     mshv_test_kernel(
         x64((src, src), loadable::MSHV_TEST_KERNEL_X64),
+        aarch64((src, src), loadable::MSHV_TEST_KERNEL_AARCH64),
     ) => PathBuf,
     mshv_boot_artifacts(
         x64((src, src), loadable::MSHV_BOOT_ARTIFACTS_X64),
+        aarch64((src, src), loadable::MSHV_BOOT_ARTIFACTS_AARCH64),
+    ) => PathBuf,
+    mshv_sbsa_flash0(
+        aarch64((src, src), loadable::MSHV_SBSA_FLASH0_AARCH64),
+    ) => PathBuf,
+    mshv_sbsa_flash1(
+        aarch64((src, src), loadable::MSHV_SBSA_FLASH1_AARCH64),
     ) => PathBuf,
     uefi(
         x64(
@@ -594,6 +610,10 @@ define_vmm_tests_built_artifacts!(
         linux_x64(
             (src, src),
             QEMU_SYSTEM_AARCH64_LINUX_X64
+        ),
+        linux_aarch64(
+            (src, src),
+            QEMU_SYSTEM_AARCH64_LINUX_AARCH64
         ),
     ) => PathBuf,
 );
@@ -637,6 +657,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
         ctx.import::<crate::resolve_mshv_boot_artifacts::Node>();
+        ctx.import::<crate::resolve_mshv_support::Node>();
         ctx.import::<crate::resolve_openvmm_test_virtio_win::Node>();
         ctx.import::<crate::git_checkout_openvmm_repo::Node>();
         ctx.import::<crate::download_uefi_mu_msvm::Node>();
@@ -726,6 +747,40 @@ impl SimpleFlowNode for Node {
                 artifacts,
             })
         });
+        let mshv_test_kernel_aarch64 = prebuilt_artifacts.mshv_test_kernel_aarch64.then(|| {
+            ctx.reqv(|v| {
+                crate::resolve_openvmm_test_linux_kernel::Request::Get(
+                    crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
+                    CommonArch::Aarch64,
+                    crate::resolve_openvmm_test_linux_kernel::LinuxTestKernelVersion::MshvTest,
+                    v,
+                )
+            })
+        });
+        let mshv_boot_artifacts_aarch64 =
+            prebuilt_artifacts.mshv_boot_artifacts_aarch64.then(|| {
+                ctx.reqv(|artifacts| crate::resolve_mshv_boot_artifacts::Request {
+                    arch: CommonArch::Aarch64,
+                    artifacts,
+                })
+            });
+        let sbsa = (prebuilt_artifacts.mshv_sbsa_flash0_aarch64
+            || prebuilt_artifacts.mshv_sbsa_flash1_aarch64)
+            .then(|| {
+                ctx.reqv(|directory| crate::resolve_mshv_support::Request {
+                    package: crate::resolve_mshv_support::MshvSupport::Sbsa,
+                    directory,
+                })
+            });
+        let mshv_sbsa_flash0_aarch64 = prebuilt_artifacts.mshv_sbsa_flash0_aarch64.then(|| {
+            sbsa.clone()
+                .expect("requested SBSA")
+                .map(ctx, |dir| dir.join("SBSA_FLASH0.fd"))
+        });
+        let mshv_sbsa_flash1_aarch64 = prebuilt_artifacts.mshv_sbsa_flash1_aarch64.then(|| {
+            sbsa.expect("requested SBSA")
+                .map(ctx, |dir| dir.join("SBSA_FLASH1.fd"))
+        });
 
         let uefi_x64 = prebuilt_artifacts.uefi_x64.then(|| {
             ctx.reqv(|msvm_fd| crate::download_uefi_mu_msvm::Request::GetMsvmFd {
@@ -753,7 +808,24 @@ impl SimpleFlowNode for Node {
                 })
             });
 
+        let qemu_system_aarch64_linux_aarch64 = prebuilt_artifacts
+            .qemu_system_aarch64_linux_aarch64
+            .then(|| {
+                ctx.reqv(|v| {
+                    crate::resolve_openvmm_qemu::Request::Get(
+                        crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
+                        CommonArch::Aarch64,
+                        v,
+                    )
+                })
+            });
+
         let prebuilt_artifacts = VmmTestsPreBuiltArtifacts {
+            mshv_test_kernel_aarch64,
+            mshv_boot_artifacts_aarch64,
+            mshv_sbsa_flash0_aarch64,
+            mshv_sbsa_flash1_aarch64,
+            qemu_system_aarch64_linux_aarch64,
             mshv_test_kernel_x64,
             mshv_boot_artifacts_x64,
             test_linux_kernel_x64,

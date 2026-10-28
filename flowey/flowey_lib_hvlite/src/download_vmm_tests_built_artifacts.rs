@@ -29,6 +29,7 @@ impl SimpleFlowNode for Node {
                     flowey_hvlite_windows_x64,
                     flowey_hvlite_windows_aarch64,
                     flowey_hvlite_linux_x64,
+                    flowey_hvlite_linux_aarch64,
                     nextest_vmm_tests_archive_windows_x64,
                     nextest_vmm_tests_archive_windows_aarch64,
                     nextest_vmm_tests_archive_linux_x64,
@@ -53,6 +54,7 @@ impl SimpleFlowNode for Node {
                     pipette_linux_musl_aarch64,
                     guest_test_uefi_x64,
                     mshv_host_boot_x64,
+                    mshv_host_boot_aarch64,
                     guest_test_uefi_aarch64,
                     openhcl_standard_x64,
                     openhcl_standard_aarch64,
@@ -157,6 +159,14 @@ impl SimpleFlowNode for Node {
 
         download!(guest_test_uefi_x64, "x64-guest_test_uefi");
         download!(mshv_host_boot_x64, "x64-mshv-host-boot");
+        anyhow::ensure!(
+            mshv_host_boot_aarch64.is_none(),
+            "ARM64 MSHV host boot is currently local-build only; use vmm-tests-run"
+        );
+        anyhow::ensure!(
+            flowey_hvlite_linux_aarch64.is_none(),
+            "ARM64 Flowey is currently local-build only; use vmm-tests-run --build-only"
+        );
         download!(guest_test_uefi_aarch64, "aarch64-guest_test_uefi");
 
         download!(openhcl_standard_x64, "x64-openhcl-igvm");

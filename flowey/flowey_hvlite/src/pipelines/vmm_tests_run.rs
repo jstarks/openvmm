@@ -63,6 +63,17 @@ pub struct VmmTestsRunCli {
     #[clap(long, default_value = "all()")]
     filter: String,
 
+    /// Include explicitly ignored tests matching the filter.
+    #[clap(long)]
+    run_ignored: bool,
+
+    /// User-provided MSHV runtime directory containing boot/.
+    #[clap(long)]
+    mshv_boot_artifacts: Option<PathBuf>,
+
+    #[command(flatten)]
+    mshv_support: super::incubator::MshvSupportArgs,
+
     /// pass `--verbose` to cargo
     #[clap(long)]
     verbose: bool,
@@ -99,7 +110,7 @@ pub struct VmmTestsRunCli {
     /// Optional: custom kernel image
     #[clap(long)]
     custom_kernel: Option<PathBuf>,
-    /// Override the pinned mshv root bzImage, independent of the child's kernel.
+    /// Override the mshv root kernel (bzImage or ARM64 Image), not the child kernel.
     #[clap(long)]
     mshv_kernel: Option<PathBuf>,
     /// Optional: custom UEFI firmware (MSVM.fd) to use instead of the
@@ -207,6 +218,9 @@ impl IntoPipeline for VmmTestsRunCli {
             target,
             dir,
             filter,
+            run_ignored,
+            mshv_boot_artifacts,
+            mshv_support,
             verbose,
             install_missing_deps,
             release,
@@ -246,8 +260,9 @@ impl IntoPipeline for VmmTestsRunCli {
             };
 
         let repo_root = crate::repo_root();
+        let support_requests = mshv_support.requests()?;
 
-        let include_ignored = build_only;
+        let include_ignored = build_only || run_ignored;
 
         // Run artifact discovery inline at pipeline construction time since
         // flowey doesn't support conditional requests yet
@@ -322,7 +337,9 @@ impl IntoPipeline for VmmTestsRunCli {
                 include_ignored: true,
             })?;
             for suite in nested_suites.values() {
-                let output = query_test_binary_artifacts(suite)?;
+                let output = query_test_binary_artifacts(suite).with_context(|| format!(
+                    "discovering nested artifacts for {nested_target_str}; foreign Linux binaries require working binfmt_misc and qemu-user-static on the host (qemu-system-aarch64 alone is insufficient)"
+                ))?;
                 if !output.nested.is_empty() {
                     anyhow::bail!("recursive nesting not supported");
                 }
@@ -335,6 +352,19 @@ impl IntoPipeline for VmmTestsRunCli {
         for artifact in artifacts {
             resolved.resolve_artifact(&artifact)?;
         }
+        let needs_arm64_mshv = resolved.prebuilt_artifacts.mshv_boot_artifacts_aarch64;
+        if needs_arm64_mshv {
+            flowey_lib_hvlite::resolve_mshv_boot_artifacts::validate_arm64_inputs(
+                mshv_boot_artifacts.as_deref().context(
+                    "ARM64 MSHV tests require --mshv-boot-artifacts with user-provided Hyper-V and lxhvloader.dll"
+                )?
+            )?;
+        }
+        anyhow::ensure!(
+            mshv_kernel.is_none()
+                || !(needs_arm64_mshv && resolved.prebuilt_artifacts.mshv_test_kernel_x64),
+            "--mshv-kernel requires a filter selecting only one MSHV root architecture"
+        );
 
         // Determine whether we need hyper-v and/or hardware isolation
         resolved.needs_hyperv = suites
@@ -447,6 +477,22 @@ impl IntoPipeline for VmmTestsRunCli {
         );
 
         job = job.dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request::Init);
+        for request in support_requests {
+            job = job.dep_on(move |_| request);
+        }
+        if let Some(path) = mshv_boot_artifacts {
+            anyhow::ensure!(
+                path.is_dir(),
+                "MSHV boot artifacts is not a directory: {}",
+                path.display()
+            );
+            let path = std::path::absolute(path)?;
+            job = job.dep_on(move |_| {
+                flowey_lib_hvlite::_jobs::cfg_versions::Request::LocalMshvBootArtifacts(
+                    ReadVar::from_static(path),
+                )
+            });
+        }
         if let Some(path) = mshv_kernel {
             anyhow::ensure!(
                 path.is_file(),
@@ -456,6 +502,11 @@ impl IntoPipeline for VmmTestsRunCli {
             let path = std::path::absolute(path)?;
             job = job.dep_on(move |_| {
                 flowey_lib_hvlite::_jobs::cfg_versions::Request::LocalMshvKernel(
+                    if needs_arm64_mshv {
+                        flowey_lib_hvlite::common::CommonArch::Aarch64
+                    } else {
+                        flowey_lib_hvlite::common::CommonArch::X86_64
+                    },
                     ReadVar::from_static(path),
                 )
             });
@@ -510,6 +561,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     selections: selections_from_resolved(filter, resolved, target_os),
                     release,
                     build_only,
+                    run_ignored,
                     copy_extras,
                     custom_kernel_modules,
                     custom_kernel,
@@ -660,6 +712,8 @@ pub(crate) enum VmmTestTargetCli {
     WindowsX64,
     /// Linux X64
     LinuxX64,
+    /// Linux Aarch64
+    LinuxAarch64,
 }
 
 /// Resolve a CLI target option to a CommonTriple, defaulting to the host.
@@ -677,6 +731,7 @@ pub(crate) fn resolve_target(
             (FlowArch::Aarch64, FlowPlatform::Windows) => VmmTestTargetCli::WindowsAarch64,
             (FlowArch::X86_64, FlowPlatform::Windows) => VmmTestTargetCli::WindowsX64,
             (FlowArch::X86_64, FlowPlatform::Linux(_)) => VmmTestTargetCli::LinuxX64,
+            (FlowArch::Aarch64, FlowPlatform::Linux(_)) => VmmTestTargetCli::LinuxAarch64,
             _ => anyhow::bail!("unsupported host"),
         }
     };
@@ -685,6 +740,7 @@ pub(crate) fn resolve_target(
         VmmTestTargetCli::WindowsAarch64 => CommonTriple::AARCH64_WINDOWS_MSVC,
         VmmTestTargetCli::WindowsX64 => CommonTriple::X86_64_WINDOWS_MSVC,
         VmmTestTargetCli::LinuxX64 => CommonTriple::X86_64_LINUX_GNU,
+        VmmTestTargetCli::LinuxAarch64 => CommonTriple::AARCH64_LINUX_GNU,
     })
 }
 
@@ -861,6 +917,35 @@ mod tests {
     use petri_artifacts_vmm_test::artifacts::openhcl_igvm;
     use petri_artifacts_vmm_test::artifacts::vmfw_dll;
     use test_with_tracing::test;
+
+    #[test]
+    fn linux_arm64_build_only_selects_native_flowey() -> anyhow::Result<()> {
+        let selections =
+            ResolvedArtifactSelections::new(CommonTriple::AARCH64_LINUX_GNU.as_triple(), true)?;
+        assert!(selections.build.flowey_hvlite_linux_aarch64);
+        assert!(!selections.build.flowey_hvlite_linux_x64);
+        Ok(())
+    }
+
+    #[test]
+    fn arm64_root_artifacts_are_guest_not_host_architecture() -> anyhow::Result<()> {
+        use petri_artifacts_vmm_test::artifacts::loadable;
+        let mut selections =
+            ResolvedArtifactSelections::new(CommonTriple::X86_64_LINUX_GNU.as_triple(), false)?;
+        for id in [
+            loadable::MSHV_HOST_BOOT_AARCH64::GLOBAL_UNIQUE_ID,
+            loadable::MSHV_BOOT_ARTIFACTS_AARCH64::GLOBAL_UNIQUE_ID,
+            loadable::MSHV_TEST_KERNEL_AARCH64::GLOBAL_UNIQUE_ID,
+        ] {
+            selections.resolve_artifact(id)?;
+        }
+        assert!(selections.build.mshv_host_boot_aarch64);
+        assert!(selections.prebuilt_artifacts.mshv_boot_artifacts_aarch64);
+        assert!(selections.prebuilt_artifacts.mshv_test_kernel_aarch64);
+        assert!(!selections.build.mshv_host_boot_x64);
+        assert!(!selections.prebuilt_artifacts.mshv_boot_artifacts_x64);
+        Ok(())
+    }
 
     #[test]
     fn cvm_dll_selects_cvm_igvm_and_dll() {

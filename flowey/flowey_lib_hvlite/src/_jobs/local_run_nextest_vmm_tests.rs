@@ -23,6 +23,7 @@ flowey_request! {
 
         // Subset of `VmmTestSelections`
         pub filter: String,
+        pub run_ignored: bool,
         pub downloaded_artifacts: Vec<ErasedVmmTestImage>,
         pub external_deps: VmmTestsExternalDeps,
         pub prep_steps_variants: Vec<String>,
@@ -56,6 +57,7 @@ impl SimpleFlowNode for Node {
             target,
             test_content_dir,
             filter,
+            run_ignored,
             downloaded_artifacts,
             external_deps,
             prep_steps_variants,
@@ -80,6 +82,7 @@ impl SimpleFlowNode for Node {
                 target: target_triple,
                 nextest_profile,
                 nextest_filter_expr: Some(filter),
+                run_ignored,
                 test_content_config: TestContentConfig::Initialized {
                     test_content_dir: ReadVar::from_static(test_content_dir),
                     needs_test_igvm_agent_rpc_server,

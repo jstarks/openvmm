@@ -6,15 +6,15 @@ Petri, keeping builds, caches, and logs on the host.
 ## Launcher and boot selection
 
 `[incubator]` selects the launcher and VM resources; `[boot]` selects the guest
-environment and defaults to `linux-direct`. These profiles run on x64 Linux
-hosts; OpenVMM requires KVM.
+environment and defaults to `linux-direct`. Standalone QEMU uses a native
+`qemu-system-aarch64` executable on Linux; OpenVMM requires x64 Linux with KVM.
 
 | Launcher | Boot environment | Current support |
 |----------|------------------|-----------------|
-| `qemu-tcg` | `linux-direct` | AArch64 guest on x64 Linux |
+| `qemu-tcg` | `linux-direct` | AArch64 guest on Linux |
 | `openvmm` | `linux-direct` | x64 Linux guest on x64 Linux |
 | `openvmm` | `mshv` | x64 mshv root partition on x64 Linux |
-| `qemu-tcg` | `mshv` | Not implemented |
+| `qemu-tcg` | `mshv` | AArch64 guest on Linux x64 or ARM64; local runtime required |
 
 Registered VMM tests use [Petri nested tests](vmm.md#nested-tests), not an
 Incubator Flowey target runner. Each Incubator invocation cold-boots a VM.
@@ -33,6 +33,141 @@ cargo run -p incubator -- \
 The kernel and static Pipette binary must match the guest architecture. Place
 Pipette and the command binary beneath the shared directory.
 Profile devices are provisioned for VFIO before the command runs.
+
+### Provision an ARM64 mshv environment
+
+The standalone ARM64 mshv path boots a GPT/FAT32 disk through QEMU `sbsa-ref`
+firmware, then runs HvLoader and the root kernel's EFI stub. Hypervisor launch,
+root Linux discovery, `/dev/mshv`, Pipette commands, an OpenVMM L2 Linux
+boot/poweroff, and clean outer shutdown have been validated with a single CPU.
+This path remains experimental. Select `--backend qemu-tcg` explicitly;
+omitting it preserves the x64/OpenVMM default. Neither KVM nor native ARM64
+virtualization is required.
+
+Hyper-V and `lxhvloader.dll` must be supplied locally as a matching ARM64 set:
+
+```text
+path/to/arm64-runtime/
+  boot/lxhvloader.dll
+  boot/Windows/System32/hvaa64.exe
+  boot/Windows/...                 other matching runtime files
+```
+
+Flowey checks the required PE architectures, preserves the Windows tree, and
+stages a content-addressed copy with the public HvLoader. It does not modify
+your directory or use a supplied `HvLoader.efi` in preference to the public
+one. Architecture validation does not establish version compatibility.
+
+Until the ARM64 dependency packages are published and pinned, supply the root
+kernel and extracted public CI packages explicitly:
+
+```bash
+cargo xflowey incubator --backend qemu-tcg \
+  --boot-artifacts path/to/arm64-runtime \
+  --kernel path/to/mshv/Image \
+  --mshv-sbsa-firmware path/to/extracted-sbsa-package \
+  --mshv-hvloader path/to/extracted-hvloader-package \
+  --timeout 600 -- /bin/sh -c 'test -c /dev/mshv && uname -a'
+```
+
+This builds native Incubator, ARM64 musl Pipette, and ARM64
+`mshv_host_boot.efi`, and resolves native-host `qemu-system-aarch64` and the
+ARM64 initrd. It never downloads the private runtime or falls back to x64 RPMs.
+`--rpm-cache` and `--offline` apply only to the OpenVMM/x64 backend.
+Use `--prepare-only` instead of a command to generate
+`target/incubator/profile.toml` and print a reusable interactive command.
+Logs are under `target/incubator/results/incubator-*`.
+The shared-directory and containment rules below apply to both backends.
+
+To override the paired firmware directly, provide both
+`--firmware path/to/SBSA_FLASH0.fd` and
+`--firmware-vars path/to/SBSA_FLASH1.fd`. The latter is a template, never the
+per-run writable copy. Do not mix firmware from different builds.
+For the registered ignored nested smoke, see
+[ARM64 QEMU-TCG MSHV](vmm.md#arm64-qemu-tcg-mshv).
+
+### ARM64 firmware and manual bring-up
+
+Supply compatible ARM64 HvLoader, `lxhvloader.dll`, and the complete hypervisor
+runtime, an ARM64 mshv EFI-launch kernel with 4 KiB pages, a test initrd, and
+matching TF-A/UEFI SBSA firmware. MSVM and QEMU `virt` firmware are not
+interchangeable with SBSA firmware. The pinned x64 RPMs and x64 `mshv-test`
+kernel cannot be reused for ARM64.
+
+The `openvmm-deps` `sbsa-mshv` package builds the paired firmware from pinned
+TF-A, EDK2, and edk2-platforms sources. Its ARM64 archive is
+`openvmm-test-sbsa-mshv.aarch64.<release>.tar.gz`, containing both flash images
+and a build manifest. It includes the virtio drivers and temporary loader
+workaround described below; loader and hypervisor payloads remain separate.
+
+The separate `hvloader` package builds the public ARM64 EFI application from
+pinned HvLoader and EDK2 sources. Flowey stages `HvLoader.efi` from
+`openvmm-test-hvloader.aarch64.<release>.tar.gz` separately from your runtime.
+For manual provisioning, copy it into the boot-artifact directory's `boot/`
+subdirectory. The archive includes licenses and a build
+manifest. It is unsigned and does not include `lxhvloader.dll` or the
+hypervisor runtime; supply those separately.
+
+Use TF-A's `qemu_sbsa` platform and EDK2's
+`Platform/Qemu/SbsaQemu/SbsaQemu.dsc`. Set `boot.firmware` to `SBSA_FLASH0.fd`
+(TF-A) and `boot.firmware-vars` to `SBSA_FLASH1.fd` (UEFI code and variables).
+Size both images for QEMU's flash banks; the validated configuration uses
+256 MiB images. Incubator copies flash1 for each run, preserving your template.
+The UEFI build must include PCI virtio transport and virtio block drivers so
+it can read the boot disk. These drivers are not present in every SBSA build.
+Secure Boot must be disabled.
+
+```admonish warning title="Development loader compatibility"
+Some loader versions apply read-only PE section protections before writing
+their import tables. These versions require a development firmware workaround
+that uninstalls `EFI_MEMORY_ATTRIBUTE_PROTOCOL` before launching HvLoader.
+SBSA's Arm platform boot manager does not provide the QEMU `virt` firmware's
+`UninstallMemAttrProtocol` fw_cfg switch. Use a corrected loader or explicitly
+prepared development firmware; do not assume an unmodified SBSA image works.
+```
+
+Build the host tools, ARM64 agent, and development EFI application:
+
+```bash
+rustup target add aarch64-unknown-uefi aarch64-unknown-linux-musl
+cargo build -p incubator --profile light
+cargo build -p pipette --target aarch64-unknown-linux-musl
+cargo build -p mshv_host_boot --target aarch64-unknown-uefi
+```
+
+Copy `petri/incubator/profiles/aarch64-tcg-mshv.toml` outside the checkout,
+set its local executable/artifact paths, and point `host-boot` at
+`target/aarch64-unknown-uefi/debug/mshv_host_boot.efi`. Start with the supplied
+single-CPU profile and no assignment devices:
+
+```bash
+target/light/incubator \
+  --profile path/to/aarch64-mshv.toml \
+  --kernel path/to/mshv/Image --initrd path/to/aarch64/initrd \
+  --share "$PWD" \
+  --guest-pipette /share/target/aarch64-unknown-linux-musl/debug/pipette \
+  --output-dir target/aarch64-mshv-logs --timeout 600 \
+  --no-pty /bin/sh -c 'test -c /dev/mshv && uname -a'
+```
+
+QEMU runs explicitly with TCG. `sbsa-ref` provides EL2 and EL3 without
+`virtualization=on` or `secure=on` machine properties; do not add those
+`virt`-specific properties to the SBSA profile. TF-A implements PSCI at EL3,
+and SBSA's ACPI FADT advertises its SMC conduit. This lets root Linux perform
+normal SMCCC hypervisor discovery without overriding the FADT identity.
+Use `[boot]` command-line overrides; leave `[incubator].cmdline` empty.
+ARM64 defaults select the PL011 Linux console and omit x86 APIC policy.
+Pipette uses TCP/user networking and the writable 9p share, not OpenVMM's
+virtio-vsock setup. Missing `/dev/mshv` fails bootstrap before starting Pipette.
+
+Firmware must preserve an EL2 handoff; the hypervisor must also accept QEMU's
+GIC, timers, PSCI, and ACPI descriptions. CPU emulation alone does not establish
+this compatibility. Inspect `guest.log` and `qemu.log` when bringing up a new
+firmware/payload combination. OpenVMM queries the host's processor-feature banks
+and supplies explicit masks when creating ARM64 child partitions, rather than
+relying on the kernel's legacy defaults.
+SMP, device assignment, and CCA/TF-RMM remain separate follow-up work. The
+ordinary mshv profile does not enable RME or load an RMM.
 
 ## OpenVMM commands
 
@@ -137,9 +272,11 @@ the example's `/dev/mshv` check with your command.
 
 ## mshv boot artifacts and kernel
 
-Incubator does not download payloads. Keep authorized binaries, their packaged
-licenses, and generated images outside Git; public availability does not change
-licensing terms.
+The standalone Incubator executable does not download payloads; Flowey resolves
+the public support packages and, for x64, pinned RPMs. ARM64 Hyper-V and
+`lxhvloader.dll` always remain user-provided. Keep authorized binaries, their
+packaged licenses, and generated images outside Git; public availability does
+not change licensing terms.
 
 The artifact directory must contain:
 
@@ -150,8 +287,9 @@ boot/
   Windows/System32/...   complete matching runtime
 ```
 
-Both `hvix64.exe` and `hvax64.exe` must be present. Shim and GRUB are not used.
-The validated Azure Linux 3 payload recipe uses
+For x64, both `hvix64.exe` and `hvax64.exe` must be present under
+`Windows/System32`; ARM64 media requires `hvaa64.exe` instead. Shim and GRUB
+are not used. The validated x64 Azure Linux 3 payload recipe uses
 edk2-hvloader 20240524git3e722403cd16-20 and matching `mshv` /
 `mshv-bootloader-lx` 26100.9444.2609032029.1-1 payloads. The composer does not
 verify provenance, signatures, architecture, or compatibility.
@@ -184,6 +322,9 @@ cargo run -p incubator --bin incubator-mshv-image -- \
 
 The output parent must exist; existing output is never overwritten. Payload
 files must be regular files with ASCII FAT-compatible names.
+For ARM64, pass `--arch aarch64` and matching ARM64 inputs. The image contains
+`EFI/BOOT/BOOTAA64.EFI` and `Image`; x64 remains the default, using
+`EFI/BOOT/BOOTX64.EFI` and `bzImage`.
 
 ### Boot command lines
 

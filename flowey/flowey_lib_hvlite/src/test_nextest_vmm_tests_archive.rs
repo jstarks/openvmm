@@ -19,6 +19,7 @@ flowey_request! {
         pub nextest_archive_file: ReadVar<NextestVmmTestsArchive>,
         /// nextest filter expression for what VMM tests to run
         pub nextest_filter_expr: Option<String>,
+        pub run_ignored: bool,
         /// Nextest profile to use when running the source code
         pub nextest_profile: NextestProfile,
         /// Nextest working directory (defaults to repo root)
@@ -53,6 +54,7 @@ impl SimpleFlowNode for Node {
         let Request {
             nextest_archive_file,
             nextest_filter_expr,
+            run_ignored,
             nextest_profile,
             nextest_working_dir,
             nextest_config_file,
@@ -76,7 +78,7 @@ impl SimpleFlowNode for Node {
             nextest_filter_expr,
             nextest_working_dir,
             nextest_config_file,
-            run_ignored: false,
+            run_ignored,
             extra_env: Some(extra_env),
             pre_run_deps,
             results,

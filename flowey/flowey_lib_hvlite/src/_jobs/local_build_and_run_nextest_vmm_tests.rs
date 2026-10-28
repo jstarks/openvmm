@@ -71,6 +71,7 @@ flowey_request! {
 
         /// Whether to run the tests or just build and archive
         pub build_only: bool,
+        pub run_ignored: bool,
         /// Copy extras to output dir (symbols, etc)
         pub copy_extras: bool,
 
@@ -131,6 +132,7 @@ impl SimpleFlowNode for Node {
             selections,
             release,
             build_only,
+            run_ignored,
             copy_extras,
             custom_kernel_modules,
             custom_kernel,
@@ -423,6 +425,14 @@ impl SimpleFlowNode for Node {
             .then(|| build_guest_test_uefi(CommonArch::Aarch64));
         let mshv_host_boot_x64 = build.mshv_host_boot_x64.then(|| {
             ctx.reqv(|host_boot| crate::build_mshv_host_boot::Request {
+                arch: CommonArch::X86_64,
+                profile: CommonProfile::from_release(release),
+                host_boot,
+            })
+        });
+        let mshv_host_boot_aarch64 = build.mshv_host_boot_aarch64.then(|| {
+            ctx.reqv(|host_boot| crate::build_mshv_host_boot::Request {
+                arch: CommonArch::Aarch64,
                 profile: CommonProfile::from_release(release),
                 host_boot,
             })
@@ -671,6 +681,9 @@ impl SimpleFlowNode for Node {
             .then(|| build_flowey_hvlite(VmmTestsBuiltArtifacts::flowey_hvlite_linux_x64_target()));
 
         let built_artifacts = VmmTestsBuiltArtifacts {
+            flowey_hvlite_linux_aarch64: build.flowey_hvlite_linux_aarch64.then(|| {
+                build_flowey_hvlite(VmmTestsBuiltArtifacts::flowey_hvlite_linux_aarch64_target())
+            }),
             flowey_hvlite_windows_x64,
             flowey_hvlite_windows_aarch64,
             flowey_hvlite_linux_x64,
@@ -698,6 +711,7 @@ impl SimpleFlowNode for Node {
             pipette_linux_musl_aarch64,
             guest_test_uefi_x64,
             mshv_host_boot_x64,
+            mshv_host_boot_aarch64,
             guest_test_uefi_aarch64,
             openhcl_standard_x64,
             openhcl_standard_aarch64,
@@ -801,6 +815,7 @@ impl SimpleFlowNode for Node {
                         CommonTriple::AARCH64_WINDOWS_MSVC => "windows-aarch64",
                         CommonTriple::X86_64_WINDOWS_MSVC => "windows-x64",
                         CommonTriple::X86_64_LINUX_GNU => "linux-x64",
+                        CommonTriple::AARCH64_LINUX_GNU => "linux-aarch64",
                         CommonTriple::AARCH64_LINUX_MUSL => "linux-aarch64-musl",
                         _ => unreachable!(),
                     };
@@ -842,6 +857,9 @@ impl SimpleFlowNode for Node {
 
                     if skip_vhd_prompt {
                         run_target_args.push("--skip-vhd-prompt".into());
+                    }
+                    if run_ignored {
+                        run_target_args.push("--run-ignored".into());
                     }
 
                     if matches!(
@@ -911,6 +929,7 @@ impl SimpleFlowNode for Node {
                     target: target_triple,
                     nextest_profile,
                     nextest_filter_expr: Some(nextest_filter_expr),
+                    run_ignored,
                     test_content_config,
                     downloaded_artifacts,
                     prep_steps_variants,

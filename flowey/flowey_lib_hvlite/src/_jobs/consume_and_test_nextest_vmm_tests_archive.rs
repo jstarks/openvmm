@@ -52,6 +52,7 @@ flowey_request! {
         pub nextest_profile: NextestProfile,
         /// Nextest test filter expression.
         pub nextest_filter_expr: Option<String>,
+        pub run_ignored: bool,
         /// Information about the test content directory to use for the tests
         pub test_content_config: TestContentConfig,
         /// Test artifacts to download
@@ -109,6 +110,7 @@ impl SimpleFlowNode for Node {
             target,
             nextest_profile,
             nextest_filter_expr,
+            run_ignored,
             test_content_config,
             downloaded_artifacts,
             prep_steps_variants,
@@ -327,6 +329,7 @@ impl SimpleFlowNode for Node {
                 nextest_archive_file: nextest_vmm_tests_archive.clone(),
                 nextest_profile,
                 nextest_filter_expr: nextest_filter_expr.clone(),
+                run_ignored,
                 nextest_working_dir: Some(openvmm_repo_path.clone()),
                 nextest_config_file: Some(nextest_config_file.clone()),
                 nextest_bin: None,

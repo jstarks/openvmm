@@ -10,19 +10,76 @@ use flowey_lib_hvlite::common::CommonProfile;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum Backend {
+    #[default]
+    Openvmm,
+    QemuTcg,
+}
+
+/// Local overrides for public packages pending the ARM64 dependency release.
+#[derive(clap::Args)]
+pub(crate) struct MshvSupportArgs {
+    /// Extracted public SBSA paired-flash package from openvmm-deps CI.
+    #[arg(long)]
+    mshv_sbsa_firmware: Option<PathBuf>,
+    /// Extracted public ARM64 HvLoader package from openvmm-deps CI.
+    #[arg(long)]
+    mshv_hvloader: Option<PathBuf>,
+}
+
+impl MshvSupportArgs {
+    pub(crate) fn requests(
+        self,
+    ) -> anyhow::Result<Vec<flowey_lib_hvlite::_jobs::cfg_versions::Request>> {
+        use flowey_lib_hvlite::resolve_mshv_support::MshvSupport;
+        [
+            (MshvSupport::Sbsa, self.mshv_sbsa_firmware),
+            (MshvSupport::Hvloader, self.mshv_hvloader),
+        ]
+        .into_iter()
+        .filter_map(|(package, path)| path.map(|path| (package, path)))
+        .map(|(package, path)| {
+            anyhow::ensure!(
+                path.is_dir(),
+                "not an extracted support directory: {}",
+                path.display()
+            );
+            Ok(
+                flowey_lib_hvlite::_jobs::cfg_versions::Request::LocalMshvSupport(
+                    package,
+                    ReadVar::from_static(fs_canonicalize(&path)?),
+                ),
+            )
+        })
+        .collect()
+    }
+}
+
 #[derive(clap::Args)]
 pub struct IncubatorCli {
-    /// Override the pinned mshv root bzImage, not the child VM's kernel.
+    /// Backend: OpenVMM/x64 with KVM, or QEMU-TCG/ARM64.
+    #[arg(long, value_enum, default_value = "openvmm")]
+    backend: Backend,
+
+    #[command(flatten)]
+    mshv_support: MshvSupportArgs,
+
+    /// Override the mshv root kernel (x64 bzImage or ARM64 Image).
     #[arg(long)]
     kernel: Option<PathBuf>,
 
-    /// Override the pinned shared x64 test initrd.
+    /// Override the shared test initrd for the guest architecture.
     #[arg(long)]
     initrd: Option<PathBuf>,
 
-    /// Override the pinned x64 MSVM.fd firmware.
+    /// Override MSVM.fd (OpenVMM) or SBSA_FLASH0.fd (QEMU).
     #[arg(long)]
     firmware: Option<PathBuf>,
+
+    /// Override the writable SBSA_FLASH1.fd template for QEMU.
+    #[arg(long, requires = "firmware")]
+    firmware_vars: Option<PathBuf>,
 
     /// Use authorized local payloads containing boot/ instead of pinned RPMs.
     #[arg(long, conflicts_with_all = ["rpm_cache", "offline"])]
@@ -85,13 +142,39 @@ impl IntoPipeline for IncubatorCli {
     fn into_pipeline(self, backend_hint: PipelineBackendHint) -> anyhow::Result<Pipeline> {
         anyhow::ensure!(
             matches!(backend_hint, PipelineBackendHint::Local)
-                && matches!(FlowPlatform::host(backend_hint), FlowPlatform::Linux(_))
-                && matches!(FlowArch::host(backend_hint), FlowArch::X86_64),
-            "incubator provisioning currently requires a local x64 Linux host with KVM"
+                && matches!(FlowPlatform::host(backend_hint), FlowPlatform::Linux(_)),
+            "incubator provisioning requires a local Linux host"
+        );
+        let qemu_tcg = self.backend == Backend::QemuTcg;
+        let host_arch = match FlowArch::host(backend_hint) {
+            FlowArch::X86_64 => flowey_lib_hvlite::common::CommonArch::X86_64,
+            FlowArch::Aarch64 => flowey_lib_hvlite::common::CommonArch::Aarch64,
+            arch => anyhow::bail!("unsupported Incubator host architecture: {arch:?}"),
+        };
+        anyhow::ensure!(
+            qemu_tcg || matches!(FlowArch::host(backend_hint), FlowArch::X86_64),
+            "OpenVMM Incubator requires an x64 Linux host with KVM"
+        );
+        anyhow::ensure!(
+            qemu_tcg || self.firmware_vars.is_none(),
+            "--firmware-vars requires --backend qemu-tcg"
+        );
+        anyhow::ensure!(
+            !qemu_tcg || (self.rpm_cache.is_none() && !self.offline),
+            "RPM options are not valid for QEMU-TCG; ARM64 runtime inputs are local-only"
+        );
+        anyhow::ensure!(
+            !qemu_tcg || self.firmware.is_some() == self.firmware_vars.is_some(),
+            "QEMU firmware overrides require both --firmware and --firmware-vars"
         );
         let kernel = self.kernel.as_deref().map(existing_file).transpose()?;
         let initrd = self.initrd.as_deref().map(existing_file).transpose()?;
         let firmware = self.firmware.as_deref().map(existing_file).transpose()?;
+        let firmware_vars = self
+            .firmware_vars
+            .as_deref()
+            .map(existing_file)
+            .transpose()?;
         let boot_artifacts = self
             .boot_artifacts
             .map(|path| {
@@ -99,6 +182,12 @@ impl IntoPipeline for IncubatorCli {
                 fs_canonicalize(&path)
             })
             .transpose()?;
+        if qemu_tcg {
+            flowey_lib_hvlite::resolve_mshv_boot_artifacts::validate_arm64_inputs(
+                boot_artifacts.as_deref().context("--backend qemu-tcg requires --boot-artifacts with user-provided ARM64 Hyper-V and lxhvloader.dll")?
+            )?;
+        }
+        let support_requests = self.mshv_support.requests()?;
         let share = fs_canonicalize(&self.share.unwrap_or_else(crate::repo_root))?;
         anyhow::ensure!(
             share.is_dir(),
@@ -115,7 +204,7 @@ impl IntoPipeline for IncubatorCli {
         let rpm_cache = self.rpm_cache.map(std::path::absolute).transpose()?;
 
         let mut pipeline = Pipeline::new();
-        pipeline
+        let mut job = pipeline
             .new_job(
                 FlowPlatform::host(backend_hint),
                 FlowArch::host(backend_hint),
@@ -142,10 +231,13 @@ impl IntoPipeline for IncubatorCli {
             })
             .dep_on(
                 |ctx| flowey_lib_hvlite::_jobs::local_run_incubator::Params {
+                    qemu_tcg,
+                    host_arch,
                     profile: CommonProfile::from_release(self.release),
                     kernel,
                     initrd,
                     firmware,
+                    firmware_vars,
                     boot_artifacts,
                     rpm_cache,
                     offline: self.offline,
@@ -158,8 +250,11 @@ impl IntoPipeline for IncubatorCli {
                     command: self.command,
                     done: ctx.new_done_handle(),
                 },
-            )
-            .finish();
+            );
+        for request in support_requests {
+            job = job.dep_on(move |_| request);
+        }
+        job.finish();
         Ok(pipeline)
     }
 }

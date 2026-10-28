@@ -61,8 +61,8 @@ impl MshvBoot {
                     .erase(),
             ),
             boot_artifacts: resolver.require(loadable::MSHV_BOOT_ARTIFACTS_X64).erase(),
-            kernel_cmdline: mshv_host_boot::DEFAULT_KERNEL_CMDLINE.into(),
-            hypervisor_cmdline: mshv_host_boot::DEFAULT_HYPERVISOR_CMDLINE.into(),
+            kernel_cmdline: "console=hvc0 panic=-1 8250.nr_uarts=0".into(),
+            hypervisor_cmdline: "MSHV_ROOT=\\Windows MSHV_ENABLE=TRUE MSHV_SCHEDULER_TYPE=ROOT MSHV_X2APIC_POLICY=ENABLE MSHV_FORCE_NESTED=TRUE".into(),
         }
     }
 
@@ -203,8 +203,8 @@ mod tests {
             kernel: unused(),
             initrd: MshvInitrd::Base(unused()),
             boot_artifacts: unused(),
-            kernel_cmdline: mshv_host_boot::DEFAULT_KERNEL_CMDLINE.into(),
-            hypervisor_cmdline: mshv_host_boot::DEFAULT_HYPERVISOR_CMDLINE.into(),
+            kernel_cmdline: "test_option=caller".into(),
+            hypervisor_cmdline: "MSHV_SCHEDULER_TYPE=ROOT".into(),
         };
         let error = boot.build(true, None).unwrap_err();
         assert!(

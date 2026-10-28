@@ -171,7 +171,7 @@ impl PetriVmmBackend for OpenVmmPetriBackend {
         None
     }
 
-    fn new(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
+    fn new(resolver: &ArtifactResolver<'_>, arch: MachineArch, _firmware: &Firmware) -> Self {
         // OpenVMM guests must have the same arch as the host
         assert_eq!(arch, MachineArch::host());
         OpenVmmPetriBackend {
@@ -201,6 +201,7 @@ impl PetriVmmBackend for OpenVmmPetriBackend {
 
 /// Configuration state for a test VM.
 pub struct PetriVmConfigOpenVmm {
+    hypervisor: Option<String>,
     guest_shares: std::collections::HashMap<String, crate::GuestShare>,
     private_virtio_devices: Vec<(&'static str, Resource<VirtioDeviceHandle>)>,
     // Direct configuration related information.

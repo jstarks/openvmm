@@ -299,6 +299,8 @@ pub mod artifacts {
     declare_artifacts! {
         /// QEMU Aarch64 system emulator for x86_64 Linux
         QEMU_SYSTEM_AARCH64_LINUX_X64("qemu-system-aarch64", LINUX_X64),
+        /// QEMU Aarch64 system emulator for Aarch64 Linux
+        QEMU_SYSTEM_AARCH64_LINUX_AARCH64("qemu-system-aarch64", LINUX_AARCH64),
     }
 
     /// Guest-side tools used by the VMM tests.
@@ -338,6 +340,8 @@ pub mod artifacts {
             FLOWEY_HVLITE_WINDOWS_X64("flowey_hvlite.exe", WINDOWS_X64),
             /// Linux x86_64 build of `flowey_hvlite`.
             FLOWEY_HVLITE_LINUX_X64("flowey_hvlite", LINUX_X64),
+            /// Linux ARM64 build of `flowey_hvlite`.
+            FLOWEY_HVLITE_LINUX_AARCH64("flowey_hvlite", LINUX_AARCH64),
             /// Windows aarch64 build of `flowey_hvlite`.
             FLOWEY_HVLITE_WINDOWS_AARCH64("flowey_hvlite.exe", WINDOWS_AARCH64),
             /// Windows x86_64 build of the `prep_steps` binary.
@@ -431,6 +435,16 @@ pub mod artifacts {
             MSHV_HOST_BOOT_X64("mshv_host_boot.efi", X64),
             /// Extracted, licensed mshv hypervisor/loader payload directory.
             MSHV_BOOT_ARTIFACTS_X64("mshv-boot-artifacts", X64),
+            /// Module-free ARM64 mshv root kernel.
+            MSHV_TEST_KERNEL_AARCH64("mshv-Image", AARCH64),
+            /// ARM64 UEFI host boot application for the mshv root.
+            MSHV_HOST_BOOT_AARCH64("mshv_host_boot.efi", AARCH64),
+            /// Staged public loader and user-provided ARM64 Hyper-V runtime.
+            MSHV_BOOT_ARTIFACTS_AARCH64("mshv-boot-artifacts", AARCH64),
+            /// Read-only SBSA firmware flash.
+            MSHV_SBSA_FLASH0_AARCH64("SBSA_FLASH0.fd", AARCH64),
+            /// Template for disposable writable SBSA firmware flash.
+            MSHV_SBSA_FLASH1_AARCH64("SBSA_FLASH1.fd", AARCH64),
             /// PCAT firmware DLL
             PCAT_FIRMWARE_X64("vmfirmwarepcat.dll", X64),
             /// SVGA firmware DLL

@@ -94,8 +94,10 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
                 kernel: ResolvedArtifact::from_local_path(config.kernel.clone()),
                 initrd: initrd.clone().into(),
                 boot_artifacts: ResolvedArtifact::from_local_path(boot.boot_artifacts.clone()),
-                kernel_cmdline: boot.kernel_cmdline.clone(),
-                hypervisor_cmdline: boot.hypervisor_cmdline.clone(),
+                kernel_cmdline: boot.kernel_cmdline(config.profile.incubator.arch()).into(),
+                hypervisor_cmdline: boot
+                    .hypervisor_cmdline(config.profile.incubator.arch())
+                    .into(),
             }),
             uefi_config: petri::UefiConfig {
                 default_boot_always_attempt: true,
@@ -162,15 +164,24 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
                 nested_test: None,
             };
             let devices = qemu::petri_devices(&config.profile.devices)?;
+            let firmware_vars = match &config.profile.boot {
+                IncubatorBoot::Mshv(boot) => boot
+                    .firmware_vars
+                    .as_ref()
+                    .map(|template| petri::qemu::copy_firmware_vars(template))
+                    .transpose()?,
+                IncubatorBoot::LinuxDirect => None,
+            };
             let profile = profile.clone();
             let share = config.share_dir.clone();
-            let builder = PetriVmBuilder::minimal("incubator", &logs, artifacts, &driver)?
+            let mut builder = PetriVmBuilder::minimal("incubator", &logs, artifacts, &driver)?
                 .with_external_pipette()
                 .with_prebuilt_initrd(initrd)
                 .modify_backend(move |backend| {
                     backend
                         .with_share_9p(share)
                         .with_devices(devices)
+                        .with_firmware_vars(firmware_vars)
                         .with_platform(
                             profile.machine,
                             profile.cpu,
@@ -179,6 +190,11 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
                             profile.cmdline,
                         )
                 });
+            if matches!(config.profile.boot, IncubatorBoot::Mshv(_)) {
+                builder = builder
+                    .with_boot_device_type(petri::BootDeviceType::PcieVirtioBlk)
+                    .with_expect_no_boot_event();
+            }
             execute(builder, &driver, &config, &signals, bound_command).await
         }
     })?;

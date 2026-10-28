@@ -25,12 +25,16 @@ impl Worker {
         host: &WorkerHost,
         cfg: Config,
         shared_memory: Option<openvmm_defs::worker::SharedMemoryFd>,
+        hypervisor: Option<&str>,
     ) -> anyhow::Result<(Self, mesh::Receiver<HaltReason>)> {
         let (vm_rpc, rpc_recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
 
         let params = VmWorkerParameters {
-            hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
+            hypervisor: match hypervisor {
+                Some(spec) => openvmm_helpers::hypervisor::hypervisor_resource(spec)?,
+                None => openvmm_helpers::hypervisor::choose_hypervisor()?,
+            },
             cfg,
             saved_state: None,
             shared_memory,

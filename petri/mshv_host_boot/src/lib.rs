@@ -15,6 +15,11 @@ pub const MAX_CMDLINE_SIZE: usize = 16 * 1024;
 pub const DEFAULT_KERNEL_CMDLINE: &str = "console=hvc0 panic=-1 8250.nr_uarts=0";
 /// Default hypervisor options for the nested root-partition environment.
 pub const DEFAULT_HYPERVISOR_CMDLINE: &str = "MSHV_ROOT=\\Windows MSHV_ENABLE=TRUE MSHV_SCHEDULER_TYPE=ROOT MSHV_X2APIC_POLICY=ENABLE MSHV_FORCE_NESTED=TRUE";
+/// Default Linux options for the QEMU ARM64 PL011 console.
+pub const AARCH64_KERNEL_CMDLINE: &str = "console=ttyAMA0,115200 earlycon panic=-1";
+/// ARM64 hypervisor options without x86 APIC policy.
+pub const AARCH64_HYPERVISOR_CMDLINE: &str =
+    "MSHV_ROOT=\\Windows MSHV_ENABLE=TRUE MSHV_SCHEDULER_TYPE=ROOT MSHV_FORCE_NESTED=TRUE";
 
 /// Validate literal, single-line UCS-2 load options, allowing a final LF or CRLF.
 pub fn command_line(text: &str) -> Result<&str, &'static str> {

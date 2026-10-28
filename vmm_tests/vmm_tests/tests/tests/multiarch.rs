@@ -7,6 +7,8 @@
 use crate::aarch64_exclusive::vm_host_emu;
 use crate::nested::vm_host;
 use crate::nested::vm_host_mshv;
+#[cfg(target_os = "linux")]
+use crate::nested::vm_host_mshv_qemu;
 use anyhow::Context;
 use futures::StreamExt;
 use guid::Guid;
@@ -127,6 +129,38 @@ async fn frontpage<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Res
 )]
 async fn boot<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Result<()> {
     let (vm, agent) = config.run().await?;
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
+/// Opt-in ARM64 MSHV boot through an emulated SBSA root.
+#[cfg(target_os = "linux")]
+#[vmm_test(nested(
+    (vm_host_mshv_qemu, qemu_uefi_aarch64(mshv)),
+    (
+        NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL,
+        "tests",
+        "multiarch",
+        ignore(reason = "Requires user-provided ARM64 Hyper-V runtime; slow TCG smoke", openvmm_linux_direct_aarch64)
+    ),
+))]
+async fn boot_mshv_qemu_tcg(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    let (vm, agent) = config
+        .with_no_vmbus()
+        .with_virtio_vsock(true)
+        .with_processor_topology(ProcessorTopology {
+            vp_count: 1,
+            ..Default::default()
+        })
+        .modify_backend(|b| b.with_hypervisor("mshv").with_pcie_root_topology(1, 1, 1))
+        .run()
+        .await?;
+    let shell = agent.unix_shell();
+    assert_eq!(
+        cmd!(shell, "echo mshv-l2-ready").read().await?,
+        "mshv-l2-ready"
+    );
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;
     Ok(())

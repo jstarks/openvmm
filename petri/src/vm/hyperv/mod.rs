@@ -166,7 +166,7 @@ impl PetriVmmBackend for HyperVPetriBackend {
         None
     }
 
-    fn new(_resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
+    fn new(_resolver: &ArtifactResolver<'_>, arch: MachineArch, _firmware: &Firmware) -> Self {
         // Hyper-V guests must have the same arch as the host
         assert_eq!(arch, MachineArch::host());
         HyperVPetriBackend {}

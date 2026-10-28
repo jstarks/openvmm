@@ -29,6 +29,7 @@ impl PetriVmConfigOpenVmm {
     async fn run_core(self) -> anyhow::Result<(PetriVmOpenVmm, PetriVmRuntimeConfig)> {
         let has_guest_shares = !self.guest_shares.is_empty();
         let Self {
+            hypervisor,
             guest_shares: _,
             private_virtio_devices: _,
             runtime_config,
@@ -153,9 +154,10 @@ impl PetriVmConfigOpenVmm {
             );
         }
 
-        let (worker, halt_notif) = Worker::launch(&host, config, shared_memory)
-            .await
-            .context("failed to launch vm worker")?;
+        let (worker, halt_notif) =
+            Worker::launch(&host, config, shared_memory, hypervisor.as_deref())
+                .await
+                .context("failed to launch vm worker")?;
 
         let worker = Arc::new(worker);
 

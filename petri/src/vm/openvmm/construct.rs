@@ -773,6 +773,7 @@ impl PetriVmConfigOpenVmm {
         };
 
         Ok(Self {
+            hypervisor: None,
             guest_shares,
             private_virtio_devices,
             runtime_config: firmware.into_runtime_config(vmbus_storage_controllers),

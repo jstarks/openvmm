@@ -241,7 +241,10 @@ impl ToTokens for UefiGuest {
                 quote!(::petri::UefiGuest::guest_test_uefi(resolver, #arch_tokens))
             }
             UefiGuest::None => quote!(::petri::UefiGuest::None),
-            UefiGuest::Mshv => quote!(::petri::UefiGuest::Mshv(::petri::mshv_boot::MshvBoot::resolve(resolver))),
+            UefiGuest::Mshv => {
+                let arch = arch_to_tokens(MachineArch::X86_64);
+                quote!(::petri::UefiGuest::Mshv(::petri::mshv_boot::MshvBoot::resolve(resolver, #arch)))
+            }
         });
     }
 }
@@ -267,6 +270,10 @@ impl ToTokens for FirmwareAndArch {
             }
             Firmware::Pcat(guest) => {
                 quote!(::petri::Firmware::pcat(resolver, #guest))
+            }
+            Firmware::Uefi(UefiGuest::Mshv) => {
+                quote!(::petri::Firmware::uefi(resolver, #arch,
+                    ::petri::UefiGuest::Mshv(::petri::mshv_boot::MshvBoot::resolve(resolver, #arch))))
             }
             Firmware::Uefi(guest) => {
                 quote!(::petri::Firmware::uefi(resolver, #arch, #guest))
@@ -505,9 +512,15 @@ impl Config {
             requires_capabilities: overrides.requires_capabilities.clone(),
         };
         if matches!(&resolved.firmware, Firmware::Uefi(UefiGuest::Mshv))
-            && resolved.vmm != Vmm::OpenVmm
+            && !matches!(
+                (resolved.vmm, resolved.arch),
+                (Vmm::OpenVmm, MachineArch::X86_64) | (Vmm::Qemu, MachineArch::Aarch64)
+            )
         {
-            return Err(Error::new(self.span, "mshv requires the OpenVMM backend"));
+            return Err(Error::new(
+                self.span,
+                "mshv requires x64 OpenVMM or ARM64 QEMU",
+            ));
         }
         Ok(resolved)
     }
@@ -593,10 +606,15 @@ impl Parse for Args {
 fn validate_firmware(config: &Config) -> syn::Result<()> {
     match config.firmware {
         Firmware::Uefi(UefiGuest::Mshv) => {
-            if config.arch != MachineArch::X86_64
-                || config.vmm.is_some_and(|vmm| vmm != Vmm::OpenVmm)
-            {
-                return Err(Error::new(config.span, "mshv requires x86-64 OpenVMM UEFI"));
+            if !matches!(
+                (config.arch, config.vmm),
+                (MachineArch::X86_64, None | Some(Vmm::OpenVmm))
+                    | (MachineArch::Aarch64, None | Some(Vmm::Qemu))
+            ) {
+                return Err(Error::new(
+                    config.span,
+                    "mshv requires x64 OpenVMM or ARM64 QEMU UEFI",
+                ));
             }
         }
         Firmware::OpenhclUefi(_, UefiGuest::Mshv) => {
@@ -1130,7 +1148,7 @@ fn parse_nested(input: ParseStream<'_>) -> syn::Result<MaybeNestedConfig> {
 /// Valid UEFI guest options are:
 /// - `vhd(<VHD>)`: One of our supported VHDs
 /// - `guest_test_uefi_{arch}`: Our UEFI test application
-/// - `mshv`: An x86-64 mshv root on OpenVMM with shared test provisioning.
+/// - `mshv`: An x64 OpenVMM or ARM64 QEMU mshv root with shared provisioning.
 /// - `none`: No guest
 ///
 /// Valid x64 VHD options are:
@@ -1566,6 +1584,7 @@ mod tests {
             "hyperv, configs(uefi_x64(mshv))",
             "qemu, configs(uefi_x64(mshv))",
             "openvmm, configs(openhcl_uefi_x64(mshv))",
+            "qemu, configs(openhcl_uefi_aarch64(mshv))",
         ] {
             assert!(
                 syn::parse_str::<ArgsWithOverrides>(input)
@@ -1574,5 +1593,25 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    #[test]
+    fn qemu_mshv_resolves_arm64_artifacts_and_preserves_nested_ignore() -> syn::Result<()> {
+        let args = syn::parse_str::<ArgsWithOverrides>(
+            r#"configs(nested(
+                (vm_host, qemu_uefi_aarch64(mshv)),
+                (ARCHIVE, "tests", "multiarch",
+                    ignore(reason = "local runtime required", openvmm_linux_direct_aarch64))
+            ))"#,
+        )?;
+        let item = syn::parse_quote!(
+            async fn smoke(config: Config) {}
+        );
+        let tokens = make_vmm_test(args, item)?.to_string();
+        assert!(tokens.contains("MshvBoot :: resolve"));
+        assert!(tokens.contains("MachineArch :: Aarch64"));
+        assert!(!tokens.contains("MachineArch :: X86_64"));
+        assert_eq!(tokens.matches(". ignore ()").count(), 2);
+        Ok(())
     }
 }

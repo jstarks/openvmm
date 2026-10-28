@@ -36,6 +36,12 @@ use vm_resource::IntoResource;
 use vmotherboard::ChipsetDeviceHandle;
 
 impl PetriVmConfigOpenVmm {
+    /// Require a specific hypervisor backend rather than probing the host.
+    pub fn with_hypervisor(mut self, spec: impl Into<String>) -> Self {
+        self.hypervisor = Some(spec.into());
+        self
+    }
+
     /// Enable the VTL0 alias map.
     // TODO: Remove once #912 is fixed.
     pub fn with_vtl0_alias_map(mut self) -> Self {

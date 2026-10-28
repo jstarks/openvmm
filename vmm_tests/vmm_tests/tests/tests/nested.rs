@@ -37,6 +37,21 @@ pub(crate) async fn vm_host_mshv(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) async fn vm_host_mshv_qemu(
+    config: PetriVmBuilder<petri::qemu::QemuPetriBackend>,
+) -> anyhow::Result<()> {
+    let (vm, agent) = config.with_mshv_platform().run().await?;
+    let shell = agent.unix_shell();
+    petri::pipette::cmd!(shell, "test -c /dev/mshv")
+        .run()
+        .await?;
+    vm.run_nested_test(&agent, Default::default()).await?;
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 #[vmm_test_macros::vmm_test(
     qemu_linux_direct_aarch64,
     openvmm_linux_direct_x64,

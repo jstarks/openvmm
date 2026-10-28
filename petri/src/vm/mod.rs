@@ -141,7 +141,7 @@ impl<T: PetriVmmBackend> PetriVmArtifacts<T> {
         };
 
         Some(Self {
-            backend: T::new(resolver, arch),
+            backend: T::new(resolver, arch, &firmware),
             arch,
             agent_image: (!firmware.is_isolated_without_paravisor()).then(|| {
                 if with_vtl0_pipette {
@@ -469,11 +469,16 @@ pub trait PetriVmmBackend: Debug {
     /// launch pipette for linux direct
     fn build_custom_init_script(pipette_path: &str) -> Option<String>;
 
+    /// Network and agent transport for an MSHV root's shared Linux bootstrap.
+    fn mshv_guest_network() -> crate::linux_bootstrap::GuestNetwork {
+        crate::linux_bootstrap::GuestNetwork::Consomme
+    }
+
     /// Resolve any artifacts needed to use this backend
     ///
     /// The architecture here is that of the guest, which may or may not be the
     /// same as the host.
-    fn new(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self;
+    fn new(resolver: &ArtifactResolver<'_>, arch: MachineArch, firmware: &Firmware) -> Self;
 
     /// Create and start VM from the generic config using the VMM backend
     async fn run(
@@ -676,8 +681,9 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 guest: UefiGuest::Mshv(_),
                 ..
             } => anyhow::ensure!(
-                artifacts.arch == MachineArch::X86_64,
-                "mshv boot requires x86-64 UEFI"
+                artifacts.arch == MachineArch::X86_64
+                    || (artifacts.arch == MachineArch::Aarch64 && T::SUPPORTS_CPU_EMULATION),
+                "mshv boot requires x86-64 UEFI or an AArch64 emulation backend"
             ),
             Firmware::OpenhclUefi {
                 guest: UefiGuest::Mshv(_),
@@ -871,6 +877,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 self.pipette_binary
                     .as_ref()
                     .context("mshv initrd preparation requires Pipette")?,
+                T::mshv_guest_network(),
             );
         }
         self.prepare_custom_initrd(T::build_custom_init_script)
@@ -1191,6 +1198,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         }
 
         let builder = if let Some(boot_drive) = self.config.firmware.boot_drive(
+            self.config.arch,
             self.use_virtio_vsock,
             self.resources.prebuilt_initrd.as_ref(),
         )? {
@@ -3498,6 +3506,9 @@ impl Firmware {
     pub fn uefi(resolver: &ArtifactResolver<'_>, arch: MachineArch, guest: UefiGuest) -> Self {
         use petri_artifacts_vmm_test::artifacts::loadable::*;
         let uefi_firmware = match arch {
+            MachineArch::Aarch64 if matches!(&guest, UefiGuest::Mshv(_)) => {
+                resolver.require(MSHV_SBSA_FLASH0_AARCH64).erase()
+            }
             MachineArch::X86_64 => resolver.require(UEFI_FIRMWARE_X64).erase(),
             MachineArch::Aarch64 => resolver.require(UEFI_FIRMWARE_AARCH64).erase(),
         };
@@ -3798,6 +3809,7 @@ impl Firmware {
 
     fn boot_drive(
         &self,
+        arch: MachineArch,
         use_virtio_vsock: bool,
         prepared: Option<&PetriInitrd>,
     ) -> anyhow::Result<Option<Drive>> {
@@ -3812,7 +3824,7 @@ impl Firmware {
         {
             return Ok(Some(Drive::new(
                 Some(
-                    boot.build(use_virtio_vsock, prepared)
+                    boot.build(arch, use_virtio_vsock, prepared)
                         .context("composing mshv boot disk")?,
                 ),
                 false,
@@ -3884,7 +3896,8 @@ impl PcatGuest {
 #[derive(Debug)]
 pub enum UefiGuest {
     /// Compose an mshv root-partition boot disk from resolved artifacts and a
-    /// prepared initrd. Requires x86-64 UEFI without OpenHCL.
+    /// prepared initrd. Supports x86-64 OpenVMM and experimental AArch64 QEMU
+    /// UEFI, without OpenHCL.
     Mshv(MshvBoot),
     /// Mount a VHD as the boot drive.
     Vhd(BootImageConfig<boot_image_type::Vhd>),

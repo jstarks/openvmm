@@ -35,7 +35,7 @@ pub enum LinuxTestKernelVersion {
     CcaV15,
     /// The x86_64-only SEV-SNP guest kernel used by the SNP Linux-direct IGVM.
     SnpGuest,
-    /// Module-free x86_64 mshv root kernel, distinct from the child test kernel.
+    /// Module-free mshv root kernel, distinct from the child test kernel.
     MshvTest,
 }
 
@@ -55,12 +55,12 @@ impl LinuxTestKernelVersion {
     /// Whether this kernel version is published for the given architecture.
     ///
     /// Most versions ship for both architectures; `cca-v15` is aarch64-only
-    /// and `snp-guest` and `mshv-test` are x86_64-only.
+    /// and `snp-guest` is x86_64-only.
     pub fn is_available_for(self, arch: CommonArch) -> bool {
         match self {
-            Self::Linux6_1 | Self::Linux6_18 => true,
+            Self::Linux6_1 | Self::Linux6_18 | Self::MshvTest => true,
             Self::CcaV15 => matches!(arch, CommonArch::Aarch64),
-            Self::SnpGuest | Self::MshvTest => matches!(arch, CommonArch::X86_64),
+            Self::SnpGuest => matches!(arch, CommonArch::X86_64),
         }
     }
 }
@@ -119,6 +119,8 @@ flowey_config! {
         pub version: Option<String>,
         /// Override the mshv-test release independently of other test kernels.
         pub mshv_version: Option<String>,
+        /// ARM64 mshv-test release, independent of the x64 release.
+        pub arm64_mshv_version: Option<String>,
         /// Use an explicit mshv root bzImage instead of the published kernel.
         pub local_mshv_kernel: Option<ConfigVar<PathBuf>>,
         /// Use locally downloaded openvmm-test-linux contents, keyed by
@@ -158,6 +160,7 @@ impl FlowNodeWithConfig for Node {
         let Config {
             version,
             mshv_version,
+            arm64_mshv_version,
             local_paths,
             local_mshv_kernel,
         } = config;
@@ -187,7 +190,10 @@ impl FlowNodeWithConfig for Node {
                             "{file:?} is not available in the openvmm-test-linux archive for {arch:?}"
                         );
                     }
-                    if kver == LinuxTestKernelVersion::MshvTest && local_mshv_kernel.is_some() {
+                    if arch == CommonArch::X86_64
+                        && kver == LinuxTestKernelVersion::MshvTest
+                        && local_mshv_kernel.is_some()
+                    {
                         anyhow::ensure!(
                             file == OpenvmmTestKernelFile::BzImage,
                             "the local mshv root override must be a bzImage"
@@ -226,7 +232,11 @@ impl FlowNodeWithConfig for Node {
             anyhow::bail!("Cannot specify both Version and LocalPath requests");
         }
 
-        if version.is_none() && mshv_version.is_none() && local_paths.is_empty() {
+        if version.is_none()
+            && mshv_version.is_none()
+            && arm64_mshv_version.is_none()
+            && local_paths.is_empty()
+        {
             anyhow::bail!("Must specify a Version or LocalPath request");
         }
 
@@ -273,7 +283,11 @@ impl FlowNodeWithConfig for Node {
         let mut archives = BTreeMap::new();
         for (arch, kver) in needed_archives {
             let version = if kver == LinuxTestKernelVersion::MshvTest {
-                mshv_version.as_ref().or(version.as_ref())
+                match arch {
+                    CommonArch::X86_64 => mshv_version.as_ref(),
+                    CommonArch::Aarch64 => arm64_mshv_version.as_ref(),
+                }
+                .or(version.as_ref())
             } else {
                 version.as_ref()
             }

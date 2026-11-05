@@ -34,6 +34,7 @@ pub const OPENHCL_KERNEL_DEV_VERSION: Option<&str> = None;
 pub const OPENHCL_KERNEL_STABLE_VERSION: &str = "6.18.37.7";
 pub const OPENVMM_DEPS: &str = "0.3.0-175";
 pub const OPENVMM_MSHV_TEST_KERNEL: &str = "0.3.0-161";
+pub const OPENVMM_ARM64_MSHV: &str = "0.3.0-173";
 pub const PROTOC: &str = "27.1";
 
 flowey_request! {
@@ -68,6 +69,7 @@ impl FlowNode for Node {
         ctx.import::<crate::resolve_openvmm_qemu::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
+        ctx.import::<crate::resolve_mshv_support::Node>();
         ctx.import::<crate::resolve_openvmm_test_virtio_win::Node>();
         ctx.import::<crate::download_uefi_mu_msvm::Node>();
         ctx.import::<crate::cfg_rustup_version::Node>();
@@ -225,7 +227,12 @@ impl FlowNode for Node {
         ctx.config(crate::resolve_openvmm_test_linux_kernel::Config {
             version: Some(OPENVMM_DEPS.into()),
             mshv_version: Some(OPENVMM_MSHV_TEST_KERNEL.into()),
+            arm64_mshv_version: Some(OPENVMM_ARM64_MSHV.into()),
             local_mshv_kernel: local_mshv_kernel.map(ConfigVar),
+            ..Default::default()
+        });
+        ctx.config(crate::resolve_mshv_support::Config {
+            version: Some(OPENVMM_ARM64_MSHV.into()),
             ..Default::default()
         });
         ctx.config(crate::resolve_openvmm_test_initrd::Config {

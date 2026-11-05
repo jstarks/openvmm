@@ -56,7 +56,7 @@ rejecting directory renames with open descendants.
 `SMBTORTURE` selects the executable for every harness; otherwise they use
 `smbtorture` from PATH. The corrected-client harness requires that variable
 explicitly and adds eleven notify cases: tcon, dir, tdis, double, tcp, overflow,
-rmdir1-4, and rec. It uses ten operations because the directory fixture assumes that
+rmdir1-4, and mask-change. It uses ten operations because the directory fixture assumes that
 count and has a fixed 1000-byte output buffer.
 
 ### Direct Provider Contracts
@@ -276,9 +276,13 @@ sending an asynchronous CANCEL. The ten-case harness above requires that fix;
 our server does not weaken cancellation identity matching. Reference comparisons
 with the corrected client pass in all three signing profiles.
 
-The recursive (`rec`) fixture now passes. The mask-change probe gets past its
-former deletion failure but still waits for separate attribute notifications;
-it is not counted as passing coverage.
+The mask-change fixture passes, including fixed attributes-only registration
+across later filter changes and file renames. The recursive (`rec`) fixture
+expects nine name records despite requesting attribute/creation changes too.
+It now gets eleven records, including two file-rename metadata records; the
+checkout-built Samba 4.25.1 server also fails that fixture (fourteen records).
+The earlier nine-record pass omitted these metadata events and is not retained
+as passing coverage. Shared provider tests cover recursive rename delivery.
 Tree uses dot-component paths rejected by the current namespace policy, and
 valid-req assumes specific native event batching and notification-buffer policy.
 The slow mask probe permits cancellation for many subcases and does not establish
@@ -309,6 +313,14 @@ including recursive watches and undersized-buffer retry. A watch on the renamed
 directory itself stays registered. SET_INFO retains its ordinary I/O barrier;
 CLOSE still cancels/drains pending operations and preserves already obtained
 rename results rather than relabeling committed effects as cancelled.
+
+File renames additionally report MODIFIED at the destination for attribute and
+creation watches, even when those metadata values are unchanged. Directories
+do not produce this extra record, and exact-case replacement already reports
+metadata, so it is not duplicated. This is a compatibility behavior exercised
+by the public Samba mask-change fixture and implemented by Samba's notify_rename;
+MS-FSA's ordinary name-notification algorithm does not explicitly require it.
+It does not introduce general deferred close-time metadata notification.
 
 The shared provider suite covers identity, moves, replacement failures, sharing,
 closed subtrees and notification filtering. Wire tests additionally cover malformed

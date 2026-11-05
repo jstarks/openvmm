@@ -291,6 +291,8 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     /// existing source opens; enforce destination sharing and replacement rules.
     /// Deny replacement of an open target and directory renames with open descendants.
     /// Namespace changes and their ordered notifications must be atomic to observers.
+    /// File renames also notify attribute/creation watchers at the destination;
+    /// exact replacement's metadata notification must not be duplicated.
     async fn rename(
         &self,
         _file: &Self::File,

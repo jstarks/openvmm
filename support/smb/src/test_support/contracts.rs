@@ -488,8 +488,8 @@ async fn register<B: FileSystem>(
     );
 }
 
-/// Same-directory old/new pairs, cross-directory removal/addition, and exact
-/// replacement's metadata notification are buffered atomically and filtered.
+/// Rename name records and file metadata compatibility records are filtered;
+/// exact replacement produces a single metadata record, not a duplicate.
 pub async fn rename_notifications<F: Fixture>(fixture: &F) {
     let fs = fixture.filesystem();
     let request = RequestContext::new(1);
@@ -518,6 +518,16 @@ pub async fn rename_notifications<F: Fixture>(fixture: &F) {
         )
         .await;
         let metadata = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+        let creation = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+        let combined = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+        let directory = open(
+            fs,
+            "left\\directory",
+            CreateDisposition::CREATE,
+            true,
+            &request,
+        )
+        .await;
         register(fs, &root, file_names(), true, 2).await;
         register(fs, &left, file_names(), false, 3).await;
         register(fs, &right, file_names(), false, 4).await;
@@ -529,6 +539,26 @@ pub async fn rename_notifications<F: Fixture>(fixture: &F) {
             5,
         )
         .await;
+        register(
+            fs,
+            &creation,
+            NotifyFilter::new().with_creation(true),
+            true,
+            6,
+        )
+        .await;
+        register(
+            fs,
+            &combined,
+            file_names().with_attributes(true).with_creation(true),
+            true,
+            7,
+        )
+        .await;
+        fs.rename(&directory, "right\\directory", false, &request)
+            .await
+            .unwrap();
+        fs.close(&directory, &request).await.unwrap();
         fs.rename(&file, "left\\source", false, &request)
             .await
             .unwrap();
@@ -544,6 +574,7 @@ pub async fn rename_notifications<F: Fixture>(fixture: &F) {
         fs.rename(&file, "left\\new", false, &request)
             .await
             .unwrap();
+        let initial = fs.metadata(&file, &request).await.unwrap();
         changes(
             fs.notify(&root, file_names(), true, 4096, &request)
                 .await
@@ -601,6 +632,13 @@ pub async fn rename_notifications<F: Fixture>(fixture: &F) {
                 .unwrap(),
             &[(NotifyAction::REMOVED, "moved")],
         );
+        fs.rename(&file, "right\\TARGET", false, &request)
+            .await
+            .unwrap();
+        let renamed = fs.metadata(&file, &request).await.unwrap();
+        assert_eq!(renamed.attributes, initial.attributes);
+        assert_eq!(renamed.created, initial.created);
+        fs.close(&file, &request).await.unwrap();
         changes(
             fs.notify(
                 &metadata,
@@ -611,8 +649,56 @@ pub async fn rename_notifications<F: Fixture>(fixture: &F) {
             )
             .await
             .unwrap(),
-            &[(NotifyAction::MODIFIED, "right\\target")],
+            &[
+                (NotifyAction::MODIFIED, "left\\new"),
+                (NotifyAction::MODIFIED, "right\\moved"),
+                (NotifyAction::MODIFIED, "right\\target"),
+                (NotifyAction::MODIFIED, "right\\TARGET"),
+            ],
         );
+        changes(
+            fs.notify(
+                &creation,
+                NotifyFilter::new().with_creation(true),
+                true,
+                4096,
+                &request,
+            )
+            .await
+            .unwrap(),
+            &[
+                (NotifyAction::MODIFIED, "left\\new"),
+                (NotifyAction::MODIFIED, "right\\moved"),
+                (NotifyAction::MODIFIED, "right\\target"),
+                (NotifyAction::MODIFIED, "right\\TARGET"),
+            ],
+        );
+        changes(
+            fs.notify(
+                &combined,
+                file_names().with_attributes(true),
+                true,
+                4096,
+                &request,
+            )
+            .await
+            .unwrap(),
+            &[
+                (NotifyAction::RENAMED_OLD_NAME, "left\\source"),
+                (NotifyAction::RENAMED_NEW_NAME, "left\\new"),
+                (NotifyAction::MODIFIED, "left\\new"),
+                (NotifyAction::REMOVED, "left\\new"),
+                (NotifyAction::ADDED, "right\\moved"),
+                (NotifyAction::MODIFIED, "right\\moved"),
+                (NotifyAction::REMOVED, "right\\moved"),
+                (NotifyAction::MODIFIED, "right\\target"),
+                (NotifyAction::RENAMED_OLD_NAME, "right\\target"),
+                (NotifyAction::RENAMED_NEW_NAME, "right\\TARGET"),
+                (NotifyAction::MODIFIED, "right\\TARGET"),
+            ],
+        );
+        fs.close(&combined, &request).await.unwrap();
+        fs.close(&creation, &request).await.unwrap();
         fs.close(&metadata, &request).await.unwrap();
     }
     fs.close(&file, &request).await.unwrap();

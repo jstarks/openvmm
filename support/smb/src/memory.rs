@@ -831,6 +831,18 @@ impl FileSystem for MemoryFs {
             )
         };
         emit(&mut state, file.node, action, filter);
+        if !directory && !exact_target {
+            // File renames also invalidate attribute/creation watches, even
+            // when those values are unchanged. Replacement already reports this.
+            emit(
+                &mut state,
+                file.node,
+                NotifyAction::MODIFIED,
+                NotifyFilter::new()
+                    .with_attributes(true)
+                    .with_creation(true),
+            );
+        }
         wake(state);
         Ok(())
     }

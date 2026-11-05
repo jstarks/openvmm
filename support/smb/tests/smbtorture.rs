@@ -55,6 +55,60 @@ fn samba_notify() {
     );
 }
 
+#[test]
+#[ignore = "requires corrected Samba smbtorture; set SMBTORTURE to its executable"]
+fn samba_notify_corrected_client() {
+    assert!(
+        std::env::var_os("SMBTORTURE").is_some(),
+        "set SMBTORTURE to a Samba client with corrected pre-interim CANCEL identities"
+    );
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "--num-ops=10",
+            "smb2.notify.tcon",
+            "smb2.notify.dir",
+            "smb2.notify.tdis",
+            "smb2.notify.double",
+            "smb2.notify.tcp",
+            "smb2.notify.overflow",
+            "smb2.notify.rmdir1",
+            "smb2.notify.rmdir2",
+            "smb2.notify.rmdir3",
+            "smb2.notify.rmdir4",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_lock() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.lock.valid-request",
+            "smb2.lock.rw-shared",
+            "smb2.lock.rw-exclusive",
+            "smb2.lock.auto-unlock",
+            "smb2.lock.lock",
+            "smb2.lock.async",
+            "smb2.lock.errorcode",
+            "smb2.lock.zerobytelength",
+            "smb2.lock.zerobyteread",
+            "smb2.lock.unlock",
+            "smb2.lock.multiple-unlock",
+            "smb2.lock.stacking",
+            "smb2.lock.contend",
+            "smb2.lock.context",
+            "smb2.lock.range",
+            "smb2.lock.overlap",
+            "smb2.lock.truncate",
+        ],
+    );
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
@@ -127,12 +181,14 @@ fn run_torture(
             service.shutdown().await
         })
     });
-    let result = Command::new("smbtorture")
+    let executable = std::env::var_os("SMBTORTURE").unwrap_or_else(|| "smbtorture".into());
+    let result = Command::new(executable)
         .args([
             "//127.0.0.1/memory",
             "-p",
             &port,
             "-U%",
+            "--configfile=/dev/null",
             "--use-kerberos=off",
             "--client-protection=off",
             "--option=client min protocol=SMB2_10",

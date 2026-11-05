@@ -4,7 +4,8 @@
 //! A bounded writable in-memory filesystem for synthetic shares.
 
 use crate::provider::{
-    BasicInformation, Change, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext,
+    BasicInformation, ByteRange, Change, FileSystem, LockId, Metadata, NotifyResult, OpenOptions,
+    RequestContext,
 };
 use crate::spec::{
     AccessMask, CreateAction, CreateDisposition, FileAttributes, NT_TICKS_PER_SECOND, NotifyAction,
@@ -23,6 +24,8 @@ pub(crate) const MAX_COMPONENT_NAME_LENGTH: u32 = 255;
 pub(crate) const NOTIFY_BUFFER_LIMIT: usize = 64 * 1024;
 const NOTIFY_WAITER_LIMIT: usize = 32;
 const NOTIFY_WATCH_LIMIT: usize = 1024;
+const LOCK_LIMIT: usize = 4096;
+const LOCK_WAITER_LIMIT: usize = 1024;
 
 /// A writable filesystem with a shared byte quota and object limit.
 #[derive(Clone)]
@@ -43,10 +46,12 @@ struct Open {
     user_set_access_time: bool,
     user_set_write_time: bool,
     user_set_change_time: bool,
+    notify_deleted: bool,
     watch: Option<Watch>,
 }
 
 struct Watch {
+    id: u64,
     filter: NotifyFilter,
     tree: bool,
     events: VecDeque<Change>,
@@ -61,11 +66,50 @@ struct State {
     next_id: u64,
     next_open: u64,
     next_notify: u64,
+    next_lock: u64,
     watches: usize,
+    locks: Vec<RangeLock>,
+    lock_waiters: usize,
     bytes: usize,
     byte_limit: usize,
     object_limit: usize,
     changed: Arc<Event>,
+}
+
+struct RangeLock {
+    id: LockId,
+    node: u64,
+    owner: u64,
+    range: ByteRange,
+    exclusive: bool,
+}
+
+fn conflicts(
+    state: &State,
+    file: &MemoryFile,
+    range: ByteRange,
+    exclusive: bool,
+    locking: bool,
+) -> bool {
+    state.locks.iter().any(|lock| {
+        lock.node == file.node
+            && lock.range.overlaps(range)
+            && if lock.exclusive {
+                lock.owner != file.open || (exclusive && locking)
+            } else {
+                exclusive
+            }
+    })
+}
+
+struct LockWaiter(Arc<Mutex<State>>);
+
+impl Drop for LockWaiter {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.lock_waiters -= 1;
+        wake(state);
+    }
 }
 
 fn wake(state: MutexGuard<'_, State>) {
@@ -127,10 +171,21 @@ fn name_filter(directory: bool) -> NotifyFilter {
         .with_file_name(!directory)
 }
 
+fn delete_watches(state: &mut State, node: u64) {
+    // MS-FSA §2.1.5.15.3 removes registrations and completes all their waiters.
+    // A replacement registration must not absorb waiters from the old generation.
+    for open in state.opens.values_mut().filter(|open| open.node == node) {
+        if open.watch.take().is_some() {
+            state.watches -= 1;
+        }
+    }
+}
+
 struct NotifyWaiter {
     state: Arc<Mutex<State>>,
     open: u64,
     id: u64,
+    watch: u64,
 }
 
 impl Drop for NotifyWaiter {
@@ -140,6 +195,7 @@ impl Drop for NotifyWaiter {
             .opens
             .get_mut(&self.open)
             .and_then(|open| open.watch.as_mut())
+            .filter(|watch| watch.id == self.watch)
         {
             watch.waiters.retain(|id| *id != self.id);
         }
@@ -194,7 +250,10 @@ impl MemoryFs {
             next_id: 2,
             next_open: 1,
             next_notify: 1,
+            next_lock: 1,
             watches: 0,
+            locks: Vec::new(),
+            lock_waiters: 0,
             bytes: 0,
             byte_limit,
             object_limit: object_limit.max(1),
@@ -295,8 +354,12 @@ impl MemoryFile {
         if open.watch.is_some() {
             state.watches -= 1;
         }
+        state.locks.retain(|lock| lock.owner != self.open);
         if let Some(node) = state.nodes.get_mut(&self.node) {
             node.delete_committed |= open.delete;
+        }
+        if open.delete && state.nodes[&self.node].metadata.is_directory() {
+            delete_watches(&mut state, self.node);
         }
         let committed = state
             .nodes
@@ -340,6 +403,31 @@ impl inspect::Inspect for MemoryFs {
             .field("watch_count", state.watches)
             .field("watch_limit", NOTIFY_WATCH_LIMIT)
             .field(
+                "notify_deleted_opens",
+                state
+                    .opens
+                    .values()
+                    .filter(|open| open.notify_deleted)
+                    .count(),
+            )
+            .field("lock_count", state.locks.len())
+            .field("lock_limit", LOCK_LIMIT)
+            .field("lock_waiters", state.lock_waiters)
+            .field("lock_waiter_limit", LOCK_WAITER_LIMIT)
+            .child("locks", |req| {
+                let mut resp = req.respond();
+                for (id, lock) in state.locks.iter().enumerate() {
+                    resp.child(&id.to_string(), |req| {
+                        req.respond()
+                            .field("node", lock.node)
+                            .field("owner", lock.owner)
+                            .field("offset", lock.range.offset)
+                            .field("length", lock.range.length)
+                            .field("exclusive", lock.exclusive);
+                    });
+                }
+            })
+            .field(
                 "notify_waiters",
                 state
                     .opens
@@ -356,6 +444,7 @@ impl inspect::Inspect for MemoryFs {
                         resp.child(&id.to_string(), |req| {
                             req.respond()
                                 .field("node", open.node)
+                                .field("registration", watch.id)
                                 .hex("filter", watch.filter.into_bits())
                                 .field("tree", watch.tree)
                                 .field("queued_events", watch.events.len())
@@ -541,6 +630,7 @@ impl FileSystem for MemoryFs {
         }
         let open = state.next_open;
         state.next_open = next_open;
+        let notify_deleted = delete && state.nodes[&id].metadata.is_directory();
         state.opens.insert(
             open,
             Open {
@@ -551,6 +641,7 @@ impl FileSystem for MemoryFs {
                 user_set_access_time: false,
                 user_set_write_time: false,
                 user_set_change_time: false,
+                notify_deleted,
                 watch: None,
             },
         );
@@ -599,6 +690,20 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
         let mut state = self.0.lock();
+        if length != 0
+            && conflicts(
+                &state,
+                file,
+                ByteRange {
+                    offset,
+                    length: length as u64,
+                },
+                false,
+                false,
+            )
+        {
+            return Err(Status::FILE_LOCK_CONFLICT);
+        }
         let user_set_access_time = state
             .opens
             .get(&file.open)
@@ -645,6 +750,18 @@ impl FileSystem for MemoryFs {
         }
         if data.is_empty() {
             return Ok(0);
+        }
+        if conflicts(
+            &state,
+            file,
+            ByteRange {
+                offset,
+                length: data.len() as u64,
+            },
+            true,
+            false,
+        ) {
+            return Err(Status::FILE_LOCK_CONFLICT);
         }
         let offset = usize::try_from(offset).map_err(|_| Status::DISK_FULL)?;
         let end = offset.checked_add(data.len()).ok_or(Status::DISK_FULL)?;
@@ -709,6 +826,109 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
+    async fn lock(
+        &self,
+        file: &MemoryFile,
+        range: ByteRange,
+        exclusive: bool,
+        fail_immediately: bool,
+        request: &RequestContext,
+    ) -> Result<LockId, Status> {
+        range.validate()?;
+        let changed = self.0.lock().changed.clone();
+        let mut waiter = None;
+        loop {
+            let listener = changed.listen();
+            {
+                let mut state = self.0.lock();
+                state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+                if state.nodes[&file.node].metadata.is_directory() {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                if request.is_cancelled() {
+                    return Err(Status::CANCELLED);
+                }
+                if !conflicts(&state, file, range, exclusive, true) {
+                    if state.locks.len() >= LOCK_LIMIT {
+                        return Err(Status::INSUFFICIENT_RESOURCES);
+                    }
+                    let id = LockId(state.next_lock);
+                    state.next_lock = state
+                        .next_lock
+                        .checked_add(1)
+                        .ok_or(Status::INSUFFICIENT_RESOURCES)?;
+                    state.locks.push(RangeLock {
+                        id,
+                        node: file.node,
+                        owner: file.open,
+                        range,
+                        exclusive,
+                    });
+                    return Ok(id);
+                }
+                if fail_immediately {
+                    return Err(Status::LOCK_NOT_GRANTED);
+                }
+                if waiter.is_none() {
+                    if state.lock_waiters >= LOCK_WAITER_LIMIT {
+                        return Err(Status::INSUFFICIENT_RESOURCES);
+                    }
+                    state.lock_waiters += 1;
+                    waiter = Some(LockWaiter(self.0.clone()));
+                }
+            }
+            let mut listener = std::pin::pin!(listener.fuse());
+            let mut cancelled = std::pin::pin!(request.cancelled().fuse());
+            futures::select! {
+                () = listener => {},
+                () = cancelled => return Err(Status::CANCELLED),
+            }
+        }
+    }
+
+    async fn rollback_lock(
+        &self,
+        file: &MemoryFile,
+        lock: LockId,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut state = self.0.lock();
+        if let Some(index) = state
+            .locks
+            .iter()
+            .position(|entry| entry.owner == file.open && entry.id == lock)
+        {
+            state.locks.remove(index);
+        }
+        wake(state);
+        Ok(())
+    }
+
+    async fn unlock(
+        &self,
+        file: &MemoryFile,
+        range: ByteRange,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        range.validate()?;
+        let mut state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        if state.nodes[&file.node].metadata.is_directory() {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let index = state
+            .locks
+            .iter()
+            .enumerate()
+            .filter(|(_, lock)| lock.owner == file.open && lock.range == range)
+            .max_by_key(|(_, lock)| lock.exclusive)
+            .map(|(index, _)| index)
+            .ok_or(Status::RANGE_NOT_LOCKED)?;
+        state.locks.remove(index);
+        wake(state);
+        Ok(())
+    }
+
     async fn set_len(
         &self,
         file: &MemoryFile,
@@ -757,17 +977,25 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::DIRECTORY_NOT_EMPTY);
         }
-        state
-            .opens
-            .get_mut(&file.open)
+        let directory = state
+            .nodes
+            .get(&file.node)
             .ok_or(Status::FILE_CLOSED)?
-            .delete = delete;
+            .metadata
+            .is_directory();
+        let open = state.opens.get_mut(&file.open).ok_or(Status::FILE_CLOSED)?;
+        open.delete = delete;
+        open.notify_deleted |= delete && directory;
+        if delete && directory {
+            delete_watches(&mut state, file.node);
+        }
         let pending = state
             .opens
             .values()
             .any(|o| o.node == file.node && o.delete);
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         node.metadata.delete_pending = node.delete_committed || pending;
+        wake(state);
         Ok(())
     }
 
@@ -871,7 +1099,7 @@ impl FileSystem for MemoryFs {
         output_length: usize,
         request: &RequestContext,
     ) -> Result<NotifyResult, Status> {
-        let (changed, id) = {
+        let (changed, id, watch_id) = {
             let mut state = self.0.lock();
             if !state
                 .nodes
@@ -884,12 +1112,11 @@ impl FileSystem for MemoryFs {
             }
             let id = state.next_notify;
             state.next_notify = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
-            let first = state
-                .opens
-                .get(&file.open)
-                .ok_or(Status::FILE_CLOSED)?
-                .watch
-                .is_none();
+            let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+            if open.notify_deleted {
+                return Err(Status::DELETE_PENDING);
+            }
+            let first = open.watch.is_none();
             if first {
                 if state.watches == NOTIFY_WATCH_LIMIT {
                     return Err(Status::INSUFFICIENT_RESOURCES);
@@ -898,6 +1125,7 @@ impl FileSystem for MemoryFs {
             }
             let open = state.opens.get_mut(&file.open).ok_or(Status::FILE_CLOSED)?;
             let watch = open.watch.get_or_insert_with(|| Watch {
+                id,
                 filter: NotifyFilter::from_bits(filter.into_bits() & NotifyFilter::VALID),
                 tree,
                 events: VecDeque::new(),
@@ -909,18 +1137,17 @@ impl FileSystem for MemoryFs {
                 return Err(Status::INSUFFICIENT_RESOURCES);
             }
             watch.waiters.push_back(id);
-            (state.changed.clone(), id)
+            let watch_id = watch.id;
+            (state.changed.clone(), id, watch_id)
         };
         let _waiter = NotifyWaiter {
             state: self.0.clone(),
             open: file.open,
             id,
+            watch: watch_id,
         };
         loop {
             let listener = changed.listen();
-            if request.is_cancelled() {
-                return Err(Status::CANCELLED);
-            }
             {
                 let mut state = self.0.lock();
                 let watch = state
@@ -929,7 +1156,11 @@ impl FileSystem for MemoryFs {
                     .ok_or(Status::FILE_CLOSED)?
                     .watch
                     .as_mut()
-                    .expect("registered watch");
+                    .filter(|watch| watch.id == watch_id)
+                    .ok_or(Status::DELETE_PENDING)?;
+                if request.is_cancelled() {
+                    return Err(Status::CANCELLED);
+                }
                 if watch.waiters.front() == Some(&id) {
                     if watch.overflow {
                         watch.overflow = false;
@@ -948,7 +1179,7 @@ impl FileSystem for MemoryFs {
             let mut cancelled = std::pin::pin!(request.cancelled().fuse());
             futures::select! {
                 () = listener => {}
-                () = cancelled => return Err(Status::CANCELLED),
+                () = cancelled => {}
             }
         }
     }
@@ -957,8 +1188,200 @@ impl FileSystem for MemoryFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::CreateOptions;
+    use crate::test_support::Operation;
+    use crate::test_support::contracts::{self, Expectations, Feature, Fixture};
     use futures::executor::block_on;
+    use std::task::Poll;
     use test_with_tracing::test;
+
+    struct ContractFixture(MemoryFs);
+
+    impl Fixture for ContractFixture {
+        type Backend = MemoryFs;
+
+        fn filesystem(&self) -> &MemoryFs {
+            &self.0
+        }
+
+        fn expectations(&self) -> Expectations {
+            Expectations {
+                basic_information: Feature::Supported,
+                locks: Feature::Supported,
+                notifications: Feature::Supported,
+            }
+        }
+
+        async fn wait_until_pending(&self, operation: Operation, request: &RequestContext) {
+            assert!(!request.is_cancelled());
+            let state = self.0.0.lock();
+            match operation {
+                Operation::Lock => assert!(state.lock_waiters > 0),
+                Operation::Notify => assert!(
+                    state
+                        .opens
+                        .values()
+                        .filter_map(|open| open.watch.as_ref())
+                        .any(|watch| !watch.waiters.is_empty())
+                ),
+                _ => panic!("unexpected pending probe: {operation:?}"),
+            }
+        }
+    }
+
+    fn run_contract(test: impl AsyncFnOnce(&ContractFixture)) {
+        let fixture = ContractFixture(MemoryFs::new(1024, 32));
+        block_on(test(&fixture));
+        let state = fixture.0.0.lock();
+        assert!(state.opens.is_empty());
+        assert!(state.locks.is_empty());
+        assert_eq!(state.lock_waiters, 0);
+        assert_eq!(state.watches, 0);
+    }
+
+    #[test]
+    fn contract_data_and_identity() {
+        run_contract(contracts::data_and_identity);
+    }
+
+    #[test]
+    fn contract_sharing_and_handle_release() {
+        run_contract(contracts::sharing_and_handle_release);
+    }
+
+    #[test]
+    fn contract_delete_on_close() {
+        run_contract(contracts::delete_on_close);
+    }
+
+    #[test]
+    fn contract_basic_information() {
+        run_contract(contracts::basic_information);
+    }
+
+    #[test]
+    fn contract_lock_conflicts_and_io() {
+        run_contract(contracts::lock_conflicts_and_io);
+    }
+
+    #[test]
+    fn contract_lock_waiters_and_cancellation() {
+        run_contract(contracts::lock_waiters_and_cancellation);
+    }
+
+    #[test]
+    fn contract_lock_rollback_and_drop() {
+        run_contract(contracts::lock_rollback_and_drop);
+    }
+
+    #[test]
+    fn contract_notify_registration_and_cancellation() {
+        run_contract(contracts::notify_registration_and_cancellation);
+    }
+
+    #[test]
+    fn contract_notify_fifo_and_small_buffer() {
+        run_contract(contracts::notify_fifo_and_small_buffer);
+    }
+
+    #[test]
+    fn contract_notify_subtree_and_filters() {
+        run_contract(contracts::notify_subtree_and_filters);
+    }
+
+    #[test]
+    fn contract_notify_deletion_generations() {
+        run_contract(contracts::notify_deletion_generations);
+    }
+
+    #[test]
+    fn deletion_invalidates_old_watch_generations_without_stealing_a_new_registration() {
+        block_on(async {
+            let fs = MemoryFs::new(1024, 16);
+            let context = RequestContext::new(1);
+            let options = OpenOptions {
+                access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                share_access: ShareAccess::ALL.into_bits(),
+                disposition: CreateDisposition::OPEN_IF.0,
+                options: CreateOptions::new().with_directory_file(true).into_bits(),
+                attributes: 0,
+            };
+            let (watched, _) = fs.open("generation", options, &context).await.unwrap();
+            let (deleting, _) = fs.open("generation", options, &context).await.unwrap();
+            let first_context = RequestContext::new(2);
+            let second_context = RequestContext::new(3);
+            let mut first = std::pin::pin!(fs.notify(
+                &watched,
+                NotifyFilter::new().with_file_name(true),
+                false,
+                1024,
+                &first_context
+            ));
+            let mut second = std::pin::pin!(fs.notify(
+                &watched,
+                NotifyFilter::new().with_file_name(true),
+                false,
+                1024,
+                &second_context
+            ));
+            assert!(futures::poll!(&mut first).is_pending());
+            assert!(futures::poll!(&mut second).is_pending());
+            fs.set_delete_on_close(&deleting, true, &context)
+                .await
+                .unwrap();
+            fs.set_delete_on_close(&deleting, false, &context)
+                .await
+                .unwrap();
+            first_context.cancel();
+            second_context.cancel();
+            let mut fresh = std::pin::pin!(fs.notify(
+                &watched,
+                NotifyFilter::new().with_dir_name(true),
+                false,
+                1024,
+                &context
+            ));
+            assert!(futures::poll!(&mut fresh).is_pending());
+            for notification in [&mut first, &mut second] {
+                assert!(matches!(
+                    futures::poll!(notification),
+                    Poll::Ready(Err(Status::DELETE_PENDING))
+                ));
+            }
+            {
+                let state = fs.0.lock();
+                assert_eq!(state.watches, 1);
+                assert_eq!(
+                    state
+                        .opens
+                        .values()
+                        .filter_map(|open| open.watch.as_ref())
+                        .map(|watch| watch.waiters.len())
+                        .sum::<usize>(),
+                    1
+                );
+            }
+            let (child, _) = fs
+                .open("generation\\child", options, &context)
+                .await
+                .unwrap();
+            let result = fresh.await.unwrap();
+            assert!(
+                matches!(result, NotifyResult::Changes(ref changes) if changes == &[Change { action: NotifyAction::ADDED, name: "child".into() }])
+            );
+            assert!(matches!(
+                fs.notify(&deleting, NotifyFilter::new(), false, 1024, &context)
+                    .await,
+                Err(Status::DELETE_PENDING)
+            ));
+            fs.close(&child, &context).await.unwrap();
+            fs.close(&watched, &context).await.unwrap();
+            fs.close(&deleting, &context).await.unwrap();
+            let state = fs.0.lock();
+            assert_eq!(state.watches, 0);
+            assert!(state.opens.is_empty());
+        });
+    }
 
     #[test]
     fn persistent_watch_capacity_is_released_by_close() {

@@ -175,6 +175,42 @@ pub enum NotifyResult {
     Overflow,
 }
 
+/// An exact byte range, including the zero-length ranges allowed by MS-FSA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    /// First byte offset.
+    pub offset: u64,
+    /// Number of bytes; may be zero.
+    pub length: u64,
+}
+
+/// Provider-owned identity of one acquisition, for exact rollback of a lock array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockId(pub u64);
+
+impl ByteRange {
+    pub(crate) fn validate(self) -> Result<(), Status> {
+        if self.length != 0 && self.offset.checked_add(self.length - 1).is_none() {
+            return Err(Status::INVALID_LOCK_RANGE);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn overlaps(self, other: Self) -> bool {
+        // MS-FSA §2.1.4.10 gives {0, 0} special treatment and uses inclusive ends.
+        self != (Self {
+            offset: 0,
+            length: 0,
+        }) && other
+            != (Self {
+                offset: 0,
+                length: 0,
+            })
+            && self.offset <= other.offset.wrapping_add(other.length).wrapping_sub(1)
+            && other.offset <= self.offset.wrapping_add(self.length).wrapping_sub(1)
+    }
+}
+
 /// The object store behind a share.
 ///
 /// Handles own their open lifetime: dropping one releases its share-access
@@ -203,6 +239,7 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         request: &RequestContext,
     ) -> Result<Metadata, Status>;
     /// Read at most `length` bytes from a default data stream.
+    /// At EOF, an empty result or STATUS_END_OF_FILE is accepted by the engine.
     async fn read(
         &self,
         file: &Self::File,
@@ -247,12 +284,53 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         info: BasicInformation,
         request: &RequestContext,
     ) -> Result<(), Status>;
-    /// Watch directory changes. The first call fixes filter/scope for this open;
+    /// Acquire a byte-range lock owned by this open (MS-FSA §2.1.5.8).
+    /// Conflicts and read/write enforcement span all opens/connections to the stream.
+    /// Shared locks block all writes; exclusive locks permit the owner's I/O.
+    /// Waiting requests must honor cancellation unless the lock was already acquired.
+    /// Explicit close and fallback handle drop release all of the open's locks.
+    /// Providers implementing this operation must also implement unlock and rollback_lock.
+    async fn lock(
+        &self,
+        _file: &Self::File,
+        _range: ByteRange,
+        _exclusive: bool,
+        _fail_immediately: bool,
+        _request: &RequestContext,
+    ) -> Result<LockId, Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+    /// Roll back one successful acquisition, never an older exact-range match.
+    /// Idempotent if that acquisition was already unlocked by concurrent work.
+    /// Cleanup must not be prevented by cancellation of the originating request.
+    async fn rollback_lock(
+        &self,
+        _file: &Self::File,
+        _lock: LockId,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+    /// Remove one exact lock owned by this open (MS-FSA §2.1.5.9).
+    /// Prefer an exclusive lock when multiple exact matches exist.
+    async fn unlock(
+        &self,
+        _file: &Self::File,
+        _range: ByteRange,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+    /// Watch directory changes. The first call fixes filter/scope for its registration;
     /// buffer changes between calls and complete overlapping requests FIFO.
     /// Cancellation removes a waiter, not the open's watch or buffered changes.
+    /// Directory deletion invalidates registrations and completes pending waits with
+    /// STATUS_DELETE_PENDING; later registration must not absorb the old waiters.
     /// Establish the watch even if the request was canceled before its first poll.
     /// Pending waits must honor cancellation unless an actual result was already obtained.
     /// Providers must bound storage and report overflow rather than silently lose events.
+    /// An undersized reply reports overflow without consuming the buffered batch;
+    /// storage overflow may discard events and require re-enumeration.
     async fn notify(
         &self,
         _file: &Self::File,

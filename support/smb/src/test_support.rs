@@ -7,8 +7,11 @@
 //! enter bounded recent history, so an unattended TCP test server cannot fill
 //! an announcement queue. No file contents are retained in diagnostic records.
 
+pub mod contracts;
+
 use crate::provider::{
-    BasicInformation, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext,
+    BasicInformation, ByteRange, FileSystem, LockId, Metadata, NotifyResult, OpenOptions,
+    RequestContext,
 };
 use crate::spec::{NotifyFilter, Status};
 use async_trait::async_trait;
@@ -47,6 +50,12 @@ pub enum Operation {
     SetBasic,
     /// Directory change notification.
     Notify,
+    /// Byte-range lock.
+    Lock,
+    /// Byte-range unlock.
+    Unlock,
+    /// Exact acquisition rollback.
+    RollbackLock,
 }
 
 /// A manually releasable scheduling point.
@@ -575,6 +584,66 @@ impl<B: Inspect> Inspect for ControlledFs<B> {
 #[async_trait]
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
+
+    async fn lock(
+        &self,
+        file: &Self::File,
+        range: ByteRange,
+        exclusive: bool,
+        fail_immediately: bool,
+        r: &RequestContext,
+    ) -> Result<LockId, Status> {
+        let mut call = self.controller.begin(
+            Operation::Lock,
+            Some(file.id),
+            None,
+            Some(range.offset),
+            Some(range.length),
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .lock(&file.inner, range, exclusive, fail_immediately, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn rollback_lock(
+        &self,
+        file: &Self::File,
+        lock: LockId,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::RollbackLock, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .rollback_lock(&file.inner, lock, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn unlock(
+        &self,
+        file: &Self::File,
+        range: ByteRange,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call = self.controller.begin(
+            Operation::Unlock,
+            Some(file.id),
+            None,
+            Some(range.offset),
+            Some(range.length),
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self.backend.unlock(&file.inner, range, &context).await;
+        call.complete(result, None).await
+    }
 
     async fn notify(
         &self,

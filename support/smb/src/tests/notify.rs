@@ -733,6 +733,83 @@ fn mutation_filters_ignore_failed_effects_and_notify_actual_size_metadata_and_re
 }
 
 #[test]
+fn directory_deletion_completes_pending_notifies_without_closing_the_watched_handle() {
+    block_on(async {
+        for separate_connection in [false, true] {
+            for initial_delete_on_close in [false, true] {
+                let memory = MemoryFs::new(1024, 16);
+                let server = Server::new("memory", memory.clone()).unwrap();
+                let mut owner = Client::new(&server).await;
+                let mut other = Client::new(&server).await;
+                let directory = owner.open("deleted-directory", 2, 1).await;
+                let watched = if separate_connection {
+                    other.open("deleted-directory", 1, 1).await
+                } else {
+                    owner.open("deleted-directory", 1, 1).await
+                };
+                let request = accept(
+                    if separate_connection {
+                        &mut other
+                    } else {
+                        &mut owner
+                    },
+                    watched,
+                    NotifyFilter::new().with_file_name(true),
+                    false,
+                    1024,
+                );
+                let mut notification = std::pin::pin!(request.execute());
+                assert!(futures::poll!(&mut notification).is_pending());
+                if initial_delete_on_close {
+                    let deleting = owner
+                        .open(
+                            "deleted-directory",
+                            1,
+                            CreateOptions::new()
+                                .with_directory_file(true)
+                                .with_delete_on_close(true)
+                                .into_bits(),
+                        )
+                        .await;
+                    owner.close(deleting).await;
+                } else {
+                    assert_eq!(
+                        response_status(
+                            &owner
+                                .set(directory, FileInformationClass::DISPOSITION.0, &[1])
+                                .await
+                        ),
+                        Status::SUCCESS
+                    );
+                    // Clearing disposition before polling must not erase the completion.
+                    assert_eq!(
+                        response_status(
+                            &owner
+                                .set(directory, FileInformationClass::DISPOSITION.0, &[0])
+                                .await
+                        ),
+                        Status::SUCCESS
+                    );
+                }
+                let Poll::Ready(reply) = futures::poll!(&mut notification) else {
+                    panic!("directory deletion left CHANGE_NOTIFY pending");
+                };
+                assert_eq!(response_status(&reply.unwrap()), Status::DELETE_PENDING);
+                assert_eq!(runtime::inspect_text("watch_count", &memory).await, "0");
+                assert_eq!(runtime::inspect_text("notify_waiters", &memory).await, "0");
+                owner.close(directory).await;
+                if separate_connection {
+                    other.close(watched).await;
+                } else {
+                    owner.close(watched).await;
+                }
+                assert_eq!(runtime::inspect_text("opens", &memory).await, "0");
+            }
+        }
+    });
+}
+
+#[test]
 fn closing_the_receiver_after_interim_cancels_and_drains_a_waiting_notification() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

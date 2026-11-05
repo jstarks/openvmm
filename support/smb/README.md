@@ -27,6 +27,10 @@ cargo nextest run --profile agent -p smb --run-ignored only \
 cargo nextest run --profile agent -p smb --features test-support --run-ignored only \
     -E 'test(samba_gated_async_compounds)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_notify)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lock)'
+SMBTORTURE=/path/to/corrected/smbtorture \
+    cargo nextest run --profile agent -p smb --run-ignored only \
+    -E 'test(samba_notify_corrected_client)'
 ```
 
 The ignored test requires `smbtorture` (Ubuntu package `samba-testsuite`),
@@ -42,6 +46,56 @@ flushes on the server's poller. Its four async compound cases include READ/WRITE
 checks requiring pending replies, rather than only allowing synchronous fallback.
 The notify harness covers CLOSE, TREE_DISCONNECT, LOGOFF, ordinary-file rejection,
 handle permissions, and excluding changes to the watched directory itself.
+The lock harness runs seventeen cases covering shared/exclusive I/O enforcement,
+conflicts, pending acquisition, exact unlocks, stacking, zero-length/64-bit
+ranges, cross-connection ownership, arrays, and truncation.
+`SMBTORTURE` selects the executable for every harness; otherwise they use
+`smbtorture` from PATH. The corrected-client harness requires that variable
+explicitly and adds ten notify cases: tcon, dir, tdis, double, tcp, overflow,
+and rmdir1-4. It uses ten operations because the directory fixture assumes that
+count and has a fixed 1000-byte output buffer.
+
+### Direct Provider Contracts
+
+`test_support::contracts` exports generic async scenarios behind `test-support`
+(also enabled for this crate's unit tests). MemoryFs runs each scenario as an
+individually named `memory::tests::contract_*` test, without an SMB server:
+
+```bash
+cargo nextest run --profile agent -p smb -E 'test(contract_)'
+cargo nextest run --profile agent -p smb --features test-support \
+    --test provider_contracts
+```
+
+Provider crates should enable that feature as a dev-dependency, implement
+`contracts::Fixture`, and register the same scenario functions as separate
+tests on their own executor. Each invocation needs a fresh, empty, isolated,
+writable filesystem; the fixture owns any native driver and temporary resources.
+Declare basic-information, locking, and notification expectations explicitly.
+Unexpected unsupported errors fail; an unsupported profile exercises rejection
+rather than silently skipping a test. These are test expectations, not runtime
+SMB capability advertisement. Read-only providers will need separate scenarios
+that do not assume successful creation or mutation.
+
+The fixture's `wait_until_pending` hook must observe an actual registered watch
+or contended lock wait. A first pending poll or worker-queue submission is not
+sufficient for an asynchronously registering provider. The scenarios keep
+driving the operation while awaiting that hook, then cancel or mutate the
+filesystem deterministically. Cancellation is initiated inside the shared
+scenarios; `RequestContext` does not expose a new production cancellation API.
+See [the external-crate tests](tests/provider_contracts.rs) for API usage,
+explicit rejection checks, short transfers, and delayed-registration scheduling.
+Their controlled wrappers validate the test infrastructure, not native I/O.
+
+The common cases check observable data and stable identity, directory listings,
+zero extension/truncation, bilateral sharing and close/drop release, basic DOS
+attributes, lock conflicts/I/O enforcement/waits/rollback, and watch policy,
+buffering/FIFO/cancellation/subtrees/deletion generations. They permit genuine
+short transfers and do not prescribe exact quotas, short names, or clock
+precision. Keep provider-specific tests for those policies, native completion
+ownership/cancellation, timestamp controls, resource bounds, and durability.
+SMB access checks, per-open request barriers, CLOSE cancel/drain, transient
+stop, and wire/transport behavior remain engine/runtime tests.
 
 ## Protocol Representation
 
@@ -147,8 +201,9 @@ without provider effects. It does not leave them blocking subsequent CANCEL.
 CHANGE_NOTIFY is supported as the last command of a compound, including inheritance
 from CREATE. A non-tail CHANGE_NOTIFY returns STATUS_NOT_SUPPORTED rather than
 stranding later commands behind an indefinite wait; MS-SMB2 section 3.3.5.2.7
-allows rejecting asynchronous compound operations. The decoder includes
-file-bearing LOCK/IOCTL layouts, but those operations remain unsupported.
+allows rejecting asynchronous compound operations. Immediate LOCK operations
+can precede other compound commands. Waiting LOCK operations are supported only
+at the tail, using the same non-tail rejection policy. IOCTL remains unsupported.
 
 The full Samba compound suite is not claimed to pass. The installed 4.19.5
 `related1` probe crashed in client session-cloning setup. `related6` expects
@@ -162,7 +217,7 @@ test server's 32-credit/4096-object profile. None are counted as passing coverag
 
 CHANGE_NOTIFY follows MS-SMB2 sections 3.3.1.3 and 3.3.5.19, MS-FSA sections
 2.1.5.11/11.1, and MS-FSCC section 2.7.1. The first provider registration fixes
-the filter and subtree policy for the lifetime of that open, including when
+the filter and subtree policy while that registration exists, including when
 its first waiter was already canceled. Unknown filter bits are ignored; an
 empty filter waits for cancellation or close.
 
@@ -172,6 +227,12 @@ reports relative UTF-16 names and aligned linked records, and completes waiters
 FIFO. Notifications have their own ordering queue, not a data/mutation barrier.
 Normal I/O and metadata operations still progress; CLOSE cancels/drains watchers
 and returns STATUS_NOTIFY_CLEANUP for canceled notifications.
+
+Marking a directory for deletion completes its pending watches with
+DELETE_PENDING and releases their registrations (MS-FSA 2.1.5.15.3).
+Registration identities keep those completions distinct from any later watch
+after disposition is cleared. The deleting open retains its own deletion marker;
+closing a directory opened delete-on-close also completes other opens' watches.
 
 Each watch retains up to 64 KiB of encoded events. The provider permits 1024
 watches and 32 backend waiters per open; the core's existing request limit also
@@ -198,8 +259,62 @@ Not all installed Samba 4.19.5 notify cases are applicable. Probes such as
 an interim, rather than the pending request's ID, and then wait indefinitely.
 That unmatched CANCEL must be ignored, not treated as "cancel any request".
 Its behavior is covered by a direct negative regression; those probes are not
-counted as passes. Other broad cases require rename or native-filesystem-specific
-buffer/event policies that this provider does not implement.
+counted as passes with the installed client.
+
+The same mismatch was reproduced with unmodified Samba 4.25.1, including against
+Samba's own server when pinned to SMB 2.1. SMB 3.1.1 defaults negotiate AES-GMAC
+and pass; forcing AES-CMAC reproduces the failure. The legacy client path sets
+MID zero too early, even when no AsyncId has been received. A corrected local
+client keeps the real MID and applies the legacy zero convention only when
+sending an asynchronous CANCEL. The ten-case harness above requires that fix;
+our server does not weaken cancellation identity matching. Reference comparisons
+with the corrected client pass in all three signing profiles.
+
+Broader probes still have limits: mask-change and recursive fixtures need rename,
+tree uses dot-component paths rejected by the current namespace policy, and
+valid-req assumes specific native event batching and notification-buffer policy.
+The slow mask probe passes but permits cancellation for many subcases; it is not
+evidence that unimplemented rename operations work.
+
+## Byte-Range Locks
+
+LOCK follows MS-SMB2 sections 2.2.26/27 and 3.3.5.14, and MS-FSA sections
+2.1.4.10 and 2.1.5.8/9. Locks belong to provider opens, not connections or
+client process IDs. Shared locks permit reads and shared acquisitions but block
+all writes, including the owner's. Exclusive locks permit the owner's I/O but
+block other opens and overlapping exclusive acquisitions by the same owner.
+Ranges may extend beyond EOF, including zero-length ranges and offsets over
+the complete unsigned 64-bit range. Overflowing nonempty ranges are rejected.
+
+Contended immediate requests return LOCK_NOT_GRANTED; conflicting I/O returns
+FILE_LOCK_CONFLICT. Waiting requests receive AsyncIds, honor CANCEL, survive
+pause/resume, and do not block UNLOCK or I/O barriers. Unlock removes one exact
+range, preferring an exclusive match when locks are stacked. A conflicting
+immediate array rolls back only its own acquisitions, using provider-issued
+identities rather than range-based unlocks that could remove older locks.
+Successfully processed unlocks and prefixes preceding invalid flags are not
+rolled back. LockSequence replay suppression is not active for this SMB 2.1
+profile without resilient/durable/persistent handles or multichannel.
+
+The memory provider bounds the share to 4096 acquired locks and 1024 waiting
+provider operations, in addition to the core's 32-request connection limit.
+Counts, limits, ownership and ranges are inspectable. Cancellation releases waiter
+resources; close/drop releases all locks belonging to that open. CLOSE retains
+its existing cancel-and-drain policy, and late acquired results remain successful.
+
+The seventeen-case Samba harness excludes `smb2.lock.cancel`, `cancel-tdis`,
+and `cancel-logoff`: the basic CANCEL portions work, but those fixtures require
+RANGE_NOT_LOCKED (or success during tree/logoff close ordering) where this
+server's cancellation policy returns CANCELLED. These are recorded mismatches,
+not passing coverage or a reason to change CLOSE. Direct regressions cover
+explicit MessageId/AsyncId cancellation, full admission, close/drain, rollback,
+quotas, literal wire fields, compound boundaries, and paused TCP delivery.
+
+Clean TCP EOF now requests cancellation and closes provider opens after accepted
+work drains, independently of transmitting remaining replies. Existing replies
+are still delivered to a half-closed peer; a malformed/truncated transport
+discards them. Broader teardown policy, including saturated publication/output
+queues and failed/uncancellable cleanup, remains under discussion.
 
 ## Controlled Provider Tests
 
@@ -238,7 +353,7 @@ for async compound interoperability.
 ## Current Limits
 
 Supported commands are NEGOTIATE, SESSION_SETUP, LOGOFF, TREE_CONNECT,
-TREE_DISCONNECT, CREATE, CLOSE, FLUSH, READ, WRITE, QUERY_DIRECTORY, CHANGE_NOTIFY, and a
+TREE_DISCONNECT, CREATE, CLOSE, FLUSH, READ, WRITE, LOCK, QUERY_DIRECTORY, CHANGE_NOTIFY, and a
 subset of QUERY_INFO/SET_INFO, plus ECHO. CREATE validates linked context
 containers and returns maximal-access (`MxAc`) and on-disk-ID (`QFid`) responses.
 Unsupported preallocation, durable-handle requests, and leases are explicitly
@@ -251,7 +366,7 @@ Alternate-name queries use optional provider short names; the memory provider
 does not generate 8.3 aliases.
 
 Non-default streams, Unicode
-case-folding, rename, ACL updates, locks, leases, and IOCTLs
+case-folding, rename, ACL updates, leases, and IOCTLs
 remain future work. Unsupported requests receive explicit status errors.
 Memory is allocated for file holes; this is not a sparse-filesystem model.
 

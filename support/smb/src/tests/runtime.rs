@@ -75,6 +75,9 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::SetLen,
             Operation::SetDeleteOnClose,
             Operation::SetBasic,
+            Operation::Lock,
+            Operation::Unlock,
+            Operation::RollbackLock,
         ];
         for operation in operations {
             control
@@ -154,6 +157,37 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         assert_eq!(metadata.written, 30);
         assert!(metadata.delete_pending);
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
+        let range = ByteRange {
+            offset: 0,
+            length: 3,
+        };
+        let acquired = through_gates(
+            fs.lock(&file, range, true, true, &context),
+            &control,
+            Operation::Lock,
+        )
+        .await;
+        assert_eq!(inspect_text("lock_count", &memory).await, "1");
+        through_gates(
+            fs.rollback_lock(&file, acquired, &context),
+            &control,
+            Operation::RollbackLock,
+        )
+        .await;
+        assert_eq!(inspect_text("lock_count", &memory).await, "0");
+        through_gates(
+            fs.lock(&file, range, false, true, &context),
+            &control,
+            Operation::Lock,
+        )
+        .await;
+        through_gates(
+            fs.unlock(&file, range, &context),
+            &control,
+            Operation::Unlock,
+        )
+        .await;
+        assert_eq!(inspect_text("lock_count", &memory).await, "0");
         assert!(
             through_gates(fs.list(&directory, &context), &control, Operation::List)
                 .await
@@ -1092,6 +1126,7 @@ fn flush_orders_earlier_and_later_writes_on_the_same_open() {
 #[derive(Default)]
 struct StreamState {
     input: VecDeque<u8>,
+    eof: bool,
     output: Vec<u8>,
     read: usize,
     write_limit: usize,
@@ -1159,6 +1194,9 @@ impl AsyncRead for TestStream {
             }
         }
         if state.input.is_empty() {
+            if state.eof {
+                return Poll::Ready(Ok(0));
+            }
             return Poll::Pending;
         }
         let length = out.len().min(state.input.len());
@@ -1225,7 +1263,7 @@ fn final_frames(bytes: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
-async fn inspect_text(path: &str, object: impl inspect::InspectMut) -> String {
+pub(super) async fn inspect_text(path: &str, object: impl inspect::InspectMut) -> String {
     let mut inspection = inspect::inspect(path, object);
     inspection.resolve().await;
     inspection.results().to_string()
@@ -1486,6 +1524,177 @@ fn notify_tcp_retains_events_async_ids_and_partial_output_across_pause() {
                 .iter()
                 .any(|call| call.phase == Phase::Abandoned)
         );
+    });
+}
+
+#[test]
+fn tcp_pause_preserves_a_waiting_lock_and_its_partial_interim_response() {
+    DefaultPool::run_with(async |driver| {
+        let memory = MemoryFs::new(1024, 16);
+        let (fs, control) = ControlledFs::new(memory.clone());
+        let server = Server::new("memory", fs).unwrap();
+        let mut owner = Client::new(&server).await;
+        let a = owner.open("paused-lock", 2, 0).await;
+        let exclusive = LockFlags::new()
+            .with_exclusive_lock(true)
+            .with_fail_immediately(true);
+        owner
+            .ok(Command::LOCK, &locking::body(a, &[(0, 1, exclusive)]))
+            .await;
+        let mut client = Client::new(&server).await;
+        let b = client.open("paused-lock", 1, 0).await;
+        control
+            .set_plan(
+                Operation::Lock,
+                Plan {
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let stream = TestStream::new();
+        stream.writable(5);
+        stream.input(&frame(&request(
+            Command::LOCK,
+            &locking::body(b, &[(0, 1, exclusive.with_fail_immediately(false))]),
+            client.session,
+            client.tree,
+            client.message,
+        )));
+        let mut task = TaskControl::new(tcp::ConnectionTask::new(
+            client.connection.clone(),
+            stream.clone(),
+        ));
+        task.insert(driver, "smb-lock-pause", ());
+        task.start();
+        let call = control.next_call().await;
+        stream.until(|state| state.output.len() == 5).await;
+        task.stop().await;
+        assert_eq!(inspect_text("lock_waiters", &memory).await, "1");
+        assert_eq!(inspect_text("transmit_offset", &task).await, "5");
+        owner
+            .ok(
+                Command::LOCK,
+                &locking::body(a, &[(0, 1, LockFlags::new().with_unlock(true))]),
+            )
+            .await;
+        assert_eq!(inspect_text("lock_count", &memory).await, "0");
+        task.start();
+        control.wait_for_phase(call.id, Phase::After).await.unwrap();
+        task.stop().await;
+        assert_eq!(inspect_text("lock_count", &memory).await, "1");
+        control.release(call.id, Gate::After).unwrap();
+        stream.writable(usize::MAX);
+        task.start();
+        stream
+            .until(|state| complete_frames(&state.output).len() == 2)
+            .await;
+        task.stop().await;
+        let bytes = stream.state.lock().output.clone();
+        let frames = complete_frames(&bytes);
+        let pending = AsyncHeader::read_from_prefix(frames[0]).unwrap().0;
+        let completed = AsyncHeader::read_from_prefix(frames[1]).unwrap().0;
+        assert_eq!(Status(pending.status.get()), Status::PENDING);
+        assert_eq!(pending.async_id, completed.async_id);
+        assert_eq!(Status(completed.status.get()), Status::SUCCESS);
+        assert_eq!(completed.credits.get(), 0);
+        assert_eq!(&frames[1][64..], &[4, 0, 0, 0]);
+        task.task_mut().shutdown().await.unwrap();
+        owner.close(a).await;
+        assert_eq!(inspect_text("lock_count", &memory).await, "0");
+        assert_eq!(inspect_text("lock_waiters", &memory).await, "0");
+        assert_eq!(inspect_text("opens", &memory).await, "0");
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.phase == Phase::Abandoned)
+        );
+    });
+}
+
+#[test]
+fn peer_eof_cancels_pending_notify_and_releases_opens_without_output() {
+    block_on(async {
+        for partial_frame in [false, true] {
+            let memory = MemoryFs::new(1024, 16);
+            let (fs, control) = ControlledFs::new(memory.clone());
+            control
+                .set_plan(
+                    Operation::Notify,
+                    Plan {
+                        hold_after: true,
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
+            let server = Server::new("memory", fs).unwrap();
+            let mut client = Client::new(&server).await;
+            let root = client.open("", 1, 1).await;
+            let stream = TestStream::new();
+            stream.input(&frame(&request(
+                Command::CHANGE_NOTIFY,
+                &notify::body(root, NotifyFilter::new().with_file_name(true), false, 1024),
+                client.session,
+                client.tree,
+                client.message,
+            )));
+            let mut connection = client.connection.clone();
+            let mut socket = stream.clone();
+            let mut serving = std::pin::pin!(tcp::serve(&mut connection, &mut socket));
+            assert!(futures::poll!(&mut serving).is_pending());
+            let call = control.next_call().await;
+            assert_eq!(inspect_text("notify_waiters", &memory).await, "1");
+            if partial_frame {
+                stream.input(&[0, 0]);
+            }
+            stream.state.lock().eof = true;
+            stream.reader.wake();
+            for _ in 0..32 {
+                assert!(futures::poll!(&mut serving).is_pending());
+                if control.snapshot(call.id).unwrap().phase == Phase::After {
+                    break;
+                }
+            }
+            let snapshot = control.snapshot(call.id).unwrap();
+            assert_eq!(snapshot.phase, Phase::After);
+            assert_eq!(snapshot.status, Some(Status::CANCELLED));
+            assert_eq!(inspect_text("notify_waiters", &memory).await, "0");
+            // Even after EOF, an obtained provider result must be drained, not dropped.
+            control.release(call.id, Gate::After).unwrap();
+            if !partial_frame {
+                for _ in 0..32 {
+                    assert!(futures::poll!(&mut serving).is_pending());
+                }
+                assert_eq!(inspect_text("watch_count", &memory).await, "0");
+                assert_eq!(inspect_text("opens", &memory).await, "0");
+                assert!(stream.state.lock().output.is_empty());
+                stream.writable(usize::MAX);
+            }
+            let result = serving.await;
+            if partial_frame {
+                assert!(matches!(result, Err(Error::Io(_))));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(inspect_text("watch_count", &memory).await, "0");
+            assert_eq!(inspect_text("opens", &memory).await, "0");
+            assert_eq!(successes(&control, Operation::Close), 1);
+            if partial_frame {
+                assert!(stream.state.lock().output.is_empty());
+            } else {
+                let bytes = stream.state.lock().output.clone();
+                let frames = complete_frames(&bytes);
+                assert_eq!(frames.len(), 2);
+                assert_eq!(response_status(frames[1]), Status::CANCELLED);
+            }
+            assert!(
+                !control
+                    .calls()
+                    .iter()
+                    .any(|call| call.phase == Phase::Abandoned)
+            );
+        }
     });
 }
 

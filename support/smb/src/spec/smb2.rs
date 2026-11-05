@@ -74,8 +74,11 @@ open_enum! {
         OBJECT_PATH_NOT_FOUND = 0xc000003a,
         OBJECT_PATH_SYNTAX_BAD = 0xc000003b,
         SHARING_VIOLATION = 0xc0000043,
+        FILE_LOCK_CONFLICT = 0xc0000054,
+        LOCK_NOT_GRANTED = 0xc0000055,
         DELETE_PENDING = 0xc0000056,
         DISK_FULL = 0xc000007f,
+        RANGE_NOT_LOCKED = 0xc000007e,
         INSUFFICIENT_RESOURCES = 0xc000009a,
         FILE_IS_A_DIRECTORY = 0xc00000ba,
         NOT_SUPPORTED = 0xc00000bb,
@@ -84,6 +87,7 @@ open_enum! {
         NOT_A_DIRECTORY = 0xc0000103,
         NAME_TOO_LONG = 0xc0000106,
         FILE_CLOSED = 0xc0000128,
+        INVALID_LOCK_RANGE = 0xc00001a1,
         USER_SESSION_DELETED = 0xc0000203,
         NETWORK_NAME_DELETED = 0xc00000c9,
     }
@@ -220,6 +224,21 @@ pub struct WriteFlags {
     reserved: u32,
 }
 le_bitfield_conversions!(WriteFlags, u32, U32);
+
+/// Byte-range lock flags: [MS-SMB2] §2.2.26.1.
+#[bitfield(u32, repr = U32, from = U32::new, into = super::u32_from_le, conversion = false)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct LockFlags {
+    pub shared_lock: bool,
+    pub exclusive_lock: bool,
+    pub unlock: bool,
+    #[bits(1)]
+    reserved_low: u32,
+    pub fail_immediately: bool,
+    #[bits(27)]
+    reserved: u32,
+}
+le_bitfield_conversions!(LockFlags, u32, U32);
 
 /// File-object access mask: [MS-SMB2] §2.2.13.1.1.
 ///
@@ -546,8 +565,8 @@ TreeConnectResponse, 16, 16 {
     maximal_access: AccessMask,
 });
 wire!(
-/// Shared fixed LOGOFF, TREE_DISCONNECT, FLUSH response, ECHO and CANCEL body:
-/// [MS-SMB2] §§2.2.7–8, 2.2.11–12, 2.2.18, 2.2.28–30.
+/// Shared fixed LOGOFF, TREE_DISCONNECT, FLUSH/LOCK response, ECHO and CANCEL body:
+/// [MS-SMB2] §§2.2.7–8, 2.2.11–12, 2.2.18, 2.2.27–30.
 SimpleBody, 4, 4 {
     structure_size: U16,
     reserved: U16
@@ -711,11 +730,11 @@ WriteResponse, 16, 17 {
     channel_info_length: U16,
 });
 wire!(
-/// LOCK element: [MS-SMB2] §2.2.26.1. Lock semantics are not yet implemented.
+/// LOCK element: [MS-SMB2] §2.2.26.1.
 LockElement, 24 {
     offset: U64,
     length: U64,
-    flags: U32,
+    flags: LockFlags,
     reserved: U32,
 });
 wire!(

@@ -46,6 +46,7 @@ pub struct ConnectionTask<B: FileSystem, S> {
     eof: bool,
     failure: Option<Error>,
     cleanup: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>>,
+    cleanup_complete: bool,
     result: Option<Result<(), Error>>,
 }
 
@@ -67,6 +68,7 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
             eof: false,
             failure: None,
             cleanup: None,
+            cleanup_complete: false,
             result: None,
         }
     }
@@ -101,8 +103,7 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
 
     /// Destructive shutdown does not wait for a client to read responses.
     pub async fn shutdown(&mut self) -> Result<(), Error> {
-        self.connection.cancel_all();
-        self.eof = true;
+        self.disconnect(None);
         let mut error = self.failure.take();
         while !self.requests.is_empty() {
             let mut request = std::pin::pin!(self.requests.next().fuse());
@@ -142,7 +143,7 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
                 if self.prefix_len != 0 {
                     return Poll::Ready(Err(unexpected_eof()));
                 }
-                self.eof = true;
+                self.disconnect(None);
                 return Poll::Ready(Ok(()));
             }
             self.prefix_len += count;
@@ -263,25 +264,31 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
                     progress = true;
                 }
             }
-            if self.eof
-                && self.requests.is_empty()
-                && self.responses.is_empty()
-                && self.response_receiver.as_ref().get_ref().is_empty()
-            {
+            if self.eof && self.requests.is_empty() && !self.cleanup_complete {
                 let cleanup = self.cleanup.get_or_insert_with(|| {
                     let connection = self.connection.clone();
                     async move { connection.shutdown().await }.boxed()
                 });
                 match cleanup.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {}
                     Poll::Ready(result) => {
                         self.cleanup = None;
-                        return Poll::Ready(match self.failure.take() {
-                            Some(error) => Err(error),
-                            None => result,
-                        });
+                        self.cleanup_complete = true;
+                        if let Err(error) = result {
+                            self.disconnect(Some(error));
+                        }
+                        progress = true;
                     }
                 }
+            }
+            if self.cleanup_complete
+                && self.responses.is_empty()
+                && self.response_receiver.as_ref().get_ref().is_empty()
+            {
+                return Poll::Ready(match self.failure.take() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                });
             }
             if !progress {
                 return Poll::Pending;

@@ -226,6 +226,7 @@ impl Client<MemoryFs> {
 
 mod compound;
 mod create;
+mod locking;
 mod notify;
 mod pending;
 mod runtime;

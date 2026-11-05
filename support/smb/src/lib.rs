@@ -6,7 +6,7 @@
 //! This initial implementation supports unsigned guest sessions for local
 //! testing, including bounded related/unrelated compound requests with retained
 //! operation ownership. It is not a network authentication service. Leases,
-//! locks, security descriptor updates, and host filesystem
+//! security descriptor updates and host filesystem
 //! providers are not yet implemented.
 
 #![forbid(unsafe_code)]
@@ -27,7 +27,8 @@ use event_listener::Event;
 use inspect::Inspect;
 use parking_lot::Mutex;
 use provider::{
-    BasicInformation, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext, map_access,
+    BasicInformation, ByteRange, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext,
+    map_access,
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -155,6 +156,7 @@ struct Activity {
     context: RequestContext,
     barrier: bool,
     notification: bool,
+    locking: bool,
 }
 
 /// Protocol state for one connection. Dropping it closes all provider opens.
@@ -310,6 +312,7 @@ impl<F> OpenFile<F> {
                     Command::FLUSH | Command::SET_INFO | Command::QUERY_DIRECTORY
                 ),
                 notification: command == Command::CHANGE_NOTIFY,
+                locking: command == Command::LOCK,
             });
         }
     }
@@ -341,13 +344,17 @@ impl<F> OpenFile<F> {
                         .position(|activity| activity.context.id() == context.id())
                         .ok_or(Status::FILE_CLOSED)?;
                     let current = &active[position];
-                    // Notifications have their own FIFO, not a data/mutation barrier.
-                    // CLOSE still drains all activities, including notifications.
+                    // Lock waits bypass I/O barriers so UNLOCK can make progress.
+                    // Notifications have their own FIFO; CLOSE drains all activities.
                     active[..position].iter().any(|earlier| {
-                        if current.notification {
+                        if current.locking {
+                            false
+                        } else if current.notification {
                             earlier.notification
                         } else {
-                            !earlier.notification && (current.barrier || earlier.barrier)
+                            !earlier.notification
+                                && !earlier.locking
+                                && (current.barrier || earlier.barrier)
                         }
                     })
                 }
@@ -641,8 +648,14 @@ impl<B: FileSystem> Connection<B> {
             } else {
                 compound::charge(&bytes, &header).err().or_else(|| {
                     // MS-SMB2 §3.3.5.2.7 permits rejecting asynchronous compounds.
-                    // A long-lived watch must not strand later commands in this executor.
-                    (command == Command::CHANGE_NOTIFY && index + 1 < command_count)
+                    // Indefinite waits must not strand later commands in this executor.
+                    ((command == Command::CHANGE_NOTIFY
+                        || (command == Command::LOCK
+                            && read_body::<LockRequest>(&bytes).is_ok_and(|request| {
+                                !request.first_lock.flags.unlock()
+                                    && !request.first_lock.flags.fail_immediately()
+                            })))
+                        && index + 1 < command_count)
                         .then_some(Status::NOT_SUPPORTED)
                 })
             };
@@ -1440,11 +1453,95 @@ impl<B: FileSystem> Connection<B> {
             }
             Command::READ => self.read(packet, tree, context).await,
             Command::WRITE => self.write(packet, tree, context).await,
+            Command::LOCK => self.lock(packet, tree, context).await,
             Command::QUERY_INFO => self.query_info(packet, tree, context).await,
             Command::QUERY_DIRECTORY => self.query_directory(packet, tree, context).await,
             Command::SET_INFO => self.set_info(packet, tree, context).await,
             _ => Err(Status::NOT_SUPPORTED),
         }
+    }
+
+    async fn lock(
+        &self,
+        packet: &[u8],
+        tree: u32,
+        context: &RequestContext,
+    ) -> Result<Vec<u8>, Status> {
+        let request: LockRequest = read_body(packet)?;
+        let count = usize::from(request.lock_count.get());
+        if count == 0 {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let start = HEADER_SIZE + std::mem::offset_of!(LockRequest, first_lock);
+        let bytes = field(packet, start, count * size_of::<LockElement>(), start)?;
+        let locks =
+            <[LockElement]>::ref_from_bytes(bytes).map_err(|_| Status::INVALID_PARAMETER)?;
+        let file = self.file(request.file_id, tree, context)?;
+        let unlocking = request.first_lock.flags.unlock();
+        if !unlocking && count > 1 && locks.iter().any(|lock| !lock.flags.fail_immediately()) {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let mut acquired = Vec::new();
+        for lock in locks {
+            let range = ByteRange {
+                offset: lock.offset.get(),
+                length: lock.length.get(),
+            };
+            let flags = lock.flags;
+            if unlocking {
+                if flags.shared_lock() || flags.exclusive_lock() || flags.fail_immediately() {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                self.server
+                    .backend
+                    .unlock(&file.file, range, context)
+                    .await?;
+            } else {
+                let expected = LockFlags::new()
+                    .with_shared_lock(flags.shared_lock())
+                    .with_exclusive_lock(flags.exclusive_lock())
+                    .with_fail_immediately(flags.fail_immediately());
+                if flags.shared_lock() == flags.exclusive_lock()
+                    || flags.into_bits() != expected.into_bits()
+                {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                let result = self
+                    .server
+                    .backend
+                    .lock(
+                        &file.file,
+                        range,
+                        flags.exclusive_lock(),
+                        flags.fail_immediately(),
+                        context,
+                    )
+                    .await;
+                if result == Err(Status::LOCK_NOT_GRANTED) && flags.fail_immediately() {
+                    let rollback = RequestContext::new(
+                        self.server.next_request.fetch_add(1, Ordering::Relaxed),
+                    );
+                    for &acquired in acquired.iter().rev() {
+                        if let Err(status) = self
+                            .server
+                            .backend
+                            .rollback_lock(&file.file, acquired, &rollback)
+                            .await
+                        {
+                            tracelimit::error_ratelimited!(?status, "SMB lock rollback failed");
+                            return Err(status);
+                        }
+                    }
+                }
+                acquired.push(result?);
+            }
+        }
+        Ok(SimpleBody {
+            structure_size: SimpleBody::STRUCTURE_SIZE.into(),
+            reserved: 0.into(),
+        }
+        .as_bytes()
+        .to_vec())
     }
 
     fn negotiate(&self, packet: &[u8]) -> Result<Vec<u8>, Status> {

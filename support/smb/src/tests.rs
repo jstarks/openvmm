@@ -25,18 +25,20 @@ fn request(command: Command, body: &[u8], session: u64, tree: u32, message: u64)
     header.message_id = message.into();
     header.session_id = session.into();
     header.tree_id = tree.into();
-    let payload = match command {
-        Command::READ => decode::<ReadRequest>(body).map(|request| request.length.get()),
-        Command::WRITE => decode::<WriteRequest>(body).map(|request| request.length.get()),
-        Command::QUERY_DIRECTORY => {
-            decode::<QueryDirectoryRequest>(body).map(|request| request.output_buffer_length.get())
+    let payload =
+        match command {
+            Command::READ => decode::<ReadRequest>(body).map(|request| request.length.get()),
+            Command::WRITE => decode::<WriteRequest>(body).map(|request| request.length.get()),
+            Command::QUERY_DIRECTORY => decode::<QueryDirectoryRequest>(body)
+                .map(|request| request.output_buffer_length.get()),
+            Command::QUERY_INFO => {
+                decode::<QueryInfoRequest>(body).map(|request| request.output_buffer_length.get())
+            }
+            Command::CHANGE_NOTIFY => decode::<ChangeNotifyRequest>(body)
+                .map(|request| request.output_buffer_length.get()),
+            _ => Ok(0),
         }
-        Command::QUERY_INFO => {
-            decode::<QueryInfoRequest>(body).map(|request| request.output_buffer_length.get())
-        }
-        _ => Ok(0),
-    }
-    .unwrap_or(0);
+        .unwrap_or(0);
     header.credit_charge = ((payload.saturating_sub(1) / CREDIT_PAYLOAD_SIZE + 1) as u16).into();
     let mut packet = header.as_bytes().to_vec();
     packet.extend_from_slice(body);
@@ -224,6 +226,7 @@ impl Client<MemoryFs> {
 
 mod compound;
 mod create;
+mod notify;
 mod pending;
 mod runtime;
 mod wire;

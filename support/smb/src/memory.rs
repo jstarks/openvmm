@@ -3,18 +3,26 @@
 
 //! A bounded writable in-memory filesystem for synthetic shares.
 
-use crate::provider::{BasicInformation, FileSystem, Metadata, OpenOptions, RequestContext};
+use crate::provider::{
+    BasicInformation, Change, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext,
+};
 use crate::spec::{
-    AccessMask, CreateAction, CreateDisposition, FileAttributes, NT_TICKS_PER_SECOND, ShareAccess,
-    Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
+    AccessMask, CreateAction, CreateDisposition, FileAttributes, NT_TICKS_PER_SECOND, NotifyAction,
+    NotifyFilter, ShareAccess, Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED,
+    UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
-use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use event_listener::Event;
+use futures::FutureExt;
+use parking_lot::{Mutex, MutexGuard};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const MAX_COMPONENT_NAME_LENGTH: u32 = 255;
+pub(crate) const NOTIFY_BUFFER_LIMIT: usize = 64 * 1024;
+const NOTIFY_WAITER_LIMIT: usize = 32;
+const NOTIFY_WATCH_LIMIT: usize = 1024;
 
 /// A writable filesystem with a shared byte quota and object limit.
 #[derive(Clone)]
@@ -35,6 +43,16 @@ struct Open {
     user_set_access_time: bool,
     user_set_write_time: bool,
     user_set_change_time: bool,
+    watch: Option<Watch>,
+}
+
+struct Watch {
+    filter: NotifyFilter,
+    tree: bool,
+    events: VecDeque<Change>,
+    bytes: usize,
+    overflow: bool,
+    waiters: VecDeque<u64>,
 }
 
 struct State {
@@ -42,9 +60,91 @@ struct State {
     opens: BTreeMap<u64, Open>,
     next_id: u64,
     next_open: u64,
+    next_notify: u64,
+    watches: usize,
     bytes: usize,
     byte_limit: usize,
     object_limit: usize,
+    changed: Arc<Event>,
+}
+
+fn wake(state: MutexGuard<'_, State>) {
+    let changed = state.changed.clone();
+    drop(state);
+    changed.notify(usize::MAX);
+}
+
+fn emit(state: &mut State, node: u64, action: NotifyAction, filter: NotifyFilter) {
+    let Some(node) = state.nodes.get(&node) else {
+        return;
+    };
+    if node.parent == node.metadata.id {
+        return;
+    }
+    let mut name = node.metadata.name.clone();
+    let mut parent = node.parent;
+    let mut depth = 0;
+    loop {
+        for open in state.opens.values_mut().filter(|open| open.node == parent) {
+            let Some(watch) = &mut open.watch else {
+                continue;
+            };
+            if watch.overflow
+                || (!watch.tree && depth != 0)
+                || watch.filter.into_bits() & filter.into_bits() == 0
+            {
+                continue;
+            }
+            let change = Change {
+                action,
+                name: name.clone(),
+            };
+            let bytes = change.encoded_len();
+            if watch.bytes + bytes > NOTIFY_BUFFER_LIMIT {
+                watch.events.clear();
+                watch.bytes = 0;
+                watch.overflow = true;
+            } else {
+                watch.bytes += bytes;
+                watch.events.push_back(change);
+            }
+        }
+        let Some(node) = state.nodes.get(&parent) else {
+            break;
+        };
+        if node.parent == parent {
+            break;
+        }
+        name = format!("{}\\{name}", node.metadata.name);
+        parent = node.parent;
+        depth += 1;
+    }
+}
+
+fn name_filter(directory: bool) -> NotifyFilter {
+    NotifyFilter::new()
+        .with_dir_name(directory)
+        .with_file_name(!directory)
+}
+
+struct NotifyWaiter {
+    state: Arc<Mutex<State>>,
+    open: u64,
+    id: u64,
+}
+
+impl Drop for NotifyWaiter {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if let Some(watch) = state
+            .opens
+            .get_mut(&self.open)
+            .and_then(|open| open.watch.as_mut())
+        {
+            watch.waiters.retain(|id| *id != self.id);
+        }
+        wake(state);
+    }
 }
 
 /// An open object whose lifetime reserves sharing rights in the provider.
@@ -93,9 +193,12 @@ impl MemoryFs {
             opens: BTreeMap::new(),
             next_id: 2,
             next_open: 1,
+            next_notify: 1,
+            watches: 0,
             bytes: 0,
             byte_limit,
             object_limit: object_limit.max(1),
+            changed: Arc::new(Event::new()),
         })))
     }
 }
@@ -189,6 +292,9 @@ impl MemoryFile {
         let Some(open) = state.opens.remove(&self.open) else {
             return;
         };
+        if open.watch.is_some() {
+            state.watches -= 1;
+        }
         if let Some(node) = state.nodes.get_mut(&self.node) {
             node.delete_committed |= open.delete;
         }
@@ -203,11 +309,22 @@ impl MemoryFile {
                     .values()
                     .any(|n| n.parent == self.node && n.metadata.id != self.node)
             {
+                let directory = state
+                    .nodes
+                    .get(&self.node)
+                    .is_some_and(|node| node.metadata.is_directory());
+                emit(
+                    &mut state,
+                    self.node,
+                    NotifyAction::REMOVED,
+                    name_filter(directory),
+                );
                 if let Some(node) = state.nodes.remove(&self.node) {
                     state.bytes -= node.data.len();
                 }
             }
         }
+        wake(state);
     }
 }
 
@@ -220,6 +337,35 @@ impl inspect::Inspect for MemoryFs {
             .field("bytes", state.bytes)
             .field("byte_limit", state.byte_limit)
             .field("object_limit", state.object_limit)
+            .field("watch_count", state.watches)
+            .field("watch_limit", NOTIFY_WATCH_LIMIT)
+            .field(
+                "notify_waiters",
+                state
+                    .opens
+                    .values()
+                    .filter_map(|open| open.watch.as_ref())
+                    .map(|watch| watch.waiters.len())
+                    .sum::<usize>(),
+            )
+            .field("notify_buffer_limit", NOTIFY_BUFFER_LIMIT)
+            .child("watches", |req| {
+                let mut resp = req.respond();
+                for (id, open) in &state.opens {
+                    if let Some(watch) = &open.watch {
+                        resp.child(&id.to_string(), |req| {
+                            req.respond()
+                                .field("node", open.node)
+                                .hex("filter", watch.filter.into_bits())
+                                .field("tree", watch.tree)
+                                .field("queued_events", watch.events.len())
+                                .field("queued_bytes", watch.bytes)
+                                .field("overflow", watch.overflow)
+                                .field("waiters", watch.waiters.len());
+                        });
+                    }
+                }
+            })
             .child("nodes", |req| {
                 let mut resp = req.respond();
                 for (id, node) in &state.nodes {
@@ -313,10 +459,19 @@ impl FileSystem for MemoryFs {
                 if !permitted {
                     return Err(Status::ACCESS_DENIED);
                 }
+                let size_changed = node.metadata.size != 0;
                 resize(&mut state, id, 0)?;
                 let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
                 node.metadata.written = nt_time();
                 node.metadata.changed = node.metadata.written;
+                emit(
+                    &mut state,
+                    id,
+                    NotifyAction::MODIFIED,
+                    NotifyFilter::new()
+                        .with_size(size_changed)
+                        .with_last_write(true),
+                );
                 (
                     id,
                     if options.disposition() == CreateDisposition::SUPERSEDE {
@@ -372,6 +527,7 @@ impl FileSystem for MemoryFs {
                     delete_committed: false,
                 },
             );
+            emit(&mut state, id, NotifyAction::ADDED, name_filter(directory));
             (id, CreateAction::CREATED.0)
         };
         if delete
@@ -395,6 +551,7 @@ impl FileSystem for MemoryFs {
                 user_set_access_time: false,
                 user_set_write_time: false,
                 user_set_change_time: false,
+                watch: None,
             },
         );
         if delete {
@@ -405,6 +562,7 @@ impl FileSystem for MemoryFs {
                 .metadata
                 .delete_pending = true;
         }
+        wake(state);
         Ok((
             MemoryFile {
                 state: self.0.clone(),
@@ -454,10 +612,22 @@ impl FileSystem for MemoryFs {
             .unwrap_or(usize::MAX)
             .min(node.data.len());
         let end = start.saturating_add(length).min(node.data.len());
+        let old_accessed = node.metadata.accessed;
         if !user_set_access_time {
             node.metadata.accessed = nt_time();
         }
-        Ok(node.data[start..end].to_vec())
+        let data = node.data[start..end].to_vec();
+        let changed = node.metadata.accessed != old_accessed;
+        if changed {
+            emit(
+                &mut state,
+                file.node,
+                NotifyAction::MODIFIED,
+                NotifyFilter::new().with_last_access(true),
+            );
+        }
+        wake(state);
+        Ok(data)
     }
 
     async fn write(
@@ -478,12 +648,19 @@ impl FileSystem for MemoryFs {
         }
         let offset = usize::try_from(offset).map_err(|_| Status::DISK_FULL)?;
         let end = offset.checked_add(data.len()).ok_or(Status::DISK_FULL)?;
-        if end > node.data.len() {
+        let size_changed = end > node.data.len();
+        if size_changed {
             resize(&mut state, file.node, end)?;
         }
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         node.data[offset..end].copy_from_slice(data);
         modified(&mut state, file)?;
+        let open = &state.opens[&file.open];
+        let filter = NotifyFilter::new()
+            .with_size(size_changed)
+            .with_last_write(!open.user_set_write_time);
+        emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+        wake(state);
         Ok(data.len())
     }
 
@@ -549,12 +726,19 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::FILE_IS_A_DIRECTORY);
         }
+        let size_changed = state.nodes[&file.node].metadata.size != length;
         resize(
             &mut state,
             file.node,
             usize::try_from(length).map_err(|_| Status::DISK_FULL)?,
         )?;
-        modified(&mut state, file)
+        modified(&mut state, file)?;
+        let filter = NotifyFilter::new()
+            .with_size(size_changed)
+            .with_last_write(!state.opens[&file.open].user_set_write_time);
+        emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+        wake(state);
+        Ok(())
     }
 
     async fn set_delete_on_close(
@@ -623,6 +807,7 @@ impl FileSystem for MemoryFs {
         }
         let user_set_change_time = open.user_set_change_time;
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let before = node.metadata.clone();
         let now = nt_time();
         if info.attributes != 0 {
             // MS-FSA §2.1.5.15.2 defines this update mask and protects root HIDDEN/SYSTEM.
@@ -668,7 +853,104 @@ impl FileSystem for MemoryFs {
                 }
             }
         }
+        let filter = NotifyFilter::new()
+            .with_attributes(node.metadata.attributes != before.attributes)
+            .with_creation(node.metadata.created != before.created)
+            .with_last_access(node.metadata.accessed != before.accessed)
+            .with_last_write(node.metadata.written != before.written);
+        emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+        wake(state);
         Ok(())
+    }
+
+    async fn notify(
+        &self,
+        file: &MemoryFile,
+        filter: NotifyFilter,
+        tree: bool,
+        output_length: usize,
+        request: &RequestContext,
+    ) -> Result<NotifyResult, Status> {
+        let (changed, id) = {
+            let mut state = self.0.lock();
+            if !state
+                .nodes
+                .get(&file.node)
+                .ok_or(Status::FILE_CLOSED)?
+                .metadata
+                .is_directory()
+            {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            let id = state.next_notify;
+            state.next_notify = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
+            let first = state
+                .opens
+                .get(&file.open)
+                .ok_or(Status::FILE_CLOSED)?
+                .watch
+                .is_none();
+            if first {
+                if state.watches == NOTIFY_WATCH_LIMIT {
+                    return Err(Status::INSUFFICIENT_RESOURCES);
+                }
+                state.watches += 1;
+            }
+            let open = state.opens.get_mut(&file.open).ok_or(Status::FILE_CLOSED)?;
+            let watch = open.watch.get_or_insert_with(|| Watch {
+                filter: NotifyFilter::from_bits(filter.into_bits() & NotifyFilter::VALID),
+                tree,
+                events: VecDeque::new(),
+                bytes: 0,
+                overflow: false,
+                waiters: VecDeque::new(),
+            });
+            if watch.waiters.len() == NOTIFY_WAITER_LIMIT {
+                return Err(Status::INSUFFICIENT_RESOURCES);
+            }
+            watch.waiters.push_back(id);
+            (state.changed.clone(), id)
+        };
+        let _waiter = NotifyWaiter {
+            state: self.0.clone(),
+            open: file.open,
+            id,
+        };
+        loop {
+            let listener = changed.listen();
+            if request.is_cancelled() {
+                return Err(Status::CANCELLED);
+            }
+            {
+                let mut state = self.0.lock();
+                let watch = state
+                    .opens
+                    .get_mut(&file.open)
+                    .ok_or(Status::FILE_CLOSED)?
+                    .watch
+                    .as_mut()
+                    .expect("registered watch");
+                if watch.waiters.front() == Some(&id) {
+                    if watch.overflow {
+                        watch.overflow = false;
+                        return Ok(NotifyResult::Overflow);
+                    }
+                    if !watch.events.is_empty() {
+                        if watch.bytes > output_length {
+                            return Ok(NotifyResult::Overflow);
+                        }
+                        watch.bytes = 0;
+                        return Ok(NotifyResult::Changes(watch.events.drain(..).collect()));
+                    }
+                }
+            }
+            let mut listener = std::pin::pin!(listener.fuse());
+            let mut cancelled = std::pin::pin!(request.cancelled().fuse());
+            futures::select! {
+                () = listener => {}
+                () = cancelled => return Err(Status::CANCELLED),
+            }
+        }
     }
 }
 
@@ -677,6 +959,45 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use test_with_tracing::test;
+
+    #[test]
+    fn persistent_watch_capacity_is_released_by_close() {
+        block_on(async {
+            let fs = MemoryFs::new(0, 1);
+            let request = RequestContext::new(1);
+            request.cancel();
+            let options = OpenOptions {
+                access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                share_access: ShareAccess::ALL.into_bits(),
+                disposition: CreateDisposition::OPEN.0,
+                options: 0,
+                attributes: 0,
+            };
+            let filter = NotifyFilter::new().with_file_name(true);
+            let mut opens = Vec::new();
+            for _ in 0..NOTIFY_WATCH_LIMIT {
+                let (file, _) = fs.open("", options, &request).await.unwrap();
+                assert!(matches!(
+                    fs.notify(&file, filter, false, 32, &request).await,
+                    Err(Status::CANCELLED)
+                ));
+                opens.push(file);
+            }
+            let (extra, _) = fs.open("", options, &request).await.unwrap();
+            assert!(matches!(
+                fs.notify(&extra, filter, false, 32, &request).await,
+                Err(Status::INSUFFICIENT_RESOURCES)
+            ));
+            fs.close(&opens.pop().unwrap(), &request).await.unwrap();
+            assert!(matches!(
+                fs.notify(&extra, filter, false, 32, &request).await,
+                Err(Status::CANCELLED)
+            ));
+            fs.close(&extra, &request).await.unwrap();
+            drop(opens);
+            assert_eq!(fs.0.lock().watches, 0);
+        });
+    }
 
     #[test]
     fn truncation_releases_backing_memory_before_quota_is_reused() {

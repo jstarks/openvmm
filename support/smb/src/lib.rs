@@ -6,7 +6,7 @@
 //! This initial implementation supports unsigned guest sessions for local
 //! testing, including bounded related/unrelated compound requests with retained
 //! operation ownership. It is not a network authentication service. Leases,
-//! locks, notifications, security descriptor updates, and host filesystem
+//! locks, security descriptor updates, and host filesystem
 //! providers are not yet implemented.
 
 #![forbid(unsafe_code)]
@@ -26,7 +26,9 @@ use codec::*;
 use event_listener::Event;
 use inspect::Inspect;
 use parking_lot::Mutex;
-use provider::{BasicInformation, FileSystem, Metadata, OpenOptions, RequestContext, map_access};
+use provider::{
+    BasicInformation, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext, map_access,
+};
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -137,15 +139,22 @@ struct OpenFile<F> {
     file: F,
     identity: u64,
     access: AccessMask,
+    is_directory: bool,
     tree: u32,
     position: u64,
     directory: Mutex<Option<(Vec<Metadata>, usize)>>,
     closing: AtomicBool,
     closed: AtomicBool,
     close_gate: futures::lock::Mutex<()>,
-    active: Mutex<Vec<(RequestContext, bool)>>,
+    active: Mutex<Vec<Activity>>,
     changed: Event,
     close_error: Mutex<Option<Status>>,
+}
+
+struct Activity {
+    context: RequestContext,
+    barrier: bool,
+    notification: bool,
 }
 
 /// Protocol state for one connection. Dropping it closes all provider opens.
@@ -213,6 +222,23 @@ fn error_body() -> Vec<u8> {
     body
 }
 
+fn notify_body(bytes: &[u8]) -> Vec<u8> {
+    let mut body = BufferResponse {
+        structure_size: BufferResponse::STRUCTURE_SIZE.into(),
+        output_buffer_offset: if bytes.is_empty() {
+            0
+        } else {
+            body_end::<BufferResponse>() as u16
+        }
+        .into(),
+        output_buffer_length: (bytes.len() as u32).into(),
+    }
+    .as_bytes()
+    .to_vec();
+    body.extend_from_slice(bytes);
+    body
+}
+
 fn response_bytes(header: &Header, async_id: Option<u64>, body: &[u8]) -> Vec<u8> {
     let mut bytes = if let Some(async_id) = async_id {
         AsyncHeader {
@@ -269,27 +295,36 @@ impl<B: FileSystem> Clone for Connection<B> {
 }
 
 impl<F> OpenFile<F> {
-    fn track(&self, context: &RequestContext, barrier: bool) {
+    fn track(&self, context: &RequestContext, command: Command) {
         let mut active = self.active.lock();
         if !active
             .iter()
-            .any(|(request, _)| request.id() == context.id())
+            .any(|activity| activity.context.id() == context.id())
         {
             // Binding order, not allocation of a compound's queued context IDs,
             // determines which operations precede this open's barriers.
-            active.push((context.clone(), barrier));
+            active.push(Activity {
+                context: context.clone(),
+                barrier: matches!(
+                    command,
+                    Command::FLUSH | Command::SET_INFO | Command::QUERY_DIRECTORY
+                ),
+                notification: command == Command::CHANGE_NOTIFY,
+            });
         }
     }
 
     fn untrack(&self, id: u64) {
-        self.active.lock().retain(|(request, _)| request.id() != id);
+        self.active
+            .lock()
+            .retain(|activity| activity.context.id() != id);
         self.changed.notify(usize::MAX);
     }
 
     fn retire(&self) {
         self.closing.store(true, Ordering::Release);
-        for (request, _) in self.active.lock().iter() {
-            request.cancel();
+        for activity in self.active.lock().iter() {
+            activity.context.cancel();
         }
     }
 
@@ -303,12 +338,18 @@ impl<F> OpenFile<F> {
                 } else {
                     let position = active
                         .iter()
-                        .position(|(request, _)| request.id() == context.id())
+                        .position(|activity| activity.context.id() == context.id())
                         .ok_or(Status::FILE_CLOSED)?;
-                    let barrier = active[position].1;
-                    active[..position]
-                        .iter()
-                        .any(|(_, earlier_barrier)| barrier || *earlier_barrier)
+                    let current = &active[position];
+                    // Notifications have their own FIFO, not a data/mutation barrier.
+                    // CLOSE still drains all activities, including notifications.
+                    active[..position].iter().any(|earlier| {
+                        if current.notification {
+                            earlier.notification
+                        } else {
+                            !earlier.notification && (current.barrier || earlier.barrier)
+                        }
+                    })
                 }
             };
             if !blocked {
@@ -334,6 +375,7 @@ impl<F> Inspect for OpenFile<F> {
         req.respond()
             .field("identity", self.identity)
             .hex("access", self.access.into_bits())
+            .field("is_directory", self.is_directory)
             .field("tree", self.tree)
             .field("closing", self.closing.load(Ordering::Acquire))
             .field("closed", self.closed.load(Ordering::Acquire))
@@ -586,6 +628,7 @@ impl<B: FileSystem> Connection<B> {
             })
             .map_err(|_| Error::Backend(Status::INSUFFICIENT_RESOURCES))?;
         let mut commands = Vec::new();
+        let command_count = headers.len();
         let mut previous_file = None;
         for (index, (header, range)) in headers.into_iter().zip(ranges).enumerate() {
             let mut bytes = packet[range].to_vec();
@@ -596,7 +639,12 @@ impl<B: FileSystem> Connection<B> {
             } else if header.flags.async_command() || header.flags.signed() {
                 Some(Status::NOT_SUPPORTED)
             } else {
-                compound::charge(&bytes, &header).err()
+                compound::charge(&bytes, &header).err().or_else(|| {
+                    // MS-SMB2 §3.3.5.2.7 permits rejecting asynchronous compounds.
+                    // A long-lived watch must not strand later commands in this executor.
+                    (command == Command::CHANGE_NOTIFY && index + 1 < command_count)
+                        .then_some(Status::NOT_SUPPORTED)
+                })
             };
             let charge = u32::from(header.credit_charge.get().max(1));
             state.credits_in_use += charge;
@@ -624,13 +672,7 @@ impl<B: FileSystem> Connection<B> {
                 None
             };
             if let Some(file) = &open {
-                file.track(
-                    &context,
-                    matches!(
-                        command,
-                        Command::FLUSH | Command::SET_INFO | Command::QUERY_DIRECTORY
-                    ),
-                );
+                file.track(&context, command);
             }
             previous_file = if command == Command::CREATE {
                 None
@@ -710,15 +752,7 @@ impl<B: FileSystem> Connection<B> {
                             if command == Command::CLOSE {
                                 file.retire();
                             } else {
-                                file.track(
-                                    context,
-                                    matches!(
-                                        command,
-                                        Command::FLUSH
-                                            | Command::SET_INFO
-                                            | Command::QUERY_DIRECTORY
-                                    ),
-                                );
+                                file.track(context, command);
                             }
                             open = Some(file.clone());
                         }
@@ -1019,7 +1053,10 @@ impl<B: FileSystem> CommandRequest<B> {
         } else if self.context.is_cancelled()
             && !matches!(
                 command,
-                Command::CLOSE | Command::TREE_DISCONNECT | Command::LOGOFF
+                Command::CLOSE
+                    | Command::TREE_DISCONNECT
+                    | Command::LOGOFF
+                    | Command::CHANGE_NOTIFY
             )
         {
             Err(Status::CANCELLED)
@@ -1044,14 +1081,36 @@ impl<B: FileSystem> CommandRequest<B> {
                 Ok(()) if command == Command::SESSION_SETUP => {
                     connection.session_setup(header, packet)
                 }
+                Ok(()) if command == Command::CHANGE_NOTIFY => {
+                    connection
+                        .change_notify(header, packet, &self.context)
+                        .await
+                }
                 Ok(()) => connection
                     .dispatch(header, command, packet, &self.context, &self.retired)
                     .await
                     .map(|body| (Status::SUCCESS, body)),
             }
         };
+        let result = result.map_err(|status| {
+            if command == Command::CHANGE_NOTIFY
+                && status == Status::CANCELLED
+                && connection
+                    .state
+                    .lock()
+                    .requests
+                    .get(&header.message_id.get())
+                    .and_then(|info| info.open.as_ref())
+                    .is_some_and(|file| file.closing.load(Ordering::Acquire))
+            {
+                Status::NOTIFY_CLEANUP
+            } else {
+                status
+            }
+        });
         let (status, body) = match result {
             Ok(response) => response,
+            Err(Status::NOTIFY_CLEANUP) => (Status::NOTIFY_CLEANUP, notify_body(&[])),
             Err(status) => (status, error_body()),
         };
         let mut response = Header {
@@ -1093,6 +1152,70 @@ impl<B: FileSystem> CommandRequest<B> {
 }
 
 impl<B: FileSystem> Connection<B> {
+    async fn change_notify(
+        &self,
+        header: &Header,
+        packet: &[u8],
+        context: &RequestContext,
+    ) -> Result<(Status, Vec<u8>), Status> {
+        let request: ChangeNotifyRequest = read_body(packet)?;
+        let length = request.output_buffer_length.get() as usize;
+        if length > MAX_TRANSFER_SIZE {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let file = self.file(request.file_id, header.tree_id.get(), context)?;
+        if !file.is_directory {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if !file.access.read_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
+        match self
+            .server
+            .backend
+            .notify(
+                &file.file,
+                NotifyFilter::from_bits(
+                    request.completion_filter.into_bits() & NotifyFilter::VALID,
+                ),
+                request.flags.watch_tree(),
+                length,
+                context,
+            )
+            .await?
+        {
+            NotifyResult::Overflow => Ok((Status::NOTIFY_ENUM_DIR, notify_body(&[]))),
+            NotifyResult::Changes(changes) => {
+                if changes.is_empty() {
+                    return Err(Status::INTERNAL_ERROR);
+                }
+                let mut bytes = Vec::new();
+                for (index, change) in changes.iter().enumerate() {
+                    if change.encoded_len() > length.saturating_sub(bytes.len()) {
+                        return Ok((Status::NOTIFY_ENUM_DIR, notify_body(&[])));
+                    }
+                    let name = encode_name(&change.name);
+                    let next = if index + 1 == changes.len() {
+                        0
+                    } else {
+                        change.encoded_len() as u32
+                    };
+                    bytes.extend_from_slice(
+                        FileNotifyInformation {
+                            next_entry_offset: next.into(),
+                            action: change.action.0.into(),
+                            file_name_length: (name.len() as u32).into(),
+                        }
+                        .as_bytes(),
+                    );
+                    bytes.extend_from_slice(&name);
+                    bytes.resize(align_up(bytes.len(), NOTIFY_ALIGNMENT)?, 0);
+                }
+                Ok((Status::SUCCESS, notify_body(&bytes)))
+            }
+        }
+    }
+
     fn session_setup(&self, header: &Header, packet: &[u8]) -> Result<(Status, Vec<u8>), Status> {
         let request: SessionSetupRequest = read_body(packet)?;
         let token = variable::<SessionSetupRequest>(
@@ -1516,6 +1639,7 @@ impl<B: FileSystem> Connection<B> {
             file,
             identity: info.id,
             access,
+            is_directory: info.is_directory(),
             tree,
             position: 0,
             directory: Mutex::new(None),

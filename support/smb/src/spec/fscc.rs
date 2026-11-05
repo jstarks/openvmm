@@ -7,6 +7,32 @@ use bitfield_struct::bitfield;
 use open_enum::open_enum;
 use zerocopy::little_endian::{I64, U16, U32, U64};
 
+/// FILE_NOTIFY_INFORMATION record alignment: [MS-FSCC] §2.7.1.
+pub const NOTIFY_ALIGNMENT: usize = 4;
+
+open_enum! {
+    /// Notification actions: [MS-FSCC] §2.7.1.
+    pub enum NotifyAction: u32 {
+        #![expect(missing_docs, reason = "Action names follow the cited table.")]
+        ADDED = 1,
+        REMOVED = 2,
+        MODIFIED = 3,
+        RENAMED_OLD_NAME = 4,
+        RENAMED_NEW_NAME = 5,
+        ADDED_STREAM = 6,
+        REMOVED_STREAM = 7,
+        MODIFIED_STREAM = 8,
+    }
+}
+
+wire!(
+/// FILE_NOTIFY_INFORMATION fixed prefix; filename is UTF-16LE: [MS-FSCC] §2.7.1.
+FileNotifyInformation, 12 {
+    next_entry_offset: U32,
+    action: U32,
+    file_name_length: U32,
+});
+
 open_enum! {
     /// File information class values: [MS-FSCC] §2.4.
     pub enum FileInformationClass: u8 {

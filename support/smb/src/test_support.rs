@@ -7,8 +7,10 @@
 //! enter bounded recent history, so an unattended TCP test server cannot fill
 //! an announcement queue. No file contents are retained in diagnostic records.
 
-use crate::provider::{BasicInformation, FileSystem, Metadata, OpenOptions, RequestContext};
-use crate::spec::Status;
+use crate::provider::{
+    BasicInformation, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext,
+};
+use crate::spec::{NotifyFilter, Status};
 use async_trait::async_trait;
 use event_listener::Event;
 use futures::FutureExt;
@@ -43,6 +45,8 @@ pub enum Operation {
     SetDeleteOnClose,
     /// Basic metadata change.
     SetBasic,
+    /// Directory change notification.
+    Notify,
 }
 
 /// A manually releasable scheduling point.
@@ -457,10 +461,16 @@ impl Call {
     }
 
     async fn prepare(&mut self) -> Result<RequestContext, Status> {
+        self.prepare_inner(false).await
+    }
+
+    async fn prepare_inner(&mut self, register_on_cancel: bool) -> Result<RequestContext, Status> {
         let error = match self.gate(Gate::Before).await {
+            Err(Status::CANCELLED) if register_on_cancel => self.plan.failure,
             Err(status) => Some(status),
             Ok(())
-                if self.plan.cancellation == Cancellation::Cooperative
+                if !register_on_cancel
+                    && self.plan.cancellation == Cancellation::Cooperative
                     && self.request.is_cancelled() =>
             {
                 Some(Status::CANCELLED)
@@ -565,6 +575,31 @@ impl<B: Inspect> Inspect for ControlledFs<B> {
 #[async_trait]
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
+
+    async fn notify(
+        &self,
+        file: &Self::File,
+        filter: NotifyFilter,
+        tree: bool,
+        output_length: usize,
+        r: &RequestContext,
+    ) -> Result<NotifyResult, Status> {
+        let mut call = self.controller.begin(
+            Operation::Notify,
+            Some(file.id),
+            None,
+            None,
+            Some(output_length as u64),
+            r,
+        )?;
+        // Canceling the waiter must not prevent the open's first registration.
+        let context = call.prepare_inner(true).await?;
+        let result = self
+            .backend
+            .notify(&file.inner, filter, tree, output_length, &context)
+            .await;
+        call.complete(result, None).await
+    }
 
     async fn open(
         &self,

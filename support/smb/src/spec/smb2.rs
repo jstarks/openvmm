@@ -52,6 +52,8 @@ open_enum! {
         #![expect(missing_docs, reason = "Status names follow the cited NTSTATUS table.")]
         SUCCESS = 0,
         PENDING = 0x00000103,
+        NOTIFY_CLEANUP = 0x0000010b,
+        NOTIFY_ENUM_DIR = 0x0000010c,
         CANCELLED = 0xc0000120,
         INFO_LENGTH_MISMATCH = 0xc0000004,
         EAS_NOT_SUPPORTED = 0xc000004f,
@@ -741,14 +743,50 @@ IoctlRequest, 56, 57 {
     flags: U32,
     reserved2: U32,
 });
+/// Notification scope: [MS-SMB2] §2.2.35.
+#[bitfield(u16, repr = U16, from = U16::new, into = super::u16_from_le, conversion = false)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct NotifyFlags {
+    pub watch_tree: bool,
+    #[bits(15)]
+    reserved: u16,
+}
+le_bitfield_conversions!(NotifyFlags, u16, U16);
+
+/// CompletionFilter bits: [MS-SMB2] §2.2.35; unknown bits are ignored (§3.3.5.19).
+#[bitfield(u32, repr = U32, from = U32::new, into = super::u32_from_le, conversion = false)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct NotifyFilter {
+    pub file_name: bool,
+    pub dir_name: bool,
+    pub attributes: bool,
+    pub size: bool,
+    pub last_write: bool,
+    pub last_access: bool,
+    pub creation: bool,
+    pub ea: bool,
+    pub security: bool,
+    pub stream_name: bool,
+    pub stream_size: bool,
+    pub stream_write: bool,
+    #[bits(20)]
+    reserved: u32,
+}
+le_bitfield_conversions!(NotifyFilter, u32, U32);
+
+impl NotifyFilter {
+    /// Valid CompletionFilter bits, including optional provider features.
+    pub const VALID: u32 = 0x00000fff;
+}
+
 wire!(
-/// CHANGE_NOTIFY request: [MS-SMB2] §2.2.35. Notifications are not yet implemented.
+/// CHANGE_NOTIFY request: [MS-SMB2] §2.2.35.
 ChangeNotifyRequest, 32, 32 {
     structure_size: U16,
-    flags: U16,
+    flags: NotifyFlags,
     output_buffer_length: U32,
     file_id: FileId,
-    completion_filter: U32,
+    completion_filter: NotifyFilter,
     reserved: U32,
 });
 wire!(
@@ -778,7 +816,7 @@ QueryDirectoryRequest, 32, 33 {
     output_buffer_length: U32,
 });
 wire!(
-/// QUERY_DIRECTORY/QUERY_INFO response fixed prefix: [MS-SMB2] §§2.2.34, 2.2.38.
+/// QUERY_DIRECTORY/CHANGE_NOTIFY/QUERY_INFO prefix: [MS-SMB2] §§2.2.34, 2.2.36, 2.2.38.
 BufferResponse, 8, 9 {
     structure_size: U16,
     output_buffer_offset: U16,

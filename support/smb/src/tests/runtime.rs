@@ -806,8 +806,8 @@ fn deferred_binding_orders_barriers_independently_of_operation_identity() {
         let file = client.connection.state.lock().files[&id.volatile.get()].clone();
         let barrier = RequestContext::new(30);
         let deferred = RequestContext::new(10);
-        file.track(&barrier, true);
-        file.track(&deferred, false);
+        file.track(&barrier, Command::FLUSH);
+        file.track(&deferred, Command::READ);
         let mut wait = std::pin::pin!(file.wait(&deferred, false));
         assert!(futures::poll!(&mut wait).is_pending());
         file.untrack(barrier.id());
@@ -1401,6 +1401,152 @@ fn excess_credited_requests_do_not_obstruct_cancel_when_every_slot_is_occupied()
         assert_eq!(successes(&control, Operation::Write), 0);
         task.task_mut().shutdown().await.unwrap();
         assert_eq!(successes(&control, Operation::Close), 1);
+    });
+}
+
+#[test]
+fn notify_tcp_retains_events_async_ids_and_partial_output_across_pause() {
+    DefaultPool::run_with(async |driver| {
+        let memory = MemoryFs::new(1024, 16);
+        let (fs, control) = ControlledFs::new(memory.clone());
+        control
+            .set_plan(
+                Operation::Notify,
+                Plan {
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let root = client.open("", 1, 1).await;
+        let stream = TestStream::new();
+        stream.input(&frame(&request(
+            Command::CHANGE_NOTIFY,
+            &notify::body(root, NotifyFilter::new().with_file_name(true), false, 1024),
+            client.session,
+            client.tree,
+            client.message,
+        )));
+        let mut task = TaskControl::new(tcp::ConnectionTask::new(
+            client.connection.clone(),
+            stream.clone(),
+        ));
+        task.insert(driver, "smb-notify-pause", ());
+        task.start();
+        let call = control.next_call().await;
+        task.stop().await;
+        assert_eq!(inspect_text("notify_waiters", &memory).await, "1");
+        let mut writer = Client::new(&server).await;
+        let child = writer.open("during-pause", 2, 0).await;
+        assert_eq!(control.snapshot(call.id).unwrap().phase, Phase::Executing);
+        task.start();
+        control.wait_for_phase(call.id, Phase::After).await.unwrap();
+        task.stop().await;
+        assert_eq!(inspect_text("notify_waiters", &memory).await, "0");
+        control.release(call.id, Gate::After).unwrap();
+        task.start();
+        control
+            .wait_for_phase(call.id, Phase::Completed)
+            .await
+            .unwrap();
+        task.stop().await;
+        assert_eq!(inspect_text("watch_count", &memory).await, "1");
+        stream.writable(5);
+        task.start();
+        stream.until(|state| state.output.len() == 5).await;
+        task.stop().await;
+        assert_eq!(inspect_text("transmit_offset", &task).await, "5");
+        stream.writable(usize::MAX);
+        task.start();
+        stream
+            .until(|state| complete_frames(&state.output).len() == 2)
+            .await;
+        task.stop().await;
+        let bytes = stream.state.lock().output.clone();
+        let frames = complete_frames(&bytes);
+        let pending = AsyncHeader::read_from_prefix(frames[0]).unwrap().0;
+        let completed = AsyncHeader::read_from_prefix(frames[1]).unwrap().0;
+        assert_eq!(Status(pending.status.get()), Status::PENDING);
+        assert_eq!(pending.async_id, completed.async_id);
+        assert!(completed.flags.async_command());
+        assert_eq!(completed.credits.get(), 0);
+        assert_eq!(
+            notify::changes(frames[1]),
+            [(NotifyAction::ADDED, "during-pause".into())]
+        );
+        writer.close(child).await;
+        task.task_mut().shutdown().await.unwrap();
+        assert_eq!(inspect_text("watch_count", &memory).await, "0");
+        assert_eq!(inspect_text("opens", &memory).await, "0");
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.phase == Phase::Abandoned)
+        );
+    });
+}
+
+#[test]
+fn notify_shutdown_drains_a_saturated_connection_without_output_or_events() {
+    DefaultPool::run_with(async |driver| {
+        let memory = MemoryFs::new(1024, 16);
+        let (fs, control) = ControlledFs::new(memory.clone());
+        control
+            .set_plan(
+                Operation::Notify,
+                Plan {
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let root = client.open("", 1, 1).await;
+        let stream = TestStream::new();
+        for _ in 0..MAX_REQUESTS {
+            stream.input(&frame(&request(
+                Command::CHANGE_NOTIFY,
+                &notify::body(root, NotifyFilter::new().with_file_name(true), false, 1024),
+                client.session,
+                client.tree,
+                client.message,
+            )));
+            client.message += 1;
+        }
+        let mut task = TaskControl::new(tcp::ConnectionTask::new(
+            client.connection.clone(),
+            stream.clone(),
+        ));
+        task.insert(driver, "smb-notify-shutdown", ());
+        task.start();
+        let call = control.next_call().await;
+        stream.until(|state| state.input.is_empty()).await;
+        task.stop().await;
+        assert_eq!(
+            inspect_text("active_requests", &task).await,
+            MAX_REQUESTS.to_string()
+        );
+        assert_eq!(inspect_text("notify_waiters", &memory).await, "1");
+        // Already executing calls retain their plans; canceled successors need no gate.
+        control
+            .set_plan(Operation::Notify, Plan::default())
+            .unwrap();
+        control.release(call.id, Gate::After).unwrap();
+        task.task_mut().shutdown().await.unwrap();
+        assert!(stream.state.lock().output.is_empty());
+        assert_eq!(inspect_text("notify_waiters", &memory).await, "0");
+        assert_eq!(inspect_text("watch_count", &memory).await, "0");
+        assert_eq!(inspect_text("opens", &memory).await, "0");
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.phase == Phase::Abandoned)
+        );
     });
 }
 

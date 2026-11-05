@@ -38,6 +38,23 @@ fn samba_read_write_smoke() {
     );
 }
 
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_notify() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.notify.close",
+            "smb2.notify.file",
+            "smb2.notify.tdis1",
+            "smb2.notify.logoff",
+            "smb2.notify.handle-permissions",
+            "smb2.notify.basedir",
+        ],
+    );
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]

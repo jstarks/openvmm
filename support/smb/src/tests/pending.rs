@@ -29,7 +29,7 @@ fn write(
     client.connection.request(bytes).unwrap()
 }
 
-fn cancel<B: FileSystem>(client: &Client<B>, id: u64) {
+pub(super) fn cancel<B: FileSystem>(client: &Client<B>, id: u64) {
     let header = AsyncHeader {
         protocol: SIGNATURE,
         structure_size: (HEADER_SIZE as u16).into(),

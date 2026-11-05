@@ -26,6 +26,7 @@ cargo nextest run --profile agent -p smb --run-ignored only \
     -E 'test(samba_read_write_smoke)'
 cargo nextest run --profile agent -p smb --features test-support --run-ignored only \
     -E 'test(samba_gated_async_compounds)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_notify)'
 ```
 
 The ignored test requires `smbtorture` (Ubuntu package `samba-testsuite`),
@@ -39,6 +40,8 @@ identity, and related/unrelated directory continuation.
 The feature-enabled async harness gates real provider reads, writes, and
 flushes on the server's poller. Its four async compound cases include READ/WRITE
 checks requiring pending replies, rather than only allowing synchronous fallback.
+The notify harness covers CLOSE, TREE_DISCONNECT, LOGOFF, ordinary-file rejection,
+handle permissions, and excluding changes to the watched directory itself.
 
 ## Protocol Representation
 
@@ -141,8 +144,11 @@ increasing window; pending requests receive credits exactly once, in the interim
 TCP answers otherwise valid requests exceeding the active-descriptor limit
 with STATUS_INSUFFICIENT_RESOURCES, consuming their IDs and returning credits
 without provider effects. It does not leave them blocking subsequent CANCEL.
-The decoder includes file-bearing LOCK/IOCTL/CHANGE_NOTIFY layouts for dependency
-handling, but those operations still return unsupported statuses.
+CHANGE_NOTIFY is supported as the last command of a compound, including inheritance
+from CREATE. A non-tail CHANGE_NOTIFY returns STATUS_NOT_SUPPORTED rather than
+stranding later commands behind an indefinite wait; MS-SMB2 section 3.3.5.2.7
+allows rejecting asynchronous compound operations. The decoder includes
+file-bearing LOCK/IOCTL layouts, but those operations remain unsupported.
 
 The full Samba compound suite is not claimed to pass. The installed 4.19.5
 `related1` probe crashed in client session-cloning setup. `related6` expects
@@ -151,6 +157,49 @@ recommended error propagation. Mixed-style `invalid3` and unknown-command
 `invalid4` fixtures expect behavior different from the normative validation rules.
 `compound_find_close` requests 128 credits and creates 5000 objects, outside this
 test server's 32-credit/4096-object profile. None are counted as passing coverage.
+
+## Directory Change Notifications
+
+CHANGE_NOTIFY follows MS-SMB2 sections 3.3.1.3 and 3.3.5.19, MS-FSA sections
+2.1.5.11/11.1, and MS-FSCC section 2.7.1. The first provider registration fixes
+the filter and subtree policy for the lifetime of that open, including when
+its first waiter was already canceled. Unknown filter bits are ignored; an
+empty filter waits for cancellation or close.
+
+The memory provider registers and records actual filesystem changes under the
+same lock, without an unmonitored gap. It retains changes between requests,
+reports relative UTF-16 names and aligned linked records, and completes waiters
+FIFO. Notifications have their own ordering queue, not a data/mutation barrier.
+Normal I/O and metadata operations still progress; CLOSE cancels/drains watchers
+and returns STATUS_NOTIFY_CLEANUP for canceled notifications.
+
+Each watch retains up to 64 KiB of encoded events. The provider permits 1024
+watches and 32 backend waiters per open; the core's existing request limit also
+applies. These limits, watch policies, queued counts/bytes, overflow state, and
+waiters are inspectable. A too-small output buffer gets STATUS_NOTIFY_ENUM_DIR
+without partially consuming the batch. Actual storage overflow discards the
+lost batch, reports re-enumeration, and resumes buffering afterward.
+
+Canceling a waiter leaves the registration and unconsumed events intact.
+Obtained results survive late cancellation, including controlled delayed delivery.
+Pausing preserves watches, incoming changes, AsyncIds, and partial output. If a
+response receiver closes after an interim, the executor cancels and drains its
+still-waiting operation instead of leaking an indefinitely pending watch.
+
+Deterministic regressions exercise registration/cancel/event ordering, backward
+polling and FIFO, queued AsyncId cancellation, late results and close, subtree and
+per-open policy, real mutation filters, overflow/recovery, resource release,
+compound boundaries, paused delivery, full queues, and blocked-output shutdown.
+Independent literal bytes check single and linked notification records. No sleeps
+are used to arrange these interleavings.
+
+Not all installed Samba 4.19.5 notify cases are applicable. Probes such as
+`smb2.notify.double` send a synchronous CANCEL with MessageId zero before receiving
+an interim, rather than the pending request's ID, and then wait indefinitely.
+That unmatched CANCEL must be ignored, not treated as "cancel any request".
+Its behavior is covered by a direct negative regression; those probes are not
+counted as passes. Other broad cases require rename or native-filesystem-specific
+buffer/event policies that this provider does not implement.
 
 ## Controlled Provider Tests
 
@@ -171,6 +220,8 @@ Cancellation can be cooperative or suppressed to model uncancellable I/O.
 Obtained results are never relabeled when cancellation arrives late. Fault
 injection fails before delegation. Transfer limits shorten the actual delegated
 read/write, so file contents and reported counts agree.
+Notify cancellation still establishes the open's persistent registration, even
+when it interrupts a before gate; it cancels the waiter, not the watch.
 
 Active calls, announcements, and queued plans are bounded at 256 each. Recent
 terminal history retains 256 calls; ordinary passthrough calls need no controller
@@ -187,7 +238,7 @@ for async compound interoperability.
 ## Current Limits
 
 Supported commands are NEGOTIATE, SESSION_SETUP, LOGOFF, TREE_CONNECT,
-TREE_DISCONNECT, CREATE, CLOSE, FLUSH, READ, WRITE, QUERY_DIRECTORY, and a
+TREE_DISCONNECT, CREATE, CLOSE, FLUSH, READ, WRITE, QUERY_DIRECTORY, CHANGE_NOTIFY, and a
 subset of QUERY_INFO/SET_INFO, plus ECHO. CREATE validates linked context
 containers and returns maximal-access (`MxAc`) and on-disk-ID (`QFid`) responses.
 Unsupported preallocation, durable-handle requests, and leases are explicitly
@@ -200,7 +251,7 @@ Alternate-name queries use optional provider short names; the memory provider
 does not generate 8.3 aliases.
 
 Non-default streams, Unicode
-case-folding, rename, ACL updates, locks, leases, notifications, and IOCTLs
+case-folding, rename, ACL updates, locks, leases, and IOCTLs
 remain future work. Unsupported requests receive explicit status errors.
 Memory is allocated for file holes; this is not a sparse-filesystem model.
 

@@ -62,6 +62,9 @@ pub(super) fn charge(packet: &[u8], header: &Header) -> Result<u32, Status> {
         Command::QUERY_INFO => read_body::<QueryInfoRequest>(packet)?
             .output_buffer_length
             .get(),
+        Command::CHANGE_NOTIFY => read_body::<ChangeNotifyRequest>(packet)?
+            .output_buffer_length
+            .get(),
         _ => 0,
     };
     let required = payload.saturating_sub(1) / CREDIT_PAYLOAD_SIZE + 1;
@@ -328,8 +331,20 @@ impl<B: FileSystem> Request<B> {
                             }
                         }
                     }
-                    // Never drop the submitted operation to publish an interim response.
-                    future.await?
+                    // Delivery can fail after the interim while backend work is still pending.
+                    if let Some(sender) = sender {
+                        let mut closed = std::pin::pin!(sender.closed().fuse());
+                        futures::select! {
+                            completion = future => completion?,
+                            () = closed => {
+                                delivery_failed = true;
+                                connection.cancel_all();
+                                future.await?
+                            }
+                        }
+                    } else {
+                        future.await?
+                    }
                 }
             };
             if let Some(error) = protocol_error {

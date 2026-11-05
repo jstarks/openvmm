@@ -3,7 +3,10 @@
 
 //! Filesystem semantics independent of host files and VM resources.
 
-use crate::spec::{AccessMask, CreateDisposition, CreateOptions, FileAttributes, Status};
+use crate::spec::{
+    AccessMask, CreateDisposition, CreateOptions, FileAttributes, FileNotifyInformation,
+    NOTIFY_ALIGNMENT, NotifyAction, NotifyFilter, Status,
+};
 use async_trait::async_trait;
 use event_listener::Event;
 use inspect::Inspect;
@@ -146,6 +149,32 @@ pub struct BasicInformation {
     pub attributes: u32,
 }
 
+/// One change relative to the directory being watched, not a host pathname.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    /// Filesystem event.
+    pub action: NotifyAction,
+    /// Backslash-separated relative name, preserving the provider's spelling.
+    pub name: String,
+}
+
+impl Change {
+    /// Byte budget of this aligned MS-FSCC 2.7.1 notification record.
+    pub fn encoded_len(&self) -> usize {
+        (size_of::<FileNotifyInformation>() + self.name.encode_utf16().count() * size_of::<u16>())
+            .next_multiple_of(NOTIFY_ALIGNMENT)
+    }
+}
+
+/// A completed watch either delivers actual events or requires re-enumeration.
+#[derive(Debug)]
+pub enum NotifyResult {
+    /// Nonempty changes, in provider order.
+    Changes(Vec<Change>),
+    /// Events were lost, or the output buffer cannot hold the pending batch.
+    Overflow,
+}
+
 /// The object store behind a share.
 ///
 /// Handles own their open lifetime: dropping one releases its share-access
@@ -218,6 +247,22 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         info: BasicInformation,
         request: &RequestContext,
     ) -> Result<(), Status>;
+    /// Watch directory changes. The first call fixes filter/scope for this open;
+    /// buffer changes between calls and complete overlapping requests FIFO.
+    /// Cancellation removes a waiter, not the open's watch or buffered changes.
+    /// Establish the watch even if the request was canceled before its first poll.
+    /// Pending waits must honor cancellation unless an actual result was already obtained.
+    /// Providers must bound storage and report overflow rather than silently lose events.
+    async fn notify(
+        &self,
+        _file: &Self::File,
+        _filter: NotifyFilter,
+        _watch_tree: bool,
+        _output_length: usize,
+        _request: &RequestContext,
+    ) -> Result<NotifyResult, Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
 }
 
 /// Expand generic access bits using the file-object generic mapping.

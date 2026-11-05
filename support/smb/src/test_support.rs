@@ -48,6 +48,8 @@ pub enum Operation {
     SetDeleteOnClose,
     /// Basic metadata change.
     SetBasic,
+    /// Namespace rename or move.
+    Rename,
     /// Directory change notification.
     Notify,
     /// Byte-range lock.
@@ -585,6 +587,23 @@ impl<B: Inspect> Inspect for ControlledFs<B> {
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
 
+    async fn rename(
+        &self,
+        file: &Self::File,
+        name: &str,
+        replace: bool,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::Rename, Some(file.id), Some(name), None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .rename(&file.inner, name, replace, &context)
+            .await;
+        call.complete(result, None).await
+    }
     async fn lock(
         &self,
         file: &Self::File,

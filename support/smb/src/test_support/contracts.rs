@@ -39,6 +39,8 @@ pub enum Feature {
 pub struct Expectations {
     /// Basic metadata mutation.
     pub basic_information: Feature,
+    /// Atomic namespace rename and replacement.
+    pub rename: Feature,
     /// Byte-range acquisition, requiring unlock and rollback when supported.
     /// Rejection is probed on acquisition, without inventing a rollback token.
     pub locks: Feature,
@@ -268,6 +270,355 @@ pub async fn data_and_identity<F: Fixture>(fixture: &F) {
         initial.id
     );
     fs.close(&reopened, &request).await.unwrap();
+}
+
+/// Renames and moves preserve source opens, data, identity and acquired locks.
+pub async fn rename_identity<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "before", CreateDisposition::CREATE, false, &request).await;
+    let peer = open(fs, "before", CreateDisposition::OPEN, false, &request).await;
+    write_all(fs, &file, 0, b"payload", &request).await;
+    let before = fs.metadata(&file, &request).await.unwrap();
+    if let Some(status) = unsupported(fixture.expectations().rename) {
+        rejected(fs.rename(&file, "after", false, &request).await, status);
+        assert_eq!(fs.metadata(&file, &request).await.unwrap().name, "before");
+    } else {
+        let locked = matches!(fixture.expectations().locks, Feature::Supported);
+        if locked {
+            fs.lock(&file, RANGE, true, true, &request).await.unwrap();
+        }
+        fs.rename(&file, "after", false, &request).await.unwrap();
+        let after = fs.metadata(&peer, &request).await.unwrap();
+        assert_eq!((after.id, after.size), (before.id, before.size));
+        assert_eq!(after.name, "after");
+        if locked {
+            rejected(
+                fs.read(&peer, 0, 7, &request).await,
+                Status::FILE_LOCK_CONFLICT,
+            );
+            fs.unlock(&file, RANGE, &request).await.unwrap();
+        }
+        assert_eq!(read_bytes(fs, &peer, 0, 7, &request).await, b"payload");
+        rejected(
+            fs.open("before", options(CreateDisposition::OPEN, false), &request)
+                .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+        fs.rename(&file, "AFTER", false, &request).await.unwrap();
+        assert_eq!(fs.metadata(&peer, &request).await.unwrap().name, "AFTER");
+        let directory = open(fs, "destination", CreateDisposition::CREATE, true, &request).await;
+        fs.rename(&file, "destination\\moved", false, &request)
+            .await
+            .unwrap();
+        let reopened = open(
+            fs,
+            "destination\\moved",
+            CreateDisposition::OPEN,
+            false,
+            &request,
+        )
+        .await;
+        assert_eq!(
+            fs.metadata(&reopened, &request).await.unwrap().id,
+            before.id
+        );
+        assert_eq!(read_bytes(fs, &reopened, 0, 7, &request).await, b"payload");
+        fs.close(&reopened, &request).await.unwrap();
+        fs.close(&directory, &request).await.unwrap();
+    }
+    fs.close(&peer, &request).await.unwrap();
+    fs.close(&file, &request).await.unwrap();
+}
+
+/// Directory moves reject open descendants and cycles; replacement rejects
+/// open targets and preserves both objects on failure.
+pub async fn rename_namespace_and_replacement<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let directory = open(fs, "directory", CreateDisposition::CREATE, true, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().rename) {
+        rejected(
+            fs.rename(&directory, "renamed", false, &request).await,
+            status,
+        );
+        fs.close(&directory, &request).await.unwrap();
+        return;
+    }
+    let subdirectory = open(
+        fs,
+        "directory\\sub",
+        CreateDisposition::CREATE,
+        true,
+        &request,
+    )
+    .await;
+    let child = open(
+        fs,
+        "directory\\sub\\child",
+        CreateDisposition::CREATE,
+        false,
+        &request,
+    )
+    .await;
+    let child_id = fs.metadata(&child, &request).await.unwrap().id;
+    write_all(fs, &child, 0, b"child", &request).await;
+    rejected(
+        fs.rename(&directory, "renamed", false, &request).await,
+        Status::ACCESS_DENIED,
+    );
+    fs.close(&child, &request).await.unwrap();
+    fs.close(&subdirectory, &request).await.unwrap();
+    rejected(
+        fs.rename(&directory, "directory\\sub\\cycle", false, &request)
+            .await,
+        Status::ACCESS_DENIED,
+    );
+    fs.rename(&directory, "renamed", false, &request)
+        .await
+        .unwrap();
+    let moved = open(
+        fs,
+        "renamed\\sub\\child",
+        CreateDisposition::OPEN,
+        false,
+        &request,
+    )
+    .await;
+    assert_eq!(fs.metadata(&moved, &request).await.unwrap().id, child_id);
+    assert_eq!(read_bytes(fs, &moved, 0, 5, &request).await, b"child");
+    fs.close(&moved, &request).await.unwrap();
+
+    let source = open(fs, "source", CreateDisposition::CREATE, false, &request).await;
+    let target = open(fs, "target", CreateDisposition::CREATE, false, &request).await;
+    let source_id = fs.metadata(&source, &request).await.unwrap().id;
+    write_all(fs, &source, 0, b"source", &request).await;
+    write_all(fs, &target, 0, b"target", &request).await;
+    for (name, replace, status) in [
+        ("target", false, Status::OBJECT_NAME_COLLISION),
+        ("target", true, Status::ACCESS_DENIED),
+        ("renamed", true, Status::ACCESS_DENIED),
+        ("missing\\name", false, Status::OBJECT_PATH_NOT_FOUND),
+        ("target\\name", false, Status::NOT_A_DIRECTORY),
+    ] {
+        rejected(fs.rename(&source, name, replace, &request).await, status);
+        assert_eq!(fs.metadata(&source, &request).await.unwrap().name, "source");
+        assert_eq!(read_bytes(fs, &source, 0, 6, &request).await, b"source");
+        assert_eq!(read_bytes(fs, &target, 0, 6, &request).await, b"target");
+    }
+    fs.close(&target, &request).await.unwrap();
+    fs.rename(&source, "target", true, &request).await.unwrap();
+    let replaced = open(fs, "target", CreateDisposition::OPEN, false, &request).await;
+    assert_eq!(
+        fs.metadata(&replaced, &request).await.unwrap().id,
+        source_id
+    );
+    assert_eq!(read_bytes(fs, &replaced, 0, 6, &request).await, b"source");
+    fs.set_delete_on_close(&source, true, &request)
+        .await
+        .unwrap();
+    rejected(
+        fs.rename(&source, "pending", false, &request).await,
+        Status::ACCESS_DENIED,
+    );
+    fs.close(&replaced, &request).await.unwrap();
+    fs.close(&source, &request).await.unwrap();
+    let container = open(fs, "container", CreateDisposition::CREATE, true, &request).await;
+    fs.rename(&directory, "container\\renamed", false, &request)
+        .await
+        .unwrap();
+    let moved = open(
+        fs,
+        "container\\renamed\\sub\\child",
+        CreateDisposition::OPEN,
+        false,
+        &request,
+    )
+    .await;
+    assert_eq!(fs.metadata(&moved, &request).await.unwrap().id, child_id);
+    assert_eq!(read_bytes(fs, &moved, 0, 5, &request).await, b"child");
+    fs.close(&moved, &request).await.unwrap();
+    fs.close(&container, &request).await.unwrap();
+    let shared = open(fs, "shared", CreateDisposition::CREATE, true, &request).await;
+    let file = open(
+        fs,
+        "shared\\file",
+        CreateDisposition::CREATE,
+        false,
+        &request,
+    )
+    .await;
+    fs.close(&shared, &request).await.unwrap();
+    let (parent, _) = fs
+        .open(
+            "shared",
+            OpenOptions {
+                access: AccessMask::FILE_GENERIC_READ.into_bits(),
+                share_access: ShareAccess::new().with_read(true).into_bits(),
+                ..options(CreateDisposition::OPEN, true)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    rejected(
+        fs.rename(&file, "shared\\new", false, &request).await,
+        Status::SHARING_VIOLATION,
+    );
+    fs.close(&parent, &request).await.unwrap();
+    fs.rename(&file, "shared\\new", false, &request)
+        .await
+        .unwrap();
+    fs.close(&file, &request).await.unwrap();
+    fs.close(&directory, &request).await.unwrap();
+}
+
+async fn register<B: FileSystem>(
+    fs: &B,
+    directory: &B::File,
+    filter: NotifyFilter,
+    tree: bool,
+    id: u64,
+) {
+    let cancelled = RequestContext::new(id);
+    cancelled.cancel();
+    rejected(
+        fs.notify(directory, filter, tree, 4096, &cancelled).await,
+        Status::CANCELLED,
+    );
+}
+
+/// Same-directory old/new pairs, cross-directory removal/addition, and exact
+/// replacement's metadata notification are buffered atomically and filtered.
+pub async fn rename_notifications<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let root = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+    let left = open(fs, "left", CreateDisposition::CREATE, true, &request).await;
+    let right = open(fs, "right", CreateDisposition::CREATE, true, &request).await;
+    let file = open(
+        fs,
+        "left\\source",
+        CreateDisposition::CREATE,
+        false,
+        &request,
+    )
+    .await;
+    if let Some(status) = unsupported(fixture.expectations().rename) {
+        rejected(fs.rename(&file, "left\\new", false, &request).await, status);
+    } else if let Some(status) = unsupported(fixture.expectations().notifications) {
+        rejected_notify(fs, &root, status, &request).await;
+    } else {
+        let target = open(
+            fs,
+            "right\\target",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        let metadata = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+        register(fs, &root, file_names(), true, 2).await;
+        register(fs, &left, file_names(), false, 3).await;
+        register(fs, &right, file_names(), false, 4).await;
+        register(
+            fs,
+            &metadata,
+            NotifyFilter::new().with_attributes(true),
+            true,
+            5,
+        )
+        .await;
+        fs.rename(&file, "left\\source", false, &request)
+            .await
+            .unwrap();
+        rejected(
+            fs.rename(&file, "right\\target", false, &request).await,
+            Status::OBJECT_NAME_COLLISION,
+        );
+        rejected(
+            fs.rename(&file, "right\\target", true, &request).await,
+            Status::ACCESS_DENIED,
+        );
+        fs.close(&target, &request).await.unwrap();
+        fs.rename(&file, "left\\new", false, &request)
+            .await
+            .unwrap();
+        changes(
+            fs.notify(&root, file_names(), true, 4096, &request)
+                .await
+                .unwrap(),
+            &[
+                (NotifyAction::RENAMED_OLD_NAME, "left\\source"),
+                (NotifyAction::RENAMED_NEW_NAME, "left\\new"),
+            ],
+        );
+        changes(
+            fs.notify(&left, file_names(), false, 4096, &request)
+                .await
+                .unwrap(),
+            &[
+                (NotifyAction::RENAMED_OLD_NAME, "source"),
+                (NotifyAction::RENAMED_NEW_NAME, "new"),
+            ],
+        );
+        fs.rename(&file, "right\\moved", false, &request)
+            .await
+            .unwrap();
+        changes(
+            fs.notify(&root, file_names(), true, 4096, &request)
+                .await
+                .unwrap(),
+            &[
+                (NotifyAction::REMOVED, "left\\new"),
+                (NotifyAction::ADDED, "right\\moved"),
+            ],
+        );
+        changes(
+            fs.notify(&left, file_names(), false, 4096, &request)
+                .await
+                .unwrap(),
+            &[(NotifyAction::REMOVED, "new")],
+        );
+        changes(
+            fs.notify(&right, file_names(), false, 4096, &request)
+                .await
+                .unwrap(),
+            &[(NotifyAction::ADDED, "moved")],
+        );
+        fs.rename(&file, "right\\target", true, &request)
+            .await
+            .unwrap();
+        changes(
+            fs.notify(&root, file_names(), true, 4096, &request)
+                .await
+                .unwrap(),
+            &[(NotifyAction::REMOVED, "right\\moved")],
+        );
+        changes(
+            fs.notify(&right, file_names(), false, 4096, &request)
+                .await
+                .unwrap(),
+            &[(NotifyAction::REMOVED, "moved")],
+        );
+        changes(
+            fs.notify(
+                &metadata,
+                NotifyFilter::new().with_attributes(true),
+                true,
+                4096,
+                &request,
+            )
+            .await
+            .unwrap(),
+            &[(NotifyAction::MODIFIED, "right\\target")],
+        );
+        fs.close(&metadata, &request).await.unwrap();
+    }
+    fs.close(&file, &request).await.unwrap();
+    fs.close(&right, &request).await.unwrap();
+    fs.close(&left, &request).await.unwrap();
+    fs.close(&root, &request).await.unwrap();
 }
 
 /// Bilateral sharing, idempotent settled close, and fallback drop release.

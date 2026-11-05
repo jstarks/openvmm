@@ -229,6 +229,7 @@ mod create;
 mod locking;
 mod notify;
 mod pending;
+mod rename;
 mod runtime;
 mod wire;
 

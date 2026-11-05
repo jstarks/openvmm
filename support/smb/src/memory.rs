@@ -8,9 +8,9 @@ use crate::provider::{
     RequestContext,
 };
 use crate::spec::{
-    AccessMask, CreateAction, CreateDisposition, FileAttributes, NT_TICKS_PER_SECOND, NotifyAction,
-    NotifyFilter, ShareAccess, Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED,
-    UNIX_EPOCH_NT_TIME,
+    AccessMask, CreateAction, CreateDisposition, FileAttributes, MAX_PATH_LENGTH,
+    NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter, ShareAccess, Status, TIME_RESTORE,
+    TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
 use event_listener::Event;
@@ -292,6 +292,36 @@ fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
     })
 }
 
+fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
+    let mut parent = 1;
+    for part in parts {
+        parent = child(state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?;
+        if !state.nodes[&parent].metadata.is_directory() {
+            return Err(Status::NOT_A_DIRECTORY);
+        }
+        if state.nodes[&parent].metadata.delete_pending {
+            return Err(Status::DELETE_PENDING);
+        }
+    }
+    if state.nodes[&parent].metadata.delete_pending {
+        return Err(Status::DELETE_PENDING);
+    }
+    Ok(parent)
+}
+
+fn beneath(state: &State, mut node: u64, ancestor: u64) -> bool {
+    loop {
+        if node == ancestor {
+            return true;
+        }
+        let parent = state.nodes[&node].parent;
+        if parent == node {
+            return false;
+        }
+        node = parent;
+    }
+}
+
 fn share_categories(access: u32) -> u32 {
     let access = AccessMask::from_bits(access);
     ShareAccess::new()
@@ -483,16 +513,7 @@ impl FileSystem for MemoryFs {
     ) -> Result<(MemoryFile, u32), Status> {
         let parts = components(name)?;
         let mut state = self.0.lock();
-        let mut parent = 1;
-        for part in &parts[..parts.len().saturating_sub(1)] {
-            parent = child(&state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?;
-            if !state.nodes[&parent].metadata.is_directory() {
-                return Err(Status::NOT_A_DIRECTORY);
-            }
-            if state.nodes[&parent].metadata.delete_pending {
-                return Err(Status::DELETE_PENDING);
-            }
-        }
+        let parent = resolve_directory(&state, &parts[..parts.len().saturating_sub(1)])?;
         let existing = match parts.last() {
             Some(name) => child(&state, parent, name),
             None => Some(1),
@@ -666,6 +687,155 @@ impl FileSystem for MemoryFs {
 
     async fn close(&self, file: &MemoryFile, _request: &RequestContext) -> Result<(), Status> {
         file.close();
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        file: &MemoryFile,
+        name: &str,
+        replace: bool,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        if name.encode_utf16().count() > MAX_PATH_LENGTH {
+            return Err(Status::NAME_TOO_LONG);
+        }
+        let parts = components(name)?;
+        if name.ends_with('\\')
+            || parts.is_empty()
+            || parts.iter().any(|part| {
+                part.chars()
+                    .any(|c| c <= '\u{1f}' || matches!(c, '"' | '|' | '<' | '>' | '*' | '?'))
+            })
+        {
+            return Err(Status::OBJECT_NAME_INVALID);
+        }
+        let mut state = self.0.lock();
+        let opened = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let user_set_change_time = opened.user_set_change_time;
+        let source = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        if file.node == 1 {
+            return Err(Status::ACCESS_DENIED);
+        }
+        let directory = source.metadata.is_directory();
+        let old_parent = source.parent;
+        let new_name = parts.last().ok_or(Status::OBJECT_NAME_INVALID)?;
+        let parent = resolve_directory(&state, &parts[..parts.len() - 1])?;
+        if state
+            .opens
+            .values()
+            .any(|open| open.node == parent && !ShareAccess::from_bits(open.sharing).write())
+        {
+            return Err(Status::SHARING_VIOLATION);
+        }
+        if source.metadata.delete_pending {
+            return Err(Status::ACCESS_DENIED);
+        }
+        if directory
+            && (beneath(&state, parent, file.node)
+                || state
+                    .opens
+                    .values()
+                    .any(|open| open.node != file.node && beneath(&state, open.node, file.node)))
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
+        if parent == old_parent && source.metadata.name == *new_name {
+            return Ok(());
+        }
+        let target = child(&state, parent, new_name).filter(|&id| id != file.node);
+        let exact_target = target.is_some_and(|id| state.nodes[&id].metadata.name == *new_name);
+        if let Some(target) = target {
+            if !replace {
+                return Err(Status::OBJECT_NAME_COLLISION);
+            }
+            let metadata = &state.nodes[&target].metadata;
+            if metadata.is_directory() || metadata.attributes().readonly() {
+                return Err(Status::ACCESS_DENIED);
+            }
+            if metadata.delete_pending {
+                return Err(Status::DELETE_PENDING);
+            }
+            if state.opens.values().any(|open| open.node == target) {
+                return Err(Status::ACCESS_DENIED);
+            }
+        }
+
+        // Validate everything before changing the namespace or publishing records.
+        // MS-FSA §2.1.5.15.12 uses metadata notification, not a new-name record,
+        // when replacing an exact-case destination.
+        let moving = parent != old_parent;
+        let filter = name_filter(directory);
+        let new_name = new_name.to_string();
+        if let Some(target) = target {
+            if !exact_target {
+                emit(
+                    &mut state,
+                    target,
+                    NotifyAction::REMOVED,
+                    name_filter(false),
+                );
+            }
+            let node = state
+                .nodes
+                .remove(&target)
+                .expect("replacement target was validated under the namespace lock");
+            state.bytes -= node.data.len();
+        }
+        emit(
+            &mut state,
+            file.node,
+            if moving || exact_target {
+                NotifyAction::REMOVED
+            } else {
+                NotifyAction::RENAMED_OLD_NAME
+            },
+            filter,
+        );
+        let now = nt_time();
+        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+        node.parent = parent;
+        node.metadata.name = new_name;
+        if !user_set_change_time {
+            node.metadata.changed = now;
+        }
+        if !directory {
+            node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+        }
+        for parent in [old_parent, parent] {
+            let metadata = &mut state
+                .nodes
+                .get_mut(&parent)
+                .ok_or(Status::FILE_CLOSED)?
+                .metadata;
+            metadata.written = now;
+            metadata.accessed = now;
+            metadata.changed = now;
+        }
+        let (action, filter) = if exact_target {
+            (
+                NotifyAction::MODIFIED,
+                NotifyFilter::new()
+                    .with_attributes(true)
+                    .with_size(true)
+                    .with_last_write(true)
+                    .with_last_access(true)
+                    .with_creation(true)
+                    .with_security(true)
+                    .with_ea(true),
+            )
+        } else {
+            (
+                if moving {
+                    NotifyAction::ADDED
+                } else {
+                    NotifyAction::RENAMED_NEW_NAME
+                },
+                filter,
+            )
+        };
+        emit(&mut state, file.node, action, filter);
+        wake(state);
         Ok(())
     }
 
@@ -1207,6 +1377,7 @@ mod tests {
         fn expectations(&self) -> Expectations {
             Expectations {
                 basic_information: Feature::Supported,
+                rename: Feature::Supported,
                 locks: Feature::Supported,
                 notifications: Feature::Supported,
             }
@@ -1257,6 +1428,85 @@ mod tests {
     #[test]
     fn contract_basic_information() {
         run_contract(contracts::basic_information);
+    }
+
+    #[test]
+    fn contract_rename_identity() {
+        run_contract(contracts::rename_identity);
+    }
+
+    #[test]
+    fn contract_rename_namespace_and_replacement() {
+        run_contract(contracts::rename_namespace_and_replacement);
+    }
+
+    #[test]
+    fn contract_rename_notifications() {
+        run_contract(contracts::rename_notifications);
+    }
+
+    #[test]
+    fn rename_replacement_reclaims_quota_and_rejects_readonly_targets() {
+        block_on(async {
+            let fs = MemoryFs::new(4, 8);
+            let request = RequestContext::new(1);
+            let options = OpenOptions {
+                access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                share_access: ShareAccess::ALL.into_bits(),
+                disposition: CreateDisposition::CREATE.0,
+                options: 0,
+                attributes: 0,
+            };
+            let (source, _) = fs.open("source", options, &request).await.unwrap();
+            let (target, _) = fs.open("target", options, &request).await.unwrap();
+            fs.write(&target, 0, b"full", &request).await.unwrap();
+            let info = BasicInformation {
+                created: 0,
+                accessed: 0,
+                written: 0,
+                changed: 0,
+                attributes: FileAttributes::new().with_readonly(true).into_bits(),
+            };
+            fs.set_basic(&target, info, &request).await.unwrap();
+            fs.close(&target, &request).await.unwrap();
+            assert_eq!(
+                fs.rename(&source, "target", true, &request).await,
+                Err(Status::ACCESS_DENIED)
+            );
+            let (attributes, _) = fs
+                .open(
+                    "target",
+                    OpenOptions {
+                        access: AccessMask::new().with_write_attributes(true).into_bits(),
+                        disposition: CreateDisposition::OPEN.0,
+                        ..options
+                    },
+                    &request,
+                )
+                .await
+                .unwrap();
+            fs.set_basic(
+                &attributes,
+                BasicInformation {
+                    attributes: FileAttributes::new().with_normal(true).into_bits(),
+                    ..info
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+            fs.close(&attributes, &request).await.unwrap();
+            assert_eq!(
+                fs.rename(&source, &"x".repeat(MAX_PATH_LENGTH + 1), false, &request)
+                    .await,
+                Err(Status::NAME_TOO_LONG)
+            );
+            fs.rename(&source, "target", true, &request).await.unwrap();
+            assert_eq!(fs.write(&source, 0, b"live", &request).await.unwrap(), 4);
+            assert_eq!(fs.0.lock().bytes, 4);
+            assert_eq!(fs.0.lock().nodes.len(), 2);
+            fs.close(&source, &request).await.unwrap();
+        });
     }
 
     #[test]

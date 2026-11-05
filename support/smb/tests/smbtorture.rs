@@ -83,6 +83,24 @@ fn samba_notify_corrected_client() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_rename() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.rename.simple",
+            "smb2.rename.simple_modtime",
+            "smb2.rename.simple_nodelete",
+            "smb2.rename.no_sharing",
+            "smb2.rename.share_delete_no_delete_access",
+            "smb2.rename.no_share_delete_no_delete_access",
+            "smb2.rename.rename_dir_openfile",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_lock() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

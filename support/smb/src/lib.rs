@@ -2075,6 +2075,28 @@ impl<B: FileSystem> Connection<B> {
         )?;
         let file = self.file(request.file_id, tree, context)?;
         match (request.info_type, FileInformationClass(request.info_class)) {
+            (InformationType::FILE, FileInformationClass::RENAME) => {
+                if data.len() < FILE_RENAME_INFORMATION_MIN_SIZE {
+                    return Err(Status::INFO_LENGTH_MISMATCH);
+                }
+                if !file.access.delete() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let (info, rest) = FileRenameInformation::read_from_prefix(data)
+                    .map_err(|_| Status::INFO_LENGTH_MISMATCH)?;
+                let length = info.file_name_length.get() as usize;
+                if info.root_directory.get() != 0 || length == 0 || !length.is_multiple_of(2) {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                let name = decode_name(rest.get(..length).ok_or(Status::INVALID_PARAMETER)?)?;
+                if name.starts_with('\\') {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                self.server
+                    .backend
+                    .rename(&file.file, &name, info.replace_if_exists != 0, context)
+                    .await?;
+            }
             (InformationType::FILE, FileInformationClass::BASIC) => {
                 if !file.access.write_attributes() {
                     return Err(Status::ACCESS_DENIED);

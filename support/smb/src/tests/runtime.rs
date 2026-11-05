@@ -75,6 +75,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::SetLen,
             Operation::SetDeleteOnClose,
             Operation::SetBasic,
+            Operation::Rename,
             Operation::Lock,
             Operation::Unlock,
             Operation::RollbackLock,
@@ -146,6 +147,12 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         )
         .await;
         through_gates(
+            fs.rename(&file, "directory\\renamed", false, &context),
+            &control,
+            Operation::Rename,
+        )
+        .await;
+        through_gates(
             fs.set_delete_on_close(&file, true, &context),
             &control,
             Operation::SetDeleteOnClose,
@@ -154,6 +161,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         let metadata =
             through_gates(fs.metadata(&file, &context), &control, Operation::Metadata).await;
         assert_eq!(metadata.size, 3);
+        assert_eq!(metadata.name, "renamed");
         assert_eq!(metadata.written, 30);
         assert!(metadata.delete_pending);
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
@@ -192,14 +200,14 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             through_gates(fs.list(&directory, &context), &control, Operation::List)
                 .await
                 .iter()
-                .any(|entry| entry.name == "file")
+                .any(|entry| entry.name == "renamed")
         );
         through_gates(fs.close(&file, &context), &control, Operation::Close).await;
         assert!(
             !through_gates(fs.list(&directory, &context), &control, Operation::List)
                 .await
                 .iter()
-                .any(|entry| entry.name == "file")
+                .any(|entry| entry.name == "renamed")
         );
         through_gates(fs.close(&directory, &context), &control, Operation::Close).await;
         assert_eq!(inspect_text("opens", &memory).await, "0");

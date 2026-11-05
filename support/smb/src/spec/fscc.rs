@@ -44,6 +44,7 @@ open_enum! {
         STANDARD = 5,
         INTERNAL = 6,
         NAME = 9,
+        RENAME = 10,
         NAMES = 12,
         DISPOSITION = 13,
         POSITION = 14,
@@ -120,6 +121,8 @@ pub const FILE_DEVICE_DISK: u32 = 0x00000007;
 pub const DIRECTORY_ALIGNMENT: usize = 8;
 /// ShortName contains at most twelve UTF-16 code units: [MS-FSCC] §2.4.8.
 pub const SHORT_NAME_CAPACITY: usize = 12;
+/// Maximum pathname length in UTF-16 code units: [MS-FSCC] §2.1.5.
+pub const MAX_PATH_LENGTH: usize = 32_760;
 /// Leave a timestamp unchanged: [MS-FSCC] §2.4.7.
 pub const TIME_UNCHANGED: i64 = 0;
 /// Suppress automatic timestamp updates on this open: [MS-FSA] §2.1.5.15.2.
@@ -172,6 +175,18 @@ wire!(
 wire!(
     /// FileDispositionInformation: [MS-FSCC] §2.4.11.
     FileDispositionInformation, 1 { delete_pending: u8 }
+);
+/// Minimum complete FILE_RENAME_INFORMATION_TYPE_2 size: [MS-FSCC] §2.4.42.2.
+pub const FILE_RENAME_INFORMATION_MIN_SIZE: usize = 24;
+wire!(
+    /// FILE_RENAME_INFORMATION_TYPE_2 prefix; UTF-16LE name and padding follow:
+    /// [MS-FSCC] §2.4.42.2.
+    FileRenameInformation, 20 {
+        replace_if_exists: u8,
+        reserved: [u8; 7],
+        root_directory: U64,
+        file_name_length: U32,
+    }
 );
 wire!(
     /// FileAllInformation fixed prefix: [MS-FSCC] §2.4.2.

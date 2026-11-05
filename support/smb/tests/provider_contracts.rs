@@ -26,6 +26,7 @@ impl Fixture for MemoryFixture {
     fn expectations(&self) -> Expectations {
         Expectations {
             basic_information: Feature::Supported,
+            rename: Feature::Supported,
             locks: Feature::Supported,
             notifications: Feature::Supported,
         }
@@ -47,7 +48,12 @@ struct ControlledFixture {
 impl ControlledFixture {
     fn rejecting() -> Self {
         let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 32));
-        for operation in [Operation::SetBasic, Operation::Lock, Operation::Notify] {
+        for operation in [
+            Operation::SetBasic,
+            Operation::Rename,
+            Operation::Lock,
+            Operation::Notify,
+        ] {
             control
                 .set_plan(
                     operation,
@@ -63,6 +69,7 @@ impl ControlledFixture {
             control,
             expectations: Expectations {
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
+                rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
                 notifications: Feature::Unsupported(Status::NOT_SUPPORTED),
             },
@@ -148,6 +155,13 @@ fn declared_unsupported_notifications_are_exercised() {
 }
 
 #[test]
+fn declared_unsupported_rename_is_exercised() {
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::rename_identity(&fixture));
+    fixture.assert_rejected(&[Operation::Rename]);
+}
+
+#[test]
 fn exported_data_contract_accepts_real_short_transfers() {
     let fixture = ControlledFixture::rejecting();
     for operation in [Operation::Read, Operation::Write] {
@@ -190,6 +204,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
         control,
         expectations: Expectations {
             basic_information: Feature::Supported,
+            rename: Feature::Supported,
             locks: Feature::Supported,
             notifications: Feature::Supported,
         },

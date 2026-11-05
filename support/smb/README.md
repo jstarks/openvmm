@@ -28,6 +28,7 @@ cargo nextest run --profile agent -p smb --features test-support --run-ignored o
     -E 'test(samba_gated_async_compounds)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_notify)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lock)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_rename)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
     -E 'test(samba_notify_corrected_client)'
@@ -49,6 +50,9 @@ handle permissions, and excluding changes to the watched directory itself.
 The lock harness runs seventeen cases covering shared/exclusive I/O enforcement,
 conflicts, pending acquisition, exact unlocks, stacking, zero-length/64-bit
 ranges, cross-connection ownership, arrays, and truncation.
+The rename harness covers seven cases: simple, modification-time preservation,
+missing DELETE access, source sharing, destination-directory sharing, and
+rejecting directory renames with open descendants.
 `SMBTORTURE` selects the executable for every harness; otherwise they use
 `smbtorture` from PATH. The corrected-client harness requires that variable
 explicitly and adds ten notify cases: tcon, dir, tdis, double, tcp, overflow,
@@ -71,7 +75,7 @@ Provider crates should enable that feature as a dev-dependency, implement
 `contracts::Fixture`, and register the same scenario functions as separate
 tests on their own executor. Each invocation needs a fresh, empty, isolated,
 writable filesystem; the fixture owns any native driver and temporary resources.
-Declare basic-information, locking, and notification expectations explicitly.
+Declare basic-information, rename, locking, and notification expectations explicitly.
 Unexpected unsupported errors fail; an unsupported profile exercises rejection
 rather than silently skipping a test. These are test expectations, not runtime
 SMB capability advertisement. Read-only providers will need separate scenarios
@@ -89,7 +93,8 @@ Their controlled wrappers validate the test infrastructure, not native I/O.
 
 The common cases check observable data and stable identity, directory listings,
 zero extension/truncation, bilateral sharing and close/drop release, basic DOS
-attributes, lock conflicts/I/O enforcement/waits/rollback, and watch policy,
+attributes, rename identity/replacement/sharing/notifications,
+lock conflicts/I/O enforcement/waits/rollback, and watch policy,
 buffering/FIFO/cancellation/subtrees/deletion generations. They permit genuine
 short transfers and do not prescribe exact quotas, short names, or clock
 precision. Keep provider-specific tests for those policies, native completion
@@ -270,11 +275,47 @@ sending an asynchronous CANCEL. The ten-case harness above requires that fix;
 our server does not weaken cancellation identity matching. Reference comparisons
 with the corrected client pass in all three signing profiles.
 
-Broader probes still have limits: mask-change and recursive fixtures need rename,
-tree uses dot-component paths rejected by the current namespace policy, and
+Broader probes still have limits: mask-change and recursive (`rec`) fixtures now
+pass their rename operations but fail later while deleting a directory containing
+a delete-pending child with an older open handle. The memory provider still
+counts that retained child when checking emptiness. These are failed probes,
+not passing coverage, and require separate deleted-entry/lifetime work.
+Tree uses dot-component paths rejected by the current namespace policy, and
 valid-req assumes specific native event batching and notification-buffer policy.
-The slow mask probe passes but permits cancellation for many subcases; it is not
-evidence that unimplemented rename operations work.
+The slow mask probe permits cancellation for many subcases and does not establish
+complete notification compatibility.
+
+## Rename and Move
+
+SET_INFO FileRenameInformation follows MS-FSCC section 2.4.42.2 and MS-FSA
+section 2.1.5.15.12. Its typed prefix is 20 bytes; the complete input must be
+at least 24 bytes. Reserved bytes and padding are ignored, the UTF-16 name is
+length-bounded, RootDirectory must be zero, and destinations are share-relative.
+DELETE access is checked by the engine before calling the provider. Extended
+rename flags, hard links and stream rename remain unsupported.
+
+The provider atomically validates and updates the namespace, preserving the
+source's data, identity, opens, and byte-range locks. Existing target names
+require replacement permission; open targets, directory targets, readonly
+targets, and directory sources with open descendants are denied. Destination
+directory sharing is enforced, cycles are rejected, and an exact self-rename
+is a no-op. The memory namespace keeps its existing ASCII-insensitive lookup
+and dot-component rejection policy.
+
+Same-directory changes report old/new name pairs; moves report removal/addition.
+An exact-case replacement reports source removal and destination metadata change,
+whereas a differently cased replacement also reports removal of the old target
+name. Records are buffered under the namespace lock before waking observers,
+including recursive watches and undersized-buffer retry. A watch on the renamed
+directory itself stays registered. SET_INFO retains its ordinary I/O barrier;
+CLOSE still cancels/drains pending operations and preserves already obtained
+rename results rather than relabeling committed effects as cancelled.
+
+The shared provider suite covers identity, moves, replacement failures, sharing,
+closed subtrees and notification filtering. Wire tests additionally cover malformed
+fields, independent literal layouts, related compounds, pending watches, and
+before/after-effect cancellation. Provider-specific tests retain quota checks.
+The selected Samba cases do not claim the entire rename or notify suite passes.
 
 ## Byte-Range Locks
 
@@ -313,8 +354,9 @@ quotas, literal wire fields, compound boundaries, and paused TCP delivery.
 Clean TCP EOF now requests cancellation and closes provider opens after accepted
 work drains, independently of transmitting remaining replies. Existing replies
 are still delivered to a half-closed peer; a malformed/truncated transport
-discards them. Broader teardown policy, including saturated publication/output
-queues and failed/uncancellable cleanup, remains under discussion.
+discards them. The explicit cancel-and-drain teardown contract is unchanged;
+uncancellable operations can delay cleanup, and saturated clean-EOF publication
+remains a known limitation.
 
 ## Controlled Provider Tests
 

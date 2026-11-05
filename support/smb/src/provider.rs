@@ -284,6 +284,20 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         info: BasicInformation,
         request: &RequestContext,
     ) -> Result<(), Status>;
+    /// Rename this open's object to a share-root-relative name (MS-FSA §2.1.5.15.12).
+    /// The caller checks DELETE access. Preserve object identity, data, locks and
+    /// existing source opens; enforce destination sharing and replacement rules.
+    /// Deny replacement of an open target and directory renames with open descendants.
+    /// Namespace changes and their ordered notifications must be atomic to observers.
+    async fn rename(
+        &self,
+        _file: &Self::File,
+        _name: &str,
+        _replace: bool,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
     /// Acquire a byte-range lock owned by this open (MS-FSA §2.1.5.8).
     /// Conflicts and read/write enforcement span all opens/connections to the stream.
     /// Shared locks block all writes; exclusive locks permit the owner's I/O.

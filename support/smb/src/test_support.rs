@@ -44,7 +44,7 @@ pub enum Operation {
     List,
     /// Length change.
     SetLen,
-    /// Delete-on-close change.
+    /// Shared delete-disposition change.
     SetDeleteOnClose,
     /// Basic metadata change.
     SetBasic,

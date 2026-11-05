@@ -673,7 +673,7 @@ pub async fn sharing_and_handle_release<F: Fixture>(fixture: &F) {
     fs.close(&writer, &request).await.unwrap();
 }
 
-/// Delete disposition can be cleared; committed deletion waits for the last
+/// Delete disposition can be cleared; pending deletion waits for the last
 /// settled close. An initially delete-on-close open also removes its object.
 pub async fn delete_on_close<F: Fixture>(fixture: &F) {
     let fs = fixture.filesystem();
@@ -720,6 +720,207 @@ pub async fn delete_on_close<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// CREATE's delete-on-close mode is per-open and applied at close, not an
+/// immediate shared disposition. A remaining open can clear the pending link.
+pub async fn delete_mode_is_deferred_to_close<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let mut mode = options(CreateDisposition::CREATE, false);
+    mode.options = CreateOptions::new().with_delete_on_close(true).into_bits();
+    let (first, _) = fs.open("mode", mode, &request).await.unwrap();
+    assert!(!fs.metadata(&first, &request).await.unwrap().delete_pending);
+    let peer = open(fs, "mode", CreateDisposition::OPEN, false, &request).await;
+    write_all(fs, &first, 0, b"retained", &request).await;
+    fs.set_delete_on_close(&peer, false, &request)
+        .await
+        .unwrap();
+    fs.set_delete_on_close(&first, false, &request)
+        .await
+        .unwrap();
+    fs.close(&first, &request).await.unwrap();
+    assert!(fs.metadata(&peer, &request).await.unwrap().delete_pending);
+    rejected(
+        fs.open("mode", options(CreateDisposition::OPEN, false), &request)
+            .await,
+        Status::DELETE_PENDING,
+    );
+    assert_eq!(read_bytes(fs, &peer, 0, 8, &request).await, b"retained");
+    fs.set_delete_on_close(&peer, false, &request)
+        .await
+        .unwrap();
+    assert!(!fs.metadata(&peer, &request).await.unwrap().delete_pending);
+    let reopened = open(fs, "mode", CreateDisposition::OPEN, false, &request).await;
+    fs.close(&peer, &request).await.unwrap();
+    fs.close(&reopened, &request).await.unwrap();
+    let preserved = open(fs, "mode", CreateDisposition::OPEN, false, &request).await;
+    assert_eq!(
+        read_bytes(fs, &preserved, 0, 8, &request).await,
+        b"retained"
+    );
+    fs.close(&preserved, &request).await.unwrap();
+
+    let first = open(
+        fs,
+        "disposition",
+        CreateDisposition::CREATE,
+        false,
+        &request,
+    )
+    .await;
+    let peer = open(fs, "disposition", CreateDisposition::OPEN, false, &request).await;
+    fs.set_delete_on_close(&first, true, &request)
+        .await
+        .unwrap();
+    fs.set_delete_on_close(&peer, false, &request)
+        .await
+        .unwrap();
+    fs.close(&first, &request).await.unwrap();
+    assert!(!fs.metadata(&peer, &request).await.unwrap().delete_pending);
+    let reopened = open(fs, "disposition", CreateDisposition::OPEN, false, &request).await;
+    fs.close(&peer, &request).await.unwrap();
+    fs.close(&reopened, &request).await.unwrap();
+}
+
+/// Nonempty directories accept CREATE delete-on-close mode but are not deleted
+/// on that close. Pending children still block explicit delete disposition.
+pub async fn directory_delete_mode_checks_emptiness_at_close<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    for child_directory in [false, true] {
+        let parent = open(fs, "parent", CreateDisposition::CREATE, true, &request).await;
+        let child = open(
+            fs,
+            "parent\\child",
+            CreateDisposition::CREATE,
+            child_directory,
+            &request,
+        )
+        .await;
+        if !child_directory {
+            write_all(fs, &child, 0, b"retained", &request).await;
+        }
+        let deleting = open(
+            fs,
+            "parent\\child",
+            CreateDisposition::OPEN,
+            child_directory,
+            &request,
+        )
+        .await;
+        fs.set_delete_on_close(&deleting, true, &request)
+            .await
+            .unwrap();
+        fs.close(&deleting, &request).await.unwrap();
+        rejected(
+            fs.set_delete_on_close(&parent, true, &request).await,
+            Status::DIRECTORY_NOT_EMPTY,
+        );
+        let mut mode = options(CreateDisposition::OPEN, true);
+        mode.options = CreateOptions::from_bits(mode.options)
+            .with_delete_on_close(true)
+            .into_bits();
+        let (attempt, _) = fs.open("parent", mode, &request).await.unwrap();
+        assert!(
+            !fs.metadata(&attempt, &request)
+                .await
+                .unwrap()
+                .delete_pending
+        );
+        fs.close(&attempt, &request).await.unwrap();
+        assert!(!fs.metadata(&parent, &request).await.unwrap().delete_pending);
+        assert!(fs.metadata(&child, &request).await.unwrap().delete_pending);
+        if !child_directory {
+            assert_eq!(read_bytes(fs, &child, 0, 8, &request).await, b"retained");
+        }
+        fs.close(&child, &request).await.unwrap();
+        let preserved = open(fs, "parent", CreateDisposition::OPEN, true, &request).await;
+        fs.close(&preserved, &request).await.unwrap();
+        fs.close(&parent, &request).await.unwrap();
+        let (last, _) = fs.open("parent", mode, &request).await.unwrap();
+        fs.close(&last, &request).await.unwrap();
+        rejected(
+            fs.open("parent", options(CreateDisposition::OPEN, true), &request)
+                .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+    }
+
+    let mut mode = options(CreateDisposition::CREATE, true);
+    mode.options = CreateOptions::from_bits(mode.options)
+        .with_delete_on_close(true)
+        .into_bits();
+    let (growing, _) = fs.open("growing", mode, &request).await.unwrap();
+    let child = open(
+        fs,
+        "growing\\live",
+        CreateDisposition::CREATE,
+        false,
+        &request,
+    )
+    .await;
+    fs.close(&growing, &request).await.unwrap();
+    fs.close(&child, &request).await.unwrap();
+    let preserved = open(fs, "growing", CreateDisposition::OPEN, true, &request).await;
+    assert!(
+        !fs.metadata(&preserved, &request)
+            .await
+            .unwrap()
+            .delete_pending
+    );
+    fs.close(&preserved, &request).await.unwrap();
+}
+
+/// A nonempty directory's deferred-delete close must not invalidate another
+/// open's watch. Only an actual deletion disposition does that.
+pub async fn notify_nonempty_delete_mode_preserves_watch<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let directory = open(fs, "watch", CreateDisposition::CREATE, true, &request).await;
+    let child = open(
+        fs,
+        "watch\\existing",
+        CreateDisposition::CREATE,
+        false,
+        &request,
+    )
+    .await;
+    if let Some(status) = unsupported(fixture.expectations().notifications) {
+        rejected_notify(fs, &directory, status, &request).await;
+    } else {
+        let added;
+        {
+            let waiting = RequestContext::new(2);
+            let mut work =
+                std::pin::pin!(fs.notify(&directory, file_names(), false, 4096, &waiting));
+            pending(fixture, Operation::Notify, &waiting, work.as_mut()).await;
+            let mut mode = options(CreateDisposition::OPEN, true);
+            mode.options = CreateOptions::from_bits(mode.options)
+                .with_delete_on_close(true)
+                .into_bits();
+            let (attempt, _) = fs.open("watch", mode, &request).await.unwrap();
+            rejected(
+                fs.notify(&attempt, file_names(), false, 4096, &request)
+                    .await,
+                Status::DELETE_PENDING,
+            );
+            fs.close(&attempt, &request).await.unwrap();
+            assert!(futures::poll!(&mut work).is_pending());
+            added = open(
+                fs,
+                "watch\\added",
+                CreateDisposition::CREATE,
+                false,
+                &request,
+            )
+            .await;
+            changes(work.await.unwrap(), &[(NotifyAction::ADDED, "added")]);
+        }
+        fs.close(&added, &request).await.unwrap();
+    }
+    fs.close(&child, &request).await.unwrap();
+    fs.close(&directory, &request).await.unwrap();
 }
 
 /// Basic attribute updates are observable and do not alter identity or length.

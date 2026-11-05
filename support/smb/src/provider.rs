@@ -82,7 +82,8 @@ pub struct Metadata {
     pub changed: u64,
     /// Logical length of the default data stream.
     pub size: u64,
-    /// Whether deletion is pending.
+    /// Whether the shared delete disposition is set, excluding CREATE's
+    /// deferred per-open delete mode (MS-FSA §2.1.5.12.27).
     pub delete_pending: bool,
     /// Maximal access for the share's established identity, not the current open.
     pub maximal_access: u32,
@@ -270,7 +271,8 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         length: u64,
         request: &RequestContext,
     ) -> Result<(), Status>;
-    /// Set or clear delete-on-close on an open object.
+    /// Set or clear the object's shared delete disposition through this open.
+    /// This does not change CREATE's per-open FILE_DELETE_ON_CLOSE mode.
     async fn set_delete_on_close(
         &self,
         file: &Self::File,

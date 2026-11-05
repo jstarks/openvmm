@@ -35,14 +35,13 @@ struct Node {
     metadata: Metadata,
     parent: u64,
     data: Vec<u8>,
-    delete_committed: bool,
 }
 
 struct Open {
     node: u64,
     access: u32,
     sharing: u32,
-    delete: bool,
+    delete_on_close: bool,
     user_set_access_time: bool,
     user_set_write_time: bool,
     user_set_change_time: bool,
@@ -242,7 +241,6 @@ impl MemoryFs {
             },
             parent: 1,
             data: Vec::new(),
-            delete_committed: false,
         };
         Self(Arc::new(Mutex::new(State {
             nodes: BTreeMap::from([(1, root)]),
@@ -290,6 +288,14 @@ fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
         (id != 1 && node.parent == parent && node.metadata.name.eq_ignore_ascii_case(name))
             .then_some(id)
     })
+}
+
+fn has_children(state: &State, node: u64) -> bool {
+    // Pending links remain directory entries until their last open closes.
+    state
+        .nodes
+        .values()
+        .any(|child| child.parent == node && child.metadata.id != node)
 }
 
 fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
@@ -385,36 +391,33 @@ impl MemoryFile {
             state.watches -= 1;
         }
         state.locks.retain(|lock| lock.owner != self.open);
-        if let Some(node) = state.nodes.get_mut(&self.node) {
-            node.delete_committed |= open.delete;
+        let directory = state.nodes[&self.node].metadata.is_directory();
+        let empty = !directory || !has_children(&state, self.node);
+        // MS-FSA §2.1.5.5 phase 1 applies CREATE's mode at close. A nonempty
+        // directory is left intact; SET_INFO disposition is separate link state.
+        if open.delete_on_close && (!directory || empty) {
+            state
+                .nodes
+                .get_mut(&self.node)
+                .expect("open's node exists")
+                .metadata
+                .delete_pending = true;
+            if directory {
+                delete_watches(&mut state, self.node);
+            }
         }
-        if open.delete && state.nodes[&self.node].metadata.is_directory() {
-            delete_watches(&mut state, self.node);
-        }
-        let committed = state
-            .nodes
-            .get(&self.node)
-            .is_some_and(|n| n.delete_committed);
-        if committed {
-            if !state.opens.values().any(|o| o.node == self.node)
-                && !state
-                    .nodes
-                    .values()
-                    .any(|n| n.parent == self.node && n.metadata.id != self.node)
-            {
-                let directory = state
-                    .nodes
-                    .get(&self.node)
-                    .is_some_and(|node| node.metadata.is_directory());
-                emit(
-                    &mut state,
-                    self.node,
-                    NotifyAction::REMOVED,
-                    name_filter(directory),
-                );
-                if let Some(node) = state.nodes.remove(&self.node) {
-                    state.bytes -= node.data.len();
-                }
+        if state.nodes[&self.node].metadata.delete_pending
+            && !state.opens.values().any(|o| o.node == self.node)
+            && empty
+        {
+            emit(
+                &mut state,
+                self.node,
+                NotifyAction::REMOVED,
+                name_filter(directory),
+            );
+            if let Some(node) = state.nodes.remove(&self.node) {
+                state.bytes -= node.data.len();
             }
         }
         wake(state);
@@ -427,6 +430,14 @@ impl inspect::Inspect for MemoryFs {
         req.respond()
             .field("objects", state.nodes.len())
             .field("opens", state.opens.len())
+            .field(
+                "delete_on_close_opens",
+                state
+                    .opens
+                    .values()
+                    .filter(|open| open.delete_on_close)
+                    .count(),
+            )
             .field("bytes", state.bytes)
             .field("byte_limit", state.byte_limit)
             .field("object_limit", state.object_limit)
@@ -634,19 +645,12 @@ impl FileSystem for MemoryFs {
                     },
                     parent,
                     data: Vec::new(),
-                    delete_committed: false,
                 },
             );
             emit(&mut state, id, NotifyAction::ADDED, name_filter(directory));
             (id, CreateAction::CREATED.0)
         };
-        if delete
-            && (id == 1
-                || state
-                    .nodes
-                    .values()
-                    .any(|n| n.parent == id && n.metadata.id != id))
-        {
+        if delete && id == 1 {
             return Err(Status::DIRECTORY_NOT_EMPTY);
         }
         let open = state.next_open;
@@ -658,7 +662,7 @@ impl FileSystem for MemoryFs {
                 node: id,
                 access: options.access,
                 sharing: options.share_access,
-                delete,
+                delete_on_close: delete,
                 user_set_access_time: false,
                 user_set_write_time: false,
                 user_set_change_time: false,
@@ -666,14 +670,6 @@ impl FileSystem for MemoryFs {
                 watch: None,
             },
         );
-        if delete {
-            state
-                .nodes
-                .get_mut(&id)
-                .ok_or(Status::FILE_CLOSED)?
-                .metadata
-                .delete_pending = true;
-        }
         wake(state);
         Ok((
             MemoryFile {
@@ -1138,13 +1134,7 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<(), Status> {
         let mut state = self.0.lock();
-        if delete
-            && (file.node == 1
-                || state
-                    .nodes
-                    .values()
-                    .any(|n| n.parent == file.node && n.metadata.id != file.node))
-        {
+        if delete && (file.node == 1 || has_children(&state, file.node)) {
             return Err(Status::DIRECTORY_NOT_EMPTY);
         }
         let directory = state
@@ -1154,17 +1144,12 @@ impl FileSystem for MemoryFs {
             .metadata
             .is_directory();
         let open = state.opens.get_mut(&file.open).ok_or(Status::FILE_CLOSED)?;
-        open.delete = delete;
         open.notify_deleted |= delete && directory;
         if delete && directory {
             delete_watches(&mut state, file.node);
         }
-        let pending = state
-            .opens
-            .values()
-            .any(|o| o.node == file.node && o.delete);
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-        node.metadata.delete_pending = node.delete_committed || pending;
+        node.metadata.delete_pending = delete;
         wake(state);
         Ok(())
     }
@@ -1428,6 +1413,21 @@ mod tests {
     #[test]
     fn contract_basic_information() {
         run_contract(contracts::basic_information);
+    }
+
+    #[test]
+    fn contract_delete_mode_is_deferred_to_close() {
+        run_contract(contracts::delete_mode_is_deferred_to_close);
+    }
+
+    #[test]
+    fn contract_directory_delete_mode_checks_emptiness_at_close() {
+        run_contract(contracts::directory_delete_mode_checks_emptiness_at_close);
+    }
+
+    #[test]
+    fn contract_notify_nonempty_delete_mode_preserves_watch() {
+        run_contract(contracts::notify_nonempty_delete_mode_preserves_watch);
     }
 
     #[test]

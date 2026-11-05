@@ -77,6 +77,7 @@ fn samba_notify_corrected_client() {
             "smb2.notify.rmdir2",
             "smb2.notify.rmdir3",
             "smb2.notify.rmdir4",
+            "smb2.notify.rec",
         ],
     );
 }

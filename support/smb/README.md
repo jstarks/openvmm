@@ -55,8 +55,8 @@ missing DELETE access, source sharing, destination-directory sharing, and
 rejecting directory renames with open descendants.
 `SMBTORTURE` selects the executable for every harness; otherwise they use
 `smbtorture` from PATH. The corrected-client harness requires that variable
-explicitly and adds ten notify cases: tcon, dir, tdis, double, tcp, overflow,
-and rmdir1-4. It uses ten operations because the directory fixture assumes that
+explicitly and adds eleven notify cases: tcon, dir, tdis, double, tcp, overflow,
+rmdir1-4, and rec. It uses ten operations because the directory fixture assumes that
 count and has a fixed 1000-byte output buffer.
 
 ### Direct Provider Contracts
@@ -94,6 +94,7 @@ Their controlled wrappers validate the test infrastructure, not native I/O.
 The common cases check observable data and stable identity, directory listings,
 zero extension/truncation, bilateral sharing and close/drop release, basic DOS
 attributes, rename identity/replacement/sharing/notifications,
+deferred delete modes versus shared disposition and nonempty-directory closes,
 lock conflicts/I/O enforcement/waits/rollback, and watch policy,
 buffering/FIFO/cancellation/subtrees/deletion generations. They permit genuine
 short transfers and do not prescribe exact quotas, short names, or clock
@@ -275,11 +276,9 @@ sending an asynchronous CANCEL. The ten-case harness above requires that fix;
 our server does not weaken cancellation identity matching. Reference comparisons
 with the corrected client pass in all three signing profiles.
 
-Broader probes still have limits: mask-change and recursive (`rec`) fixtures now
-pass their rename operations but fail later while deleting a directory containing
-a delete-pending child with an older open handle. The memory provider still
-counts that retained child when checking emptiness. These are failed probes,
-not passing coverage, and require separate deleted-entry/lifetime work.
+The recursive (`rec`) fixture now passes. The mask-change probe gets past its
+former deletion failure but still waits for separate attribute notifications;
+it is not counted as passing coverage.
 Tree uses dot-component paths rejected by the current namespace policy, and
 valid-req assumes specific native event batching and notification-buffer policy.
 The slow mask probe permits cancellation for many subcases and does not establish
@@ -316,6 +315,28 @@ closed subtrees and notification filtering. Wire tests additionally cover malfor
 fields, independent literal layouts, related compounds, pending watches, and
 before/after-effect cancellation. Provider-specific tests retain quota checks.
 The selected Samba cases do not claim the entire rename or notify suite passes.
+
+## Delete Mode and Disposition
+
+MS-FSA sections 2.1.5.5 and 2.1.5.15.3 distinguish CREATE's per-open
+FILE_DELETE_ON_CLOSE mode from the link's shared delete disposition.
+Mode alone does not set Metadata.delete_pending or block other opens.
+At close it marks a file deleted, or marks a directory deleted only if empty
+at that time. Opening a nonempty directory with this mode is allowed; closing
+it leaves that directory intact rather than returning DIRECTORY_NOT_EMPTY.
+A directory may also gain children after a mode-bearing open.
+
+Explicit disposition remains shared, reversible through another open, and
+rejects nonempty directories. Pending child links still count as directory
+entries until their last open closes. A retained handle can continue using
+the object and clear its disposition; there is no separate irreversible
+"committed delete" flag. Clearing disposition does not clear an open's mode.
+Links, data, and quota are released only at actual final deletion.
+
+A mode-bearing directory open has its own notify-deleted marker, but closing
+it while nonempty must not invalidate watches on other opens. The inspector
+reports delete_on_close_opens separately from node delete_pending state.
+The frontend's CLOSE cancellation and draining behavior is unchanged.
 
 ## Byte-Range Locks
 

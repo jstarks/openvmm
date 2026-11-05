@@ -3,7 +3,11 @@
 
 //! Resumable Direct TCP framing and a controllable loopback test server.
 
-use crate::{Connection, Error, MAX_REQUESTS, protocol, provider::FileSystem};
+use crate::spec::{
+    Command, HEADER_SIZE, Header,
+    tcp::{DirectTcpHeader, SESSION_MESSAGE},
+};
+use crate::{Connection, Error, MAX_MESSAGE_SIZE, MAX_REQUESTS, provider::FileSystem};
 use futures::{AsyncRead, AsyncWrite, FutureExt, Stream};
 use inspect::Inspect;
 use pal_async::{DefaultDriver, socket::PolledSocket};
@@ -15,6 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use task_control::{AsyncRun, Cancelled, InspectTask, StopTask, TaskControl};
 use unicycle::FuturesUnordered;
+use zerocopy::{FromBytes, IntoBytes};
 
 type Operation = Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send>>;
 
@@ -30,7 +35,7 @@ struct Response {
 pub struct ConnectionTask<B: FileSystem, S> {
     connection: Connection<B>,
     stream: S,
-    prefix: [u8; 4],
+    prefix: [u8; size_of::<DirectTcpHeader>()],
     prefix_len: usize,
     packet: Vec<u8>,
     packet_len: usize,
@@ -48,7 +53,7 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
         Self {
             connection,
             stream,
-            prefix: [0; 4],
+            prefix: [0; size_of::<DirectTcpHeader>()],
             prefix_len: 0,
             packet: Vec::new(),
             packet_len: 0,
@@ -77,14 +82,16 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
         }
     }
 
-    fn response(&mut self, bytes: Vec<u8>) {
-        let mut frame = Vec::with_capacity(bytes.len() + 4);
-        frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    fn response(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
+        let header = DirectTcpHeader::new(bytes.len()).ok_or(Error::InvalidFrame)?;
+        let mut frame = Vec::with_capacity(bytes.len() + size_of::<DirectTcpHeader>());
+        frame.extend_from_slice(header.as_bytes());
         frame.extend_from_slice(&bytes);
         self.responses.push_back(Response {
             bytes: frame,
             offset: 0,
         });
+        Ok(())
     }
 
     /// Destructive shutdown does not wait for a client to read responses.
@@ -115,7 +122,7 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
 
 impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
     fn read_step(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if self.prefix_len != 4 {
+        if self.prefix_len != self.prefix.len() {
             let count = std::task::ready!(
                 Pin::new(&mut self.stream).poll_read(cx, &mut self.prefix[self.prefix_len..])
             )?;
@@ -127,10 +134,12 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
                 return Poll::Ready(Ok(()));
             }
             self.prefix_len += count;
-            if self.prefix_len == 4 {
-                let length = u32::from_be_bytes(self.prefix) as usize;
-                if self.prefix[0] != 0
-                    || !(protocol::HEADER_SIZE..=protocol::MAX_MESSAGE_SIZE).contains(&length)
+            if self.prefix_len == self.prefix.len() {
+                let header = DirectTcpHeader::read_from_bytes(&self.prefix)
+                    .map_err(|_| Error::InvalidFrame)?;
+                let length = header.length();
+                if header.message_type != SESSION_MESSAGE
+                    || !(HEADER_SIZE..=MAX_MESSAGE_SIZE).contains(&length)
                 {
                     return Poll::Ready(Err(Error::InvalidFrame));
                 }
@@ -149,8 +158,10 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
             self.packet_len += count;
             return Poll::Ready(Ok(()));
         }
-        let command = u16::from_le_bytes([self.packet[12], self.packet[13]]);
-        if command == protocol::Command::CANCEL.0 {
+        let header = Header::read_from_prefix(&self.packet)
+            .map_err(|_| Error::InvalidHeader)?
+            .0;
+        if header.command() == Command::CANCEL {
             self.connection.cancel(&self.packet)?;
         } else {
             // Leave room to receive CANCEL even when every operation slot is used.
@@ -193,7 +204,11 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
             let mut progress = false;
             if let Poll::Ready(Some(result)) = Pin::new(&mut self.requests).poll_next(cx) {
                 match result {
-                    Ok(response) if self.failure.is_none() => self.response(response),
+                    Ok(response) if self.failure.is_none() => {
+                        if let Err(error) = self.response(response) {
+                            self.disconnect(Some(error));
+                        }
+                    }
                     Ok(_) => {}
                     Err(error) => self.disconnect(Some(error)),
                 }

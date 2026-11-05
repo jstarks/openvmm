@@ -10,21 +10,25 @@
 
 #![forbid(unsafe_code)]
 
+mod codec;
 pub mod memory;
-pub mod protocol;
 pub mod provider;
+pub mod spec;
 pub mod tcp;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
+use codec::*;
 use event_listener::Event;
 use inspect::Inspect;
 use parking_lot::Mutex;
-use protocol::*;
-use provider::{FileSystem, Metadata, OpenOptions, RequestContext, map_access};
+use provider::{BasicInformation, FileSystem, Metadata, OpenOptions, RequestContext, map_access};
+use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use thiserror::Error;
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
 /// Failure that cannot be represented by a response to a valid SMB header.
 #[derive(Debug, Error)]
@@ -50,6 +54,12 @@ pub enum Error {
 }
 
 pub(crate) const MAX_REQUESTS: usize = 32;
+/// Implementation transfer bound, not a protocol maximum.
+pub const MAX_TRANSFER_SIZE: usize = 1024 * 1024;
+/// Implementation packet bound including fixed fields and context overhead.
+pub const MAX_MESSAGE_SIZE: usize = MAX_TRANSFER_SIZE + 1024;
+const MAX_TREES: usize = 1024;
+const MAX_OPENS: usize = 1024;
 
 /// Shared configuration and object store for one share.
 pub struct Server<B: FileSystem> {
@@ -109,7 +119,7 @@ impl<B: FileSystem> Server<B> {
 struct OpenFile<F> {
     file: F,
     identity: u64,
-    access: u32,
+    access: AccessMask,
     tree: u32,
     position: u64,
     directory: Mutex<Option<(Vec<Metadata>, usize)>>,
@@ -217,7 +227,7 @@ impl<F> Inspect for OpenFile<F> {
     fn inspect(&self, req: inspect::Request<'_>) {
         req.respond()
             .field("identity", self.identity)
-            .hex("access", self.access)
+            .hex("access", self.access.into_bits())
             .field("tree", self.tree)
             .field("closing", self.closing.load(Ordering::Acquire))
             .field("closed", self.closed.load(Ordering::Acquire))
@@ -301,50 +311,92 @@ impl<B: FileSystem> Drop for Request<B> {
     }
 }
 
-fn read_body<T: FromBytes + IntoBytes + KnownLayout + Immutable>(
-    packet: &[u8],
-    size: u16,
-) -> Result<T, Status> {
-    decode(
-        packet.get(HEADER_SIZE..).ok_or(Status::INVALID_PARAMETER)?,
-        size,
-    )
-}
-
-fn variable(packet: &[u8], offset: usize, length: usize, fixed: usize) -> Result<&[u8], Status> {
-    field(packet, offset, length, HEADER_SIZE + fixed)
-}
-
-fn u32_bytes(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn u64_bytes(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn basic_info(info: &Metadata) -> Vec<u8> {
-    let mut out = Vec::with_capacity(40);
-    for time in [info.created, info.accessed, info.written, info.changed] {
-        u64_bytes(&mut out, time);
+fn basic_info(info: &Metadata) -> FileBasicInformation {
+    FileBasicInformation {
+        creation_time: (info.created as i64).into(),
+        last_access_time: (info.accessed as i64).into(),
+        last_write_time: (info.written as i64).into(),
+        change_time: (info.changed as i64).into(),
+        file_attributes: info.attributes.into(),
+        reserved: 0.into(),
     }
-    u32_bytes(&mut out, info.attributes);
-    u32_bytes(&mut out, 0);
-    out
 }
 
-fn standard_info(info: &Metadata) -> Vec<u8> {
-    let mut out = Vec::with_capacity(24);
-    u64_bytes(&mut out, info.size);
-    u64_bytes(&mut out, info.size);
-    u32_bytes(&mut out, 1);
-    out.extend_from_slice(&[
-        u8::from(info.delete_pending),
-        u8::from(info.is_directory()),
-        0,
-        0,
-    ]);
-    out
+fn standard_info(info: &Metadata) -> FileStandardInformation {
+    FileStandardInformation {
+        allocation_size: info.size.into(),
+        end_of_file: info.size.into(),
+        number_of_links: 1.into(),
+        delete_pending: u8::from(info.delete_pending),
+        directory: u8::from(info.is_directory()),
+        reserved: [0; 2],
+    }
+}
+
+fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<u8>, Status> {
+    let name = encode_name(&info.name);
+    let basic = basic_info(info);
+    let header = DirectoryEntryHeader::new_zeroed();
+    let directory = FileDirectoryInformation {
+        header,
+        creation_time: basic.creation_time,
+        last_access_time: basic.last_access_time,
+        last_write_time: basic.last_write_time,
+        change_time: basic.change_time,
+        end_of_file: info.size.into(),
+        allocation_size: info.size.into(),
+        file_attributes: info.attributes.into(),
+        file_name_length: (name.len() as u32).into(),
+    };
+    let full = FileFullDirectoryInformation {
+        directory,
+        ea_size: 0.into(),
+    };
+    let mut out = match class {
+        FileInformationClass::DIRECTORY => directory.as_bytes().to_vec(),
+        FileInformationClass::FULL_DIRECTORY => full.as_bytes().to_vec(),
+        FileInformationClass::ID_FULL_DIRECTORY => FileIdFullDirectoryInformation {
+            full,
+            reserved: 0.into(),
+            file_id: info.id.into(),
+        }
+        .as_bytes()
+        .to_vec(),
+        FileInformationClass::NAMES => FileNamesInformation {
+            header,
+            file_name_length: (name.len() as u32).into(),
+        }
+        .as_bytes()
+        .to_vec(),
+        FileInformationClass::BOTH_DIRECTORY | FileInformationClass::ID_BOTH_DIRECTORY => {
+            let mut short_name = DirectoryShortName::new_zeroed();
+            if let Some(name) = &info.short_name {
+                let units: Vec<_> = name.encode_utf16().collect();
+                if units.len() > SHORT_NAME_CAPACITY {
+                    return Err(Status::INTERNAL_ERROR);
+                }
+                short_name.length = (units.len() * size_of::<zerocopy::little_endian::U16>()) as u8;
+                for (target, unit) in short_name.name.iter_mut().zip(units) {
+                    *target = unit.into();
+                }
+            }
+            let both = FileBothDirectoryInformation { full, short_name };
+            if class == FileInformationClass::BOTH_DIRECTORY {
+                both.as_bytes().to_vec()
+            } else {
+                FileIdBothDirectoryInformation {
+                    both,
+                    reserved: 0.into(),
+                    file_id: info.id.into(),
+                }
+                .as_bytes()
+                .to_vec()
+            }
+        }
+        _ => return Err(Status::NOT_SUPPORTED),
+    };
+    out.extend_from_slice(&name);
+    Ok(out)
 }
 
 fn buffer_response(bytes: Vec<u8>, maximum: u32) -> Result<Vec<u8>, Status> {
@@ -352,8 +404,8 @@ fn buffer_response(bytes: Vec<u8>, maximum: u32) -> Result<Vec<u8>, Status> {
         return Err(Status::BUFFER_TOO_SMALL);
     }
     let mut out = BufferResponse {
-        structure_size: 9.into(),
-        output_buffer_offset: 72.into(),
+        structure_size: BufferResponse::STRUCTURE_SIZE.into(),
+        output_buffer_offset: (body_end::<BufferResponse>() as u16).into(),
         output_buffer_length: (bytes.len() as u32).into(),
     }
     .as_bytes()
@@ -374,13 +426,13 @@ impl<B: FileSystem> Connection<B> {
     /// Admit work synchronously, before polling its owned operation future.
     pub fn request(&self, packet: Vec<u8>) -> Result<Request<B>, Error> {
         let (header, _) = Header::read_from_prefix(&packet).map_err(|_| Error::InvalidHeader)?;
-        if header.protocol != *b"\xfeSMB"
-            || header.structure_size.get() != 64
-            || header.flags.get() & FLAG_SERVER_TO_REDIR != 0
+        if header.protocol != SIGNATURE
+            || header.structure_size.get() as usize != HEADER_SIZE
+            || header.flags.server_to_redir()
         {
             return Err(Error::InvalidHeader);
         }
-        let command = Command(header.command.get());
+        let command = header.command();
         if command == Command::CANCEL {
             return Err(Error::InvalidHeader);
         }
@@ -396,7 +448,9 @@ impl<B: FileSystem> Connection<B> {
         if packet.len() > MAX_MESSAGE_SIZE {
             error = Some(Status::INVALID_PARAMETER);
         } else if header.next_command.get() != 0
-            || header.flags.get() & (FLAG_ASYNC | FLAG_RELATED | FLAG_SIGNED) != 0
+            || header.flags.async_command()
+            || header.flags.related_operations()
+            || header.flags.signed()
         {
             error = Some(Status::NOT_SUPPORTED);
         } else if state.disconnected {
@@ -426,19 +480,16 @@ impl<B: FileSystem> Connection<B> {
         let mut retired = Vec::new();
         if error.is_none() {
             let file_id = match command {
-                Command::READ => read_body::<ReadRequest>(&packet, 49).map(|r| Some(r.file_id)),
-                Command::WRITE => read_body::<WriteRequest>(&packet, 49).map(|r| Some(r.file_id)),
-                Command::CLOSE | Command::FLUSH => {
-                    read_body::<CloseRequest>(&packet, 24).map(|r| Some(r.file_id))
-                }
+                Command::READ => read_body::<ReadRequest>(&packet).map(|r| Some(r.file_id)),
+                Command::WRITE => read_body::<WriteRequest>(&packet).map(|r| Some(r.file_id)),
+                Command::CLOSE => read_body::<CloseRequest>(&packet).map(|r| Some(r.file_id)),
+                Command::FLUSH => read_body::<FlushRequest>(&packet).map(|r| Some(r.file_id)),
                 Command::QUERY_INFO => {
-                    read_body::<QueryInfoRequest>(&packet, 41).map(|r| Some(r.file_id))
+                    read_body::<QueryInfoRequest>(&packet).map(|r| Some(r.file_id))
                 }
-                Command::SET_INFO => {
-                    read_body::<SetInfoRequest>(&packet, 33).map(|r| Some(r.file_id))
-                }
+                Command::SET_INFO => read_body::<SetInfoRequest>(&packet).map(|r| Some(r.file_id)),
                 Command::QUERY_DIRECTORY => {
-                    read_body::<QueryDirectoryRequest>(&packet, 33).map(|r| Some(r.file_id))
+                    read_body::<QueryDirectoryRequest>(&packet).map(|r| Some(r.file_id))
                 }
                 _ => Ok(None),
             };
@@ -476,7 +527,7 @@ impl<B: FileSystem> Connection<B> {
             }
         }
         if error.is_none() && matches!(command, Command::LOGOFF | Command::TREE_DISCONNECT) {
-            match read_body::<SimpleBody>(&packet, 4) {
+            match read_body::<SimpleBody>(&packet) {
                 Err(status) => error = Some(status),
                 Ok(_) => {
                     let tree = header.tree_id.get();
@@ -534,15 +585,16 @@ impl<B: FileSystem> Connection<B> {
     /// Expedite cancellation without consuming a credit or producing a reply.
     pub fn cancel(&self, packet: &[u8]) -> Result<(), Error> {
         let (header, _) = Header::read_from_prefix(packet).map_err(|_| Error::InvalidHeader)?;
-        if header.protocol != *b"\xfeSMB"
-            || header.structure_size.get() != 64
-            || Command(header.command.get()) != Command::CANCEL
-            || read_body::<SimpleBody>(packet, 4).is_err()
-            || header.flags.get() & (FLAG_SERVER_TO_REDIR | FLAG_SIGNED) != 0
+        if header.protocol != SIGNATURE
+            || header.structure_size.get() as usize != HEADER_SIZE
+            || header.command() != Command::CANCEL
+            || read_body::<SimpleBody>(packet).is_err()
+            || header.flags.server_to_redir()
+            || header.flags.signed()
         {
             return Err(Error::InvalidHeader);
         }
-        if header.flags.get() & FLAG_ASYNC == 0 {
+        if !header.flags.async_command() {
             if let Some(info) = self.state.lock().requests.get(&header.message_id.get()) {
                 if !matches!(
                     info.command,
@@ -649,7 +701,7 @@ impl<B: FileSystem> Request<B> {
     /// Run admitted work. Dropping this future is not a backend cancellation API.
     pub async fn execute(self) -> Result<Vec<u8>, Error> {
         let header = &self.header;
-        let command = Command(header.command.get());
+        let command = header.command();
         let packet = &self.packet;
         let connection = &self.connection;
         let result = if let Some(error) = self.error {
@@ -692,7 +744,7 @@ impl<B: FileSystem> Request<B> {
             Ok(response) => response,
             Err(status) => {
                 let mut body = ErrorResponse {
-                    structure_size: 9.into(),
+                    structure_size: ErrorResponse::STRUCTURE_SIZE.into(),
                     context_count: 0,
                     reserved: 0,
                     byte_count: 0.into(),
@@ -704,13 +756,13 @@ impl<B: FileSystem> Request<B> {
             }
         };
         let mut response = Header {
-            protocol: *b"\xfeSMB",
-            structure_size: 64.into(),
+            protocol: SIGNATURE,
+            structure_size: (HEADER_SIZE as u16).into(),
             credit_charge: header.credit_charge,
             status: status.0.into(),
             command: header.command,
             credits: 0.into(),
-            flags: FLAG_SERVER_TO_REDIR.into(),
+            flags: HeaderFlags::new().with_server_to_redir(true),
             next_command: 0.into(),
             message_id: header.message_id,
             process_id: header.process_id,
@@ -745,46 +797,66 @@ impl<B: FileSystem> Request<B> {
 
 impl<B: FileSystem> Connection<B> {
     fn session_setup(&self, header: &Header, packet: &[u8]) -> Result<(Status, Vec<u8>), Status> {
-        let request: SessionSetupRequest = read_body(packet, 25)?;
-        let token = variable(
+        let request: SessionSetupRequest = read_body(packet)?;
+        let token = variable::<SessionSetupRequest>(
             packet,
             request.security_buffer_offset.get() as usize,
             request.security_buffer_length.get() as usize,
-            24,
         )?;
         let mut state = self.state.lock();
-        if request.flags != 0 || request.security_mode & 2 != 0 || state.session_active {
+        if request.flags.into_bits() != 0
+            || request.security_mode.signing_required()
+            || state.session_active
+        {
             return Err(Status::NOT_SUPPORTED);
         }
         let mut security = Vec::new();
         let status;
         if token.is_empty() && state.session == 0 {
             status = Status::SUCCESS;
-        } else if token.starts_with(b"NTLMSSP\0") && token.len() >= 12 {
-            let message = u32::from_le_bytes(
-                token[8..12]
-                    .try_into()
-                    .map_err(|_| Status::INVALID_PARAMETER)?,
-            );
+        } else if token.starts_with(&ntlm::SIGNATURE)
+            && token.len() >= size_of::<ntlm::MessageHeader>()
+        {
+            let message = ntlm::MessageHeader::read_from_prefix(token)
+                .map_err(|_| Status::INVALID_PARAMETER)?
+                .0;
+            let message = ntlm::MessageType(message.message_type.get());
             match message {
-                1 if state.session == 0 => {
+                ntlm::MessageType::NEGOTIATE if state.session == 0 => {
                     // This is a guest-only test handshake, not credential verification.
-                    // MS-NLMP 2.2.1.2 defines the raw CHALLENGE_MESSAGE layout.
-                    security.extend_from_slice(b"NTLMSSP\0");
-                    u32_bytes(&mut security, 2);
-                    security.extend_from_slice(&[0; 4]);
-                    u32_bytes(&mut security, 48);
-                    u32_bytes(&mut security, 0x008a0205);
-                    security.extend_from_slice(&[0; 16]);
-                    security.extend_from_slice(&4u16.to_le_bytes());
-                    security.extend_from_slice(&4u16.to_le_bytes());
-                    u32_bytes(&mut security, 48);
-                    u32_bytes(&mut security, 0);
+                    let payload_offset = size_of::<ntlm::ChallengeMessage>() as u32;
+                    let mut challenge = ntlm::ChallengeMessage::new_zeroed();
+                    challenge.header = ntlm::MessageHeader {
+                        signature: ntlm::SIGNATURE,
+                        message_type: ntlm::MessageType::CHALLENGE.0.into(),
+                    };
+                    challenge.target_name.offset = payload_offset.into();
+                    challenge.negotiate_flags = ntlm::NegotiateFlags::new()
+                        .with_unicode(true)
+                        .with_request_target(true)
+                        .with_ntlm(true)
+                        .with_target_type_server(true)
+                        .with_extended_session_security(true)
+                        .with_target_info(true);
+                    challenge.target_info = ntlm::SecurityBuffer {
+                        length: (size_of::<ntlm::AvPair>() as u16).into(),
+                        maximum_length: (size_of::<ntlm::AvPair>() as u16).into(),
+                        offset: payload_offset.into(),
+                    };
+                    security.extend_from_slice(challenge.as_bytes());
+                    security.extend_from_slice(
+                        ntlm::AvPair {
+                            id: ntlm::MSV_AV_EOL.into(),
+                            length: 0.into(),
+                        }
+                        .as_bytes(),
+                    );
                     status = Status::MORE_PROCESSING_REQUIRED;
                 }
-                3 if state.session != 0
-                    && header.session_id.get() == state.session
-                    && token.len() >= 64 =>
+                ntlm::MessageType::AUTHENTICATE
+                    if state.session != 0
+                        && header.session_id.get() == state.session
+                        && token.len() >= size_of::<ntlm::AuthenticateMessage>() =>
                 {
                     status = Status::SUCCESS;
                 }
@@ -806,9 +878,13 @@ impl<B: FileSystem> Connection<B> {
             info.response_session = session;
         }
         let mut body = SessionSetupResponse {
-            structure_size: 9.into(),
-            session_flags: u16::from(state.session_active).into(),
-            security_buffer_offset: 72.into(),
+            structure_size: SessionSetupResponse::STRUCTURE_SIZE.into(),
+            session_flags: if state.session_active {
+                SESSION_FLAG_IS_GUEST.into()
+            } else {
+                0.into()
+            },
+            security_buffer_offset: (body_end::<SessionSetupResponse>() as u16).into(),
             security_buffer_length: (security.len() as u16).into(),
         }
         .as_bytes()
@@ -829,9 +905,9 @@ impl<B: FileSystem> Connection<B> {
             return self.negotiate(packet);
         }
         if command == Command::ECHO {
-            let _: SimpleBody = read_body(packet, 4)?;
+            let _: SimpleBody = read_body(packet)?;
             return Ok(SimpleBody {
-                structure_size: 4.into(),
+                structure_size: SimpleBody::STRUCTURE_SIZE.into(),
                 reserved: 0.into(),
             }
             .as_bytes()
@@ -842,19 +918,18 @@ impl<B: FileSystem> Connection<B> {
                 self.close_file(file, context).await?;
             }
             return Ok(SimpleBody {
-                structure_size: 4.into(),
+                structure_size: SimpleBody::STRUCTURE_SIZE.into(),
                 reserved: 0.into(),
             }
             .as_bytes()
             .to_vec());
         }
         if command == Command::TREE_CONNECT {
-            let request: TreeConnectRequest = read_body(packet, 9)?;
-            let path = decode_name(variable(
+            let request: TreeConnectRequest = read_body(packet)?;
+            let path = decode_name(variable::<TreeConnectRequest>(
                 packet,
                 request.path_offset.get() as usize,
                 request.path_length.get() as usize,
-                8,
             )?)?;
             let parts: Vec<_> = path.split('\\').filter(|s| !s.is_empty()).collect();
             if !path.starts_with("\\\\")
@@ -864,7 +939,7 @@ impl<B: FileSystem> Connection<B> {
                 return Err(Status::BAD_NETWORK_NAME);
             }
             let mut state = self.state.lock();
-            if state.trees.len() >= 1024 {
+            if state.trees.len() >= MAX_TREES {
                 return Err(Status::INSUFFICIENT_RESOURCES);
             }
             let next_tree = state
@@ -878,12 +953,12 @@ impl<B: FileSystem> Connection<B> {
                 info.response_tree = tree;
             }
             return Ok(TreeConnectResponse {
-                structure_size: 16.into(),
-                share_type: 1,
+                structure_size: TreeConnectResponse::STRUCTURE_SIZE.into(),
+                share_type: ShareType::DISK,
                 reserved: 0,
                 share_flags: 0.into(),
                 capabilities: 0.into(),
-                maximal_access: 0x1f01ff.into(),
+                maximal_access: AccessMask::FILE_ALL_ACCESS,
             }
             .as_bytes()
             .to_vec());
@@ -895,7 +970,7 @@ impl<B: FileSystem> Connection<B> {
                     self.close_file(file, context).await?;
                 }
                 Ok(SimpleBody {
-                    structure_size: 4.into(),
+                    structure_size: SimpleBody::STRUCTURE_SIZE.into(),
                     reserved: 0.into(),
                 }
                 .as_bytes()
@@ -906,10 +981,10 @@ impl<B: FileSystem> Connection<B> {
                     .await
             }
             Command::CLOSE => {
-                let request: CloseRequest = read_body(packet, 24)?;
+                let request: CloseRequest = read_body(packet)?;
                 let file = self.file(request.file_id, tree, context)?;
                 file.wait(context, true).await?;
-                let info = if request.flags.get() & 1 != 0 {
+                let info = if request.flags.postquery_attrib() {
                     // MS-SMB2 3.3.5.10 permits omitting unavailable optional attributes.
                     self.server.backend.metadata(&file.file, context).await.ok()
                 } else {
@@ -917,9 +992,9 @@ impl<B: FileSystem> Connection<B> {
                 };
                 self.close_file(&file, context).await?;
                 let mut response = CloseResponse::new_zeroed();
-                response.structure_size = 60.into();
+                response.structure_size = CloseResponse::STRUCTURE_SIZE.into();
                 if let Some(info) = info {
-                    response.flags = 1.into();
+                    response.flags = CloseFlags::new().with_postquery_attrib(true);
                     response.creation_time = info.created.into();
                     response.last_access_time = info.accessed.into();
                     response.last_write_time = info.written.into();
@@ -931,13 +1006,13 @@ impl<B: FileSystem> Connection<B> {
                 Ok(response.as_bytes().to_vec())
             }
             Command::FLUSH => {
-                let request: CloseRequest = read_body(packet, 24)?;
+                let request: FlushRequest = read_body(packet)?;
                 self.server
                     .backend
                     .flush(&self.file(request.file_id, tree, context)?.file, context)
                     .await?;
                 Ok(SimpleBody {
-                    structure_size: 4.into(),
+                    structure_size: SimpleBody::STRUCTURE_SIZE.into(),
                     reserved: 0.into(),
                 }
                 .as_bytes()
@@ -953,22 +1028,26 @@ impl<B: FileSystem> Connection<B> {
     }
 
     fn negotiate(&self, packet: &[u8]) -> Result<Vec<u8>, Status> {
-        let request: NegotiateRequest = read_body(packet, 36)?;
+        let request: NegotiateRequest = read_body(packet)?;
         let mut state = self.state.lock();
-        if state.negotiated || request.security_mode.get() & 2 != 0 {
+        if state.negotiated || request.security_mode.signing_required() {
             return Err(Status::NOT_SUPPORTED);
         }
-        let dialects = variable(packet, 100, request.dialect_count.get() as usize * 2, 36)?;
+        let dialects = variable::<NegotiateRequest>(
+            packet,
+            body_end::<NegotiateRequest>(),
+            request.dialect_count.get() as usize * size_of::<zerocopy::little_endian::U16>(),
+        )?;
         if !dialects
-            .chunks_exact(2)
+            .chunks_exact(size_of::<zerocopy::little_endian::U16>())
             .any(|p| u16::from_le_bytes([p[0], p[1]]) == DIALECT_210)
         {
             return Err(Status::NOT_SUPPORTED);
         }
         state.negotiated = true;
         Ok(NegotiateResponse {
-            structure_size: 65.into(),
-            security_mode: 1.into(),
+            structure_size: NegotiateResponse::STRUCTURE_SIZE.into(),
+            security_mode: SecurityMode::new().with_signing_enabled(true),
             dialect: DIALECT_210.into(),
             reserved: 0.into(),
             server_guid: self
@@ -977,13 +1056,13 @@ impl<B: FileSystem> Connection<B> {
                 .as_bytes()
                 .try_into()
                 .map_err(|_| Status::INVALID_PARAMETER)?,
-            capabilities: 4.into(),
+            capabilities: Capabilities::new().with_large_mtu(true),
             max_transact_size: (MAX_TRANSFER_SIZE as u32).into(),
             max_read_size: (MAX_TRANSFER_SIZE as u32).into(),
             max_write_size: (MAX_TRANSFER_SIZE as u32).into(),
             system_time: memory::nt_time().into(),
             server_start_time: 0.into(),
-            security_buffer_offset: 128.into(),
+            security_buffer_offset: (body_end::<NegotiateResponse>() as u16).into(),
             security_buffer_length: 0.into(),
             reserved2: 0.into(),
         }
@@ -998,39 +1077,102 @@ impl<B: FileSystem> Connection<B> {
         session: u64,
         context: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
-        let request: CreateRequest = read_body(packet, 57)?;
-        let name = decode_name(variable(
+        let request: CreateRequest = read_body(packet)?;
+        let name = decode_name(variable::<CreateRequest>(
             packet,
             request.name_offset.get() as usize,
             request.name_length.get() as usize,
-            56,
         )?)?;
-        variable(
+        let contexts = variable::<CreateRequest>(
             packet,
             request.contexts_offset.get() as usize,
             request.contexts_length.get() as usize,
-            56,
         )?;
-        if request.contexts_length.get() != 0 {
-            return Err(Status::NOT_SUPPORTED);
-        }
-        if request.create_disposition.get() > 5
-            || request.share_access.get() & !7 != 0
-            || request.create_options.get() & 0x41 == 0x41
-            || request.impersonation_level.get() > 3
+        if !contexts.is_empty()
+            && !(request.contexts_offset.get() as usize).is_multiple_of(CREATE_CONTEXT_ALIGNMENT)
         {
             return Err(Status::INVALID_PARAMETER);
         }
-        let access = map_access(request.desired_access.get());
-        let access = if access & 0x02000000 != 0 {
-            (access & !0x02000000) | 0x1f01ff
+        let contexts = create_contexts(contexts)?;
+        let mut names = BTreeSet::new();
+        let mut maximal_access = None;
+        let mut disk_id = false;
+        for context in contexts {
+            if !names.insert(context.name) {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            match context.name() {
+                Some(CreateContextName::QUERY_MAXIMAL_ACCESS) => {
+                    let timestamp = match context.data.len() {
+                        0 => None,
+                        length if length == size_of::<MaximalAccessRequest>() => Some(
+                            MaximalAccessRequest::read_from_bytes(context.data)
+                                .map_err(|_| Status::INVALID_PARAMETER)?
+                                .timestamp
+                                .get(),
+                        ),
+                        _ => return Err(Status::INVALID_PARAMETER),
+                    };
+                    maximal_access = Some(timestamp);
+                }
+                Some(CreateContextName::QUERY_ON_DISK_ID) if context.data.is_empty() => {
+                    disk_id = true
+                }
+                // The object store does not grant durable handles, leases, or preallocation.
+                Some(CreateContextName::DURABLE_HANDLE_REQUEST)
+                    if context.data.len() == size_of::<DurableHandleRequest>() => {}
+                Some(CreateContextName::ALLOCATION_SIZE)
+                    if context.data.len() == size_of::<AllocationSizeContext>() => {}
+                Some(CreateContextName::REQUEST_LEASE) => {}
+                Some(CreateContextName::EA_BUFFER)
+                    if request.disposition() == CreateDisposition::OPEN => {}
+                Some(CreateContextName::EA_BUFFER) => return Err(Status::EAS_NOT_SUPPORTED),
+                Some(CreateContextName::SECURITY_DESCRIPTOR)
+                    if request.disposition() == CreateDisposition::OPEN => {}
+                Some(CreateContextName::SECURITY_DESCRIPTOR) => return Err(Status::NOT_SUPPORTED),
+                Some(CreateContextName::TIMEWARP)
+                    if context.data.len() == size_of::<TimewarpContext>() =>
+                {
+                    return Err(Status::OBJECT_NAME_NOT_FOUND);
+                }
+                Some(CreateContextName::DURABLE_HANDLE_RECONNECT)
+                    if context.data.len() == size_of::<DurableHandleReconnect>() =>
+                {
+                    return Err(Status::OBJECT_NAME_NOT_FOUND);
+                }
+                Some(
+                    CreateContextName::QUERY_ON_DISK_ID
+                    | CreateContextName::DURABLE_HANDLE_REQUEST
+                    | CreateContextName::ALLOCATION_SIZE
+                    | CreateContextName::TIMEWARP
+                    | CreateContextName::DURABLE_HANDLE_RECONNECT,
+                ) => {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                _ => return Err(Status::NOT_SUPPORTED),
+            }
+        }
+        let options = request.create_options;
+        if !request.disposition().is_valid()
+            || !request.share_access.is_valid()
+            || (options.directory_file() && options.non_directory_file())
+            || request.impersonation_level.get() > ImpersonationLevel::DELEGATE.0
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let access = map_access(request.desired_access.into_bits());
+        let access_mask = AccessMask::from_bits(access);
+        let access = if access_mask.maximum_allowed() {
+            access_mask.with_maximum_allowed(false).into_bits()
+                | AccessMask::FILE_ALL_ACCESS.into_bits()
         } else {
             access
         };
+        let access = AccessMask::from_bits(access);
         let volatile = {
             let mut state = self.state.lock();
             if state.files.len() + state.requests.values().filter(|info| info.creating).count()
-                >= 1024
+                >= MAX_OPENS
             {
                 return Err(Status::INSUFFICIENT_RESOURCES);
             }
@@ -1051,11 +1193,11 @@ impl<B: FileSystem> Connection<B> {
             .open(
                 &name,
                 OpenOptions {
-                    access,
-                    share_access: request.share_access.get(),
+                    access: access.into_bits(),
+                    share_access: request.share_access.into_bits(),
                     disposition: request.create_disposition.get(),
-                    options: request.create_options.get(),
-                    attributes: request.file_attributes.get(),
+                    options: request.create_options.into_bits(),
+                    attributes: request.file_attributes.into_bits(),
                 },
                 context,
             )
@@ -1113,9 +1255,47 @@ impl<B: FileSystem> Connection<B> {
             self.server.backend.close(&file.file, &cleanup).await?;
             return Err(error);
         }
-        Ok(CreateResponse {
-            structure_size: 89.into(),
-            oplock_level: 0,
+        let mut response_contexts = Vec::new();
+        let mut previous = None;
+        if let Some(timestamp) = maximal_access {
+            let unchanged = timestamp == Some(info.changed);
+            append_create_context(
+                &mut response_contexts,
+                &mut previous,
+                CreateContextName::QUERY_MAXIMAL_ACCESS,
+                MaximalAccessResponse {
+                    query_status: if unchanged {
+                        Status::NONE_MAPPED.0.into()
+                    } else {
+                        Status::SUCCESS.0.into()
+                    },
+                    maximal_access: if unchanged {
+                        0.into()
+                    } else {
+                        info.maximal_access.into()
+                    },
+                }
+                .as_bytes(),
+            );
+        }
+        if disk_id {
+            let mut volume_id = [0; 8];
+            volume_id.copy_from_slice(&self.server.guid.as_bytes()[..8]);
+            append_create_context(
+                &mut response_contexts,
+                &mut previous,
+                CreateContextName::QUERY_ON_DISK_ID,
+                OnDiskIdResponse {
+                    file_id: info.id.into(),
+                    volume_id: u64::from_le_bytes(volume_id).into(),
+                    reserved: [0; 16],
+                }
+                .as_bytes(),
+            );
+        }
+        let mut response = CreateResponse {
+            structure_size: CreateResponse::STRUCTURE_SIZE.into(),
+            oplock_level: OplockLevel::NONE,
             flags: 0,
             create_action: action.into(),
             creation_time: info.created.into(),
@@ -1127,11 +1307,17 @@ impl<B: FileSystem> Connection<B> {
             file_attributes: info.attributes.into(),
             reserved: 0.into(),
             file_id,
-            contexts_offset: 0.into(),
-            contexts_length: 0.into(),
+            contexts_offset: if response_contexts.is_empty() {
+                0.into()
+            } else {
+                (body_end::<CreateResponse>() as u32).into()
+            },
+            contexts_length: (response_contexts.len() as u32).into(),
         }
         .as_bytes()
-        .to_vec())
+        .to_vec();
+        response.extend_from_slice(&response_contexts);
+        Ok(response)
     }
 
     async fn read(
@@ -1140,15 +1326,15 @@ impl<B: FileSystem> Connection<B> {
         tree: u32,
         context: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
-        let request: ReadRequest = read_body(packet, 49)?;
+        let request: ReadRequest = read_body(packet)?;
         if request.length.get() as usize > MAX_TRANSFER_SIZE
-            || request.channel.get() != 0
+            || Channel(request.channel.get()) != Channel::NONE
             || request.offset.get() > i64::MAX as u64 - u64::from(request.length.get())
         {
             return Err(Status::INVALID_PARAMETER);
         }
         let file = self.file(request.file_id, tree, context)?;
-        if file.access & 1 == 0 {
+        if !file.access.read_data() {
             return Err(Status::ACCESS_DENIED);
         }
         let bytes = if request.length.get() == 0 {
@@ -1171,8 +1357,8 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::END_OF_FILE);
         }
         let mut out = ReadResponse {
-            structure_size: 17.into(),
-            data_offset: 80,
+            structure_size: ReadResponse::STRUCTURE_SIZE.into(),
+            data_offset: body_end::<ReadResponse>() as u8,
             reserved: 0,
             data_length: (bytes.len() as u32).into(),
             data_remaining: 0.into(),
@@ -1190,21 +1376,20 @@ impl<B: FileSystem> Connection<B> {
         tree: u32,
         context: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
-        let request: WriteRequest = read_body(packet, 49)?;
+        let request: WriteRequest = read_body(packet)?;
         if request.length.get() as usize > MAX_TRANSFER_SIZE
-            || request.channel.get() != 0
+            || Channel(request.channel.get()) != Channel::NONE
             || request.offset.get() > i64::MAX as u64 - u64::from(request.length.get())
         {
             return Err(Status::INVALID_PARAMETER);
         }
-        let bytes = variable(
+        let bytes = variable::<WriteRequest>(
             packet,
             request.data_offset.get() as usize,
             request.length.get() as usize,
-            48,
         )?;
         let file = self.file(request.file_id, tree, context)?;
-        if file.access & 2 == 0 {
+        if !file.access.write_data() {
             return Err(Status::ACCESS_DENIED);
         }
         let written = self
@@ -1213,7 +1398,7 @@ impl<B: FileSystem> Connection<B> {
             .write(&file.file, request.offset.get(), bytes, context)
             .await?;
         Ok(WriteResponse {
-            structure_size: 17.into(),
+            structure_size: WriteResponse::STRUCTURE_SIZE.into(),
             reserved: 0.into(),
             count: (written as u32).into(),
             remaining: 0.into(),
@@ -1230,64 +1415,129 @@ impl<B: FileSystem> Connection<B> {
         tree: u32,
         context: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
-        let request: QueryInfoRequest = read_body(packet, 41)?;
-        variable(
+        let request: QueryInfoRequest = read_body(packet)?;
+        variable::<QueryInfoRequest>(
             packet,
             request.input_buffer_offset.get() as usize,
             request.input_buffer_length.get() as usize,
-            40,
         )?;
         let file = self.file(request.file_id, tree, context)?;
-        if request.info_type == 1
-            && matches!(request.info_class, 4 | 18 | 34)
-            && file.access & 0x80 == 0
+        let info_type = request.info_type;
+        let class = FileInformationClass(request.info_class);
+        if info_type == InformationType::FILE
+            && matches!(
+                class,
+                FileInformationClass::BASIC
+                    | FileInformationClass::ALL
+                    | FileInformationClass::NETWORK_OPEN
+            )
+            && !file.access.read_attributes()
         {
             return Err(Status::ACCESS_DENIED);
         }
         let info = self.server.backend.metadata(&file.file, context).await?;
         let mut out = Vec::new();
-        match (request.info_type, request.info_class) {
-            (1, 4) => out = basic_info(&info),
-            (1, 5) => out = standard_info(&info),
-            (1, 6) => u64_bytes(&mut out, info.id),
-            (1, 9) => {
-                let name = encode_name(&info.name);
-                u32_bytes(&mut out, name.len() as u32);
-                out.extend_from_slice(&name);
-            }
-            (1, 14) => u64_bytes(&mut out, file.position),
-            (1, 18) => {
-                out = basic_info(&info);
-                out.extend_from_slice(&standard_info(&info));
-                u64_bytes(&mut out, info.id);
-                u32_bytes(&mut out, 0);
-                u32_bytes(&mut out, file.access);
-                u64_bytes(&mut out, file.position);
-                u32_bytes(&mut out, 0);
-                u32_bytes(&mut out, 0);
-                let name = encode_name(&info.name);
-                u32_bytes(&mut out, name.len() as u32);
-                out.extend_from_slice(&name);
-            }
-            (1, 34) => {
-                out = basic_info(&info);
-                out.truncate(32);
-                u64_bytes(&mut out, info.size);
-                u64_bytes(&mut out, info.size);
-                u32_bytes(&mut out, info.attributes);
-                u32_bytes(&mut out, 0);
-            }
-            (2, 4) => {
-                u32_bytes(&mut out, 7);
-                u32_bytes(&mut out, 0);
-            }
-            (2, 5) => {
-                let name = encode_name("MEMORY");
-                u32_bytes(&mut out, 2 | 4);
-                u32_bytes(&mut out, 255);
-                u32_bytes(&mut out, name.len() as u32);
-                out.extend_from_slice(&name);
-            }
+        match info_type {
+            InformationType::FILE => match class {
+                FileInformationClass::BASIC => out.extend_from_slice(basic_info(&info).as_bytes()),
+                FileInformationClass::STANDARD => {
+                    out.extend_from_slice(standard_info(&info).as_bytes())
+                }
+                FileInformationClass::INTERNAL => out.extend_from_slice(
+                    FileInternalInformation {
+                        index_number: info.id.into(),
+                    }
+                    .as_bytes(),
+                ),
+                FileInformationClass::NAME | FileInformationClass::ALTERNATE_NAME => {
+                    let name = if class == FileInformationClass::ALTERNATE_NAME {
+                        info.short_name
+                            .as_deref()
+                            .ok_or(Status::OBJECT_NAME_NOT_FOUND)?
+                    } else {
+                        &info.name
+                    };
+                    let name = encode_name(name);
+                    out.extend_from_slice(
+                        FileNameInformation {
+                            file_name_length: (name.len() as u32).into(),
+                        }
+                        .as_bytes(),
+                    );
+                    out.extend_from_slice(&name);
+                }
+                FileInformationClass::POSITION => out.extend_from_slice(
+                    FilePositionInformation {
+                        current_byte_offset: file.position.into(),
+                    }
+                    .as_bytes(),
+                ),
+                FileInformationClass::ALL => {
+                    let name = encode_name(&info.name);
+                    out.extend_from_slice(
+                        FileAllInformation {
+                            basic: basic_info(&info),
+                            standard: standard_info(&info),
+                            internal: FileInternalInformation {
+                                index_number: info.id.into(),
+                            },
+                            ea_size: 0.into(),
+                            access_flags: file.access,
+                            position: FilePositionInformation {
+                                current_byte_offset: file.position.into(),
+                            },
+                            mode: 0.into(),
+                            alignment_requirement: 0.into(),
+                            name: FileNameInformation {
+                                file_name_length: (name.len() as u32).into(),
+                            },
+                        }
+                        .as_bytes(),
+                    );
+                    out.extend_from_slice(&name);
+                }
+                FileInformationClass::NETWORK_OPEN => {
+                    let basic = basic_info(&info);
+                    out.extend_from_slice(
+                        FileNetworkOpenInformation {
+                            creation_time: basic.creation_time,
+                            last_access_time: basic.last_access_time,
+                            last_write_time: basic.last_write_time,
+                            change_time: basic.change_time,
+                            allocation_size: info.size.into(),
+                            end_of_file: info.size.into(),
+                            file_attributes: info.attributes.into(),
+                            reserved: 0.into(),
+                        }
+                        .as_bytes(),
+                    );
+                }
+                _ => return Err(Status::NOT_SUPPORTED),
+            },
+            InformationType::FILESYSTEM => match FileSystemInformationClass(request.info_class) {
+                FileSystemInformationClass::DEVICE => out.extend_from_slice(
+                    FileFsDeviceInformation {
+                        device_type: FILE_DEVICE_DISK.into(),
+                        characteristics: 0.into(),
+                    }
+                    .as_bytes(),
+                ),
+                FileSystemInformationClass::ATTRIBUTE => {
+                    let name = encode_name("MEMORY");
+                    out.extend_from_slice(
+                        FileFsAttributeInformation {
+                            file_system_attributes: FileSystemAttributes::new()
+                                .with_case_preserved_names(true)
+                                .with_unicode_on_disk(true),
+                            maximum_component_name_length: memory::MAX_COMPONENT_NAME_LENGTH.into(),
+                            file_system_name_length: (name.len() as u32).into(),
+                        }
+                        .as_bytes(),
+                    );
+                    out.extend_from_slice(&name);
+                }
+                _ => return Err(Status::NOT_SUPPORTED),
+            },
             _ => return Err(Status::NOT_SUPPORTED),
         }
         buffer_response(out, request.output_buffer_length.get())
@@ -1299,42 +1549,81 @@ impl<B: FileSystem> Connection<B> {
         tree: u32,
         context: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
-        let request: SetInfoRequest = read_body(packet, 33)?;
-        let data = variable(
+        let request: SetInfoRequest = read_body(packet)?;
+        let data = variable::<SetInfoRequest>(
             packet,
             request.buffer_offset.get() as usize,
             request.buffer_length.get() as usize,
-            32,
         )?;
         let file = self.file(request.file_id, tree, context)?;
-        match (request.info_type, request.info_class) {
-            (1, 20) if data.len() == 8 => {
-                if file.access & 2 == 0 {
+        match (request.info_type, FileInformationClass(request.info_class)) {
+            (InformationType::FILE, FileInformationClass::BASIC) => {
+                if !file.access.write_attributes() {
                     return Err(Status::ACCESS_DENIED);
                 }
-                let length =
-                    u64::from_le_bytes(data.try_into().map_err(|_| Status::INVALID_PARAMETER)?);
-                if length > i64::MAX as u64 {
-                    return Err(Status::INVALID_PARAMETER);
+                let info = FileBasicInformation::read_from_prefix(data)
+                    .map_err(|_| Status::INFO_LENGTH_MISMATCH)?
+                    .0;
+                self.server
+                    .backend
+                    .set_basic(
+                        &file.file,
+                        BasicInformation {
+                            created: info.creation_time.get(),
+                            accessed: info.last_access_time.get(),
+                            written: info.last_write_time.get(),
+                            changed: info.change_time.get(),
+                            attributes: info.file_attributes.into_bits(),
+                        },
+                        context,
+                    )
+                    .await?;
+            }
+            (InformationType::FILE, FileInformationClass::END_OF_FILE)
+                if data.len() == size_of::<FileEndOfFileInformation>() =>
+            {
+                if !file.access.write_data() {
+                    return Err(Status::ACCESS_DENIED);
                 }
+                let length = FileEndOfFileInformation::read_from_bytes(data)
+                    .map_err(|_| Status::INVALID_PARAMETER)?
+                    .end_of_file
+                    .get();
+                let length = u64::try_from(length).map_err(|_| Status::INVALID_PARAMETER)?;
                 self.server
                     .backend
                     .set_len(&file.file, length, context)
                     .await?;
             }
-            (1, 13) if !data.is_empty() => {
-                if file.access & 0x10000 == 0 {
+            (InformationType::FILE, FileInformationClass::DISPOSITION) if !data.is_empty() => {
+                if !file.access.delete() {
                     return Err(Status::ACCESS_DENIED);
                 }
                 self.server
                     .backend
-                    .set_delete_on_close(&file.file, data[0] != 0, context)
+                    .set_delete_on_close(
+                        &file.file,
+                        FileDispositionInformation::read_from_prefix(data)
+                            .map_err(|_| Status::INVALID_PARAMETER)?
+                            .0
+                            .delete_pending
+                            != 0,
+                        context,
+                    )
                     .await?;
             }
-            (1, 14) if data.len() == 8 => return Err(Status::NOT_SUPPORTED),
+            (InformationType::FILE, FileInformationClass::POSITION)
+                if data.len() == size_of::<FilePositionInformation>() =>
+            {
+                return Err(Status::NOT_SUPPORTED);
+            }
             _ => return Err(Status::NOT_SUPPORTED),
         }
-        Ok(2u16.to_le_bytes().to_vec())
+        Ok(SetInfoResponse {
+            structure_size: SetInfoResponse::STRUCTURE_SIZE.into(),
+        }
+        .as_bytes()
+        .to_vec())
     }
 
     async fn query_directory(
@@ -1343,30 +1632,31 @@ impl<B: FileSystem> Connection<B> {
         tree: u32,
         context: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
-        let request: QueryDirectoryRequest = read_body(packet, 33)?;
-        let pattern = decode_name(variable(
+        let request: QueryDirectoryRequest = read_body(packet)?;
+        let pattern = decode_name(variable::<QueryDirectoryRequest>(
             packet,
             request.name_offset.get() as usize,
             request.name_length.get() as usize,
-            32,
         )?)?;
-        let fixed = match request.info_class {
-            1 => 64,
-            2 => 68,
-            3 => 94,
-            12 => 12,
-            37 => 104,
-            38 => 80,
+        let class = FileInformationClass(request.info_class);
+        let fixed = match class {
+            FileInformationClass::DIRECTORY => size_of::<FileDirectoryInformation>(),
+            FileInformationClass::FULL_DIRECTORY => size_of::<FileFullDirectoryInformation>(),
+            FileInformationClass::BOTH_DIRECTORY => size_of::<FileBothDirectoryInformation>(),
+            FileInformationClass::NAMES => size_of::<FileNamesInformation>(),
+            FileInformationClass::ID_BOTH_DIRECTORY => size_of::<FileIdBothDirectoryInformation>(),
+            FileInformationClass::ID_FULL_DIRECTORY => size_of::<FileIdFullDirectoryInformation>(),
             _ => return Err(Status::NOT_SUPPORTED),
         };
-        if request.flags & 4 != 0 {
+        let flags = request.flags;
+        if flags.index_specified() {
             return Err(Status::NOT_SUPPORTED);
         }
         let file = self.file(request.file_id, tree, context)?;
-        if file.access & 1 == 0 {
+        if !file.access.read_data() {
             return Err(Status::ACCESS_DENIED);
         }
-        if file.directory.lock().is_none() || request.flags & (1 | 0x10) != 0 {
+        if file.directory.lock().is_none() || flags.restart_scans() || flags.reopen() {
             if pattern != "*" && pattern != "*.*" && pattern.contains(['*', '?', '<', '>', '"']) {
                 return Err(Status::NOT_SUPPORTED);
             }
@@ -1388,39 +1678,36 @@ impl<B: FileSystem> Connection<B> {
         let mut out = Vec::new();
         let mut previous = None;
         while let Some(info) = entries.get(*cursor) {
-            let name = encode_name(&info.name);
-            let entry_len = (fixed + name.len() + 7) & !7;
+            let name_length = info
+                .name
+                .encode_utf16()
+                .count()
+                .checked_mul(size_of::<zerocopy::little_endian::U16>())
+                .ok_or(Status::INTERNAL_ERROR)?;
+            let entry_len = align_up(
+                fixed
+                    .checked_add(name_length)
+                    .ok_or(Status::INTERNAL_ERROR)?,
+                DIRECTORY_ALIGNMENT,
+            )?;
             if out.len() + entry_len > maximum {
                 if out.is_empty() {
                     return Err(Status::BUFFER_TOO_SMALL);
                 }
                 break;
             }
+            let record = directory_record(class, info)?;
             let start = out.len();
             if let Some(previous) = previous {
-                out[previous..previous + 4]
-                    .copy_from_slice(&((start - previous) as u32).to_le_bytes());
+                let (header, _) = DirectoryEntryHeader::mut_from_prefix(&mut out[previous..])
+                    .expect("encoded directory record");
+                header.next_entry_offset = ((start - previous) as u32).into();
             }
+            out.extend_from_slice(&record);
             out.resize(start + entry_len, 0);
-            let entry = &mut out[start..];
-            if request.info_class == 12 {
-                entry[8..12].copy_from_slice(&(name.len() as u32).to_le_bytes());
-            } else {
-                entry[8..40].copy_from_slice(&basic_info(info)[..32]);
-                entry[40..48].copy_from_slice(&info.size.to_le_bytes());
-                entry[48..56].copy_from_slice(&info.size.to_le_bytes());
-                entry[56..60].copy_from_slice(&info.attributes.to_le_bytes());
-                entry[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
-                if request.info_class == 37 {
-                    entry[96..104].copy_from_slice(&info.id.to_le_bytes());
-                } else if request.info_class == 38 {
-                    entry[72..80].copy_from_slice(&info.id.to_le_bytes());
-                }
-            }
-            entry[fixed..fixed + name.len()].copy_from_slice(&name);
             previous = Some(start);
             *cursor += 1;
-            if request.flags & 2 != 0 {
+            if flags.return_single_entry() {
                 break;
             }
         }

@@ -30,8 +30,28 @@ The ignored test requires `smbtorture` (Ubuntu package `samba-testsuite`),
 starts its own server on an ephemeral loopback port, and shuts it down on
 completion. It checks connection and tree isolation, multi-client read/write data integrity,
 EOF/short reads, Windows-style position semantics, directory-read behavior,
-and per-open read rights. Unit tests drive the core directly and cover
+per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests drive the core directly and cover
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
+
+## Protocol Representation
+
+`spec::{smb2, fscc, ntlm, tcp}` contains public-specification layouts and named
+values, with section references at their declarations. It contains no server
+policy or filesystem operations. Fixed layouts use zerocopy endian wrappers;
+embedded bitfield types derive zerocopy and use alignment-one little-endian
+storage, including inside directory records. Unknown enum values and flag bits
+remain representable for explicit validation by the engine.
+
+Each SMB body declares its specified `StructureSize` separately from its Rust
+layout size, checked at compile time. The private `codec` module bounds-checks
+header-relative fields against those layouts and validates linked CREATE
+contexts. Handlers encode named response structures rather than individual
+byte offsets. Implementation limits live outside `spec`.
+
+Independent byte fixtures verify unaligned embedded bitfields, all six supported
+directory layouts (with and without short names), and actual CREATE context,
+QUERY_INFO, and READ replies. Literal offsets in these fixtures are deliberate
+independent expectations, not production packet-access logic.
 
 ## Runtime and Backend Contract
 
@@ -70,12 +90,53 @@ a response or credit consumption. `tcp::ConnectionTask` provides persistent
 framing/operation state for `TaskControl`; the direct `process`/`serve` convenience
 futures are not pause-safe when dropped.
 
+## Controlled Provider Tests
+
+The optional `test-support` feature exposes `test_support::ControlledFs<B>`.
+It wraps any real provider; it does not add timing branches or fabricated
+filesystem results to `MemoryFs`. Unit tests have this support available
+automatically, and integration tests can enable the feature.
+
+Its `Controller` configures operation defaults or one-shot plans. Each call
+gets a unique token distinct from its request context ID. A plan can hold the
+call before invoking the provider, or retain its actual result after invocation
+until the controller releases that particular gate. Gates use events, not sleeps.
+Held calls are announced by `next_call`; `snapshot` and `wait_for_phase` expose
+their progress. Pending calls, cancellation observations, queues, and recent
+history are inspectable without retaining file contents.
+
+Cancellation can be cooperative or suppressed to model uncancellable I/O.
+Obtained results are never relabeled when cancellation arrives late. Fault
+injection fails before delegation. Transfer limits shorten the actual delegated
+read/write, so file contents and reported counts agree.
+
+Active calls, announcements, and queued plans are bounded at 256 each. Recent
+terminal history retains 256 calls; ordinary passthrough calls need no controller
+consumer. Dropping an unfinished call records `Abandoned`, not successful
+completion or acknowledged cancellation.
+
+The tests cover all provider operations, independent completion ordering,
+committed writes with concurrent close/pause, partial transfers, real failure
+effects, cancellation during nested delegate execution, and controller errors.
+With the feature enabled, the Samba harness also uses the controlled wrapper
+in its ordinary passthrough configuration.
+
 ## Current Limits
 
 Supported commands are NEGOTIATE, SESSION_SETUP, LOGOFF, TREE_CONNECT,
 TREE_DISCONNECT, CREATE, CLOSE, FLUSH, READ, WRITE, QUERY_DIRECTORY, and a
-subset of QUERY_INFO/SET_INFO, plus ECHO. CREATE contexts, compounding,
-complete credit-window enforcement, non-default streams, Unicode
+subset of QUERY_INFO/SET_INFO, plus ECHO. CREATE validates linked context
+containers and returns maximal-access (`MxAc`) and on-disk-ID (`QFid`) responses.
+Unsupported preallocation, durable-handle requests, and leases are explicitly
+declined without response contexts. EA creation returns `STATUS_EAS_NOT_SUPPORTED`;
+security descriptors and snapshots remain unsupported.
+
+Basic-information updates support DOS attributes and per-open timestamp
+controls, including zero/no-change and -1/-2 automatic-update suppression/reset.
+Alternate-name queries use optional provider short names; the memory provider
+does not generate 8.3 aliases.
+
+Compounding, complete credit-window enforcement, non-default streams, Unicode
 case-folding, rename, ACL updates, locks, leases, notifications, and IOCTLs
 remain future work. Unsupported requests receive explicit status errors.
 Cancellation currently uses MessageId; interim STATUS_PENDING/AsyncId responses

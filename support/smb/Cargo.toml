@@ -6,8 +6,12 @@ name = "smb"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 async-trait.workspace = true
+bitfield-struct.workspace = true
 event-listener.workspace = true
 futures.workspace = true
 guid = { workspace = true, features = ["getrandom"] }

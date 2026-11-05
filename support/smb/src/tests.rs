@@ -18,8 +18,8 @@ struct Client<B: FileSystem = MemoryFs> {
 
 fn request(command: Command, body: &[u8], session: u64, tree: u32, message: u64) -> Vec<u8> {
     let mut header = Header::new_zeroed();
-    header.protocol = *b"\xfeSMB";
-    header.structure_size = 64.into();
+    header.protocol = SIGNATURE;
+    header.structure_size = (HEADER_SIZE as u16).into();
     header.command = command.0.into();
     header.credits = 1.into();
     header.message_id = message.into();
@@ -31,12 +31,12 @@ fn request(command: Command, body: &[u8], session: u64, tree: u32, message: u64)
 }
 
 fn response_status(packet: &[u8]) -> Status {
-    Status(u32::from_le_bytes(packet[8..12].try_into().unwrap()))
+    Header::read_from_prefix(packet).unwrap().0.status()
 }
 
 fn negotiate_body() -> Vec<u8> {
     let mut body = NegotiateRequest::new_zeroed();
-    body.structure_size = 36.into();
+    body.structure_size = NegotiateRequest::STRUCTURE_SIZE.into();
     body.dialect_count = 1.into();
     let mut out = body.as_bytes().to_vec();
     out.extend_from_slice(&DIALECT_210.to_le_bytes());
@@ -46,12 +46,41 @@ fn negotiate_body() -> Vec<u8> {
 fn tree_body() -> Vec<u8> {
     let path = encode_name("\\\\localhost\\memory");
     let mut tree = TreeConnectRequest::new_zeroed();
-    tree.structure_size = 9.into();
-    tree.path_offset = 72.into();
+    tree.structure_size = TreeConnectRequest::STRUCTURE_SIZE.into();
+    tree.path_offset = (body_end::<TreeConnectRequest>() as u16).into();
     tree.path_length = (path.len() as u16).into();
     let mut body = tree.as_bytes().to_vec();
     body.extend(path);
     body
+}
+
+fn create_body(
+    name: &str,
+    access: u32,
+    sharing: u32,
+    disposition: u32,
+    options: u32,
+    contexts: &[u8],
+) -> Vec<u8> {
+    let name = encode_name(name);
+    let mut body = CreateRequest::new_zeroed();
+    body.structure_size = CreateRequest::STRUCTURE_SIZE.into();
+    body.desired_access = access.into();
+    body.share_access = sharing.into();
+    body.create_disposition = disposition.into();
+    body.create_options = options.into();
+    body.name_offset = (body_end::<CreateRequest>() as u16).into();
+    body.name_length = (name.len() as u16).into();
+    let mut bytes = body.as_bytes().to_vec();
+    bytes.extend(name);
+    if !contexts.is_empty() {
+        bytes.resize(align_up(bytes.len(), CREATE_CONTEXT_ALIGNMENT).unwrap(), 0);
+        body.contexts_offset = ((HEADER_SIZE + bytes.len()) as u32).into();
+        body.contexts_length = (contexts.len() as u32).into();
+        bytes[..size_of::<CreateRequest>()].copy_from_slice(body.as_bytes());
+        bytes.extend_from_slice(contexts);
+    }
+    bytes
 }
 
 impl<B: FileSystem> Client<B> {
@@ -64,17 +93,21 @@ impl<B: FileSystem> Client<B> {
         };
         client.ok(Command::NEGOTIATE, &negotiate_body()).await;
         let mut setup = SessionSetupRequest::new_zeroed();
-        setup.structure_size = 25.into();
+        setup.structure_size = SessionSetupRequest::STRUCTURE_SIZE.into();
         let response = client.ok(Command::SESSION_SETUP, setup.as_bytes()).await;
-        client.session = u64::from_le_bytes(response[40..48].try_into().unwrap());
+        client.session = Header::read_from_prefix(&response)
+            .unwrap()
+            .0
+            .session_id
+            .get();
         let response = client.ok(Command::TREE_CONNECT, &tree_body()).await;
-        client.tree = u32::from_le_bytes(response[36..40].try_into().unwrap());
+        client.tree = Header::read_from_prefix(&response).unwrap().0.tree_id.get();
         client
     }
 
     async fn send(&mut self, command: Command, body: &[u8]) -> Vec<u8> {
         let mut packet = request(command, body, self.session, self.tree, self.message);
-        packet[14..16].copy_from_slice(&32u16.to_le_bytes());
+        Header::mut_from_prefix(&mut packet[..]).unwrap().0.credits = (MAX_REQUESTS as u16).into();
         self.message += 1;
         self.connection.process(&packet).await.unwrap()
     }
@@ -93,31 +126,30 @@ impl<B: FileSystem> Client<B> {
         disposition: u32,
         options: u32,
     ) -> Vec<u8> {
-        let name = encode_name(name);
-        let mut body = CreateRequest::new_zeroed();
-        body.structure_size = 57.into();
-        body.desired_access = access.into();
-        body.share_access = sharing.into();
-        body.create_disposition = disposition.into();
-        body.create_options = options.into();
-        body.name_offset = 120.into();
-        body.name_length = (name.len() as u16).into();
-        let mut bytes = body.as_bytes().to_vec();
-        bytes.extend(name);
-        self.send(Command::CREATE, &bytes).await
+        self.send(
+            Command::CREATE,
+            &create_body(name, access, sharing, disposition, options, &[]),
+        )
+        .await
     }
 
     async fn open(&mut self, name: &str, disposition: u32, options: u32) -> FileId {
         let response = self
-            .open_result(name, 0x1f01ff, 7, disposition, options)
+            .open_result(
+                name,
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                ShareAccess::ALL.into_bits(),
+                disposition,
+                options,
+            )
             .await;
         assert_eq!(response_status(&response), Status::SUCCESS);
-        FileId::read_from_bytes(&response[128..144]).unwrap()
+        read_body::<CreateResponse>(&response).unwrap().file_id
     }
 
     async fn close(&mut self, id: FileId) {
         let mut body = CloseRequest::new_zeroed();
-        body.structure_size = 24.into();
+        body.structure_size = CloseRequest::STRUCTURE_SIZE.into();
         body.file_id = id;
         let response = self.ok(Command::CLOSE, body.as_bytes()).await;
         assert!(response[66..].iter().all(|&b| b == 0));
@@ -125,7 +157,7 @@ impl<B: FileSystem> Client<B> {
 
     async fn read(&mut self, id: FileId, offset: u64, length: u32) -> Vec<u8> {
         let mut body = ReadRequest::new_zeroed();
-        body.structure_size = 49.into();
+        body.structure_size = ReadRequest::STRUCTURE_SIZE.into();
         body.file_id = id;
         body.offset = offset.into();
         body.length = length.into();
@@ -134,25 +166,35 @@ impl<B: FileSystem> Client<B> {
 
     async fn set(&mut self, id: FileId, class: u8, data: &[u8]) -> Vec<u8> {
         let mut body = SetInfoRequest::new_zeroed();
-        body.structure_size = 33.into();
-        body.info_type = 1;
+        body.structure_size = SetInfoRequest::STRUCTURE_SIZE.into();
+        body.info_type = InformationType::FILE;
         body.info_class = class;
         body.file_id = id;
-        body.buffer_offset = 96.into();
+        body.buffer_offset = (body_end::<SetInfoRequest>() as u16).into();
         body.buffer_length = (data.len() as u32).into();
         let mut bytes = body.as_bytes().to_vec();
         bytes.extend_from_slice(data);
         self.send(Command::SET_INFO, &bytes).await
+    }
+
+    async fn query(&mut self, id: FileId, class: u8) -> Vec<u8> {
+        let mut body = QueryInfoRequest::new_zeroed();
+        body.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        body.info_type = InformationType::FILE;
+        body.info_class = class;
+        body.output_buffer_length = (MAX_TRANSFER_SIZE as u32).into();
+        body.file_id = id;
+        self.send(Command::QUERY_INFO, body.as_bytes()).await
     }
 }
 
 impl Client<MemoryFs> {
     fn write_body(id: FileId, offset: u64, data: &[u8]) -> Vec<u8> {
         let mut body = WriteRequest::new_zeroed();
-        body.structure_size = 49.into();
+        body.structure_size = WriteRequest::STRUCTURE_SIZE.into();
         body.file_id = id;
         body.offset = offset.into();
-        body.data_offset = 112.into();
+        body.data_offset = (body_end::<WriteRequest>() as u16).into();
         body.length = (data.len() as u32).into();
         let mut bytes = body.as_bytes().to_vec();
         bytes.extend_from_slice(data);
@@ -160,7 +202,9 @@ impl Client<MemoryFs> {
     }
 }
 
+mod create;
 mod runtime;
+mod wire;
 
 #[test]
 fn test_client_guest_handshake_does_not_activate_a_pending_session() {
@@ -172,8 +216,8 @@ fn test_client_guest_handshake_does_not_activate_a_pending_session() {
             .await
             .unwrap();
         let mut setup = SessionSetupRequest::new_zeroed();
-        setup.structure_size = 25.into();
-        setup.security_buffer_offset = 88.into();
+        setup.structure_size = SessionSetupRequest::STRUCTURE_SIZE.into();
+        setup.security_buffer_offset = (body_end::<SessionSetupRequest>() as u16).into();
         setup.security_buffer_length = 32.into();
         let mut body = setup.as_bytes().to_vec();
         body.extend_from_slice(b"NTLMSSP\0");
@@ -187,7 +231,7 @@ fn test_client_guest_handshake_does_not_activate_a_pending_session() {
         assert_eq!(&response[72..80], b"NTLMSSP\0");
         let session = u64::from_le_bytes(response[40..48].try_into().unwrap());
         let simple = SimpleBody {
-            structure_size: 4.into(),
+            structure_size: SimpleBody::STRUCTURE_SIZE.into(),
             reserved: 0.into(),
         };
         let response = connection
@@ -271,7 +315,7 @@ fn trees_scope_handles_and_disconnect_does_not_close_other_trees() {
             .await;
         client.tree = first_tree;
         let simple = SimpleBody {
-            structure_size: 4.into(),
+            structure_size: SimpleBody::STRUCTURE_SIZE.into(),
             reserved: 0.into(),
         };
         client.ok(Command::TREE_DISCONNECT, simple.as_bytes()).await;
@@ -445,10 +489,15 @@ fn malformed_creates_and_traversal_are_rejected() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
         let mut client = Client::new(&server).await;
-        for name in ["..\\escape", "\\rooted", "a/../b", "file:stream"] {
+        for (name, status) in [
+            ("..\\escape", Status::OBJECT_PATH_SYNTAX_BAD),
+            ("\\rooted", Status::OBJECT_PATH_SYNTAX_BAD),
+            ("a/../b", Status::OBJECT_NAME_INVALID),
+            ("file:stream", Status::OBJECT_NAME_INVALID),
+        ] {
             assert_eq!(
                 response_status(&client.open_result(name, 1, 7, 2, 0).await),
-                Status::OBJECT_NAME_INVALID
+                status
             );
         }
         assert_eq!(
@@ -456,8 +505,8 @@ fn malformed_creates_and_traversal_are_rejected() {
             Status::NAME_TOO_LONG,
         );
         let mut create = CreateRequest::new_zeroed();
-        create.structure_size = 57.into();
-        create.name_offset = 120.into();
+        create.structure_size = CreateRequest::STRUCTURE_SIZE.into();
+        create.name_offset = (body_end::<CreateRequest>() as u16).into();
         create.name_length = 4.into();
         let mut bytes = create.as_bytes().to_vec();
         bytes.extend(encode_name("ab"));
@@ -515,8 +564,8 @@ fn directory_pagination_and_small_buffer_do_not_lose_entries() {
         client.close(a).await;
         client.close(b).await;
         let mut query = QueryDirectoryRequest::new_zeroed();
-        query.structure_size = 33.into();
-        query.info_class = 12;
+        query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+        query.info_class = FileInformationClass::NAMES.0;
         query.file_id = dir;
         query.output_buffer_length = 1.into();
         assert_eq!(
@@ -544,7 +593,7 @@ fn directory_pagination_and_small_buffer_do_not_lose_entries() {
             ),
             Status::NO_MORE_FILES
         );
-        query.flags = 1;
+        query.flags = QueryDirectoryFlags::new().with_restart_scans(true);
         assert_eq!(
             &client.ok(Command::QUERY_DIRECTORY, query.as_bytes()).await[84..86],
             &encode_name(".")

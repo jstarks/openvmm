@@ -3,13 +3,18 @@
 
 //! A bounded writable in-memory filesystem for synthetic shares.
 
-use crate::protocol::Status;
-use crate::provider::{FileSystem, Metadata, OpenOptions, RequestContext};
+use crate::provider::{BasicInformation, FileSystem, Metadata, OpenOptions, RequestContext};
+use crate::spec::{
+    AccessMask, CreateAction, CreateDisposition, FileAttributes, NT_TICKS_PER_SECOND, ShareAccess,
+    Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
+};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) const MAX_COMPONENT_NAME_LENGTH: u32 = 255;
 
 /// A writable filesystem with a shared byte quota and object limit.
 #[derive(Clone)]
@@ -27,6 +32,9 @@ struct Open {
     access: u32,
     sharing: u32,
     delete: bool,
+    user_set_access_time: bool,
+    user_set_write_time: bool,
+    user_set_change_time: bool,
 }
 
 struct State {
@@ -48,10 +56,13 @@ pub struct MemoryFile {
 
 /// Current time in the Windows NT epoch.
 pub(crate) fn nt_time() -> u64 {
-    const UNIX_EPOCH_NT_TIME: u64 = 116444736000000000;
+    const NANOSECONDS_PER_NT_TICK: u128 = 1_000_000_000 / NT_TICKS_PER_SECOND as u128;
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => UNIX_EPOCH_NT_TIME + (elapsed.as_nanos() / 100) as u64,
-        Err(before_epoch) => UNIX_EPOCH_NT_TIME - (before_epoch.duration().as_nanos() / 100) as u64,
+        Ok(elapsed) => UNIX_EPOCH_NT_TIME + (elapsed.as_nanos() / NANOSECONDS_PER_NT_TICK) as u64,
+        Err(before_epoch) => {
+            UNIX_EPOCH_NT_TIME
+                - (before_epoch.duration().as_nanos() / NANOSECONDS_PER_NT_TICK) as u64
+        }
     }
 }
 
@@ -63,13 +74,15 @@ impl MemoryFs {
             metadata: Metadata {
                 id: 1,
                 name: String::new(),
-                attributes: 0x10,
+                short_name: None,
+                attributes: FileAttributes::new().with_directory(true).into_bits(),
                 created: now,
                 accessed: now,
                 written: now,
                 changed: now,
                 size: 0,
                 delete_pending: false,
+                maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
             },
             parent: 1,
             data: Vec::new(),
@@ -88,17 +101,23 @@ impl MemoryFs {
 }
 
 fn components(name: &str) -> Result<Vec<&str>, Status> {
-    if name.starts_with(['\\', '/']) || name.contains(['/', ':']) {
+    if name.starts_with('\\') {
+        return Err(Status::OBJECT_PATH_SYNTAX_BAD);
+    }
+    if name.starts_with('/') || name.contains(['/', ':']) {
         return Err(Status::OBJECT_NAME_INVALID);
     }
     let parts: Vec<_> = name.split('\\').filter(|s| !s.is_empty()).collect();
-    if parts
-        .iter()
-        .any(|s| *s == "." || *s == ".." || s.contains('\0'))
-    {
+    if parts.iter().any(|s| *s == "." || *s == "..") {
+        return Err(Status::OBJECT_PATH_SYNTAX_BAD);
+    }
+    if parts.iter().any(|s| s.contains('\0')) {
         return Err(Status::OBJECT_NAME_INVALID);
     }
-    if parts.iter().any(|name| name.encode_utf16().count() > 255) {
+    if parts
+        .iter()
+        .any(|name| name.encode_utf16().count() > MAX_COMPONENT_NAME_LENGTH as usize)
+    {
         return Err(Status::NAME_TOO_LONG);
     }
     Ok(parts)
@@ -112,9 +131,12 @@ fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
 }
 
 fn share_categories(access: u32) -> u32 {
-    u32::from(access & (1 | 0x20) != 0)
-        | (u32::from(access & (2 | 4) != 0) << 1)
-        | (u32::from(access & 0x10000 != 0) << 2)
+    let access = AccessMask::from_bits(access);
+    ShareAccess::new()
+        .with_read(access.read_data() || access.execute())
+        .with_write(access.write_data() || access.append_data())
+        .with_delete(access.delete())
+        .into_bits()
 }
 
 fn resize(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
@@ -138,9 +160,20 @@ fn resize(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> 
         node.data.shrink_to_fit();
     }
     node.metadata.size = length as u64;
-    node.metadata.written = nt_time();
-    node.metadata.changed = node.metadata.written;
     state.bytes = new_bytes;
+    Ok(())
+}
+
+fn modified(state: &mut State, file: &MemoryFile) -> Result<(), Status> {
+    let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+    let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+    let now = nt_time();
+    if !open.user_set_write_time {
+        node.metadata.written = now;
+    }
+    if !open.user_set_change_time {
+        node.metadata.changed = now;
+    }
     Ok(())
 }
 
@@ -233,8 +266,8 @@ impl FileSystem for MemoryFs {
             .next_open
             .checked_add(1)
             .ok_or(Status::INSUFFICIENT_RESOURCES)?;
-        let delete = options.options & 0x1000 != 0;
-        if delete && options.access & 0x10000 == 0 {
+        let delete = options.options().delete_on_close();
+        if delete && !options.access().delete() {
             return Err(Status::ACCESS_DENIED);
         }
         let (id, action) = if let Some(id) = existing {
@@ -242,16 +275,18 @@ impl FileSystem for MemoryFs {
             if node.metadata.delete_pending {
                 return Err(Status::DELETE_PENDING);
             }
-            if options.disposition == 2 {
+            if options.disposition() == CreateDisposition::CREATE {
                 return Err(Status::OBJECT_NAME_COLLISION);
             }
-            if options.options & 1 != 0 && !node.metadata.is_directory() {
+            if options.options().directory_file() && !node.metadata.is_directory() {
                 return Err(Status::NOT_A_DIRECTORY);
             }
-            if options.options & 0x40 != 0 && node.metadata.is_directory() {
+            if options.options().non_directory_file() && node.metadata.is_directory() {
                 return Err(Status::FILE_IS_A_DIRECTORY);
             }
-            if node.metadata.attributes & 1 != 0 && (options.access & 6 != 0 || delete) {
+            if node.metadata.attributes().readonly()
+                && (options.access().write_data() || options.access().append_data() || delete)
+            {
                 return Err(Status::ACCESS_DENIED);
             }
             for other in state.opens.values().filter(|o| o.node == id) {
@@ -261,21 +296,43 @@ impl FileSystem for MemoryFs {
                     return Err(Status::SHARING_VIOLATION);
                 }
             }
-            if matches!(options.disposition, 0 | 4 | 5) {
+            if matches!(
+                options.disposition(),
+                CreateDisposition::SUPERSEDE
+                    | CreateDisposition::OVERWRITE
+                    | CreateDisposition::OVERWRITE_IF
+            ) {
                 if node.metadata.is_directory() {
                     return Err(Status::FILE_IS_A_DIRECTORY);
                 }
-                let required = if options.disposition == 0 { 0x10000 } else { 2 };
-                if options.access & required == 0 {
+                let permitted = if options.disposition() == CreateDisposition::SUPERSEDE {
+                    options.access().delete()
+                } else {
+                    options.access().write_data()
+                };
+                if !permitted {
                     return Err(Status::ACCESS_DENIED);
                 }
                 resize(&mut state, id, 0)?;
-                (id, if options.disposition == 0 { 0 } else { 3 })
+                let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
+                node.metadata.written = nt_time();
+                node.metadata.changed = node.metadata.written;
+                (
+                    id,
+                    if options.disposition() == CreateDisposition::SUPERSEDE {
+                        CreateAction::SUPERSEDED.0
+                    } else {
+                        CreateAction::OVERWRITTEN.0
+                    },
+                )
             } else {
-                (id, 1)
+                (id, CreateAction::OPENED.0)
             }
         } else {
-            if matches!(options.disposition, 1 | 4) {
+            if matches!(
+                options.disposition(),
+                CreateDisposition::OPEN | CreateDisposition::OVERWRITE
+            ) {
                 return Err(Status::OBJECT_NAME_NOT_FOUND);
             }
             if state.nodes.len() >= state.object_limit {
@@ -284,17 +341,23 @@ impl FileSystem for MemoryFs {
             let id = state.next_id;
             state.next_id = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
             let now = nt_time();
-            let directory = options.options & 1 != 0;
+            let directory = options.options().directory_file();
             state.nodes.insert(
                 id,
                 Node {
                     metadata: Metadata {
                         id,
                         name: parts.last().ok_or(Status::OBJECT_NAME_INVALID)?.to_string(),
+                        short_name: None,
                         attributes: if directory {
-                            0x10
+                            FileAttributes::new().with_directory(true).into_bits()
                         } else {
-                            (options.attributes & !0x90) | 0x20
+                            options
+                                .attributes()
+                                .with_directory(false)
+                                .with_normal(false)
+                                .with_archive(true)
+                                .into_bits()
                         },
                         created: now,
                         accessed: now,
@@ -302,13 +365,14 @@ impl FileSystem for MemoryFs {
                         changed: now,
                         size: 0,
                         delete_pending: false,
+                        maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
                     },
                     parent,
                     data: Vec::new(),
                     delete_committed: false,
                 },
             );
-            (id, 2)
+            (id, CreateAction::CREATED.0)
         };
         if delete
             && (id == 1
@@ -328,6 +392,9 @@ impl FileSystem for MemoryFs {
                 access: options.access,
                 sharing: options.share_access,
                 delete,
+                user_set_access_time: false,
+                user_set_write_time: false,
+                user_set_change_time: false,
             },
         );
         if delete {
@@ -373,8 +440,13 @@ impl FileSystem for MemoryFs {
         length: usize,
         _request: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
-        let state = self.0.lock();
-        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let mut state = self.0.lock();
+        let user_set_access_time = state
+            .opens
+            .get(&file.open)
+            .ok_or(Status::FILE_CLOSED)?
+            .user_set_access_time;
+        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         if node.metadata.is_directory() {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
@@ -382,6 +454,9 @@ impl FileSystem for MemoryFs {
             .unwrap_or(usize::MAX)
             .min(node.data.len());
         let end = start.saturating_add(length).min(node.data.len());
+        if !user_set_access_time {
+            node.metadata.accessed = nt_time();
+        }
         Ok(node.data[start..end].to_vec())
     }
 
@@ -393,6 +468,7 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<usize, Status> {
         let mut state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         if node.metadata.is_directory() {
             return Err(Status::INVALID_DEVICE_REQUEST);
@@ -407,8 +483,7 @@ impl FileSystem for MemoryFs {
         }
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         node.data[offset..end].copy_from_slice(data);
-        node.metadata.written = nt_time();
-        node.metadata.changed = node.metadata.written;
+        modified(&mut state, file)?;
         Ok(data.len())
     }
 
@@ -464,6 +539,7 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<(), Status> {
         let mut state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         if state
             .nodes
             .get(&file.node)
@@ -477,7 +553,8 @@ impl FileSystem for MemoryFs {
             &mut state,
             file.node,
             usize::try_from(length).map_err(|_| Status::DISK_FULL)?,
-        )
+        )?;
+        modified(&mut state, file)
     }
 
     async fn set_delete_on_close(
@@ -509,6 +586,90 @@ impl FileSystem for MemoryFs {
         node.metadata.delete_pending = node.delete_committed || pending;
         Ok(())
     }
+
+    async fn set_basic(
+        &self,
+        file: &MemoryFile,
+        info: BasicInformation,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        if [info.created, info.accessed, info.written, info.changed]
+            .iter()
+            .any(|time| *time < TIME_RESTORE)
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let mut state = self.0.lock();
+        let directory = state
+            .nodes
+            .get(&file.node)
+            .ok_or(Status::FILE_CLOSED)?
+            .metadata
+            .is_directory();
+        let attributes = FileAttributes::from_bits(info.attributes);
+        if (attributes.directory() && !directory) || (attributes.temporary() && directory) {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let open = state.opens.get_mut(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let old_change_time = open.user_set_change_time;
+        for (time, flag) in [
+            (info.accessed, &mut open.user_set_access_time),
+            (info.written, &mut open.user_set_write_time),
+            (info.changed, &mut open.user_set_change_time),
+        ] {
+            if time != TIME_UNCHANGED {
+                *flag = time != TIME_RESTORE;
+            }
+        }
+        let user_set_change_time = open.user_set_change_time;
+        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let now = nt_time();
+        if info.attributes != 0 {
+            // MS-FSA §2.1.5.15.2 defines this update mask and protects root HIDDEN/SYSTEM.
+            let mut valid = FileAttributes::new()
+                .with_readonly(true)
+                .with_hidden(true)
+                .with_system(true)
+                .with_archive(true)
+                .with_temporary(true)
+                .with_offline(true)
+                .with_not_content_indexed(true);
+            if file.node == 1 {
+                valid = valid.with_hidden(false).with_system(false);
+            }
+            let valid = valid.into_bits();
+            let attributes = (node.metadata.attributes().with_normal(false).into_bits() & !valid)
+                | (info.attributes & valid);
+            let attributes = if attributes == 0 {
+                FileAttributes::new().with_normal(true).into_bits()
+            } else {
+                attributes
+            };
+            if attributes != node.metadata.attributes
+                && !old_change_time
+                && info.changed != TIME_SUPPRESS
+            {
+                node.metadata.changed = now;
+            }
+            node.metadata.attributes = attributes;
+        }
+        if info.changed > 0 {
+            node.metadata.changed = info.changed as u64;
+        }
+        for (time, field) in [
+            (info.created, &mut node.metadata.created),
+            (info.accessed, &mut node.metadata.accessed),
+            (info.written, &mut node.metadata.written),
+        ] {
+            if time > 0 {
+                *field = time as u64;
+                if !user_set_change_time && info.changed != TIME_SUPPRESS {
+                    node.metadata.changed = now;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -523,9 +684,9 @@ mod tests {
             let fs = MemoryFs::new(64, 8);
             let request = RequestContext::new(1);
             let options = OpenOptions {
-                access: 0x1f01ff,
-                share_access: 7,
-                disposition: 2,
+                access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                share_access: ShareAccess::ALL.into_bits(),
+                disposition: CreateDisposition::CREATE.0,
                 options: 0,
                 attributes: 0,
             };

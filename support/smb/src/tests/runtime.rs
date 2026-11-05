@@ -2,142 +2,499 @@
 // Licensed under the MIT License.
 
 use super::*;
-use async_trait::async_trait;
-use futures::{AsyncRead, AsyncWrite, FutureExt};
+use crate::test_support::{Cancellation, ControlledFs, Controller, Gate, Operation, Phase, Plan};
+use futures::{AsyncRead, AsyncWrite};
 use pal_async::DefaultPool;
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicUsize;
 use task_control::TaskControl;
 use test_with_tracing::test;
 
-#[derive(Clone)]
-struct GatedFs {
-    memory: MemoryFs,
-    started: async_channel::Sender<u64>,
-    release: async_channel::Receiver<()>,
-    cancellable: bool,
-    writes: Arc<AtomicUsize>,
-    closes: Arc<AtomicUsize>,
-    flushes: Arc<AtomicUsize>,
-    fail_close: Arc<AtomicBool>,
-}
-
-impl GatedFs {
-    fn new(
-        cancellable: bool,
-    ) -> (
-        Self,
-        async_channel::Receiver<u64>,
-        async_channel::Sender<()>,
-    ) {
-        let (started, starts) = async_channel::bounded(64);
-        let (release, releases) = async_channel::bounded(64);
-        (
-            Self {
-                memory: MemoryFs::new(1024, 16),
-                started,
-                release: releases,
-                cancellable,
-                writes: Arc::new(AtomicUsize::new(0)),
-                closes: Arc::new(AtomicUsize::new(0)),
-                flushes: Arc::new(AtomicUsize::new(0)),
-                fail_close: Arc::new(AtomicBool::new(false)),
+fn controlled(cancellable: bool) -> (ControlledFs<MemoryFs>, Controller) {
+    let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+    control
+        .set_plan(
+            Operation::Write,
+            Plan {
+                hold_before: true,
+                cancellation: if cancellable {
+                    Cancellation::Cooperative
+                } else {
+                    Cancellation::Ignore
+                },
+                ..Plan::default()
             },
-            starts,
-            release,
         )
-    }
+        .unwrap();
+    (fs, control)
 }
 
-impl Inspect for GatedFs {
-    fn inspect(&self, req: inspect::Request<'_>) {
-        req.respond()
-            .field("memory", &self.memory)
-            .field("writes", self.writes.load(Ordering::Relaxed))
-            .field("closes", self.closes.load(Ordering::Relaxed));
-    }
+fn successes(control: &Controller, operation: Operation) -> usize {
+    control
+        .calls()
+        .iter()
+        .filter(|call| {
+            call.operation == operation
+                && call.phase == Phase::Completed
+                && call.status == Some(Status::SUCCESS)
+        })
+        .count()
 }
 
-#[async_trait]
-impl FileSystem for GatedFs {
-    type File = memory::MemoryFile;
+async fn through_gates<T>(
+    future: impl Future<Output = Result<T, Status>>,
+    control: &Controller,
+    operation: Operation,
+) -> T {
+    let mut future = std::pin::pin!(future);
+    assert!(futures::poll!(&mut future).is_pending());
+    let call = control.next_call().await;
+    assert_eq!(call.operation, operation);
+    assert!(!control.snapshot(call.id).unwrap().delegated);
+    control.release(call.id, Gate::Before).unwrap();
+    assert!(futures::poll!(&mut future).is_pending());
+    let snapshot = control.snapshot(call.id).unwrap();
+    assert_eq!(snapshot.phase, Phase::After);
+    assert_eq!(snapshot.status, Some(Status::SUCCESS));
+    control.release(call.id, Gate::After).unwrap();
+    future.await.unwrap()
+}
 
-    async fn open(
-        &self,
-        name: &str,
-        options: OpenOptions,
-        r: &RequestContext,
-    ) -> Result<(Self::File, u32), Status> {
-        self.memory.open(name, options, r).await
-    }
-    async fn close(&self, file: &Self::File, r: &RequestContext) -> Result<(), Status> {
-        self.closes.fetch_add(1, Ordering::Relaxed);
-        if self.fail_close.swap(false, Ordering::Relaxed) {
-            return Err(Status::ACCESS_DENIED);
+#[test]
+fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results() {
+    block_on(async {
+        let memory = MemoryFs::new(1024, 16);
+        let (fs, control) = ControlledFs::new(memory.clone());
+        let operations = [
+            Operation::Open,
+            Operation::Close,
+            Operation::Metadata,
+            Operation::Read,
+            Operation::Write,
+            Operation::Flush,
+            Operation::List,
+            Operation::SetLen,
+            Operation::SetDeleteOnClose,
+            Operation::SetBasic,
+        ];
+        for operation in operations {
+            control
+                .set_plan(
+                    operation,
+                    Plan {
+                        hold_before: true,
+                        hold_after: true,
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
         }
-        self.memory.close(file, r).await
-    }
-    async fn metadata(&self, file: &Self::File, r: &RequestContext) -> Result<Metadata, Status> {
-        self.memory.metadata(file, r).await
-    }
-    async fn read(
-        &self,
-        file: &Self::File,
-        offset: u64,
-        length: usize,
-        r: &RequestContext,
-    ) -> Result<Vec<u8>, Status> {
-        self.memory.read(file, offset, length, r).await
-    }
-    async fn write(
-        &self,
-        file: &Self::File,
-        offset: u64,
-        data: &[u8],
-        r: &RequestContext,
-    ) -> Result<usize, Status> {
-        self.started.try_send(r.id()).unwrap();
-        if self.cancellable {
-            let mut release = std::pin::pin!(self.release.recv().fuse());
-            let mut cancel = std::pin::pin!(r.cancelled().fuse());
-            futures::select! {
-                release = release => release.unwrap(),
-                () = cancel => return Err(Status::CANCELLED),
+        let context = RequestContext::new(101);
+        let options = OpenOptions {
+            access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+            share_access: ShareAccess::ALL.into_bits(),
+            disposition: CreateDisposition::CREATE.0,
+            options: CreateOptions::new().with_directory_file(true).into_bits(),
+            attributes: 0,
+        };
+        let (directory, _) = through_gates(
+            fs.open("directory", options, &context),
+            &control,
+            Operation::Open,
+        )
+        .await;
+        let (file, _) = through_gates(
+            fs.open(
+                "directory\\file",
+                OpenOptions {
+                    options: 0,
+                    ..options
+                },
+                &context,
+            ),
+            &control,
+            Operation::Open,
+        )
+        .await;
+        assert_eq!(
+            through_gates(
+                fs.write(&file, 0, b"abcdef", &context),
+                &control,
+                Operation::Write
+            )
+            .await,
+            6
+        );
+        through_gates(fs.set_len(&file, 3, &context), &control, Operation::SetLen).await;
+        assert_eq!(
+            through_gates(fs.read(&file, 0, 6, &context), &control, Operation::Read).await,
+            b"abc"
+        );
+        let info = BasicInformation {
+            created: 10,
+            accessed: 20,
+            written: 30,
+            changed: 40,
+            attributes: FileAttributes::new().with_normal(true).into_bits(),
+        };
+        through_gates(
+            fs.set_basic(&file, info, &context),
+            &control,
+            Operation::SetBasic,
+        )
+        .await;
+        through_gates(
+            fs.set_delete_on_close(&file, true, &context),
+            &control,
+            Operation::SetDeleteOnClose,
+        )
+        .await;
+        let metadata =
+            through_gates(fs.metadata(&file, &context), &control, Operation::Metadata).await;
+        assert_eq!(metadata.size, 3);
+        assert_eq!(metadata.written, 30);
+        assert!(metadata.delete_pending);
+        through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
+        assert!(
+            through_gates(fs.list(&directory, &context), &control, Operation::List)
+                .await
+                .iter()
+                .any(|entry| entry.name == "file")
+        );
+        through_gates(fs.close(&file, &context), &control, Operation::Close).await;
+        assert!(
+            !through_gates(fs.list(&directory, &context), &control, Operation::List)
+                .await
+                .iter()
+                .any(|entry| entry.name == "file")
+        );
+        through_gates(fs.close(&directory, &context), &control, Operation::Close).await;
+        assert_eq!(inspect_text("opens", &memory).await, "0");
+        let calls = control.calls();
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.request_id == 101 && call.phase == Phase::Completed)
+        );
+        let ids: BTreeSet<_> = calls.iter().map(|call| call.id).collect();
+        assert_eq!(ids.len(), calls.len());
+        let kinds: BTreeSet<_> = calls.iter().map(|call| call.operation).collect();
+        assert_eq!(kinds, operations.into_iter().collect());
+    });
+}
+
+#[test]
+fn partial_transfers_and_injected_failure_match_actual_file_contents() {
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("partial", 2, 0).await;
+        control
+            .set_plan(
+                Operation::Write,
+                Plan {
+                    transfer_limit: Some(2),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let response = client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"hello"))
+            .await;
+        assert_eq!(u32::from_le_bytes(response[68..72].try_into().unwrap()), 2);
+        assert_eq!(&client.read(file, 0, 10).await[80..], b"he");
+        control
+            .set_plan(
+                Operation::Read,
+                Plan {
+                    transfer_limit: Some(1),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(&client.read(file, 0, 10).await[80..], b"h");
+        control
+            .plan_next(
+                Operation::Write,
+                Plan {
+                    failure: Some(Status::DISK_FULL),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::WRITE, &Client::write_body(file, 0, b"changed"))
+                    .await
+            ),
+            Status::DISK_FULL
+        );
+        control.set_plan(Operation::Read, Plan::default()).unwrap();
+        assert_eq!(&client.read(file, 0, 10).await[80..], b"he");
+        let calls = control.calls();
+        let failed = calls
+            .iter()
+            .find(|call| {
+                call.operation == Operation::Write && call.status == Some(Status::DISK_FULL)
+            })
+            .unwrap();
+        assert!(!failed.delegated);
+        assert_eq!(failed.phase, Phase::Completed);
+        assert_eq!(
+            calls
+                .iter()
+                .find(|call| call.operation == Operation::Write
+                    && call.status == Some(Status::SUCCESS))
+                .unwrap()
+                .transferred,
+            Some(2)
+        );
+    });
+}
+
+#[test]
+fn selected_write_completion_order_and_late_close_cancellation_preserve_committed_data() {
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("reorder", 2, 0).await;
+        let other = client.open("other", 2, 0).await;
+        control
+            .set_plan(
+                Operation::Write,
+                Plan {
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let first_message = client.message;
+        let first = admitted(
+            &mut client,
+            Command::WRITE,
+            &Client::write_body(file, 0, b"one"),
+        )
+        .execute();
+        let second_message = client.message;
+        let second = admitted(
+            &mut client,
+            Command::WRITE,
+            &Client::write_body(file, 3, b"two"),
+        )
+        .execute();
+        let mut first = std::pin::pin!(first);
+        let mut second = std::pin::pin!(second);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        let first_call = control.next_call().await;
+        let second_call = control.next_call().await;
+        assert_eq!(first_call.offset, Some(0));
+        assert_eq!(second_call.offset, Some(3));
+        assert_eq!(control.snapshot(first_call.id).unwrap().phase, Phase::After);
+        assert_eq!(&client.read(file, 0, 6).await[80..], b"onetwo");
+        control.release(second_call.id, Gate::After).unwrap();
+        let response = second.await.unwrap();
+        assert_eq!(
+            Header::read_from_prefix(&response)
+                .unwrap()
+                .0
+                .message_id
+                .get(),
+            second_message
+        );
+        assert!(futures::poll!(&mut first).is_pending());
+        let close = admitted(&mut client, Command::CLOSE, close_body(file).as_bytes()).execute();
+        let mut close = std::pin::pin!(close);
+        assert!(futures::poll!(&mut close).is_pending());
+        let snapshot = control.snapshot(first_call.id).unwrap();
+        assert!(snapshot.cancel_requested);
+        assert_eq!(snapshot.status, Some(Status::SUCCESS));
+        assert_eq!(
+            inspect_text(&format!("calls/{}/phase", first_call.id), &control).await,
+            "\"After\""
+        );
+        assert_eq!(
+            inspect_text(
+                &format!("calls/{}/cancel_requested", first_call.id),
+                &control
+            )
+            .await,
+            "true"
+        );
+        assert_eq!(successes(&control, Operation::Close), 0);
+        assert_eq!(
+            response_status(&client.read(other, 0, 0).await),
+            Status::SUCCESS
+        );
+        control.release(first_call.id, Gate::After).unwrap();
+        let response = first.await.unwrap();
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        assert_eq!(
+            Header::read_from_prefix(&response)
+                .unwrap()
+                .0
+                .message_id
+                .get(),
+            first_message
+        );
+        assert_eq!(response_status(&close.await.unwrap()), Status::SUCCESS);
+        assert_eq!(successes(&control, Operation::Write), 2);
+        assert_eq!(successes(&control, Operation::Close), 1);
+        let file = client.open("reorder", 1, 0).await;
+        assert_eq!(&client.read(file, 0, 6).await[80..], b"onetwo");
+    });
+}
+
+#[test]
+fn controlled_call_errors_and_abandonment_do_not_claim_completion() {
+    block_on(async {
+        use crate::test_support::ControlError;
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        assert!(matches!(
+            control.set_plan(
+                Operation::Open,
+                Plan {
+                    transfer_limit: Some(1),
+                    ..Plan::default()
+                }
+            ),
+            Err(ControlError::InvalidTransferLimit)
+        ));
+        assert!(matches!(
+            control.plan_next(
+                Operation::Write,
+                Plan {
+                    failure: Some(Status::SUCCESS),
+                    ..Plan::default()
+                }
+            ),
+            Err(ControlError::InvalidFailure(Status::SUCCESS))
+        ));
+        assert!(matches!(
+            control.release(0, Gate::Before),
+            Err(ControlError::UnknownCall(0))
+        ));
+        control
+            .set_plan(
+                Operation::Open,
+                Plan {
+                    hold_before: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let context = RequestContext::new(1);
+        let options = OpenOptions {
+            access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+            share_access: 7,
+            disposition: 2,
+            options: 0,
+            attributes: 0,
+        };
+        let mut open = Box::pin(fs.open("abandoned", options, &context));
+        assert!(futures::poll!(&mut open).is_pending());
+        let call = control.next_call().await;
+        assert!(matches!(
+            control.release(call.id, Gate::After),
+            Err(ControlError::GateNotHeld(_, Gate::After))
+        ));
+        drop(open);
+        assert!(matches!(
+            control.wait_for_phase(call.id, Phase::Completed).await,
+            Err(ControlError::Abandoned(_))
+        ));
+        assert_eq!(control.snapshot(call.id).unwrap().status, None);
+        control.set_plan(Operation::Open, Plan::default()).unwrap();
+        let (_, action) = fs.open("abandoned", options, &context).await.unwrap();
+        assert_eq!(action, 2);
+    });
+}
+
+#[test]
+fn cancellation_during_a_delegate_future_is_forwarded_or_suppressed_by_policy() {
+    block_on(async {
+        for policy in [Cancellation::Cooperative, Cancellation::Ignore] {
+            let (inner, inner_control) = ControlledFs::new(MemoryFs::new(1024, 16));
+            let (outer, outer_control) = ControlledFs::new(inner);
+            let server = Server::new("memory", outer).unwrap();
+            let mut client = Client::new(&server).await;
+            let file = client.open("nested", 2, 0).await;
+            inner_control
+                .set_plan(
+                    Operation::Write,
+                    Plan {
+                        hold_before: true,
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
+            outer_control
+                .set_plan(
+                    Operation::Write,
+                    Plan {
+                        cancellation: policy,
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
+            let message = client.message;
+            let write = admitted(
+                &mut client,
+                Command::WRITE,
+                &Client::write_body(file, 0, b"data"),
+            )
+            .execute();
+            let mut write = std::pin::pin!(write);
+            assert!(futures::poll!(&mut write).is_pending());
+            let call = inner_control.next_call().await;
+            let outer_call = outer_control
+                .calls()
+                .into_iter()
+                .find(|call| call.operation == Operation::Write)
+                .unwrap();
+            assert_eq!(outer_call.phase, Phase::Executing);
+            client
+                .connection
+                .cancel(&request(
+                    Command::CANCEL,
+                    SimpleBody {
+                        structure_size: SimpleBody::STRUCTURE_SIZE.into(),
+                        reserved: 0.into(),
+                    }
+                    .as_bytes(),
+                    client.session,
+                    client.tree,
+                    message,
+                ))
+                .unwrap();
+            if policy == Cancellation::Ignore {
+                assert!(!inner_control.snapshot(call.id).unwrap().cancel_requested);
+                inner_control.release(call.id, Gate::Before).unwrap();
             }
-        } else {
-            self.release.recv().await.unwrap();
+            let response = write.await.unwrap();
+            assert_eq!(
+                response_status(&response),
+                if policy == Cancellation::Ignore {
+                    Status::SUCCESS
+                } else {
+                    Status::CANCELLED
+                }
+            );
+            let read = client.read(file, 0, 4).await;
+            if policy == Cancellation::Ignore {
+                assert_eq!(&read[80..], b"data");
+            } else {
+                assert_eq!(response_status(&read), Status::END_OF_FILE);
+            }
         }
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        self.memory.write(file, offset, data, r).await
-    }
-    async fn flush(&self, file: &Self::File, r: &RequestContext) -> Result<(), Status> {
-        self.flushes.fetch_add(1, Ordering::Relaxed);
-        self.memory.flush(file, r).await
-    }
-    async fn list(&self, file: &Self::File, r: &RequestContext) -> Result<Vec<Metadata>, Status> {
-        self.memory.list(file, r).await
-    }
-    async fn set_len(
-        &self,
-        file: &Self::File,
-        length: u64,
-        r: &RequestContext,
-    ) -> Result<(), Status> {
-        self.memory.set_len(file, length, r).await
-    }
-    async fn set_delete_on_close(
-        &self,
-        file: &Self::File,
-        delete: bool,
-        r: &RequestContext,
-    ) -> Result<(), Status> {
-        self.memory.set_delete_on_close(file, delete, r).await
-    }
+    });
 }
 
 fn close_body(file: FileId) -> CloseRequest {
     let mut body = CloseRequest::new_zeroed();
-    body.structure_size = 24.into();
+    body.structure_size = CloseRequest::STRUCTURE_SIZE.into();
     body.file_id = file;
     body
 }
@@ -149,9 +506,132 @@ fn admitted<B: FileSystem>(client: &mut Client<B>, command: Command, body: &[u8]
 }
 
 #[test]
+fn tcp_pause_retains_committed_reordered_writes_and_a_concurrent_close() {
+    DefaultPool::run_with(async |driver| {
+        let memory = MemoryFs::new(1024, 16);
+        let (fs, control) = ControlledFs::new(memory.clone());
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("committed", 2, 0).await;
+        control
+            .set_plan(
+                Operation::Write,
+                Plan {
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let first_message = client.message;
+        let first_frame = frame(&request(
+            Command::WRITE,
+            &Client::write_body(file, 0, b"one"),
+            client.session,
+            client.tree,
+            first_message,
+        ));
+        let second_frame = frame(&request(
+            Command::WRITE,
+            &Client::write_body(file, 3, b"two"),
+            client.session,
+            client.tree,
+            first_message + 1,
+        ));
+        let close_frame = frame(&request(
+            Command::CLOSE,
+            close_body(file).as_bytes(),
+            client.session,
+            client.tree,
+            first_message + 2,
+        ));
+        let stream = TestStream::new();
+        stream.writable(usize::MAX);
+        stream.input(&first_frame);
+        stream.input(&second_frame);
+        let mut task = TaskControl::new(tcp::ConnectionTask::new(
+            client.connection.clone(),
+            stream.clone(),
+        ));
+        task.insert(driver, "smb-committed-test", ());
+        task.start();
+        let first_call = control.next_call().await;
+        let second_call = control.next_call().await;
+        control
+            .wait_for_phase(first_call.id, Phase::After)
+            .await
+            .unwrap();
+        control
+            .wait_for_phase(second_call.id, Phase::After)
+            .await
+            .unwrap();
+        let context = RequestContext::new(1000);
+        let (observer, _) = memory
+            .open(
+                "committed",
+                OpenOptions {
+                    access: 1,
+                    share_access: 7,
+                    disposition: 1,
+                    options: 0,
+                    attributes: 0,
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            memory.read(&observer, 0, 6, &context).await.unwrap(),
+            b"onetwo"
+        );
+        memory.close(&observer, &context).await.unwrap();
+        control.release(second_call.id, Gate::After).unwrap();
+        stream.until(|s| s.output.len() == 84).await;
+        task.stop().await;
+        assert_eq!(control.snapshot(first_call.id).unwrap().phase, Phase::After);
+        stream.input(&close_frame);
+        task.start();
+        stream
+            .until(|s| s.read == first_frame.len() + second_frame.len() + close_frame.len())
+            .await;
+        assert_eq!(inspect_text("active_requests", &task).await, "2");
+        task.stop().await;
+        let snapshot = control.snapshot(first_call.id).unwrap();
+        assert!(snapshot.cancel_requested);
+        assert_eq!(snapshot.status, Some(Status::SUCCESS));
+        assert_eq!(successes(&control, Operation::Close), 0);
+        let before = stream.state.lock().output.clone();
+        control.release(first_call.id, Gate::After).unwrap();
+        assert_eq!(stream.state.lock().output, before);
+        task.start();
+        stream.until(|s| s.output.len() == 296).await;
+        task.stop().await;
+        let bytes = stream.state.lock().output.clone();
+        let first_response = Header::read_from_prefix(&bytes[4..]).unwrap().0;
+        let second_response = Header::read_from_prefix(&bytes[88..]).unwrap().0;
+        let close_response = Header::read_from_prefix(&bytes[172..]).unwrap().0;
+        assert_eq!(first_response.message_id.get(), first_message + 1);
+        assert_eq!(second_response.message_id.get(), first_message);
+        assert_eq!(close_response.message_id.get(), first_message + 2);
+        assert_eq!(first_response.status.get(), Status::SUCCESS.0);
+        assert_eq!(second_response.status.get(), Status::SUCCESS.0);
+        assert_eq!(close_response.status.get(), Status::SUCCESS.0);
+        assert_eq!(successes(&control, Operation::Write), 2);
+        assert_eq!(successes(&control, Operation::Close), 1);
+        task.task_mut().shutdown().await.unwrap();
+        assert_eq!(successes(&control, Operation::Close), 1);
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.phase == Phase::Abandoned)
+        );
+    });
+}
+
+#[test]
 fn close_drains_uncancellable_writes_without_blocking_other_opens() {
     block_on(async {
-        let (fs, starts, release) = GatedFs::new(false);
+        let (fs, control) = controlled(false);
         let server = Server::new("memory", fs.clone()).unwrap();
         let mut client = Client::new(&server).await;
         let file = client.open("target", 2, 0).await;
@@ -172,13 +652,15 @@ fn close_drains_uncancellable_writes_without_blocking_other_opens() {
         let mut second = std::pin::pin!(second);
         assert!(futures::poll!(&mut first).is_pending());
         assert!(futures::poll!(&mut second).is_pending());
-        assert_ne!(starts.recv().await.unwrap(), starts.recv().await.unwrap());
+        let first_call = control.next_call().await;
+        let second_call = control.next_call().await;
+        assert_ne!(first_call.id, second_call.id);
         let mut body = close_body(file);
-        body.flags = 1.into();
+        body.flags = CloseFlags::new().with_postquery_attrib(true);
         let close = admitted(&mut client, Command::CLOSE, body.as_bytes()).execute();
         let mut close = std::pin::pin!(close);
         assert!(futures::poll!(&mut close).is_pending());
-        assert_eq!(fs.closes.load(Ordering::Relaxed), 0);
+        assert_eq!(successes(&control, Operation::Close), 0);
         assert_eq!(
             response_status(&client.read(file, 0, 1).await),
             Status::FILE_CLOSED
@@ -187,16 +669,16 @@ fn close_drains_uncancellable_writes_without_blocking_other_opens() {
             response_status(&client.read(other, 0, 0).await),
             Status::SUCCESS
         );
-        release.send(()).await.unwrap();
-        release.send(()).await.unwrap();
+        control.release(first_call.id, Gate::Before).unwrap();
+        control.release(second_call.id, Gate::Before).unwrap();
         let (first, second, close) = futures::join!(first, second, close);
         assert_eq!(response_status(&first.unwrap()), Status::SUCCESS);
         assert_eq!(response_status(&second.unwrap()), Status::SUCCESS);
         let close = close.unwrap();
         assert_eq!(response_status(&close), Status::SUCCESS);
         assert_eq!(u64::from_le_bytes(close[112..120].try_into().unwrap()), 6);
-        assert_eq!(fs.writes.load(Ordering::Relaxed), 2);
-        assert_eq!(fs.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(successes(&control, Operation::Write), 2);
+        assert_eq!(successes(&control, Operation::Close), 1);
         let reopened = client.open("target", 1, 0).await;
         assert_eq!(&client.read(reopened, 0, 6).await[80..], b"onetwo");
     });
@@ -205,7 +687,7 @@ fn close_drains_uncancellable_writes_without_blocking_other_opens() {
 #[test]
 fn close_cancels_pending_io_and_cancel_races_are_harmless() {
     block_on(async {
-        let (fs, starts, _release) = GatedFs::new(true);
+        let (fs, control) = controlled(true);
         let server = Server::new("memory", fs.clone()).unwrap();
         let mut client = Client::new(&server).await;
         let file = client.open("target", 2, 0).await;
@@ -218,7 +700,7 @@ fn close_cancels_pending_io_and_cancel_races_are_harmless() {
         .execute();
         let mut write = std::pin::pin!(write);
         assert!(futures::poll!(&mut write).is_pending());
-        starts.recv().await.unwrap();
+        control.next_call().await;
         let close = admitted(&mut client, Command::CLOSE, close_body(file).as_bytes()).execute();
         let (write, close) = futures::join!(write, close);
         assert_eq!(response_status(&write.unwrap()), Status::CANCELLED);
@@ -226,7 +708,7 @@ fn close_cancels_pending_io_and_cancel_races_are_harmless() {
         let cancel = request(
             Command::CANCEL,
             SimpleBody {
-                structure_size: 4.into(),
+                structure_size: SimpleBody::STRUCTURE_SIZE.into(),
                 reserved: 0.into(),
             }
             .as_bytes(),
@@ -235,15 +717,15 @@ fn close_cancels_pending_io_and_cancel_races_are_harmless() {
             message,
         );
         client.connection.cancel(&cancel).unwrap();
-        assert_eq!(fs.writes.load(Ordering::Relaxed), 0);
-        assert_eq!(fs.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(successes(&control, Operation::Write), 0);
+        assert_eq!(successes(&control, Operation::Close), 1);
     });
 }
 
 #[test]
 fn flush_orders_earlier_and_later_writes_on_the_same_open() {
     block_on(async {
-        let (fs, starts, release) = GatedFs::new(false);
+        let (fs, control) = controlled(false);
         let server = Server::new("memory", fs.clone()).unwrap();
         let mut client = Client::new(&server).await;
         let file = client.open("target", 2, 0).await;
@@ -266,16 +748,16 @@ fn flush_orders_earlier_and_later_writes_on_the_same_open() {
         assert!(futures::poll!(&mut first).is_pending());
         assert!(futures::poll!(&mut flush).is_pending());
         assert!(futures::poll!(&mut second).is_pending());
-        starts.recv().await.unwrap();
-        assert!(starts.try_recv().is_err());
-        assert_eq!(fs.flushes.load(Ordering::Relaxed), 0);
-        release.send(()).await.unwrap();
+        let first_call = control.next_call().await;
+        assert!(control.try_next_call().is_none());
+        assert_eq!(successes(&control, Operation::Flush), 0);
+        control.release(first_call.id, Gate::Before).unwrap();
         assert_eq!(response_status(&first.await.unwrap()), Status::SUCCESS);
         assert_eq!(response_status(&flush.await.unwrap()), Status::SUCCESS);
-        assert_eq!(fs.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(successes(&control, Operation::Flush), 1);
         assert!(futures::poll!(&mut second).is_pending());
-        starts.recv().await.unwrap();
-        release.send(()).await.unwrap();
+        let second_call = control.next_call().await;
+        control.release(second_call.id, Gate::Before).unwrap();
         assert_eq!(response_status(&second.await.unwrap()), Status::SUCCESS);
     });
 }
@@ -336,7 +818,7 @@ impl AsyncRead for TestStream {
         if state.input.is_empty() {
             if let Some((session, tree, message)) = state.repeat_echo {
                 let body = SimpleBody {
-                    structure_size: 4.into(),
+                    structure_size: SimpleBody::STRUCTURE_SIZE.into(),
                     reserved: 0.into(),
                 };
                 state.input.extend(frame(&request(
@@ -405,7 +887,7 @@ async fn inspect_text(path: &str, object: impl inspect::InspectMut) -> String {
 #[test]
 fn task_pause_and_inspection_preserve_partial_frames_pending_io_and_responses() {
     DefaultPool::run_with(async |driver| {
-        let (fs, starts, release) = GatedFs::new(false);
+        let (fs, control) = controlled(false);
         let server = Server::new("memory", fs.clone()).unwrap();
         let mut client = Client::new(&server).await;
         let file = client.open("target", 2, 0).await;
@@ -435,7 +917,7 @@ fn task_pause_and_inspection_preserve_partial_frames_pending_io_and_responses() 
         assert_eq!(inspect_text("receive_body_bytes", &task).await, "7");
         task.start();
         stream.input(&write_frame[11..]);
-        starts.recv().await.unwrap();
+        let call = control.next_call().await;
         let close = frame(&request(
             Command::CLOSE,
             close_body(file).as_bytes(),
@@ -457,14 +939,14 @@ fn task_pause_and_inspection_preserve_partial_frames_pending_io_and_responses() 
             "true"
         );
         task.stop().await;
-        assert_eq!(fs.writes.load(Ordering::Relaxed), 0);
-        release.send(()).await.unwrap();
-        assert_eq!(fs.writes.load(Ordering::Relaxed), 0);
+        assert_eq!(successes(&control, Operation::Write), 0);
+        control.release(call.id, Gate::Before).unwrap();
+        assert_eq!(successes(&control, Operation::Write), 0);
         stream.writable(9);
         task.start();
         stream.until(|s| s.output.len() == 9).await;
         task.stop().await;
-        assert_eq!(fs.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(successes(&control, Operation::Write), 1);
         assert_eq!(inspect_text("transmit_offset", &task).await, "9");
         assert_eq!(inspect_text("queued_responses", &task).await, "2");
         stream.writable(usize::MAX);
@@ -476,16 +958,16 @@ fn task_pause_and_inspection_preserve_partial_frames_pending_io_and_responses() 
         assert_eq!(bytes.len(), 212);
         assert_eq!(response_status(&bytes[4..]), Status::SUCCESS);
         assert_eq!(response_status(&bytes[88..]), Status::SUCCESS);
-        assert_eq!(fs.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(successes(&control, Operation::Write), 1);
         task.task_mut().shutdown().await.unwrap();
-        assert_eq!(fs.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(successes(&control, Operation::Close), 1);
     });
 }
 
 #[test]
 fn cancel_is_processed_when_every_request_slot_is_occupied() {
     DefaultPool::run_with(async |driver| {
-        let (fs, starts, _release) = GatedFs::new(true);
+        let (fs, control) = controlled(true);
         let server = Server::new("memory", fs.clone()).unwrap();
         let mut client = Client::new(&server).await;
         let file = client.open("target", 2, 0).await;
@@ -510,7 +992,7 @@ fn cancel_is_processed_when_every_request_slot_is_occupied() {
 
         task.start();
         for _ in 0..MAX_REQUESTS {
-            starts.recv().await.unwrap();
+            control.next_call().await;
         }
         assert_eq!(
             inspect_text("active_requests", &task).await,
@@ -519,7 +1001,7 @@ fn cancel_is_processed_when_every_request_slot_is_occupied() {
         let cancel = request(
             Command::CANCEL,
             SimpleBody {
-                structure_size: 4.into(),
+                structure_size: SimpleBody::STRUCTURE_SIZE.into(),
                 reserved: 0.into(),
             }
             .as_bytes(),
@@ -530,9 +1012,9 @@ fn cancel_is_processed_when_every_request_slot_is_occupied() {
         stream.input(&frame(&cancel));
         stream.until(|s| s.output.len() >= 4).await;
         task.stop().await;
-        assert_eq!(fs.writes.load(Ordering::Relaxed), 0);
+        assert_eq!(successes(&control, Operation::Write), 0);
         task.task_mut().shutdown().await.unwrap();
-        assert_eq!(fs.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(successes(&control, Operation::Close), 1);
     });
 }
 
@@ -597,7 +1079,7 @@ fn tcp_service_pause_preserves_existing_connections() {
         assert!(service.stop().await);
         assert_eq!(inspect_text("running", &service).await, "false");
         let echo = SimpleBody {
-            structure_size: 4.into(),
+            structure_size: SimpleBody::STRUCTURE_SIZE.into(),
             reserved: 0.into(),
         };
         client
@@ -617,18 +1099,26 @@ fn tcp_service_pause_preserves_existing_connections() {
 #[test]
 fn shutdown_closes_other_opens_and_retains_failed_close_for_retry() {
     block_on(async {
-        let (fs, _starts, _release) = GatedFs::new(false);
+        let (fs, control) = controlled(false);
         let server = Server::new("memory", fs.clone()).unwrap();
         let mut client = Client::new(&server).await;
         client.open("first", 2, 0).await;
         client.open("second", 2, 0).await;
-        fs.fail_close.store(true, Ordering::Relaxed);
+        control
+            .plan_next(
+                Operation::Close,
+                Plan {
+                    failure: Some(Status::ACCESS_DENIED),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
         assert!(matches!(
             client.connection.shutdown().await,
             Err(Error::Backend(Status::ACCESS_DENIED))
         ));
-        assert_eq!(inspect_text("opens", &fs.memory).await, "1");
+        assert_eq!(inspect_text("backend/opens", &fs).await, "1");
         client.connection.shutdown().await.unwrap();
-        assert_eq!(inspect_text("opens", &fs.memory).await, "0");
+        assert_eq!(inspect_text("backend/opens", &fs).await, "0");
     });
 }

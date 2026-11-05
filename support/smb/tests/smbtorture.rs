@@ -14,7 +14,10 @@ use test_with_tracing::test;
 fn samba_read_write_smoke() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port().to_string();
-    let server = Server::new("memory", MemoryFs::new(16 * 1024 * 1024, 4096)).unwrap();
+    let backend = MemoryFs::new(16 * 1024 * 1024, 4096);
+    #[cfg(feature = "test-support")]
+    let (backend, _control) = smb::test_support::ControlledFs::new(backend);
+    let server = Server::new("memory", backend).unwrap();
     let (stop, stopped) = async_channel::bounded::<()>(1);
     let worker = std::thread::spawn(move || {
         DefaultPool::run_with(async |driver| -> Result<(), smb::Error> {
@@ -46,6 +49,8 @@ fn samba_read_write_smoke() {
             "smb2.read.position",
             "smb2.read.dir",
             "smb2.read.access",
+            "smb2.create.open",
+            "smb2.mkdir",
         ])
         .status();
     stop.send_blocking(()).unwrap();

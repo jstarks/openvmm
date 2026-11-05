@@ -60,10 +60,28 @@ open_enum! {
 open_enum! {
     /// Filesystem information class values: [MS-FSCC] §2.5.
     pub enum FileSystemInformationClass: u8 {
+        /// FileFsVolumeInformation, §2.5.9.
+        VOLUME = 1,
+        /// Local-only label update, §2.5.5.
+        LABEL = 2,
+        /// FileFsSizeInformation, §2.5.8.
+        SIZE = 3,
         /// FileFsDeviceInformation, §2.5.10.
         DEVICE = 4,
         /// FileFsAttributeInformation, §2.5.1.
         ATTRIBUTE = 5,
+        /// FileFsControlInformation, §2.5.2.
+        CONTROL = 6,
+        /// FileFsFullSizeInformation, §2.5.4.
+        FULL_SIZE = 7,
+        /// FileFsObjectIdInformation, §2.5.6.
+        OBJECT_ID = 8,
+        /// Local-only driver query, §2.5.3.
+        DRIVER_PATH = 9,
+        /// Local-only volume flags, §2.5.
+        VOLUME_FLAGS = 10,
+        /// FileFsSectorSizeInformation, §2.5.7.
+        SECTOR_SIZE = 11,
     }
 }
 
@@ -117,6 +135,10 @@ le_bitfield_conversions!(FileSystemAttributes, u32, U32);
 
 /// FILE_DEVICE_DISK: [MS-FSCC] §2.5.10.
 pub const FILE_DEVICE_DISK: u32 = 0x00000007;
+/// Minimum volume query buffer, including native alignment: [MS-FSA] §2.1.5.13.1.
+pub const FILE_FS_VOLUME_MIN_BUFFER_SIZE: usize = 24;
+/// Maximum volume label length in characters: [MS-FSCC] §2.5.9.
+pub const FILE_FS_VOLUME_MAX_LABEL_LENGTH: usize = 32;
 /// Linked directory records are eight-byte aligned: [MS-FSCC] §2.4.
 pub const DIRECTORY_ALIGNMENT: usize = 8;
 /// ShortName contains at most twelve UTF-16 code units: [MS-FSCC] §2.4.8.
@@ -218,6 +240,35 @@ wire!(
 wire!(
     /// FileFsDeviceInformation: [MS-FSCC] §2.5.10.
     FileFsDeviceInformation, 8 { device_type: U32, characteristics: U32 }
+);
+wire!(
+    /// FileFsVolumeInformation prefix; label is UTF-16LE: [MS-FSCC] §2.5.9.
+    FileFsVolumeInformation, 18 {
+        volume_creation_time: U64,
+        volume_serial_number: U32,
+        volume_label_length: U32,
+        supports_objects: u8,
+        reserved: u8,
+    }
+);
+wire!(
+    /// FileFsSizeInformation: [MS-FSCC] §2.5.8.
+    FileFsSizeInformation, 24 {
+        total_allocation_units: I64,
+        available_allocation_units: I64,
+        sectors_per_allocation_unit: U32,
+        bytes_per_sector: U32,
+    }
+);
+wire!(
+    /// FileFsFullSizeInformation: [MS-FSCC] §2.5.4.
+    FileFsFullSizeInformation, 32 {
+        total_allocation_units: I64,
+        caller_available_allocation_units: I64,
+        actual_available_allocation_units: I64,
+        sectors_per_allocation_unit: U32,
+        bytes_per_sector: U32,
+    }
 );
 wire!(
     /// FileFsAttributeInformation fixed prefix: [MS-FSCC] §2.5.1.

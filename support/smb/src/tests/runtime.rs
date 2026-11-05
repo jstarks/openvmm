@@ -68,6 +68,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::Open,
             Operation::Close,
             Operation::Metadata,
+            Operation::FileSystemInformation,
             Operation::Read,
             Operation::Write,
             Operation::Flush,
@@ -164,6 +165,13 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         assert_eq!(metadata.name, "renamed");
         assert_eq!(metadata.written, 30);
         assert!(metadata.delete_pending);
+        let volume = through_gates(
+            fs.filesystem_information(&file, &context),
+            &control,
+            Operation::FileSystemInformation,
+        )
+        .await;
+        assert_eq!(volume.caller_available_allocation_units, 1021);
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
         let range = ByteRange {
             offset: 0,

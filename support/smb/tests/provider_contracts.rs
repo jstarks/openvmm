@@ -25,6 +25,7 @@ impl Fixture for MemoryFixture {
 
     fn expectations(&self) -> Expectations {
         Expectations {
+            filesystem_information: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -49,6 +50,7 @@ impl ControlledFixture {
     fn rejecting() -> Self {
         let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 32));
         for operation in [
+            Operation::FileSystemInformation,
             Operation::SetBasic,
             Operation::Rename,
             Operation::Lock,
@@ -68,6 +70,7 @@ impl ControlledFixture {
             fs,
             control,
             expectations: Expectations {
+                filesystem_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -141,6 +144,13 @@ fn declared_unsupported_basic_information_is_exercised() {
 }
 
 #[test]
+fn declared_unsupported_filesystem_information_is_exercised() {
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::filesystem_information(&fixture));
+    fixture.assert_rejected(&[Operation::FileSystemInformation]);
+}
+
+#[test]
 fn declared_unsupported_locks_are_exercised() {
     let fixture = ControlledFixture::rejecting();
     block_on(contracts::lock_conflicts_and_io(&fixture));
@@ -203,6 +213,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
         fs,
         control,
         expectations: Expectations {
+            filesystem_information: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

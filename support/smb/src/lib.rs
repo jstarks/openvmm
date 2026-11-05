@@ -27,8 +27,8 @@ use event_listener::Event;
 use inspect::Inspect;
 use parking_lot::Mutex;
 use provider::{
-    BasicInformation, ByteRange, FileSystem, Metadata, NotifyResult, OpenOptions, RequestContext,
-    map_access,
+    BasicInformation, ByteRange, FileSystem, FileSystemInformation, Metadata, NotifyResult,
+    OpenOptions, RequestContext, map_access,
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -572,6 +572,109 @@ fn buffer_response(bytes: Vec<u8>, maximum: u32) -> Result<Vec<u8>, Status> {
     Ok(out)
 }
 
+fn filesystem_response(
+    info: &FileSystemInformation,
+    class: FileSystemInformationClass,
+    maximum: u32,
+) -> Result<(Status, Vec<u8>), Status> {
+    let minimum = match class {
+        FileSystemInformationClass::VOLUME => FILE_FS_VOLUME_MIN_BUFFER_SIZE,
+        FileSystemInformationClass::SIZE => size_of::<FileFsSizeInformation>(),
+        FileSystemInformationClass::FULL_SIZE => size_of::<FileFsFullSizeInformation>(),
+        FileSystemInformationClass::DEVICE => size_of::<FileFsDeviceInformation>(),
+        FileSystemInformationClass::ATTRIBUTE => size_of::<FileFsAttributeInformation>(),
+        _ => return Err(Status::INVALID_PARAMETER),
+    };
+    if (maximum as usize) < minimum {
+        return Err(Status::INFO_LENGTH_MISMATCH);
+    }
+    let mut out = Vec::new();
+    match class {
+        FileSystemInformationClass::VOLUME => {
+            let label: String = info
+                .label
+                .chars()
+                .take(FILE_FS_VOLUME_MAX_LABEL_LENGTH)
+                .collect();
+            let label = encode_name(&label);
+            out.extend_from_slice(
+                FileFsVolumeInformation {
+                    volume_creation_time: info.created.into(),
+                    volume_serial_number: info.serial.into(),
+                    volume_label_length: (label.len() as u32).into(),
+                    supports_objects: u8::from(info.supports_objects),
+                    reserved: 0,
+                }
+                .as_bytes(),
+            );
+            out.extend_from_slice(&label);
+        }
+        FileSystemInformationClass::DEVICE => out.extend_from_slice(
+            FileFsDeviceInformation {
+                device_type: info.device_type.into(),
+                characteristics: info.device_characteristics.into(),
+            }
+            .as_bytes(),
+        ),
+        FileSystemInformationClass::ATTRIBUTE => {
+            let name = encode_name(&info.name);
+            out.extend_from_slice(
+                FileFsAttributeInformation {
+                    file_system_attributes: FileSystemAttributes::from_bits(info.attributes),
+                    maximum_component_name_length: info.maximum_component_name_length.into(),
+                    file_system_name_length: (name.len() as u32).into(),
+                }
+                .as_bytes(),
+            );
+            out.extend_from_slice(&name);
+        }
+        FileSystemInformationClass::SIZE | FileSystemInformationClass::FULL_SIZE => {
+            if info.total_allocation_units < 0
+                || info.caller_available_allocation_units < 0
+                || info.actual_available_allocation_units < 0
+                || info.sectors_per_allocation_unit == 0
+                || info.bytes_per_sector == 0
+            {
+                return Err(Status::INTERNAL_ERROR);
+            }
+            if class == FileSystemInformationClass::SIZE {
+                out.extend_from_slice(
+                    FileFsSizeInformation {
+                        total_allocation_units: info.total_allocation_units.into(),
+                        available_allocation_units: info.caller_available_allocation_units.into(),
+                        sectors_per_allocation_unit: info.sectors_per_allocation_unit.into(),
+                        bytes_per_sector: info.bytes_per_sector.into(),
+                    }
+                    .as_bytes(),
+                );
+            } else {
+                out.extend_from_slice(
+                    FileFsFullSizeInformation {
+                        total_allocation_units: info.total_allocation_units.into(),
+                        caller_available_allocation_units: info
+                            .caller_available_allocation_units
+                            .into(),
+                        actual_available_allocation_units: info
+                            .actual_available_allocation_units
+                            .into(),
+                        sectors_per_allocation_unit: info.sectors_per_allocation_unit.into(),
+                        bytes_per_sector: info.bytes_per_sector.into(),
+                    }
+                    .as_bytes(),
+                );
+            }
+        }
+        _ => return Err(Status::INVALID_PARAMETER),
+    }
+    let status = if out.len() > maximum as usize {
+        out.truncate(maximum as usize);
+        Status::BUFFER_OVERFLOW
+    } else {
+        Status::SUCCESS
+    };
+    Ok((status, buffer_response(out, maximum)?))
+}
+
 impl<B: FileSystem> Connection<B> {
     /// Process one complete SMB packet, excluding transport framing.
     ///
@@ -1099,6 +1202,11 @@ impl<B: FileSystem> CommandRequest<B> {
                         .change_notify(header, packet, &self.context)
                         .await
                 }
+                Ok(()) if command == Command::QUERY_INFO => {
+                    connection
+                        .query_info(packet, header.tree_id.get(), &self.context)
+                        .await
+                }
                 Ok(()) => connection
                     .dispatch(header, command, packet, &self.context, &self.retired)
                     .await
@@ -1454,7 +1562,6 @@ impl<B: FileSystem> Connection<B> {
             Command::READ => self.read(packet, tree, context).await,
             Command::WRITE => self.write(packet, tree, context).await,
             Command::LOCK => self.lock(packet, tree, context).await,
-            Command::QUERY_INFO => self.query_info(packet, tree, context).await,
             Command::QUERY_DIRECTORY => self.query_directory(packet, tree, context).await,
             Command::SET_INFO => self.set_info(packet, tree, context).await,
             _ => Err(Status::NOT_SUPPORTED),
@@ -1932,7 +2039,7 @@ impl<B: FileSystem> Connection<B> {
         packet: &[u8],
         tree: u32,
         context: &RequestContext,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<(Status, Vec<u8>), Status> {
         let request: QueryInfoRequest = read_body(packet)?;
         variable::<QueryInfoRequest>(
             packet,
@@ -1942,6 +2049,28 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let info_type = request.info_type;
         let class = FileInformationClass(request.info_class);
+        if info_type == InformationType::FILESYSTEM {
+            let class = FileSystemInformationClass(request.info_class);
+            match class {
+                FileSystemInformationClass::VOLUME
+                | FileSystemInformationClass::SIZE
+                | FileSystemInformationClass::FULL_SIZE
+                | FileSystemInformationClass::DEVICE
+                | FileSystemInformationClass::ATTRIBUTE => {}
+                FileSystemInformationClass::LABEL
+                | FileSystemInformationClass::DRIVER_PATH
+                | FileSystemInformationClass::VOLUME_FLAGS => {
+                    return Err(Status::INVALID_INFO_CLASS);
+                }
+                _ => return Err(Status::INVALID_PARAMETER),
+            }
+            let info = self
+                .server
+                .backend
+                .filesystem_information(&file.file, context)
+                .await?;
+            return filesystem_response(&info, class, request.output_buffer_length.get());
+        }
         if info_type == InformationType::FILE
             && matches!(
                 class,
@@ -2032,33 +2161,9 @@ impl<B: FileSystem> Connection<B> {
                 }
                 _ => return Err(Status::NOT_SUPPORTED),
             },
-            InformationType::FILESYSTEM => match FileSystemInformationClass(request.info_class) {
-                FileSystemInformationClass::DEVICE => out.extend_from_slice(
-                    FileFsDeviceInformation {
-                        device_type: FILE_DEVICE_DISK.into(),
-                        characteristics: 0.into(),
-                    }
-                    .as_bytes(),
-                ),
-                FileSystemInformationClass::ATTRIBUTE => {
-                    let name = encode_name("MEMORY");
-                    out.extend_from_slice(
-                        FileFsAttributeInformation {
-                            file_system_attributes: FileSystemAttributes::new()
-                                .with_case_preserved_names(true)
-                                .with_unicode_on_disk(true),
-                            maximum_component_name_length: memory::MAX_COMPONENT_NAME_LENGTH.into(),
-                            file_system_name_length: (name.len() as u32).into(),
-                        }
-                        .as_bytes(),
-                    );
-                    out.extend_from_slice(&name);
-                }
-                _ => return Err(Status::NOT_SUPPORTED),
-            },
             _ => return Err(Status::NOT_SUPPORTED),
         }
-        buffer_response(out, request.output_buffer_length.get())
+        buffer_response(out, request.output_buffer_length.get()).map(|body| (Status::SUCCESS, body))
     }
 
     async fn set_info(

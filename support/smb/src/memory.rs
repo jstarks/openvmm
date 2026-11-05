@@ -4,13 +4,13 @@
 //! A bounded writable in-memory filesystem for synthetic shares.
 
 use crate::provider::{
-    BasicInformation, ByteRange, Change, FileSystem, LockId, Metadata, NotifyResult, OpenOptions,
-    RequestContext,
+    BasicInformation, ByteRange, Change, FileSystem, FileSystemInformation, LockId, Metadata,
+    NotifyResult, OpenOptions, RequestContext,
 };
 use crate::spec::{
-    AccessMask, CreateAction, CreateDisposition, FileAttributes, MAX_PATH_LENGTH,
-    NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter, ShareAccess, Status, TIME_RESTORE,
-    TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
+    AccessMask, CreateAction, CreateDisposition, FILE_DEVICE_DISK, FileAttributes,
+    FileSystemAttributes, MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter,
+    ShareAccess, Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
 use event_listener::Event;
@@ -60,6 +60,7 @@ struct Watch {
 }
 
 struct State {
+    created: u64,
     nodes: BTreeMap<u64, Node>,
     opens: BTreeMap<u64, Open>,
     next_id: u64,
@@ -243,6 +244,7 @@ impl MemoryFs {
             data: Vec::new(),
         };
         Self(Arc::new(Mutex::new(State {
+            created: now,
             nodes: BTreeMap::from([(1, root)]),
             opens: BTreeMap::new(),
             next_id: 2,
@@ -860,6 +862,37 @@ impl FileSystem for MemoryFs {
             .ok_or(Status::FILE_CLOSED)
     }
 
+    async fn filesystem_information(
+        &self,
+        file: &MemoryFile,
+        _request: &RequestContext,
+    ) -> Result<FileSystemInformation, Status> {
+        let state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let total = i64::try_from(state.byte_limit).map_err(|_| Status::NOT_SUPPORTED)?;
+        let available =
+            i64::try_from(state.byte_limit - state.bytes).map_err(|_| Status::NOT_SUPPORTED)?;
+        Ok(FileSystemInformation {
+            created: state.created,
+            serial: 0,
+            label: "Memory".into(),
+            supports_objects: true,
+            name: "MEMORY".into(),
+            attributes: FileSystemAttributes::new()
+                .with_case_preserved_names(true)
+                .with_unicode_on_disk(true)
+                .into_bits(),
+            maximum_component_name_length: MAX_COMPONENT_NAME_LENGTH,
+            device_type: FILE_DEVICE_DISK,
+            device_characteristics: 0,
+            total_allocation_units: total,
+            caller_available_allocation_units: available,
+            actual_available_allocation_units: available,
+            sectors_per_allocation_unit: 1,
+            bytes_per_sector: 1,
+        })
+    }
+
     async fn read(
         &self,
         file: &MemoryFile,
@@ -1373,6 +1406,7 @@ mod tests {
 
         fn expectations(&self) -> Expectations {
             Expectations {
+                filesystem_information: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -1410,6 +1444,11 @@ mod tests {
     #[test]
     fn contract_data_and_identity() {
         run_contract(contracts::data_and_identity);
+    }
+
+    #[test]
+    fn contract_filesystem_information() {
+        run_contract(contracts::filesystem_information);
     }
 
     #[test]

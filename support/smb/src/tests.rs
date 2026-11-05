@@ -234,6 +234,219 @@ mod runtime;
 mod wire;
 
 #[test]
+fn filesystem_queries_report_provider_identity_and_live_capacity() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let root = client.open("", 1, 1).await;
+        let file = client.open("data", 2, 0).await;
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILESYSTEM;
+        query.file_id = root;
+        query.output_buffer_length = 4096.into();
+        query.info_class = 1;
+        let response = client.ok(Command::QUERY_INFO, query.as_bytes()).await;
+        let body: BufferResponse = read_body(&response).unwrap();
+        let data = &response[body.output_buffer_offset.get() as usize..];
+        assert_eq!(&data[8..12], &0u32.to_le_bytes());
+        assert_eq!(&data[12..16], &12u32.to_le_bytes());
+        assert_eq!(&data[16..18], &[1, 0]);
+        assert_eq!(&data[18..], &encode_name("Memory"));
+        let created = data[..8].to_vec();
+        for (size, available) in [(0, 1024i64), (17, 1007), (0, 1024)] {
+            let response = client.set(file, 20, &(size as i64).to_le_bytes()).await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            for class in [3, 7] {
+                query.info_class = class;
+                let response = client.ok(Command::QUERY_INFO, query.as_bytes()).await;
+                let body: BufferResponse = read_body(&response).unwrap();
+                let data = &response[body.output_buffer_offset.get() as usize..];
+                let mut expected = 1024i64.to_le_bytes().to_vec();
+                expected.extend_from_slice(&available.to_le_bytes());
+                if class == 7 {
+                    expected.extend_from_slice(&available.to_le_bytes());
+                }
+                expected.extend_from_slice(&1u32.to_le_bytes());
+                expected.extend_from_slice(&1u32.to_le_bytes());
+                assert_eq!(data, expected);
+            }
+        }
+        query.info_class = 1;
+        query.output_buffer_length = 24.into();
+        let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+        assert_eq!(response_status(&response), Status::BUFFER_OVERFLOW);
+        let body: BufferResponse = read_body(&response).unwrap();
+        let data = &response[body.output_buffer_offset.get() as usize..];
+        assert_eq!(body.output_buffer_length.get(), 24);
+        assert_eq!(&data[12..16], &12u32.to_le_bytes());
+        assert_eq!(&data[18..], &encode_name("Mem"));
+        query.info_class = 3;
+        query.output_buffer_length = 23.into();
+        let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+        assert_eq!(response_status(&response), Status::INFO_LENGTH_MISMATCH);
+        query.output_buffer_length = 4096.into();
+        query.info_class = 1;
+        let response = client.ok(Command::QUERY_INFO, query.as_bytes()).await;
+        let body: BufferResponse = read_body(&response).unwrap();
+        assert_eq!(
+            &response[body.output_buffer_offset.get() as usize..][..8],
+            created
+        );
+        client.close(file).await;
+        client.close(root).await;
+    });
+}
+
+#[test]
+fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
+    let mut info = FileSystemInformation {
+        created: 123,
+        serial: 0x12345678,
+        label: "Other volume".into(),
+        supports_objects: false,
+        name: "OtherFS".into(),
+        attributes: 0x80003,
+        maximum_component_name_length: 128,
+        device_type: 2,
+        device_characteristics: 2,
+        total_allocation_units: 100,
+        caller_available_allocation_units: 20,
+        actual_available_allocation_units: 30,
+        sectors_per_allocation_unit: 8,
+        bytes_per_sector: 512,
+    };
+    for (class, maximum, expected) in [
+        (
+            FileSystemInformationClass::DEVICE,
+            8,
+            vec![2, 0, 0, 0, 2, 0, 0, 0],
+        ),
+        (FileSystemInformationClass::ATTRIBUTE, 14, {
+            let mut out = vec![3, 0, 8, 0, 128, 0, 0, 0, 14, 0, 0, 0];
+            out.extend_from_slice(&[b'O', 0]);
+            out
+        }),
+        (FileSystemInformationClass::SIZE, 24, {
+            let mut out = 100i64.to_le_bytes().to_vec();
+            out.extend_from_slice(&20i64.to_le_bytes());
+            out.extend_from_slice(&8u32.to_le_bytes());
+            out.extend_from_slice(&512u32.to_le_bytes());
+            out
+        }),
+        (FileSystemInformationClass::FULL_SIZE, 32, {
+            let mut out = 100i64.to_le_bytes().to_vec();
+            out.extend_from_slice(&20i64.to_le_bytes());
+            out.extend_from_slice(&30i64.to_le_bytes());
+            out.extend_from_slice(&8u32.to_le_bytes());
+            out.extend_from_slice(&512u32.to_le_bytes());
+            out
+        }),
+    ] {
+        let (status, body) = filesystem_response(&info, class, maximum).unwrap();
+        assert_eq!(
+            status,
+            if class == FileSystemInformationClass::ATTRIBUTE {
+                Status::BUFFER_OVERFLOW
+            } else {
+                Status::SUCCESS
+            }
+        );
+        assert_eq!(&body[8..], expected);
+        assert_eq!(
+            filesystem_response(
+                &info,
+                class,
+                if class == FileSystemInformationClass::ATTRIBUTE {
+                    11
+                } else {
+                    maximum - 1
+                }
+            )
+            .err(),
+            Some(Status::INFO_LENGTH_MISMATCH),
+        );
+    }
+    let (status, body) =
+        filesystem_response(&info, FileSystemInformationClass::VOLUME, 25).unwrap();
+    assert_eq!(status, Status::BUFFER_OVERFLOW);
+    assert_eq!(&body[8..16], &123u64.to_le_bytes());
+    assert_eq!(&body[16..20], &0x12345678u32.to_le_bytes());
+    assert_eq!(&body[20..24], &24u32.to_le_bytes());
+    assert_eq!(&body[24..26], &[0, 0]);
+    assert_eq!(&body[26..], &encode_name("Other volume")[..7]);
+    assert_eq!(
+        filesystem_response(&info, FileSystemInformationClass::VOLUME, 23).err(),
+        Some(Status::INFO_LENGTH_MISMATCH)
+    );
+    info.label = "a".repeat(40);
+    let (status, body) =
+        filesystem_response(&info, FileSystemInformationClass::VOLUME, 4096).unwrap();
+    assert_eq!(status, Status::SUCCESS);
+    assert_eq!(&body[20..24], &64u32.to_le_bytes());
+    assert_eq!(&body[26..], &encode_name(&"a".repeat(32)));
+    info.total_allocation_units = -1;
+    assert_eq!(
+        filesystem_response(&info, FileSystemInformationClass::SIZE, 24).err(),
+        Some(Status::INTERNAL_ERROR)
+    );
+    info.total_allocation_units = 100;
+    info.bytes_per_sector = 0;
+    assert_eq!(
+        filesystem_response(&info, FileSystemInformationClass::FULL_SIZE, 32).err(),
+        Some(Status::INTERNAL_ERROR)
+    );
+}
+
+#[test]
+fn filesystem_queries_propagate_provider_rejection_without_memory_fallback() {
+    use crate::test_support::{ControlledFs, Operation, Plan};
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        control
+            .set_plan(
+                Operation::FileSystemInformation,
+                Plan {
+                    failure: Some(Status::NOT_SUPPORTED),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let root = client.open("", 1, 1).await;
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILESYSTEM;
+        query.file_id = root;
+        query.output_buffer_length = 4096.into();
+        for class in [1, 3, 4, 5, 7] {
+            query.info_class = class;
+            let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+            assert_eq!(response_status(&response), Status::NOT_SUPPORTED);
+        }
+        assert_eq!(
+            control
+                .calls()
+                .iter()
+                .filter(|call| call.operation == Operation::FileSystemInformation)
+                .count(),
+            5
+        );
+        for (class, status) in [
+            (2, Status::INVALID_INFO_CLASS),
+            (11, Status::INVALID_PARAMETER),
+            (255, Status::INVALID_PARAMETER),
+        ] {
+            query.info_class = class;
+            let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+            assert_eq!(response_status(&response), status);
+        }
+        client.close(root).await;
+    });
+}
+
+#[test]
 fn test_client_guest_handshake_does_not_activate_a_pending_session() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

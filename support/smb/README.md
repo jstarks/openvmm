@@ -92,6 +92,7 @@ explicit rejection checks, short transfers, and delayed-registration scheduling.
 Their controlled wrappers validate the test infrastructure, not native I/O.
 
 The common cases check observable data and stable identity, directory listings,
+provider-owned volume identity/capacity and explicit unsupported-volume profiles,
 zero extension/truncation, bilateral sharing and close/drop release, basic DOS
 attributes, rename identity/replacement/sharing/notifications,
 deferred delete modes versus shared disposition and nonempty-directory closes,
@@ -287,6 +288,24 @@ Tree uses dot-component paths rejected by the current namespace policy, and
 valid-req assumes specific native event batching and notification-buffer policy.
 The slow mask probe permits cancellation for many subcases and does not establish
 complete notification compatibility.
+
+## Filesystem Information
+
+QUERY_INFO obtains volume identity, capabilities, device information and capacity
+from the provider's optional filesystem_information operation. The engine does
+not label arbitrary providers MEMORY or assume their component limits or device
+characteristics. Supported classes are volume (1), size (3), device (4),
+attributes (5), and full size (7); other classes are rejected explicitly.
+Variable name/label replies retain their full length fields when returning a
+partial buffer with BUFFER_OVERFLOW. Undersized fixed prefixes return
+INFO_LENGTH_MISMATCH.
+
+MemoryFs uses one-byte logical allocation units: total capacity is its configured
+data quota and available capacity follows retained data bytes, including truncation
+and final deletion. These are synthetic byte units, not invented host disk
+geometry. Volume creation time is independent of root file timestamps; serial
+zero is a valid provider-assigned opaque value. Unsupported providers return
+NOT_SUPPORTED rather than receiving a successful memory-volume fallback.
 
 ## Rename and Move
 

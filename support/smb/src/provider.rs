@@ -101,6 +101,39 @@ impl Metadata {
     }
 }
 
+/// One coherent volume snapshot, supplied by the filesystem rather than the SMB engine.
+#[derive(Debug, Clone)]
+pub struct FileSystemInformation {
+    /// Volume creation time in NT ticks.
+    pub created: u64,
+    /// Provider-assigned opaque volume serial; uniqueness is not required.
+    pub serial: u32,
+    /// Volume label.
+    pub label: String,
+    /// Whether the volume supports object-oriented filesystem objects.
+    pub supports_objects: bool,
+    /// Filesystem name.
+    pub name: String,
+    /// FILE_FS_ATTRIBUTE_INFORMATION capability flags.
+    pub attributes: u32,
+    /// Maximum component length in UTF-16 code units.
+    pub maximum_component_name_length: u32,
+    /// FILE_DEVICE_* volume type.
+    pub device_type: u32,
+    /// FILE_* device characteristics.
+    pub device_characteristics: u32,
+    /// Nonnegative allocation units available in total to the share identity.
+    pub total_allocation_units: i64,
+    /// Nonnegative free units available to the share identity.
+    pub caller_available_allocation_units: i64,
+    /// Nonnegative free units on the volume, before identity-specific quotas.
+    pub actual_available_allocation_units: i64,
+    /// Nonzero sectors per allocation unit.
+    pub sectors_per_allocation_unit: u32,
+    /// Nonzero logical bytes per sector.
+    pub bytes_per_sector: u32,
+}
+
 /// Parameters of an SMB open, after protocol validation.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
@@ -239,6 +272,14 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         file: &Self::File,
         request: &RequestContext,
     ) -> Result<Metadata, Status>;
+    /// Query the volume containing this open. Do not invent native geometry or capabilities.
+    async fn filesystem_information(
+        &self,
+        _file: &Self::File,
+        _request: &RequestContext,
+    ) -> Result<FileSystemInformation, Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
     /// Read at most `length` bytes from a default data stream.
     /// At EOF, an empty result or STATUS_END_OF_FILE is accepted by the engine.
     async fn read(

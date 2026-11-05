@@ -10,8 +10,8 @@
 pub mod contracts;
 
 use crate::provider::{
-    BasicInformation, ByteRange, FileSystem, LockId, Metadata, NotifyResult, OpenOptions,
-    RequestContext,
+    BasicInformation, ByteRange, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
+    OpenOptions, RequestContext,
 };
 use crate::spec::{NotifyFilter, Status};
 use async_trait::async_trait;
@@ -34,6 +34,8 @@ pub enum Operation {
     Close,
     /// Metadata query.
     Metadata,
+    /// Filesystem identity, capabilities and capacity query.
+    FileSystemInformation,
     /// Data read.
     Read,
     /// Data write.
@@ -725,6 +727,27 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
                 .begin(Operation::Metadata, Some(file.id), None, None, None, r)?;
         let context = call.prepare().await?;
         let result = self.backend.metadata(&file.inner, &context).await;
+        call.complete(result, None).await
+    }
+
+    async fn filesystem_information(
+        &self,
+        file: &Self::File,
+        r: &RequestContext,
+    ) -> Result<FileSystemInformation, Status> {
+        let mut call = self.controller.begin(
+            Operation::FileSystemInformation,
+            Some(file.id),
+            None,
+            None,
+            None,
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .filesystem_information(&file.inner, &context)
+            .await;
         call.complete(result, None).await
     }
 

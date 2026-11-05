@@ -37,6 +37,8 @@ pub enum Feature {
 /// Explicit test expectations, not protocol capability advertisement.
 #[derive(Debug, Clone, Copy)]
 pub struct Expectations {
+    /// Volume identity, capability and capacity snapshots.
+    pub filesystem_information: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -190,6 +192,37 @@ const RANGE: ByteRange = ByteRange {
     offset: 2,
     length: 4,
 };
+
+/// Volume queries through file and directory opens describe the same volume,
+/// with nonnegative capacities and real, nonzero allocation geometry.
+pub async fn filesystem_information<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let root = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().filesystem_information) {
+        rejected(fs.filesystem_information(&root, &request).await, status);
+    } else {
+        let before = fs.filesystem_information(&root, &request).await.unwrap();
+        let file = open(fs, "capacity", CreateDisposition::CREATE, false, &request).await;
+        write_all(fs, &file, 0, b"data", &request).await;
+        let after = fs.filesystem_information(&file, &request).await.unwrap();
+        assert_eq!(
+            (after.created, after.serial),
+            (before.created, before.serial)
+        );
+        assert_eq!((&after.label, &after.name), (&before.label, &before.name));
+        for info in [before, after] {
+            assert!(info.total_allocation_units >= 0);
+            assert!(info.caller_available_allocation_units >= 0);
+            assert!(info.actual_available_allocation_units >= 0);
+            assert!(info.caller_available_allocation_units <= info.total_allocation_units);
+            assert!(info.sectors_per_allocation_unit > 0);
+            assert!(info.bytes_per_sector > 0);
+        }
+        fs.close(&file, &request).await.unwrap();
+    }
+    fs.close(&root, &request).await.unwrap();
+}
 
 async fn rejected_lock<B: FileSystem>(
     fs: &B,

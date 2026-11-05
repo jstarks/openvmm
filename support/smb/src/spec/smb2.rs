@@ -51,6 +51,7 @@ open_enum! {
     pub enum Status: u32 {
         #![expect(missing_docs, reason = "Status names follow the cited NTSTATUS table.")]
         SUCCESS = 0,
+        PENDING = 0x00000103,
         CANCELLED = 0xc0000120,
         INFO_LENGTH_MISMATCH = 0xc0000004,
         EAS_NOT_SUPPORTED = 0xc000004f,
@@ -459,6 +460,22 @@ Header, 64 {
     signature: [u8; 16],
 });
 
+wire!(
+/// Asynchronous header, replacing ProcessId/TreeId with AsyncId: [MS-SMB2] §2.2.1.1.
+AsyncHeader, 64 {
+    protocol: [u8; 4],
+    structure_size: U16,
+    credit_charge: U16,
+    status: U32,
+    command: U16,
+    credits: U16,
+    flags: HeaderFlags,
+    next_command: U32,
+    message_id: U64,
+    async_id: U64,
+    session_id: U64,
+    signature: [u8; 16],
+});
 wire!(
 /// NEGOTIATE request fixed prefix: [MS-SMB2] §2.2.3.
 NegotiateRequest, 36, 36 {

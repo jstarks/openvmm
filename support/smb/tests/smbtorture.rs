@@ -3,8 +3,9 @@
 
 //! Optional independent interoperability coverage; no host filesystem share is used.
 
+use futures::FutureExt;
 use pal_async::DefaultPool;
-use smb::{Server, memory::MemoryFs};
+use smb::{Server, memory::MemoryFs, provider::FileSystem};
 use std::net::TcpListener;
 use std::process::Command;
 use test_with_tracing::test;
@@ -12,18 +13,100 @@ use test_with_tracing::test;
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
 fn samba_read_write_smoke() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port().to_string();
     let backend = MemoryFs::new(16 * 1024 * 1024, 4096);
     #[cfg(feature = "test-support")]
     let (backend, _control) = smb::test_support::ControlledFs::new(backend);
+    run_torture(
+        backend,
+        std::future::pending(),
+        &[
+            "smb2.connect",
+            "smb2.tcon",
+            "smb2.rw.rw1",
+            "smb2.rw.rw2",
+            "smb2.read.eof",
+            "smb2.read.position",
+            "smb2.read.dir",
+            "smb2.read.access",
+            "smb2.create.open",
+            "smb2.mkdir",
+            "smb2.compound.create-write-close",
+            "smb2.compound.related5",
+            "smb2.compound_find.compound_find_related",
+            "smb2.compound_find.compound_find_unrelated",
+        ],
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_gated_async_compounds() {
+    use smb::test_support::{ControlledFs, Gate, Operation, Phase, Plan};
+    let (backend, control) = ControlledFs::new(MemoryFs::new(16 * 1024 * 1024, 4096));
+    for operation in [Operation::Read, Operation::Write, Operation::Flush] {
+        control
+            .set_plan(
+                operation,
+                Plan {
+                    hold_before: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+    }
+    let driver = control.clone();
+    // The gate controller shares the server's poller, rather than racing an I/O thread.
+    let controller = async move {
+        loop {
+            let call = driver.next_call().await;
+            driver.release(call.id, Gate::Before).unwrap();
+        }
+    };
+    run_torture(
+        backend,
+        controller,
+        &[
+            "--option=torture:smbd=true",
+            "smb2.compound_async.flush_close",
+            "smb2.compound_async.flush_flush",
+            "smb2.compound_async.write_write",
+            "smb2.compound_async.read_read",
+        ],
+    );
+    assert!(
+        control
+            .calls()
+            .iter()
+            .any(|call| call.operation == Operation::Write && call.delegated)
+    );
+    assert!(
+        !control
+            .calls()
+            .iter()
+            .any(|call| call.phase == Phase::Abandoned)
+    );
+}
+
+fn run_torture(
+    backend: impl FileSystem,
+    controller: impl Future<Output = ()> + Send + 'static,
+    suites: &[&str],
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
     let server = Server::new("memory", backend).unwrap();
     let (stop, stopped) = async_channel::bounded::<()>(1);
     let worker = std::thread::spawn(move || {
         DefaultPool::run_with(async |driver| -> Result<(), smb::Error> {
             let mut service = smb::tcp::Server::new(driver, listener, server)?;
             service.start();
-            stopped.recv().await.unwrap();
+            let mut controller = std::pin::pin!(controller.fuse());
+            let mut stopped = std::pin::pin!(stopped.recv().fuse());
+            futures::select! {
+                () = controller => panic!("test controller unexpectedly completed"),
+                result = stopped => { result.unwrap(); }
+            }
             service.shutdown().await
         })
     });
@@ -41,21 +124,8 @@ fn samba_read_write_smoke() {
             "--seed=12345",
             "--num-ops=32",
             "--maximum-runtime=90",
-            "smb2.connect",
-            "smb2.tcon",
-            "smb2.rw.rw1",
-            "smb2.rw.rw2",
-            "smb2.read.eof",
-            "smb2.read.position",
-            "smb2.read.dir",
-            "smb2.read.access",
-            "smb2.create.open",
-            "smb2.mkdir",
-            "smb2.compound.create-write-close",
-            "smb2.compound.related5",
-            "smb2.compound_find.compound_find_related",
-            "smb2.compound_find.compound_find_unrelated",
         ])
+        .args(suites)
         .status();
     stop.send_blocking(()).unwrap();
     worker.join().unwrap().unwrap();

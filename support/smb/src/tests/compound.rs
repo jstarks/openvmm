@@ -50,6 +50,20 @@ pub(super) fn responses(mut packet: &[u8]) -> Vec<&[u8]> {
     replies
 }
 
+pub(super) fn refresh<B: FileSystem>(client: &mut Client<B>, packet: &mut [u8]) {
+    let mut offset = 0;
+    loop {
+        let header = Header::mut_from_prefix(&mut packet[offset..]).unwrap().0;
+        header.message_id = client.message.into();
+        client.message += u64::from(header.credit_charge.get().max(1));
+        let next = header.next_command.get() as usize;
+        if next == 0 {
+            break;
+        }
+        offset += next;
+    }
+}
+
 pub(super) fn read(file: FileId, length: u32) -> Vec<u8> {
     let mut request = ReadRequest::new_zeroed();
     request.structure_size = ReadRequest::STRUCTURE_SIZE.into();
@@ -417,6 +431,7 @@ fn malformed_chains_and_mixed_styles_are_rejected_before_filesystem_effects() {
             ),
             Status::OBJECT_NAME_NOT_FOUND
         );
+        let unused = client.message;
         let oversized = packet(
             &mut client,
             (0..=MAX_REQUESTS)
@@ -428,8 +443,10 @@ fn malformed_chains_and_mixed_styles_are_rejected_before_filesystem_effects() {
             client.connection.request(oversized),
             Err(Error::InvalidCompound)
         ));
+        client.message = unused;
         for offset in [0, second] {
             let mut mixed = bytes.clone();
+            refresh(&mut client, &mut mixed);
             let header = Header::mut_from_prefix(&mut mixed[offset..]).unwrap().0;
             header.flags.set_related_operations(offset == 0);
             let response = client.connection.process(&mixed).await.unwrap();
@@ -477,6 +494,8 @@ fn per_command_credit_charge_and_close_before_later_io_are_enforced() {
             response_status(&client.read(file, 0, 1).await),
             Status::END_OF_FILE
         );
+        let mut bytes = bytes;
+        refresh(&mut client, &mut bytes);
         let accepted = client.connection.request(bytes).unwrap();
         assert_eq!(client.connection.state.lock().credits_in_use, 4);
         let response = accepted.execute().await.unwrap();

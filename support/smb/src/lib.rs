@@ -13,6 +13,7 @@
 
 mod codec;
 mod compound;
+mod credits;
 pub use compound::Request;
 pub mod memory;
 pub mod provider;
@@ -54,6 +55,15 @@ pub enum Error {
     /// A compound chain has invalid boundaries or exceeds the command bound.
     #[error("invalid SMB compound chain")]
     InvalidCompound,
+    /// A message ID, replay, or multi-credit range was not granted to the peer.
+    #[error("invalid SMB credit sequence number {0}")]
+    InvalidCreditSequence(u64),
+    /// Sequence numbers cannot wrap or be reused.
+    #[error("SMB credit sequence exhausted")]
+    CreditSequenceExhausted,
+    /// The caller stopped receiving responses; accepted backend work was still drained.
+    #[error("SMB response channel closed")]
+    ResponseChannelClosed,
     /// A backend could not complete destructive shutdown.
     #[error("SMB backend shutdown failed: {0:?}")]
     Backend(Status),
@@ -107,9 +117,10 @@ impl<B: FileSystem> Server<B> {
             next_file: 1,
             files: BTreeMap::new(),
             requests: BTreeMap::new(),
-            credits: 1,
+            window: credits::Window::new(),
             credits_in_use: 0,
             disconnected: false,
+            next_async: 1,
         }));
         let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
         let mut connections = self.connections.lock();
@@ -152,9 +163,10 @@ struct ConnectionState<F> {
     next_file: u64,
     files: BTreeMap<u64, Arc<OpenFile<F>>>,
     requests: BTreeMap<u64, RequestInfo<F>>,
-    credits: u32,
+    window: credits::Window,
     credits_in_use: u32,
     disconnected: bool,
+    next_async: u64,
 }
 
 struct RequestInfo<F> {
@@ -168,6 +180,7 @@ struct RequestInfo<F> {
     creating: bool,
     group: u64,
     activated: bool,
+    async_id: Option<u64>,
 }
 
 /// An admitted request. Its future must be retained until completion.
@@ -179,6 +192,71 @@ struct CommandRequest<B: FileSystem> {
     error: Option<Status>,
     retired: Vec<Arc<OpenFile<B::File>>>,
     activated: bool,
+}
+
+struct CommandResponse {
+    header: Header,
+    bytes: Vec<u8>,
+    async_id: Option<u64>,
+}
+
+fn error_body() -> Vec<u8> {
+    let mut body = ErrorResponse {
+        structure_size: ErrorResponse::STRUCTURE_SIZE.into(),
+        context_count: 0,
+        reserved: 0,
+        byte_count: 0.into(),
+    }
+    .as_bytes()
+    .to_vec();
+    body.push(0);
+    body
+}
+
+fn response_bytes(header: &Header, async_id: Option<u64>, body: &[u8]) -> Vec<u8> {
+    let mut bytes = if let Some(async_id) = async_id {
+        AsyncHeader {
+            protocol: header.protocol,
+            structure_size: header.structure_size,
+            credit_charge: header.credit_charge,
+            status: header.status,
+            command: header.command,
+            credits: header.credits,
+            flags: header
+                .flags
+                .with_async_command(true)
+                .with_related_operations(false),
+            next_command: 0.into(),
+            message_id: header.message_id,
+            async_id: async_id.into(),
+            session_id: header.session_id,
+            signature: header.signature,
+        }
+        .as_bytes()
+        .to_vec()
+    } else {
+        header.as_bytes().to_vec()
+    };
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+impl<F> ConnectionState<F> {
+    fn grant(&mut self, header: &Header) -> Result<u16, Error> {
+        let info = self
+            .requests
+            .get_mut(&header.message_id.get())
+            .ok_or(Error::Backend(Status::INTERNAL_ERROR))?;
+        self.credits_in_use -= info.charge;
+        info.charge = 0;
+        self.grant_credits(header.credits.get())
+    }
+
+    fn grant_credits(&mut self, requested: u16) -> Result<u16, Error> {
+        let grant = u32::from(requested.max(1))
+            .min(MAX_REQUESTS as u32 - self.window.len() - self.credits_in_use);
+        self.window.grant(grant)
+    }
 }
 
 impl<B: FileSystem> Clone for Connection<B> {
@@ -292,7 +370,7 @@ impl<F> Inspect for ConnectionState<F> {
             .field("session", self.session)
             .field("session_active", self.session_active)
             .field("disconnected", self.disconnected)
-            .field("credits", self.credits)
+            .field("credits", self.window.len())
             .field("credits_in_use", self.credits_in_use)
             .field("trees", inspect::iter_by_index(self.trees.iter()))
             .field("opens", inspect::iter_by_key(self.files.iter()))
@@ -305,6 +383,7 @@ impl<F> Inspect for ConnectionState<F> {
                             .field("operation_id", info.context.id())
                             .field("compound_group", info.group)
                             .field("activated", info.activated)
+                            .field("async_id", info.async_id)
                             .field("tree", info.tree)
                             .field("cancel_requested", info.context.is_cancelled());
                     });
@@ -331,7 +410,8 @@ impl<B: FileSystem> Drop for CommandRequest<B> {
             if request.charge != 0 {
                 let mut state = self.connection.state.lock();
                 state.credits_in_use -= request.charge;
-                state.credits += request.charge;
+                // A discarded accepted request cannot reissue its consumed IDs.
+                state.disconnected = true;
             }
             if let Some(file) = request.open {
                 file.untrack(request.context.id());
@@ -488,11 +568,16 @@ impl<B: FileSystem> Connection<B> {
         if state.requests.len() + headers.len() > MAX_REQUESTS {
             return Err(Error::RequestLimit);
         }
-        let total_charge: u32 = headers
+        let sequence_ranges: Vec<_> = headers
             .iter()
-            .map(|header| u32::from(header.credit_charge.get().max(1)))
-            .sum();
-        let invalid_credit = total_charge > state.credits;
+            .map(|header| {
+                (
+                    header.message_id.get(),
+                    u32::from(header.credit_charge.get().max(1)),
+                )
+            })
+            .collect();
+        state.window.consume(&sequence_ranges)?;
         let group = self
             .server
             .next_request
@@ -506,15 +591,14 @@ impl<B: FileSystem> Connection<B> {
             let mut bytes = packet[range].to_vec();
             let command = header.command();
             let context = RequestContext::new(group + index as u64);
-            let error = if invalid_style || invalid_credit || packet.len() > MAX_MESSAGE_SIZE {
+            let error = if invalid_style || packet.len() > MAX_MESSAGE_SIZE {
                 Some(Status::INVALID_PARAMETER)
             } else if header.flags.async_command() || header.flags.signed() {
                 Some(Status::NOT_SUPPORTED)
             } else {
                 compound::charge(&bytes, &header).err()
             };
-            let charge = u32::from(header.credit_charge.get().max(1)).min(state.credits);
-            state.credits -= charge;
+            let charge = u32::from(header.credit_charge.get().max(1));
             state.credits_in_use += charge;
             let file = compound::request_file_id(&mut bytes, None).ok().flatten();
             let bound_file = if related && index != 0 {
@@ -566,6 +650,7 @@ impl<B: FileSystem> Connection<B> {
                     creating: false,
                     group,
                     activated: false,
+                    async_id: None,
                 },
             );
             commands.push(CommandRequest {
@@ -720,6 +805,46 @@ impl<B: FileSystem> Connection<B> {
         request.retired = retired;
     }
 
+    // Interim credit grants must not let a full registry obstruct subsequent CANCEL.
+    pub(crate) fn busy_response(&self, packet: &[u8]) -> Result<Vec<u8>, Error> {
+        let ranges = compound::ranges(packet)?;
+        let headers = ranges
+            .iter()
+            .map(|range| {
+                Header::read_from_prefix(&packet[range.clone()])
+                    .map(|(header, _)| header)
+                    .map_err(|_| Error::InvalidHeader)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sequences = headers
+            .iter()
+            .map(|header| {
+                (
+                    header.message_id.get(),
+                    u32::from(header.credit_charge.get().max(1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = self.state.lock();
+        state.window.consume(&sequences)?;
+        let mut output = Vec::new();
+        let mut last = None;
+        for (index, mut header) in headers.into_iter().enumerate() {
+            let related = index != 0 && header.flags.related_operations();
+            header.status = Status::INSUFFICIENT_RESOURCES.0.into();
+            header.flags = HeaderFlags::new().with_server_to_redir(true);
+            header.next_command = 0.into();
+            header.signature = [0; 16];
+            header.credits = state.grant_credits(header.credits.get())?.into();
+            let response = response_bytes(&header, None, &error_body());
+            if ranges.len() == 1 {
+                return Ok(response);
+            }
+            compound::append_response(&mut output, &mut last, response, related)?;
+        }
+        Ok(output)
+    }
+
     /// Expedite cancellation without consuming a credit or producing a reply.
     pub fn cancel(&self, packet: &[u8]) -> Result<(), Error> {
         let (header, _) = Header::read_from_prefix(packet).map_err(|_| Error::InvalidHeader)?;
@@ -733,8 +858,22 @@ impl<B: FileSystem> Connection<B> {
         {
             return Err(Error::InvalidHeader);
         }
-        if !header.flags.async_command() {
-            if let Some(info) = self.state.lock().requests.get(&header.message_id.get()) {
+        {
+            let state = self.state.lock();
+            let target = if header.flags.async_command() {
+                let id = AsyncHeader::read_from_prefix(packet)
+                    .map_err(|_| Error::InvalidHeader)?
+                    .0
+                    .async_id
+                    .get();
+                state
+                    .requests
+                    .values()
+                    .find(|info| info.async_id == Some(id))
+            } else {
+                state.requests.get(&header.message_id.get())
+            };
+            if let Some(info) = target {
                 if !matches!(
                     info.command,
                     Command::CLOSE | Command::TREE_DISCONNECT | Command::LOGOFF
@@ -744,6 +883,34 @@ impl<B: FileSystem> Connection<B> {
             }
         }
         Ok(())
+    }
+
+    fn pending_response(&self, header: &Header, session: u64) -> Result<Option<Vec<u8>>, Error> {
+        let mut state = self.state.lock();
+        let info = state
+            .requests
+            .get(&header.message_id.get())
+            .ok_or(Error::Backend(Status::INTERNAL_ERROR))?;
+        if info.async_id.is_some() {
+            return Ok(None);
+        }
+        let id = state.next_async;
+        state.next_async = id
+            .checked_add(1)
+            .ok_or(Error::Backend(Status::INSUFFICIENT_RESOURCES))?;
+        state
+            .requests
+            .get_mut(&header.message_id.get())
+            .ok_or(Error::Backend(Status::INTERNAL_ERROR))?
+            .async_id = Some(id);
+        let mut response = *header;
+        response.status = Status::PENDING.0.into();
+        response.flags = HeaderFlags::new().with_server_to_redir(true);
+        response.next_command = 0.into();
+        response.session_id = session.into();
+        response.signature = [0; 16];
+        response.credits = state.grant(header)?.into();
+        Ok(Some(response_bytes(&response, Some(id), &error_body())))
     }
 
     fn file(
@@ -838,7 +1005,7 @@ impl<B: FileSystem> Connection<B> {
 
 impl<B: FileSystem> CommandRequest<B> {
     /// Run admitted work. Dropping this future is not a backend cancellation API.
-    async fn execute(mut self) -> Result<Vec<u8>, Error> {
+    async fn execute(mut self) -> Result<CommandResponse, Error> {
         if !self.activated {
             let connection = self.connection.clone();
             connection.activate(&mut self, &mut connection.state.lock());
@@ -885,18 +1052,7 @@ impl<B: FileSystem> CommandRequest<B> {
         };
         let (status, body) = match result {
             Ok(response) => response,
-            Err(status) => {
-                let mut body = ErrorResponse {
-                    structure_size: ErrorResponse::STRUCTURE_SIZE.into(),
-                    context_count: 0,
-                    reserved: 0,
-                    byte_count: 0.into(),
-                }
-                .as_bytes()
-                .to_vec();
-                body.push(0);
-                (status, body)
-            }
+            Err(status) => (status, error_body()),
         };
         let mut response = Header {
             protocol: SIGNATURE,
@@ -913,28 +1069,26 @@ impl<B: FileSystem> CommandRequest<B> {
             session_id: header.session_id,
             signature: [0; 16],
         };
-        {
+        let async_id = {
             let mut state = connection.state.lock();
             if let Some(info) = state.requests.get(&header.message_id.get()) {
                 response.session_id = info.response_session.into();
                 response.tree_id = info.response_tree.into();
             }
-            let charge = state
+            let async_id = state
                 .requests
                 .get(&header.message_id.get())
-                .map_or(0, |info| info.charge);
-            state.credits_in_use -= charge;
-            if let Some(info) = state.requests.get_mut(&header.message_id.get()) {
-                info.charge = 0;
+                .and_then(|info| info.async_id);
+            if async_id.is_none() {
+                response.credits = state.grant(header)?.into();
             }
-            let grant = u32::from(header.credits.get().max(1))
-                .min(MAX_REQUESTS as u32 - state.credits - state.credits_in_use);
-            state.credits += grant;
-            response.credits = (grant as u16).into();
-        }
-        let mut out = response.as_bytes().to_vec();
-        out.extend_from_slice(&body);
-        Ok(out)
+            async_id
+        };
+        Ok(CommandResponse {
+            bytes: response_bytes(&response, async_id, &body),
+            header: response,
+            async_id,
+        })
     }
 }
 

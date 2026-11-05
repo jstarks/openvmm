@@ -585,7 +585,7 @@ fn tcp_pause_retains_committed_reordered_writes_and_a_concurrent_close() {
         );
         memory.close(&observer, &context).await.unwrap();
         control.release(second_call.id, Gate::After).unwrap();
-        stream.until(|s| s.output.len() == 84).await;
+        stream.until(|s| final_frames(&s.output).len() == 1).await;
         task.stop().await;
         assert_eq!(control.snapshot(first_call.id).unwrap().phase, Phase::After);
         stream.input(&close_frame);
@@ -603,12 +603,13 @@ fn tcp_pause_retains_committed_reordered_writes_and_a_concurrent_close() {
         control.release(first_call.id, Gate::After).unwrap();
         assert_eq!(stream.state.lock().output, before);
         task.start();
-        stream.until(|s| s.output.len() == 296).await;
+        stream.until(|s| final_frames(&s.output).len() == 3).await;
         task.stop().await;
         let bytes = stream.state.lock().output.clone();
-        let first_response = Header::read_from_prefix(&bytes[4..]).unwrap().0;
-        let second_response = Header::read_from_prefix(&bytes[88..]).unwrap().0;
-        let close_response = Header::read_from_prefix(&bytes[172..]).unwrap().0;
+        let replies = final_frames(&bytes);
+        let first_response = Header::read_from_prefix(replies[0]).unwrap().0;
+        let second_response = Header::read_from_prefix(replies[1]).unwrap().0;
+        let close_response = Header::read_from_prefix(replies[2]).unwrap().0;
         assert_eq!(first_response.message_id.get(), first_message + 1);
         assert_eq!(second_response.message_id.get(), first_message);
         assert_eq!(close_response.message_id.get(), first_message + 2);
@@ -676,7 +677,7 @@ fn compound_pause_retains_committed_io_and_queued_commands_during_external_close
             3
         );
         task.stop().await;
-        assert!(stream.state.lock().output.is_empty());
+        assert!(final_frames(&stream.state.lock().output).is_empty());
         let close_id = client.message;
         let close = frame(&request(
             Command::CLOSE,
@@ -693,31 +694,49 @@ fn compound_pause_retains_committed_io_and_queued_commands_during_external_close
         task.stop().await;
         assert!(control.snapshot(write.id).unwrap().cancel_requested);
         assert_eq!(successes(&control, Operation::Close), 0);
+        let paused = stream.state.lock().output.clone();
         control.release(write.id, Gate::After).unwrap();
-        assert!(stream.state.lock().output.is_empty());
+        assert_eq!(stream.state.lock().output, paused);
         task.start();
-        stream.until(|state| state.output.len() == 372).await;
+        stream
+            .until(|state| final_frames(&state.output).len() == 4)
+            .await;
         task.stop().await;
         let output = stream.state.lock().output.clone();
-        let mut frames = output.as_slice();
         let mut saw_compound = false;
         let mut saw_close = false;
-        while !frames.is_empty() {
-            let length = u32::from_be_bytes(frames[..4].try_into().unwrap()) as usize;
-            let replies = compound::responses(&frames[4..4 + length]);
-            let header = Header::read_from_prefix(replies[0]).unwrap().0;
+        let pending: BTreeMap<_, _> = complete_frames(&output)
+            .into_iter()
+            .filter(|frame| response_status(frame) == Status::PENDING)
+            .map(|frame| {
+                let header = AsyncHeader::read_from_prefix(frame).unwrap().0;
+                (header.message_id.get(), header.async_id.get())
+            })
+            .collect();
+        assert_eq!(pending.len(), 4);
+        let replies = final_frames(&output);
+        assert_eq!(replies.len(), 4);
+        for reply in replies {
+            let header = Header::read_from_prefix(reply).unwrap().0;
+            let asynchronous = AsyncHeader::read_from_prefix(reply).unwrap().0;
+            assert!(header.flags.async_command());
+            assert_eq!(
+                pending[&header.message_id.get()],
+                asynchronous.async_id.get()
+            );
+            assert_eq!(header.credits.get(), 0);
             if header.message_id.get() == first_id {
-                assert_eq!(replies.len(), 3);
-                assert_eq!(response_status(replies[0]), Status::SUCCESS);
-                assert_eq!(response_status(replies[1]), Status::FILE_CLOSED);
-                assert_eq!(response_status(replies[2]), Status::FILE_CLOSED);
+                assert_eq!(header.status(), Status::SUCCESS);
                 saw_compound = true;
-            } else {
-                assert_eq!(header.message_id.get(), close_id);
+            } else if header.message_id.get() == close_id {
                 assert_eq!(header.status(), Status::SUCCESS);
                 saw_close = true;
+            } else {
+                assert!(
+                    matches!(header.message_id.get(), id if id == first_id + 1 || id == first_id + 2)
+                );
+                assert_eq!(header.status(), Status::FILE_CLOSED);
             }
-            frames = &frames[4 + length..];
         }
         assert!(saw_compound && saw_close);
         assert_eq!(successes(&control, Operation::Write), 1);
@@ -799,7 +818,7 @@ fn deferred_binding_orders_barriers_independently_of_operation_identity() {
 }
 
 #[test]
-fn cancel_reaches_queued_compound_io_and_dropping_unstarted_work_refunds_credits() {
+fn cancel_reaches_queued_compound_io_and_discarded_work_does_not_reissue_ids() {
     block_on(async {
         let (fs, control) = controlled(false);
         let server = Server::new("memory", fs).unwrap();
@@ -816,10 +835,25 @@ fn cancel_reaches_queued_compound_io_and_dropping_unstarted_work_refunds_credits
             ],
             true,
         );
-        let baseline = client.connection.state.lock().credits;
+        let baseline = client.connection.state.lock().window.len();
         drop(client.connection.request(bytes.clone()).unwrap());
-        assert_eq!(client.connection.state.lock().credits, baseline);
+        assert_eq!(client.connection.state.lock().window.len(), baseline - 2);
+        assert!(client.connection.state.lock().disconnected);
         assert!(client.connection.state.lock().requests.is_empty());
+        client.connection.shutdown().await.unwrap();
+        client = Client::new(&server).await;
+        let file = client.open("queued-cancel", 1, 0).await;
+        let bytes = compound::packet(
+            &mut client,
+            vec![
+                (Command::WRITE, Client::write_body(file, 0, b"one")),
+                (
+                    Command::WRITE,
+                    Client::write_body(FileId::RELATED, 3, b"two"),
+                ),
+            ],
+            true,
+        );
         let next = Header::read_from_prefix(&bytes)
             .unwrap()
             .0
@@ -859,7 +893,7 @@ fn cancel_reaches_queued_compound_io_and_dropping_unstarted_work_refunds_credits
 }
 
 #[test]
-fn tcp_retains_a_compound_frame_when_command_admission_is_full() {
+fn tcp_rejects_an_excess_compound_atomically_without_waiting_for_pending_io() {
     DefaultPool::run_with(async |driver| {
         let (fs, control) = controlled(false);
         let server = Server::new("memory", fs).unwrap();
@@ -896,24 +930,27 @@ fn tcp_retains_a_compound_frame_when_command_admission_is_full() {
         let held = control.next_call().await;
         stream.input(&frame(&bytes));
         stream
-            .until(|state| state.read == write.len() + bytes.len() + 8)
+            .until(|state| final_frames(&state.output).len() == 1)
             .await;
         task.stop().await;
         assert_eq!(inspect_text("active_requests", &task).await, "1");
         control.release(held.id, Gate::Before).unwrap();
         task.start();
         stream
-            .until(|state| state.output.len() == 84 + 4 + MAX_REQUESTS * 72)
+            .until(|state| final_frames(&state.output).len() == 2)
             .await;
         task.stop().await;
         let output = stream.state.lock().output.clone();
-        let replies = compound::responses(&output[88..]);
+        let finals = final_frames(&output);
+        let replies = compound::responses(finals[0]);
         assert_eq!(replies.len(), MAX_REQUESTS);
         assert!(
             replies
                 .iter()
-                .all(|reply| response_status(reply) == Status::SUCCESS)
+                .all(|reply| response_status(reply) == Status::INSUFFICIENT_RESOURCES)
         );
+        assert_eq!(response_status(finals[1]), Status::SUCCESS);
+        client.ok(Command::ECHO, echo.as_bytes()).await;
         task.task_mut().shutdown().await.unwrap();
     });
 }
@@ -1168,6 +1205,26 @@ fn frame(packet: &[u8]) -> Vec<u8> {
     frame
 }
 
+fn complete_frames(mut bytes: &[u8]) -> Vec<&[u8]> {
+    let mut frames = Vec::new();
+    while bytes.len() >= 4 {
+        let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        if bytes.len() < 4 + length {
+            break;
+        }
+        frames.push(&bytes[4..4 + length]);
+        bytes = &bytes[4 + length..];
+    }
+    frames
+}
+
+fn final_frames(bytes: &[u8]) -> Vec<&[u8]> {
+    complete_frames(bytes)
+        .into_iter()
+        .filter(|frame| response_status(frame) != Status::PENDING)
+        .collect()
+}
+
 async fn inspect_text(path: &str, object: impl inspect::InspectMut) -> String {
     let mut inspection = inspect::inspect(path, object);
     inspection.resolve().await;
@@ -1238,16 +1295,26 @@ fn task_pause_and_inspection_preserve_partial_frames_pending_io_and_responses() 
         task.stop().await;
         assert_eq!(successes(&control, Operation::Write), 1);
         assert_eq!(inspect_text("transmit_offset", &task).await, "9");
-        assert_eq!(inspect_text("queued_responses", &task).await, "2");
+        let queued: usize = inspect_text("queued_responses", &task)
+            .await
+            .parse()
+            .unwrap();
+        let channel: usize = inspect_text("response_channel_frames", &task)
+            .await
+            .parse()
+            .unwrap();
+        assert_eq!(queued + channel, 4);
         stream.writable(usize::MAX);
         task.start();
-        stream.until(|s| s.output.len() == 212).await;
+        stream.until(|s| final_frames(&s.output).len() == 2).await;
         assert_eq!(inspect_text("queued_responses", &task).await, "0");
         task.stop().await;
         let bytes = stream.state.lock().output.clone();
-        assert_eq!(bytes.len(), 212);
-        assert_eq!(response_status(&bytes[4..]), Status::SUCCESS);
-        assert_eq!(response_status(&bytes[88..]), Status::SUCCESS);
+        let replies = final_frames(&bytes);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(complete_frames(&bytes).len(), 4);
+        assert_eq!(response_status(replies[0]), Status::SUCCESS);
+        assert_eq!(response_status(replies[1]), Status::SUCCESS);
         assert_eq!(successes(&control, Operation::Write), 1);
         task.task_mut().shutdown().await.unwrap();
         assert_eq!(successes(&control, Operation::Close), 1);
@@ -1255,7 +1322,7 @@ fn task_pause_and_inspection_preserve_partial_frames_pending_io_and_responses() 
 }
 
 #[test]
-fn cancel_is_processed_when_every_request_slot_is_occupied() {
+fn excess_credited_requests_do_not_obstruct_cancel_when_every_slot_is_occupied() {
     DefaultPool::run_with(async |driver| {
         let (fs, control) = controlled(true);
         let server = Server::new("memory", fs.clone()).unwrap();
@@ -1288,6 +1355,19 @@ fn cancel_is_processed_when_every_request_slot_is_occupied() {
             inspect_text("active_requests", &task).await,
             MAX_REQUESTS.to_string()
         );
+        let excess_message = client.message;
+        stream.input(&frame(&request(
+            Command::ECHO,
+            SimpleBody {
+                structure_size: SimpleBody::STRUCTURE_SIZE.into(),
+                reserved: 0.into(),
+            }
+            .as_bytes(),
+            client.session,
+            client.tree,
+            excess_message,
+        )));
+        client.message += 1;
         let cancel = request(
             Command::CANCEL,
             SimpleBody {
@@ -1300,7 +1380,23 @@ fn cancel_is_processed_when_every_request_slot_is_occupied() {
             first_message,
         );
         stream.input(&frame(&cancel));
-        stream.until(|s| s.output.len() >= 4).await;
+        stream
+            .until(|s| {
+                final_frames(&s.output).iter().any(|frame| {
+                    let header = Header::read_from_prefix(frame).unwrap().0;
+                    header.message_id.get() == first_message && header.status() == Status::CANCELLED
+                })
+            })
+            .await;
+        assert!(
+            final_frames(&stream.state.lock().output)
+                .iter()
+                .any(|frame| {
+                    let header = Header::read_from_prefix(frame).unwrap().0;
+                    header.message_id.get() == excess_message
+                        && header.status() == Status::INSUFFICIENT_RESOURCES
+                })
+        );
         task.stop().await;
         assert_eq!(successes(&control, Operation::Write), 0);
         task.task_mut().shutdown().await.unwrap();

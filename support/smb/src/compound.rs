@@ -120,6 +120,33 @@ struct Previous {
     poisoned: Option<Status>,
 }
 
+pub(super) fn append_response(
+    output: &mut Vec<u8>,
+    last_response: &mut Option<usize>,
+    mut response: Vec<u8>,
+    related: bool,
+) -> Result<(), Error> {
+    Header::mut_from_prefix(&mut response[..])
+        .map_err(|_| Error::InvalidHeader)?
+        .0
+        .flags
+        .set_related_operations(related);
+    if let Some(start) = *last_response {
+        let next = output.len() - start;
+        Header::mut_from_prefix(&mut output[start..])
+            .map_err(|_| Error::InvalidHeader)?
+            .0
+            .next_command = (next as u32).into();
+    }
+    *last_response = Some(output.len());
+    output.extend_from_slice(&response);
+    output.resize(
+        align_up(output.len(), COMPOUND_ALIGNMENT).map_err(Error::Backend)?,
+        0,
+    );
+    Ok(())
+}
+
 struct InheritanceFailure {
     status: Status,
     stops_chain: bool,
@@ -181,13 +208,52 @@ impl Previous {
 }
 
 impl<B: FileSystem> Request<B> {
-    /// Run accepted work. Retain this future across pause; dropping is not cancellation.
+    /// Return final replies only. Retain this future across pause.
+    ///
+    /// Discarding accepted work disconnects the connection; it does not cancel backend I/O.
     pub async fn execute(self) -> Result<Vec<u8>, Error> {
+        self.execute_inner(None).await
+    }
+
+    /// Deliver interim/early frames while retaining accepted work to completion.
+    ///
+    /// The caller must receive concurrently and retain this future across pause.
+    /// If the receiver closes, the connection is canceled and executing backend
+    /// work is still drained before returning the delivery error.
+    pub async fn execute_with_interim(
+        self,
+        sender: async_channel::Sender<Vec<u8>>,
+    ) -> Result<(), Error> {
+        let connection = self
+            .commands
+            .first()
+            .map(|request| request.connection.clone());
+        let response = self.execute_inner(Some(&sender)).await?;
+        if !response.is_empty() {
+            if sender.send(response).await.is_err() {
+                if let Some(connection) = connection {
+                    connection.cancel_all();
+                }
+                return Err(Error::ResponseChannelClosed);
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_inner(
+        self,
+        sender: Option<&async_channel::Sender<Vec<u8>>>,
+    ) -> Result<Vec<u8>, Error> {
+        use futures::FutureExt;
+        use std::task::Poll;
         let compounded = self.commands.len() > 1;
         let mut output = Vec::new();
         let mut last_response = None;
         let mut previous: Option<Previous> = None;
-        for (index, mut request) in self.commands.into_iter().enumerate() {
+        let mut commands = self.commands.into_iter();
+        let mut index = 0;
+        let mut delivery_failed = false;
+        while let Some(mut request) = commands.next() {
             let command = request.header.command();
             let mut poisoned = None;
             if self.related && index != 0 {
@@ -201,10 +267,76 @@ impl<B: FileSystem> Request<B> {
                 }
             }
             let file = request_file_id(&mut request.packet, None).ok().flatten();
-            let mut response = request.execute().await?;
-            let response_header = Header::read_from_prefix(&response)
-                .map_err(|_| Error::InvalidHeader)?
-                .0;
+            let connection = request.connection.clone();
+            let header = request.header;
+            let mut future = std::pin::pin!(request.execute().fuse());
+            let first = std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
+            let mut protocol_error = None;
+            let completion = match first {
+                Poll::Ready(completion) => completion?,
+                Poll::Pending => {
+                    if let Some(sender) = sender {
+                        if !output.is_empty() {
+                            if sender.send(std::mem::take(&mut output)).await.is_err() {
+                                delivery_failed = true;
+                                connection.cancel_all();
+                            }
+                            last_response = None;
+                        }
+                        let session = connection
+                            .state
+                            .lock()
+                            .requests
+                            .get(&header.message_id.get())
+                            .map_or(header.session_id.get(), |info| info.response_session);
+                        let pending = std::iter::once(&header).chain(
+                            commands
+                                .as_slice()
+                                .iter()
+                                .filter(|_| self.related)
+                                .map(|request| &request.header)
+                                .filter(|header| {
+                                    matches!(
+                                        header.command(),
+                                        Command::READ
+                                            | Command::WRITE
+                                            | Command::CLOSE
+                                            | Command::FLUSH
+                                            | Command::QUERY_INFO
+                                            | Command::SET_INFO
+                                            | Command::QUERY_DIRECTORY
+                                            | Command::LOCK
+                                            | Command::IOCTL
+                                            | Command::CHANGE_NOTIFY
+                                    )
+                                }),
+                        );
+                        for header in pending {
+                            match connection.pending_response(header, session) {
+                                Ok(Some(response)) => {
+                                    if sender.send(response).await.is_err() {
+                                        delivery_failed = true;
+                                        connection.cancel_all();
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    protocol_error = Some(error);
+                                    connection.cancel_all();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Never drop the submitted operation to publish an interim response.
+                    future.await?
+                }
+            };
+            if let Some(error) = protocol_error {
+                return Err(error);
+            }
+            let response_header = completion.header;
+            let response = completion.bytes;
             let status = response_header.status();
             let generated_file = if command == Command::CREATE && status == Status::SUCCESS {
                 Some(
@@ -236,29 +368,29 @@ impl<B: FileSystem> Request<B> {
                 poisoned: poisoned
                     .or_else(|| previous.as_ref().and_then(|previous| previous.poisoned)),
             });
-            if compounded {
-                Header::mut_from_prefix(&mut response[..])
-                    .map_err(|_| Error::InvalidHeader)?
-                    .0
-                    .flags
-                    .set_related_operations(self.related && index != 0);
-                if let Some(start) = last_response {
-                    let next = output.len() - start;
-                    Header::mut_from_prefix(&mut output[start..])
-                        .map_err(|_| Error::InvalidHeader)?
-                        .0
-                        .next_command = (next as u32).into();
+            if completion.async_id.is_some() {
+                if let Some(sender) = sender {
+                    if sender.send(response).await.is_err() {
+                        delivery_failed = true;
+                        connection.cancel_all();
+                    }
                 }
-                last_response = Some(output.len());
-                output.extend_from_slice(&response);
-                output.resize(
-                    align_up(output.len(), COMPOUND_ALIGNMENT).map_err(Error::Backend)?,
-                    0,
-                );
+            } else if compounded {
+                append_response(
+                    &mut output,
+                    &mut last_response,
+                    response,
+                    self.related && index != 0,
+                )?;
             } else {
                 output = response;
             }
+            index += 1;
         }
-        Ok(output)
+        if delivery_failed {
+            Err(Error::ResponseChannelClosed)
+        } else {
+            Ok(output)
+        }
     }
 }

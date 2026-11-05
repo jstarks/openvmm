@@ -121,7 +121,14 @@ impl<B: FileSystem> Client<B> {
     async fn send(&mut self, command: Command, body: &[u8]) -> Vec<u8> {
         let mut packet = request(command, body, self.session, self.tree, self.message);
         Header::mut_from_prefix(&mut packet[..]).unwrap().0.credits = (MAX_REQUESTS as u16).into();
-        self.message += 1;
+        self.message += u64::from(
+            Header::read_from_prefix(&packet)
+                .unwrap()
+                .0
+                .credit_charge
+                .get()
+                .max(1),
+        );
         self.connection.process(&packet).await.unwrap()
     }
 
@@ -217,6 +224,7 @@ impl Client<MemoryFs> {
 
 mod compound;
 mod create;
+mod pending;
 mod runtime;
 mod wire;
 
@@ -653,7 +661,7 @@ impl futures::AsyncWrite for FragmentedStream {
 fn tcp_handles_fragmentation_and_rejects_truncated_or_oversized_frames() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
-        let packet = request(Command::NEGOTIATE, &negotiate_body(), 0, 0, 1);
+        let packet = request(Command::NEGOTIATE, &negotiate_body(), 0, 0, 0);
         let mut frame = (packet.len() as u32).to_be_bytes().to_vec();
         frame.extend(packet);
         let mut stream = FragmentedStream {

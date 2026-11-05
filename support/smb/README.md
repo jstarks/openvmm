@@ -24,6 +24,8 @@ It has a 16 MiB data quota and a 4096-object limit.
 cargo nextest run --profile agent -p smb
 cargo nextest run --profile agent -p smb --run-ignored only \
     -E 'test(samba_read_write_smoke)'
+cargo nextest run --profile agent -p smb --features test-support --run-ignored only \
+    -E 'test(samba_gated_async_compounds)'
 ```
 
 The ignored test requires `smbtorture` (Ubuntu package `samba-testsuite`),
@@ -34,6 +36,9 @@ per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests driv
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
 The harness also checks compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
+The feature-enabled async harness gates real provider reads, writes, and
+flushes on the server's poller. Its four async compound cases include READ/WRITE
+checks requiring pending replies, rather than only allowing synchronous fallback.
 
 ## Protocol Representation
 
@@ -65,8 +70,9 @@ it requests cancellation, drives outstanding operations to completion, and
 explicitly closes opens without waiting for clients to read responses. Drive
 shutdown to completion before dropping a service with outstanding work.
 
-Connections can have up to 32 outstanding command descriptors and 32 transport
-request/response frames, plus one
+Connections can have up to 32 outstanding command descriptors, 32 executing
+transport frames, and two bounded 32-frame response queues (publication and
+transmit), plus one
 bounded receive frame for intake and cancellation. Frames and transfers are
 size-limited. Ready processing is batched so stop and inspection can interrupt
 continuous traffic. The service creates no executor or per-request threads.
@@ -88,7 +94,13 @@ Explicit provider close releases sharing/delete-on-close state; `Drop` remains
 fallback cleanup. A failed shutdown close stays inspectable and can be retried.
 
 `Connection::request` admits an owned request synchronously; retain its
-`execute()` future until completion. `Connection::cancel` handles CANCEL without
+execution future until completion. `execute()` returns final replies only;
+`execute_with_interim(sender)` publishes interim and final frames through a
+caller-supplied channel that must be received concurrently. TCP uses the latter
+with bounded publication. Closed receivers trigger cancellation while already
+executing backend work is still drained. Discarding accepted work disconnects
+the connection; consumed message IDs are never refunded or reissued.
+`Connection::cancel` handles MessageId or AsyncId CANCEL without
 a response or credit consumption. `tcp::ConnectionTask` provides persistent
 framing/operation state for `TaskControl`; the direct `process`/`serve` convenience
 futures are not pause-safe when dropped.
@@ -107,7 +119,7 @@ identities from the previous operation or its response, ignoring replacement
 IDs supplied in later requests. Missing dependencies and previous operation
 failures follow section 3.3.5.2.7.2; unrelated commands have independent outcomes.
 Variable-buffer offsets are bounded to each individual command, not the whole
-transport frame. Replies form one ordered, eight-byte-aligned response chain.
+transport frame. Synchronous replies form ordered, eight-byte-aligned chains.
 
 Queued operations remain owned and cancellable across pause. Known-open queued
 I/O participates in per-open barriers. Barrier order follows binding to the open,
@@ -115,9 +127,20 @@ not allocation of a deferred compound's operation IDs. CLOSE/teardown removes
 later unstarted work in its own chain from the drain set without discarding its
 reply descriptors, so it cannot wait on commands that depend on its completion.
 
-This slice sends final responses only. Interim STATUS_PENDING/AsyncId responses
-and complete credit sequence-window validation remain deferred; delayed-provider
-tests prove ownership, not complete SMB asynchronous-wire interoperability.
+In wire mode, the first pending command flushes the synchronous prefix and
+receives STATUS_PENDING with a nonzero AsyncId. File-bearing related dependents
+also receive early pending identities so they can be canceled before execution.
+Final asynchronous replies carry matching AsyncIds and no further credits.
+Logical session/tree identities remain available for inheritance even though
+the async header replaces the TreeId fields.
+
+The credit sequence window starts at message ID zero. Admission atomically
+consumes all declared ranges, permits out-of-order use, and rejects ungranted,
+replayed, overlapping, or overflowing IDs. Grants only extend the monotonically
+increasing window; pending requests receive credits exactly once, in the interim.
+TCP answers otherwise valid requests exceeding the active-descriptor limit
+with STATUS_INSUFFICIENT_RESOURCES, consuming their IDs and returning credits
+without provider effects. It does not leave them blocking subsequent CANCEL.
 The decoder includes file-bearing LOCK/IOCTL/CHANGE_NOTIFY layouts for dependency
 handling, but those operations still return unsupported statuses.
 
@@ -157,8 +180,9 @@ completion or acknowledged cancellation.
 The tests cover all provider operations, independent completion ordering,
 committed writes with concurrent close/pause, partial transfers, real failure
 effects, cancellation during nested delegate execution, and controller errors.
-With the feature enabled, the Samba harness also uses the controlled wrapper
-in its ordinary passthrough configuration.
+With the feature enabled, the ordinary Samba harness uses the controlled wrapper
+in passthrough mode; a second harness releases individual before-execution gates
+for async compound interoperability.
 
 ## Current Limits
 
@@ -175,11 +199,9 @@ controls, including zero/no-change and -1/-2 automatic-update suppression/reset.
 Alternate-name queries use optional provider short names; the memory provider
 does not generate 8.3 aliases.
 
-Complete credit-window enforcement, non-default streams, Unicode
+Non-default streams, Unicode
 case-folding, rename, ACL updates, locks, leases, notifications, and IOCTLs
 remain future work. Unsupported requests receive explicit status errors.
-Cancellation currently uses MessageId; interim STATUS_PENDING/AsyncId responses
-and full credit sequence-window validation remain future work.
 Memory is allocated for file holes; this is not a sparse-filesystem model.
 
 Full filesystem- and dialect-specific torture suites are not expected to

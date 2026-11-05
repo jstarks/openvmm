@@ -21,7 +21,7 @@ use task_control::{AsyncRun, Cancelled, InspectTask, StopTask, TaskControl};
 use unicycle::FuturesUnordered;
 use zerocopy::{FromBytes, IntoBytes};
 
-type Operation = Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send>>;
+type Operation = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
 
 struct Response {
     bytes: Vec<u8>,
@@ -41,6 +41,8 @@ pub struct ConnectionTask<B: FileSystem, S> {
     packet_len: usize,
     requests: FuturesUnordered<Operation>,
     responses: VecDeque<Response>,
+    response_sender: async_channel::Sender<Vec<u8>>,
+    response_receiver: Pin<Box<async_channel::Receiver<Vec<u8>>>>,
     eof: bool,
     failure: Option<Error>,
     cleanup: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>>,
@@ -50,6 +52,7 @@ pub struct ConnectionTask<B: FileSystem, S> {
 impl<B: FileSystem, S> ConnectionTask<B, S> {
     /// Create a connection without spawning an executor or starting work.
     pub fn new(connection: Connection<B>, stream: S) -> Self {
+        let (response_sender, response_receiver) = async_channel::bounded(MAX_REQUESTS);
         Self {
             connection,
             stream,
@@ -59,6 +62,8 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
             packet_len: 0,
             requests: FuturesUnordered::new(),
             responses: VecDeque::new(),
+            response_sender,
+            response_receiver: Box::pin(response_receiver),
             eof: false,
             failure: None,
             cleanup: None,
@@ -99,13 +104,20 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
         self.connection.cancel_all();
         self.eof = true;
         let mut error = self.failure.take();
-        while let Some(result) = self.requests.next().await {
-            if let Err(failure) = result {
-                if error.is_none() {
-                    error = Some(failure);
+        while !self.requests.is_empty() {
+            let mut request = std::pin::pin!(self.requests.next().fuse());
+            let mut response =
+                std::pin::pin!(self.response_receiver.as_ref().get_ref().recv().fuse());
+            futures::select! {
+                result = request => {
+                    if let Some(Err(failure)) = result {
+                        if error.is_none() { error = Some(failure); }
+                    }
                 }
+                _ = response => {}
             }
         }
+        while self.response_receiver.as_ref().get_ref().try_recv().is_ok() {}
         self.responses.clear();
         if let Some(cleanup) = &mut self.cleanup {
             cleanup.await?;
@@ -165,14 +177,25 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
             self.connection.cancel(&self.packet)?;
         } else {
             // Leave room to receive CANCEL even when every operation slot is used.
-            if self.requests.len() + self.responses.len() >= MAX_REQUESTS {
+            if self.responses.len() >= MAX_REQUESTS {
                 return Poll::Pending;
             }
-            match self.connection.request_ref(&self.packet) {
+            let request = if self.requests.len() >= MAX_REQUESTS {
+                Err(Error::RequestLimit)
+            } else {
+                self.connection.request_ref(&self.packet)
+            };
+            match request {
                 Ok(request) => {
-                    self.requests.push(request.execute().boxed());
+                    self.requests.push(
+                        request
+                            .execute_with_interim(self.response_sender.clone())
+                            .boxed(),
+                    );
                 }
-                Err(Error::RequestLimit) => return Poll::Pending,
+                Err(Error::RequestLimit) => {
+                    self.response(self.connection.busy_response(&self.packet)?)?;
+                }
                 Err(error) => return Poll::Ready(Err(error)),
             }
         }
@@ -207,14 +230,19 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
         // A ready backend or stream must still return control to TaskControl.
         for _ in 0..16 {
             let mut progress = false;
-            if let Poll::Ready(Some(result)) = Pin::new(&mut self.requests).poll_next(cx) {
-                match result {
-                    Ok(response) if self.failure.is_none() => {
+            if self.failure.is_some() || self.responses.len() < MAX_REQUESTS {
+                if let Poll::Ready(Some(response)) = self.response_receiver.as_mut().poll_next(cx) {
+                    if self.failure.is_none() {
                         if let Err(error) = self.response(response) {
                             self.disconnect(Some(error));
                         }
                     }
-                    Ok(_) => {}
+                    progress = true;
+                }
+            }
+            if let Poll::Ready(Some(result)) = Pin::new(&mut self.requests).poll_next(cx) {
+                match result {
+                    Ok(()) => {}
                     Err(error) => self.disconnect(Some(error)),
                 }
                 progress = true;
@@ -235,7 +263,11 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
                     progress = true;
                 }
             }
-            if self.eof && self.requests.is_empty() && self.responses.is_empty() {
+            if self.eof
+                && self.requests.is_empty()
+                && self.responses.is_empty()
+                && self.response_receiver.as_ref().get_ref().is_empty()
+            {
                 let cleanup = self.cleanup.get_or_insert_with(|| {
                     let connection = self.connection.clone();
                     async move { connection.shutdown().await }.boxed()
@@ -273,6 +305,10 @@ impl<B: FileSystem, S> Inspect for ConnectionTask<B, S> {
             .field("receive_body_length", self.packet.len())
             .field("active_requests", self.requests.len())
             .field("queued_responses", self.responses.len())
+            .field(
+                "response_channel_frames",
+                self.response_receiver.as_ref().get_ref().len(),
+            )
             .field(
                 "queued_response_bytes",
                 self.responses

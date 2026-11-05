@@ -66,6 +66,8 @@ members = [
   "opentmk/opentmk_executor",
   # support crates consumed by closed-source only
   "support/debug_output_tracing",
+  # Standalone SMB core, until consumed by a device wrapper.
+  "support/smb",
   # TDISP
   # Temporary: remove once a workspace member depends on this crate.
   "vm/devices/tdisp_lstoraccel",

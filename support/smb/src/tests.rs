@@ -234,6 +234,139 @@ mod runtime;
 mod wire;
 
 #[test]
+fn file_metadata_queries_use_open_mode_and_complete_namespace_paths() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let directory = client.open("directory", 2, 1).await;
+        let response = client
+            .open_result(
+                "directory\\file",
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                ShareAccess::ALL.into_bits(),
+                2,
+                6,
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        for (class, value) in [
+            (7, 0),
+            (8, AccessMask::FILE_ALL_ACCESS.into_bits()),
+            (16, 6),
+            (17, 0),
+        ] {
+            let response = client.query(file, class).await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            assert_eq!(&response[72..], &value.to_le_bytes());
+        }
+        let response = client.query(file, 18).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let data = &response[72..];
+        assert_eq!(&data[88..92], &6u32.to_le_bytes());
+        assert_eq!(&data[96..100], &30u32.to_le_bytes());
+        assert_eq!(&data[100..], &encode_name("\\directory\\file"));
+        assert_eq!(
+            response_status(&client.query(file, 9).await),
+            Status::NOT_SUPPORTED
+        );
+        client.close(file).await;
+        client.close(directory).await;
+    });
+}
+
+#[test]
+fn file_metadata_buffer_errors_and_pending_link_counts_are_specified() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("long-name", 2, 0).await;
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILE;
+        query.file_id = file;
+        for (class, minimum) in [
+            (4, 40),
+            (5, 24),
+            (6, 8),
+            (7, 4),
+            (8, 4),
+            (14, 8),
+            (16, 4),
+            (17, 4),
+            (18, 104),
+            (21, 8),
+            (34, 56),
+        ] {
+            query.info_class = class;
+            query.output_buffer_length = (minimum - 1).into();
+            let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+            assert_eq!(
+                response_status(&response),
+                Status::INFO_LENGTH_MISMATCH,
+                "class {class}"
+            );
+        }
+        query.info_class = 18;
+        query.output_buffer_length = 105.into();
+        let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+        assert_eq!(response_status(&response), Status::BUFFER_OVERFLOW);
+        assert_eq!(&response[68..72], &104u32.to_le_bytes());
+        assert_eq!(&response[168..], &[20, 0, 0, 0, b'\\', 0, b'l', 0]);
+        let response = client.set(file, 20, &9i64.to_le_bytes()).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let response = client.set(file, 13, &[1]).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let response = client.query(file, 5).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        assert_eq!(&response[72..80], &9u64.to_le_bytes());
+        assert_eq!(&response[80..88], &9u64.to_le_bytes());
+        assert_eq!(&response[88..94], &[0, 0, 0, 0, 1, 0]);
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn file_mode_ignores_remote_sync_flags_and_unbuffered_access_excludes_append() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        for (name, options, mode, append) in [
+            ("ignored", 0x800134, 4u32, true),
+            ("unbuffered", 8, 8, false),
+            ("delete", 0x1000, 0, true),
+        ] {
+            let response = client
+                .open_result(name, AccessMask::FILE_ALL_ACCESS.into_bits(), 7, 2, options)
+                .await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+            assert_eq!(&client.query(file, 16).await[72..], &mode.to_le_bytes());
+            let expected = AccessMask::FILE_ALL_ACCESS
+                .with_append_data(append)
+                .into_bits();
+            assert_eq!(&client.query(file, 8).await[72..], &expected.to_le_bytes());
+            client.close(file).await;
+        }
+        let response = client
+            .open_result(
+                "rights",
+                AccessMask::new().with_read_attributes(true).into_bits(),
+                7,
+                2,
+                0,
+            )
+            .await;
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(&client.query(file, 7).await),
+            Status::ACCESS_DENIED
+        );
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn filesystem_queries_report_provider_identity_and_live_capacity() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

@@ -245,6 +245,7 @@ pub async fn data_and_identity<F: Fixture>(fixture: &F) {
     assert_eq!(action, CreateAction::CREATED.0);
     let initial = fs.metadata(&file, &request).await.unwrap();
     assert_eq!(initial.name, "data");
+    assert_eq!(initial.path, "\\data");
     assert!(!initial.is_directory());
     assert_eq!(initial.size, 0);
     let (peer, action) = fs
@@ -277,6 +278,7 @@ pub async fn data_and_identity<F: Fixture>(fixture: &F) {
     );
     let metadata = fs.metadata(&peer, &request).await.unwrap();
     assert_eq!((metadata.id, metadata.size), (initial.id, 10));
+    assert_eq!(metadata.number_of_links, 1);
     match fs.read(&peer, 20, 8, &request).await {
         Ok(bytes) => assert!(bytes.is_empty()),
         Err(status) => assert_eq!(status, Status::END_OF_FILE),
@@ -325,6 +327,7 @@ pub async fn rename_identity<F: Fixture>(fixture: &F) {
         let after = fs.metadata(&peer, &request).await.unwrap();
         assert_eq!((after.id, after.size), (before.id, before.size));
         assert_eq!(after.name, "after");
+        assert_eq!(after.path, "\\after");
         if locked {
             rejected(
                 fs.read(&peer, 0, 7, &request).await,
@@ -344,6 +347,10 @@ pub async fn rename_identity<F: Fixture>(fixture: &F) {
         fs.rename(&file, "destination\\moved", false, &request)
             .await
             .unwrap();
+        assert_eq!(
+            fs.metadata(&peer, &request).await.unwrap().path,
+            "\\destination\\moved"
+        );
         let reopened = open(
             fs,
             "destination\\moved",

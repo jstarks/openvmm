@@ -68,6 +68,8 @@ pub struct Metadata {
     pub id: u64,
     /// Last component of the object's name.
     pub name: String,
+    /// Canonical backslash-prefixed path within the share's virtual volume.
+    pub path: String,
     /// Optional short filename supplied by providers that expose short names.
     pub short_name: Option<String>,
     /// Windows file attribute bits.
@@ -82,6 +84,14 @@ pub struct Metadata {
     pub changed: u64,
     /// Logical length of the default data stream.
     pub size: u64,
+    /// Space allocated to the default stream, independent of logical length.
+    pub allocation_size: u64,
+    /// Provider-reported count of nondeleted links.
+    pub number_of_links: u32,
+    /// Encoded extended-attribute bytes, excluding the query's outer length field.
+    pub extended_attributes_length: u32,
+    /// Required byte alignment minus one; zero permits byte-aligned I/O.
+    pub alignment_requirement: u32,
     /// Whether the shared delete disposition is set, excluding CREATE's
     /// deferred per-open delete mode (MS-FSA §2.1.5.12.27).
     pub delete_pending: bool,

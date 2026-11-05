@@ -41,6 +41,7 @@ fn directory_formats_match_independent_byte_layouts() {
     let info = Metadata {
         id: 0x0807_0605_0403_0201,
         name: "a\u{100}".into(),
+        path: "\\a\u{100}".into(),
         short_name: Some("S1".into()),
         attributes: FileAttributes::new().with_archive(true).into_bits(),
         created: 1,
@@ -48,6 +49,10 @@ fn directory_formats_match_independent_byte_layouts() {
         written: 3,
         changed: 4,
         size: 5,
+        allocation_size: 8,
+        number_of_links: 2,
+        extended_attributes_length: 8,
+        alignment_requirement: 511,
         delete_pending: false,
         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
     };
@@ -69,9 +74,12 @@ fn directory_formats_match_independent_byte_layouts() {
                 expected[offset..offset + 8].copy_from_slice(&time.to_le_bytes());
             }
             expected[40..48].copy_from_slice(&5u64.to_le_bytes());
-            expected[48..56].copy_from_slice(&5u64.to_le_bytes());
+            expected[48..56].copy_from_slice(&8u64.to_le_bytes());
             expected[56..60].copy_from_slice(&0x20u32.to_le_bytes());
             expected[60..64].copy_from_slice(&4u32.to_le_bytes());
+            if class != FileInformationClass::DIRECTORY {
+                expected[64..68].copy_from_slice(&8u32.to_le_bytes());
+            }
             if short_name {
                 expected[68] = 4;
                 expected[70..74].copy_from_slice(&[b'S', 0, b'1', 0]);
@@ -104,6 +112,11 @@ fn directory_formats_match_independent_byte_layouts() {
         directory_record(FileInformationClass::BOTH_DIRECTORY, &invalid_alias),
         Err(Status::INTERNAL_ERROR)
     ));
+    assert_eq!(ea_size(&invalid_alias).unwrap(), 12);
+    let standard = standard_info(&invalid_alias);
+    assert_eq!(standard.allocation_size.get(), 8);
+    assert_eq!(standard.end_of_file.get(), 5);
+    assert_eq!(standard.number_of_links.get(), 2);
 }
 
 #[test]
@@ -143,12 +156,12 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
         let file = read_body::<CreateResponse>(&response).unwrap().file_id;
         let created = read_body::<CreateResponse>(&response).unwrap();
         let response = client.query(file, FileInformationClass::ALL.0).await;
-        // MS-SMB2 §2.2.38 and MS-FSCC §2.4.2: fixed ALL prefix 100, name 2 bytes.
-        assert_eq!(&response[64..72], &[9, 0, 72, 0, 102, 0, 0, 0]);
-        assert_eq!(&response[168..], &[2, 0, 0, 0, b'A', 0]);
+        // MS-SMB2 §2.2.38 and MS-FSCC §2.4.2: fixed ALL prefix 100, name 4 bytes.
+        assert_eq!(&response[64..72], &[9, 0, 72, 0, 104, 0, 0, 0]);
+        assert_eq!(&response[168..], &[4, 0, 0, 0, b'\\', 0, b'A', 0]);
         assert_eq!(
-            &client.query(file, FileInformationClass::NAME.0).await[72..],
-            &[2, 0, 0, 0, b'A', 0]
+            response_status(&client.query(file, FileInformationClass::NAME.0).await),
+            Status::NOT_SUPPORTED
         );
         let standard = client.query(file, FileInformationClass::STANDARD.0).await;
         assert_eq!(

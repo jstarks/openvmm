@@ -307,6 +307,26 @@ geometry. Volume creation time is independent of root file timestamps; serial
 zero is a valid provider-assigned opaque value. Unsupported providers return
 NOT_SUPPORTED rather than receiving a successful memory-volume fallback.
 
+## File Metadata Queries
+
+Provider metadata distinguishes stream allocation from logical length, supplies
+link counts, EA lengths, alignment and canonical paths within the share's virtual
+volume. Directory records, CREATE/CLOSE attributes and file queries use those
+values rather than assuming allocation equals EOF or every object has one link.
+MemoryFs uses byte-granular allocation and derives paths from current parent links.
+
+File access (8), EA size (7), mode (16) and alignment (17) queries complement the
+basic/standard/internal/all/network-open classes. Modes reflect normalized CREATE
+options; SMB-mandated ignored synchronous/completion/free-space flags are cleared,
+and unbuffered opens exclude append access. FileAllInformation reports the complete
+backslash-prefixed path, not only its final component. Direct FileNameInformation
+is local-only and returns NOT_SUPPORTED remotely.
+
+File queries validate their fixed minimum buffers with INFO_LENGTH_MISMATCH.
+Variable name replies retain the full name length and return partial complete
+UTF-16 code units with BUFFER_OVERFLOW. Explicit EA-size queries require READ_EA;
+providers report actual EA lengths, with no EAs in the current MemoryFs profile.
+
 ## Rename and Move
 
 SET_INFO FileRenameInformation follows MS-FSCC section 2.4.42.2 and MS-FSA

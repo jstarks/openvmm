@@ -140,6 +140,7 @@ struct OpenFile<F> {
     file: F,
     identity: u64,
     access: AccessMask,
+    mode: u32,
     is_directory: bool,
     tree: u32,
     position: u64,
@@ -482,12 +483,22 @@ fn basic_info(info: &Metadata) -> FileBasicInformation {
 
 fn standard_info(info: &Metadata) -> FileStandardInformation {
     FileStandardInformation {
-        allocation_size: info.size.into(),
+        allocation_size: info.allocation_size.into(),
         end_of_file: info.size.into(),
-        number_of_links: 1.into(),
-        delete_pending: u8::from(info.delete_pending),
+        number_of_links: info.number_of_links.into(),
+        delete_pending: u8::from(info.delete_pending || info.number_of_links == 0),
         directory: u8::from(info.is_directory()),
         reserved: [0; 2],
+    }
+}
+
+fn ea_size(info: &Metadata) -> Result<u32, Status> {
+    if info.extended_attributes_length == 0 {
+        Ok(0)
+    } else {
+        info.extended_attributes_length
+            .checked_add(4)
+            .ok_or(Status::INTERNAL_ERROR)
     }
 }
 
@@ -502,13 +513,13 @@ fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<
         last_write_time: basic.last_write_time,
         change_time: basic.change_time,
         end_of_file: info.size.into(),
-        allocation_size: info.size.into(),
+        allocation_size: info.allocation_size.into(),
         file_attributes: info.attributes.into(),
         file_name_length: (name.len() as u32).into(),
     };
     let full = FileFullDirectoryInformation {
         directory,
-        ea_size: 0.into(),
+        ea_size: info.extended_attributes_length.into(),
     };
     let mut out = match class {
         FileInformationClass::DIRECTORY => directory.as_bytes().to_vec(),
@@ -1540,7 +1551,7 @@ impl<B: FileSystem> Connection<B> {
                     response.last_access_time = info.accessed.into();
                     response.last_write_time = info.written.into();
                     response.change_time = info.changed.into();
-                    response.allocation_size = info.size.into();
+                    response.allocation_size = info.allocation_size.into();
                     response.end_of_file = info.size.into();
                     response.file_attributes = info.attributes.into();
                 }
@@ -1776,7 +1787,12 @@ impl<B: FileSystem> Connection<B> {
                 _ => return Err(Status::NOT_SUPPORTED),
             }
         }
-        let options = request.create_options;
+        let options = request
+            .create_options
+            .with_complete_if_oplocked(false)
+            .with_synchronous_io_alert(false)
+            .with_synchronous_io_nonalert(false)
+            .with_open_for_free_space_query(false);
         if !request.disposition().is_valid()
             || !request.share_access.is_valid()
             || (options.directory_file() && options.non_directory_file())
@@ -1793,6 +1809,11 @@ impl<B: FileSystem> Connection<B> {
             access
         };
         let access = AccessMask::from_bits(access);
+        let access = if options.no_intermediate_buffering() {
+            access.with_append_data(false)
+        } else {
+            access
+        };
         let volatile = {
             let mut state = self.state.lock();
             if state.files.len() + state.requests.values().filter(|info| info.creating).count()
@@ -1820,7 +1841,7 @@ impl<B: FileSystem> Connection<B> {
                     access: access.into_bits(),
                     share_access: request.share_access.into_bits(),
                     disposition: request.create_disposition.get(),
-                    options: request.create_options.into_bits(),
+                    options: options.into_bits(),
                     attributes: request.file_attributes.into_bits(),
                 },
                 context,
@@ -1843,6 +1864,7 @@ impl<B: FileSystem> Connection<B> {
             file,
             identity: info.id,
             access,
+            mode: options.into_bits() & FILE_MODE_INFORMATION_MASK,
             is_directory: info.is_directory(),
             tree,
             position: 0,
@@ -1927,7 +1949,7 @@ impl<B: FileSystem> Connection<B> {
             last_access_time: info.accessed.into(),
             last_write_time: info.written.into(),
             change_time: info.changed.into(),
-            allocation_size: info.size.into(),
+            allocation_size: info.allocation_size.into(),
             end_of_file: info.size.into(),
             file_attributes: info.attributes.into(),
             reserved: 0.into(),
@@ -2071,6 +2093,58 @@ impl<B: FileSystem> Connection<B> {
                 .await?;
             return filesystem_response(&info, class, request.output_buffer_length.get());
         }
+        if info_type != InformationType::FILE {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        if class == FileInformationClass::NAME {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        let minimum = match class {
+            FileInformationClass::BASIC => size_of::<FileBasicInformation>(),
+            FileInformationClass::STANDARD => size_of::<FileStandardInformation>(),
+            FileInformationClass::INTERNAL => size_of::<FileInternalInformation>(),
+            FileInformationClass::EA => size_of::<FileEaInformation>(),
+            FileInformationClass::ACCESS => size_of::<FileAccessInformation>(),
+            FileInformationClass::MODE => size_of::<FileModeInformation>(),
+            FileInformationClass::ALIGNMENT => size_of::<FileAlignmentInformation>(),
+            FileInformationClass::POSITION => size_of::<FilePositionInformation>(),
+            FileInformationClass::ALL => FILE_ALL_INFORMATION_MIN_BUFFER_SIZE,
+            FileInformationClass::ALTERNATE_NAME => FILE_NAME_INFORMATION_MIN_BUFFER_SIZE,
+            FileInformationClass::NETWORK_OPEN => size_of::<FileNetworkOpenInformation>(),
+            FileInformationClass::DIRECTORY
+            | FileInformationClass::FULL_DIRECTORY
+            | FileInformationClass::BOTH_DIRECTORY
+            | FileInformationClass::NAMES
+            | FileInformationClass::ID_BOTH_DIRECTORY
+            | FileInformationClass::ID_FULL_DIRECTORY => return Err(Status::INVALID_INFO_CLASS),
+            _ => return Err(Status::NOT_SUPPORTED),
+        };
+        let maximum = request.output_buffer_length.get();
+        if (maximum as usize) < minimum {
+            return Err(Status::INFO_LENGTH_MISMATCH);
+        }
+        if matches!(
+            class,
+            FileInformationClass::ACCESS | FileInformationClass::MODE
+        ) {
+            let out = if class == FileInformationClass::ACCESS {
+                FileAccessInformation {
+                    access_flags: file.access,
+                }
+                .as_bytes()
+                .to_vec()
+            } else {
+                FileModeInformation {
+                    mode: file.mode.into(),
+                }
+                .as_bytes()
+                .to_vec()
+            };
+            return buffer_response(out, maximum).map(|body| (Status::SUCCESS, body));
+        }
+        if class == FileInformationClass::EA && !file.access.read_ea() {
+            return Err(Status::ACCESS_DENIED);
+        }
         if info_type == InformationType::FILE
             && matches!(
                 class,
@@ -2096,14 +2170,23 @@ impl<B: FileSystem> Connection<B> {
                     }
                     .as_bytes(),
                 ),
-                FileInformationClass::NAME | FileInformationClass::ALTERNATE_NAME => {
-                    let name = if class == FileInformationClass::ALTERNATE_NAME {
-                        info.short_name
-                            .as_deref()
-                            .ok_or(Status::OBJECT_NAME_NOT_FOUND)?
-                    } else {
-                        &info.name
-                    };
+                FileInformationClass::EA => out.extend_from_slice(
+                    FileEaInformation {
+                        ea_size: ea_size(&info)?.into(),
+                    }
+                    .as_bytes(),
+                ),
+                FileInformationClass::ALIGNMENT => out.extend_from_slice(
+                    FileAlignmentInformation {
+                        alignment_requirement: info.alignment_requirement.into(),
+                    }
+                    .as_bytes(),
+                ),
+                FileInformationClass::ALTERNATE_NAME => {
+                    let name = info
+                        .short_name
+                        .as_deref()
+                        .ok_or(Status::OBJECT_NAME_NOT_FOUND)?;
                     let name = encode_name(name);
                     out.extend_from_slice(
                         FileNameInformation {
@@ -2120,7 +2203,7 @@ impl<B: FileSystem> Connection<B> {
                     .as_bytes(),
                 ),
                 FileInformationClass::ALL => {
-                    let name = encode_name(&info.name);
+                    let name = encode_name(&info.path);
                     out.extend_from_slice(
                         FileAllInformation {
                             basic: basic_info(&info),
@@ -2128,13 +2211,13 @@ impl<B: FileSystem> Connection<B> {
                             internal: FileInternalInformation {
                                 index_number: info.id.into(),
                             },
-                            ea_size: 0.into(),
+                            ea_size: ea_size(&info)?.into(),
                             access_flags: file.access,
                             position: FilePositionInformation {
                                 current_byte_offset: file.position.into(),
                             },
-                            mode: 0.into(),
-                            alignment_requirement: 0.into(),
+                            mode: file.mode.into(),
+                            alignment_requirement: info.alignment_requirement.into(),
                             name: FileNameInformation {
                                 file_name_length: (name.len() as u32).into(),
                             },
@@ -2151,7 +2234,7 @@ impl<B: FileSystem> Connection<B> {
                             last_access_time: basic.last_access_time,
                             last_write_time: basic.last_write_time,
                             change_time: basic.change_time,
-                            allocation_size: info.size.into(),
+                            allocation_size: info.allocation_size.into(),
                             end_of_file: info.size.into(),
                             file_attributes: info.attributes.into(),
                             reserved: 0.into(),
@@ -2163,7 +2246,13 @@ impl<B: FileSystem> Connection<B> {
             },
             _ => return Err(Status::NOT_SUPPORTED),
         }
-        buffer_response(out, request.output_buffer_length.get()).map(|body| (Status::SUCCESS, body))
+        let status = if out.len() > maximum as usize {
+            out.truncate(maximum as usize & !1);
+            Status::BUFFER_OVERFLOW
+        } else {
+            Status::SUCCESS
+        };
+        buffer_response(out, maximum).map(|body| (status, body))
     }
 
     async fn set_info(

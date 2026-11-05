@@ -230,6 +230,7 @@ impl MemoryFs {
             metadata: Metadata {
                 id: 1,
                 name: String::new(),
+                path: String::new(),
                 short_name: None,
                 attributes: FileAttributes::new().with_directory(true).into_bits(),
                 created: now,
@@ -237,6 +238,10 @@ impl MemoryFs {
                 written: now,
                 changed: now,
                 size: 0,
+                allocation_size: 0,
+                number_of_links: 1,
+                extended_attributes_length: 0,
+                alignment_requirement: 0,
                 delete_pending: false,
                 maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
             },
@@ -290,6 +295,29 @@ fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
         (id != 1 && node.parent == parent && node.metadata.name.eq_ignore_ascii_case(name))
             .then_some(id)
     })
+}
+
+fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
+    let mut metadata = state
+        .nodes
+        .get(&id)
+        .ok_or(Status::FILE_CLOSED)?
+        .metadata
+        .clone();
+    let mut components = Vec::new();
+    let mut current = id;
+    loop {
+        let node = state.nodes.get(&current).ok_or(Status::FILE_CLOSED)?;
+        if node.parent == current {
+            break;
+        }
+        components.push(node.metadata.name.as_str());
+        current = node.parent;
+    }
+    components.reverse();
+    metadata.path = format!("\\{}", components.join("\\"));
+    metadata.number_of_links = u32::from(!metadata.delete_pending);
+    Ok(metadata)
 }
 
 fn has_children(state: &State, node: u64) -> bool {
@@ -360,6 +388,7 @@ fn resize(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> 
         node.data.shrink_to_fit();
     }
     node.metadata.size = length as u64;
+    node.metadata.allocation_size = length as u64;
     state.bytes = new_bytes;
     Ok(())
 }
@@ -626,6 +655,7 @@ impl FileSystem for MemoryFs {
                     metadata: Metadata {
                         id,
                         name: parts.last().ok_or(Status::OBJECT_NAME_INVALID)?.to_string(),
+                        path: String::new(),
                         short_name: None,
                         attributes: if directory {
                             FileAttributes::new().with_directory(true).into_bits()
@@ -642,6 +672,10 @@ impl FileSystem for MemoryFs {
                         written: now,
                         changed: now,
                         size: 0,
+                        allocation_size: 0,
+                        number_of_links: 1,
+                        extended_attributes_length: 0,
+                        alignment_requirement: 0,
                         delete_pending: false,
                         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
                     },
@@ -854,12 +888,7 @@ impl FileSystem for MemoryFs {
         file: &MemoryFile,
         _request: &RequestContext,
     ) -> Result<Metadata, Status> {
-        self.0
-            .lock()
-            .nodes
-            .get(&file.node)
-            .map(|n| n.metadata.clone())
-            .ok_or(Status::FILE_CLOSED)
+        node_metadata(&self.0.lock(), file.node)
     }
 
     async fn filesystem_information(
@@ -1008,14 +1037,9 @@ impl FileSystem for MemoryFs {
             return Err(Status::NOT_A_DIRECTORY);
         }
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
-        let mut current = node.metadata.clone();
+        let mut current = node_metadata(&state, file.node)?;
         current.name = ".".to_owned();
-        let mut parent = state
-            .nodes
-            .get(&node.parent)
-            .ok_or(Status::FILE_CLOSED)?
-            .metadata
-            .clone();
+        let mut parent = node_metadata(&state, node.parent)?;
         parent.name = "..".to_owned();
         let mut entries = vec![current, parent];
         entries.extend(
@@ -1023,7 +1047,8 @@ impl FileSystem for MemoryFs {
                 .nodes
                 .values()
                 .filter(|n| n.parent == file.node && n.metadata.id != file.node)
-                .map(|n| n.metadata.clone()),
+                .map(|n| node_metadata(&state, n.metadata.id))
+                .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(entries)
     }

@@ -345,14 +345,23 @@ impl ShareAccess {
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 pub struct CreateOptions {
     pub directory_file: bool,
-    #[bits(5)]
-    other0: u8,
+    pub write_through: bool,
+    pub sequential_only: bool,
+    pub no_intermediate_buffering: bool,
+    pub synchronous_io_alert: bool,
+    pub synchronous_io_nonalert: bool,
     pub non_directory_file: bool,
-    #[bits(5)]
+    #[bits(1)]
+    other0: u8,
+    pub complete_if_oplocked: bool,
+    #[bits(3)]
     other1: u8,
     pub delete_on_close: bool,
-    #[bits(19)]
+    #[bits(10)]
     other2: u32,
+    pub open_for_free_space_query: bool,
+    #[bits(8)]
+    other3: u8,
 }
 le_bitfield_conversions!(CreateOptions, u32, U32);
 

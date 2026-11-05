@@ -43,11 +43,15 @@ open_enum! {
         BASIC = 4,
         STANDARD = 5,
         INTERNAL = 6,
+        EA = 7,
+        ACCESS = 8,
         NAME = 9,
         RENAME = 10,
         NAMES = 12,
         DISPOSITION = 13,
         POSITION = 14,
+        MODE = 16,
+        ALIGNMENT = 17,
         ALL = 18,
         END_OF_FILE = 20,
         ALTERNATE_NAME = 21,
@@ -139,6 +143,12 @@ pub const FILE_DEVICE_DISK: u32 = 0x00000007;
 pub const FILE_FS_VOLUME_MIN_BUFFER_SIZE: usize = 24;
 /// Maximum volume label length in characters: [MS-FSCC] §2.5.9.
 pub const FILE_FS_VOLUME_MAX_LABEL_LENGTH: usize = 32;
+/// Queryable file mode flags, excluding delete mode: [MS-FSCC] §2.4.31.
+pub const FILE_MODE_INFORMATION_MASK: u32 = 0x0000003e;
+/// Minimum complete FileAllInformation buffer: [MS-FSA] §2.1.5.12.3.
+pub const FILE_ALL_INFORMATION_MIN_BUFFER_SIZE: usize = 104;
+/// Minimum alternate-name buffer: [MS-FSA] §2.1.5.12.4.
+pub const FILE_NAME_INFORMATION_MIN_BUFFER_SIZE: usize = 8;
 /// Linked directory records are eight-byte aligned: [MS-FSCC] §2.4.
 pub const DIRECTORY_ALIGNMENT: usize = 8;
 /// ShortName contains at most twelve UTF-16 code units: [MS-FSCC] §2.4.8.
@@ -189,6 +199,22 @@ wire!(
 wire!(
     /// FilePositionInformation: [MS-FSCC] §2.4.40.
     FilePositionInformation, 8 { current_byte_offset: U64 }
+);
+wire!(
+    /// FileEaInformation: [MS-FSCC] §2.4.13.
+    FileEaInformation, 4 { ea_size: U32 }
+);
+wire!(
+    /// FileAccessInformation: [MS-FSCC] §2.4.1.
+    FileAccessInformation, 4 { access_flags: super::smb2::AccessMask }
+);
+wire!(
+    /// FileModeInformation: [MS-FSCC] §2.4.31.
+    FileModeInformation, 4 { mode: U32 }
+);
+wire!(
+    /// FileAlignmentInformation: [MS-FSCC] §2.4.3.
+    FileAlignmentInformation, 4 { alignment_requirement: U32 }
 );
 wire!(
     /// FileEndOfFileInformation: [MS-FSCC] §2.4.14.

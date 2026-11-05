@@ -4,13 +4,16 @@
 //! A VM-independent SMB 2.1 server core and synthetic filesystem.
 //!
 //! This initial implementation supports unsigned guest sessions for local
-//! testing. It is not a network authentication service. Compounds, leases,
+//! testing, including bounded related/unrelated compound requests with retained
+//! operation ownership. It is not a network authentication service. Leases,
 //! locks, notifications, security descriptor updates, and host filesystem
 //! providers are not yet implemented.
 
 #![forbid(unsafe_code)]
 
 mod codec;
+mod compound;
+pub use compound::Request;
 pub mod memory;
 pub mod provider;
 pub mod spec;
@@ -48,6 +51,9 @@ pub enum Error {
     /// Admission requires the caller to finish an existing request first.
     #[error("SMB outstanding request limit reached")]
     RequestLimit,
+    /// A compound chain has invalid boundaries or exceeds the command bound.
+    #[error("invalid SMB compound chain")]
+    InvalidCompound,
     /// A backend could not complete destructive shutdown.
     #[error("SMB backend shutdown failed: {0:?}")]
     Backend(Status),
@@ -126,7 +132,7 @@ struct OpenFile<F> {
     closing: AtomicBool,
     closed: AtomicBool,
     close_gate: futures::lock::Mutex<()>,
-    active: Mutex<BTreeMap<u64, (RequestContext, bool)>>,
+    active: Mutex<Vec<(RequestContext, bool)>>,
     changed: Event,
     close_error: Mutex<Option<Status>>,
 }
@@ -160,16 +166,19 @@ struct RequestInfo<F> {
     response_session: u64,
     response_tree: u32,
     creating: bool,
+    group: u64,
+    activated: bool,
 }
 
 /// An admitted request. Its future must be retained until completion.
-pub struct Request<B: FileSystem> {
+struct CommandRequest<B: FileSystem> {
     connection: Connection<B>,
     header: Header,
     packet: Vec<u8>,
     context: RequestContext,
     error: Option<Status>,
     retired: Vec<Arc<OpenFile<B::File>>>,
+    activated: bool,
 }
 
 impl<B: FileSystem> Clone for Connection<B> {
@@ -182,9 +191,26 @@ impl<B: FileSystem> Clone for Connection<B> {
 }
 
 impl<F> OpenFile<F> {
+    fn track(&self, context: &RequestContext, barrier: bool) {
+        let mut active = self.active.lock();
+        if !active
+            .iter()
+            .any(|(request, _)| request.id() == context.id())
+        {
+            // Binding order, not allocation of a compound's queued context IDs,
+            // determines which operations precede this open's barriers.
+            active.push((context.clone(), barrier));
+        }
+    }
+
+    fn untrack(&self, id: u64) {
+        self.active.lock().retain(|(request, _)| request.id() != id);
+        self.changed.notify(usize::MAX);
+    }
+
     fn retire(&self) {
         self.closing.store(true, Ordering::Release);
-        for (request, _) in self.active.lock().values() {
+        for (request, _) in self.active.lock().iter() {
             request.cancel();
         }
     }
@@ -197,12 +223,14 @@ impl<F> OpenFile<F> {
                 if closing {
                     !active.is_empty()
                 } else {
-                    let barrier = active
-                        .get(&context.id())
-                        .is_some_and(|(_, barrier)| *barrier);
-                    active
-                        .range(..context.id())
-                        .any(|(_, (_, earlier_barrier))| barrier || *earlier_barrier)
+                    let position = active
+                        .iter()
+                        .position(|(request, _)| request.id() == context.id())
+                        .ok_or(Status::FILE_CLOSED)?;
+                    let barrier = active[position].1;
+                    active[..position]
+                        .iter()
+                        .any(|(_, earlier_barrier)| barrier || *earlier_barrier)
                 }
             };
             if !blocked {
@@ -275,6 +303,8 @@ impl<F> Inspect for ConnectionState<F> {
                         req.respond()
                             .field("command", inspect::AsDebug(info.command))
                             .field("operation_id", info.context.id())
+                            .field("compound_group", info.group)
+                            .field("activated", info.activated)
                             .field("tree", info.tree)
                             .field("cancel_requested", info.context.is_cancelled());
                     });
@@ -289,7 +319,7 @@ impl<B: FileSystem> Inspect for Connection<B> {
     }
 }
 
-impl<B: FileSystem> Drop for Request<B> {
+impl<B: FileSystem> Drop for CommandRequest<B> {
     fn drop(&mut self) {
         let request = self
             .connection
@@ -304,8 +334,7 @@ impl<B: FileSystem> Drop for Request<B> {
                 state.credits += request.charge;
             }
             if let Some(file) = request.open {
-                file.active.lock().remove(&request.context.id());
-                file.changed.notify(usize::MAX);
+                file.untrack(request.context.id());
             }
         }
     }
@@ -425,74 +454,164 @@ impl<B: FileSystem> Connection<B> {
 
     /// Admit work synchronously, before polling its owned operation future.
     pub fn request(&self, packet: Vec<u8>) -> Result<Request<B>, Error> {
-        let (header, _) = Header::read_from_prefix(&packet).map_err(|_| Error::InvalidHeader)?;
-        if header.protocol != SIGNATURE
-            || header.structure_size.get() as usize != HEADER_SIZE
-            || header.flags.server_to_redir()
-        {
-            return Err(Error::InvalidHeader);
-        }
-        let command = header.command();
-        if command == Command::CANCEL {
-            return Err(Error::InvalidHeader);
-        }
-        let context = RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
+        self.request_ref(&packet)
+    }
+
+    pub(crate) fn request_ref(&self, packet: &[u8]) -> Result<Request<B>, Error> {
+        let ranges = compound::ranges(packet)?;
+        let headers: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                Header::read_from_prefix(&packet[range.clone()])
+                    .map(|(header, _)| header)
+                    .map_err(|_| Error::InvalidHeader)
+            })
+            .collect::<Result<_, _>>()?;
+        let related = headers.len() > 1
+            && headers[1..]
+                .iter()
+                .all(|header| header.flags.related_operations());
+        let invalid_style = headers[0].flags.related_operations()
+            || (headers[1..]
+                .iter()
+                .any(|header| header.flags.related_operations())
+                && !related);
         let mut state = self.state.lock();
-        if state.requests.contains_key(&header.message_id.get()) {
-            return Err(Error::DuplicateMessageId(header.message_id.get()));
+        let mut ids = BTreeSet::new();
+        for header in &headers {
+            if !ids.insert(header.message_id.get())
+                || state.requests.contains_key(&header.message_id.get())
+            {
+                return Err(Error::DuplicateMessageId(header.message_id.get()));
+            }
         }
-        if state.requests.len() >= MAX_REQUESTS {
+        if state.requests.len() + headers.len() > MAX_REQUESTS {
             return Err(Error::RequestLimit);
         }
-        let mut error = None;
-        if packet.len() > MAX_MESSAGE_SIZE {
-            error = Some(Status::INVALID_PARAMETER);
-        } else if header.next_command.get() != 0
-            || header.flags.async_command()
-            || header.flags.related_operations()
-            || header.flags.signed()
-        {
-            error = Some(Status::NOT_SUPPORTED);
-        } else if state.disconnected {
-            error = Some(Status::USER_SESSION_DELETED);
-        } else if command != Command::NEGOTIATE {
-            if !state.negotiated {
-                error = Some(Status::INVALID_PARAMETER);
-            } else if command != Command::SESSION_SETUP && command != Command::ECHO {
-                if !state.session_active || header.session_id.get() != state.session {
-                    error = Some(Status::USER_SESSION_DELETED);
-                } else if command != Command::TREE_CONNECT
-                    && command != Command::LOGOFF
-                    && !state.trees.contains(&header.tree_id.get())
-                {
-                    error = Some(Status::NETWORK_NAME_DELETED);
+        let total_charge: u32 = headers
+            .iter()
+            .map(|header| u32::from(header.credit_charge.get().max(1)))
+            .sum();
+        let invalid_credit = total_charge > state.credits;
+        let group = self
+            .server
+            .next_request
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                id.checked_add(headers.len() as u64)
+            })
+            .map_err(|_| Error::Backend(Status::INSUFFICIENT_RESOURCES))?;
+        let mut commands = Vec::new();
+        let mut previous_file = None;
+        for (index, (header, range)) in headers.into_iter().zip(ranges).enumerate() {
+            let mut bytes = packet[range].to_vec();
+            let command = header.command();
+            let context = RequestContext::new(group + index as u64);
+            let error = if invalid_style || invalid_credit || packet.len() > MAX_MESSAGE_SIZE {
+                Some(Status::INVALID_PARAMETER)
+            } else if header.flags.async_command() || header.flags.signed() {
+                Some(Status::NOT_SUPPORTED)
+            } else {
+                compound::charge(&bytes, &header).err()
+            };
+            let charge = u32::from(header.credit_charge.get().max(1)).min(state.credits);
+            state.credits -= charge;
+            state.credits_in_use += charge;
+            let file = compound::request_file_id(&mut bytes, None).ok().flatten();
+            let bound_file = if related && index != 0 {
+                previous_file
+            } else {
+                file
+            };
+            let open = if error.is_none()
+                && file.is_some()
+                && !matches!(command, Command::CLOSE | Command::CREATE)
+            {
+                bound_file.and_then(|id: FileId| {
+                    state
+                        .files
+                        .get(&id.volatile.get())
+                        .filter(|file| {
+                            file.identity == id.persistent.get()
+                                && !file.closing.load(Ordering::Acquire)
+                        })
+                        .cloned()
+                })
+            } else {
+                None
+            };
+            if let Some(file) = &open {
+                file.track(
+                    &context,
+                    matches!(
+                        command,
+                        Command::FLUSH | Command::SET_INFO | Command::QUERY_DIRECTORY
+                    ),
+                );
+            }
+            previous_file = if command == Command::CREATE {
+                None
+            } else {
+                bound_file.filter(|_| file.is_some())
+            };
+            state.requests.insert(
+                header.message_id.get(),
+                RequestInfo {
+                    context: context.clone(),
+                    command,
+                    tree: header.tree_id.get(),
+                    open,
+                    charge,
+                    response_session: header.session_id.get(),
+                    response_tree: header.tree_id.get(),
+                    creating: false,
+                    group,
+                    activated: false,
+                },
+            );
+            commands.push(CommandRequest {
+                connection: self.clone(),
+                header,
+                packet: bytes,
+                context,
+                error,
+                retired: Vec::new(),
+                activated: false,
+            });
+        }
+        if let Some(first) = commands.first_mut() {
+            self.activate(first, &mut state);
+        }
+        Ok(Request { commands, related })
+    }
+
+    fn activate(&self, request: &mut CommandRequest<B>, state: &mut ConnectionState<B::File>) {
+        request.activated = true;
+        let header = &request.header;
+        let command = header.command();
+        let context = &request.context;
+        let mut error = request.error;
+        if error.is_none() {
+            if state.disconnected {
+                error = Some(Status::USER_SESSION_DELETED);
+            } else if command != Command::NEGOTIATE {
+                if !state.negotiated {
+                    error = Some(Status::INVALID_PARAMETER);
+                } else if command != Command::SESSION_SETUP && command != Command::ECHO {
+                    if !state.session_active || header.session_id.get() != state.session {
+                        error = Some(Status::USER_SESSION_DELETED);
+                    } else if command != Command::TREE_CONNECT
+                        && command != Command::LOGOFF
+                        && !state.trees.contains(&header.tree_id.get())
+                    {
+                        error = Some(Status::NETWORK_NAME_DELETED);
+                    }
                 }
             }
         }
-        let charge = u32::from(header.credit_charge.get().max(1));
-        if charge > state.credits {
-            error = Some(Status::INVALID_PARAMETER);
-        }
-        let charge = charge.min(state.credits);
-        state.credits -= charge;
-        state.credits_in_use += charge;
         let mut open = None;
         let mut retired = Vec::new();
         if error.is_none() {
-            let file_id = match command {
-                Command::READ => read_body::<ReadRequest>(&packet).map(|r| Some(r.file_id)),
-                Command::WRITE => read_body::<WriteRequest>(&packet).map(|r| Some(r.file_id)),
-                Command::CLOSE => read_body::<CloseRequest>(&packet).map(|r| Some(r.file_id)),
-                Command::FLUSH => read_body::<FlushRequest>(&packet).map(|r| Some(r.file_id)),
-                Command::QUERY_INFO => {
-                    read_body::<QueryInfoRequest>(&packet).map(|r| Some(r.file_id))
-                }
-                Command::SET_INFO => read_body::<SetInfoRequest>(&packet).map(|r| Some(r.file_id)),
-                Command::QUERY_DIRECTORY => {
-                    read_body::<QueryDirectoryRequest>(&packet).map(|r| Some(r.file_id))
-                }
-                _ => Ok(None),
-            };
+            let file_id = compound::request_file_id(&mut request.packet, None);
             match file_id {
                 Err(status) => error = Some(status),
                 Ok(Some(id)) => {
@@ -506,16 +625,13 @@ impl<B: FileSystem> Connection<B> {
                             if command == Command::CLOSE {
                                 file.retire();
                             } else {
-                                file.active.lock().insert(
-                                    context.id(),
-                                    (
-                                        context.clone(),
-                                        matches!(
-                                            command,
-                                            Command::FLUSH
-                                                | Command::SET_INFO
-                                                | Command::QUERY_DIRECTORY
-                                        ),
+                                file.track(
+                                    context,
+                                    matches!(
+                                        command,
+                                        Command::FLUSH
+                                            | Command::SET_INFO
+                                            | Command::QUERY_DIRECTORY
                                     ),
                                 );
                             }
@@ -527,7 +643,7 @@ impl<B: FileSystem> Connection<B> {
             }
         }
         if error.is_none() && matches!(command, Command::LOGOFF | Command::TREE_DISCONNECT) {
-            match read_body::<SimpleBody>(&packet) {
+            match read_body::<SimpleBody>(&request.packet) {
                 Err(status) => error = Some(status),
                 Ok(_) => {
                     let tree = header.tree_id.get();
@@ -558,28 +674,50 @@ impl<B: FileSystem> Connection<B> {
                 }
             }
         }
-        state.requests.insert(
-            header.message_id.get(),
-            RequestInfo {
-                context: context.clone(),
-                command,
-                tree: header.tree_id.get(),
-                open,
-                charge,
-                response_session: header.session_id.get(),
-                response_tree: header.tree_id.get(),
-                creating: false,
-            },
-        );
-        drop(state);
-        Ok(Request {
-            connection: self.clone(),
-            header,
-            packet,
-            context,
-            error,
-            retired,
-        })
+        // A close/teardown must not wait for later, unstarted commands in its
+        // own chain. They retain descriptors but cannot submit backend I/O.
+        if let Some(group) = state
+            .requests
+            .get(&header.message_id.get())
+            .map(|info| info.group)
+        {
+            for info in state
+                .requests
+                .values_mut()
+                .filter(|info| info.group == group && !info.activated)
+            {
+                let retiring = info.open.as_ref().is_some_and(|file| {
+                    (command == Command::CLOSE
+                        && open
+                            .as_ref()
+                            .is_some_and(|closing| Arc::ptr_eq(file, closing)))
+                        || retired.iter().any(|closing| Arc::ptr_eq(file, closing))
+                });
+                if retiring {
+                    if let Some(file) = info.open.take() {
+                        file.untrack(info.context.id());
+                    }
+                    info.context.cancel();
+                }
+            }
+        }
+        if let Some(info) = state.requests.get_mut(&header.message_id.get()) {
+            if let Some(previous) = info.open.take() {
+                if open
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &previous))
+                {
+                    previous.untrack(context.id());
+                }
+            }
+            info.tree = header.tree_id.get();
+            info.response_session = header.session_id.get();
+            info.response_tree = header.tree_id.get();
+            info.open = open;
+            info.activated = true;
+        }
+        request.error = error;
+        request.retired = retired;
     }
 
     /// Expedite cancellation without consuming a credit or producing a reply.
@@ -588,6 +726,7 @@ impl<B: FileSystem> Connection<B> {
         if header.protocol != SIGNATURE
             || header.structure_size.get() as usize != HEADER_SIZE
             || header.command() != Command::CANCEL
+            || header.next_command.get() != 0
             || read_body::<SimpleBody>(packet).is_err()
             || header.flags.server_to_redir()
             || header.flags.signed()
@@ -697,9 +836,13 @@ impl<B: FileSystem> Connection<B> {
     }
 }
 
-impl<B: FileSystem> Request<B> {
+impl<B: FileSystem> CommandRequest<B> {
     /// Run admitted work. Dropping this future is not a backend cancellation API.
-    pub async fn execute(self) -> Result<Vec<u8>, Error> {
+    async fn execute(mut self) -> Result<Vec<u8>, Error> {
+        if !self.activated {
+            let connection = self.connection.clone();
+            connection.activate(&mut self, &mut connection.state.lock());
+        }
         let header = &self.header;
         let command = header.command();
         let packet = &self.packet;
@@ -1225,7 +1368,7 @@ impl<B: FileSystem> Connection<B> {
             closing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             close_gate: futures::lock::Mutex::new(()),
-            active: Mutex::new(BTreeMap::new()),
+            active: Mutex::new(Vec::new()),
             changed: Event::new(),
             close_error: Mutex::new(None),
         });

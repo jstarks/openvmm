@@ -15,6 +15,10 @@ pub const SIGNATURE: [u8; 4] = *b"\xfeSMB";
 pub const DIALECT_210: u16 = 0x0210;
 /// CREATE context alignment: [MS-SMB2] §2.2.13.2.
 pub const CREATE_CONTEXT_ALIGNMENT: usize = 8;
+/// Compound command headers/responses are eight-byte aligned: [MS-SMB2] §3.3.5.2.7.
+pub const COMPOUND_ALIGNMENT: usize = 8;
+/// Multi-credit payload unit: [MS-SMB2] §3.1.5.2.
+pub const CREDIT_PAYLOAD_SIZE: u32 = 65536;
 
 open_enum! {
     /// Command codes: [MS-SMB2] §2.2.1.
@@ -89,6 +93,13 @@ impl std::fmt::Display for Status {
 }
 
 impl std::error::Error for Status {}
+
+impl Command {
+    /// Defined command range: [MS-SMB2] §2.2.1. Unknown commands require disconnect (§3.3.5.2.6).
+    pub fn is_valid(self) -> bool {
+        self.0 <= Self::OPLOCK_BREAK.0
+    }
+}
 
 impl Status {
     /// Error severity occupies the upper two bits: [MS-ERREF] §2.3.
@@ -681,6 +692,49 @@ WriteResponse, 16, 17 {
     channel_info_length: U16,
 });
 wire!(
+/// LOCK element: [MS-SMB2] §2.2.26.1. Lock semantics are not yet implemented.
+LockElement, 24 {
+    offset: U64,
+    length: U64,
+    flags: U32,
+    reserved: U32,
+});
+wire!(
+/// LOCK request through its first element: [MS-SMB2] §2.2.26.
+LockRequest, 48, 48 {
+    structure_size: U16,
+    lock_count: U16,
+    lock_sequence: U32,
+    file_id: FileId,
+    first_lock: LockElement,
+});
+wire!(
+/// IOCTL request fixed prefix: [MS-SMB2] §2.2.31. Only compound identity is processed.
+IoctlRequest, 56, 57 {
+    structure_size: U16,
+    reserved: U16,
+    control_code: U32,
+    file_id: FileId,
+    input_offset: U32,
+    input_count: U32,
+    max_input_response: U32,
+    output_offset: U32,
+    output_count: U32,
+    max_output_response: U32,
+    flags: U32,
+    reserved2: U32,
+});
+wire!(
+/// CHANGE_NOTIFY request: [MS-SMB2] §2.2.35. Notifications are not yet implemented.
+ChangeNotifyRequest, 32, 32 {
+    structure_size: U16,
+    flags: U16,
+    output_buffer_length: U32,
+    file_id: FileId,
+    completion_filter: U32,
+    reserved: U32,
+});
+wire!(
 /// QUERY_INFO request fixed prefix: [MS-SMB2] §2.2.37.
 QueryInfoRequest, 40, 41 {
     structure_size: U16,
@@ -754,4 +808,12 @@ impl CreateRequest {
     pub fn disposition(&self) -> CreateDisposition {
         CreateDisposition(self.create_disposition.get())
     }
+}
+
+impl FileId {
+    /// Conventional placeholder in related requests: [MS-SMB2] §3.2.4.1.4.
+    pub const RELATED: Self = Self {
+        persistent: U64::new(u64::MAX),
+        volatile: U64::new(u64::MAX),
+    };
 }

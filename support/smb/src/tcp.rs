@@ -168,8 +168,13 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
             if self.requests.len() + self.responses.len() >= MAX_REQUESTS {
                 return Poll::Pending;
             }
-            let request = self.connection.request(std::mem::take(&mut self.packet))?;
-            self.requests.push(request.execute().boxed());
+            match self.connection.request_ref(&self.packet) {
+                Ok(request) => {
+                    self.requests.push(request.execute().boxed());
+                }
+                Err(Error::RequestLimit) => return Poll::Pending,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
         }
         self.packet.clear();
         self.prefix_len = 0;

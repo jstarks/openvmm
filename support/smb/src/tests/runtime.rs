@@ -629,6 +629,296 @@ fn tcp_pause_retains_committed_reordered_writes_and_a_concurrent_close() {
 }
 
 #[test]
+fn compound_pause_retains_committed_io_and_queued_commands_during_external_close() {
+    DefaultPool::run_with(async |driver| {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("compound-pause", 2, 0).await;
+        control
+            .set_plan(
+                Operation::Write,
+                Plan {
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let bytes = compound::packet(
+            &mut client,
+            vec![
+                (Command::WRITE, Client::write_body(file, 0, b"abc")),
+                (Command::READ, compound::read(FileId::RELATED, 3)),
+                (Command::CLOSE, compound::close(FileId::RELATED)),
+            ],
+            true,
+        );
+        let first_id = Header::read_from_prefix(&bytes).unwrap().0.message_id.get();
+        let stream = TestStream::new();
+        stream.writable(usize::MAX);
+        stream.input(&frame(&bytes));
+        let mut task = TaskControl::new(tcp::ConnectionTask::new(
+            client.connection.clone(),
+            stream.clone(),
+        ));
+        task.insert(driver, "smb-compound-pause", ());
+        task.start();
+        let write = control.next_call().await;
+        control
+            .wait_for_phase(write.id, Phase::After)
+            .await
+            .unwrap();
+        assert_eq!(
+            inspect_text("connection/requests", &task)
+                .await
+                .matches("activated")
+                .count(),
+            3
+        );
+        task.stop().await;
+        assert!(stream.state.lock().output.is_empty());
+        let close_id = client.message;
+        let close = frame(&request(
+            Command::CLOSE,
+            close_body(file).as_bytes(),
+            client.session,
+            client.tree,
+            close_id,
+        ));
+        stream.input(&close);
+        task.start();
+        stream
+            .until(|state| state.read == bytes.len() + 4 + close.len())
+            .await;
+        task.stop().await;
+        assert!(control.snapshot(write.id).unwrap().cancel_requested);
+        assert_eq!(successes(&control, Operation::Close), 0);
+        control.release(write.id, Gate::After).unwrap();
+        assert!(stream.state.lock().output.is_empty());
+        task.start();
+        stream.until(|state| state.output.len() == 372).await;
+        task.stop().await;
+        let output = stream.state.lock().output.clone();
+        let mut frames = output.as_slice();
+        let mut saw_compound = false;
+        let mut saw_close = false;
+        while !frames.is_empty() {
+            let length = u32::from_be_bytes(frames[..4].try_into().unwrap()) as usize;
+            let replies = compound::responses(&frames[4..4 + length]);
+            let header = Header::read_from_prefix(replies[0]).unwrap().0;
+            if header.message_id.get() == first_id {
+                assert_eq!(replies.len(), 3);
+                assert_eq!(response_status(replies[0]), Status::SUCCESS);
+                assert_eq!(response_status(replies[1]), Status::FILE_CLOSED);
+                assert_eq!(response_status(replies[2]), Status::FILE_CLOSED);
+                saw_compound = true;
+            } else {
+                assert_eq!(header.message_id.get(), close_id);
+                assert_eq!(header.status(), Status::SUCCESS);
+                saw_close = true;
+            }
+            frames = &frames[4 + length..];
+        }
+        assert!(saw_compound && saw_close);
+        assert_eq!(successes(&control, Operation::Write), 1);
+        assert_eq!(successes(&control, Operation::Read), 0);
+        assert_eq!(successes(&control, Operation::Close), 1);
+        task.task_mut().shutdown().await.unwrap();
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.phase == Phase::Abandoned)
+        );
+    });
+}
+
+#[test]
+fn queued_compound_writes_remain_ordered_before_a_later_flush() {
+    block_on(async {
+        let (fs, control) = controlled(false);
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("compound-order", 2, 0).await;
+        let bytes = compound::packet(
+            &mut client,
+            vec![
+                (Command::WRITE, Client::write_body(file, 0, b"one")),
+                (
+                    Command::WRITE,
+                    Client::write_body(FileId::RELATED, 3, b"two"),
+                ),
+            ],
+            true,
+        );
+        let mut group = std::pin::pin!(client.connection.request(bytes).unwrap().execute());
+        assert!(futures::poll!(&mut group).is_pending());
+        let first = control.next_call().await;
+        let mut flush = FlushRequest::new_zeroed();
+        flush.structure_size = FlushRequest::STRUCTURE_SIZE.into();
+        flush.file_id = file;
+        let mut flush =
+            std::pin::pin!(admitted(&mut client, Command::FLUSH, flush.as_bytes()).execute());
+        assert!(futures::poll!(&mut flush).is_pending());
+        control.release(first.id, Gate::Before).unwrap();
+        assert!(futures::poll!(&mut group).is_pending());
+        let second = control.next_call().await;
+        assert_eq!(successes(&control, Operation::Write), 1);
+        assert!(futures::poll!(&mut flush).is_pending());
+        assert_eq!(successes(&control, Operation::Flush), 0);
+        control.release(second.id, Gate::Before).unwrap();
+        let response = group.await.unwrap();
+        assert!(
+            compound::responses(&response)
+                .iter()
+                .all(|reply| response_status(reply) == Status::SUCCESS)
+        );
+        assert_eq!(response_status(&flush.await.unwrap()), Status::SUCCESS);
+        assert_eq!(&client.read(file, 0, 6).await[80..], b"onetwo");
+    });
+}
+
+#[test]
+fn deferred_binding_orders_barriers_independently_of_operation_identity() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let id = client.open("binding-order", 2, 0).await;
+        let file = client.connection.state.lock().files[&id.volatile.get()].clone();
+        let barrier = RequestContext::new(30);
+        let deferred = RequestContext::new(10);
+        file.track(&barrier, true);
+        file.track(&deferred, false);
+        let mut wait = std::pin::pin!(file.wait(&deferred, false));
+        assert!(futures::poll!(&mut wait).is_pending());
+        file.untrack(barrier.id());
+        wait.await.unwrap();
+        file.untrack(deferred.id());
+        client.close(id).await;
+    });
+}
+
+#[test]
+fn cancel_reaches_queued_compound_io_and_dropping_unstarted_work_refunds_credits() {
+    block_on(async {
+        let (fs, control) = controlled(false);
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("queued-cancel", 2, 0).await;
+        let bytes = compound::packet(
+            &mut client,
+            vec![
+                (Command::WRITE, Client::write_body(file, 0, b"one")),
+                (
+                    Command::WRITE,
+                    Client::write_body(FileId::RELATED, 3, b"two"),
+                ),
+            ],
+            true,
+        );
+        let baseline = client.connection.state.lock().credits;
+        drop(client.connection.request(bytes.clone()).unwrap());
+        assert_eq!(client.connection.state.lock().credits, baseline);
+        assert!(client.connection.state.lock().requests.is_empty());
+        let next = Header::read_from_prefix(&bytes)
+            .unwrap()
+            .0
+            .next_command
+            .get() as usize;
+        let message = Header::read_from_prefix(&bytes[next..])
+            .unwrap()
+            .0
+            .message_id
+            .get();
+        let mut group = std::pin::pin!(client.connection.request(bytes).unwrap().execute());
+        assert!(futures::poll!(&mut group).is_pending());
+        let held = control.next_call().await;
+        let cancel = SimpleBody {
+            structure_size: SimpleBody::STRUCTURE_SIZE.into(),
+            reserved: 0.into(),
+        };
+        client
+            .connection
+            .cancel(&request(
+                Command::CANCEL,
+                cancel.as_bytes(),
+                client.session,
+                client.tree,
+                message,
+            ))
+            .unwrap();
+        control.release(held.id, Gate::Before).unwrap();
+        let response = group.await.unwrap();
+        let replies = compound::responses(&response);
+        assert_eq!(response_status(replies[0]), Status::SUCCESS);
+        assert_eq!(response_status(replies[1]), Status::CANCELLED);
+        assert_eq!(successes(&control, Operation::Write), 1);
+        assert_eq!(&client.read(file, 0, 6).await[80..], b"one");
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn tcp_retains_a_compound_frame_when_command_admission_is_full() {
+    DefaultPool::run_with(async |driver| {
+        let (fs, control) = controlled(false);
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("capacity", 2, 0).await;
+        let write = request(
+            Command::WRITE,
+            &Client::write_body(file, 0, b"x"),
+            client.session,
+            client.tree,
+            client.message,
+        );
+        client.message += 1;
+        let echo = SimpleBody {
+            structure_size: SimpleBody::STRUCTURE_SIZE.into(),
+            reserved: 0.into(),
+        };
+        let bytes = compound::packet(
+            &mut client,
+            (0..MAX_REQUESTS)
+                .map(|_| (Command::ECHO, echo.as_bytes().to_vec()))
+                .collect(),
+            false,
+        );
+        let stream = TestStream::new();
+        stream.writable(usize::MAX);
+        stream.input(&frame(&write));
+        let mut task = TaskControl::new(tcp::ConnectionTask::new(
+            client.connection.clone(),
+            stream.clone(),
+        ));
+        task.insert(driver, "smb-compound-capacity", ());
+        task.start();
+        let held = control.next_call().await;
+        stream.input(&frame(&bytes));
+        stream
+            .until(|state| state.read == write.len() + bytes.len() + 8)
+            .await;
+        task.stop().await;
+        assert_eq!(inspect_text("active_requests", &task).await, "1");
+        control.release(held.id, Gate::Before).unwrap();
+        task.start();
+        stream
+            .until(|state| state.output.len() == 84 + 4 + MAX_REQUESTS * 72)
+            .await;
+        task.stop().await;
+        let output = stream.state.lock().output.clone();
+        let replies = compound::responses(&output[88..]);
+        assert_eq!(replies.len(), MAX_REQUESTS);
+        assert!(
+            replies
+                .iter()
+                .all(|reply| response_status(reply) == Status::SUCCESS)
+        );
+        task.task_mut().shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn close_drains_uncancellable_writes_without_blocking_other_opens() {
     block_on(async {
         let (fs, control) = controlled(false);

@@ -241,8 +241,13 @@ advanced ACEs, SACLs and descendant reinheritance require a separate supported
 provider profile, not successful no-ops or broader advertisement.
 SET_SECURITY is routed through an optional provider operation after open-right
 checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.
-Providers must apply selected components atomically and enforce their policy on
-future opens and namespace operations; merely storing an ACL is not success.
+Providers enforcing security apply selected components atomically and enforce
+their policy on future opens and namespace operations; merely storing an ACL
+does not establish enforcement support.
+Frontend framing, descriptor decoding and access checks do not depend on
+provider effects. A provider returning success produces a SET_INFO response
+without frontend read-back or simulated mutation; MemoryFs applies real policy
+changes for semantic testing.
 ControlledFs gates both the call and delivery of its settled result.
 
 Independent byte fixtures verify unaligned embedded bitfields, all six supported

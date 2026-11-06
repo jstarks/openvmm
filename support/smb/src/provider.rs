@@ -318,10 +318,12 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     ) -> Result<SecurityDescriptor, Status> {
         Err(Status::INVALID_DEVICE_REQUEST)
     }
-    /// Atomically apply selected security components for the established share identity.
-    /// The caller checks open rights; the provider validates ownership, ACL policy
-    /// and inheritance. Success must affect future authorization, not just store bytes.
-    /// Existing opens retain their grants. Unsupported stores reject explicitly.
+    /// Set selected security components for the established share identity.
+    /// The caller validates the wire descriptor and open rights. Providers enforcing
+    /// security apply components atomically and validate ownership, ACL policy and
+    /// inheritance; existing opens retain their grants. A store may explicitly model
+    /// successful no-op security updates. The frontend returns its result without
+    /// imposing mutation or reading the descriptor back.
     async fn set_security(
         &self,
         _file: &Self::File,

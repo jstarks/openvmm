@@ -5,6 +5,173 @@ use super::*;
 use crate::security::{AclState, SecurityDescriptor};
 use test_with_tracing::test;
 
+struct NoopSecurityFs {
+    inner: MemoryFs,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Inspect for NoopSecurityFs {
+    fn inspect(&self, request: inspect::Request<'_>) {
+        Inspect::inspect(&self.inner, request);
+    }
+}
+
+#[async_trait::async_trait]
+impl FileSystem for NoopSecurityFs {
+    type File = memory::MemoryFile;
+
+    async fn open(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        request: &RequestContext,
+    ) -> Result<(Self::File, u32), Status> {
+        self.inner.open(name, options, request).await
+    }
+    async fn close(&self, file: &Self::File, request: &RequestContext) -> Result<(), Status> {
+        self.inner.close(file, request).await
+    }
+    async fn metadata(
+        &self,
+        file: &Self::File,
+        request: &RequestContext,
+    ) -> Result<Metadata, Status> {
+        self.inner.metadata(file, request).await
+    }
+    async fn query_security(
+        &self,
+        file: &Self::File,
+        information: SecurityInformation,
+        request: &RequestContext,
+    ) -> Result<SecurityDescriptor, Status> {
+        self.inner.query_security(file, information, request).await
+    }
+    async fn set_security(
+        &self,
+        _file: &Self::File,
+        information: SecurityInformation,
+        descriptor: &SecurityDescriptor,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        assert_eq!(information.into_bits(), 4);
+        assert!(matches!(descriptor.dacl, AclState::Present(_)));
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    async fn read(
+        &self,
+        file: &Self::File,
+        offset: u64,
+        length: usize,
+        request: &RequestContext,
+    ) -> Result<Vec<u8>, Status> {
+        self.inner.read(file, offset, length, request).await
+    }
+    async fn write(
+        &self,
+        file: &Self::File,
+        offset: u64,
+        bytes: &[u8],
+        request: &RequestContext,
+    ) -> Result<usize, Status> {
+        self.inner.write(file, offset, bytes, request).await
+    }
+    async fn flush(&self, file: &Self::File, request: &RequestContext) -> Result<(), Status> {
+        self.inner.flush(file, request).await
+    }
+    async fn list(
+        &self,
+        file: &Self::File,
+        request: &RequestContext,
+    ) -> Result<Vec<Metadata>, Status> {
+        self.inner.list(file, request).await
+    }
+    async fn set_len(
+        &self,
+        file: &Self::File,
+        length: u64,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        self.inner.set_len(file, length, request).await
+    }
+    async fn set_delete_on_close(
+        &self,
+        file: &Self::File,
+        delete: bool,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        self.inner.set_delete_on_close(file, delete, request).await
+    }
+    async fn set_basic(
+        &self,
+        file: &Self::File,
+        info: BasicInformation,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        self.inner.set_basic(file, info, request).await
+    }
+}
+
+#[test]
+fn frontend_security_validation_is_independent_of_successful_provider_effects() {
+    use crate::security::Acl;
+    block_on(async {
+        let server = Server::new(
+            "memory",
+            NoopSecurityFs {
+                inner: MemoryFs::new(1024, 16),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            },
+        )
+        .unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("noop-security", 2, 0).await;
+        let before = client.ok(Command::QUERY_INFO, &query(file, 4, 4096)).await;
+        let mut descriptor = SecurityDescriptor::empty();
+        descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+        let response = client
+            .ok(
+                Command::SET_INFO,
+                &set(file, 0x80000004, &descriptor.encode()),
+            )
+            .await;
+        assert_eq!(&response[64..], &[2, 0]);
+        assert_eq!(server.backend.calls.load(Ordering::Relaxed), 1);
+        let after = client.ok(Command::QUERY_INFO, &query(file, 4, 4096)).await;
+        assert_eq!(&after[72..], &before[72..]);
+        let response = client
+            .open_result(
+                "noop-security",
+                AccessMask::new().with_read_attributes(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        let limited = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::SET_INFO, &set(limited, 4, &descriptor.encode()))
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::SET_INFO, &set(file, 4, &[0; 20]))
+                    .await
+            )
+            .0,
+            0xc0000079
+        );
+        assert_eq!(server.backend.calls.load(Ordering::Relaxed), 1);
+        client.close(limited).await;
+        client.close(file).await;
+    });
+}
+
 fn query(file: FileId, information: u32, length: u32) -> Vec<u8> {
     let mut body = QueryInfoRequest::new_zeroed();
     body.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();

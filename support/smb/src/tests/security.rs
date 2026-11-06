@@ -539,6 +539,9 @@ fn rejected_file_security_updates_are_atomic_and_directory_policy_is_explicit() 
         client.query(attributes, 4).await;
         client.close(attributes).await;
         let directory = client.open("directory", 2, 1).await;
+        let before = client
+            .ok(Command::QUERY_INFO, &query(directory, 4, 4096))
+            .await;
         descriptor.control.set_dacl_auto_inherit_required(true);
         descriptor.dacl = AclState::Present(
             Acl::access(&[AccessAce {
@@ -557,6 +560,10 @@ fn rejected_file_security_updates_are_atomic_and_directory_policy_is_explicit() 
             ),
             Status::NOT_SUPPORTED
         );
+        let after = client
+            .ok(Command::QUERY_INFO, &query(directory, 4, 4096))
+            .await;
+        assert_eq!(&after[72..], &before[72..]);
         client.close(directory).await;
         client.close(file).await;
     });

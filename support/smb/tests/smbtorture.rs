@@ -32,6 +32,7 @@ fn samba_read_write_smoke() {
             "smb2.mkdir",
             "smb2.getinfo.qsec_buffercheck",
             "smb2.getinfo.granted",
+            "smb2.sdread",
             "smb2.acls-with-sysacl.OWNER-RIGHTS",
             "smb2.acls-with-sysacl.OWNER-RIGHTS-DENY",
             "smb2.acls-with-sysacl.MXAC-NOT-GRANTED",

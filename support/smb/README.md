@@ -28,7 +28,7 @@ will not need them.
 | Namespace and enumeration | Directory continuation, rename/move, sharing, replacement and deletion | Implemented subset; broaden directory/rename cases; no generated short names or hard links |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
-| Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Four selected ACL cases plus direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
+| Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Explicit unsupported storage profile, validation and access checks | Neither capability advertised; no fabricated empty-success replies; fixtures requiring storage are not passes |
 | Caching and IOCTLs | Explicit uncached profile and validated unsupported controls | No oplock/lease grants; ACK/error/identity/bounds/credit regressions; no successful FSCTL operations |
 | Naming | Share-relative namespace and canonical paths | Dot components resolve within the virtual root; case folding is ASCII-only and no short names are generated |
@@ -78,7 +78,8 @@ completion. It checks connection and tree isolation, multi-client read/write dat
 EOF/short reads, Windows-style position semantics, directory-read behavior,
 per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests drive the core directly and cover
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
-The harness also checks compound CREATE/write/close, invalid inherited file
+The harness also checks descriptor component selection/read rights,
+compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
 The CREATE/sharing harness adds nineteen cases covering locked-file opens,
 multiple connections, readonly deletion, leading-backslash rejection, invalid
@@ -231,7 +232,13 @@ Automatic reinheritance requests, SACLs, advanced ACEs and security selectors
 are still unsupported.
 Maximum grants check each individual right with
 the same ordered DACL policy as explicit requests (MS-FSA 2.1.5.1.2.1).
-The persistent-ACL capability remains off pending broader security interoperability.
+Parent policy changes affect future creation, not the ACLs of existing
+descendants. Explicit automatic-reinheritance requests return NOT_SUPPORTED
+without changing the stored descriptor. The persistent-ACL capability remains
+off: basic synthetic enforcement and selected passing ACL cases do not establish
+complete persistent filesystem ACL semantics. Native identity/privilege policy,
+advanced ACEs, SACLs and descendant reinheritance require a separate supported
+provider profile, not successful no-ops or broader advertisement.
 SET_SECURITY is routed through an optional provider operation after open-right
 checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.
 Providers must apply selected components atomically and enforce their policy on

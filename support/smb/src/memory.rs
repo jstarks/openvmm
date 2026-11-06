@@ -51,6 +51,13 @@ struct NamedStream {
     size: u64,
     data: Vec<u8>,
     delete_pending: bool,
+    replacement_deleted: bool,
+}
+
+impl NamedStream {
+    fn is_deleted(&self) -> bool {
+        self.delete_pending || self.replacement_deleted
+    }
 }
 
 struct Open {
@@ -466,7 +473,7 @@ fn file_metadata(state: &State, file: &MemoryFile) -> Result<Metadata, Status> {
         info.path.push_str(":$DATA");
         info.size = stream.size;
         info.allocation_size = stream.data.len() as u64;
-        info.delete_pending = stream.delete_pending || info.number_of_links == 0;
+        info.delete_pending = stream.is_deleted() || info.number_of_links == 0;
         if let Some(compression) = &mut info.compression {
             compression.compressed_size = info.allocation_size;
         }
@@ -855,7 +862,7 @@ fn open_named_stream(
         .iter()
         .find(|(_, stream)| stream.name.eq_ignore_ascii_case(name))
         .map(|(id, stream)| (*id, stream));
-    if existing.is_some_and(|(_, stream)| stream.delete_pending) {
+    if existing.is_some_and(|(_, stream)| stream.is_deleted()) {
         return Err(Status::DELETE_PENDING);
     }
     if existing.is_some() && options.disposition() == CreateDisposition::CREATE {
@@ -959,6 +966,7 @@ fn open_named_stream(
                 size: 0,
                 data,
                 delete_pending: false,
+                replacement_deleted: false,
             },
         );
         node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
@@ -988,6 +996,13 @@ fn rename_stream(
         return Err(Status::ACCESS_DENIED);
     }
     let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+    if node
+        .streams
+        .get(&file.stream)
+        .is_some_and(|stream| stream.is_deleted())
+    {
+        return Err(Status::ACCESS_DENIED);
+    }
     let source_default = file.stream == node.default_stream;
     let directory_stream = source_default && node.metadata.is_directory();
     let suffix = name.strip_prefix(':').ok_or(Status::INVALID_PARAMETER)?;
@@ -1107,6 +1122,7 @@ fn rename_stream(
                 size,
                 data,
                 delete_pending: false,
+                replacement_deleted: false,
             },
         );
         state.next_stream = next;
@@ -1256,13 +1272,13 @@ fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usi
     Ok(new_bytes)
 }
 
-fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
+fn allocate(state: &mut State, node_id: u64, length: usize, released: usize) -> Result<(), Status> {
     let stream = state
         .nodes
         .get(&node_id)
         .ok_or(Status::FILE_CLOSED)?
         .default_stream;
-    allocate_stream(state, node_id, stream, length)
+    allocate_stream_with_release(state, node_id, stream, length, released)
 }
 
 fn allocate_stream(
@@ -1271,13 +1287,27 @@ fn allocate_stream(
     stream: u64,
     length: usize,
 ) -> Result<(), Status> {
+    allocate_stream_with_release(state, node_id, stream, length, 0)
+}
+
+// Credited storage must be removed before releasing the state lock.
+fn allocate_stream_with_release(
+    state: &mut State,
+    node_id: u64,
+    stream: u64,
+    length: usize,
+    released: usize,
+) -> Result<(), Status> {
     let old_len = stream_data(
         state.nodes.get(&node_id).ok_or(Status::FILE_CLOSED)?,
         stream,
     )?
     .0
     .len();
-    let new_bytes = allocation_charge(state, old_len, length)?;
+    let old_bytes = old_len
+        .checked_add(released)
+        .ok_or(Status::INTERNAL_ERROR)?;
+    let new_bytes = allocation_charge(state, old_bytes, length)?;
     let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
     let (data, size) = stream_data_mut(node, stream)?;
     if length > old_len {
@@ -1394,7 +1424,7 @@ impl MemoryFile {
                 .nodes
                 .get(&self.node)
                 .and_then(|node| node.streams.get(&open.stream))
-                .is_some_and(|stream| stream.delete_pending)
+                .is_some_and(|stream| stream.is_deleted())
                 && !state
                     .opens
                     .values()
@@ -1541,7 +1571,11 @@ impl inspect::Inspect for MemoryFs {
                                             .field("name", &stream.name)
                                             .field("size", stream.size)
                                             .field("allocation_size", stream.data.len())
-                                            .field("delete_pending", stream.delete_pending);
+                                            .field("delete_pending", stream.delete_pending)
+                                            .field(
+                                                "replacement_deleted",
+                                                stream.replacement_deleted,
+                                            );
                                     });
                                 }
                             });
@@ -1661,6 +1695,9 @@ impl FileSystem for MemoryFs {
                 }
                 for other in state.opens.values().filter(|o| o.node == id) {
                     if stream_sharing_conflict(options.access, options.share_access, other, default)
+                        || (replacement
+                            && other.stream != default
+                            && !ShareAccess::from_bits(other.sharing).delete())
                     {
                         return Err(Status::SHARING_VIOLATION);
                     }
@@ -1676,13 +1713,40 @@ impl FileSystem for MemoryFs {
                     let attributes_changed = attributes != node.metadata.attributes;
                     let allocation =
                         usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?;
-                    allocate(&mut state, id, allocation)?;
+                    let removed: Vec<_> = node
+                        .streams
+                        .iter()
+                        .filter(|(stream, _)| {
+                            !state
+                                .opens
+                                .values()
+                                .any(|open| open.node == id && open.stream == **stream)
+                        })
+                        .map(|(id, stream)| (*id, stream.name.clone(), stream.data.len()))
+                        .collect();
+                    let released = removed.iter().map(|(_, _, length)| *length).sum();
+                    allocate(&mut state, id, allocation, released)?;
                     let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
+                    for stream in node.streams.values_mut() {
+                        stream.replacement_deleted = true;
+                    }
+                    for (stream, _, _) in &removed {
+                        node.streams.remove(stream);
+                    }
                     node.data.fill(0);
                     node.metadata.size = 0;
                     node.metadata.attributes = attributes;
                     node.metadata.written = nt_time();
                     node.metadata.changed = node.metadata.written;
+                    for (_, name, _) in removed {
+                        emit_named(
+                            &mut state,
+                            id,
+                            Some(&name),
+                            NotifyAction::REMOVED_STREAM,
+                            NotifyFilter::new().with_stream_name(true),
+                        );
+                    }
                     emit(
                         &mut state,
                         id,
@@ -1787,6 +1851,7 @@ impl FileSystem for MemoryFs {
                         size: 0,
                         data: std::mem::take(&mut data),
                         delete_pending: false,
+                        replacement_deleted: false,
                     },
                 )])
             } else {
@@ -2422,7 +2487,7 @@ impl FileSystem for MemoryFs {
         streams.extend(
             node.streams
                 .values()
-                .filter(|stream| !stream.delete_pending)
+                .filter(|stream| !stream.is_deleted())
                 .map(|stream| StreamInformation {
                     name: stream.name.clone(),
                     size: stream.size,

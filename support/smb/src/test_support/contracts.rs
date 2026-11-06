@@ -834,6 +834,28 @@ pub async fn named_streams<F: Fixture>(fixture: &F) {
             .await,
             Status::OBJECT_NAME_NOT_FOUND,
         );
+        let named = open(
+            fs,
+            "streams:replacement",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        write_all(fs, &named, 0, b"data", &request).await;
+        fs.close(&named, &request).await.unwrap();
+        let replaced = open(fs, "streams", CreateDisposition::OVERWRITE, false, &request).await;
+        rejected(
+            fs.open(
+                "streams:replacement",
+                options(CreateDisposition::OPEN, false),
+                &request,
+            )
+            .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+        assert_eq!(fs.metadata(&base, &request).await.unwrap().size, 0);
+        fs.close(&replaced, &request).await.unwrap();
     }
     fs.close(&base, &request).await.unwrap();
 }

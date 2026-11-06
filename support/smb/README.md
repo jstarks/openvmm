@@ -29,7 +29,7 @@ will not need them.
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
-| EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; twelve selected naming/directory/I/O/sharing/deletion/rename/attribute/permission stream cases pass |
+| EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
 | Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
 | Naming | Share-relative namespace and canonical paths | Dot components and explicit short aliases resolve within the virtual root; case folding is ASCII-only |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
@@ -81,6 +81,10 @@ an empty, unopened target; its reserved allocation is released.
 Data-stream names follow MS-FSCC 2.1.5.3 rather than filename restrictions:
 wildcards, punctuation and non-NUL controls can be literal stream-name characters;
 separators, NUL and names longer than 255 UTF-16 units are rejected.
+Default-stream replacement removes closed named streams and uses their released
+allocation in the same atomic reservation. Live named opens must share deletion:
+their data/locks and quota charges remain until final close, with new opens
+receiving DELETE_PENDING. Failed replacement leaves data and notifications intact.
 
 SET_INFO FileShortNameInformation delegates explicit 8.3 alias assignment/removal
 to the provider after framing and DELETE-access validation. Providers own restore

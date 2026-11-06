@@ -653,6 +653,189 @@ fn supersede_of_a_new_named_stream_does_not_add_delete_access() {
 }
 
 #[test]
+fn default_stream_replacement_releases_closed_named_streams_atomically() {
+    block_on(async {
+        for disposition in [0, 4, 5] {
+            let memory = MemoryFs::new(12, 16);
+            let server = Server::new("memory", memory).unwrap();
+            let mut client = Client::new(&server).await;
+            let base = client.open("replacement", 2, 0).await;
+            client
+                .ok(Command::WRITE, &Client::write_body(base, 0, b"base"))
+                .await;
+            let named = client.open("replacement:side", 3, 0).await;
+            client
+                .ok(Command::WRITE, &Client::write_body(named, 0, b"side"))
+                .await;
+            client.close(named).await;
+            let other = client.open("other", 2, 0).await;
+            client
+                .ok(Command::WRITE, &Client::write_body(other, 0, b"busy"))
+                .await;
+            let root = client.open("", 1, 1).await;
+            let mut watching = std::pin::pin!(
+                notify::accept(
+                    &mut client,
+                    root,
+                    NotifyFilter::new().with_stream_name(true),
+                    false,
+                    4096
+                )
+                .execute()
+            );
+            assert!(futures::poll!(&mut watching).is_pending());
+            for (allocation, status) in [(12u64, Status::DISK_FULL), (8, Status::SUCCESS)] {
+                let mut extra = Vec::new();
+                let mut last = None;
+                append_create_context(
+                    &mut extra,
+                    &mut last,
+                    CreateContextName::ALLOCATION_SIZE,
+                    &allocation.to_le_bytes(),
+                );
+                let response = client
+                    .send(
+                        Command::CREATE,
+                        &create_body("replacement", 0x1f01ff, 7, disposition, 0, &extra),
+                    )
+                    .await;
+                assert_eq!(response_status(&response), status);
+                if status == Status::DISK_FULL {
+                    assert!(futures::poll!(&mut watching).is_pending());
+                    assert_eq!(&client.read(base, 0, 4).await[80..], b"base");
+                    let named = client.open("replacement:side", 1, 0).await;
+                    assert_eq!(&client.read(named, 0, 4).await[80..], b"side");
+                    client.close(named).await;
+                } else {
+                    let replaced = read_body::<CreateResponse>(&response).unwrap().file_id;
+                    assert_eq!(
+                        response_status(&client.read(base, 0, 4).await),
+                        Status::END_OF_FILE
+                    );
+                    assert_eq!(
+                        response_status(&client.open_result("replacement:side", 1, 7, 1, 0).await),
+                        Status::OBJECT_NAME_NOT_FOUND
+                    );
+                    assert_eq!(
+                        &client.query(replaced, 5).await[72..80],
+                        &8u64.to_le_bytes()
+                    );
+                    client.close(replaced).await;
+                }
+            }
+            assert_eq!(
+                notify::changes(&watching.await.unwrap()),
+                [(NotifyAction::REMOVED_STREAM, "replacement:side".into())]
+            );
+            client.close(base).await;
+            client.close(other).await;
+            client.close(root).await;
+        }
+    });
+}
+
+#[test]
+fn default_replacement_respects_named_delete_sharing_and_retains_live_data() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let access = AccessMask::new()
+            .with_read_data(true)
+            .with_write_data(true)
+            .into_bits();
+        let response = client.open_result("active:side", access, 3, 3, 0).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let named = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client
+            .ok(Command::WRITE, &Client::write_body(named, 0, b"side"))
+            .await;
+        let response = client.open_result("active", access, 7, 1, 0).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let base = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client
+            .ok(Command::WRITE, &Client::write_body(base, 0, b"base"))
+            .await;
+        assert_eq!(
+            response_status(&client.open_result("active", access, 7, 4, 0).await),
+            Status::SHARING_VIOLATION
+        );
+        assert_eq!(&client.read(base, 0, 4).await[80..], b"base");
+        client.close(named).await;
+        let named = client.open("active:side", 1, 0).await;
+        let alias = client.open("active:side", 1, 0).await;
+        client
+            .ok(
+                Command::LOCK,
+                &locking::body(
+                    named,
+                    &[(
+                        0,
+                        4,
+                        LockFlags::new()
+                            .with_exclusive_lock(true)
+                            .with_fail_immediately(true),
+                    )],
+                ),
+            )
+            .await;
+        let root = client.open("", 1, 1).await;
+        let mut watching = std::pin::pin!(
+            notify::accept(
+                &mut client,
+                root,
+                NotifyFilter::new().with_stream_name(true),
+                false,
+                4096
+            )
+            .execute()
+        );
+        assert!(futures::poll!(&mut watching).is_pending());
+        let replaced = client.open("active", 4, 0).await;
+        assert!(futures::poll!(&mut watching).is_pending());
+        assert_eq!(
+            response_status(&client.set(named, 13, &[0]).await),
+            Status::SUCCESS
+        );
+        let name = encode_name(":resurrected");
+        let mut rename = FileRenameInformation::new_zeroed();
+        rename.file_name_length = (name.len() as u32).into();
+        let mut bytes = rename.as_bytes().to_vec();
+        bytes.extend(name);
+        assert_eq!(
+            response_status(&client.set(named, 10, &bytes).await),
+            Status::ACCESS_DENIED
+        );
+        let streams = client.query(base, 22).await;
+        assert_eq!(response_status(&streams), Status::SUCCESS);
+        assert_eq!(&streams[96..], encode_name("::$DATA"));
+        assert_eq!(&client.read(named, 0, 4).await[80..], b"side");
+        assert_eq!(
+            response_status(&client.read(alias, 0, 4).await),
+            Status::FILE_LOCK_CONFLICT
+        );
+        assert_eq!(
+            response_status(&client.open_result("active:side", 1, 7, 1, 0).await),
+            Status::DELETE_PENDING
+        );
+        client.close(named).await;
+        assert!(futures::poll!(&mut watching).is_pending());
+        assert_eq!(&client.read(alias, 0, 4).await[80..], b"side");
+        client.close(alias).await;
+        assert_eq!(
+            notify::changes(&watching.await.unwrap()),
+            [(NotifyAction::REMOVED_STREAM, "active:side".into())]
+        );
+        assert_eq!(
+            response_status(&client.open_result("active:side", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        client.close(replaced).await;
+        client.close(base).await;
+        client.close(root).await;
+    });
+}
+
+#[test]
 fn named_stream_creation_is_atomic_under_byte_and_object_limits() {
     block_on(async {
         for (bytes, objects) in [(32usize, 32usize), (1024, 2)] {

@@ -240,6 +240,12 @@ pub async fn filesystem_information<F: Fixture>(fixture: &F) {
             assert!(info.caller_available_allocation_units <= info.total_allocation_units);
             assert!(info.sectors_per_allocation_unit > 0);
             assert!(info.bytes_per_sector > 0);
+            if let Some(sector) = info.sector_size {
+                assert_eq!(sector.logical_bytes, info.bytes_per_sector);
+                assert!(sector.physical_atomic_bytes > 0);
+                assert!(sector.physical_performance_bytes > 0);
+                assert!(sector.effective_atomic_bytes > 0);
+            }
         }
         fs.close(&file, &request).await.unwrap();
     }

@@ -722,6 +722,7 @@ fn filesystem_response(
         FileSystemInformationClass::FULL_SIZE => size_of::<FileFsFullSizeInformation>(),
         FileSystemInformationClass::DEVICE => size_of::<FileFsDeviceInformation>(),
         FileSystemInformationClass::ATTRIBUTE => size_of::<FileFsAttributeInformation>(),
+        FileSystemInformationClass::SECTOR_SIZE => size_of::<FileFsSectorSizeInformation>(),
         _ => return Err(Status::INVALID_PARAMETER),
     };
     if (maximum as usize) < minimum {
@@ -755,6 +756,25 @@ fn filesystem_response(
             }
             .as_bytes(),
         ),
+        FileSystemInformationClass::SECTOR_SIZE => {
+            let sector = info.sector_size.ok_or(Status::NOT_SUPPORTED)?;
+            out.extend_from_slice(
+                FileFsSectorSizeInformation {
+                    logical_bytes_per_sector: sector.logical_bytes.into(),
+                    physical_bytes_per_sector_for_atomicity: sector.physical_atomic_bytes.into(),
+                    physical_bytes_per_sector_for_performance: sector
+                        .physical_performance_bytes
+                        .into(),
+                    file_system_effective_physical_bytes_per_sector_for_atomicity: sector
+                        .effective_atomic_bytes
+                        .into(),
+                    flags: SectorSizeFlags::from_bits(sector.flags),
+                    byte_offset_for_sector_alignment: sector.sector_alignment.into(),
+                    byte_offset_for_partition_alignment: sector.partition_alignment.into(),
+                }
+                .as_bytes(),
+            );
+        }
         FileSystemInformationClass::ATTRIBUTE => {
             let name = encode_name(&info.name);
             out.extend_from_slice(
@@ -2335,6 +2355,7 @@ impl<B: FileSystem> Connection<B> {
                 | FileSystemInformationClass::SIZE
                 | FileSystemInformationClass::FULL_SIZE
                 | FileSystemInformationClass::DEVICE
+                | FileSystemInformationClass::SECTOR_SIZE
                 | FileSystemInformationClass::ATTRIBUTE => {}
                 FileSystemInformationClass::LABEL
                 | FileSystemInformationClass::DRIVER_PATH

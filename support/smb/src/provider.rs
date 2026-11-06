@@ -137,6 +137,25 @@ impl Metadata {
     }
 }
 
+/// Provider-owned sector geometry and alignment, including synthetic devices.
+#[derive(Debug, Clone, Copy)]
+pub struct SectorSizeInformation {
+    /// Logical addressing unit in bytes.
+    pub logical_bytes: u32,
+    /// Physical unit of atomic write.
+    pub physical_atomic_bytes: u32,
+    /// Physical unit used for performance alignment.
+    pub physical_performance_bytes: u32,
+    /// Filesystem-effective unit of atomic write.
+    pub effective_atomic_bytes: u32,
+    /// SSINFO_FLAGS_* geometry flags.
+    pub flags: u32,
+    /// Logical-to-physical sector offset, or SSINFO_OFFSET_UNKNOWN.
+    pub sector_alignment: u32,
+    /// Partition offset, or SSINFO_OFFSET_UNKNOWN.
+    pub partition_alignment: u32,
+}
+
 /// One coherent volume snapshot, supplied by the filesystem rather than the SMB engine.
 #[derive(Debug, Clone)]
 pub struct FileSystemInformation {
@@ -168,6 +187,8 @@ pub struct FileSystemInformation {
     pub sectors_per_allocation_unit: u32,
     /// Nonzero logical bytes per sector.
     pub bytes_per_sector: u32,
+    /// Extended geometry when supported; None declines this optional query.
+    pub sector_size: Option<SectorSizeInformation>,
 }
 
 /// Parameters of an SMB open, after protocol validation.

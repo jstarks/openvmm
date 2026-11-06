@@ -24,7 +24,7 @@ will not need them.
 | CREATE and data I/O | Sharing, access grants, dispositions, EOF, short I/O, flush and close | Implemented; selected CREATE/read/write/mkdir cases and provider contracts |
 | Compounds and credits | Bounded admission, inherited identities, error propagation, pending replies and cancellation | Implemented; selected compound/async cases; retain committed CLOSE and compound-tail policies |
 | File metadata | Supported query classes, attributes/timestamps, allocation, EOF, mode and position | Implemented subset; broaden applicable getinfo/setinfo cases and classify unsupported-class dependencies |
-| Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7 implemented; broader fixtures may require quota/object-ID/sector classes outside this profile |
+| Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/11 implemented; broader fixtures may require quota/object-ID classes |
 | Namespace and enumeration | Directory continuation, rename/move, sharing, replacement and deletion | Implemented subset; broaden directory/rename cases; no generated short names or hard links |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |

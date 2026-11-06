@@ -322,6 +322,32 @@ wire!(
     }
 );
 wire!(
+    /// FileFsSectorSizeInformation: [MS-FSCC] §2.5.7.
+    FileFsSectorSizeInformation, 28 {
+        logical_bytes_per_sector: U32,
+        physical_bytes_per_sector_for_atomicity: U32,
+        physical_bytes_per_sector_for_performance: U32,
+        file_system_effective_physical_bytes_per_sector_for_atomicity: U32,
+        flags: SectorSizeFlags,
+        byte_offset_for_sector_alignment: U32,
+        byte_offset_for_partition_alignment: U32,
+    }
+);
+
+/// Sector geometry flags: [MS-FSCC] §2.5.7.
+#[bitfield(u32, repr = U32, from = U32::new, into = super::u32_from_le, conversion = false)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct SectorSizeFlags {
+    pub aligned_device: bool,
+    pub partition_aligned: bool,
+    pub no_seek_penalty: bool,
+    pub trim_enabled: bool,
+    #[bits(28)]
+    reserved: u32,
+}
+le_bitfield_conversions!(SectorSizeFlags, u32, U32);
+
+wire!(
     /// FileFsDeviceInformation: [MS-FSCC] §2.5.10.
     FileFsDeviceInformation, 8 { device_type: U32, characteristics: U32 }
 );

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use super::*;
+use crate::provider::SectorSizeInformation;
 use futures::executor::block_on;
 use memory::MemoryFs;
 use std::pin::Pin;
@@ -602,6 +603,39 @@ fn filesystem_queries_report_provider_identity_and_live_capacity() {
 }
 
 #[test]
+fn filesystem_sector_information_reports_memory_geometry_and_fixed_boundaries() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let root = client.open("", 1, 1).await;
+        let file = client.open("sector-info", 2, 0).await;
+        for id in [root, file] {
+            let mut query = QueryInfoRequest::new_zeroed();
+            query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+            query.info_type = InformationType::FILESYSTEM;
+            query.info_class = 11;
+            query.file_id = id;
+            for length in [0u32, 27, 28] {
+                query.output_buffer_length = length.into();
+                let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+                if length < 28 {
+                    assert_eq!(response_status(&response), Status::INFO_LENGTH_MISMATCH);
+                } else {
+                    assert_eq!(response_status(&response), Status::SUCCESS);
+                    let expected: Vec<_> = [1u32, 1, 1, 1, 7, 0, 0]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    assert_eq!(&response[72..], expected);
+                }
+            }
+        }
+        client.close(file).await;
+        client.close(root).await;
+    });
+}
+
+#[test]
 fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
     let mut info = FileSystemInformation {
         created: 123,
@@ -618,8 +652,25 @@ fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
         actual_available_allocation_units: 30,
         sectors_per_allocation_unit: 8,
         bytes_per_sector: 512,
+        sector_size: Some(SectorSizeInformation {
+            logical_bytes: 512,
+            physical_atomic_bytes: 4096,
+            physical_performance_bytes: 8192,
+            effective_atomic_bytes: 4096,
+            flags: 12,
+            sector_alignment: u32::MAX,
+            partition_alignment: 512,
+        }),
     };
     for (class, maximum, expected) in [
+        (
+            FileSystemInformationClass::SECTOR_SIZE,
+            28,
+            [512u32, 4096, 8192, 4096, 12, u32::MAX, 512]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        ),
         (
             FileSystemInformationClass::DEVICE,
             8,
@@ -670,6 +721,11 @@ fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
             Some(Status::INFO_LENGTH_MISMATCH),
         );
     }
+    info.sector_size = None;
+    assert_eq!(
+        filesystem_response(&info, FileSystemInformationClass::SECTOR_SIZE, 28).err(),
+        Some(Status::NOT_SUPPORTED)
+    );
     let (status, body) =
         filesystem_response(&info, FileSystemInformationClass::VOLUME, 25).unwrap();
     assert_eq!(status, Status::BUFFER_OVERFLOW);
@@ -723,7 +779,7 @@ fn filesystem_queries_propagate_provider_rejection_without_memory_fallback() {
         query.info_type = InformationType::FILESYSTEM;
         query.file_id = root;
         query.output_buffer_length = 4096.into();
-        for class in [1, 3, 4, 5, 7] {
+        for class in [1, 3, 4, 5, 7, 11] {
             query.info_class = class;
             let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
             assert_eq!(response_status(&response), Status::NOT_SUPPORTED);
@@ -734,11 +790,10 @@ fn filesystem_queries_propagate_provider_rejection_without_memory_fallback() {
                 .iter()
                 .filter(|call| call.operation == Operation::FileSystemInformation)
                 .count(),
-            5
+            6
         );
         for (class, status) in [
             (2, Status::INVALID_INFO_CLASS),
-            (11, Status::INVALID_PARAMETER),
             (255, Status::INVALID_PARAMETER),
         ] {
             query.info_class = class;

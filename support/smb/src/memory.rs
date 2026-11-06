@@ -5,15 +5,15 @@
 
 use crate::provider::{
     BasicInformation, ByteRange, Change, CompressionInformation, FileSystem, FileSystemInformation,
-    LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
+    LockId, Metadata, NotifyResult, OpenOptions, RequestContext, SectorSizeInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
     AccessMask, AceFlags, CreateAction, CreateDisposition, CreateOptions, FILE_DEVICE_DISK,
     FILE_MODE_INFORMATION_MASK, FILE_MODE_INFORMATION_SET_MASK, FileAttributes,
     FileSystemAttributes, MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter,
-    SecurityDescriptorControl, SecurityInformation, ShareAccess, Status, TIME_RESTORE,
-    TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
+    SectorSizeFlags, SecurityDescriptorControl, SecurityInformation, ShareAccess, Status,
+    TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
 use event_listener::Event;
@@ -1387,6 +1387,19 @@ impl FileSystem for MemoryFs {
             actual_available_allocation_units: available,
             sectors_per_allocation_unit: 1,
             bytes_per_sector: 1,
+            sector_size: Some(SectorSizeInformation {
+                logical_bytes: 1,
+                physical_atomic_bytes: 1,
+                physical_performance_bytes: 1,
+                effective_atomic_bytes: 1,
+                flags: SectorSizeFlags::new()
+                    .with_aligned_device(true)
+                    .with_partition_aligned(true)
+                    .with_no_seek_penalty(true)
+                    .into_bits(),
+                sector_alignment: 0,
+                partition_alignment: 0,
+            }),
         })
     }
 

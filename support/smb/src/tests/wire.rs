@@ -5,6 +5,37 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn ea_size_queries_do_not_require_ea_content_or_attribute_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        for (name, options) in [("file", 0), ("directory", 1)] {
+            let response = client
+                .open_result(
+                    name,
+                    AccessMask::new().with_synchronize(true).into_bits(),
+                    7,
+                    2,
+                    options,
+                )
+                .await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+            let response = client.query(file, FileInformationClass::EA.0).await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            assert_eq!(&response[72..], &[0; 4]);
+            for class in [FileInformationClass::FULL_EA, FileInformationClass::BASIC] {
+                assert_eq!(
+                    response_status(&client.query(file, class.0).await),
+                    Status::ACCESS_DENIED
+                );
+            }
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

@@ -1133,6 +1133,22 @@ pub async fn rename_namespace_and_replacement<F: Fixture>(fixture: &F) {
     fs.rename(&file, "shared\\new", false, &request)
         .await
         .unwrap();
+    let (parent, _) = fs
+        .open(
+            "shared",
+            OpenOptions {
+                access: AccessMask::new().with_read_attributes(true).into_bits(),
+                share_access: 0,
+                ..options(CreateDisposition::OPEN, true)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    fs.rename(&file, "shared\\metadata", false, &request)
+        .await
+        .unwrap();
+    fs.close(&parent, &request).await.unwrap();
     fs.close(&file, &request).await.unwrap();
     fs.close(&directory, &request).await.unwrap();
 }
@@ -1371,7 +1387,7 @@ pub async fn rename_notifications<F: Fixture>(fixture: &F) {
     fs.close(&root, &request).await.unwrap();
 }
 
-/// Bilateral sharing, idempotent settled close, and fallback drop release.
+/// Bilateral sharing, metadata-only exemptions, and settled close/drop release.
 pub async fn sharing_and_handle_release<F: Fixture>(fixture: &F) {
     let fs = fixture.filesystem();
     let request = RequestContext::new(1);
@@ -1421,6 +1437,29 @@ pub async fn sharing_and_handle_release<F: Fixture>(fixture: &F) {
     drop(fallback);
     let (writer, _) = fs.open("sharing", write, &request).await.unwrap();
     fs.close(&writer, &request).await.unwrap();
+    for access in [
+        AccessMask::new().with_read_attributes(true),
+        AccessMask::new().with_write_attributes(true),
+        AccessMask::new().with_synchronize(true),
+    ] {
+        let metadata = OpenOptions {
+            access: access.into_bits(),
+            share_access: 0,
+            ..options(CreateDisposition::OPEN, false)
+        };
+        let exclusive = OpenOptions {
+            share_access: 0,
+            ..write
+        };
+        let (first, _) = fs.open("sharing", metadata, &request).await.unwrap();
+        let (second, _) = fs.open("sharing", exclusive, &request).await.unwrap();
+        fs.close(&second, &request).await.unwrap();
+        fs.close(&first, &request).await.unwrap();
+        let (first, _) = fs.open("sharing", exclusive, &request).await.unwrap();
+        let (second, _) = fs.open("sharing", metadata, &request).await.unwrap();
+        fs.close(&second, &request).await.unwrap();
+        fs.close(&first, &request).await.unwrap();
+    }
 }
 
 /// Delete disposition can be cleared; pending deletion waits for the last

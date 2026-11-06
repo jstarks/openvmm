@@ -80,9 +80,10 @@ handle permissions, and excluding changes to the watched directory itself.
 The lock harness runs seventeen cases covering shared/exclusive I/O enforcement,
 conflicts, pending acquisition, exact unlocks, stacking, zero-length/64-bit
 ranges, cross-connection ownership, arrays, and truncation.
-The rename harness covers seven cases: simple, modification-time preservation,
+The rename harness covers eleven cases: simple, modification-time preservation,
 missing DELETE access, source sharing, destination-directory sharing, and
-rejecting directory renames with open descendants.
+rejecting directory renames with open descendants, plus metadata-only parent
+opens, no-delete-sharing parent opens, close-time metadata and concurrent opens.
 `SMBTORTURE` selects the executable for every harness; otherwise they use
 `smbtorture` from PATH. The corrected-client harness requires that variable
 explicitly and adds eleven notify cases: tcon, dir, tdis, double, tcp, overflow,
@@ -135,6 +136,11 @@ precision. Keep provider-specific tests for those policies, native completion
 ownership/cancellation, timestamp controls, resource bounds, and durability.
 SMB access checks, per-open request barriers, CLOSE cancel/drain, transient
 stop, and wire/transport behavior remain engine/runtime tests.
+
+Metadata-only opens do not participate in data/execute/delete sharing conflicts
+(MS-FSA 2.1.5.1.2.2). This exemption works in both open orders, even when either
+handle requests exclusive sharing. Rename's temporary destination-directory open
+uses the same check, so a metadata-only parent handle cannot obstruct a rename.
 
 ## Protocol Representation
 
@@ -375,6 +381,11 @@ Variable name/label replies retain their full length fields when returning a
 partial buffer with BUFFER_OVERFLOW. Undersized fixed prefixes return
 INFO_LENGTH_MISMATCH.
 
+The filesystem-attribute fixed prefix is 12 bytes, as specified by MS-FSA
+2.1.5.13.5. Samba's `qfs_buffercheck` expects 16 and is not a passing case;
+the implementation retains the specified prefix. That fixture and `fsinfo`
+also require volume classes outside this provider profile.
+
 MemoryFs uses one-byte logical allocation units: total capacity is its configured
 data quota and available capacity follows retained data bytes, including truncation
 and final deletion. These are synthetic byte units, not invented host disk
@@ -399,8 +410,9 @@ is local-only and returns NOT_SUPPORTED remotely.
 
 File queries validate their fixed minimum buffers with INFO_LENGTH_MISMATCH.
 Variable name replies retain the full name length and return partial complete
-UTF-16 code units with BUFFER_OVERFLOW. Explicit EA-size queries require READ_EA;
-providers report actual EA lengths, with no EAs in the current MemoryFs profile.
+UTF-16 code units with BUFFER_OVERFLOW. EA-size queries do not require READ_EA;
+only queries for EA contents require that right. Providers report actual EA
+lengths, with no EAs in the current MemoryFs profile.
 
 The provider resolves MAXIMUM_ALLOWED and reports actual per-open grants
 separately from maximal access for the established identity. The engine does not
@@ -463,6 +475,12 @@ closed subtrees and notification filtering. Wire tests additionally cover malfor
 fields, independent literal layouts, related compounds, pending watches, and
 before/after-effect cancellation. Provider-specific tests retain quota checks.
 The selected Samba cases do not claim the entire rename or notify suite passes.
+`share_delete_and_delete_access` expects rename to reject a parent DELETE
+handle even when it shares writes. MS-FSA 2.1.5.15.12 uses all three sharing
+flags for the temporary destination-directory open; Appendix A note 185
+documents the older Windows behavior that omits FILE_SHARE_DELETE. This
+implementation retains the main algorithm rather than adding that legacy
+restriction to make the fixture pass.
 
 ## Delete Mode and Disposition
 
@@ -581,8 +599,9 @@ READ_ATTRIBUTES and fixed-buffer checks. MemoryFs has no reparse objects and
 ignores CREATE's non-settable REPARSE_POINT attribute.
 
 MemoryFs deliberately has no EAs or named streams and advertises neither.
-Full-EA/stream queries return INVALID_INFO_CLASS; EA queries/sets check READ_EA /
-WRITE_EA. Structurally invalid EA SET lists return EA_LIST_INCONSISTENT, while
+Full-EA/stream queries return INVALID_INFO_CLASS; EA-content queries/sets check
+READ_EA / WRITE_EA. EA-size queries are unrestricted. Structurally invalid EA
+SET lists return EA_LIST_INCONSISTENT, while
 valid unsupported sets return INVALID_DEVICE_REQUEST. Creation EAs fail
 EAS_NOT_SUPPORTED before publication, but existing objects ignore EA bytes,
 including OPEN_IF. Borrowed OpenOptions input preserves atomic native-provider

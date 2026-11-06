@@ -679,6 +679,14 @@ fn share_categories(access: u32) -> u32 {
         .into_bits()
 }
 
+fn sharing_conflict(access: u32, sharing: u32, other: &Open) -> bool {
+    let access = share_categories(access);
+    let other_access = share_categories(other.access);
+    access != 0
+        && other_access != 0
+        && (access & !other.sharing != 0 || other_access & !sharing != 0)
+}
+
 fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
     let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
     let old_len = node.data.len();
@@ -922,9 +930,7 @@ impl FileSystem for MemoryFs {
                 return Err(Status::ACCESS_DENIED);
             }
             for other in state.opens.values().filter(|o| o.node == id) {
-                if share_categories(options.access) & !other.sharing != 0
-                    || share_categories(other.access) & !options.share_access != 0
-                {
+                if sharing_conflict(options.access, options.share_access, other) {
                     return Err(Status::SHARING_VIOLATION);
                 }
             }
@@ -1112,11 +1118,14 @@ impl FileSystem for MemoryFs {
         let old_parent = source.parent;
         let new_name = parts.last().ok_or(Status::OBJECT_NAME_INVALID)?;
         let parent = resolve_directory(&state, &parts[..parts.len() - 1])?;
-        if state
-            .opens
-            .values()
-            .any(|open| open.node == parent && !ShareAccess::from_bits(open.sharing).write())
-        {
+        let parent_access = AccessMask::new()
+            .with_write_data(!directory)
+            .with_append_data(directory)
+            .into_bits();
+        if state.opens.values().any(|open| {
+            open.node == parent
+                && sharing_conflict(parent_access, ShareAccess::ALL.into_bits(), open)
+        }) {
             return Err(Status::SHARING_VIOLATION);
         }
         if source.metadata.delete_pending {

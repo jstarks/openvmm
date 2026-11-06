@@ -2264,9 +2264,6 @@ impl<B: FileSystem> Connection<B> {
             };
             return buffer_response(out, maximum).map(|body| (Status::SUCCESS, body));
         }
-        if class == FileInformationClass::EA && !file.access.read_ea() {
-            return Err(Status::ACCESS_DENIED);
-        }
         if info_type == InformationType::FILE
             && matches!(
                 class,

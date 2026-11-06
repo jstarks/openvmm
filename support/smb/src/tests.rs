@@ -533,21 +533,6 @@ fn file_mode_ignores_remote_sync_flags_and_unbuffered_access_excludes_append() {
             }
             client.close(file).await;
         }
-        let response = client
-            .open_result(
-                "rights",
-                AccessMask::new().with_read_attributes(true).into_bits(),
-                7,
-                2,
-                0,
-            )
-            .await;
-        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
-        assert_eq!(
-            response_status(&client.query(file, 7).await),
-            Status::ACCESS_DENIED
-        );
-        client.close(file).await;
     });
 }
 

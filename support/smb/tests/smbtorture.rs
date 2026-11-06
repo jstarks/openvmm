@@ -30,6 +30,7 @@ fn samba_read_write_smoke() {
             "smb2.read.access",
             "smb2.create.open",
             "smb2.mkdir",
+            "smb2.dir.find",
             "smb2.getinfo.qsec_buffercheck",
             "smb2.getinfo.granted",
             "smb2.acls-with-sysacl.OWNER-RIGHTS",
@@ -102,6 +103,10 @@ fn samba_rename() {
             "smb2.rename.share_delete_no_delete_access",
             "smb2.rename.no_share_delete_no_delete_access",
             "smb2.rename.rename_dir_openfile",
+            "smb2.rename.no_share_delete_but_delete_access",
+            "smb2.rename.msword",
+            "smb2.rename.close-full-information",
+            "smb2.rename.rename-open",
         ],
     );
 }

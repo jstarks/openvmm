@@ -949,6 +949,30 @@ impl FileSystem for MemoryFs {
             if delete && node.metadata.attributes().readonly() {
                 return Err(Status::CANNOT_DELETE);
             }
+            let replacement = matches!(
+                options.disposition(),
+                CreateDisposition::SUPERSEDE
+                    | CreateDisposition::OVERWRITE
+                    | CreateDisposition::OVERWRITE_IF
+            );
+            if replacement {
+                if node.metadata.is_directory() {
+                    return Err(Status::FILE_IS_A_DIRECTORY);
+                }
+                if (node.metadata.attributes().hidden() && !options.attributes().hidden())
+                    || (node.metadata.attributes().system() && !options.attributes().system())
+                {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let supersede = options.disposition() == CreateDisposition::SUPERSEDE;
+                options.access = options
+                    .access()
+                    .with_write_ea(true)
+                    .with_write_attributes(true)
+                    .with_write_data(!supersede || options.access().write_data())
+                    .with_delete(supersede || options.access().delete())
+                    .into_bits();
+            }
             let mut available = AccessMask::from_bits(allowed_access(&state, id));
             if options.access().maximum_allowed() && node.metadata.attributes().readonly() {
                 available.set_write_data(false);
@@ -966,26 +990,18 @@ impl FileSystem for MemoryFs {
                     return Err(Status::SHARING_VIOLATION);
                 }
             }
-            if matches!(
-                options.disposition(),
-                CreateDisposition::SUPERSEDE
-                    | CreateDisposition::OVERWRITE
-                    | CreateDisposition::OVERWRITE_IF
-            ) {
-                if node.metadata.is_directory() {
-                    return Err(Status::FILE_IS_A_DIRECTORY);
-                }
-                let permitted = if options.disposition() == CreateDisposition::SUPERSEDE {
-                    options.access().delete()
-                } else {
-                    options.access().write_data()
-                };
-                if !permitted {
-                    return Err(Status::ACCESS_DENIED);
-                }
+            if replacement {
                 let size_changed = node.metadata.size != 0;
+                let attributes = FileAttributes::from_bits(
+                    options.attributes & settable_attributes().into_bits(),
+                )
+                .with_archive(true)
+                .with_not_content_indexed(false)
+                .into_bits();
+                let attributes_changed = attributes != node.metadata.attributes;
                 allocate(&mut state, id, 0)?;
                 let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
+                node.metadata.attributes = attributes;
                 node.metadata.written = nt_time();
                 node.metadata.changed = node.metadata.written;
                 emit(
@@ -993,6 +1009,7 @@ impl FileSystem for MemoryFs {
                     id,
                     NotifyAction::MODIFIED,
                     NotifyFilter::new()
+                        .with_attributes(attributes_changed)
                         .with_size(size_changed)
                         .with_last_write(true),
                 );

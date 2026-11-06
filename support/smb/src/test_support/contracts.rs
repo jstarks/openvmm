@@ -1921,6 +1921,55 @@ pub async fn basic_information<F: Fixture>(fixture: &F) {
             .await,
             Status::OBJECT_NAME_NOT_FOUND,
         );
+        let attributes = FileAttributes::new().with_hidden(true).with_system(true);
+        let (original, _) = fs
+            .open(
+                "overwrite-attributes",
+                OpenOptions {
+                    attributes: attributes.into_bits(),
+                    ..options(CreateDisposition::CREATE, false)
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+        write_all(fs, &original, 0, b"before", &request).await;
+        rejected(
+            fs.open(
+                "overwrite-attributes",
+                OpenOptions {
+                    attributes: FileAttributes::new().with_hidden(true).into_bits(),
+                    ..options(CreateDisposition::OVERWRITE, false)
+                },
+                &request,
+            )
+            .await,
+            Status::ACCESS_DENIED,
+        );
+        assert_eq!(read_bytes(fs, &original, 0, 6, &request).await, b"before");
+        let (replacement, action) = fs
+            .open(
+                "overwrite-attributes",
+                OpenOptions {
+                    access: AccessMask::new().with_read_attributes(true).into_bits(),
+                    attributes: attributes
+                        .with_readonly(true)
+                        .with_not_content_indexed(true)
+                        .into_bits(),
+                    ..options(CreateDisposition::OVERWRITE, false)
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(action, CreateAction::OVERWRITTEN.0);
+        let metadata = fs.metadata(&replacement, &request).await.unwrap();
+        assert_eq!(metadata.size, 0);
+        assert_eq!(metadata.attributes, 0x27);
+        let granted = AccessMask::from_bits(metadata.granted_access);
+        assert!(granted.write_data() && granted.write_attributes() && granted.write_ea());
+        fs.close(&replacement, &request).await.unwrap();
+        fs.close(&original, &request).await.unwrap();
     }
     fs.close(&file, &request).await.unwrap();
 }

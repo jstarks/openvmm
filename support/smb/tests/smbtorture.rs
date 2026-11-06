@@ -69,6 +69,7 @@ fn samba_create_and_sharing() {
             "smb2.delete-on-close-perms.READONLY",
             "smb2.winattr",
             "smb2.winattr2",
+            "smb2.openattr",
         ],
     );
 }

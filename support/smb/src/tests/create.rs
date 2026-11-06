@@ -5,6 +5,111 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn replacement_checks_attributes_before_truncation_and_applies_requested_attributes() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        for disposition in [
+            CreateDisposition::SUPERSEDE,
+            CreateDisposition::OVERWRITE,
+            CreateDisposition::OVERWRITE_IF,
+        ] {
+            let name = format!("replacement-{}", disposition.0);
+            let original_attributes = FileAttributes::new().with_hidden(true).with_system(true);
+            let mut body =
+                create_body(&name, AccessMask::FILE_ALL_ACCESS.into_bits(), 7, 2, 0, &[]);
+            CreateRequest::mut_from_prefix(&mut body)
+                .unwrap()
+                .0
+                .file_attributes = original_attributes;
+            let original = read_body::<CreateResponse>(&client.ok(Command::CREATE, &body).await)
+                .unwrap()
+                .file_id;
+            client
+                .ok(Command::WRITE, &Client::write_body(original, 0, b"before"))
+                .await;
+            let root = client.open("", 1, 1).await;
+            let mut watch = std::pin::pin!(
+                notify::accept(
+                    &mut client,
+                    root,
+                    NotifyFilter::new().with_attributes(true),
+                    false,
+                    1024
+                )
+                .execute()
+            );
+            assert!(futures::poll!(&mut watch).is_pending());
+            for attributes in [
+                FileAttributes::new().with_hidden(true),
+                FileAttributes::new().with_system(true),
+            ] {
+                let mut body = create_body(
+                    &name,
+                    AccessMask::FILE_ALL_ACCESS.into_bits(),
+                    7,
+                    disposition.0,
+                    0,
+                    &[],
+                );
+                CreateRequest::mut_from_prefix(&mut body)
+                    .unwrap()
+                    .0
+                    .file_attributes = attributes;
+                assert_eq!(
+                    response_status(&client.send(Command::CREATE, &body).await),
+                    Status::ACCESS_DENIED
+                );
+                assert_eq!(&client.read(original, 0, 6).await[80..], b"before");
+                assert!(futures::poll!(&mut watch).is_pending());
+            }
+            let mut body = create_body(
+                &name,
+                AccessMask::new().with_read_attributes(true).into_bits(),
+                7,
+                disposition.0,
+                0,
+                &[],
+            );
+            CreateRequest::mut_from_prefix(&mut body)
+                .unwrap()
+                .0
+                .file_attributes = original_attributes
+                .with_readonly(true)
+                .with_compressed(true)
+                .with_not_content_indexed(true);
+            let response = client.ok(Command::CREATE, &body).await;
+            let replacement = read_body::<CreateResponse>(&response).unwrap();
+            assert_eq!(replacement.file_attributes.into_bits(), 0x27);
+            assert_eq!(replacement.end_of_file.get(), 0);
+            assert_eq!(
+                replacement.create_action.get(),
+                if disposition == CreateDisposition::SUPERSEDE {
+                    CreateAction::SUPERSEDED.0
+                } else {
+                    CreateAction::OVERWRITTEN.0
+                }
+            );
+            let metadata = client.query(original, FileInformationClass::BASIC.0).await;
+            assert_eq!(
+                FileBasicInformation::read_from_bytes(&metadata[72..])
+                    .unwrap()
+                    .file_attributes
+                    .into_bits(),
+                0x27
+            );
+            assert_eq!(
+                notify::changes(&watch.await.unwrap()),
+                vec![(NotifyAction::MODIFIED, name)]
+            );
+            client.close(replacement.file_id).await;
+            client.close(original).await;
+            client.close(root).await;
+        }
+    });
+}
+
+#[test]
 fn memory_creation_preserves_dos_attributes_without_fabricating_storage_features() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

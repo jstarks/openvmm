@@ -18,7 +18,7 @@ pub(super) fn body(file: FileId, filter: NotifyFilter, tree: bool, length: u32) 
     .to_vec()
 }
 
-fn accept<B: FileSystem>(
+pub(super) fn accept<B: FileSystem>(
     client: &mut Client<B>,
     file: FileId,
     filter: NotifyFilter,

@@ -74,12 +74,13 @@ per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests driv
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
 The harness also checks compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
-The CREATE/sharing harness adds eighteen cases covering locked-file opens,
+The CREATE/sharing harness adds nineteen cases covering locked-file opens,
 multiple connections, readonly deletion, leading-backslash rejection, invalid
 impersonation, concurrent/visible directory creation, directory allocation,
 temporary attributes, the no-stream profile, bilateral share modes and readonly
 file/directory maximum-access reporting, readonly delete modes/dispositions,
-and basic DOS attributes/unchanged attributes on existing-object opens.
+and basic DOS attributes/unchanged attributes on existing-object opens,
+plus attribute checks on truncating replacement.
 The feature-enabled async harness gates real provider reads, writes, and
 flushes on the server's poller. Its four async compound cases include READ/WRITE
 checks requiring pending replies, rather than only allowing synchronous fallback.
@@ -159,6 +160,11 @@ publication (MS-FSA 2.1.5.1.1). Readonly directory creation remains ignored in
 this profile. Unsupported compression, encryption, sparse, reparse and other
 storage flags are not fabricated. Basic attribute updates use the same settable
 mask; opening an existing object does not apply creation attributes.
+
+OVERWRITE/OVERWRITE_IF/SUPERSEDE preserve existing HIDDEN/SYSTEM requirements
+before truncation, check their implied data/delete/metadata rights, and apply
+requested supported attributes with ARCHIVE set and not-content-indexed cleared
+(MS-FSA 2.1.5.1.2). Attribute changes notify registered attribute watches.
 
 Metadata-only opens do not participate in data/execute/delete sharing conflicts
 (MS-FSA 2.1.5.1.2.2). This exemption works in both open orders, even when either

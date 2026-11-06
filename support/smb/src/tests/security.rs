@@ -29,6 +29,72 @@ fn set(file: FileId, information: u32, descriptor: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn replacement_requires_its_implied_metadata_rights_before_effects() {
+    use crate::security::{AccessAce, Acl, Sid};
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("protected-replacement", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"before"))
+            .await;
+        let world = Sid::new([0, 0, 0, 0, 0, 1], &[0]).unwrap();
+        for denied in [
+            AccessMask::new().with_write_attributes(true),
+            AccessMask::new().with_write_ea(true),
+        ] {
+            let mut descriptor = SecurityDescriptor::empty();
+            descriptor.dacl = AclState::Present(
+                Acl::access(&[
+                    AccessAce {
+                        deny: true,
+                        mask: denied.into_bits(),
+                        flags: AceFlags::new(),
+                        sid: world.clone(),
+                    },
+                    AccessAce {
+                        deny: false,
+                        mask: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                        flags: AceFlags::new(),
+                        sid: world.clone(),
+                    },
+                ])
+                .unwrap(),
+            );
+            client
+                .ok(Command::SET_INFO, &set(file, 4, &descriptor.encode()))
+                .await;
+            for disposition in [
+                CreateDisposition::SUPERSEDE,
+                CreateDisposition::OVERWRITE,
+                CreateDisposition::OVERWRITE_IF,
+            ] {
+                assert_eq!(
+                    response_status(
+                        &client
+                            .open_result(
+                                "protected-replacement",
+                                AccessMask::new()
+                                    .with_read_attributes(true)
+                                    .with_write_data(true)
+                                    .with_delete(true)
+                                    .into_bits(),
+                                7,
+                                disposition.0,
+                                0,
+                            )
+                            .await
+                    ),
+                    Status::ACCESS_DENIED,
+                );
+                assert_eq!(&client.read(file, 0, 6).await[80..], b"before");
+            }
+        }
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn security_updates_check_rights_and_reject_unimplemented_stores() {
     use crate::test_support::{ControlledFs, Operation, Plan};
     block_on(async {

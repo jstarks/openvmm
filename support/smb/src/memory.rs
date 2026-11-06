@@ -344,7 +344,11 @@ fn stream_path<'a>(
     };
     let mut parts = suffix.split(':');
     let stream = parts.next().ok_or(Status::OBJECT_NAME_INVALID)?;
-    let kind = parts.next().unwrap_or("");
+    let kind = parts.next();
+    if kind == Some("") {
+        return Err(Status::OBJECT_NAME_INVALID);
+    }
+    let kind = kind.unwrap_or("");
     if parts.next().is_some() || suffix.contains(['\\', '/']) {
         return Err(Status::OBJECT_NAME_INVALID);
     }
@@ -356,18 +360,7 @@ fn stream_path<'a>(
         return Ok((base, None, false));
     }
     if !kind.is_empty() && !kind.eq_ignore_ascii_case("$DATA") {
-        return Err(
-            if matches!(
-                options.disposition(),
-                CreateDisposition::SUPERSEDE
-                    | CreateDisposition::OVERWRITE
-                    | CreateDisposition::OVERWRITE_IF
-            ) {
-                Status::ACCESS_DENIED
-            } else {
-                Status::OBJECT_NAME_INVALID
-            },
-        );
+        return Err(Status::OBJECT_NAME_INVALID);
     }
     let data = !stream.is_empty() || kind.eq_ignore_ascii_case("$DATA");
     if data && options.options().directory_file() {
@@ -376,7 +369,12 @@ fn stream_path<'a>(
     if stream.is_empty() {
         return Ok((base, None, data));
     }
-    components(stream)?;
+    if stream.encode_utf16().count() > MAX_COMPONENT_NAME_LENGTH as usize {
+        return Err(Status::NAME_TOO_LONG);
+    }
+    if stream.contains('\0') {
+        return Err(Status::OBJECT_NAME_INVALID);
+    }
     Ok((base, Some(stream), true))
 }
 
@@ -1005,15 +1003,11 @@ fn rename_stream(
     {
         return Err(Status::INVALID_PARAMETER);
     }
-    components(kind).map_err(|_| Status::INVALID_PARAMETER)?;
-    if kind.contains(['\\', '/']) {
+    if kind.contains(['\\', '/', '\0']) {
         return Err(Status::INVALID_PARAMETER);
     }
-    if !new_name.is_empty() {
-        components(new_name).map_err(|_| Status::INVALID_PARAMETER)?;
-        if new_name.contains(['\\', '/']) {
-            return Err(Status::INVALID_PARAMETER);
-        }
+    if new_name.contains(['\\', '/', '\0']) {
+        return Err(Status::INVALID_PARAMETER);
     }
     if directory_stream {
         return Err(if kind.eq_ignore_ascii_case("$INDEX_ALLOCATION") {

@@ -87,6 +87,11 @@ fn samba_streams() {
             "smb2.streams.delete",
             "smb2.streams.zero-byte",
             "smb2.streams.rename",
+            "smb2.streams.names2",
+            "smb2.streams.attributes1",
+            "smb2.streams.attributes2",
+            "smb2.streams.basefile-rename-with-open-stream",
+            "smb2.streams.perms",
         ],
     );
 }

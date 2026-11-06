@@ -545,6 +545,70 @@ fn named_streams_keep_data_allocation_and_locks_separate_and_work_on_directories
 }
 
 #[test]
+fn data_stream_names_use_stream_rules_instead_of_filename_rules() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        for name in ["wild*?<>\"|", " space.end. ", "\u{1}control", "é", ".."] {
+            let path = format!("stream-grammar:{name}");
+            let file = client.open(&path, 3, 0).await;
+            client
+                .ok(Command::WRITE, &Client::write_body(file, 0, b"data"))
+                .await;
+            let alias = client.open(&path, 1, 0).await;
+            assert_eq!(&client.read(alias, 0, 4).await[80..], b"data");
+            let new = format!(":{name}-renamed");
+            let new = encode_name(&new);
+            let mut rename = FileRenameInformation::new_zeroed();
+            rename.file_name_length = (new.len() as u32).into();
+            let mut bytes = rename.as_bytes().to_vec();
+            bytes.extend(new);
+            assert_eq!(
+                response_status(&client.set(file, 10, &bytes).await),
+                Status::SUCCESS
+            );
+            let renamed = client.open(&format!("{path}-renamed"), 1, 0).await;
+            assert_eq!(&client.read(renamed, 0, 4).await[80..], b"data");
+            for file in [alias, renamed, file] {
+                client.close(file).await;
+            }
+        }
+        assert_eq!(
+            response_status(
+                &client
+                    .open_result(
+                        &format!("stream-grammar:{}", "x".repeat(256)),
+                        AccessMask::FILE_ALL_ACCESS.into_bits(),
+                        7,
+                        3,
+                        0
+                    )
+                    .await
+            ),
+            Status::NAME_TOO_LONG
+        );
+        for name in ["stream-grammar:bad:", "stream-grammar:bad:$FOO"] {
+            for disposition in [0, 1, 4, 5] {
+                assert_eq!(
+                    response_status(
+                        &client
+                            .open_result(
+                                name,
+                                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                                7,
+                                disposition,
+                                0
+                            )
+                            .await
+                    ),
+                    Status::OBJECT_NAME_INVALID
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn named_stream_creation_is_atomic_under_byte_and_object_limits() {
     block_on(async {
         for (bytes, objects) in [(32usize, 32usize), (1024, 2)] {
@@ -763,7 +827,7 @@ fn stream_rename_validation_and_replacement_preserve_data_on_failure() {
                 false,
                 Status::OBJECT_TYPE_MISMATCH,
             ),
-            (":bad:$D?TA", false, Status::INVALID_PARAMETER),
+            (":bad:$D?TA", false, Status::OBJECT_TYPE_MISMATCH),
         ] {
             assert_eq!(
                 response_status(&client.set(source, 10, &rename(name, replace)).await),

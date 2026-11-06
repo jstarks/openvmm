@@ -74,10 +74,11 @@ per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests driv
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
 The harness also checks compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
-The CREATE/sharing harness adds thirteen cases covering locked-file opens,
+The CREATE/sharing harness adds fourteen cases covering locked-file opens,
 multiple connections, readonly deletion, leading-backslash rejection, invalid
 impersonation, concurrent/visible directory creation, directory allocation,
-temporary attributes, the no-stream profile and bilateral share modes.
+temporary attributes, the no-stream profile, bilateral share modes and readonly
+maximum-access reporting.
 The feature-enabled async harness gates real provider reads, writes, and
 flushes on the server's poller. Its four async compound cases include READ/WRITE
 checks requiring pending replies, rather than only allowing synchronous fallback.
@@ -444,7 +445,11 @@ The provider resolves MAXIMUM_ALLOWED and reports actual per-open grants
 separately from maximal access for the established identity. The engine does not
 expand that request to blanket FILE_ALL_ACCESS. Existing opens retain their grants
 when attributes or security change; new opens are checked against current state.
-MemoryFs maximum access on readonly objects excludes data write/append rights.
+MxAc reports descriptor-derived maximum rights, independently of readonly
+attributes and parent-directory fallback grants (MS-SMB2 3.3.5.9.5, note 334).
+Actual MAXIMUM_ALLOWED grants on readonly objects exclude data write/append and
+DELETE_CHILD rights (MS-FSA 2.1.5.1.2.1); the readonly restriction does not alter
+the reported descriptor maximum or revoke existing handles.
 FILE_EXECUTE authorizes SMB READ without adding FILE_READ_DATA to the reported
 grant. On directories it means traversal, not enumeration or change-notify access.
 

@@ -136,7 +136,10 @@ fn create_security_applies_before_visibility_and_ignores_existing_context_bytes(
         descriptor.control.set_dacl_protected(true);
         descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
         let encoded = descriptor.encode();
-        let data = contexts(&[(CreateContextName::SECURITY_DESCRIPTOR, &encoded)]);
+        let data = contexts(&[
+            (CreateContextName::SECURITY_DESCRIPTOR, &encoded),
+            (CreateContextName::QUERY_MAXIMAL_ACCESS, &[]),
+        ]);
         let response = client
             .ok(
                 Command::CREATE,
@@ -151,6 +154,15 @@ fn create_security_applies_before_visibility_and_ignores_existing_context_bytes(
             )
             .await;
         let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let returned = returned_contexts(&response);
+        let maximal = MaximalAccessResponse::read_from_bytes(returned[0].data).unwrap();
+        assert_eq!(
+            maximal.maximal_access.into_bits(),
+            AccessMask::new()
+                .with_read_control(true)
+                .with_write_dac(true)
+                .into_bits()
+        );
         client
             .ok(
                 Command::WRITE,
@@ -394,22 +406,33 @@ fn maximum_allowed_uses_provider_grants_and_readonly_constraints() {
             Status::SUCCESS
         );
         client.close(file).await;
+        let data = contexts(&[(CreateContextName::QUERY_MAXIMAL_ACCESS, &[])]);
         let response = client
-            .open_result(
-                "readonly",
-                AccessMask::new().with_maximum_allowed(true).into_bits(),
-                7,
-                1,
-                0,
+            .ok(
+                Command::CREATE,
+                &create_body(
+                    "readonly",
+                    AccessMask::new().with_maximum_allowed(true).into_bits(),
+                    7,
+                    1,
+                    0,
+                    &data,
+                ),
             )
             .await;
-        assert_eq!(response_status(&response), Status::SUCCESS);
+        let returned = returned_contexts(&response);
+        let maximal = MaximalAccessResponse::read_from_bytes(returned[0].data).unwrap();
+        assert_eq!(
+            maximal.maximal_access.into_bits(),
+            AccessMask::FILE_ALL_ACCESS.into_bits()
+        );
         let file = read_body::<CreateResponse>(&response).unwrap().file_id;
         let access = client.query(file, 8).await;
         let access = AccessMask::from_bits(u32::from_le_bytes(access[72..76].try_into().unwrap()));
         assert!(access.read_data());
         assert!(!access.write_data());
         assert!(!access.append_data());
+        assert!(!access.delete_child());
         assert!(!access.maximum_allowed());
         assert_eq!(
             response_status(

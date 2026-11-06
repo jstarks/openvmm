@@ -325,7 +325,7 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     components.reverse();
     metadata.path = format!("\\{}", components.join("\\"));
     metadata.number_of_links = u32::from(!metadata.delete_pending);
-    metadata.maximal_access = allowed_access(state, id);
+    metadata.maximal_access = acl_access(&state.nodes[&id].security);
     Ok(metadata)
 }
 
@@ -391,12 +391,6 @@ fn allowed_access(state: &State, id: u64) -> u32 {
         granted |= AccessMask::new()
             .with_delete(parent.delete_child())
             .with_read_attributes(parent.read_data())
-            .into_bits();
-    }
-    if node.metadata.attributes().readonly() {
-        granted &= !AccessMask::new()
-            .with_write_data(true)
-            .with_append_data(true)
             .into_bits();
     }
     granted
@@ -923,7 +917,13 @@ impl FileSystem for MemoryFs {
             if options.options().non_directory_file() && node.metadata.is_directory() {
                 return Err(Status::FILE_IS_A_DIRECTORY);
             }
-            options.access = grant_access(allowed_access(&state, id), options.access, delete)?;
+            let mut available = AccessMask::from_bits(allowed_access(&state, id));
+            if options.access().maximum_allowed() && node.metadata.attributes().readonly() {
+                available.set_write_data(false);
+                available.set_append_data(false);
+                available.set_delete_child(false);
+            }
+            options.access = grant_access(available.into_bits(), options.access, delete)?;
             if node.metadata.attributes().readonly()
                 && (options.access().write_data() || options.access().append_data() || delete)
             {

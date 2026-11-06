@@ -64,6 +64,7 @@ fn samba_create_and_sharing() {
             "smb2.sharemode.sharemode-access",
             "smb2.sharemode.access-sharemode",
             "smb2.sharemode.bug14375",
+            "smb2.maximum_allowed.read_only_file",
         ],
     );
 }

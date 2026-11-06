@@ -763,12 +763,38 @@ pub async fn maximum_allowed_access<F: Fixture>(fixture: &F) {
         let metadata = fs.metadata(&peer, &request).await.unwrap();
         let granted = AccessMask::from_bits(metadata.granted_access);
         assert!(granted.read_data());
-        assert!(!granted.write_data() && !granted.append_data());
+        assert!(!granted.write_data() && !granted.append_data() && !granted.delete_child());
+        assert_eq!(metadata.maximal_access, original.maximal_access);
         assert_eq!(
             fs.metadata(&file, &request).await.unwrap().granted_access,
             original.granted_access
         );
         fs.close(&peer, &request).await.unwrap();
+        let access = AccessMask::new().with_delete_child(true);
+        rejected(
+            fs.open(
+                "grants",
+                OpenOptions {
+                    access: access.with_maximum_allowed(true).into_bits(),
+                    ..maximum
+                },
+                &request,
+            )
+            .await,
+            Status::ACCESS_DENIED,
+        );
+        let (explicit, _) = fs
+            .open(
+                "grants",
+                OpenOptions {
+                    access: access.into_bits(),
+                    ..maximum
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+        fs.close(&explicit, &request).await.unwrap();
     }
     fs.close(&file, &request).await.unwrap();
 }

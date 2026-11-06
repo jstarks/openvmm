@@ -98,7 +98,8 @@ pub struct Metadata {
     /// Whether the shared delete disposition is set, excluding CREATE's
     /// deferred per-open delete mode (MS-FSA §2.1.5.12.27).
     pub delete_pending: bool,
-    /// Maximal access for the share's established identity, not the current open.
+    /// Descriptor-derived maximal access for the share's established identity,
+    /// independent of the current open's grant and readonly attribute restrictions.
     pub maximal_access: u32,
     /// Actual logical rights granted to this open, without generic/MAXIMUM_ALLOWED bits.
     /// Directory enumeration entries need not populate this field.

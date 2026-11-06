@@ -101,6 +101,7 @@ struct Watch {
 }
 
 struct State {
+    generate_short_names: bool,
     next_object_id: u64,
     created: u64,
     object_information: VolumeObjectInformation,
@@ -345,6 +346,7 @@ impl MemoryFs {
             streams: BTreeMap::new(),
         };
         Self(Arc::new(Mutex::new(State {
+            generate_short_names: false,
             next_object_id: 1,
             created: now,
             object_information: {
@@ -383,6 +385,77 @@ impl MemoryFs {
             changed: Arc::new(Event::new()),
         })))
     }
+
+    /// Enable automatic 8.3 aliases for future namespace creation and rename.
+    /// Existing names are not retroactively changed.
+    pub fn with_short_name_generation(self) -> Self {
+        self.0.lock().generate_short_names = true;
+        self
+    }
+}
+
+fn valid_short_name(name: &str) -> bool {
+    let (base, extension) = name.split_once('.').unwrap_or((name, ""));
+    name.is_ascii()
+        && !name.contains(' ')
+        && (1..=8).contains(&base.len())
+        && (!name.contains('.') || (1..=3).contains(&extension.len()))
+        && !extension.contains('.')
+        && !name.contains(['\\', '/'])
+        && components(name).is_ok()
+}
+
+fn generated_short_name(
+    state: &State,
+    parent: u64,
+    name: &str,
+    exclude: &[u64],
+) -> Result<Option<String>, Status> {
+    if !state.generate_short_names {
+        return Ok(None);
+    }
+    if valid_short_name(name) {
+        return Ok(Some(name.to_owned()));
+    }
+    let used: std::collections::BTreeSet<_> = state
+        .links
+        .iter()
+        .filter(|(id, link)| link.parent == parent && !exclude.contains(id))
+        .flat_map(|(_, link)| std::iter::once(&link.name).chain(link.short_name.iter()))
+        .map(|name| name.to_ascii_uppercase())
+        .collect();
+    let (base, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+    let clean = |name: &str| {
+        name.chars()
+            .filter(|c| !matches!(c, ' ' | '.'))
+            .map(|c| {
+                if c.is_ascii() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    let base = clean(base);
+    let extension = clean(extension);
+    let extension = &extension[..extension.len().min(3)];
+    for index in 1..=used.len() + 1 {
+        let digits = index.to_string();
+        if digits.len() > 7 {
+            break;
+        }
+        let prefix = &base[..base.len().min(7 - digits.len())];
+        let mut candidate = format!("{prefix}~{digits}");
+        if !extension.is_empty() {
+            candidate.push('.');
+            candidate.push_str(extension);
+        }
+        if !used.contains(&candidate) {
+            return Ok(Some(candidate));
+        }
+    }
+    Err(Status::INSUFFICIENT_RESOURCES)
 }
 
 fn stream_path<'a>(
@@ -1620,6 +1693,7 @@ impl inspect::Inspect for MemoryFs {
             .field("bytes", state.bytes)
             .field("byte_limit", state.byte_limit)
             .field("object_limit", state.object_limit)
+            .field("generate_short_names", state.generate_short_names)
             .field(
                 "volume_object_id",
                 format!("{:02x?}", state.object_information.object_id),
@@ -2037,6 +2111,12 @@ impl FileSystem for MemoryFs {
                 BTreeMap::new()
             };
             let now = nt_time();
+            let short_name = generated_short_name(
+                &state,
+                parent,
+                parts.last().ok_or(Status::OBJECT_NAME_INVALID)?,
+                &[],
+            )?;
             let attributes =
                 FileAttributes::from_bits(options.attributes & settable_attributes().into_bits())
                     .with_readonly(!directory && options.attributes().readonly())
@@ -2095,7 +2175,7 @@ impl FileSystem for MemoryFs {
                     node: id,
                     parent,
                     name: parts.last().unwrap_or(&"").to_string(),
-                    short_name: None,
+                    short_name,
                     delete_pending: false,
                 },
             );
@@ -2169,18 +2249,8 @@ impl FileSystem for MemoryFs {
         name: &str,
         _request: &RequestContext,
     ) -> Result<(), Status> {
-        if !name.is_empty() {
-            let (base, extension) = name.split_once('.').unwrap_or((name, ""));
-            if !name.is_ascii()
-                || name.contains(' ')
-                || !(1..=8).contains(&base.len())
-                || (name.contains('.') && !(1..=3).contains(&extension.len()))
-                || extension.contains('.')
-                || name.contains(['\\', '/'])
-                || components(name).is_err()
-            {
-                return Err(Status::INVALID_PARAMETER);
-            }
+        if !name.is_empty() && !valid_short_name(name) {
+            return Err(Status::INVALID_PARAMETER);
         }
         let mut state = self.0.lock();
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
@@ -2403,6 +2473,18 @@ impl FileSystem for MemoryFs {
         let link = state.next_link;
         let next = link.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
         let exact = target.is_some_and(|id| state.links[&id].name == **name);
+        let short_name = if state.links.iter().any(|(id, link)| {
+            link.node == file.node && Some(*id) != target && link.short_name.is_some()
+        }) {
+            None
+        } else {
+            generated_short_name(
+                &state,
+                parent,
+                name,
+                &target.into_iter().collect::<Vec<_>>(),
+            )?
+        };
         if let Some(target) = target {
             if !exact {
                 emit(
@@ -2420,7 +2502,7 @@ impl FileSystem for MemoryFs {
                 node: file.node,
                 parent,
                 name: name.to_string(),
-                short_name: None,
+                short_name,
                 delete_pending: false,
             },
         );
@@ -2555,6 +2637,17 @@ impl FileSystem for MemoryFs {
         let short_collision = source_link.short_name.as_ref().is_some_and(|name| {
             child(&state, parent, name).is_some_and(|id| id != file.link && Some(id) != target)
         });
+        let short_name = if same_file {
+            target_short_name
+        } else if state.generate_short_names && source_link.short_name.is_some() {
+            let mut excluded = vec![file.link];
+            excluded.extend(target);
+            generated_short_name(&state, parent, new_name, &excluded)?
+        } else if short_collision {
+            None
+        } else {
+            source_link.short_name.clone()
+        };
         let filter = name_filter(directory);
         let new_name = new_name.to_string();
         if let Some(target) = target {
@@ -2582,11 +2675,7 @@ impl FileSystem for MemoryFs {
         let link = state.links.get_mut(&file.link).ok_or(Status::FILE_CLOSED)?;
         link.parent = parent;
         link.name = new_name;
-        if same_file {
-            link.short_name = target_short_name;
-        } else if short_collision {
-            link.short_name = None;
-        }
+        link.short_name = short_name;
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         if !user_set_change_time {
             node.metadata.changed = now;

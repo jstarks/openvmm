@@ -2073,6 +2073,136 @@ fn stream_rename_validation_and_replacement_preserve_data_on_failure() {
 }
 
 #[test]
+fn configured_short_names_are_unique_real_aliases_for_files_and_directories() {
+    block_on(async {
+        let server = Server::new(
+            "memory",
+            MemoryFs::new(1024, 32).with_short_name_generation(),
+        )
+        .unwrap();
+        let mut client = Client::new(&server).await;
+        let existing = client.open("LONGFI~1.TXT", 2, 0).await;
+        let first = client.open("long filename.txt", 2, 0).await;
+        let second = client.open("long fileother.txt", 2, 0).await;
+        let simple = client.open("abc.txt", 2, 0).await;
+        let unicode = client.open("\u{e9}longname.txt", 2, 0).await;
+        for (file, alias) in [
+            (existing, "LONGFI~1.TXT"),
+            (first, "LONGFI~2.TXT"),
+            (second, "LONGFI~3.TXT"),
+            (simple, "abc.txt"),
+            (unicode, "_LONGN~1.TXT"),
+        ] {
+            assert_eq!(&client.query(file, 21).await[76..], encode_name(alias));
+            let opened = client.open(alias, 1, 0).await;
+            assert_eq!(opened.persistent, file.persistent);
+            client.close(opened).await;
+        }
+        client
+            .ok(Command::WRITE, &Client::write_body(first, 0, b"data"))
+            .await;
+        let alias = client.open("longfi~2.txt", 1, 0).await;
+        assert_eq!(&client.read(alias, 0, 4).await[80..], b"data");
+        client.close(alias).await;
+        let directory = client.open("long directory", 2, 1).await;
+        assert_eq!(
+            &client.query(directory, 21).await[76..],
+            encode_name("LONGDI~1")
+        );
+        let child = client.open("LONGDI~1\\long child.txt:side", 3, 0).await;
+        assert_eq!(
+            &client.query(child, 21).await[76..],
+            encode_name("LONGCH~1.TXT")
+        );
+        client.close(child).await;
+        for file in [existing, first, second, simple, unicode, directory] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn configured_short_names_regenerate_on_move_and_remain_primary_link_scoped() {
+    block_on(async {
+        let server = Server::new(
+            "memory",
+            MemoryFs::new(1024, 24).with_short_name_generation(),
+        )
+        .unwrap();
+        let mut client = Client::new(&server).await;
+        let source = client.open("long filename.txt", 2, 0).await;
+        let folder = client.open("folder", 2, 1).await;
+        let conflict = client.open("folder\\DIFFER~1.TXT", 2, 0).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(
+                        source,
+                        10,
+                        &namespace_information("folder\\different long.txt", false)
+                    )
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            &client.query(source, 21).await[76..],
+            encode_name("DIFFER~2.TXT")
+        );
+        assert_eq!(
+            response_status(&client.open_result("LONGFI~1.TXT", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        let moved = client.open("folder\\differ~2.txt", 1, 0).await;
+        assert_eq!(moved.persistent, source.persistent);
+        client.close(moved).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(
+                        source,
+                        11,
+                        &namespace_information("secondary long.txt", false)
+                    )
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let secondary = client.open("secondary long.txt", 1, 0).await;
+        assert_eq!(
+            response_status(&client.query(secondary, 21).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            response_status(&client.set(source, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(source).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(
+                        secondary,
+                        11,
+                        &namespace_information("another alias.txt", false)
+                    )
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let primary = client.open("ANOTHE~1.TXT", 1, 0).await;
+        assert_eq!(primary.persistent, secondary.persistent);
+        assert_eq!(
+            &client.query(primary, 21).await[76..],
+            encode_name("ANOTHE~1.TXT")
+        );
+        for file in [primary, secondary, conflict, folder] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
 fn short_names_are_real_aliases_with_query_and_collision_semantics() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();

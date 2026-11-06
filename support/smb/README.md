@@ -25,7 +25,7 @@ will not need them.
 | Compounds and credits | Bounded admission, inherited identities, error propagation, pending replies and cancellation | Implemented; selected compound/async cases; retain committed CLOSE and compound-tail policies |
 | File metadata | Supported query classes, attributes/timestamps, allocation, EOF, mode and position | Implemented subset; broaden applicable getinfo/setinfo cases and classify unsupported-class dependencies |
 | Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/8/11 implemented; object-ID metadata can be set; quota controls remain |
-| Namespace and enumeration | Directory continuation, rename/move, hard links, short names, sharing, replacement and deletion | Link-scoped names/deletion and shared-file identity implemented; no automatic short-name generation |
+| Namespace and enumeration | Directory continuation, rename/move, hard links, short names, sharing, replacement and deletion | Link-scoped names/deletion and shared-file identity implemented; automatic short names can be enabled in MemoryFs |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
@@ -92,8 +92,13 @@ privilege and filesystem eligibility; their errors are preserved. MemoryFs treat
 its fixed synthetic system identity as having restore access. It validates write
 rights, stream/directory eligibility and namespace-wide uniqueness, preserves
 existing opens, and publishes ordered alias notifications. Alias opens, directory
-matching and alternate-name queries use real stored names. Automatic short-name
-generation is still unimplemented; this is not a native privilege model.
+matching and alternate-name queries use real stored names. MemoryFs defaults to
+explicit aliases; `with_short_name_generation()` enables future automatic
+assignment and rename regeneration. Compliant names alias themselves; other
+names receive deterministic unique ASCII `prefix~number` aliases with bounded
+extensions, checking both long names and aliases. The selected generation
+algorithm is implementation-specific, not an NTFS/OEM-codepage emulation.
+Only one link per file carries an alias. This is not a native privilege model.
 
 FileFsObjectIdInformation queries and sets use optional provider-owned volume
 identity and 48-byte extension metadata, separate from per-file object IDs.

@@ -471,6 +471,7 @@ fn rejected_file_security_updates_are_atomic_and_directory_policy_is_explicit() 
         client.query(attributes, 4).await;
         client.close(attributes).await;
         let directory = client.open("directory", 2, 1).await;
+        descriptor.control.set_dacl_auto_inherit_required(true);
         descriptor.dacl = AclState::Present(
             Acl::access(&[AccessAce {
                 deny: false,

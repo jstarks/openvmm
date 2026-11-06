@@ -141,11 +141,18 @@ is restricted to SYSTEM; group metadata may contain any valid SID.
 Directory DACL updates also govern traversal, child creation and rename
 destinations. Parent DELETE_CHILD / LIST_DIRECTORY rights independently authorize
 child DELETE / READ_ATTRIBUTES and are checked against the actual parent ACL.
-Inheritable directory ACEs, automatic inheritance, CREATE security contexts,
-SACLs, advanced ACEs and security selectors are still unsupported.
+New objects inherit basic file/container ACEs, preserving generic SID/right
+templates for later generations and honoring no-propagate. Effective ACEs map
+CREATOR_OWNER / CREATOR_GROUP to the fixed share identity. When no ACE applies,
+the synthetic token's default DACL is used. Creation retains the requested grant
+even when the newly assigned ACL denies subsequent opens (MS-FSA 2.1.5.1.1).
+The effective/template split follows the public
+[ACE inheritance rules](https://learn.microsoft.com/en-us/windows/win32/secauthz/ace-inheritance-rules).
+Automatic reinheritance requests, CREATE security contexts, SACLs, advanced ACEs
+and security selectors are still unsupported.
 Maximum grants check each individual right with
 the same ordered DACL policy as explicit requests (MS-FSA 2.1.5.1.2.1).
-No persistent-ACL capability is advertised until inheritance is complete.
+No persistent-ACL capability is advertised while CREATE security is incomplete.
 SET_SECURITY is routed through an optional provider operation after open-right
 checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.
 Providers must apply selected components atomically and enforce their policy on

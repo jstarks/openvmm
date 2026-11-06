@@ -433,6 +433,57 @@ fn default_security(directory: bool) -> SecurityDescriptor {
     }
 }
 
+fn inherited_security(
+    parent: &SecurityDescriptor,
+    directory: bool,
+) -> Result<SecurityDescriptor, Status> {
+    let mut descriptor = default_security(directory);
+    let AclState::Present(acl) = &parent.dacl else {
+        return Ok(descriptor);
+    };
+    let mut entries = Vec::new();
+    let creator_owner = Sid::new([0, 0, 0, 0, 0, 3], &[0]).expect("well-known SID");
+    let creator_group = Sid::new([0, 0, 0, 0, 0, 3], &[1]).expect("well-known SID");
+    for ace in acl.entries() {
+        let ace = ace.access().expect("supported memory ACL");
+        let effective = if directory {
+            ace.flags.container_inherit()
+        } else {
+            ace.flags.object_inherit()
+        };
+        let propagate = directory
+            && !ace.flags.no_propagate_inherit()
+            && (ace.flags.object_inherit() || ace.flags.container_inherit());
+        let mut mapped = ace.clone();
+        mapped.mask = crate::provider::map_access(ace.mask);
+        if ace.sid == creator_owner || ace.sid == creator_group {
+            mapped.sid = system_sid();
+        }
+        // Effective ACEs specialize generic information; container templates
+        // retain it for the next generation.
+        if effective && propagate && mapped.mask == ace.mask && mapped.sid == ace.sid {
+            mapped.flags = ace.flags.with_inherit_only(false).with_inherited(true);
+            entries.push(mapped);
+        } else {
+            if effective {
+                mapped.flags = AceFlags::new().with_inherited(true);
+                entries.push(mapped);
+            }
+            if propagate {
+                let mut template = ace;
+                template.flags = template.flags.with_inherit_only(true).with_inherited(true);
+                entries.push(template);
+            }
+        }
+    }
+    if !entries.is_empty() {
+        descriptor.dacl =
+            AclState::Present(Acl::access(&entries).map_err(|_| Status::INSUFFICIENT_RESOURCES)?);
+        descriptor.control.set_dacl_auto_inherited(true);
+    }
+    Ok(descriptor)
+}
+
 fn grant_access(available: u32, requested: u32, delete: bool) -> Result<u32, Status> {
     let mask = AccessMask::from_bits(requested);
     let requested = mask.with_maximum_allowed(false).into_bits();
@@ -808,14 +859,15 @@ impl FileSystem for MemoryFs {
             if state.nodes.len() >= state.object_limit {
                 return Err(Status::DISK_FULL);
             }
+            let directory = options.options().directory_file();
+            let security = inherited_security(&state.nodes[&parent].security, directory)?;
             let id = state.next_id;
             state.next_id = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
             let now = nt_time();
-            let directory = options.options().directory_file();
             state.nodes.insert(
                 id,
                 Node {
-                    security: default_security(directory),
+                    security,
                     metadata: Metadata {
                         id,
                         name: parts.last().ok_or(Status::OBJECT_NAME_INVALID)?.to_string(),
@@ -1174,11 +1226,6 @@ impl FileSystem for MemoryFs {
             if let AclState::Present(acl) = &descriptor.dacl {
                 for ace in acl.entries() {
                     let ace = ace.access().ok_or(Status::NOT_SUPPORTED)?;
-                    if node.metadata.is_directory()
-                        && (ace.flags.object_inherit() || ace.flags.container_inherit())
-                    {
-                        return Err(Status::NOT_SUPPORTED);
-                    }
                     if ace.flags.into_bits() & 0xe0 != 0
                         || crate::provider::map_access(ace.mask)
                             & !AccessMask::FILE_ALL_ACCESS.into_bits()
@@ -1798,6 +1845,51 @@ mod tests {
 
     struct ContractFixture(MemoryFs);
 
+    #[test]
+    fn inherited_creator_templates_preserve_generic_information_for_descendants() {
+        for rid in [0, 1] {
+            let creator = Sid::new([0, 0, 0, 0, 0, 3], &[rid]).unwrap();
+            let generic = AccessMask::new().with_generic_read(true).into_bits();
+            let mut parent = SecurityDescriptor::empty();
+            parent.dacl = AclState::Present(
+                Acl::access(&[AccessAce {
+                    deny: false,
+                    flags: AceFlags::new()
+                        .with_object_inherit(true)
+                        .with_container_inherit(true)
+                        .with_inherit_only(true),
+                    mask: generic,
+                    sid: creator.clone(),
+                }])
+                .unwrap(),
+            );
+            let directory = inherited_security(&parent, true).unwrap();
+            let AclState::Present(acl) = &directory.dacl else {
+                panic!("missing inherited ACL")
+            };
+            let entries: Vec<_> = acl.entries().map(|ace| ace.access().unwrap()).collect();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].sid, system_sid());
+            assert_eq!(entries[0].mask, AccessMask::FILE_GENERIC_READ.into_bits());
+            assert_eq!(
+                entries[0].flags.into_bits(),
+                AceFlags::new().with_inherited(true).into_bits()
+            );
+            assert_eq!(entries[1].sid, creator);
+            assert_eq!(entries[1].mask, generic);
+            assert!(entries[1].flags.inherit_only() && entries[1].flags.inherited());
+            let child = inherited_security(&directory, false).unwrap();
+            let AclState::Present(acl) = child.dacl else {
+                panic!("missing inherited ACL")
+            };
+            let entries: Vec<_> = acl.entries().map(|ace| ace.access().unwrap()).collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].sid, system_sid());
+            assert_eq!(entries[0].mask, AccessMask::FILE_GENERIC_READ.into_bits());
+            assert!(!entries[0].flags.inherit_only());
+        }
+    }
+
     impl Fixture for ContractFixture {
         type Backend = MemoryFs;
 
@@ -1813,6 +1905,7 @@ mod tests {
                 security_queries: Feature::Supported,
                 file_acl_updates: Feature::Supported,
                 directory_acl_updates: Feature::Supported,
+                acl_inheritance: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -1875,6 +1968,11 @@ mod tests {
     #[test]
     fn contract_directory_acl_updates() {
         run_contract(contracts::directory_acl_updates);
+    }
+
+    #[test]
+    fn contract_acl_inheritance() {
+        run_contract(contracts::acl_inheritance);
     }
 
     #[test]

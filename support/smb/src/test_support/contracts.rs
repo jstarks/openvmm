@@ -50,6 +50,8 @@ pub struct Expectations {
     /// Directory DACL updates and namespace authorization, excluding inheritance.
     /// Supporting fixtures also support file ACL updates and rename.
     pub directory_acl_updates: Feature,
+    /// Basic inherited file/container ACEs and no-propagate behavior.
+    pub acl_inheritance: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -460,6 +462,123 @@ pub async fn directory_acl_updates<F: Fixture>(fixture: &F) {
     }
     fs.close(&source, &request).await.unwrap();
     fs.close(&directory, &request).await.unwrap();
+}
+
+/// Inheritance carries file-only ACEs through container templates, while
+/// no-propagate limits their effect to immediate children.
+pub async fn acl_inheritance<F: Fixture>(fixture: &F) {
+    use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
+    use crate::spec::{AceFlags, SecurityInformation};
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let parent = open(fs, "parent", CreateDisposition::CREATE, true, &request).await;
+    let world = Sid::new([0, 0, 0, 0, 0, 1], &[0]).unwrap();
+    let mut entries = vec![
+        AccessAce {
+            deny: false,
+            flags: AceFlags::new().with_container_inherit(true),
+            mask: AccessMask::FILE_ALL_ACCESS.into_bits(),
+            sid: world.clone(),
+        },
+        AccessAce {
+            deny: true,
+            flags: AceFlags::new()
+                .with_object_inherit(true)
+                .with_inherit_only(true),
+            mask: AccessMask::new()
+                .with_read_data(true)
+                .with_execute(true)
+                .into_bits(),
+            sid: world,
+        },
+    ];
+    let mut descriptor = SecurityDescriptor::empty();
+    descriptor.control.set_dacl_protected(true);
+    descriptor.dacl = AclState::Present(Acl::access(&entries).unwrap());
+    let information = SecurityInformation::new().with_dacl(true);
+    if let Some(status) = unsupported(fixture.expectations().acl_inheritance) {
+        rejected(
+            fs.set_security(&parent, information, &descriptor, &request)
+                .await,
+            status,
+        );
+    } else {
+        fs.set_security(&parent, information, &descriptor, &request)
+            .await
+            .unwrap();
+        let directory = open(
+            fs,
+            "parent\\directory",
+            CreateDisposition::CREATE,
+            true,
+            &request,
+        )
+        .await;
+        let file = open(
+            fs,
+            "parent\\directory\\file",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        assert!(
+            AccessMask::from_bits(fs.metadata(&file, &request).await.unwrap().granted_access)
+                .read_data()
+        );
+        let read = OpenOptions {
+            access: AccessMask::new().with_read_data(true).into_bits(),
+            ..options(CreateDisposition::OPEN, false)
+        };
+        rejected(
+            fs.open("parent\\directory\\file", read, &request).await,
+            Status::ACCESS_DENIED,
+        );
+        entries[1].flags.set_no_propagate_inherit(true);
+        descriptor.dacl = AclState::Present(Acl::access(&entries).unwrap());
+        fs.set_security(&parent, information, &descriptor, &request)
+            .await
+            .unwrap();
+        let immediate = open(
+            fs,
+            "parent\\immediate",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        rejected(
+            fs.open("parent\\immediate", read, &request).await,
+            Status::ACCESS_DENIED,
+        );
+        let other_directory = open(
+            fs,
+            "parent\\other",
+            CreateDisposition::CREATE,
+            true,
+            &request,
+        )
+        .await;
+        let grandchild = open(
+            fs,
+            "parent\\other\\grandchild",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        let (reopened, _) = fs
+            .open("parent\\other\\grandchild", read, &request)
+            .await
+            .unwrap();
+        fs.close(&reopened, &request).await.unwrap();
+        fs.close(&grandchild, &request).await.unwrap();
+        fs.close(&other_directory, &request).await.unwrap();
+        fs.close(&immediate, &request).await.unwrap();
+        fs.close(&file, &request).await.unwrap();
+        fs.close(&directory, &request).await.unwrap();
+    }
+    fs.close(&parent, &request).await.unwrap();
 }
 
 /// MAXIMUM_ALLOWED is resolved by the provider, not expanded to blanket rights.

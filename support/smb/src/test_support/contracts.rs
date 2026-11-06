@@ -63,6 +63,8 @@ pub struct Expectations {
     pub ea_operations: Feature,
     /// Data-stream snapshots, independent of named-stream creation support.
     pub stream_queries: Feature,
+    /// Named data-stream opens, isolated content and stream-scoped deletion.
+    pub named_streams: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -660,6 +662,51 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Named streams isolate content and retain opens through stream-scoped deletion.
+pub async fn named_streams<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let base = open(fs, "streams", CreateDisposition::CREATE, false, &request).await;
+    write_all(fs, &base, 0, b"base", &request).await;
+    let result = fs
+        .open(
+            "streams:side:$DATA",
+            options(CreateDisposition::OPEN_IF, false),
+            &request,
+        )
+        .await;
+    if let Some(status) = unsupported(fixture.expectations().named_streams) {
+        rejected(result, status);
+        assert_eq!(read_bytes(fs, &base, 0, 4, &request).await, b"base");
+    } else {
+        let (named, _) = result.unwrap();
+        write_all(fs, &named, 0, b"side", &request).await;
+        let info = fs.metadata(&named, &request).await.unwrap();
+        assert_eq!(info.stream_name.as_deref(), Some("side"));
+        assert_eq!(info.id, fs.metadata(&base, &request).await.unwrap().id);
+        assert_eq!(read_bytes(fs, &base, 0, 4, &request).await, b"base");
+        fs.set_len(&named, 2, &request).await.unwrap();
+        let alias = open(fs, "streams:SIDE", CreateDisposition::OPEN, false, &request).await;
+        assert_eq!(read_bytes(fs, &alias, 0, 2, &request).await, b"si");
+        fs.set_delete_on_close(&named, true, &request)
+            .await
+            .unwrap();
+        fs.close(&named, &request).await.unwrap();
+        assert_eq!(read_bytes(fs, &alias, 0, 2, &request).await, b"si");
+        fs.close(&alias, &request).await.unwrap();
+        rejected(
+            fs.open(
+                "streams:side",
+                options(CreateDisposition::OPEN, false),
+                &request,
+            )
+            .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+    }
+    fs.close(&base, &request).await.unwrap();
 }
 
 /// Data-stream queries describe actual lengths and omit directory/index streams.

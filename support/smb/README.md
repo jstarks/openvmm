@@ -29,7 +29,7 @@ will not need them.
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
-| EAs and named streams | Retained EAs with atomic CREATE/set, bounded enumeration and access checks | EAs advertised; named streams remain unsupported; stream-dependent fixtures are not passes |
+| EAs and named streams | Retained EAs and real named-stream storage, enumeration and lifetime | Both advertised; selected directory/I/O/sharing/deletion stream cases pass; stream rename remains pending |
 | Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
 | Naming | Share-relative namespace and canonical paths | Dot components resolve within the virtual root; case folding is ASCII-only and no short names are generated |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
@@ -70,9 +70,12 @@ QUERY_INFO returns complete aligned records with per-open continuation,
 restart/single-entry/indexed queries and explicit name lists. EA mutations
 preserve open grants, update metadata and notify EA/attribute watchers.
 Stream-information queries use provider-owned names, lengths and allocation.
-MemoryFs currently reports its default data stream, excluding directory/index
-streams. The frontend also encodes named-provider snapshots and bounded complete
-records; named-stream opens/storage remain pending and are not advertised yet.
+MemoryFs reports default and named data streams, excluding directory/index
+streams. Named streams have independent data, EOF, allocation and locks, and
+stream-local sharing with file-wide delete-sharing checks. They work on files
+and directories, charge shared storage/object quotas atomically, and retain
+existing opens through stream-scoped deletion. File metadata/times and identity
+are shared. Stream rename is explicitly unsupported pending its own slice.
 
 ## Run
 

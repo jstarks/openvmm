@@ -792,7 +792,7 @@ fn ea_validation_precedes_provider_rejection_and_existing_eas_are_ignored() {
         let flags = FileSystemAttributes::from_bits(u32::from_le_bytes(
             response[72..76].try_into().unwrap(),
         ));
-        assert!(!flags.named_streams());
+        assert!(flags.named_streams());
         assert!(flags.extended_attributes());
         assert!(!flags.persistent_acls());
         client.close(limited).await;

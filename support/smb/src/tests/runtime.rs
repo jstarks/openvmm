@@ -66,6 +66,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         let (fs, control) = ControlledFs::new(memory.clone());
         let operations = [
             Operation::Open,
+            Operation::OpenStream,
             Operation::Close,
             Operation::Metadata,
             Operation::FileSystemInformation,
@@ -130,6 +131,20 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::Open,
         )
         .await;
+        let (stream, _) = through_gates(
+            fs.open(
+                "directory\\file:side",
+                OpenOptions {
+                    options: CreateOptions::new().with_delete_on_close(true).into_bits(),
+                    ..options
+                },
+                &context,
+            ),
+            &control,
+            Operation::OpenStream,
+        )
+        .await;
+        through_gates(fs.close(&stream, &context), &control, Operation::Close).await;
         assert_eq!(
             through_gates(
                 fs.write(&file, 0, b"abcdef", &context),

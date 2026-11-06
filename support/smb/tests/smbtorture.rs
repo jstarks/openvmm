@@ -61,7 +61,6 @@ fn samba_create_and_sharing() {
             "smb2.create.mkdir-visible",
             "smb2.create.dir-alloc-size",
             "smb2.create.dosattr_tmp_dir",
-            "smb2.create_no_streams.no_stream",
             "smb2.sharemode.sharemode-access",
             "smb2.sharemode.access-sharemode",
             "smb2.sharemode.bug14375",
@@ -71,6 +70,22 @@ fn samba_create_and_sharing() {
             "smb2.winattr",
             "smb2.winattr2",
             "smb2.openattr",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_streams() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.streams.dir",
+            "smb2.streams.io",
+            "smb2.streams.sharemodes",
+            "smb2.streams.delete",
+            "smb2.streams.zero-byte",
         ],
     );
 }

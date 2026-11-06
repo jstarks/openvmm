@@ -1097,7 +1097,7 @@ fn malformed_creates_and_traversal_are_rejected() {
         for (name, status) in [
             ("\\rooted", Status::INVALID_PARAMETER),
             ("a/../b", Status::OBJECT_NAME_INVALID),
-            ("file:stream", Status::OBJECT_NAME_INVALID),
+            ("file:stream:$UNKNOWN", Status::OBJECT_NAME_INVALID),
             ("bad*name", Status::OBJECT_NAME_INVALID),
             ("bad?name", Status::OBJECT_NAME_INVALID),
             ("bad\u{1}name", Status::OBJECT_NAME_INVALID),

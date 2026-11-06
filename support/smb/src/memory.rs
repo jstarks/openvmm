@@ -42,10 +42,19 @@ struct Node {
     parent: u64,
     data: Vec<u8>,
     eas: Vec<ExtendedAttribute>,
+    streams: BTreeMap<u64, NamedStream>,
+}
+
+struct NamedStream {
+    name: String,
+    size: u64,
+    data: Vec<u8>,
+    delete_pending: bool,
 }
 
 struct Open {
     node: u64,
+    stream: u64,
     access: u32,
     sharing: u32,
     delete_on_close: bool,
@@ -73,6 +82,7 @@ struct State {
     opens: BTreeMap<u64, Open>,
     next_id: u64,
     next_open: u64,
+    next_stream: u64,
     next_notify: u64,
     next_lock: u64,
     watches: usize,
@@ -87,6 +97,7 @@ struct State {
 struct RangeLock {
     id: LockId,
     node: u64,
+    stream: u64,
     owner: u64,
     range: ByteRange,
     exclusive: bool,
@@ -101,6 +112,7 @@ fn conflicts(
 ) -> bool {
     state.locks.iter().any(|lock| {
         lock.node == file.node
+            && lock.stream == file.stream
             && lock.range.overlaps(range)
             && if lock.exclusive {
                 lock.owner != file.open || (exclusive && locking)
@@ -127,6 +139,16 @@ fn wake(state: MutexGuard<'_, State>) {
 }
 
 fn emit(state: &mut State, node: u64, action: NotifyAction, filter: NotifyFilter) {
+    emit_named(state, node, None, action, filter);
+}
+
+fn emit_named(
+    state: &mut State,
+    node: u64,
+    stream: Option<&str>,
+    action: NotifyAction,
+    filter: NotifyFilter,
+) {
     let Some(node) = state.nodes.get(&node) else {
         return;
     };
@@ -134,6 +156,10 @@ fn emit(state: &mut State, node: u64, action: NotifyAction, filter: NotifyFilter
         return;
     }
     let mut name = node.metadata.name.clone();
+    if let Some(stream) = stream {
+        name.push(':');
+        name.push_str(stream);
+    }
     let mut parent = node.parent;
     let mut depth = 0;
     loop {
@@ -215,6 +241,7 @@ impl Drop for NotifyWaiter {
 pub struct MemoryFile {
     state: Arc<Mutex<State>>,
     node: u64,
+    stream: u64,
     open: u64,
 }
 
@@ -236,6 +263,7 @@ impl MemoryFs {
         let now = nt_time();
         let root = Node {
             metadata: Metadata {
+                stream_name: None,
                 id: 1,
                 id128: None,
                 name: String::new(),
@@ -261,6 +289,7 @@ impl MemoryFs {
             security: default_security(true),
             data: Vec::new(),
             eas: Vec::new(),
+            streams: BTreeMap::new(),
         };
         Self(Arc::new(Mutex::new(State {
             created: now,
@@ -268,6 +297,7 @@ impl MemoryFs {
             opens: BTreeMap::new(),
             next_id: 2,
             next_open: 1,
+            next_stream: 1,
             next_notify: 1,
             next_lock: 1,
             watches: 0,
@@ -279,6 +309,54 @@ impl MemoryFs {
             changed: Arc::new(Event::new()),
         })))
     }
+}
+
+fn stream_path<'a>(
+    name: &'a str,
+    options: &mut OpenOptions<'_>,
+) -> Result<(&'a str, Option<&'a str>, bool), Status> {
+    if name.encode_utf16().count() > MAX_PATH_LENGTH {
+        return Err(Status::NAME_TOO_LONG);
+    }
+    let Some((base, suffix)) = name.split_once(':') else {
+        return Ok((name, None, false));
+    };
+    let mut parts = suffix.split(':');
+    let stream = parts.next().ok_or(Status::OBJECT_NAME_INVALID)?;
+    let kind = parts.next().unwrap_or("");
+    if parts.next().is_some() || suffix.contains(['\\', '/']) {
+        return Err(Status::OBJECT_NAME_INVALID);
+    }
+    if kind.eq_ignore_ascii_case("$INDEX_ALLOCATION") {
+        if !stream.is_empty() && !stream.eq_ignore_ascii_case("$I30") {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        options.options = options.options().with_directory_file(true).into_bits();
+        return Ok((base, None, false));
+    }
+    if !kind.is_empty() && !kind.eq_ignore_ascii_case("$DATA") {
+        return Err(
+            if matches!(
+                options.disposition(),
+                CreateDisposition::SUPERSEDE
+                    | CreateDisposition::OVERWRITE
+                    | CreateDisposition::OVERWRITE_IF
+            ) {
+                Status::ACCESS_DENIED
+            } else {
+                Status::OBJECT_NAME_INVALID
+            },
+        );
+    }
+    let data = !stream.is_empty() || kind.eq_ignore_ascii_case("$DATA");
+    if data && options.options().directory_file() {
+        return Err(Status::NOT_A_DIRECTORY);
+    }
+    if stream.is_empty() {
+        return Ok((base, None, data));
+    }
+    components(stream)?;
+    Ok((base, Some(stream), true))
 }
 
 fn components(name: &str) -> Result<Vec<&str>, Status> {
@@ -343,6 +421,31 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     }
     metadata.maximal_access = acl_access(&state.nodes[&id].security);
     Ok(metadata)
+}
+
+fn file_metadata(state: &State, file: &MemoryFile) -> Result<Metadata, Status> {
+    let mut info = node_metadata(state, file.node)?;
+    if file.stream != 0 {
+        let stream = state
+            .nodes
+            .get(&file.node)
+            .and_then(|node| node.streams.get(&file.stream))
+            .ok_or(Status::FILE_CLOSED)?;
+        info.stream_name = Some(stream.name.clone());
+        info.name.push(':');
+        info.name.push_str(&stream.name);
+        info.name.push_str(":$DATA");
+        info.path.push(':');
+        info.path.push_str(&stream.name);
+        info.path.push_str(":$DATA");
+        info.size = stream.size;
+        info.allocation_size = stream.data.len() as u64;
+        info.delete_pending = stream.delete_pending || info.number_of_links == 0;
+        if let Some(compression) = &mut info.compression {
+            compression.compressed_size = info.allocation_size;
+        }
+    }
+    Ok(info)
 }
 
 fn system_sid() -> Sid {
@@ -701,6 +804,152 @@ fn sharing_conflict(access: u32, sharing: u32, other: &Open) -> bool {
         && (access & !other.sharing != 0 || other_access & !sharing != 0)
 }
 
+fn stream_sharing_conflict(access: u32, sharing: u32, other: &Open, stream: u64) -> bool {
+    if other.stream == stream {
+        sharing_conflict(access, sharing, other)
+    } else {
+        (AccessMask::from_bits(access).delete() && !ShareAccess::from_bits(other.sharing).delete())
+            || (AccessMask::from_bits(other.access).delete()
+                && !ShareAccess::from_bits(sharing).delete())
+    }
+}
+
+fn open_named_stream(
+    state: &mut State,
+    id: u64,
+    name: &str,
+    options: &mut OpenOptions<'_>,
+) -> Result<(u64, u32), Status> {
+    let node = state.nodes.get(&id).ok_or(Status::FILE_CLOSED)?;
+    if options.options().delete_on_close() && node.metadata.attributes().readonly() {
+        return Err(Status::CANNOT_DELETE);
+    }
+    let existing = node
+        .streams
+        .iter()
+        .find(|(_, stream)| stream.name.eq_ignore_ascii_case(name))
+        .map(|(id, stream)| (*id, stream));
+    if existing.is_some_and(|(_, stream)| stream.delete_pending) {
+        return Err(Status::DELETE_PENDING);
+    }
+    if existing.is_some() && options.disposition() == CreateDisposition::CREATE {
+        return Err(Status::OBJECT_NAME_COLLISION);
+    }
+    if existing.is_none()
+        && matches!(
+            options.disposition(),
+            CreateDisposition::OPEN | CreateDisposition::OVERWRITE
+        )
+    {
+        return Err(Status::OBJECT_NAME_NOT_FOUND);
+    }
+    let replacement = existing.is_some()
+        && matches!(
+            options.disposition(),
+            CreateDisposition::SUPERSEDE
+                | CreateDisposition::OVERWRITE
+                | CreateDisposition::OVERWRITE_IF
+        );
+    if existing.is_none() || replacement {
+        options.access = options
+            .access()
+            .with_write_data(
+                existing.is_none()
+                    || options.disposition() != CreateDisposition::SUPERSEDE
+                    || options.access().write_data(),
+            )
+            .with_delete(
+                options.disposition() == CreateDisposition::SUPERSEDE || options.access().delete(),
+            )
+            .into_bits();
+    }
+    let readonly = node.metadata.attributes().readonly() && !node.metadata.is_directory();
+    let mut available = AccessMask::from_bits(allowed_access(state, id));
+    if readonly && options.access().maximum_allowed() {
+        available.set_write_data(false);
+        available.set_append_data(false);
+    }
+    options.access = grant_access(
+        available.into_bits(),
+        options.access,
+        options.options().delete_on_close(),
+    )?;
+    if readonly && (options.access().write_data() || options.access().append_data()) {
+        return Err(Status::ACCESS_DENIED);
+    }
+    let stream = existing.map(|(id, _)| id).unwrap_or(state.next_stream);
+    for open in state.opens.values().filter(|open| open.node == id) {
+        if stream_sharing_conflict(options.access, options.share_access, open, stream) {
+            return Err(Status::SHARING_VIOLATION);
+        }
+    }
+    let action;
+    if replacement {
+        let allocation = usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?;
+        allocate_stream(state, id, stream, allocation)?;
+        let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
+        let data = node.streams.get_mut(&stream).ok_or(Status::FILE_CLOSED)?;
+        let name = data.name.clone();
+        data.data.fill(0);
+        data.size = 0;
+        node.metadata.written = nt_time();
+        node.metadata.changed = node.metadata.written;
+        emit_named(
+            state,
+            id,
+            Some(&name),
+            NotifyAction::MODIFIED_STREAM,
+            NotifyFilter::new()
+                .with_stream_size(true)
+                .with_stream_write(true),
+        );
+        action = if options.disposition() == CreateDisposition::SUPERSEDE {
+            CreateAction::SUPERSEDED.0
+        } else {
+            CreateAction::OVERWRITTEN.0
+        };
+    } else if existing.is_some() {
+        action = CreateAction::OPENED.0;
+    } else {
+        if object_count(state) >= state.object_limit {
+            return Err(Status::DISK_FULL);
+        }
+        let next_stream = state
+            .next_stream
+            .checked_add(1)
+            .ok_or(Status::INSUFFICIENT_RESOURCES)?;
+        let allocation = usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?;
+        let new_bytes = allocation_charge(state, 0, allocation)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(allocation)
+            .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
+        data.resize(allocation, 0);
+        let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
+        node.streams.insert(
+            stream,
+            NamedStream {
+                name: name.to_owned(),
+                size: 0,
+                data,
+                delete_pending: false,
+            },
+        );
+        node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+        node.metadata.changed = nt_time();
+        state.bytes = new_bytes;
+        state.next_stream = next_stream;
+        emit_named(
+            state,
+            id,
+            Some(name),
+            NotifyAction::ADDED_STREAM,
+            NotifyFilter::new().with_stream_name(true),
+        );
+        action = CreateAction::CREATED.0;
+    }
+    Ok((stream, action))
+}
+
 fn settable_attributes() -> FileAttributes {
     FileAttributes::new()
         .with_readonly(true)
@@ -750,6 +999,43 @@ fn update_eas(
     Ok(entries.into_values().collect())
 }
 
+fn stream_data(node: &Node, stream: u64) -> Result<(&[u8], u64), Status> {
+    if stream == 0 {
+        Ok((&node.data, node.metadata.size))
+    } else {
+        let stream = node.streams.get(&stream).ok_or(Status::FILE_CLOSED)?;
+        Ok((&stream.data, stream.size))
+    }
+}
+
+fn stream_data_mut(node: &mut Node, stream: u64) -> Result<(&mut Vec<u8>, &mut u64), Status> {
+    if stream == 0 {
+        Ok((&mut node.data, &mut node.metadata.size))
+    } else {
+        let stream = node.streams.get_mut(&stream).ok_or(Status::FILE_CLOSED)?;
+        Ok((&mut stream.data, &mut stream.size))
+    }
+}
+
+fn stored_bytes(node: &Node) -> usize {
+    node.data.len()
+        + node.metadata.extended_attributes_length as usize
+        + node
+            .streams
+            .values()
+            .map(|stream| stream.data.len())
+            .sum::<usize>()
+}
+
+fn object_count(state: &State) -> usize {
+    state.nodes.len()
+        + state
+            .nodes
+            .values()
+            .map(|node| node.streams.len())
+            .sum::<usize>()
+}
+
 fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usize, Status> {
     let new_bytes = state
         .bytes
@@ -763,43 +1049,59 @@ fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usi
 }
 
 fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
-    let old_len = state
-        .nodes
-        .get(&node_id)
-        .ok_or(Status::FILE_CLOSED)?
-        .data
-        .len();
+    allocate_stream(state, node_id, 0, length)
+}
+
+fn allocate_stream(
+    state: &mut State,
+    node_id: u64,
+    stream: u64,
+    length: usize,
+) -> Result<(), Status> {
+    let old_len = stream_data(
+        state.nodes.get(&node_id).ok_or(Status::FILE_CLOSED)?,
+        stream,
+    )?
+    .0
+    .len();
     let new_bytes = allocation_charge(state, old_len, length)?;
     let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
+    let (data, size) = stream_data_mut(node, stream)?;
     if length > old_len {
-        node.data
-            .try_reserve_exact(length - old_len)
+        data.try_reserve_exact(length - old_len)
             .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
     }
-    node.data.resize(length, 0);
+    data.resize(length, 0);
     if length < old_len {
-        node.data.shrink_to_fit();
+        data.shrink_to_fit();
     }
-    node.metadata.size = node.metadata.size.min(length as u64);
-    node.metadata.allocation_size = length as u64;
+    *size = (*size).min(length as u64);
+    if stream == 0 {
+        node.metadata.allocation_size = length as u64;
+    }
     state.bytes = new_bytes;
     Ok(())
 }
 
-fn resize(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
+fn resize_stream(
+    state: &mut State,
+    node_id: u64,
+    stream: u64,
+    length: usize,
+) -> Result<(), Status> {
     let node = state.nodes.get(&node_id).ok_or(Status::FILE_CLOSED)?;
-    let allocation = if length as u64 >= node.metadata.size {
-        node.data.len().max(length)
+    let (data, size) = stream_data(node, stream)?;
+    let allocation = if length as u64 >= size {
+        data.len().max(length)
     } else {
         length
     };
-    allocate(state, node_id, allocation)?;
-    state
-        .nodes
-        .get_mut(&node_id)
-        .ok_or(Status::FILE_CLOSED)?
-        .metadata
-        .size = length as u64;
+    allocate_stream(state, node_id, stream, allocation)?;
+    *stream_data_mut(
+        state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?,
+        stream,
+    )?
+    .1 = length as u64;
     Ok(())
 }
 
@@ -812,6 +1114,37 @@ fn modified(state: &mut State, file: &MemoryFile) -> Result<(), Status> {
     }
     if !open.user_set_change_time {
         node.metadata.changed = now;
+    }
+    Ok(())
+}
+
+fn data_changed(state: &mut State, file: &MemoryFile, size_changed: bool) -> Result<(), Status> {
+    let write = !state.opens[&file.open].user_set_write_time;
+    if file.stream == 0 {
+        emit(
+            state,
+            file.node,
+            NotifyAction::MODIFIED,
+            NotifyFilter::new()
+                .with_size(size_changed)
+                .with_last_write(write),
+        );
+    } else {
+        let name = state
+            .nodes
+            .get(&file.node)
+            .and_then(|node| node.streams.get(&file.stream))
+            .map(|stream| stream.name.clone())
+            .ok_or(Status::FILE_CLOSED)?;
+        emit_named(
+            state,
+            file.node,
+            Some(&name),
+            NotifyAction::MODIFIED_STREAM,
+            NotifyFilter::new()
+                .with_stream_size(size_changed)
+                .with_stream_write(write),
+        );
     }
     Ok(())
 }
@@ -836,7 +1169,40 @@ impl MemoryFile {
         let empty = !directory || !has_children(&state, self.node);
         // MS-FSA §2.1.5.5 phase 1 applies CREATE's mode at close. A nonempty
         // directory is left intact; SET_INFO disposition is separate link state.
-        if open.delete_on_close && (!directory || empty) {
+        if open.stream != 0 {
+            if let Some(stream) = state
+                .nodes
+                .get_mut(&self.node)
+                .and_then(|node| node.streams.get_mut(&open.stream))
+            {
+                stream.delete_pending |= open.delete_on_close;
+            }
+            let remove = state
+                .nodes
+                .get(&self.node)
+                .and_then(|node| node.streams.get(&open.stream))
+                .is_some_and(|stream| stream.delete_pending)
+                && !state
+                    .opens
+                    .values()
+                    .any(|other| other.node == self.node && other.stream == open.stream);
+            if remove {
+                if let Some(stream) = state
+                    .nodes
+                    .get_mut(&self.node)
+                    .and_then(|node| node.streams.remove(&open.stream))
+                {
+                    state.bytes -= stream.data.len();
+                    emit_named(
+                        &mut state,
+                        self.node,
+                        Some(&stream.name),
+                        NotifyAction::REMOVED_STREAM,
+                        NotifyFilter::new().with_stream_name(true),
+                    );
+                }
+            }
+        } else if open.delete_on_close && (!directory || empty) {
             state
                 .nodes
                 .get_mut(&self.node)
@@ -858,7 +1224,7 @@ impl MemoryFile {
                 name_filter(directory),
             );
             if let Some(node) = state.nodes.remove(&self.node) {
-                state.bytes -= node.data.len() + node.metadata.extended_attributes_length as usize;
+                state.bytes -= stored_bytes(&node);
             }
         }
         wake(state);
@@ -869,7 +1235,7 @@ impl inspect::Inspect for MemoryFs {
     fn inspect(&self, req: inspect::Request<'_>) {
         let state = self.0.lock();
         req.respond()
-            .field("objects", state.nodes.len())
+            .field("objects", object_count(&state))
             .field("opens", state.opens.len())
             .field(
                 "delete_on_close_opens",
@@ -902,6 +1268,7 @@ impl inspect::Inspect for MemoryFs {
                     resp.child(&id.to_string(), |req| {
                         req.respond()
                             .field("node", lock.node)
+                            .field("stream", lock.stream)
                             .field("owner", lock.owner)
                             .field("offset", lock.range.offset)
                             .field("length", lock.range.length)
@@ -926,6 +1293,7 @@ impl inspect::Inspect for MemoryFs {
                         resp.child(&id.to_string(), |req| {
                             req.respond()
                                 .field("node", open.node)
+                                .field("stream", open.stream)
                                 .field("registration", watch.id)
                                 .hex("filter", watch.filter.into_bits())
                                 .field("tree", watch.tree)
@@ -947,7 +1315,19 @@ impl inspect::Inspect for MemoryFs {
                             .field("size", node.metadata.size)
                             .field("allocation_size", node.metadata.allocation_size)
                             .hex("attributes", node.metadata.attributes)
-                            .field("delete_pending", node.metadata.delete_pending);
+                            .field("delete_pending", node.metadata.delete_pending)
+                            .child("streams", |req| {
+                                let mut resp = req.respond();
+                                for (id, stream) in &node.streams {
+                                    resp.child(&id.to_string(), |req| {
+                                        req.respond()
+                                            .field("name", &stream.name)
+                                            .field("size", stream.size)
+                                            .field("allocation_size", stream.data.len())
+                                            .field("delete_pending", stream.delete_pending);
+                                    });
+                                }
+                            });
                     });
                 }
             });
@@ -965,8 +1345,10 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<(MemoryFile, u32), Status> {
         let mut options = options;
+        let (name, named, force_data) = stream_path(name, &mut options)?;
         let parts = components(name)?;
-        if matches!(parts.last().copied(), Some("." | ".."))
+        if named.is_none()
+            && matches!(parts.last().copied(), Some("." | ".."))
             && !matches!(
                 options.disposition(),
                 CreateDisposition::OPEN | CreateDisposition::OPEN_IF
@@ -992,105 +1374,117 @@ impl FileSystem for MemoryFs {
             .checked_add(1)
             .ok_or(Status::INSUFFICIENT_RESOURCES)?;
         let delete = options.options().delete_on_close();
-        let (id, action) = if let Some(id) = existing {
+        let (id, stream, action) = if let Some(id) = existing {
             let node = &state.nodes[&id];
-            if options.options().no_ea_knowledge() && node.eas.iter().any(|ea| ea.need_ea) {
+            if named.is_none()
+                && options.options().no_ea_knowledge()
+                && node.eas.iter().any(|ea| ea.need_ea)
+            {
                 return Err(Status::ACCESS_DENIED);
             }
             if node.metadata.delete_pending {
                 return Err(Status::DELETE_PENDING);
             }
-            if options.disposition() == CreateDisposition::CREATE {
-                return Err(Status::OBJECT_NAME_COLLISION);
-            }
-            if options.options().directory_file() && !node.metadata.is_directory() {
-                return Err(Status::NOT_A_DIRECTORY);
-            }
-            if options.options().non_directory_file() && node.metadata.is_directory() {
-                return Err(Status::FILE_IS_A_DIRECTORY);
-            }
-            if delete && node.metadata.attributes().readonly() {
-                return Err(Status::CANNOT_DELETE);
-            }
-            let replacement = matches!(
-                options.disposition(),
-                CreateDisposition::SUPERSEDE
-                    | CreateDisposition::OVERWRITE
-                    | CreateDisposition::OVERWRITE_IF
-            );
-            if replacement {
-                if node.metadata.is_directory() {
+            if let Some(name) = named {
+                let (stream, action) = open_named_stream(&mut state, id, name, &mut options)?;
+                (id, stream, action)
+            } else {
+                if force_data && node.metadata.is_directory() {
                     return Err(Status::FILE_IS_A_DIRECTORY);
                 }
-                if (node.metadata.attributes().hidden() && !options.attributes().hidden())
-                    || (node.metadata.attributes().system() && !options.attributes().system())
+                if options.disposition() == CreateDisposition::CREATE {
+                    return Err(Status::OBJECT_NAME_COLLISION);
+                }
+                if options.options().directory_file() && !node.metadata.is_directory() {
+                    return Err(Status::NOT_A_DIRECTORY);
+                }
+                if options.options().non_directory_file() && node.metadata.is_directory() {
+                    return Err(Status::FILE_IS_A_DIRECTORY);
+                }
+                if delete && node.metadata.attributes().readonly() {
+                    return Err(Status::CANNOT_DELETE);
+                }
+                let replacement = matches!(
+                    options.disposition(),
+                    CreateDisposition::SUPERSEDE
+                        | CreateDisposition::OVERWRITE
+                        | CreateDisposition::OVERWRITE_IF
+                );
+                if replacement {
+                    if node.metadata.is_directory() {
+                        return Err(Status::FILE_IS_A_DIRECTORY);
+                    }
+                    if (node.metadata.attributes().hidden() && !options.attributes().hidden())
+                        || (node.metadata.attributes().system() && !options.attributes().system())
+                    {
+                        return Err(Status::ACCESS_DENIED);
+                    }
+                    let supersede = options.disposition() == CreateDisposition::SUPERSEDE;
+                    options.access = options
+                        .access()
+                        .with_write_ea(true)
+                        .with_write_attributes(true)
+                        .with_write_data(!supersede || options.access().write_data())
+                        .with_delete(supersede || options.access().delete())
+                        .into_bits();
+                }
+                let mut available = AccessMask::from_bits(allowed_access(&state, id));
+                if options.access().maximum_allowed() && node.metadata.attributes().readonly() {
+                    available.set_write_data(false);
+                    available.set_append_data(false);
+                    available.set_delete_child(false);
+                }
+                options.access = grant_access(available.into_bits(), options.access, delete)?;
+                if !node.metadata.is_directory()
+                    && node.metadata.attributes().readonly()
+                    && (options.access().write_data() || options.access().append_data())
                 {
                     return Err(Status::ACCESS_DENIED);
                 }
-                let supersede = options.disposition() == CreateDisposition::SUPERSEDE;
-                options.access = options
-                    .access()
-                    .with_write_ea(true)
-                    .with_write_attributes(true)
-                    .with_write_data(!supersede || options.access().write_data())
-                    .with_delete(supersede || options.access().delete())
-                    .into_bits();
-            }
-            let mut available = AccessMask::from_bits(allowed_access(&state, id));
-            if options.access().maximum_allowed() && node.metadata.attributes().readonly() {
-                available.set_write_data(false);
-                available.set_append_data(false);
-                available.set_delete_child(false);
-            }
-            options.access = grant_access(available.into_bits(), options.access, delete)?;
-            if !node.metadata.is_directory()
-                && node.metadata.attributes().readonly()
-                && (options.access().write_data() || options.access().append_data())
-            {
-                return Err(Status::ACCESS_DENIED);
-            }
-            for other in state.opens.values().filter(|o| o.node == id) {
-                if sharing_conflict(options.access, options.share_access, other) {
-                    return Err(Status::SHARING_VIOLATION);
+                for other in state.opens.values().filter(|o| o.node == id) {
+                    if stream_sharing_conflict(options.access, options.share_access, other, 0) {
+                        return Err(Status::SHARING_VIOLATION);
+                    }
                 }
-            }
-            if replacement {
-                let size_changed = node.metadata.size != 0;
-                let attributes = FileAttributes::from_bits(
-                    options.attributes & settable_attributes().into_bits(),
-                )
-                .with_archive(true)
-                .with_not_content_indexed(false)
-                .into_bits();
-                let attributes_changed = attributes != node.metadata.attributes;
-                let allocation =
-                    usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?;
-                allocate(&mut state, id, allocation)?;
-                let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
-                node.data.fill(0);
-                node.metadata.size = 0;
-                node.metadata.attributes = attributes;
-                node.metadata.written = nt_time();
-                node.metadata.changed = node.metadata.written;
-                emit(
-                    &mut state,
-                    id,
-                    NotifyAction::MODIFIED,
-                    NotifyFilter::new()
-                        .with_attributes(attributes_changed)
-                        .with_size(size_changed)
-                        .with_last_write(true),
-                );
-                (
-                    id,
-                    if options.disposition() == CreateDisposition::SUPERSEDE {
-                        CreateAction::SUPERSEDED.0
-                    } else {
-                        CreateAction::OVERWRITTEN.0
-                    },
-                )
-            } else {
-                (id, CreateAction::OPENED.0)
+                if replacement {
+                    let size_changed = node.metadata.size != 0;
+                    let attributes = FileAttributes::from_bits(
+                        options.attributes & settable_attributes().into_bits(),
+                    )
+                    .with_archive(true)
+                    .with_not_content_indexed(false)
+                    .into_bits();
+                    let attributes_changed = attributes != node.metadata.attributes;
+                    let allocation =
+                        usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?;
+                    allocate(&mut state, id, allocation)?;
+                    let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
+                    node.data.fill(0);
+                    node.metadata.size = 0;
+                    node.metadata.attributes = attributes;
+                    node.metadata.written = nt_time();
+                    node.metadata.changed = node.metadata.written;
+                    emit(
+                        &mut state,
+                        id,
+                        NotifyAction::MODIFIED,
+                        NotifyFilter::new()
+                            .with_attributes(attributes_changed)
+                            .with_size(size_changed)
+                            .with_last_write(true),
+                    );
+                    (
+                        id,
+                        0,
+                        if options.disposition() == CreateDisposition::SUPERSEDE {
+                            CreateAction::SUPERSEDED.0
+                        } else {
+                            CreateAction::OVERWRITTEN.0
+                        },
+                    )
+                } else {
+                    (id, 0, CreateAction::OPENED.0)
+                }
             }
         } else {
             if matches!(
@@ -1109,12 +1503,18 @@ impl FileSystem for MemoryFs {
             if directory && options.attributes().temporary() {
                 return Err(Status::INVALID_PARAMETER);
             }
+            if named.is_some() {
+                options.access = options.access().with_write_data(true).into_bits();
+            }
             options.access = grant_access(
                 AccessMask::FILE_ALL_ACCESS.into_bits(),
                 options.access,
                 delete,
             )?;
-            if state.nodes.len() >= state.object_limit {
+            if object_count(&state)
+                .checked_add(1 + usize::from(named.is_some()))
+                .is_none_or(|count| count > state.object_limit)
+            {
                 return Err(Status::DISK_FULL);
             }
             let security = match options.security {
@@ -1147,6 +1547,32 @@ impl FileSystem for MemoryFs {
             data.try_reserve_exact(allocation)
                 .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
             data.resize(allocation, 0);
+            let stream = if named.is_some() {
+                state.next_stream
+            } else {
+                0
+            };
+            let next_stream = if named.is_some() {
+                state
+                    .next_stream
+                    .checked_add(1)
+                    .ok_or(Status::INSUFFICIENT_RESOURCES)?
+            } else {
+                state.next_stream
+            };
+            let streams = if let Some(name) = named {
+                BTreeMap::from([(
+                    stream,
+                    NamedStream {
+                        name: name.to_owned(),
+                        size: 0,
+                        data: std::mem::take(&mut data),
+                        delete_pending: false,
+                    },
+                )])
+            } else {
+                BTreeMap::new()
+            };
             let now = nt_time();
             let attributes =
                 FileAttributes::from_bits(options.attributes & settable_attributes().into_bits())
@@ -1165,6 +1591,7 @@ impl FileSystem for MemoryFs {
                 Node {
                     security,
                     metadata: Metadata {
+                        stream_name: None,
                         id,
                         id128: None,
                         name: parts.last().ok_or(Status::OBJECT_NAME_INVALID)?.to_string(),
@@ -1177,7 +1604,11 @@ impl FileSystem for MemoryFs {
                         written: now,
                         changed: now,
                         size: 0,
-                        allocation_size: allocation as u64,
+                        allocation_size: if named.is_some() {
+                            0
+                        } else {
+                            allocation as u64
+                        },
                         compression: Some(CompressionInformation::default()),
                         number_of_links: 1,
                         extended_attributes_length: ea_length as u32,
@@ -1189,23 +1620,35 @@ impl FileSystem for MemoryFs {
                     parent,
                     data,
                     eas,
+                    streams,
                 },
             );
             state.next_id = next_id;
+            state.next_stream = next_stream;
             state.bytes = new_bytes;
             emit(&mut state, id, NotifyAction::ADDED, name_filter(directory));
-            (id, CreateAction::CREATED.0)
+            if let Some(name) = named {
+                emit_named(
+                    &mut state,
+                    id,
+                    Some(name),
+                    NotifyAction::ADDED_STREAM,
+                    NotifyFilter::new().with_stream_name(true),
+                );
+            }
+            (id, stream, CreateAction::CREATED.0)
         };
-        if delete && id == 1 {
+        if delete && id == 1 && stream == 0 {
             return Err(Status::DIRECTORY_NOT_EMPTY);
         }
         let open = state.next_open;
         state.next_open = next_open;
-        let notify_deleted = delete && state.nodes[&id].metadata.is_directory();
+        let notify_deleted = delete && stream == 0 && state.nodes[&id].metadata.is_directory();
         state.opens.insert(
             open,
             Open {
                 node: id,
+                stream,
                 access: options.access,
                 sharing: options.share_access,
                 delete_on_close: delete,
@@ -1222,6 +1665,7 @@ impl FileSystem for MemoryFs {
             MemoryFile {
                 state: self.0.clone(),
                 node: id,
+                stream,
                 open,
             },
             action,
@@ -1240,6 +1684,9 @@ impl FileSystem for MemoryFs {
         replace: bool,
         _request: &RequestContext,
     ) -> Result<(), Status> {
+        if file.stream != 0 {
+            return Err(Status::NOT_SUPPORTED);
+        }
         let parts = components(name)?;
         if name.ends_with('\\')
             || parts.is_empty()
@@ -1264,7 +1711,7 @@ impl FileSystem for MemoryFs {
             .into_bits();
         if state.opens.values().any(|open| {
             open.node == parent
-                && sharing_conflict(parent_access, ShareAccess::ALL.into_bits(), open)
+                && stream_sharing_conflict(parent_access, ShareAccess::ALL.into_bits(), open, 0)
         }) {
             return Err(Status::SHARING_VIOLATION);
         }
@@ -1328,7 +1775,7 @@ impl FileSystem for MemoryFs {
                 .nodes
                 .remove(&target)
                 .expect("replacement target was validated under the namespace lock");
-            state.bytes -= node.data.len() + node.metadata.extended_attributes_length as usize;
+            state.bytes -= stored_bytes(&node);
         }
         emit(
             &mut state,
@@ -1406,7 +1853,7 @@ impl FileSystem for MemoryFs {
     ) -> Result<Metadata, Status> {
         let state = self.0.lock();
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
-        let mut metadata = node_metadata(&state, file.node)?;
+        let mut metadata = file_metadata(&state, file)?;
         metadata.granted_access = open.access;
         Ok(metadata)
     }
@@ -1431,6 +1878,7 @@ impl FileSystem for MemoryFs {
                 .with_case_preserved_names(true)
                 .with_unicode_on_disk(true)
                 .with_extended_attributes(true)
+                .with_named_streams(true)
                 .into_bits(),
             maximum_component_name_length: MAX_COMPONENT_NAME_LENGTH,
             device_type: FILE_DEVICE_DISK,
@@ -1474,13 +1922,16 @@ impl FileSystem for MemoryFs {
                     .format,
             )),
             FileControl::SetZeroData { offset, end } => {
-                if offset > end || end > i64::MAX as u64 || node.metadata.is_directory() {
+                if offset > end
+                    || end > i64::MAX as u64
+                    || (file.stream == 0 && node.metadata.is_directory())
+                {
                     return Err(Status::INVALID_PARAMETER);
                 }
                 if !access.write_data() {
                     return Err(Status::ACCESS_DENIED);
                 }
-                let end = end.min(node.metadata.size);
+                let end = end.min(stream_data(node, file.stream)?.1);
                 if offset >= end {
                     return Ok(FileControlResult::Done);
                 }
@@ -1499,14 +1950,13 @@ impl FileSystem for MemoryFs {
                 let start = usize::try_from(offset).map_err(|_| Status::INTERNAL_ERROR)?;
                 let end = usize::try_from(end).map_err(|_| Status::INTERNAL_ERROR)?;
                 let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-                node.data
+                stream_data_mut(node, file.stream)?
+                    .0
                     .get_mut(start..end)
                     .ok_or(Status::INTERNAL_ERROR)?
                     .fill(0);
                 modified(&mut state, file)?;
-                let filter = NotifyFilter::new()
-                    .with_last_write(!state.opens[&file.open].user_set_write_time);
-                emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+                data_changed(&mut state, file, false)?;
                 wake(state);
                 Ok(FileControlResult::Done)
             }
@@ -1514,7 +1964,7 @@ impl FileSystem for MemoryFs {
                 range,
                 maximum_ranges,
             } => {
-                if node.metadata.is_directory()
+                if (file.stream == 0 && node.metadata.is_directory())
                     || range
                         .offset
                         .checked_add(range.length)
@@ -1531,7 +1981,7 @@ impl FileSystem for MemoryFs {
                 // Dense streams report the queried range, not zero-content holes
                 // or an EOF-clamped extent (MS-FSCC §2.3.51).
                 Ok(FileControlResult::AllocatedRanges {
-                    ranges: if range.length == 0 || node.data.is_empty() {
+                    ranges: if range.length == 0 || stream_data(node, file.stream)?.0.is_empty() {
                         Vec::new()
                     } else {
                         vec![range]
@@ -1609,7 +2059,7 @@ impl FileSystem for MemoryFs {
         let state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
-        Ok(if node.metadata.is_directory() {
+        let mut streams = if node.metadata.is_directory() {
             Vec::new()
         } else {
             vec![StreamInformation {
@@ -1617,7 +2067,18 @@ impl FileSystem for MemoryFs {
                 size: node.metadata.size,
                 allocation_size: node.metadata.allocation_size,
             }]
-        })
+        };
+        streams.extend(
+            node.streams
+                .values()
+                .filter(|stream| !stream.delete_pending)
+                .map(|stream| StreamInformation {
+                    name: stream.name.clone(),
+                    size: stream.size,
+                    allocation_size: stream.data.len() as u64,
+                }),
+        );
+        Ok(streams)
     }
 
     async fn query_security(
@@ -1747,17 +2208,18 @@ impl FileSystem for MemoryFs {
             .ok_or(Status::FILE_CLOSED)?
             .user_set_access_time;
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-        if node.metadata.is_directory() {
+        if file.stream == 0 && node.metadata.is_directory() {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
-        let file_size = node.metadata.size as usize;
+        let (data, size) = stream_data(node, file.stream)?;
+        let file_size = size as usize;
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(file_size);
         let end = start.saturating_add(length).min(file_size);
+        let data = data[start..end].to_vec();
         let old_accessed = node.metadata.accessed;
         if !user_set_access_time {
             node.metadata.accessed = nt_time();
         }
-        let data = node.data[start..end].to_vec();
         let changed = node.metadata.accessed != old_accessed;
         if changed {
             emit(
@@ -1781,7 +2243,7 @@ impl FileSystem for MemoryFs {
         let mut state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
-        if node.metadata.is_directory() {
+        if file.stream == 0 && node.metadata.is_directory() {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
         if data.is_empty() {
@@ -1801,19 +2263,17 @@ impl FileSystem for MemoryFs {
         }
         let offset = usize::try_from(offset).map_err(|_| Status::DISK_FULL)?;
         let end = offset.checked_add(data.len()).ok_or(Status::DISK_FULL)?;
-        let size_changed = end as u64 > node.metadata.size;
-        if end > node.data.len() {
-            allocate(&mut state, file.node, end)?;
+        let (stored, size) = stream_data(node, file.stream)?;
+        let size_changed = end as u64 > size;
+        if end > stored.len() {
+            allocate_stream(&mut state, file.node, file.stream, end)?;
         }
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-        node.data[offset..end].copy_from_slice(data);
-        node.metadata.size = node.metadata.size.max(end as u64);
+        let (stored, size) = stream_data_mut(node, file.stream)?;
+        stored[offset..end].copy_from_slice(data);
+        *size = (*size).max(end as u64);
         modified(&mut state, file)?;
-        let open = &state.opens[&file.open];
-        let filter = NotifyFilter::new()
-            .with_size(size_changed)
-            .with_last_write(!open.user_set_write_time);
-        emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+        data_changed(&mut state, file, size_changed)?;
         wake(state);
         Ok(data.len())
     }
@@ -1824,12 +2284,13 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<Vec<Metadata>, Status> {
         let state = self.0.lock();
-        if !state
-            .nodes
-            .get(&file.node)
-            .ok_or(Status::FILE_CLOSED)?
-            .metadata
-            .is_directory()
+        if file.stream != 0
+            || !state
+                .nodes
+                .get(&file.node)
+                .ok_or(Status::FILE_CLOSED)?
+                .metadata
+                .is_directory()
         {
             return Err(Status::NOT_A_DIRECTORY);
         }
@@ -1875,7 +2336,7 @@ impl FileSystem for MemoryFs {
             {
                 let mut state = self.0.lock();
                 state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
-                if state.nodes[&file.node].metadata.is_directory() {
+                if file.stream == 0 && state.nodes[&file.node].metadata.is_directory() {
                     return Err(Status::INVALID_PARAMETER);
                 }
                 if request.is_cancelled() {
@@ -1891,6 +2352,7 @@ impl FileSystem for MemoryFs {
                         .checked_add(1)
                         .ok_or(Status::INSUFFICIENT_RESOURCES)?;
                     state.locks.push(RangeLock {
+                        stream: file.stream,
                         id,
                         node: file.node,
                         owner: file.open,
@@ -1946,7 +2408,7 @@ impl FileSystem for MemoryFs {
         range.validate()?;
         let mut state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
-        if state.nodes[&file.node].metadata.is_directory() {
+        if file.stream == 0 && state.nodes[&file.node].metadata.is_directory() {
             return Err(Status::INVALID_PARAMETER);
         }
         let index = state
@@ -1970,26 +2432,25 @@ impl FileSystem for MemoryFs {
     ) -> Result<(), Status> {
         let mut state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
-        if state
-            .nodes
-            .get(&file.node)
-            .ok_or(Status::FILE_CLOSED)?
-            .metadata
-            .is_directory()
+        if file.stream == 0
+            && state
+                .nodes
+                .get(&file.node)
+                .ok_or(Status::FILE_CLOSED)?
+                .metadata
+                .is_directory()
         {
             return Err(Status::FILE_IS_A_DIRECTORY);
         }
-        let size_changed = state.nodes[&file.node].metadata.size != length;
-        resize(
+        let size_changed = stream_data(&state.nodes[&file.node], file.stream)?.1 != length;
+        resize_stream(
             &mut state,
             file.node,
+            file.stream,
             usize::try_from(length).map_err(|_| Status::DISK_FULL)?,
         )?;
         modified(&mut state, file)?;
-        let filter = NotifyFilter::new()
-            .with_size(size_changed)
-            .with_last_write(!state.opens[&file.open].user_set_write_time);
-        emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+        data_changed(&mut state, file, size_changed)?;
         wake(state);
         Ok(())
     }
@@ -2004,19 +2465,16 @@ impl FileSystem for MemoryFs {
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let user_set_change_time = open.user_set_change_time;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
-        if node.metadata.is_directory() {
+        if file.stream == 0 && node.metadata.is_directory() {
             return Err(Status::INVALID_PARAMETER);
         }
-        let before = node.metadata.size;
+        let (data, before) = stream_data(node, file.stream)?;
         let length = usize::try_from(length).map_err(|_| Status::INVALID_PARAMETER)?;
-        let unchanged = node.data.len() == length;
-        allocate(&mut state, file.node, length)?;
-        if state.nodes[&file.node].metadata.size < before {
+        let unchanged = data.len() == length;
+        allocate_stream(&mut state, file.node, file.stream, length)?;
+        if stream_data(&state.nodes[&file.node], file.stream)?.1 < before {
             modified(&mut state, file)?;
-            let filter = NotifyFilter::new()
-                .with_size(true)
-                .with_last_write(!state.opens[&file.open].user_set_write_time);
-            emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+            data_changed(&mut state, file, true)?;
         } else if unchanged {
             let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
             if !user_set_change_time {
@@ -2072,6 +2530,16 @@ impl FileSystem for MemoryFs {
             .metadata;
         if delete && metadata.attributes().readonly() {
             return Err(Status::CANNOT_DELETE);
+        }
+        if file.stream != 0 {
+            state
+                .nodes
+                .get_mut(&file.node)
+                .and_then(|node| node.streams.get_mut(&file.stream))
+                .ok_or(Status::FILE_CLOSED)?
+                .delete_pending = delete;
+            wake(state);
+            return Ok(());
         }
         let directory = metadata.is_directory();
         if delete && (file.node == 1 || has_children(&state, file.node)) {
@@ -2183,12 +2651,13 @@ impl FileSystem for MemoryFs {
     ) -> Result<NotifyResult, Status> {
         let (changed, id, watch_id) = {
             let mut state = self.0.lock();
-            if !state
-                .nodes
-                .get(&file.node)
-                .ok_or(Status::FILE_CLOSED)?
-                .metadata
-                .is_directory()
+            if file.stream != 0
+                || !state
+                    .nodes
+                    .get(&file.node)
+                    .ok_or(Status::FILE_CLOSED)?
+                    .metadata
+                    .is_directory()
             {
                 return Err(Status::INVALID_PARAMETER);
             }
@@ -2468,6 +2937,7 @@ mod tests {
                 creation_eas: Feature::Supported,
                 ea_operations: Feature::Supported,
                 stream_queries: Feature::Supported,
+                named_streams: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -2553,6 +3023,10 @@ mod tests {
     #[test]
     fn contract_stream_information() {
         run_contract(contracts::stream_information);
+    }
+    #[test]
+    fn contract_named_streams() {
+        run_contract(contracts::named_streams);
     }
 
     #[test]

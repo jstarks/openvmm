@@ -149,6 +149,8 @@ pub struct CompressionInformation {
 /// Metadata expressed in Windows file attributes and 100 ns NT timestamps.
 #[derive(Debug, Clone)]
 pub struct Metadata {
+    /// Unqualified named data stream; None for default data/directory opens.
+    pub stream_name: Option<String>,
     /// Stable identity within this provider.
     pub id: u64,
     /// Opaque stable 128-bit volume-scoped file identity, when supported.
@@ -171,9 +173,9 @@ pub struct Metadata {
     pub written: u64,
     /// Last metadata change time.
     pub changed: u64,
-    /// Logical length of the default data stream.
+    /// Logical length of the opened stream.
     pub size: u64,
-    /// Space allocated to the default stream, independent of logical length.
+    /// Space allocated to the opened stream, independent of logical length.
     pub allocation_size: u64,
     /// Actual compression metadata; None explicitly declines compression queries.
     pub compression: Option<CompressionInformation>,
@@ -195,9 +197,9 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Whether this object is a directory.
+    /// Whether this open addresses a directory namespace rather than a data stream.
     pub fn is_directory(&self) -> bool {
-        self.attributes().directory()
+        self.attributes().directory() && self.stream_name.is_none()
     }
 
     /// Decoded DOS attributes, preserving unknown bits.

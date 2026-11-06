@@ -33,6 +33,8 @@ const CAPACITY: usize = 256;
 pub enum Operation {
     /// Open/create.
     Open,
+    /// Open a stream-qualified path.
+    OpenStream,
     /// Open with an atomic creation security descriptor.
     OpenSecurity,
     /// Open with an atomic creation EA list.
@@ -725,6 +727,8 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
                 Operation::OpenSecurity
             } else if options.extended_attributes.is_some() {
                 Operation::OpenExtendedAttributes
+            } else if name.contains(':') {
+                Operation::OpenStream
             } else {
                 Operation::Open
             },

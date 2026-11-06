@@ -459,6 +459,194 @@ fn stream_output_preserves_provider_sizes_unicode_and_record_boundaries() {
 }
 
 #[test]
+fn named_streams_keep_data_allocation_and_locks_separate_and_work_on_directories() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let base = client.open("streams", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(base, 0, b"base"))
+            .await;
+        let named = client.open("streams:meta:$DATA", 3, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(named, 0, b"side"))
+            .await;
+        assert_eq!(&client.read(base, 0, 4).await[80..], b"base");
+        assert_eq!(&client.read(named, 0, 4).await[80..], b"side");
+        assert_eq!(
+            response_status(&client.set(named, 20, &2i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.set(named, 19, &8i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        let info = client.query(named, 5).await;
+        assert_eq!(&info[72..80], &8u64.to_le_bytes());
+        assert_eq!(&info[80..88], &2u64.to_le_bytes());
+        let alias = client.open("streams:MeTa", 1, 0).await;
+        assert_eq!(&client.read(alias, 0, 4).await[80..], b"si");
+        assert_eq!(
+            &client.query(alias, 6).await[72..],
+            &client.query(base, 6).await[72..]
+        );
+        let default = client.open("streams::$DATA", 1, 0).await;
+        assert_eq!(&client.read(default, 0, 4).await[80..], b"base");
+        let flags = LockFlags::new()
+            .with_exclusive_lock(true)
+            .with_fail_immediately(true);
+        client
+            .ok(Command::LOCK, &locking::body(named, &[(0, 2, flags)]))
+            .await;
+        client
+            .ok(Command::WRITE, &Client::write_body(base, 0, b"B"))
+            .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::WRITE, &Client::write_body(alias, 0, b"X"))
+                    .await
+            ),
+            Status::FILE_LOCK_CONFLICT,
+        );
+        client
+            .ok(
+                Command::LOCK,
+                &locking::body(named, &[(0, 2, LockFlags::new().with_unlock(true))]),
+            )
+            .await;
+        let mut zero = IoctlRequest::new_zeroed();
+        zero.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+        zero.file_id = named;
+        zero.control_code = FsctlCode::SET_ZERO_DATA.0.into();
+        zero.flags = IoctlFlags::new().with_fsctl(true);
+        zero.input_offset = 120.into();
+        zero.input_count = 16.into();
+        let mut bytes = zero.as_bytes().to_vec();
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        client.ok(Command::IOCTL, &bytes).await;
+        assert_eq!(&client.read(named, 0, 4).await[80..], b"s\0");
+        assert_eq!(&client.read(base, 0, 4).await[80..], b"Base");
+        let directory = client.open("folder", 2, 1).await;
+        let data = client.open("folder:payload", 3, 0).await;
+        client
+            .ok(
+                Command::WRITE,
+                &Client::write_body(data, 0, b"directory-data"),
+            )
+            .await;
+        assert_eq!(&client.read(data, 0, 32).await[80..], b"directory-data");
+        assert_eq!(client.query(data, 5).await[93], 0);
+        for file in [data, directory, alias, named, default, base] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn named_stream_creation_is_atomic_under_byte_and_object_limits() {
+    block_on(async {
+        for (bytes, objects) in [(32usize, 32usize), (1024, 2)] {
+            let server = Server::new("memory", MemoryFs::new(bytes, objects)).unwrap();
+            let mut client = Client::new(&server).await;
+            let base = client.open("base", 2, 0).await;
+            client
+                .ok(Command::WRITE, &Client::write_body(base, 0, b"base"))
+                .await;
+            let mut extra = Vec::new();
+            let mut last = None;
+            append_create_context(
+                &mut extra,
+                &mut last,
+                CreateContextName::ALLOCATION_SIZE,
+                &40u64.to_le_bytes(),
+            );
+            for name in ["base:side", "absent:side"] {
+                let body = create_body(name, 0x1f01ff, 7, 2, 0, &extra);
+                assert_eq!(
+                    response_status(&client.send(Command::CREATE, &body).await),
+                    Status::DISK_FULL
+                );
+                assert_eq!(
+                    response_status(&client.open_result(name, 1, 7, 1, 0).await),
+                    Status::OBJECT_NAME_NOT_FOUND
+                );
+            }
+            assert_eq!(
+                response_status(&client.open_result("absent", 1, 7, 1, 0).await),
+                Status::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(&client.read(base, 0, 4).await[80..], b"base");
+            client.close(base).await;
+        }
+    });
+}
+
+#[test]
+fn named_stream_opens_do_not_require_the_base_files_ea_knowledge() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let mut extra = Vec::new();
+        let mut last = None;
+        append_create_context(
+            &mut extra,
+            &mut last,
+            CreateContextName::EA_BUFFER,
+            &[0, 0, 0, 0, 128, 1, 1, 0, b'A', 0, b'v'],
+        );
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body("knowledge", 0x1f01ff, 7, 2, 0, &extra),
+            )
+            .await;
+        let base = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let response = client.open_result("knowledge:side", 1, 7, 3, 0x200).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let named = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client.close(named).await;
+        assert_eq!(
+            response_status(&client.open_result("knowledge", 1, 7, 1, 0x200).await),
+            Status::ACCESS_DENIED
+        );
+        client.close(base).await;
+    });
+}
+
+#[test]
+fn readonly_files_reject_named_stream_delete_on_close() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let base = client.open("readonly-stream", 2, 0).await;
+        let named = client.open("readonly-stream:side", 3, 0).await;
+        client.close(named).await;
+        let mut basic = [0; 40];
+        basic[32] = 1;
+        assert_eq!(
+            response_status(&client.set(base, 4, &basic).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .open_result("readonly-stream:side", 1, 7, 1, 0x1000)
+                    .await
+            ),
+            Status::CANNOT_DELETE
+        );
+        let response = client.open_result("readonly-stream:side", 1, 7, 1, 0).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        client
+            .close(read_body::<CreateResponse>(&response).unwrap().file_id)
+            .await;
+        client.close(base).await;
+    });
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
@@ -688,6 +876,7 @@ fn embedded_bitfields_decode_unaligned_create_and_preserve_unknown_bits() {
 #[test]
 fn directory_formats_match_independent_byte_layouts() {
     let info = Metadata {
+        stream_name: None,
         id: 0x0807_0605_0403_0201,
         id128: Some([0xA5; 16]),
         name: "a\u{100}".into(),
@@ -925,7 +1114,7 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
             (
                 FileSystemInformationClass::ATTRIBUTE,
                 vec![
-                    6, 0, 128, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
+                    6, 0, 132, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
                     b'R', 0, b'Y', 0,
                 ],
             ),

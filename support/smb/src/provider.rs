@@ -322,6 +322,24 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         length: u64,
         request: &RequestContext,
     ) -> Result<(), Status>;
+    /// Reserve allocation without extending EOF; smaller reservations may truncate it.
+    async fn set_allocation_size(
+        &self,
+        _file: &Self::File,
+        _length: u64,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+    /// Update per-open mode and return the applied mode, retaining immutable flags.
+    async fn set_mode(
+        &self,
+        _file: &Self::File,
+        _mode: u32,
+        _request: &RequestContext,
+    ) -> Result<u32, Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
     /// Set or clear the object's shared delete disposition through this open.
     /// This does not change CREATE's per-open FILE_DELETE_ON_CLOSE mode.
     async fn set_delete_on_close(

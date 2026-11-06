@@ -46,6 +46,10 @@ pub enum Operation {
     List,
     /// Length change.
     SetLen,
+    /// Allocation reservation or truncation.
+    SetAllocationSize,
+    /// Per-open I/O mode change.
+    SetMode,
     /// Shared delete-disposition change.
     SetDeleteOnClose,
     /// Basic metadata change.
@@ -839,6 +843,42 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         )?;
         let context = call.prepare().await?;
         let result = self.backend.set_len(&file.inner, length, &context).await;
+        call.complete(result, None).await
+    }
+
+    async fn set_allocation_size(
+        &self,
+        file: &Self::File,
+        length: u64,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call = self.controller.begin(
+            Operation::SetAllocationSize,
+            Some(file.id),
+            None,
+            None,
+            Some(length),
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .set_allocation_size(&file.inner, length, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn set_mode(
+        &self,
+        file: &Self::File,
+        mode: u32,
+        r: &RequestContext,
+    ) -> Result<u32, Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::SetMode, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self.backend.set_mode(&file.inner, mode, &context).await;
         call.complete(result, None).await
     }
 

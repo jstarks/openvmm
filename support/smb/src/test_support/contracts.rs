@@ -39,6 +39,10 @@ pub enum Feature {
 pub struct Expectations {
     /// Volume identity, capability and capacity snapshots.
     pub filesystem_information: Feature,
+    /// Allocation reservations, including zero-size truncation.
+    pub allocation: Feature,
+    /// Per-open I/O mode updates.
+    pub file_mode: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -222,6 +226,81 @@ pub async fn filesystem_information<F: Fixture>(fixture: &F) {
         fs.close(&file, &request).await.unwrap();
     }
     fs.close(&root, &request).await.unwrap();
+}
+
+/// Allocation reserves space without extending EOF; writes in that space
+/// expose zero-filled gaps and allocation zero truncates the stream.
+pub async fn allocation_reservations<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "reserved", CreateDisposition::CREATE, false, &request).await;
+    write_all(fs, &file, 0, b"data", &request).await;
+    if let Some(status) = unsupported(fixture.expectations().allocation) {
+        rejected(fs.set_allocation_size(&file, 32, &request).await, status);
+    } else {
+        fs.set_allocation_size(&file, 32, &request).await.unwrap();
+        let info = fs.metadata(&file, &request).await.unwrap();
+        assert_eq!(info.size, 4);
+        assert!(info.allocation_size >= 32);
+        match fs.read(&file, 4, 1, &request).await {
+            Ok(data) => assert!(data.is_empty()),
+            Err(status) => assert_eq!(status, Status::END_OF_FILE),
+        }
+        fs.set_len(&file, 8, &request).await.unwrap();
+        assert!(fs.metadata(&file, &request).await.unwrap().allocation_size >= 32);
+        write_all(fs, &file, 16, b"x", &request).await;
+        assert_eq!(fs.metadata(&file, &request).await.unwrap().size, 17);
+        assert_eq!(
+            read_bytes(fs, &file, 4, 13, &request).await,
+            b"\0\0\0\0\0\0\0\0\0\0\0\0x"
+        );
+        fs.set_allocation_size(&file, 0, &request).await.unwrap();
+        let info = fs.metadata(&file, &request).await.unwrap();
+        assert_eq!((info.size, info.allocation_size), (0, 0));
+    }
+    fs.close(&file, &request).await.unwrap();
+}
+
+/// Mode changes retain immutable buffering/write-through state and cannot
+/// change whether an open is synchronous.
+pub async fn file_mode_updates<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "mode", CreateDisposition::CREATE, false, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().file_mode) {
+        rejected(fs.set_mode(&file, 6, &request).await, status);
+    } else {
+        assert_eq!(fs.set_mode(&file, 6, &request).await.unwrap(), 6);
+        for mode in [8, 0x10, 0x20, 0x1000, u32::MAX] {
+            rejected(
+                fs.set_mode(&file, mode, &request).await,
+                Status::INVALID_PARAMETER,
+            );
+        }
+        assert_eq!(fs.set_mode(&file, 0, &request).await.unwrap(), 0);
+        for (name, initial, applied) in
+            [("unbuffered", 8, 12), ("through", 10, 14), ("sync", 16, 32)]
+        {
+            let (other, _) = fs
+                .open(
+                    name,
+                    OpenOptions {
+                        access: AccessMask::FILE_ALL_ACCESS
+                            .with_append_data(false)
+                            .into_bits(),
+                        options: initial,
+                        ..options(CreateDisposition::CREATE, false)
+                    },
+                    &request,
+                )
+                .await
+                .unwrap();
+            let mode = if initial == 16 { 32 } else { 6 };
+            assert_eq!(fs.set_mode(&other, mode, &request).await.unwrap(), applied);
+            fs.close(&other, &request).await.unwrap();
+        }
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 async fn rejected_lock<B: FileSystem>(

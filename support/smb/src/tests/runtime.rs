@@ -74,6 +74,8 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::Flush,
             Operation::List,
             Operation::SetLen,
+            Operation::SetAllocationSize,
+            Operation::SetMode,
             Operation::SetDeleteOnClose,
             Operation::SetBasic,
             Operation::Rename,
@@ -130,6 +132,27 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             6
         );
         through_gates(fs.set_len(&file, 3, &context), &control, Operation::SetLen).await;
+        through_gates(
+            fs.set_allocation_size(&file, 32, &context),
+            &control,
+            Operation::SetAllocationSize,
+        )
+        .await;
+        assert_eq!(
+            through_gates(
+                fs.set_mode(&file, 6, &context),
+                &control,
+                Operation::SetMode
+            )
+            .await,
+            6
+        );
+        through_gates(
+            fs.set_allocation_size(&file, 3, &context),
+            &control,
+            Operation::SetAllocationSize,
+        )
+        .await;
         assert_eq!(
             through_gates(fs.read(&file, 0, 6, &context), &control, Operation::Read).await,
             b"abc"
@@ -229,6 +252,104 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         assert_eq!(ids.len(), calls.len());
         let kinds: BTreeSet<_> = calls.iter().map(|call| call.operation).collect();
         assert_eq!(kinds, operations.into_iter().collect());
+    });
+}
+
+#[test]
+fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
+    block_on(async {
+        for operation in [Operation::SetAllocationSize, Operation::SetMode] {
+            for after in [false, true] {
+                let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+                control
+                    .set_plan(
+                        operation,
+                        Plan {
+                            hold_before: !after,
+                            hold_after: after,
+                            ..Plan::default()
+                        },
+                    )
+                    .unwrap();
+                let server = Server::new("memory", fs).unwrap();
+                let mut client = Client::new(&server).await;
+                let file = client.open("update", 2, 0).await;
+                let opened = client.connection.state.lock().files[&file.volatile.get()].clone();
+                let data = if operation == Operation::SetMode {
+                    6u32.to_le_bytes().to_vec()
+                } else {
+                    32i64.to_le_bytes().to_vec()
+                };
+                let mut body = SetInfoRequest::new_zeroed();
+                body.structure_size = SetInfoRequest::STRUCTURE_SIZE.into();
+                body.info_type = InformationType::FILE;
+                body.info_class = if operation == Operation::SetMode {
+                    16
+                } else {
+                    19
+                };
+                body.file_id = file;
+                body.buffer_offset = (body_end::<SetInfoRequest>() as u16).into();
+                body.buffer_length = (data.len() as u32).into();
+                let mut bytes = body.as_bytes().to_vec();
+                bytes.extend(data);
+                let packet = request(
+                    Command::SET_INFO,
+                    &bytes,
+                    client.session,
+                    client.tree,
+                    client.message,
+                );
+                client.message += 1;
+                let mut updating =
+                    std::pin::pin!(client.connection.request(packet).unwrap().execute());
+                assert!(futures::poll!(&mut updating).is_pending());
+                let call = control.next_call().await;
+                assert_eq!(call.operation, operation);
+                assert_eq!(control.snapshot(call.id).unwrap().delegated, after);
+                let mut body = CloseRequest::new_zeroed();
+                body.structure_size = CloseRequest::STRUCTURE_SIZE.into();
+                body.file_id = file;
+                let packet = request(
+                    Command::CLOSE,
+                    body.as_bytes(),
+                    client.session,
+                    client.tree,
+                    client.message,
+                );
+                client.message += 1;
+                let mut closing =
+                    std::pin::pin!(client.connection.request(packet).unwrap().execute());
+                assert!(futures::poll!(&mut closing).is_pending());
+                if after {
+                    control.release(call.id, Gate::After).unwrap();
+                }
+                assert_eq!(
+                    response_status(&updating.await.unwrap()),
+                    if after {
+                        Status::SUCCESS
+                    } else {
+                        Status::CANCELLED
+                    }
+                );
+                assert_eq!(response_status(&closing.await.unwrap()), Status::SUCCESS);
+                assert!(control.snapshot(call.id).unwrap().cancel_requested);
+                if operation == Operation::SetMode {
+                    assert_eq!(
+                        opened.mode.load(Ordering::Relaxed),
+                        if after { 6 } else { 0 }
+                    );
+                } else {
+                    let reopened = client.open("update", 1, 0).await;
+                    let response = client.query(reopened, 5).await;
+                    assert_eq!(
+                        &response[72..80],
+                        &(if after { 32u64 } else { 0 }).to_le_bytes()
+                    );
+                    client.close(reopened).await;
+                }
+            }
+        }
     });
 }
 

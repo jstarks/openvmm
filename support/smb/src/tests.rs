@@ -234,6 +234,153 @@ mod runtime;
 mod wire;
 
 #[test]
+fn allocation_reservation_and_mode_updates_preserve_their_distinct_state() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("reserved", 2, 0).await;
+        assert_eq!(
+            response_status(&client.set(file, 20, &4i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.set(file, 19, &32i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        let standard = client.query(file, 5).await;
+        assert_eq!(&standard[72..80], &32u64.to_le_bytes());
+        assert_eq!(&standard[80..88], &4u64.to_le_bytes());
+        assert_eq!(
+            response_status(&client.read(file, 4, 1).await),
+            Status::END_OF_FILE
+        );
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 16, b"x"))
+            .await;
+        let standard = client.query(file, 5).await;
+        assert_eq!(&standard[72..80], &32u64.to_le_bytes());
+        assert_eq!(&standard[80..88], &17u64.to_le_bytes());
+        let response = client.read(file, 4, 13).await;
+        assert_eq!(&response[80..], b"\0\0\0\0\0\0\0\0\0\0\0\0x");
+        assert_eq!(
+            response_status(&client.set(file, 19, &0i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.query(file, 5).await[72..88], &[0; 16]);
+        assert_eq!(
+            response_status(&client.set(file, 16, &6u32.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.query(file, 16).await[72..], &6u32.to_le_bytes());
+        for value in [8u32, 0x10, 0x20, 0x30, 0x1000, u32::MAX] {
+            assert_eq!(
+                response_status(&client.set(file, 16, &value.to_le_bytes()).await),
+                Status::INVALID_PARAMETER
+            );
+        }
+        assert_eq!(&client.query(file, 16).await[72..], &6u32.to_le_bytes());
+        assert_eq!(
+            response_status(&client.set(file, 19, &(-1i64).to_le_bytes()).await),
+            Status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            response_status(&client.set(file, 19, &[0; 7]).await),
+            Status::INFO_LENGTH_MISMATCH
+        );
+        assert_eq!(
+            response_status(&client.set(file, 16, &[0; 3]).await),
+            Status::INFO_LENGTH_MISMATCH
+        );
+        assert_eq!(
+            response_status(&client.set(file, 14, &123i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.query(file, 14).await[72..], &123i64.to_le_bytes());
+        assert_eq!(
+            &client.query(file, 18).await[152..160],
+            &123i64.to_le_bytes()
+        );
+        assert_eq!(
+            response_status(&client.set(file, 14, &(-1i64).to_le_bytes()).await),
+            Status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            response_status(&client.set(file, 14, &[0; 7]).await),
+            Status::INFO_LENGTH_MISMATCH
+        );
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"data"))
+            .await;
+        assert_eq!(&client.query(file, 14).await[72..], &123i64.to_le_bytes());
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn allocation_reservations_consume_quota_and_failed_growth_is_atomic() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(32, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let first = client.open("first", 2, 0).await;
+        let second = client.open("second", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(first, 0, b"data"))
+            .await;
+        assert_eq!(
+            response_status(&client.set(first, 19, &32i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.set(first, 19, &64i64.to_le_bytes()).await),
+            Status::DISK_FULL
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::WRITE, &Client::write_body(second, 0, b"x"))
+                    .await
+            ),
+            Status::DISK_FULL
+        );
+        let response = client.query(first, 5).await;
+        assert_eq!(&response[72..80], &32u64.to_le_bytes());
+        assert_eq!(&response[80..88], &4u64.to_le_bytes());
+        assert_eq!(&client.read(first, 0, 4).await[80..], b"data");
+        assert_eq!(
+            response_status(&client.set(first, 19, &2i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.read(first, 0, 4).await[80..], b"da");
+        client
+            .ok(Command::WRITE, &Client::write_body(second, 0, b"now fits"))
+            .await;
+        let response = client
+            .open_result(
+                "read-only",
+                AccessMask::FILE_GENERIC_READ.into_bits(),
+                7,
+                2,
+                0,
+            )
+            .await;
+        let read_only = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(&client.set(read_only, 19, &1i64.to_le_bytes()).await),
+            Status::ACCESS_DENIED
+        );
+        let directory = client.open("directory", 2, 1).await;
+        assert_eq!(
+            response_status(&client.set(directory, 19, &0i64.to_le_bytes()).await),
+            Status::INVALID_PARAMETER
+        );
+        client.close(directory).await;
+        client.close(read_only).await;
+        client.close(second).await;
+        client.close(first).await;
+    });
+}
+
+#[test]
 fn file_metadata_queries_use_open_mode_and_complete_namespace_paths() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
@@ -346,6 +493,13 @@ fn file_mode_ignores_remote_sync_flags_and_unbuffered_access_excludes_append() {
                 .with_append_data(append)
                 .into_bits();
             assert_eq!(&client.query(file, 8).await[72..], &expected.to_le_bytes());
+            if options == 8 {
+                assert_eq!(
+                    response_status(&client.set(file, 14, &1i64.to_le_bytes()).await),
+                    Status::SUCCESS
+                );
+                assert_eq!(&client.query(file, 14).await[72..], &1i64.to_le_bytes());
+            }
             client.close(file).await;
         }
         let response = client
@@ -575,6 +729,13 @@ fn filesystem_queries_propagate_provider_rejection_without_memory_fallback() {
             let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
             assert_eq!(response_status(&response), status);
         }
+        let unbuffered = client.open("unbuffered", 2, 8).await;
+        assert_eq!(
+            response_status(&client.set(unbuffered, 14, &1i64.to_le_bytes()).await),
+            Status::NOT_SUPPORTED
+        );
+        assert_eq!(&client.query(unbuffered, 14).await[72..], &[0; 8]);
+        client.close(unbuffered).await;
         client.close(root).await;
     });
 }

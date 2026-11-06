@@ -32,7 +32,7 @@ use provider::{
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use thiserror::Error;
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
@@ -140,10 +140,10 @@ struct OpenFile<F> {
     file: F,
     identity: u64,
     access: AccessMask,
-    mode: u32,
+    mode: AtomicU32,
     is_directory: bool,
     tree: u32,
-    position: u64,
+    position: AtomicI64,
     directory: Mutex<Option<(Vec<Metadata>, usize)>>,
     closing: AtomicBool,
     closed: AtomicBool,
@@ -383,6 +383,8 @@ impl<F> Inspect for OpenFile<F> {
         req.respond()
             .field("identity", self.identity)
             .hex("access", self.access.into_bits())
+            .hex("mode", self.mode.load(Ordering::Relaxed))
+            .field("position", self.position.load(Ordering::Relaxed))
             .field("is_directory", self.is_directory)
             .field("tree", self.tree)
             .field("closing", self.closing.load(Ordering::Acquire))
@@ -1864,10 +1866,10 @@ impl<B: FileSystem> Connection<B> {
             file,
             identity: info.id,
             access,
-            mode: options.into_bits() & FILE_MODE_INFORMATION_MASK,
+            mode: AtomicU32::new(options.into_bits() & FILE_MODE_INFORMATION_MASK),
             is_directory: info.is_directory(),
             tree,
-            position: 0,
+            position: AtomicI64::new(0),
             directory: Mutex::new(None),
             closing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -2135,7 +2137,7 @@ impl<B: FileSystem> Connection<B> {
                 .to_vec()
             } else {
                 FileModeInformation {
-                    mode: file.mode.into(),
+                    mode: file.mode.load(Ordering::Relaxed).into(),
                 }
                 .as_bytes()
                 .to_vec()
@@ -2198,7 +2200,7 @@ impl<B: FileSystem> Connection<B> {
                 }
                 FileInformationClass::POSITION => out.extend_from_slice(
                     FilePositionInformation {
-                        current_byte_offset: file.position.into(),
+                        current_byte_offset: file.position.load(Ordering::Relaxed).into(),
                     }
                     .as_bytes(),
                 ),
@@ -2214,9 +2216,9 @@ impl<B: FileSystem> Connection<B> {
                             ea_size: ea_size(&info)?.into(),
                             access_flags: file.access,
                             position: FilePositionInformation {
-                                current_byte_offset: file.position.into(),
+                                current_byte_offset: file.position.load(Ordering::Relaxed).into(),
                             },
-                            mode: file.mode.into(),
+                            mode: file.mode.load(Ordering::Relaxed).into(),
                             alignment_requirement: info.alignment_requirement.into(),
                             name: FileNameInformation {
                                 file_name_length: (name.len() as u32).into(),
@@ -2268,7 +2270,8 @@ impl<B: FileSystem> Connection<B> {
             request.buffer_length.get() as usize,
         )?;
         let file = self.file(request.file_id, tree, context)?;
-        match (request.info_type, FileInformationClass(request.info_class)) {
+        let class = FileInformationClass(request.info_class);
+        match (request.info_type, class) {
             (InformationType::FILE, FileInformationClass::RENAME) => {
                 if data.len() < FILE_RENAME_INFORMATION_MIN_SIZE {
                     return Err(Status::INFO_LENGTH_MISMATCH);
@@ -2313,21 +2316,61 @@ impl<B: FileSystem> Connection<B> {
                     )
                     .await?;
             }
-            (InformationType::FILE, FileInformationClass::END_OF_FILE)
-                if data.len() == size_of::<FileEndOfFileInformation>() =>
-            {
+            (
+                InformationType::FILE,
+                FileInformationClass::ALLOCATION | FileInformationClass::END_OF_FILE,
+            ) => {
+                let length = if class == FileInformationClass::ALLOCATION {
+                    FileAllocationInformation::read_from_prefix(data)
+                        .map_err(|_| Status::INFO_LENGTH_MISMATCH)?
+                        .0
+                        .allocation_size
+                        .get()
+                } else {
+                    FileEndOfFileInformation::read_from_prefix(data)
+                        .map_err(|_| Status::INFO_LENGTH_MISMATCH)?
+                        .0
+                        .end_of_file
+                        .get()
+                };
                 if !file.access.write_data() {
                     return Err(Status::ACCESS_DENIED);
                 }
-                let length = FileEndOfFileInformation::read_from_bytes(data)
-                    .map_err(|_| Status::INVALID_PARAMETER)?
-                    .end_of_file
-                    .get();
                 let length = u64::try_from(length).map_err(|_| Status::INVALID_PARAMETER)?;
-                self.server
+                if class == FileInformationClass::ALLOCATION {
+                    self.server
+                        .backend
+                        .set_allocation_size(&file.file, length, context)
+                        .await?;
+                } else {
+                    self.server
+                        .backend
+                        .set_len(&file.file, length, context)
+                        .await?;
+                }
+            }
+            (InformationType::FILE, FileInformationClass::MODE) => {
+                let mode = FileModeInformation::read_from_prefix(data)
+                    .map_err(|_| Status::INFO_LENGTH_MISMATCH)?
+                    .0
+                    .mode
+                    .get();
+                let flags = CreateOptions::from_bits(mode);
+                if mode & !FILE_MODE_INFORMATION_SET_MASK != 0
+                    || flags.synchronous_io_alert()
+                    || flags.synchronous_io_nonalert()
+                {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                let applied = self
+                    .server
                     .backend
-                    .set_len(&file.file, length, context)
+                    .set_mode(&file.file, mode, context)
                     .await?;
+                if applied & !FILE_MODE_INFORMATION_MASK != 0 {
+                    return Err(Status::INTERNAL_ERROR);
+                }
+                file.mode.store(applied, Ordering::Relaxed);
             }
             (InformationType::FILE, FileInformationClass::DISPOSITION) if !data.is_empty() => {
                 if !file.access.delete() {
@@ -2346,10 +2389,31 @@ impl<B: FileSystem> Connection<B> {
                     )
                     .await?;
             }
-            (InformationType::FILE, FileInformationClass::POSITION)
-                if data.len() == size_of::<FilePositionInformation>() =>
-            {
-                return Err(Status::NOT_SUPPORTED);
+            (InformationType::FILE, FileInformationClass::POSITION) => {
+                let position = FilePositionInformation::read_from_prefix(data)
+                    .map_err(|_| Status::INFO_LENGTH_MISMATCH)?
+                    .0
+                    .current_byte_offset
+                    .get();
+                if position < 0 {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                if CreateOptions::from_bits(file.mode.load(Ordering::Relaxed))
+                    .no_intermediate_buffering()
+                {
+                    let volume = self
+                        .server
+                        .backend
+                        .filesystem_information(&file.file, context)
+                        .await?;
+                    if volume.bytes_per_sector == 0 {
+                        return Err(Status::INTERNAL_ERROR);
+                    }
+                    if !(position as u64).is_multiple_of(u64::from(volume.bytes_per_sector)) {
+                        return Err(Status::INVALID_PARAMETER);
+                    }
+                }
+                file.position.store(position, Ordering::Relaxed);
             }
             _ => return Err(Status::NOT_SUPPORTED),
         }

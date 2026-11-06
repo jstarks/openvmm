@@ -8,7 +8,8 @@ use crate::provider::{
     NotifyResult, OpenOptions, RequestContext,
 };
 use crate::spec::{
-    AccessMask, CreateAction, CreateDisposition, FILE_DEVICE_DISK, FileAttributes,
+    AccessMask, CreateAction, CreateDisposition, CreateOptions, FILE_DEVICE_DISK,
+    FILE_MODE_INFORMATION_MASK, FILE_MODE_INFORMATION_SET_MASK, FileAttributes,
     FileSystemAttributes, MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter,
     ShareAccess, Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
@@ -42,6 +43,7 @@ struct Open {
     access: u32,
     sharing: u32,
     delete_on_close: bool,
+    mode: u32,
     user_set_access_time: bool,
     user_set_write_time: bool,
     user_set_change_time: bool,
@@ -367,7 +369,7 @@ fn share_categories(access: u32) -> u32 {
         .into_bits()
 }
 
-fn resize(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
+fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
     let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
     let old_len = node.data.len();
     let new_bytes = state
@@ -387,9 +389,26 @@ fn resize(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> 
     if length < old_len {
         node.data.shrink_to_fit();
     }
-    node.metadata.size = length as u64;
+    node.metadata.size = node.metadata.size.min(length as u64);
     node.metadata.allocation_size = length as u64;
     state.bytes = new_bytes;
+    Ok(())
+}
+
+fn resize(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
+    let node = state.nodes.get(&node_id).ok_or(Status::FILE_CLOSED)?;
+    let allocation = if length as u64 >= node.metadata.size {
+        node.data.len().max(length)
+    } else {
+        length
+    };
+    allocate(state, node_id, allocation)?;
+    state
+        .nodes
+        .get_mut(&node_id)
+        .ok_or(Status::FILE_CLOSED)?
+        .metadata
+        .size = length as u64;
     Ok(())
 }
 
@@ -612,7 +631,7 @@ impl FileSystem for MemoryFs {
                     return Err(Status::ACCESS_DENIED);
                 }
                 let size_changed = node.metadata.size != 0;
-                resize(&mut state, id, 0)?;
+                allocate(&mut state, id, 0)?;
                 let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
                 node.metadata.written = nt_time();
                 node.metadata.changed = node.metadata.written;
@@ -699,6 +718,7 @@ impl FileSystem for MemoryFs {
                 access: options.access,
                 sharing: options.share_access,
                 delete_on_close: delete,
+                mode: options.options & FILE_MODE_INFORMATION_MASK,
                 user_set_access_time: false,
                 user_set_write_time: false,
                 user_set_change_time: false,
@@ -953,10 +973,9 @@ impl FileSystem for MemoryFs {
         if node.metadata.is_directory() {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(node.data.len());
-        let end = start.saturating_add(length).min(node.data.len());
+        let file_size = node.metadata.size as usize;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(file_size);
+        let end = start.saturating_add(length).min(file_size);
         let old_accessed = node.metadata.accessed;
         if !user_set_access_time {
             node.metadata.accessed = nt_time();
@@ -1005,12 +1024,13 @@ impl FileSystem for MemoryFs {
         }
         let offset = usize::try_from(offset).map_err(|_| Status::DISK_FULL)?;
         let end = offset.checked_add(data.len()).ok_or(Status::DISK_FULL)?;
-        let size_changed = end > node.data.len();
-        if size_changed {
-            resize(&mut state, file.node, end)?;
+        let size_changed = end as u64 > node.metadata.size;
+        if end > node.data.len() {
+            allocate(&mut state, file.node, end)?;
         }
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         node.data[offset..end].copy_from_slice(data);
+        node.metadata.size = node.metadata.size.max(end as u64);
         modified(&mut state, file)?;
         let open = &state.opens[&file.open];
         let filter = NotifyFilter::new()
@@ -1195,6 +1215,69 @@ impl FileSystem for MemoryFs {
         emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
         wake(state);
         Ok(())
+    }
+
+    async fn set_allocation_size(
+        &self,
+        file: &MemoryFile,
+        length: u64,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let user_set_change_time = open.user_set_change_time;
+        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        if node.metadata.is_directory() {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let before = node.metadata.size;
+        let length = usize::try_from(length).map_err(|_| Status::INVALID_PARAMETER)?;
+        let unchanged = node.data.len() == length;
+        allocate(&mut state, file.node, length)?;
+        if state.nodes[&file.node].metadata.size < before {
+            modified(&mut state, file)?;
+            let filter = NotifyFilter::new()
+                .with_size(true)
+                .with_last_write(!state.opens[&file.open].user_set_write_time);
+            emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+        } else if unchanged {
+            let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+            if !user_set_change_time {
+                node.metadata.changed = nt_time();
+            }
+            node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+        }
+        wake(state);
+        Ok(())
+    }
+
+    async fn set_mode(
+        &self,
+        file: &MemoryFile,
+        mode: u32,
+        _request: &RequestContext,
+    ) -> Result<u32, Status> {
+        let mut state = self.0.lock();
+        let open = state.opens.get_mut(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let old = CreateOptions::from_bits(open.mode);
+        let new = CreateOptions::from_bits(mode);
+        let was_sync = old.synchronous_io_alert() || old.synchronous_io_nonalert();
+        let is_sync = new.synchronous_io_alert() || new.synchronous_io_nonalert();
+        if mode & !FILE_MODE_INFORMATION_SET_MASK != 0
+            || was_sync != is_sync
+            || (new.synchronous_io_alert() && new.synchronous_io_nonalert())
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let mut applied = old
+            .with_sequential_only(new.sequential_only())
+            .with_synchronous_io_alert(new.synchronous_io_alert())
+            .with_synchronous_io_nonalert(new.synchronous_io_nonalert());
+        if !old.no_intermediate_buffering() {
+            applied.set_write_through(new.write_through());
+        }
+        open.mode = applied.into_bits();
+        Ok(open.mode)
     }
 
     async fn set_delete_on_close(
@@ -1432,6 +1515,8 @@ mod tests {
         fn expectations(&self) -> Expectations {
             Expectations {
                 filesystem_information: Feature::Supported,
+                allocation: Feature::Supported,
+                file_mode: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -1474,6 +1559,16 @@ mod tests {
     #[test]
     fn contract_filesystem_information() {
         run_contract(contracts::filesystem_information);
+    }
+
+    #[test]
+    fn contract_allocation_reservations() {
+        run_contract(contracts::allocation_reservations);
+    }
+
+    #[test]
+    fn contract_file_mode_updates() {
+        run_contract(contracts::file_mode_updates);
     }
 
     #[test]

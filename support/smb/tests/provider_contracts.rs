@@ -26,6 +26,8 @@ impl Fixture for MemoryFixture {
     fn expectations(&self) -> Expectations {
         Expectations {
             filesystem_information: Feature::Supported,
+            allocation: Feature::Supported,
+            file_mode: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -51,6 +53,8 @@ impl ControlledFixture {
         let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 32));
         for operation in [
             Operation::FileSystemInformation,
+            Operation::SetAllocationSize,
+            Operation::SetMode,
             Operation::SetBasic,
             Operation::Rename,
             Operation::Lock,
@@ -71,6 +75,8 @@ impl ControlledFixture {
             control,
             expectations: Expectations {
                 filesystem_information: Feature::Unsupported(Status::NOT_SUPPORTED),
+                allocation: Feature::Unsupported(Status::NOT_SUPPORTED),
+                file_mode: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -151,6 +157,14 @@ fn declared_unsupported_filesystem_information_is_exercised() {
 }
 
 #[test]
+fn declared_unsupported_allocation_and_modes_are_exercised() {
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::allocation_reservations(&fixture));
+    block_on(contracts::file_mode_updates(&fixture));
+    fixture.assert_rejected(&[Operation::SetAllocationSize, Operation::SetMode]);
+}
+
+#[test]
 fn declared_unsupported_locks_are_exercised() {
     let fixture = ControlledFixture::rejecting();
     block_on(contracts::lock_conflicts_and_io(&fixture));
@@ -214,6 +228,8 @@ fn pending_checkpoint_keeps_driving_the_operation() {
         control,
         expectations: Expectations {
             filesystem_information: Feature::Supported,
+            allocation: Feature::Supported,
+            file_mode: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

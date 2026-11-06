@@ -75,7 +75,8 @@ Provider crates should enable that feature as a dev-dependency, implement
 `contracts::Fixture`, and register the same scenario functions as separate
 tests on their own executor. Each invocation needs a fresh, empty, isolated,
 writable filesystem; the fixture owns any native driver and temporary resources.
-Declare basic-information, rename, locking, and notification expectations explicitly.
+Declare filesystem-information, allocation, file-mode, basic-information,
+rename, locking, and notification expectations explicitly.
 Unexpected unsupported errors fail; an unsupported profile exercises rejection
 rather than silently skipping a test. These are test expectations, not runtime
 SMB capability advertisement. Read-only providers will need separate scenarios
@@ -94,7 +95,8 @@ Their controlled wrappers validate the test infrastructure, not native I/O.
 The common cases check observable data and stable identity, directory listings,
 provider-owned volume identity/capacity and explicit unsupported-volume profiles,
 zero extension/truncation, bilateral sharing and close/drop release, basic DOS
-attributes, rename identity/replacement/sharing/notifications,
+attributes, allocation reservation/truncation, per-open modes,
+rename identity/replacement/sharing/notifications,
 deferred delete modes versus shared disposition and nonempty-directory closes,
 lock conflicts/I/O enforcement/waits/rollback, and watch policy,
 buffering/FIFO/cancellation/subtrees/deletion generations. They permit genuine
@@ -326,6 +328,20 @@ File queries validate their fixed minimum buffers with INFO_LENGTH_MISMATCH.
 Variable name replies retain the full name length and return partial complete
 UTF-16 code units with BUFFER_OVERFLOW. Explicit EA-size queries require READ_EA;
 providers report actual EA lengths, with no EAs in the current MemoryFs profile.
+
+Allocation updates (19) reserve space without extending EOF and can truncate
+data when reduced. MemoryFs charges reservations to its quota, hides bytes beyond
+EOF, preserves zero-filled gaps and retains reservations during EOF growth.
+Failed reservation growth has no data or quota effects. EOF truncation and
+deletion release storage.
+
+Mode updates (16) delegate to the provider and cache the applied per-open flags
+only after completion. Buffering and synchronous status cannot be changed through
+this operation; write-through is retained on unbuffered opens. Explicit position
+updates (14) are per-open, validate nonnegative/sector-aligned offsets and do not
+affect the explicit offsets of SMB reads/writes. Reads/writes do not advance
+that position. Mode and position are inspectable. Controlled before/after gates
+verify that CLOSE cancels uncommitted updates and drains committed results.
 
 ## Rename and Move
 

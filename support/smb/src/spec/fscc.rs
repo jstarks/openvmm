@@ -53,6 +53,7 @@ open_enum! {
         MODE = 16,
         ALIGNMENT = 17,
         ALL = 18,
+        ALLOCATION = 19,
         END_OF_FILE = 20,
         ALTERNATE_NAME = 21,
         NETWORK_OPEN = 34,
@@ -145,6 +146,8 @@ pub const FILE_FS_VOLUME_MIN_BUFFER_SIZE: usize = 24;
 pub const FILE_FS_VOLUME_MAX_LABEL_LENGTH: usize = 32;
 /// Queryable file mode flags, excluding delete mode: [MS-FSCC] §2.4.31.
 pub const FILE_MODE_INFORMATION_MASK: u32 = 0x0000003e;
+/// Settable file mode flags: [MS-FSCC] §2.4.31.
+pub const FILE_MODE_INFORMATION_SET_MASK: u32 = 0x00000036;
 /// Minimum complete FileAllInformation buffer: [MS-FSA] §2.1.5.12.3.
 pub const FILE_ALL_INFORMATION_MIN_BUFFER_SIZE: usize = 104;
 /// Minimum alternate-name buffer: [MS-FSA] §2.1.5.12.4.
@@ -198,7 +201,7 @@ wire!(
 );
 wire!(
     /// FilePositionInformation: [MS-FSCC] §2.4.40.
-    FilePositionInformation, 8 { current_byte_offset: U64 }
+    FilePositionInformation, 8 { current_byte_offset: I64 }
 );
 wire!(
     /// FileEaInformation: [MS-FSCC] §2.4.13.
@@ -219,6 +222,10 @@ wire!(
 wire!(
     /// FileEndOfFileInformation: [MS-FSCC] §2.4.14.
     FileEndOfFileInformation, 8 { end_of_file: I64 }
+);
+wire!(
+    /// FileAllocationInformation: [MS-FSCC] §2.4.4.
+    FileAllocationInformation, 8 { allocation_size: I64 }
 );
 wire!(
     /// FileDispositionInformation: [MS-FSCC] §2.4.11.

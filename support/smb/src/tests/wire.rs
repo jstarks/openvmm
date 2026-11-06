@@ -277,6 +277,7 @@ fn directory_formats_match_independent_byte_layouts() {
         changed: 4,
         size: 5,
         allocation_size: 8,
+        compression: None,
         number_of_links: 2,
         extended_attributes_length: 8,
         alignment_requirement: 511,

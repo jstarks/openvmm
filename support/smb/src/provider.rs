@@ -62,6 +62,21 @@ impl RequestContext {
     }
 }
 
+/// Provider-reported compression state, independent of wire layouts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompressionInformation {
+    /// Actual allocated bytes occupied by stream data.
+    pub compressed_size: u64,
+    /// COMPRESSION_FORMAT_* identifier.
+    pub format: u16,
+    /// Log2 compression unit size.
+    pub unit_shift: u8,
+    /// Log2 compression chunk size.
+    pub chunk_shift: u8,
+    /// Log2 allocation cluster size used by compression.
+    pub cluster_shift: u8,
+}
+
 /// Metadata expressed in Windows file attributes and 100 ns NT timestamps.
 #[derive(Debug, Clone)]
 pub struct Metadata {
@@ -89,6 +104,8 @@ pub struct Metadata {
     pub size: u64,
     /// Space allocated to the default stream, independent of logical length.
     pub allocation_size: u64,
+    /// Actual compression metadata; None explicitly declines compression queries.
+    pub compression: Option<CompressionInformation>,
     /// Provider-reported count of nondeleted links.
     pub number_of_links: u32,
     /// Encoded extended-attribute bytes, excluding the query's outer length field.

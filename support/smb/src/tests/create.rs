@@ -5,6 +5,69 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn compression_information_reports_actual_memory_allocation_without_read_attributes() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(128, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("compression", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"data"))
+            .await;
+        let limited = client
+            .open_result(
+                "compression",
+                AccessMask::new().with_read_data(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        let limited = read_body::<CreateResponse>(&limited).unwrap().file_id;
+        for allocation in [4u64, 32] {
+            if allocation != 4 {
+                assert_eq!(
+                    response_status(
+                        &client
+                            .set(
+                                file,
+                                FileInformationClass::ALLOCATION.0,
+                                &allocation.to_le_bytes()
+                            )
+                            .await
+                    ),
+                    Status::SUCCESS
+                );
+            }
+            let response = client.query(limited, 28).await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            assert_eq!(&response[72..80], &allocation.to_le_bytes());
+            assert_eq!(&response[80..88], &[0; 8]);
+        }
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.file_id = limited;
+        query.info_type = InformationType::FILE;
+        query.info_class = 28;
+        query.output_buffer_length = 15.into();
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_INFO, query.as_bytes()).await),
+            Status::INFO_LENGTH_MISMATCH
+        );
+        assert_eq!(
+            response_status(&client.query(limited, 48).await),
+            Status::NOT_SUPPORTED
+        );
+        client.close(limited).await;
+        client.close(file).await;
+        let directory = client.open("", 1, 1).await;
+        let response = client.query(directory, 28).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        assert_eq!(&response[72..], &[0; 16]);
+        client.close(directory).await;
+    });
+}
+
+#[test]
 fn create_allocation_reserves_atomically_without_extending_eof() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(32, 16)).unwrap();

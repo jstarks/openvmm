@@ -2312,7 +2312,10 @@ impl<B: FileSystem> Connection<B> {
         if info_type != InformationType::FILE {
             return Err(Status::NOT_SUPPORTED);
         }
-        if class == FileInformationClass::NAME {
+        if matches!(
+            class,
+            FileInformationClass::NAME | FileInformationClass::NORMALIZED_NAME
+        ) {
             return Err(Status::NOT_SUPPORTED);
         }
         if class == FileInformationClass::FULL_EA {
@@ -2327,6 +2330,7 @@ impl<B: FileSystem> Connection<B> {
         let minimum = match class {
             FileInformationClass::BASIC => size_of::<FileBasicInformation>(),
             FileInformationClass::STANDARD => size_of::<FileStandardInformation>(),
+            FileInformationClass::COMPRESSION => size_of::<FileCompressionInformation>(),
             FileInformationClass::INTERNAL => size_of::<FileInternalInformation>(),
             FileInformationClass::EA => size_of::<FileEaInformation>(),
             FileInformationClass::ACCESS => size_of::<FileAccessInformation>(),
@@ -2387,6 +2391,20 @@ impl<B: FileSystem> Connection<B> {
                 FileInformationClass::BASIC => out.extend_from_slice(basic_info(&info).as_bytes()),
                 FileInformationClass::STANDARD => {
                     out.extend_from_slice(standard_info(&info).as_bytes())
+                }
+                FileInformationClass::COMPRESSION => {
+                    let compression = info.compression.ok_or(Status::NOT_SUPPORTED)?;
+                    out.extend_from_slice(
+                        FileCompressionInformation {
+                            compressed_file_size: compression.compressed_size.into(),
+                            compression_format: compression.format.into(),
+                            compression_unit_shift: compression.unit_shift,
+                            chunk_shift: compression.chunk_shift,
+                            cluster_shift: compression.cluster_shift,
+                            reserved: [0; 3],
+                        }
+                        .as_bytes(),
+                    );
                 }
                 FileInformationClass::INTERNAL => out.extend_from_slice(
                     FileInternalInformation {

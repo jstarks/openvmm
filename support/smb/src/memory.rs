@@ -4,8 +4,8 @@
 //! A bounded writable in-memory filesystem for synthetic shares.
 
 use crate::provider::{
-    BasicInformation, ByteRange, Change, FileSystem, FileSystemInformation, LockId, Metadata,
-    NotifyResult, OpenOptions, RequestContext,
+    BasicInformation, ByteRange, Change, CompressionInformation, FileSystem, FileSystemInformation,
+    LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
@@ -245,6 +245,7 @@ impl MemoryFs {
                 changed: now,
                 size: 0,
                 allocation_size: 0,
+                compression: Some(CompressionInformation::default()),
                 number_of_links: 1,
                 extended_attributes_length: 0,
                 alignment_requirement: 0,
@@ -329,6 +330,9 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     components.reverse();
     metadata.path = format!("\\{}", components.join("\\"));
     metadata.number_of_links = u32::from(!metadata.delete_pending);
+    if let Some(compression) = &mut metadata.compression {
+        compression.compressed_size = metadata.allocation_size;
+    }
     metadata.maximal_access = acl_access(&state.nodes[&id].security);
     Ok(metadata)
 }
@@ -1118,6 +1122,7 @@ impl FileSystem for MemoryFs {
                         changed: now,
                         size: 0,
                         allocation_size: allocation as u64,
+                        compression: Some(CompressionInformation::default()),
                         number_of_links: 1,
                         extended_attributes_length: 0,
                         alignment_requirement: 0,

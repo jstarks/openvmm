@@ -58,10 +58,12 @@ open_enum! {
         END_OF_FILE = 20,
         ALTERNATE_NAME = 21,
         STREAM = 22,
+        COMPRESSION = 28,
         NETWORK_OPEN = 34,
         ATTRIBUTE_TAG = 35,
         ID_BOTH_DIRECTORY = 37,
         ID_FULL_DIRECTORY = 38,
+        NORMALIZED_NAME = 48,
         ID_EXTD_DIRECTORY = 60,
         ID64_EXTD_DIRECTORY = 78,
         ID64_EXTD_BOTH_DIRECTORY = 79,
@@ -216,6 +218,17 @@ wire!(
         change_time: I64,
         file_attributes: FileAttributes,
         reserved: U32,
+    }
+);
+wire!(
+    /// FileCompressionInformation: [MS-FSCC] §2.4.9.
+    FileCompressionInformation, 16 {
+        compressed_file_size: U64,
+        compression_format: U16,
+        compression_unit_shift: u8,
+        chunk_shift: u8,
+        cluster_shift: u8,
+        reserved: [u8; 3],
     }
 );
 wire!(

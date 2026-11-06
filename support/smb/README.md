@@ -697,6 +697,10 @@ snapshots remain unsupported; security descriptors are applied atomically on cre
 
 Basic-information updates support DOS attributes and per-open timestamp
 controls, including zero/no-change and -1/-2 automatic-update suppression/reset.
+FileCompressionInformation returns provider-owned compression metadata.
+MemoryFs reports its actual allocated bytes with COMPRESSION_FORMAT_NONE; this
+query does not claim compression storage or require READ_ATTRIBUTES.
+FileNormalizedNameInformation remains NOT_SUPPORTED as required for SMB 2.1.
 Alternate-name queries use optional provider short names; the memory provider
 does not generate 8.3 aliases.
 

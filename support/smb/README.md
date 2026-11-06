@@ -54,6 +54,9 @@ passthrough. GET_COMPRESSION returns the provider's format for files and
 directories; MemoryFs reports NONE and does not advertise compressed storage.
 Controlled providers can gate, cancel or reject these calls, and CLOSE drains
 their actual results before releasing the open.
+SET_ZERO_DATA requires WRITE_DATA and zeroes only the requested bytes below EOF,
+without allocating or extending the stream. MemoryFs enforces byte-range locks,
+updates automatic modification times and emits last-write notifications.
 
 ## Run
 

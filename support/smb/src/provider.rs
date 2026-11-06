@@ -142,11 +142,20 @@ impl Metadata {
 pub enum FileControl {
     /// Query the stream or directory's COMPRESSION_FORMAT_* state.
     GetCompression,
+    /// Zero [offset, end) without extending EOF or moving the open's position.
+    SetZeroData {
+        /// First byte to zero.
+        offset: u64,
+        /// Exclusive end, clamped to EOF; both offsets must fit signed 64 bits.
+        end: u64,
+    },
 }
 
 /// Semantic result of a selected filesystem control.
 #[derive(Debug)]
 pub enum FileControlResult {
+    /// A mutation completed without output data.
+    Done,
     /// Current COMPRESSION_FORMAT_* state.
     Compression(u16),
 }

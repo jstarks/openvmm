@@ -221,6 +221,13 @@ wire!(
     }
 );
 wire!(
+    /// FILE_ZERO_DATA_INFORMATION: [MS-FSCC] §2.3.85.
+    FileZeroDataInformation, 16 {
+        file_offset: I64,
+        beyond_final_zero: I64,
+    }
+);
+wire!(
     /// FileCompressionInformation: [MS-FSCC] §2.4.9.
     FileCompressionInformation, 16 {
         compressed_file_size: U64,

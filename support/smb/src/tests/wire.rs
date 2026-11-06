@@ -95,6 +95,143 @@ fn get_compression_control_reports_storage_state_without_attribute_access() {
 }
 
 #[test]
+fn zero_data_control_preserves_eof_and_allocation_and_enforces_write_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("zero-data", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"abcdefgh"))
+            .await;
+        assert_eq!(
+            response_status(&client.set(file, 19, &32i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        let before = client.query(file, 5).await;
+        let mut ioctl = IoctlRequest::new_zeroed();
+        ioctl.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+        ioctl.file_id = file;
+        ioctl.control_code = 0x000980c8u32.into();
+        ioctl.flags = IoctlFlags::new().with_fsctl(true);
+        ioctl.input_offset = 120.into();
+        ioctl.input_count = 16.into();
+        let make_body = |ioctl: &IoctlRequest, start: i64, end: i64| {
+            let mut body = ioctl.as_bytes().to_vec();
+            body.extend_from_slice(&start.to_le_bytes());
+            body.extend_from_slice(&end.to_le_bytes());
+            body
+        };
+        let response = client.ok(Command::IOCTL, &make_body(&ioctl, 2, 5)).await;
+        assert_eq!(response.len(), 112);
+        assert_eq!(&response[96..104], &[0; 8]);
+        assert_eq!(&client.read(file, 0, 8).await[80..], b"ab\0\0\0fgh");
+        let after = client.query(file, 5).await;
+        assert_eq!(&after[72..88], &before[72..88]);
+        for (start, end) in [(-1, 2), (0, -1), (6, 3)] {
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(Command::IOCTL, &make_body(&ioctl, start, end))
+                        .await
+                ),
+                Status::INVALID_PARAMETER,
+            );
+        }
+        let no_write = client.open_result("zero-data", 4, 7, 1, 0).await;
+        let no_write = read_body::<CreateResponse>(&no_write).unwrap().file_id;
+        ioctl.file_id = no_write;
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &make_body(&ioctl, 0, 8)).await),
+            Status::ACCESS_DENIED,
+        );
+        client.close(no_write).await;
+        ioctl.file_id = file;
+        client
+            .ok(Command::IOCTL, &make_body(&ioctl, 6, i64::MAX))
+            .await;
+        assert_eq!(&client.read(file, 0, 16).await[80..], b"ab\0\0\0f\0\0");
+        let before = client.query(file, 4).await;
+        for (start, end) in [(0, 0), (8, 8), (9, i64::MAX)] {
+            client
+                .ok(Command::IOCTL, &make_body(&ioctl, start, end))
+                .await;
+        }
+        assert_eq!(&client.query(file, 4).await[72..], &before[72..]);
+        ioctl.input_count = 15.into();
+        let mut body = make_body(&ioctl, 0, 1);
+        body.pop();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &body).await),
+            Status::INVALID_PARAMETER,
+        );
+        let directory = client.open("zero-directory", 2, 1).await;
+        ioctl.file_id = directory;
+        ioctl.input_count = 16.into();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &make_body(&ioctl, 0, 1)).await),
+            Status::INVALID_PARAMETER,
+        );
+        client.close(directory).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn zero_data_control_obeys_cross_connection_and_owner_byte_range_locks() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut first = Client::new(&server).await;
+        let mut second = Client::new(&server).await;
+        let file = first.open("zero-locked", 2, 0).await;
+        first
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"abcdef"))
+            .await;
+        let other = second.open("zero-locked", 1, 0).await;
+        let mut ioctl = IoctlRequest::new_zeroed();
+        ioctl.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+        ioctl.file_id = file;
+        ioctl.control_code = FsctlCode::SET_ZERO_DATA.0.into();
+        ioctl.flags = IoctlFlags::new().with_fsctl(true);
+        ioctl.input_count = 16.into();
+        ioctl.input_offset = 120.into();
+        let mut bytes = ioctl.as_bytes().to_vec();
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        bytes.extend_from_slice(&4i64.to_le_bytes());
+        let unlock = LockFlags::new().with_unlock(true);
+        for exclusive in [false, true] {
+            let flags = LockFlags::new()
+                .with_shared_lock(!exclusive)
+                .with_exclusive_lock(exclusive)
+                .with_fail_immediately(true);
+            second
+                .ok(Command::LOCK, &locking::body(other, &[(2, 2, flags)]))
+                .await;
+            assert_eq!(
+                response_status(&first.send(Command::IOCTL, &bytes).await),
+                Status::FILE_LOCK_CONFLICT,
+            );
+            second
+                .ok(Command::LOCK, &locking::body(other, &[(2, 2, unlock)]))
+                .await;
+            assert_eq!(&first.read(file, 0, 6).await[80..], b"abcdef");
+        }
+        let flags = LockFlags::new()
+            .with_exclusive_lock(true)
+            .with_fail_immediately(true);
+        first
+            .ok(Command::LOCK, &locking::body(file, &[(2, 2, flags)]))
+            .await;
+        first.ok(Command::IOCTL, &bytes).await;
+        first
+            .ok(Command::LOCK, &locking::body(file, &[(2, 2, unlock)]))
+            .await;
+        assert_eq!(&first.read(file, 0, 6).await[80..], b"ab\0\0ef");
+        second.close(other).await;
+        first.close(file).await;
+    });
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

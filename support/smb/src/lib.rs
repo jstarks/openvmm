@@ -320,7 +320,7 @@ impl<F> OpenFile<F> {
                 context: context.clone(),
                 barrier: matches!(
                     command,
-                    Command::FLUSH | Command::SET_INFO | Command::QUERY_DIRECTORY
+                    Command::FLUSH | Command::SET_INFO | Command::QUERY_DIRECTORY | Command::IOCTL
                 ),
                 notification: command == Command::CHANGE_NOTIFY,
                 locking: command == Command::LOCK,
@@ -1778,7 +1778,7 @@ impl<B: FileSystem> Connection<B> {
         {
             return Err(Status::INVALID_PARAMETER);
         }
-        variable::<IoctlRequest>(
+        let input = variable::<IoctlRequest>(
             packet,
             request.input_offset.get() as usize,
             request.input_count.get() as usize,
@@ -1798,16 +1798,36 @@ impl<B: FileSystem> Connection<B> {
                 }
                 FileControl::GetCompression
             }
+            FsctlCode::SET_ZERO_DATA => {
+                let info = FileZeroDataInformation::read_from_prefix(input)
+                    .map_err(|_| Status::INVALID_PARAMETER)?
+                    .0;
+                let offset =
+                    u64::try_from(info.file_offset.get()).map_err(|_| Status::INVALID_PARAMETER)?;
+                let end = u64::try_from(info.beyond_final_zero.get())
+                    .map_err(|_| Status::INVALID_PARAMETER)?;
+                if offset > end {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                FileControl::SetZeroData { offset, end }
+            }
             _ => return Err(Status::NOT_SUPPORTED),
         };
         let file = self.file(request.file_id, tree, context)?;
+        if matches!(control, FileControl::SetZeroData { .. }) && !file.access.write_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
         let result = self
             .server
             .backend
             .file_control(&file.file, control, context)
             .await?;
-        let output = match result {
-            FileControlResult::Compression(format) => format.to_le_bytes().to_vec(),
+        let output = match (control, result) {
+            (FileControl::GetCompression, FileControlResult::Compression(format)) => {
+                format.to_le_bytes().to_vec()
+            }
+            (FileControl::SetZeroData { .. }, FileControlResult::Done) => Vec::new(),
+            _ => return Err(Status::INTERNAL_ERROR),
         };
         let mut body = IoctlResponse {
             structure_size: IoctlResponse::STRUCTURE_SIZE.into(),
@@ -1816,7 +1836,12 @@ impl<B: FileSystem> Connection<B> {
             file_id: request.file_id,
             input_offset: (body_end::<IoctlResponse>() as u32).into(),
             input_count: 0.into(),
-            output_offset: (body_end::<IoctlResponse>() as u32).into(),
+            output_offset: if output.is_empty() {
+                0
+            } else {
+                body_end::<IoctlResponse>() as u32
+            }
+            .into(),
             output_count: (output.len() as u32).into(),
             flags: 0.into(),
             reserved2: 0.into(),

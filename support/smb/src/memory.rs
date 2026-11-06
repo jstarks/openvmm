@@ -1410,8 +1410,9 @@ impl FileSystem for MemoryFs {
         control: FileControl,
         _request: &RequestContext,
     ) -> Result<FileControlResult, Status> {
-        let state = self.0.lock();
-        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let mut state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let access = AccessMask::from_bits(open.access);
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         match control {
             FileControl::GetCompression => Ok(FileControlResult::Compression(
@@ -1420,6 +1421,43 @@ impl FileSystem for MemoryFs {
                     .ok_or(Status::INVALID_DEVICE_REQUEST)?
                     .format,
             )),
+            FileControl::SetZeroData { offset, end } => {
+                if offset > end || end > i64::MAX as u64 || node.metadata.is_directory() {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                if !access.write_data() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let end = end.min(node.metadata.size);
+                if offset >= end {
+                    return Ok(FileControlResult::Done);
+                }
+                if conflicts(
+                    &state,
+                    file,
+                    ByteRange {
+                        offset,
+                        length: end - offset,
+                    },
+                    true,
+                    false,
+                ) {
+                    return Err(Status::FILE_LOCK_CONFLICT);
+                }
+                let start = usize::try_from(offset).map_err(|_| Status::INTERNAL_ERROR)?;
+                let end = usize::try_from(end).map_err(|_| Status::INTERNAL_ERROR)?;
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                node.data
+                    .get_mut(start..end)
+                    .ok_or(Status::INTERNAL_ERROR)?
+                    .fill(0);
+                modified(&mut state, file)?;
+                let filter = NotifyFilter::new()
+                    .with_last_write(!state.opens[&file.open].user_set_write_time);
+                emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+                wake(state);
+                Ok(FileControlResult::Done)
+            }
         }
     }
 

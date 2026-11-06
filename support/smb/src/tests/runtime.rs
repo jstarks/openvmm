@@ -216,6 +216,23 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             .await,
             FileControlResult::Compression(0),
         ));
+        assert!(matches!(
+            through_gates(
+                fs.file_control(
+                    &file,
+                    FileControl::SetZeroData { offset: 1, end: 2 },
+                    &context
+                ),
+                &control,
+                Operation::FileControl,
+            )
+            .await,
+            FileControlResult::Done,
+        ));
+        assert_eq!(
+            through_gates(fs.read(&file, 0, 3, &context), &control, Operation::Read).await,
+            b"a\0c",
+        );
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
         let range = ByteRange {
             offset: 0,
@@ -279,7 +296,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
 #[test]
 fn pending_filesystem_controls_cancel_or_drain_before_close() {
     block_on(async {
-        for after in [false, true] {
+        for (zero, after) in [(false, false), (false, true), (true, false), (true, true)] {
             let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
             control
                 .set_plan(
@@ -294,15 +311,35 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
             let server = Server::new("memory", fs).unwrap();
             let mut client = Client::new(&server).await;
             let file = client.open("controlled", 2, 0).await;
+            client
+                .ok(Command::WRITE, &Client::write_body(file, 0, b"abc"))
+                .await;
+            let observer = client.open("controlled", 1, 0).await;
             let mut body = IoctlRequest::new_zeroed();
             body.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
             body.file_id = file;
-            body.control_code = FsctlCode::GET_COMPRESSION.0.into();
+            body.control_code = if zero {
+                FsctlCode::SET_ZERO_DATA
+            } else {
+                FsctlCode::GET_COMPRESSION
+            }
+            .0
+            .into();
             body.flags = IoctlFlags::new().with_fsctl(true);
             body.max_output_response = 2.into();
+            let mut bytes;
+            if zero {
+                body.input_offset = 120.into();
+                body.input_count = 16.into();
+                bytes = body.as_bytes().to_vec();
+                bytes.extend_from_slice(&1i64.to_le_bytes());
+                bytes.extend_from_slice(&2i64.to_le_bytes());
+            } else {
+                bytes = body.as_bytes().to_vec();
+            }
             let packet = request(
                 Command::IOCTL,
-                body.as_bytes(),
+                &bytes,
                 client.session,
                 client.tree,
                 client.message,
@@ -339,11 +376,16 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 }
             );
             if after {
-                assert_eq!(&response[112..], &[0, 0]);
+                assert_eq!(&response[112..], if zero { &[][..] } else { &[0, 0][..] });
             }
             assert_eq!(response_status(&closing.await.unwrap()), Status::SUCCESS);
             assert!(control.snapshot(call.id).unwrap().cancel_requested);
             assert_eq!(successes(&control, Operation::Close), 1);
+            assert_eq!(
+                &client.read(observer, 0, 3).await[80..],
+                if zero && after { b"a\0c" } else { b"abc" },
+            );
+            client.close(observer).await;
         }
     });
 }

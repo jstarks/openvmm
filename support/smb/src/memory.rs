@@ -976,6 +976,9 @@ impl FileSystem for MemoryFs {
             ) {
                 return Err(Status::OBJECT_NAME_NOT_FOUND);
             }
+            if options.extended_attributes.is_some() {
+                return Err(Status::EAS_NOT_SUPPORTED);
+            }
             if !can_add(&state, parent, options.options().directory_file()) {
                 return Err(Status::ACCESS_DENIED);
             }
@@ -1989,6 +1992,7 @@ mod tests {
                 options: 1,
                 attributes: 0,
                 security: Some(encoded.as_slice()),
+                extended_attributes: None,
             };
             let (directory, _) = fs.open("explicit", options, &context).await.unwrap();
             let actual = fs
@@ -2135,6 +2139,7 @@ mod tests {
                 directory_acl_updates: Feature::Supported,
                 acl_inheritance: Feature::Supported,
                 security_creation: Feature::Supported,
+                creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -2210,6 +2215,11 @@ mod tests {
     }
 
     #[test]
+    fn contract_creation_eas() {
+        run_contract(contracts::creation_eas);
+    }
+
+    #[test]
     fn contract_allocation_reservations() {
         run_contract(contracts::allocation_reservations);
     }
@@ -2276,6 +2286,7 @@ mod tests {
                 options: 0,
                 attributes: 0,
                 security: None,
+                extended_attributes: None,
             };
             let (source, _) = fs.open("source", options, &request).await.unwrap();
             let (target, _) = fs.open("target", options, &request).await.unwrap();
@@ -2376,6 +2387,7 @@ mod tests {
                 options: CreateOptions::new().with_directory_file(true).into_bits(),
                 attributes: 0,
                 security: None,
+                extended_attributes: None,
             };
             let (watched, _) = fs.open("generation", options, &context).await.unwrap();
             let (deleting, _) = fs.open("generation", options, &context).await.unwrap();
@@ -2467,6 +2479,7 @@ mod tests {
                 options: 0,
                 attributes: 0,
                 security: None,
+                extended_attributes: None,
             };
             let filter = NotifyFilter::new().with_file_name(true);
             let mut opens = Vec::new();
@@ -2506,6 +2519,7 @@ mod tests {
                 options: 0,
                 attributes: 0,
                 security: None,
+                extended_attributes: None,
             };
             let (first, _) = fs.open("first", options, &request).await.unwrap();
             fs.write(&first, 0, &[1; 64], &request).await.unwrap();

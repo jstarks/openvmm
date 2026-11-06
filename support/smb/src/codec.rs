@@ -60,6 +60,28 @@ pub(crate) fn encode_name(name: &str) -> Vec<u8> {
     name.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
+pub(crate) fn validate_ea_list(mut bytes: &[u8]) -> Result<(), Status> {
+    while !bytes.is_empty() {
+        let (entry, rest) = FileFullEaInformation::read_from_prefix(bytes)
+            .map_err(|_| Status::EA_LIST_INCONSISTENT)?;
+        let name = usize::from(entry.name_length);
+        let length =
+            size_of::<FileFullEaInformation>() + name + 1 + usize::from(entry.value_length.get());
+        if rest.get(name) != Some(&0) || bytes.get(..length).is_none() {
+            return Err(Status::EA_LIST_INCONSISTENT);
+        }
+        let next = entry.next_entry_offset.get() as usize;
+        if next == 0 {
+            return Ok(());
+        }
+        if next < length || !next.is_multiple_of(4) || next >= bytes.len() {
+            return Err(Status::EA_LIST_INCONSISTENT);
+        }
+        bytes = &bytes[next..];
+    }
+    Ok(())
+}
+
 pub(crate) fn align_up(length: usize, alignment: usize) -> Result<usize, Status> {
     length
         .checked_add(alignment - 1)

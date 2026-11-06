@@ -168,6 +168,9 @@ pub struct OpenOptions<'a> {
     /// Ignore it for existing objects, including malformed bytes. New-object
     /// validation must finish before publication; unsupported policy must fail.
     pub security: Option<&'a [u8]>,
+    /// Optional FSCC EA list for atomic creation; ignore it for existing objects.
+    /// Unsupported stores must reject new-object EAs without publishing an object.
+    pub extended_attributes: Option<&'a [u8]>,
 }
 
 impl OpenOptions<'_> {

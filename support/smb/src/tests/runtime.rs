@@ -104,6 +104,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             options: CreateOptions::new().with_directory_file(true).into_bits(),
             attributes: 0,
             security: None,
+            extended_attributes: None,
         };
         let (directory, _) = through_gates(
             fs.open("directory", options, &context),
@@ -573,6 +574,7 @@ fn controlled_call_errors_and_abandonment_do_not_claim_completion() {
             options: 0,
             attributes: 0,
             security: None,
+            extended_attributes: None,
         };
         let mut open = Box::pin(fs.open("abandoned", options, &context));
         assert!(futures::poll!(&mut open).is_pending());
@@ -756,6 +758,7 @@ fn tcp_pause_retains_committed_reordered_writes_and_a_concurrent_close() {
                     options: 0,
                     attributes: 0,
                     security: None,
+                    extended_attributes: None,
                 },
                 &context,
             )

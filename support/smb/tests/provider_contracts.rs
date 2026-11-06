@@ -33,6 +33,7 @@ impl Fixture for MemoryFixture {
             directory_acl_updates: Feature::Supported,
             acl_inheritance: Feature::Supported,
             security_creation: Feature::Supported,
+            creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -90,6 +91,7 @@ impl ControlledFixture {
                 directory_acl_updates: Feature::Unsupported(Status::NOT_SUPPORTED),
                 acl_inheritance: Feature::Unsupported(Status::NOT_SUPPORTED),
                 security_creation: Feature::Unsupported(Status::NOT_SUPPORTED),
+                creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -213,6 +215,12 @@ fn declared_unsupported_security_creation_is_exercised() {
 }
 
 #[test]
+fn exported_ea_creation_contract_checks_no_storage_profile() {
+    let fixture = MemoryFixture(MemoryFs::new(1024, 32));
+    block_on(contracts::creation_eas(&fixture));
+}
+
+#[test]
 fn declared_unsupported_locks_are_exercised() {
     let fixture = ControlledFixture::rejecting();
     block_on(contracts::lock_conflicts_and_io(&fixture));
@@ -283,6 +291,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             directory_acl_updates: Feature::Supported,
             acl_inheritance: Feature::Supported,
             security_creation: Feature::Supported,
+            creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

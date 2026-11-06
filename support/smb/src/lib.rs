@@ -1736,6 +1736,7 @@ impl<B: FileSystem> Connection<B> {
         let mut maximal_access = None;
         let mut disk_id = false;
         let mut security = None;
+        let mut extended_attributes = None;
         for context in contexts {
             if !names.insert(context.name) {
                 return Err(Status::INVALID_PARAMETER);
@@ -1763,9 +1764,7 @@ impl<B: FileSystem> Connection<B> {
                 Some(CreateContextName::ALLOCATION_SIZE)
                     if context.data.len() == size_of::<AllocationSizeContext>() => {}
                 Some(CreateContextName::REQUEST_LEASE) => {}
-                Some(CreateContextName::EA_BUFFER)
-                    if request.disposition() == CreateDisposition::OPEN => {}
-                Some(CreateContextName::EA_BUFFER) => return Err(Status::EAS_NOT_SUPPORTED),
+                Some(CreateContextName::EA_BUFFER) => extended_attributes = Some(context.data),
                 Some(CreateContextName::SECURITY_DESCRIPTOR) => security = Some(context.data),
                 Some(CreateContextName::TIMEWARP)
                     if context.data.len() == size_of::<TimewarpContext>() =>
@@ -1839,6 +1838,7 @@ impl<B: FileSystem> Connection<B> {
                     options: options.into_bits(),
                     attributes: request.file_attributes.into_bits(),
                     security,
+                    extended_attributes,
                 },
                 context,
             )
@@ -2131,6 +2131,15 @@ impl<B: FileSystem> Connection<B> {
         if class == FileInformationClass::NAME {
             return Err(Status::NOT_SUPPORTED);
         }
+        if class == FileInformationClass::FULL_EA {
+            if !file.access.read_ea() {
+                return Err(Status::ACCESS_DENIED);
+            }
+            return Err(Status::INVALID_INFO_CLASS);
+        }
+        if class == FileInformationClass::STREAM {
+            return Err(Status::INVALID_INFO_CLASS);
+        }
         let minimum = match class {
             FileInformationClass::BASIC => size_of::<FileBasicInformation>(),
             FileInformationClass::STANDARD => size_of::<FileStandardInformation>(),
@@ -2311,6 +2320,13 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let class = FileInformationClass(request.info_class);
         match (request.info_type, class) {
+            (InformationType::FILE, FileInformationClass::FULL_EA) => {
+                if !file.access.write_ea() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                validate_ea_list(data)?;
+                return Err(Status::INVALID_DEVICE_REQUEST);
+            }
             (InformationType::SECURITY, _) => {
                 let information = SecurityInformation::from_bits(
                     request.additional_information.get() & SecurityInformation::VALID,

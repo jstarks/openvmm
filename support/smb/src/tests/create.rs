@@ -161,6 +161,95 @@ fn create_security_applies_before_visibility_and_ignores_existing_context_bytes(
 }
 
 #[test]
+fn unsupported_eas_and_streams_have_explicit_profiles_and_existing_eas_are_ignored() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("eas", 2, 0).await;
+        for class in [15, 22] {
+            assert_eq!(
+                response_status(&client.query(file, class).await),
+                Status::INVALID_INFO_CLASS
+            );
+        }
+        let ea = [0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v'];
+        assert_eq!(
+            response_status(&client.set(file, 15, &ea).await),
+            Status::INVALID_DEVICE_REQUEST
+        );
+        let mut linked = ea.to_vec();
+        linked[..4].copy_from_slice(&12u32.to_le_bytes());
+        linked.push(0);
+        linked.extend_from_slice(&ea);
+        assert_eq!(
+            response_status(&client.set(file, 15, &linked).await),
+            Status::INVALID_DEVICE_REQUEST
+        );
+        for malformed in [&ea[..7], &ea[..10], &[1][..]] {
+            assert_eq!(
+                response_status(&client.set(file, 15, malformed).await),
+                Status::EA_LIST_INCONSISTENT
+            );
+        }
+        let mut malformed = ea;
+        malformed[9] = b'x';
+        assert_eq!(
+            response_status(&client.set(file, 15, &malformed).await),
+            Status::EA_LIST_INCONSISTENT
+        );
+        malformed = ea;
+        malformed[..4].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            response_status(&client.set(file, 15, &malformed).await),
+            Status::EA_LIST_INCONSISTENT
+        );
+        let response = client.open_result("eas", 1, 7, 1, 0).await;
+        let limited = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(&client.query(limited, 15).await),
+            Status::ACCESS_DENIED
+        );
+        assert_eq!(
+            response_status(&client.set(limited, 15, &[1]).await),
+            Status::ACCESS_DENIED
+        );
+        let data = contexts(&[(CreateContextName::EA_BUFFER, &[1])]);
+        let response = client
+            .ok(Command::CREATE, &create_body("eas", 1, 7, 3, 0, &data))
+            .await;
+        let existing = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client.close(existing).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::CREATE, &create_body("new-eas", 1, 7, 2, 0, &data))
+                    .await
+            ),
+            Status::EAS_NOT_SUPPORTED
+        );
+        assert_eq!(
+            response_status(&client.open_result("new-eas", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        let mut volume = QueryInfoRequest::new_zeroed();
+        volume.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        volume.info_type = InformationType::FILESYSTEM;
+        volume.info_class = 5;
+        volume.file_id = file;
+        volume.output_buffer_length = 256.into();
+        let response = client.ok(Command::QUERY_INFO, volume.as_bytes()).await;
+        let flags = FileSystemAttributes::from_bits(u32::from_le_bytes(
+            response[72..76].try_into().unwrap(),
+        ));
+        assert!(!flags.named_streams());
+        assert!(!flags.extended_attributes());
+        assert!(!flags.persistent_acls());
+        client.close(limited).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn create_context_queries_return_stable_ids_and_backend_maximal_access() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(8, 16)).unwrap();

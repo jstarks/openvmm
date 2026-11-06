@@ -50,12 +50,14 @@ open_enum! {
         NAMES = 12,
         DISPOSITION = 13,
         POSITION = 14,
+        FULL_EA = 15,
         MODE = 16,
         ALIGNMENT = 17,
         ALL = 18,
         ALLOCATION = 19,
         END_OF_FILE = 20,
         ALTERNATE_NAME = 21,
+        STREAM = 22,
         NETWORK_OPEN = 34,
         ATTRIBUTE_TAG = 35,
         ID_BOTH_DIRECTORY = 37,
@@ -134,8 +136,15 @@ pub struct FileSystemAttributes {
     pub case_sensitive_search: bool,
     pub case_preserved_names: bool,
     pub unicode_on_disk: bool,
-    #[bits(29)]
-    other: u32,
+    pub persistent_acls: bool,
+    #[bits(14)]
+    other0: u16,
+    pub named_streams: bool,
+    #[bits(4)]
+    other1: u8,
+    pub extended_attributes: bool,
+    #[bits(8)]
+    other2: u8,
 }
 le_bitfield_conversions!(FileSystemAttributes, u32, U32);
 
@@ -170,6 +179,15 @@ pub const NT_TICKS_PER_SECOND: u64 = 10_000_000;
 /// Difference between the NT and Unix epochs, in NT ticks: [MS-DTYP] §2.3.3.
 pub const UNIX_EPOCH_NT_TIME: u64 = 116_444_736_000_000_000;
 
+wire!(
+    /// FILE_FULL_EA_INFORMATION prefix, followed by name, NUL and value: [MS-FSCC] §2.4.16.
+    FileFullEaInformation, 8 {
+        next_entry_offset: U32,
+        flags: u8,
+        name_length: u8,
+        value_length: U16,
+    }
+);
 wire!(
     /// FileAttributeTagInformation: [MS-FSCC] §2.4.6.
     FileAttributeTagInformation, 8 {

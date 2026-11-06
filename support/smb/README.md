@@ -550,9 +550,17 @@ FileAttributeTagInformation reports provider attributes and reparse tags with
 READ_ATTRIBUTES and fixed-buffer checks. MemoryFs has no reparse objects and
 ignores CREATE's non-settable REPARSE_POINT attribute.
 
-Non-default streams, EAs, full Unicode case-folding, advanced/reinherited ACLs,
-leases and IOCTLs remain future work. Basic rename/move and ACL updates are
-implemented. Unsupported requests receive explicit status errors.
+MemoryFs deliberately has no EAs or named streams and advertises neither.
+Full-EA/stream queries return INVALID_INFO_CLASS; EA queries/sets check READ_EA /
+WRITE_EA. Structurally invalid EA SET lists return EA_LIST_INCONSISTENT, while
+valid unsupported sets return INVALID_DEVICE_REQUEST. Creation EAs fail
+EAS_NOT_SUPPORTED before publication, but existing objects ignore EA bytes,
+including OPEN_IF. Borrowed OpenOptions input preserves atomic native-provider
+creation rather than requiring an open-then-set sequence.
+
+Full Unicode case-folding, advanced/reinherited ACLs, leases and IOCTLs remain
+future work. Basic rename/move and ACL updates are implemented.
+Unsupported requests receive explicit status errors.
 Memory is allocated for file holes; this is not a sparse-filesystem model.
 
 Full filesystem- and dialect-specific torture suites are not expected to

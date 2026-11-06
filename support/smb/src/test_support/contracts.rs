@@ -54,6 +54,8 @@ pub struct Expectations {
     pub acl_inheritance: Feature,
     /// Atomic security descriptors on creation; ignored for existing objects.
     pub security_creation: Feature,
+    /// Atomic EA creation, or explicit rejection by a store without EAs.
+    pub creation_eas: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -103,6 +105,7 @@ fn options(disposition: CreateDisposition, directory: bool) -> OpenOptions<'stat
             .into_bits(),
         attributes: 0,
         security: None,
+        extended_attributes: None,
     }
 }
 
@@ -643,6 +646,61 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Creation EAs are ignored for existing objects. Unsupported new-object EAs
+/// must fail without creating an object; supporting stores retain nonzero EA data.
+pub async fn creation_eas<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "existing", CreateDisposition::CREATE, false, &request).await;
+    let (existing, _) = fs
+        .open(
+            "existing",
+            OpenOptions {
+                disposition: CreateDisposition::OPEN_IF.0,
+                extended_attributes: Some(&[1]),
+                ..options(CreateDisposition::OPEN, false)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    fs.close(&existing, &request).await.unwrap();
+    fs.close(&file, &request).await.unwrap();
+    let ea = [0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v'];
+    let result = fs
+        .open(
+            "with-eas",
+            OpenOptions {
+                extended_attributes: Some(&ea),
+                ..options(CreateDisposition::CREATE, false)
+            },
+            &request,
+        )
+        .await;
+    if let Some(status) = unsupported(fixture.expectations().creation_eas) {
+        rejected(result, status);
+        rejected(
+            fs.open(
+                "with-eas",
+                options(CreateDisposition::OPEN, false),
+                &request,
+            )
+            .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+    } else {
+        let (created, _) = result.unwrap();
+        assert!(
+            fs.metadata(&created, &request)
+                .await
+                .unwrap()
+                .extended_attributes_length
+                > 0
+        );
+        fs.close(&created, &request).await.unwrap();
+    }
 }
 
 /// MAXIMUM_ALLOWED is resolved by the provider, not expanded to blanket rights.

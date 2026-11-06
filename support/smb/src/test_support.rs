@@ -34,6 +34,8 @@ pub enum Operation {
     Open,
     /// Open with an atomic creation security descriptor.
     OpenSecurity,
+    /// Open with an atomic creation EA list.
+    OpenExtendedAttributes,
     /// Explicit close.
     Close,
     /// Metadata query.
@@ -712,6 +714,8 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         let mut call = self.controller.begin(
             if options.security.is_some() {
                 Operation::OpenSecurity
+            } else if options.extended_attributes.is_some() {
+                Operation::OpenExtendedAttributes
             } else {
                 Operation::Open
             },

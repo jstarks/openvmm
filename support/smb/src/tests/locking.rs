@@ -656,6 +656,7 @@ fn provider_lock_and_waiter_quotas_recover_after_cancellation_and_close() {
                     options: 0,
                     attributes: 0,
                     security: None,
+                    extended_attributes: None,
                 },
                 &context,
             )
@@ -731,6 +732,7 @@ fn provider_lock_and_waiter_quotas_recover_after_cancellation_and_close() {
                     options: 0,
                     attributes: 0,
                     security: None,
+                    extended_attributes: None,
                 },
                 &context,
             )

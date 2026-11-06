@@ -501,6 +501,11 @@ directory sharing is enforced, cycles are rejected, and an exact self-rename
 is a no-op. The memory namespace keeps its existing ASCII-insensitive lookup
 and dot-component rejection policy.
 
+CREATE and rename share filename-component validation (MS-FSCC 2.1.5.2).
+Wildcard characters, quotes, vertical bars and ASCII controls are rejected
+before namespace publication. Query-directory patterns deliberately permit
+their standard/DOS wildcard characters; those are not valid created filenames.
+
 Same-directory changes report old/new name pairs; moves report removal/addition.
 An exact-case replacement reports source removal and destination metadata change,
 whereas a differently cased replacement also reports removal of the old target

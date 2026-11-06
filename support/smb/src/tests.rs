@@ -1044,6 +1044,9 @@ fn malformed_creates_and_traversal_are_rejected() {
             ("\\rooted", Status::INVALID_PARAMETER),
             ("a/../b", Status::OBJECT_NAME_INVALID),
             ("file:stream", Status::OBJECT_NAME_INVALID),
+            ("bad*name", Status::OBJECT_NAME_INVALID),
+            ("bad?name", Status::OBJECT_NAME_INVALID),
+            ("bad\u{1}name", Status::OBJECT_NAME_INVALID),
         ] {
             assert_eq!(
                 response_status(&client.open_result(name, 1, 7, 2, 0).await),

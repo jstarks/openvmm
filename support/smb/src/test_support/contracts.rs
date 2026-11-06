@@ -888,6 +888,13 @@ async fn rejected_lock<B: FileSystem>(
 pub async fn data_and_identity<F: Fixture>(fixture: &F) {
     let fs = fixture.filesystem();
     let request = RequestContext::new(1);
+    for name in ["bad*", "bad?", "bad<", "bad>", "bad\"", "bad|", "bad\u{1}"] {
+        rejected(
+            fs.open(name, options(CreateDisposition::CREATE, false), &request)
+                .await,
+            Status::OBJECT_NAME_INVALID,
+        );
+    }
     let (file, action) = fs
         .open("data", options(CreateDisposition::CREATE, false), &request)
         .await
@@ -1085,6 +1092,9 @@ pub async fn rename_namespace_and_replacement<F: Fixture>(fixture: &F) {
     write_all(fs, &source, 0, b"source", &request).await;
     write_all(fs, &target, 0, b"target", &request).await;
     for (name, replace, status) in [
+        ("bad*", false, Status::OBJECT_NAME_INVALID),
+        ("bad?", false, Status::OBJECT_NAME_INVALID),
+        ("bad\"", false, Status::OBJECT_NAME_INVALID),
         ("target", false, Status::OBJECT_NAME_COLLISION),
         ("target", true, Status::ACCESS_DENIED),
         ("renamed", true, Status::ACCESS_DENIED),

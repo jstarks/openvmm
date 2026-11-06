@@ -286,7 +286,11 @@ fn components(name: &str) -> Result<Vec<&str>, Status> {
     if parts.iter().any(|s| *s == "." || *s == "..") {
         return Err(Status::OBJECT_PATH_SYNTAX_BAD);
     }
-    if parts.iter().any(|s| s.contains('\0')) {
+    if parts.iter().any(|part| {
+        part.chars().any(|character| {
+            character < ' ' || matches!(character, '"' | '|' | '<' | '>' | '*' | '?')
+        })
+    }) {
         return Err(Status::OBJECT_NAME_INVALID);
     }
     if parts
@@ -1104,13 +1108,7 @@ impl FileSystem for MemoryFs {
             return Err(Status::NAME_TOO_LONG);
         }
         let parts = components(name)?;
-        if name.ends_with('\\')
-            || parts.is_empty()
-            || parts.iter().any(|part| {
-                part.chars()
-                    .any(|c| c <= '\u{1f}' || matches!(c, '"' | '|' | '<' | '>' | '*' | '?'))
-            })
-        {
+        if name.ends_with('\\') || parts.is_empty() {
             return Err(Status::OBJECT_NAME_INVALID);
         }
         let mut state = self.0.lock();

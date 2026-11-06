@@ -459,14 +459,14 @@ fn malformed_chains_and_mixed_styles_are_rejected_before_filesystem_effects() {
             response_status(responses(&response)[0]),
             Status::INVALID_PARAMETER
         );
-        // The following ECHO body begins with UTF-16 U+0004. It is not CREATE data.
+        // The following ECHO body begins with U+0004, which is not a valid filename.
         assert_eq!(
             response_status(
                 &client
                     .open_result("\u{4}", 1, 7, CreateDisposition::OPEN.0, 0)
                     .await
             ),
-            Status::OBJECT_NAME_NOT_FOUND
+            Status::OBJECT_NAME_INVALID
         );
         let unused = client.message;
         let oversized = packet(

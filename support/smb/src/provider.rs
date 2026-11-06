@@ -283,6 +283,7 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     type File: Send + Sync;
 
     /// Open an object and return its handle and SMB create-action value.
+    /// Validate filename components before publishing a new object (MS-FSCC §2.1.5.2).
     async fn open(
         &self,
         name: &str,

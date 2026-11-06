@@ -2678,6 +2678,13 @@ impl<B: FileSystem> Connection<B> {
             request.name_offset.get() as usize,
             request.name_length.get() as usize,
         )?)?;
+        let file = self.file(request.file_id, tree, context)?;
+        if !file.is_directory {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if !file.access.read_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
         let class = FileInformationClass(request.info_class);
         let fixed = match class {
             FileInformationClass::DIRECTORY => size_of::<FileDirectoryInformation>(),
@@ -2686,13 +2693,16 @@ impl<B: FileSystem> Connection<B> {
             FileInformationClass::NAMES => size_of::<FileNamesInformation>(),
             FileInformationClass::ID_BOTH_DIRECTORY => size_of::<FileIdBothDirectoryInformation>(),
             FileInformationClass::ID_FULL_DIRECTORY => size_of::<FileIdFullDirectoryInformation>(),
-            _ => return Err(Status::NOT_SUPPORTED),
+            FileInformationClass::ID_EXTD_DIRECTORY
+            | FileInformationClass::ID64_EXTD_DIRECTORY
+            | FileInformationClass::ID64_EXTD_BOTH_DIRECTORY
+            | FileInformationClass::ID_ALL_EXTD_DIRECTORY
+            | FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY => {
+                return Err(Status::NOT_SUPPORTED);
+            }
+            _ => return Err(Status::INVALID_INFO_CLASS),
         };
         let flags = request.flags;
-        let file = self.file(request.file_id, tree, context)?;
-        if !file.access.read_data() {
-            return Err(Status::ACCESS_DENIED);
-        }
         let first = file.directory.lock().is_none();
         let restart = first || flags.restart_scans() || flags.reopen();
         if restart {

@@ -62,6 +62,11 @@ open_enum! {
         ATTRIBUTE_TAG = 35,
         ID_BOTH_DIRECTORY = 37,
         ID_FULL_DIRECTORY = 38,
+        ID_EXTD_DIRECTORY = 60,
+        ID64_EXTD_DIRECTORY = 78,
+        ID64_EXTD_BOTH_DIRECTORY = 79,
+        ID_ALL_EXTD_DIRECTORY = 80,
+        ID_ALL_EXTD_BOTH_DIRECTORY = 81,
     }
 }
 

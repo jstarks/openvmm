@@ -1401,6 +1401,67 @@ fn directory_continuation_observes_live_entries_and_preserves_its_pattern() {
 }
 
 #[test]
+fn directory_queries_distinguish_invalid_classes_optional_classes_and_file_handles() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("ordinary", 2, 0).await;
+        let root = client.open("", 1, 1).await;
+        let mut query = QueryDirectoryRequest::new_zeroed();
+        query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+        query.info_class = FileInformationClass::NAMES.0;
+        query.file_id = file;
+        query.output_buffer_length = 256.into();
+        for reopen in [false, true] {
+            query.flags.set_reopen(reopen);
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(Command::QUERY_DIRECTORY, query.as_bytes())
+                        .await
+                ),
+                Status::INVALID_PARAMETER,
+            );
+        }
+        query.flags = QueryDirectoryFlags::new();
+        query.file_id = root;
+        for class in [0, 4, 50, 59, 63, 255] {
+            query.info_class = class;
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(Command::QUERY_DIRECTORY, query.as_bytes())
+                        .await
+                ),
+                Status::INVALID_INFO_CLASS,
+            );
+        }
+        for class in [60, 78, 79, 80, 81] {
+            query.info_class = class;
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(Command::QUERY_DIRECTORY, query.as_bytes())
+                        .await
+                ),
+                Status::NOT_SUPPORTED,
+            );
+        }
+        query.info_class = FileInformationClass::NAMES.0;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::QUERY_DIRECTORY, query.as_bytes())
+                    .await
+            ),
+            Status::SUCCESS,
+        );
+        client.close(file).await;
+        client.close(root).await;
+    });
+}
+
+#[test]
 fn directory_buffers_distinguish_prefix_overflow_and_exact_unpadded_records() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

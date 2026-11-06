@@ -364,10 +364,12 @@ pub struct CreateOptions {
     #[bits(1)]
     other0: u8,
     pub complete_if_oplocked: bool,
-    #[bits(3)]
+    pub no_ea_knowledge: bool,
+    #[bits(2)]
     other1: u8,
     pub delete_on_close: bool,
-    #[bits(10)]
+    pub open_by_file_id: bool,
+    #[bits(9)]
     other2: u32,
     pub open_for_free_space_query: bool,
     #[bits(8)]
@@ -447,6 +449,11 @@ open_enum! {
 }
 /// SMB2_SESSION_FLAG_IS_GUEST: [MS-SMB2] §2.2.6.
 pub const SESSION_FLAG_IS_GUEST: u16 = 1;
+
+/// SMB2_CREATECONTEXT_RESERVED, ignored on receipt: [MS-SMB2] §2.2.13.2.
+pub const RESERVED_CREATE_CONTEXT_NAME: [u8; 16] = [
+    0x93, 0xad, 0x25, 0x50, 0x9c, 0xb4, 0x11, 0xe7, 0xb4, 0x23, 0x83, 0xde, 0x96, 0x8b, 0xcd, 0x7c,
+];
 
 /// Four-byte CREATE context identifiers: [MS-SMB2] §2.2.13.2.
 #[repr(transparent)]

@@ -1901,6 +1901,9 @@ impl<B: FileSystem> Connection<B> {
         let mut security = None;
         let mut extended_attributes = None;
         for context in contexts {
+            if context.name == RESERVED_CREATE_CONTEXT_NAME {
+                continue;
+            }
             if !names.insert(context.name) {
                 return Err(Status::INVALID_PARAMETER);
             }
@@ -1957,6 +1960,12 @@ impl<B: FileSystem> Connection<B> {
             .with_synchronous_io_alert(false)
             .with_synchronous_io_nonalert(false)
             .with_open_for_free_space_query(false);
+        if options.open_by_file_id() {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        if options.no_ea_knowledge() && extended_attributes.is_some() {
+            return Err(Status::ACCESS_DENIED);
+        }
         if request.impersonation_level.get() > ImpersonationLevel::DELEGATE.0 {
             return Err(Status::BAD_IMPERSONATION_LEVEL);
         }

@@ -695,6 +695,10 @@ ignores CREATE's non-settable REPARSE_POINT attribute.
 CREATE rejects undefined attribute bits and leading-backslash names with
 INVALID_PARAMETER before invoking the provider. Invalid impersonation values
 return BAD_IMPERSONATION_LEVEL; all four defined levels remain accepted.
+FILE_OPEN_BY_FILE_ID returns NOT_SUPPORTED, and FILE_NO_EA_KNOWLEDGE combined
+with an EA-buffer context returns ACCESS_DENIED, before provider calls.
+The specifically reserved CREATE context is ignored after framing validation;
+it does not prevent processing other contexts.
 
 MemoryFs deliberately has no EAs or named streams and advertises neither.
 Full-EA/stream queries return INVALID_INFO_CLASS; EA-content queries/sets check

@@ -5,6 +5,116 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn create_file_id_and_no_ea_knowledge_options_fail_before_provider_calls() {
+    use crate::test_support::ControlledFs;
+    block_on(async {
+        let (backend, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", backend).unwrap();
+        let mut client = Client::new(&server).await;
+        let existing = client.open("existing", 2, 0).await;
+        client.close(existing).await;
+        let calls = control.calls().len();
+        let ea = contexts(&[(
+            CreateContextName::EA_BUFFER,
+            &[0, 0, 0, 0, 0, 1, 0, 0, b'A', 0],
+        )]);
+        for (name, disposition) in [("new", 2), ("existing", 1), ("existing", 4)] {
+            for (options, contexts, expected) in [
+                (0x2000, &[][..], Status::NOT_SUPPORTED),
+                (0x200, ea.as_slice(), Status::ACCESS_DENIED),
+            ] {
+                let body = create_body(
+                    name,
+                    AccessMask::FILE_ALL_ACCESS.into_bits(),
+                    7,
+                    disposition,
+                    options,
+                    contexts,
+                );
+                assert_eq!(
+                    response_status(&client.send(Command::CREATE, &body).await),
+                    expected
+                );
+                assert_eq!(control.calls().len(), calls);
+            }
+        }
+    });
+}
+
+#[test]
+fn reserved_create_context_is_ignored_without_skipping_framing_or_known_contexts() {
+    use crate::test_support::ControlledFs;
+    block_on(async {
+        let (backend, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", backend).unwrap();
+        let mut client = Client::new(&server).await;
+        let header = CreateContextHeader {
+            name_offset: 16.into(),
+            name_length: 16.into(),
+            data_offset: 32.into(),
+            ..CreateContextHeader::new_zeroed()
+        };
+        let mut reserved = header.as_bytes().to_vec();
+        reserved.extend_from_slice(&[
+            0x93, 0xad, 0x25, 0x50, 0x9c, 0xb4, 0x11, 0xe7, 0xb4, 0x23, 0x83, 0xde, 0x96, 0x8b,
+            0xcd, 0x7c,
+        ]);
+        let mut malformed = reserved.clone();
+        CreateContextHeader::mut_from_prefix(&mut malformed)
+            .unwrap()
+            .0
+            .next = 1.into();
+        let body = create_body(
+            "reserved",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            2,
+            0,
+            &malformed,
+        );
+        assert_eq!(
+            response_status(&client.send(Command::CREATE, &body).await),
+            Status::INVALID_PARAMETER
+        );
+        assert!(control.calls().is_empty());
+        for repetitions in [1, 2] {
+            let mut data = reserved.repeat(repetitions);
+            if repetitions == 2 {
+                CreateContextHeader::mut_from_prefix(&mut data)
+                    .unwrap()
+                    .0
+                    .next = 32.into();
+            }
+            let mut previous = Some((repetitions - 1) * 32);
+            append_create_context(
+                &mut data,
+                &mut previous,
+                CreateContextName::QUERY_MAXIMAL_ACCESS,
+                &[],
+            );
+            let name = format!("reserved-{repetitions}");
+            let body = create_body(
+                &name,
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                7,
+                2,
+                0,
+                &data,
+            );
+            let response = client.ok(Command::CREATE, &body).await;
+            let returned = returned_contexts(&response);
+            assert_eq!(returned.len(), 1);
+            assert_eq!(
+                returned[0].name(),
+                Some(CreateContextName::QUERY_MAXIMAL_ACCESS)
+            );
+            let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
 fn replacement_checks_attributes_before_truncation_and_applies_requested_attributes() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

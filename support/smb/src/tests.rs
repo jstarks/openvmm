@@ -1041,7 +1041,7 @@ fn malformed_creates_and_traversal_are_rejected() {
         let mut client = Client::new(&server).await;
         for (name, status) in [
             ("..\\escape", Status::OBJECT_PATH_SYNTAX_BAD),
-            ("\\rooted", Status::OBJECT_PATH_SYNTAX_BAD),
+            ("\\rooted", Status::INVALID_PARAMETER),
             ("a/../b", Status::OBJECT_NAME_INVALID),
             ("file:stream", Status::OBJECT_NAME_INVALID),
         ] {

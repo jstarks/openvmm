@@ -5,6 +5,52 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn create_rejects_invalid_attributes_paths_and_impersonation_before_provider_calls() {
+    use crate::test_support::ControlledFs;
+    block_on(async {
+        let (backend, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", backend).unwrap();
+        let mut client = Client::new(&server).await;
+        for (name, attributes, impersonation, status) in [
+            ("invalid", 0x08, 0, Status::INVALID_PARAMETER),
+            ("invalid", 0x40, 0, Status::INVALID_PARAMETER),
+            ("invalid", 0x80000000, 0, Status::INVALID_PARAMETER),
+            ("invalid", 0, 4, Status::BAD_IMPERSONATION_LEVEL),
+            ("invalid", 0, u32::MAX, Status::BAD_IMPERSONATION_LEVEL),
+            ("\\invalid", 0, 0, Status::INVALID_PARAMETER),
+            ("\\\\invalid", 0, 0, Status::INVALID_PARAMETER),
+        ] {
+            let mut body = create_body(name, AccessMask::FILE_ALL_ACCESS.into_bits(), 7, 2, 0, &[]);
+            let (request, _) = CreateRequest::mut_from_prefix(&mut body).unwrap();
+            request.file_attributes = FileAttributes::from_bits(attributes);
+            request.impersonation_level = impersonation.into();
+            let response = client.send(Command::CREATE, &body).await;
+            assert_eq!(response_status(&response), status);
+            assert!(control.calls().is_empty());
+        }
+        for impersonation in 0..=3u32 {
+            let mut body = create_body(
+                "invalid",
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                7,
+                3,
+                0,
+                &[],
+            );
+            let (request, _) = CreateRequest::mut_from_prefix(&mut body).unwrap();
+            request.impersonation_level = impersonation.into();
+            let response = client.ok(Command::CREATE, &body).await;
+            let created = read_body::<CreateResponse>(&response).unwrap();
+            assert_eq!(
+                created.create_action.get(),
+                if impersonation == 0 { 2 } else { 1 }
+            );
+            client.close(created.file_id).await;
+        }
+    });
+}
+
+#[test]
 fn execute_only_permits_reads_without_granting_directory_enumeration() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

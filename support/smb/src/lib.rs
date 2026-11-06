@@ -1890,10 +1890,14 @@ impl<B: FileSystem> Connection<B> {
             .with_synchronous_io_alert(false)
             .with_synchronous_io_nonalert(false)
             .with_open_for_free_space_query(false);
-        if !request.disposition().is_valid()
+        if request.impersonation_level.get() > ImpersonationLevel::DELEGATE.0 {
+            return Err(Status::BAD_IMPERSONATION_LEVEL);
+        }
+        if name.starts_with('\\')
+            || !request.file_attributes.is_valid()
+            || !request.disposition().is_valid()
             || !request.share_access.is_valid()
             || (options.directory_file() && options.non_directory_file())
-            || request.impersonation_level.get() > ImpersonationLevel::DELEGATE.0
         {
             return Err(Status::INVALID_PARAMETER);
         }

@@ -87,6 +87,7 @@ open_enum! {
         DISK_FULL = 0xc000007f,
         RANGE_NOT_LOCKED = 0xc000007e,
         INSUFFICIENT_RESOURCES = 0xc000009a,
+        BAD_IMPERSONATION_LEVEL = 0xc00000a5,
         FILE_IS_A_DIRECTORY = 0xc00000ba,
         NOT_SUPPORTED = 0xc00000bb,
         BAD_NETWORK_NAME = 0xc00000cc,

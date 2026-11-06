@@ -46,6 +46,30 @@ fn samba_read_write_smoke() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_create_and_sharing() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.create.brlocked",
+            "smb2.create.multi",
+            "smb2.create.delete",
+            "smb2.create.leading-slash",
+            "smb2.create.impersonation",
+            "smb2.create.mkdir-dup",
+            "smb2.create.mkdir-visible",
+            "smb2.create.dir-alloc-size",
+            "smb2.create.dosattr_tmp_dir",
+            "smb2.create_no_streams.no_stream",
+            "smb2.sharemode.sharemode-access",
+            "smb2.sharemode.access-sharemode",
+            "smb2.sharemode.bug14375",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_directory() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

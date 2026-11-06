@@ -129,6 +129,13 @@ pub struct FileAttributes {
 }
 le_bitfield_conversions!(FileAttributes, u32, U32);
 
+impl FileAttributes {
+    /// Whether all bits are defined by [MS-FSCC] §2.6.
+    pub fn is_valid(self) -> bool {
+        self.into_bits() & !0x005effb7 == 0
+    }
+}
+
 /// Filesystem attributes: [MS-FSCC] §2.5.1.
 #[bitfield(u32, repr = U32, from = U32::new, into = super::u32_from_le, conversion = false)]
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]

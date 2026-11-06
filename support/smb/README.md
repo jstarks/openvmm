@@ -60,6 +60,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_notif
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lock)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_rename)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_directory)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
     -E 'test(samba_notify_corrected_client)'
@@ -73,6 +74,10 @@ per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests driv
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
 The harness also checks compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
+The CREATE/sharing harness adds thirteen cases covering locked-file opens,
+multiple connections, readonly deletion, leading-backslash rejection, invalid
+impersonation, concurrent/visible directory creation, directory allocation,
+temporary attributes, the no-stream profile and bilateral share modes.
 The feature-enabled async harness gates real provider reads, writes, and
 flushes on the server's poller. Its four async compound cases include READ/WRITE
 checks requiring pending replies, rather than only allowing synchronous fallback.
@@ -618,6 +623,9 @@ does not generate 8.3 aliases.
 FileAttributeTagInformation reports provider attributes and reparse tags with
 READ_ATTRIBUTES and fixed-buffer checks. MemoryFs has no reparse objects and
 ignores CREATE's non-settable REPARSE_POINT attribute.
+CREATE rejects undefined attribute bits and leading-backslash names with
+INVALID_PARAMETER before invoking the provider. Invalid impersonation values
+return BAD_IMPERSONATION_LEVEL; all four defined levels remain accepted.
 
 MemoryFs deliberately has no EAs or named streams and advertises neither.
 Full-EA/stream queries return INVALID_INFO_CLASS; EA-content queries/sets check

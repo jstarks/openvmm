@@ -165,6 +165,11 @@ pub struct OpenOptions<'a> {
     pub options: u32,
     /// Requested Windows file attributes.
     pub attributes: u32,
+    /// Allocation hint for a created or replaced data stream, without extending EOF.
+    /// Existing OPEN/OPEN_IF objects and directory objects ignore this value.
+    /// Supporting stores reserve atomically before publication or truncation;
+    /// unsupported stores may ignore the hint as permitted by MS-SMB2 §3.3.5.9.3.
+    pub allocation_size: u64,
     /// Optional self-relative DTYP descriptor, applied atomically only on creation.
     /// Ignore it for existing objects, including malformed bytes. New-object
     /// validation must finish before publication; unsupported policy must fail.

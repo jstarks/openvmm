@@ -27,6 +27,7 @@ impl Fixture for MemoryFixture {
         Expectations {
             filesystem_information: Feature::Supported,
             allocation: Feature::Supported,
+            creation_allocation: true,
             file_mode: Feature::Supported,
             security_queries: Feature::Supported,
             file_acl_updates: Feature::Supported,
@@ -85,6 +86,7 @@ impl ControlledFixture {
             expectations: Expectations {
                 filesystem_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 allocation: Feature::Unsupported(Status::NOT_SUPPORTED),
+                creation_allocation: true,
                 file_mode: Feature::Unsupported(Status::NOT_SUPPORTED),
                 security_queries: Feature::Unsupported(Status::NOT_SUPPORTED),
                 file_acl_updates: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -285,6 +287,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
         expectations: Expectations {
             filesystem_information: Feature::Supported,
             allocation: Feature::Supported,
+            creation_allocation: true,
             file_mode: Feature::Supported,
             security_queries: Feature::Supported,
             file_acl_updates: Feature::Supported,

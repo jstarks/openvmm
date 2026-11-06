@@ -1900,6 +1900,7 @@ impl<B: FileSystem> Connection<B> {
         let mut disk_id = false;
         let mut security = None;
         let mut extended_attributes = None;
+        let mut allocation_size = 0;
         for context in contexts {
             if context.name == RESERVED_CREATE_CONTEXT_NAME {
                 continue;
@@ -1924,11 +1925,17 @@ impl<B: FileSystem> Connection<B> {
                 Some(CreateContextName::QUERY_ON_DISK_ID) if context.data.is_empty() => {
                     disk_id = true
                 }
-                // The object store does not grant durable handles, leases, or preallocation.
+                // The object store does not grant durable handles or leases.
                 Some(CreateContextName::DURABLE_HANDLE_REQUEST)
                     if context.data.len() == size_of::<DurableHandleRequest>() => {}
                 Some(CreateContextName::ALLOCATION_SIZE)
-                    if context.data.len() == size_of::<AllocationSizeContext>() => {}
+                    if context.data.len() == size_of::<AllocationSizeContext>() =>
+                {
+                    allocation_size = AllocationSizeContext::read_from_bytes(context.data)
+                        .map_err(|_| Status::INVALID_PARAMETER)?
+                        .allocation_size
+                        .get();
+                }
                 Some(CreateContextName::REQUEST_LEASE) => {}
                 Some(CreateContextName::EA_BUFFER) => extended_attributes = Some(context.data),
                 Some(CreateContextName::SECURITY_DESCRIPTOR) => security = Some(context.data),
@@ -2013,6 +2020,7 @@ impl<B: FileSystem> Connection<B> {
                     disposition: request.create_disposition.get(),
                     options: options.into_bits(),
                     attributes: request.file_attributes.into_bits(),
+                    allocation_size,
                     security,
                     extended_attributes,
                 },

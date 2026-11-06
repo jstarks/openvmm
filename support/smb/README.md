@@ -124,6 +124,8 @@ tests on their own executor. Each invocation needs a fresh, empty, isolated,
 writable filesystem; the fixture owns any native driver and temporary resources.
 Declare filesystem-information, allocation, file-mode, basic-information,
 rename, locking, and notification expectations explicitly.
+Creation-allocation expectations are independent from SET_ALLOCATION support;
+declare explicitly whether the provider honors or ignores creation hints.
 Unexpected unsupported errors fail; an unsupported profile exercises rejection
 rather than silently skipping a test. These are test expectations, not runtime
 SMB capability advertisement. Read-only providers will need separate scenarios
@@ -685,8 +687,12 @@ Supported commands are NEGOTIATE, SESSION_SETUP, LOGOFF, TREE_CONNECT,
 TREE_DISCONNECT, CREATE, CLOSE, FLUSH, READ, WRITE, LOCK, QUERY_DIRECTORY, CHANGE_NOTIFY, and a
 subset of QUERY_INFO/SET_INFO, plus ECHO. CREATE validates linked context
 containers and returns maximal-access (`MxAc`) and on-disk-ID (`QFid`) responses.
-Unsupported preallocation, durable-handle requests, and leases are explicitly
-declined without response contexts. EA creation returns `STATUS_EAS_NOT_SUPPORTED`;
+CREATE allocation (`AlSi`) reaches the provider open. MemoryFs reserves space
+without extending EOF, including replacement opens, and fails quota checks
+before publication or truncation. Ordinary existing-object opens and directory
+creation ignore the hint. Durable-handle requests and leases are accepted
+without granting those features or returning response contexts.
+EA creation returns `STATUS_EAS_NOT_SUPPORTED`;
 snapshots remain unsupported; security descriptors are applied atomically on creation.
 
 Basic-information updates support DOS attributes and per-open timestamp

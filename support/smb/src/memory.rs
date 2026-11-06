@@ -700,9 +700,7 @@ fn settable_attributes() -> FileAttributes {
         .with_not_content_indexed(true)
 }
 
-fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
-    let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
-    let old_len = node.data.len();
+fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usize, Status> {
     let new_bytes = state
         .bytes
         .checked_sub(old_len)
@@ -711,6 +709,18 @@ fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status
     if new_bytes > state.byte_limit {
         return Err(Status::DISK_FULL);
     }
+    Ok(new_bytes)
+}
+
+fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
+    let old_len = state
+        .nodes
+        .get(&node_id)
+        .ok_or(Status::FILE_CLOSED)?
+        .data
+        .len();
+    let new_bytes = allocation_charge(state, old_len, length)?;
+    let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
     if length > old_len {
         node.data
             .try_reserve_exact(length - old_len)
@@ -1000,8 +1010,12 @@ impl FileSystem for MemoryFs {
                 .with_not_content_indexed(false)
                 .into_bits();
                 let attributes_changed = attributes != node.metadata.attributes;
-                allocate(&mut state, id, 0)?;
+                let allocation =
+                    usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?;
+                allocate(&mut state, id, allocation)?;
                 let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
+                node.data.fill(0);
+                node.metadata.size = 0;
                 node.metadata.attributes = attributes;
                 node.metadata.written = nt_time();
                 node.metadata.changed = node.metadata.written;
@@ -1063,7 +1077,17 @@ impl FileSystem for MemoryFs {
                 )?,
             };
             let id = state.next_id;
-            state.next_id = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
+            let next_id = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
+            let allocation = if directory {
+                0
+            } else {
+                usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?
+            };
+            let new_bytes = allocation_charge(&state, 0, allocation)?;
+            let mut data = Vec::new();
+            data.try_reserve_exact(allocation)
+                .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
+            data.resize(allocation, 0);
             let now = nt_time();
             let attributes =
                 FileAttributes::from_bits(options.attributes & settable_attributes().into_bits())
@@ -1093,7 +1117,7 @@ impl FileSystem for MemoryFs {
                         written: now,
                         changed: now,
                         size: 0,
-                        allocation_size: 0,
+                        allocation_size: allocation as u64,
                         number_of_links: 1,
                         extended_attributes_length: 0,
                         alignment_requirement: 0,
@@ -1102,9 +1126,11 @@ impl FileSystem for MemoryFs {
                         granted_access: 0,
                     },
                     parent,
-                    data: Vec::new(),
+                    data,
                 },
             );
+            state.next_id = next_id;
+            state.bytes = new_bytes;
             emit(&mut state, id, NotifyAction::ADDED, name_filter(directory));
             (id, CreateAction::CREATED.0)
         };
@@ -2051,6 +2077,7 @@ mod tests {
                 attributes: 0,
                 security: Some(encoded.as_slice()),
                 extended_attributes: None,
+                allocation_size: 0,
             };
             let (directory, _) = fs.open("explicit", options, &context).await.unwrap();
             let actual = fs
@@ -2191,6 +2218,7 @@ mod tests {
             Expectations {
                 filesystem_information: Feature::Supported,
                 allocation: Feature::Supported,
+                creation_allocation: true,
                 file_mode: Feature::Supported,
                 security_queries: Feature::Supported,
                 file_acl_updates: Feature::Supported,
@@ -2345,6 +2373,7 @@ mod tests {
                 attributes: 0,
                 security: None,
                 extended_attributes: None,
+                allocation_size: 0,
             };
             let (source, _) = fs.open("source", options, &request).await.unwrap();
             let (target, _) = fs.open("target", options, &request).await.unwrap();
@@ -2446,6 +2475,7 @@ mod tests {
                 attributes: 0,
                 security: None,
                 extended_attributes: None,
+                allocation_size: 0,
             };
             let (watched, _) = fs.open("generation", options, &context).await.unwrap();
             let (deleting, _) = fs.open("generation", options, &context).await.unwrap();
@@ -2538,6 +2568,7 @@ mod tests {
                 attributes: 0,
                 security: None,
                 extended_attributes: None,
+                allocation_size: 0,
             };
             let filter = NotifyFilter::new().with_file_name(true);
             let mut opens = Vec::new();
@@ -2578,6 +2609,7 @@ mod tests {
                 attributes: 0,
                 security: None,
                 extended_attributes: None,
+                allocation_size: 0,
             };
             let (first, _) = fs.open("first", options, &request).await.unwrap();
             fs.write(&first, 0, &[1; 64], &request).await.unwrap();

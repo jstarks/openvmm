@@ -5,6 +5,130 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn create_allocation_reserves_atomically_without_extending_eof() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(32, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let allocation =
+            |size: u64| contexts(&[(CreateContextName::ALLOCATION_SIZE, &size.to_le_bytes())]);
+        let body = create_body(
+            "allocated",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            2,
+            0,
+            &allocation(16),
+        );
+        let response = client.ok(Command::CREATE, &body).await;
+        let created = read_body::<CreateResponse>(&response).unwrap();
+        assert_eq!(
+            (created.end_of_file.get(), created.allocation_size.get()),
+            (0, 16)
+        );
+        let file = created.file_id;
+        assert_eq!(
+            response_status(&client.read(file, 0, 1).await),
+            Status::END_OF_FILE
+        );
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"before"))
+            .await;
+        let body = create_body(
+            "allocated",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            1,
+            0,
+            &allocation(64),
+        );
+        let response = client.ok(Command::CREATE, &body).await;
+        let existing = read_body::<CreateResponse>(&response).unwrap();
+        assert_eq!(
+            (existing.end_of_file.get(), existing.allocation_size.get()),
+            (6, 16)
+        );
+        client.close(existing.file_id).await;
+        let body = create_body(
+            "failed",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            2,
+            0,
+            &allocation(33),
+        );
+        assert_eq!(
+            response_status(&client.send(Command::CREATE, &body).await),
+            Status::DISK_FULL
+        );
+        assert_eq!(
+            response_status(&client.open_result("failed", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        for disposition in [0, 4, 5] {
+            let body = create_body(
+                "allocated",
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                7,
+                disposition,
+                0,
+                &allocation(33),
+            );
+            assert_eq!(
+                response_status(&client.send(Command::CREATE, &body).await),
+                Status::DISK_FULL
+            );
+            assert_eq!(&client.read(file, 0, 6).await[80..], b"before");
+            let standard = client.query(file, FileInformationClass::STANDARD.0).await;
+            let standard = FileStandardInformation::read_from_bytes(&standard[72..]).unwrap();
+            assert_eq!(
+                (standard.end_of_file.get(), standard.allocation_size.get()),
+                (6, 16)
+            );
+        }
+        let body = create_body(
+            "allocated",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            4,
+            0,
+            &allocation(24),
+        );
+        let response = client.ok(Command::CREATE, &body).await;
+        let overwritten = read_body::<CreateResponse>(&response).unwrap();
+        assert_eq!(
+            (
+                overwritten.end_of_file.get(),
+                overwritten.allocation_size.get()
+            ),
+            (0, 24)
+        );
+        let response = client
+            .set(
+                file,
+                FileInformationClass::END_OF_FILE.0,
+                &6u64.to_le_bytes(),
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        assert_eq!(&client.read(file, 0, 6).await[80..], &[0; 6]);
+        client.close(overwritten.file_id).await;
+        client.close(file).await;
+        let body = create_body(
+            "directory",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            2,
+            1,
+            &allocation(1024),
+        );
+        let response = client.ok(Command::CREATE, &body).await;
+        let directory = read_body::<CreateResponse>(&response).unwrap();
+        assert_eq!(directory.allocation_size.get(), 0);
+        client.close(directory.file_id).await;
+    });
+}
+
+#[test]
 fn create_file_id_and_no_ea_knowledge_options_fail_before_provider_calls() {
     use crate::test_support::ControlledFs;
     block_on(async {
@@ -595,13 +719,20 @@ fn create_context_queries_return_stable_ids_and_backend_maximal_access() {
         let data = contexts(&[
             (CreateContextName::QUERY_ON_DISK_ID, &[]),
             (CreateContextName::DURABLE_HANDLE_REQUEST, &[0; 16]),
-            (CreateContextName::ALLOCATION_SIZE, &u64::MAX.to_le_bytes()),
+            (CreateContextName::ALLOCATION_SIZE, &8u64.to_le_bytes()),
             (CreateContextName::QUERY_MAXIMAL_ACCESS, &[]),
         ]);
         let packet = client
             .ok(Command::CREATE, &create_body("file", 0x81, 7, 2, 0, &data))
             .await;
         let id = FileId::read_from_bytes(&packet[128..144]).unwrap();
+        assert_eq!(
+            read_body::<CreateResponse>(&packet)
+                .unwrap()
+                .allocation_size
+                .get(),
+            8
+        );
         let contexts = returned_contexts(&packet);
         assert_eq!(contexts.len(), 2);
         let maximal = MaximalAccessResponse::read_from_bytes(

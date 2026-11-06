@@ -538,6 +538,7 @@ fn security_update_gates_preserve_cancellation_and_backend_rejection() {
                     attributes: 0,
                     security: None,
                     extended_attributes: None,
+                    allocation_size: 0,
                 },
                 &context,
             )
@@ -751,6 +752,7 @@ fn late_security_update_cancellation_retains_applied_policy() {
             attributes: 0,
             security: None,
             extended_attributes: None,
+            allocation_size: 0,
         };
         let (file, _) = fs.open("acl", options, &context).await.unwrap();
         control
@@ -900,6 +902,7 @@ fn creation_security_gates_keep_new_object_policy_set_before_result_delivery() {
             attributes: 0,
             security: Some(&bytes),
             extended_attributes: None,
+            allocation_size: 0,
         };
         let context = RequestContext::new(1);
         let mut future = std::pin::pin!(fs.open("secured", options, &context));

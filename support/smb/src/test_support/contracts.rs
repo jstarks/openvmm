@@ -41,6 +41,8 @@ pub struct Expectations {
     pub filesystem_information: Feature,
     /// Allocation reservations, including zero-size truncation.
     pub allocation: Feature,
+    /// Honor creation allocation hints; false explicitly models ignored hints.
+    pub creation_allocation: bool,
     /// Per-open I/O mode updates.
     pub file_mode: Feature,
     /// Basic owner/group/DACL descriptor queries.
@@ -104,6 +106,7 @@ fn options(disposition: CreateDisposition, directory: bool) -> OpenOptions<'stat
             .with_directory_file(directory)
             .into_bits(),
         attributes: 0,
+        allocation_size: 0,
         security: None,
         extended_attributes: None,
     }
@@ -805,6 +808,26 @@ pub async fn allocation_reservations<F: Fixture>(fixture: &F) {
     let fs = fixture.filesystem();
     let request = RequestContext::new(1);
     let file = open(fs, "reserved", CreateDisposition::CREATE, false, &request).await;
+    let empty_allocation = fs.metadata(&file, &request).await.unwrap().allocation_size;
+    let (created, _) = fs
+        .open(
+            "creation-reserved",
+            OpenOptions {
+                allocation_size: 32,
+                ..options(CreateDisposition::CREATE, false)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let metadata = fs.metadata(&created, &request).await.unwrap();
+    assert_eq!(metadata.size, 0);
+    if fixture.expectations().creation_allocation {
+        assert!(metadata.allocation_size >= 32);
+    } else {
+        assert_eq!(metadata.allocation_size, empty_allocation);
+    }
+    fs.close(&created, &request).await.unwrap();
     write_all(fs, &file, 0, b"data", &request).await;
     if let Some(status) = unsupported(fixture.expectations().allocation) {
         rejected(fs.set_allocation_size(&file, 32, &request).await, status);

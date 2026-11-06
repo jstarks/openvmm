@@ -152,8 +152,11 @@ pub struct FileSystemAttributes {
     pub case_preserved_names: bool,
     pub unicode_on_disk: bool,
     pub persistent_acls: bool,
-    #[bits(14)]
+    #[bits(12)]
     other0: u16,
+    pub supports_object_ids: bool,
+    #[bits(1)]
+    other_object: u8,
     pub named_streams: bool,
     #[bits(4)]
     other1: u8,
@@ -364,6 +367,23 @@ wire!(
         end_of_file: U64,
         file_attributes: FileAttributes,
         reserved: U32,
+    }
+);
+wire!(
+    /// FILE_OBJECTID_BUFFER Type 1: [MS-FSCC] §2.1.3.1.
+    FileObjectIdBuffer, 64 {
+        object_id: [u8; 16],
+        birth_volume_id: [u8; 16],
+        birth_object_id: [u8; 16],
+        domain_id: [u8; 16],
+    }
+);
+wire!(
+    /// Object-ID extension input: [MS-FSCC] §2.3.79.
+    FileObjectIdExtendedInformation, 48 {
+        birth_volume_id: [u8; 16],
+        birth_object_id: [u8; 16],
+        domain_id: [u8; 16],
     }
 );
 wire!(

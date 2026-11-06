@@ -4,6 +4,213 @@
 use super::*;
 use test_with_tracing::test;
 
+fn object_id_ioctl(file: FileId, code: u32, maximum: u32) -> Vec<u8> {
+    let mut request = IoctlRequest::new_zeroed();
+    request.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+    request.file_id = file;
+    request.control_code = code.into();
+    request.flags = IoctlFlags::new().with_fsctl(true);
+    request.max_output_response = maximum.into();
+    request.as_bytes().to_vec()
+}
+
+fn object_id_ioctl_input(file: FileId, code: u32, input: &[u8]) -> Vec<u8> {
+    let mut bytes = object_id_ioctl(file, code, 0);
+    let request = IoctlRequest::mut_from_prefix(&mut bytes).unwrap().0;
+    request.input_offset = (body_end::<IoctlRequest>() as u32).into();
+    request.input_count = (input.len() as u32).into();
+    bytes.extend_from_slice(input);
+    bytes
+}
+
+#[test]
+fn object_id_mutations_enforce_collisions_bounds_and_extension_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("custom-object-id", 2, 0).await;
+        let other = client.open("other-object-id", 2, 0).await;
+        let mut data = vec![7; 16];
+        data.extend_from_slice(&[8; 16]);
+        data.extend_from_slice(&[9; 16]);
+        data.extend_from_slice(&[10; 16]);
+        for length in [0, 63, 65] {
+            let mut invalid = data.clone();
+            invalid.resize(length, 0);
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(
+                            Command::IOCTL,
+                            &object_id_ioctl_input(file, 0x90098, &invalid)
+                        )
+                        .await
+                ),
+                Status::INVALID_PARAMETER
+            );
+        }
+        client
+            .ok(Command::IOCTL, &object_id_ioctl_input(file, 0x90098, &data))
+            .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl_input(file, 0x90098, &data))
+                    .await
+            ),
+            Status::OBJECT_NAME_COLLISION
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::IOCTL,
+                        &object_id_ioctl_input(other, 0x90098, &data)
+                    )
+                    .await
+            ),
+            Status::DUPLICATE_NAME
+        );
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(file, 0x9009c, 64))
+                .await[112..],
+            data
+        );
+        let response = client
+            .open_result(
+                "custom-object-id",
+                AccessMask::new().with_read_data(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let restricted = read_body::<CreateResponse>(&response).unwrap().file_id;
+        for length in [47, 49] {
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(
+                            Command::IOCTL,
+                            &object_id_ioctl_input(file, 0x900bc, &vec![11; length])
+                        )
+                        .await
+                ),
+                Status::INVALID_PARAMETER
+            );
+        }
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::IOCTL,
+                        &object_id_ioctl_input(restricted, 0x900bc, &[11; 48])
+                    )
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x900bc, &[11; 48]),
+            )
+            .await;
+        let result = client
+            .ok(Command::IOCTL, &object_id_ioctl(file, 0x9009c, 64))
+            .await;
+        assert_eq!(&result[112..128], &[7; 16]);
+        assert_eq!(&result[128..], &[11; 48]);
+        for _ in 0..2 {
+            client
+                .ok(Command::IOCTL, &object_id_ioctl(restricted, 0x900a0, 0))
+                .await;
+        }
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl(file, 0x9009c, 64))
+                    .await
+            ),
+            Status::OBJECTID_NOT_FOUND
+        );
+        let recreated = client
+            .ok(Command::IOCTL, &object_id_ioctl(file, 0x900c0, 64))
+            .await;
+        assert_ne!(&recreated[112..128], &[7; 16]);
+        assert_eq!(&recreated[128..160], &[11; 32]);
+        assert_eq!(&recreated[160..], &[0; 16]);
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(other, 0x90098, &data),
+            )
+            .await;
+        for file in [restricted, file, other] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn object_id_controls_create_real_shared_file_identity_with_boundaries() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("object-id", 2, 0).await;
+        for code in [0x9009c, 0x900c0] {
+            for maximum in [0, 63] {
+                assert_eq!(
+                    response_status(
+                        &client
+                            .send(Command::IOCTL, &object_id_ioctl(file, code, maximum))
+                            .await
+                    ),
+                    Status::INVALID_PARAMETER
+                );
+            }
+        }
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl(file, 0x9009c, 64))
+                    .await
+            ),
+            Status(0xc00002f0)
+        );
+        let response = client
+            .ok(Command::IOCTL, &object_id_ioctl(file, 0x900c0, 64))
+            .await;
+        let object = response[112..].to_vec();
+        assert_eq!(object.len(), 64);
+        assert_ne!(&object[..16], &[0; 16]);
+        assert_eq!(&object[32..48], &object[..16]);
+        assert_eq!(&object[48..], &[0; 16]);
+        for path in ["object-id", "object-id:side"] {
+            let alias = client.open(path, 3, 0).await;
+            for code in [0x9009c, 0x900c0] {
+                assert_eq!(
+                    &client
+                        .ok(Command::IOCTL, &object_id_ioctl(alias, code, 64))
+                        .await[112..],
+                    object
+                );
+            }
+            client.close(alias).await;
+        }
+        let directory = client.open("object-directory", 2, 1).await;
+        let other = client
+            .ok(Command::IOCTL, &object_id_ioctl(directory, 0x900c0, 64))
+            .await;
+        assert_ne!(&other[112..128], &object[..16]);
+        assert_eq!(&other[128..144], &object[16..32]);
+        client.close(directory).await;
+        client.close(file).await;
+    });
+}
+
 #[test]
 fn ea_size_queries_do_not_require_ea_content_or_attribute_access() {
     block_on(async {
@@ -1982,7 +2189,7 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
             (
                 FileSystemInformationClass::ATTRIBUTE,
                 vec![
-                    6, 0, 132, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
+                    6, 0, 133, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
                     b'R', 0, b'Y', 0,
                 ],
             ),

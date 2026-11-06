@@ -7,7 +7,8 @@ use crate::codec::{align_up, decode_ea_list, encode_ea_list};
 use crate::provider::{
     BasicInformation, ByteRange, Change, CompressionInformation, ExtendedAttribute, FileControl,
     FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
-    OpenOptions, RequestContext, SectorSizeInformation, StreamInformation, VolumeObjectInformation,
+    ObjectIdInformation, OpenOptions, RequestContext, SectorSizeInformation, StreamInformation,
+    VolumeObjectInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
@@ -37,6 +38,7 @@ const LOCK_WAITER_LIMIT: usize = 1024;
 pub struct MemoryFs(Arc<Mutex<State>>);
 
 struct Node {
+    object_id: ObjectIdInformation,
     default_stream: u64,
     metadata: Metadata,
     security: SecurityDescriptor,
@@ -85,6 +87,7 @@ struct Watch {
 }
 
 struct State {
+    next_object_id: u64,
     created: u64,
     object_information: VolumeObjectInformation,
     nodes: BTreeMap<u64, Node>,
@@ -280,6 +283,7 @@ impl MemoryFs {
     pub fn new(byte_limit: usize, object_limit: usize) -> Self {
         let now = nt_time();
         let root = Node {
+            object_id: ObjectIdInformation::default(),
             default_stream: 0,
             metadata: Metadata {
                 stream_name: None,
@@ -311,6 +315,7 @@ impl MemoryFs {
             streams: BTreeMap::new(),
         };
         Self(Arc::new(Mutex::new(State {
+            next_object_id: 1,
             created: now,
             object_information: {
                 let mut object_id = [0; 16];
@@ -1562,6 +1567,7 @@ impl inspect::Inspect for MemoryFs {
                             .field("size", node.metadata.size)
                             .field("allocation_size", node.metadata.allocation_size)
                             .hex("attributes", node.metadata.attributes)
+                            .field("object_id", format!("{:02x?}", node.object_id.object_id))
                             .field("delete_pending", node.metadata.delete_pending)
                             .child("streams", |req| {
                                 let mut resp = req.respond();
@@ -1873,6 +1879,7 @@ impl FileSystem for MemoryFs {
             state.nodes.insert(
                 id,
                 Node {
+                    object_id: ObjectIdInformation::default(),
                     default_stream: 0,
                     security,
                     metadata: Metadata {
@@ -2290,6 +2297,7 @@ impl FileSystem for MemoryFs {
             supports_objects: true,
             name: "MEMORY".into(),
             attributes: FileSystemAttributes::new()
+                .with_supports_object_ids(true)
                 .with_case_preserved_names(true)
                 .with_unicode_on_disk(true)
                 .with_extended_attributes(true)
@@ -2331,6 +2339,94 @@ impl FileSystem for MemoryFs {
         let access = AccessMask::from_bits(open.access);
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         match control {
+            FileControl::GetObjectId => {
+                if node.object_id.object_id == [0; 16] {
+                    return Err(Status::OBJECTID_NOT_FOUND);
+                }
+                Ok(FileControlResult::ObjectId(node.object_id))
+            }
+            FileControl::CreateOrGetObjectId => {
+                let mut info = node.object_id;
+                let created = info.object_id == [0; 16];
+                if created {
+                    loop {
+                        let counter = state.next_object_id;
+                        let next = counter
+                            .checked_add(1)
+                            .ok_or(Status::INSUFFICIENT_RESOURCES)?;
+                        let mut candidate = [0; 16];
+                        candidate[..8].copy_from_slice(&counter.to_le_bytes());
+                        candidate[8..].copy_from_slice(b"SMBObjID");
+                        state.next_object_id = next;
+                        if !state
+                            .nodes
+                            .values()
+                            .any(|node| node.object_id.object_id == candidate)
+                        {
+                            info.object_id = candidate;
+                            break;
+                        }
+                    }
+                }
+                if created || (info.birth_volume_id == [0; 16] && info.birth_object_id == [0; 16]) {
+                    if info.birth_volume_id == [0; 16] {
+                        info.birth_volume_id = state.object_information.object_id;
+                    }
+                    if info.birth_object_id == [0; 16] {
+                        info.birth_object_id = info.object_id;
+                    }
+                    info.domain_id = [0; 16];
+                }
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                node.object_id = info;
+                if created {
+                    node.metadata.changed = nt_time();
+                }
+                Ok(FileControlResult::ObjectId(info))
+            }
+            FileControl::SetObjectId(info) => {
+                if node.object_id.object_id != [0; 16] {
+                    return Err(Status::OBJECT_NAME_COLLISION);
+                }
+                if info.object_id != [0; 16]
+                    && state
+                        .nodes
+                        .values()
+                        .any(|node| node.object_id.object_id == info.object_id)
+                {
+                    return Err(Status::DUPLICATE_NAME);
+                }
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                node.object_id = info;
+                node.metadata.changed = nt_time();
+                Ok(FileControlResult::Done)
+            }
+            FileControl::DeleteObjectId => {
+                if node.object_id.object_id != [0; 16] {
+                    let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                    node.object_id.object_id = [0; 16];
+                    node.metadata.changed = nt_time();
+                }
+                Ok(FileControlResult::Done)
+            }
+            FileControl::SetObjectIdExtended {
+                birth_volume_id,
+                birth_object_id,
+                domain_id,
+            } => {
+                if !(access.write_data() || access.write_attributes()) {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                if node.object_id.object_id == [0; 16] {
+                    return Err(Status::OBJECTID_NOT_FOUND);
+                }
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                node.object_id.birth_volume_id = birth_volume_id;
+                node.object_id.birth_object_id = birth_object_id;
+                node.object_id.domain_id = domain_id;
+                node.metadata.changed = nt_time();
+                Ok(FileControlResult::Done)
+            }
             FileControl::GetCompression => Ok(FileControlResult::Compression(
                 node.metadata
                     .compression
@@ -3359,6 +3455,7 @@ mod tests {
                 stream_rename: Feature::Supported,
                 short_names: Feature::Supported,
                 volume_object_ids: Feature::Supported,
+                object_id_controls: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -3460,6 +3557,10 @@ mod tests {
     #[test]
     fn contract_volume_object_ids() {
         run_contract(contracts::volume_object_ids);
+    }
+    #[test]
+    fn contract_object_id_controls() {
+        run_contract(contracts::object_id_controls);
     }
 
     #[test]

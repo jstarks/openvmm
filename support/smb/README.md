@@ -30,7 +30,7 @@ will not need them.
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
-| Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
+| Caching and IOCTLs | Uncached profile and selected provider-backed controls | Compression/zero/range and object-ID controls use actual provider state; unsupported controls remain errors; no oplock/lease grants |
 | Naming | Share-relative namespace and canonical paths | Dot components and explicit short aliases resolve within the virtual root; case folding is ASCII-only |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
@@ -101,7 +101,17 @@ MemoryFs assigns an initial synthetic volume ID and retains atomic updates
 visible through every open. An all-zero ID represents no assigned identity and
 queries return OBJECT_NAME_NOT_FOUND. Unsupported snapshots/updates are explicit
 errors. SET requires WRITE_DATA and participates in cancellation/CLOSE draining.
-This does not implement per-file object-ID controls, quotas or persistent identity.
+Volume metadata alone does not establish per-file controls, quotas or persistent identity.
+
+Per-file GET_OBJECT_ID, CREATE_OR_GET_OBJECT_ID, SET_OBJECT_ID,
+SET_OBJECT_ID_EXTENDED and DELETE_OBJECT_ID also use semantic provider controls.
+MemoryFs stores volume-unique identities shared by all file streams, preserves
+birth metadata on deletion, and enforces assignment collisions. Creation is
+atomic and repeated queries return the same identity. Extension updates require
+WRITE_DATA or WRITE_ATTRIBUTES; restore access for assignment belongs to the
+provider (the synthetic system identity has it). The actual object-ID capability
+is advertised. This does not provide a USN journal, an NTFS object-ID index
+namespace or persistent/native GUID generation.
 
 ## Run
 

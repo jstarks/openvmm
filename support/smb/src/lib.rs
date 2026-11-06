@@ -772,6 +772,28 @@ fn file_control_output(
 ) -> Result<(Status, Vec<u8>), Status> {
     let mut status = Status::SUCCESS;
     let output = match (control, result) {
+        (
+            FileControl::GetObjectId | FileControl::CreateOrGetObjectId,
+            FileControlResult::ObjectId(info),
+        ) => {
+            if info.object_id == [0; 16] {
+                return Err(Status::INTERNAL_ERROR);
+            }
+            FileObjectIdBuffer {
+                object_id: info.object_id,
+                birth_volume_id: info.birth_volume_id,
+                birth_object_id: info.birth_object_id,
+                domain_id: info.domain_id,
+            }
+            .as_bytes()
+            .to_vec()
+        }
+        (
+            FileControl::SetObjectId(_)
+            | FileControl::DeleteObjectId
+            | FileControl::SetObjectIdExtended { .. },
+            FileControlResult::Done,
+        ) => Vec::new(),
         (FileControl::GetCompression, FileControlResult::Compression(format)) => {
             format.to_le_bytes().to_vec()
         }
@@ -1916,6 +1938,36 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
         let control = match code {
+            FsctlCode::GET_OBJECT_ID | FsctlCode::CREATE_OR_GET_OBJECT_ID => {
+                if request.max_output_response.get() < size_of::<FileObjectIdBuffer>() as u32 {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                if code == FsctlCode::GET_OBJECT_ID {
+                    FileControl::GetObjectId
+                } else {
+                    FileControl::CreateOrGetObjectId
+                }
+            }
+            FsctlCode::SET_OBJECT_ID => {
+                let info = FileObjectIdBuffer::read_from_bytes(input)
+                    .map_err(|_| Status::INVALID_PARAMETER)?;
+                FileControl::SetObjectId(provider::ObjectIdInformation {
+                    object_id: info.object_id,
+                    birth_volume_id: info.birth_volume_id,
+                    birth_object_id: info.birth_object_id,
+                    domain_id: info.domain_id,
+                })
+            }
+            FsctlCode::DELETE_OBJECT_ID => FileControl::DeleteObjectId,
+            FsctlCode::SET_OBJECT_ID_EXTENDED => {
+                let info = FileObjectIdExtendedInformation::read_from_bytes(input)
+                    .map_err(|_| Status::INVALID_PARAMETER)?;
+                FileControl::SetObjectIdExtended {
+                    birth_volume_id: info.birth_volume_id,
+                    birth_object_id: info.birth_object_id,
+                    domain_id: info.domain_id,
+                }
+            }
             FsctlCode::GET_COMPRESSION => {
                 if request.max_output_response.get() < 2 {
                     return Err(Status::INVALID_PARAMETER);
@@ -1962,6 +2014,11 @@ impl<B: FileSystem> Connection<B> {
             _ => return Err(Status::NOT_SUPPORTED),
         };
         let file = self.file(request.file_id, tree, context)?;
+        if matches!(control, FileControl::SetObjectIdExtended { .. })
+            && !(file.access.write_data() || file.access.write_attributes())
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
         if matches!(control, FileControl::SetZeroData { .. }) && !file.access.write_data() {
             return Err(Status::ACCESS_DENIED);
         }

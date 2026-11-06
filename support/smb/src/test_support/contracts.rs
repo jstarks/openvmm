@@ -15,8 +15,8 @@
 
 use super::Operation;
 use crate::provider::{
-    BasicInformation, ByteRange, Change, ExtendedAttribute, FileSystem, NotifyResult, OpenOptions,
-    RequestContext, StreamInformation,
+    BasicInformation, ByteRange, Change, ExtendedAttribute, FileControl, FileControlResult,
+    FileSystem, NotifyResult, OpenOptions, RequestContext, StreamInformation,
 };
 use crate::spec::{
     AccessMask, CreateAction, CreateDisposition, CreateOptions, FileAttributes, NotifyAction,
@@ -71,6 +71,8 @@ pub struct Expectations {
     pub short_names: Feature,
     /// Atomic volume object-ID and extension metadata updates.
     pub volume_object_ids: Feature,
+    /// Per-file object-ID query/create/set/delete/extension controls.
+    pub object_id_controls: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -668,6 +670,79 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// File object IDs are shared, unique, and retained until explicitly removed.
+pub async fn object_id_controls<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "object", CreateDisposition::CREATE, false, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().object_id_controls) {
+        for control in [
+            FileControl::GetObjectId,
+            FileControl::CreateOrGetObjectId,
+            FileControl::DeleteObjectId,
+            FileControl::SetObjectId(crate::provider::ObjectIdInformation::default()),
+            FileControl::SetObjectIdExtended {
+                birth_volume_id: [0; 16],
+                birth_object_id: [0; 16],
+                domain_id: [0; 16],
+            },
+        ] {
+            rejected(fs.file_control(&file, control, &request).await, status);
+        }
+    } else {
+        rejected(
+            fs.file_control(&file, FileControl::GetObjectId, &request)
+                .await,
+            Status::OBJECTID_NOT_FOUND,
+        );
+        let FileControlResult::ObjectId(created) = fs
+            .file_control(&file, FileControl::CreateOrGetObjectId, &request)
+            .await
+            .unwrap()
+        else {
+            panic!("missing object ID")
+        };
+        assert_ne!(created.object_id, [0; 16]);
+        assert_eq!(created.birth_object_id, created.object_id);
+        let alias = open(fs, "object", CreateDisposition::OPEN, false, &request).await;
+        let FileControlResult::ObjectId(info) = fs
+            .file_control(&alias, FileControl::GetObjectId, &request)
+            .await
+            .unwrap()
+        else {
+            panic!("missing object ID")
+        };
+        assert_eq!(info, created);
+        let other = open(
+            fs,
+            "other-object",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        rejected(
+            fs.file_control(&other, FileControl::SetObjectId(created), &request)
+                .await,
+            Status::DUPLICATE_NAME,
+        );
+        fs.file_control(&file, FileControl::DeleteObjectId, &request)
+            .await
+            .unwrap();
+        rejected(
+            fs.file_control(&alias, FileControl::GetObjectId, &request)
+                .await,
+            Status::OBJECTID_NOT_FOUND,
+        );
+        fs.file_control(&other, FileControl::SetObjectId(created), &request)
+            .await
+            .unwrap();
+        fs.close(&other, &request).await.unwrap();
+        fs.close(&alias, &request).await.unwrap();
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// Volume object-ID metadata is shared across opens and updates atomically.

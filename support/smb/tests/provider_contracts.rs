@@ -41,6 +41,7 @@ impl Fixture for MemoryFixture {
             stream_rename: Feature::Supported,
             short_names: Feature::Supported,
             volume_object_ids: Feature::Supported,
+            object_id_controls: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -75,6 +76,7 @@ impl ControlledFixture {
             Operation::Rename,
             Operation::SetShortName,
             Operation::SetVolumeObjectId,
+            Operation::FileControl,
             Operation::Lock,
             Operation::Notify,
             Operation::QueryEas,
@@ -112,6 +114,7 @@ impl ControlledFixture {
                 stream_rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 short_names: Feature::Unsupported(Status::NOT_SUPPORTED),
                 volume_object_ids: Feature::Unsupported(Status::NOT_SUPPORTED),
+                object_id_controls: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -294,6 +297,15 @@ fn exported_volume_object_id_contract_checks_shared_metadata_and_declines() {
     block_on(contracts::volume_object_ids(&fixture));
     fixture.assert_rejected(&[Operation::SetVolumeObjectId]);
 }
+#[test]
+fn exported_object_id_control_contract_checks_identity_and_declines() {
+    block_on(contracts::object_id_controls(&MemoryFixture(
+        MemoryFs::new(1024, 32),
+    )));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::object_id_controls(&fixture));
+    fixture.assert_rejected(&[Operation::FileControl]);
+}
 
 #[test]
 fn declared_unsupported_locks_are_exercised() {
@@ -374,6 +386,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             stream_rename: Feature::Supported,
             short_names: Feature::Supported,
             volume_object_ids: Feature::Supported,
+            object_id_controls: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

@@ -393,7 +393,16 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
 #[test]
 fn pending_filesystem_controls_cancel_or_drain_before_close() {
     block_on(async {
-        for (zero, after) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (code, after) in [
+            (FsctlCode::GET_COMPRESSION, false),
+            (FsctlCode::GET_COMPRESSION, true),
+            (FsctlCode::SET_ZERO_DATA, false),
+            (FsctlCode::SET_ZERO_DATA, true),
+            (FsctlCode::CREATE_OR_GET_OBJECT_ID, false),
+            (FsctlCode::CREATE_OR_GET_OBJECT_ID, true),
+        ] {
+            let zero = code == FsctlCode::SET_ZERO_DATA;
+            let object = code == FsctlCode::CREATE_OR_GET_OBJECT_ID;
             let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
             control
                 .set_plan(
@@ -415,15 +424,9 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
             let mut body = IoctlRequest::new_zeroed();
             body.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
             body.file_id = file;
-            body.control_code = if zero {
-                FsctlCode::SET_ZERO_DATA
-            } else {
-                FsctlCode::GET_COMPRESSION
-            }
-            .0
-            .into();
+            body.control_code = code.0.into();
             body.flags = IoctlFlags::new().with_fsctl(true);
-            body.max_output_response = 2.into();
+            body.max_output_response = (if object { 64 } else { 2 }).into();
             let mut bytes;
             if zero {
                 body.input_offset = 120.into();
@@ -473,7 +476,12 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 }
             );
             if after {
-                assert_eq!(&response[112..], if zero { &[][..] } else { &[0, 0][..] });
+                if object {
+                    assert_eq!(response.len(), 176);
+                    assert_ne!(&response[112..128], &[0; 16]);
+                } else {
+                    assert_eq!(&response[112..], if zero { &[][..] } else { &[0, 0][..] });
+                }
             }
             assert_eq!(response_status(&closing.await.unwrap()), Status::SUCCESS);
             assert!(control.snapshot(call.id).unwrap().cancel_requested);
@@ -482,6 +490,25 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 &client.read(observer, 0, 3).await[80..],
                 if zero && after { b"a\0c" } else { b"abc" },
             );
+            if object {
+                control
+                    .set_plan(Operation::FileControl, Plan::default())
+                    .unwrap();
+                let mut query = IoctlRequest::new_zeroed();
+                query.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+                query.file_id = observer;
+                query.control_code = FsctlCode::GET_OBJECT_ID.0.into();
+                query.flags = IoctlFlags::new().with_fsctl(true);
+                query.max_output_response = 64.into();
+                assert_eq!(
+                    response_status(&client.send(Command::IOCTL, query.as_bytes()).await),
+                    if after {
+                        Status::SUCCESS
+                    } else {
+                        Status::OBJECTID_NOT_FOUND
+                    }
+                );
+            }
             client.close(observer).await;
         }
     });

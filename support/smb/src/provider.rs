@@ -211,6 +211,23 @@ impl Metadata {
 /// Selected filesystem controls, decoded independently of SMB buffer layouts.
 #[derive(Debug, Clone, Copy)]
 pub enum FileControl {
+    /// Query an assigned file object ID.
+    GetObjectId,
+    /// Atomically create an object ID if absent, or return the existing ID.
+    CreateOrGetObjectId,
+    /// Assign an object ID and its birth/domain metadata.
+    SetObjectId(ObjectIdInformation),
+    /// Remove the assigned object ID without discarding birth metadata.
+    DeleteObjectId,
+    /// Replace birth/domain metadata without changing the assigned object ID.
+    SetObjectIdExtended {
+        /// Volume identity at initial assignment.
+        birth_volume_id: [u8; 16],
+        /// Object identity at initial assignment.
+        birth_object_id: [u8; 16],
+        /// Application-specific domain identity.
+        domain_id: [u8; 16],
+    },
     /// Query the stream or directory's COMPRESSION_FORMAT_* state.
     GetCompression,
     /// Zero [offset, end) without extending EOF or moving the open's position.
@@ -232,6 +249,8 @@ pub enum FileControl {
 /// Semantic result of a selected filesystem control.
 #[derive(Debug)]
 pub enum FileControlResult {
+    /// Assigned file object identity and birth/domain metadata.
+    ObjectId(ObjectIdInformation),
     /// A mutation completed without output data.
     Done,
     /// Current COMPRESSION_FORMAT_* state.
@@ -243,6 +262,19 @@ pub enum FileControlResult {
         /// More records remain than fit in the requested limit.
         overflow: bool,
     },
+}
+
+/// File object-ID metadata, shared by all streams and opens of the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectIdInformation {
+    /// Volume-unique assigned identity; zero means unassigned.
+    pub object_id: [u8; 16],
+    /// Volume identity at initial assignment.
+    pub birth_volume_id: [u8; 16],
+    /// Original assigned identity.
+    pub birth_object_id: [u8; 16],
+    /// Application-specific domain identity.
+    pub domain_id: [u8; 16],
 }
 
 /// Provider-owned sector geometry and alignment, including synthetic devices.

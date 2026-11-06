@@ -27,11 +27,11 @@ will not need them.
 | Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7 implemented; broader fixtures may require quota/object-ID/sector classes outside this profile |
 | Namespace and enumeration | Directory continuation, rename/move, sharing, replacement and deletion | Implemented subset; broaden directory/rename cases; no generated short names or hard links |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
-| Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Seventeen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
+| Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Four selected ACL cases plus direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Explicit unsupported storage profile, validation and access checks | Neither capability advertised; no fabricated empty-success replies; fixtures requiring storage are not passes |
 | Caching and IOCTLs | Explicit uncached profile and validated unsupported controls | No oplock/lease grants; ACK/error/identity/bounds/credit regressions; no successful FSCTL operations |
-| Naming | Share-relative namespace and canonical paths | ASCII-insensitive lookup; full Unicode folding, dot-component normalization and short-name generation remain limitations |
+| Naming | Share-relative namespace and canonical paths | Dot components resolve within the virtual root; case folding is ASCII-only and no short names are generated |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
 Compatibility work proceeds by selecting applicable Samba cases, checking any
@@ -93,8 +93,8 @@ rejecting directory renames with open descendants, plus metadata-only parent
 opens, no-delete-sharing parent opens, close-time metadata and concurrent opens.
 `SMBTORTURE` selects the executable for every harness; otherwise they use
 `smbtorture` from PATH. The corrected-client harness requires that variable
-explicitly and adds eleven notify cases: tcon, dir, tdis, double, tcp, overflow,
-rmdir1-4, and mask-change. It uses ten operations because the directory fixture assumes that
+explicitly and adds twelve notify cases: tcon, dir, tdis, double, tcp, overflow,
+rmdir1-4, mask-change, and tree. It uses ten operations because the directory fixture assumes that
 count and has a fixed 1000-byte output buffer.
 
 ### Direct Provider Contracts
@@ -143,6 +143,13 @@ precision. Keep provider-specific tests for those policies, native completion
 ownership/cancellation, timestamp controls, resource bounds, and durability.
 SMB access checks, per-open request barriers, CLOSE cancel/drain, transient
 stop, and wire/transport behavior remain engine/runtime tests.
+
+Dot-directory components resolve within the virtual share (MS-FSCC 2.1.5.1).
+The parent of the root is that root, so repeated `..` cannot escape it. Resolution
+retains directory traversal/type checks rather than blindly deleting path text.
+Opening dot aliases preserves identity and canonical metadata paths. Literal
+dot names cannot be published by CREATE or rename. Pathnames are bounded at
+32,760 UTF-16 units.
 
 Metadata-only opens do not participate in data/execute/delete sharing conflicts
 (MS-FSA 2.1.5.1.2.2). This exemption works in both open orders, even when either
@@ -398,7 +405,7 @@ Samba's own server when pinned to SMB 2.1. SMB 3.1.1 defaults negotiate AES-GMAC
 and pass; forcing AES-CMAC reproduces the failure. The legacy client path sets
 MID zero too early, even when no AsyncId has been received. A corrected local
 client keeps the real MID and applies the legacy zero convention only when
-sending an asynchronous CANCEL. The ten-case harness above requires that fix;
+sending an asynchronous CANCEL. The extended notify harness requires that fix;
 our server does not weaken cancellation identity matching. Reference comparisons
 with the corrected client pass in all three signing profiles.
 
@@ -409,8 +416,8 @@ It now gets eleven records, including two file-rename metadata records; the
 checkout-built Samba 4.25.1 server also fails that fixture (fourteen records).
 The earlier nine-record pass omitted these metadata events and is not retained
 as passing coverage. Shared provider tests cover recursive rename delivery.
-Tree uses dot-component paths rejected by the current namespace policy, and
-valid-req assumes specific native event batching and notification-buffer policy.
+Tree now passes with share-root-clamped dot-directory resolution.
+Valid-req assumes specific native event batching and notification-buffer policy.
 The slow mask probe permits cancellation for many subcases and does not establish
 complete notification compatibility.
 
@@ -498,8 +505,8 @@ source's data, identity, opens, and byte-range locks. Existing target names
 require replacement permission; open targets, directory targets, readonly
 targets, and directory sources with open descendants are denied. Destination
 directory sharing is enforced, cycles are rejected, and an exact self-rename
-is a no-op. The memory namespace keeps its existing ASCII-insensitive lookup
-and dot-component rejection policy.
+is a no-op. The memory namespace keeps its ASCII-insensitive lookup and resolves
+dot-directory components within the share.
 
 CREATE and rename share filename-component validation (MS-FSCC 2.1.5.2).
 Wildcard characters, quotes, vertical bars and ASCII controls are rejected

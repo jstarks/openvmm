@@ -284,6 +284,8 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
 
     /// Open an object and return its handle and SMB create-action value.
     /// Validate filename components before publishing a new object (MS-FSCC §2.1.5.2).
+    /// Resolve dot-directory components within the share; ".." at the root stays
+    /// at that root, never at a host parent (MS-FSCC §2.1.5.1).
     async fn open(
         &self,
         name: &str,

@@ -1040,7 +1040,6 @@ fn malformed_creates_and_traversal_are_rejected() {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
         let mut client = Client::new(&server).await;
         for (name, status) in [
-            ("..\\escape", Status::OBJECT_PATH_SYNTAX_BAD),
             ("\\rooted", Status::INVALID_PARAMETER),
             ("a/../b", Status::OBJECT_NAME_INVALID),
             ("file:stream", Status::OBJECT_NAME_INVALID),
@@ -1142,6 +1141,67 @@ fn filename_wildcards_follow_dos_period_and_end_of_name_rules() {
             "{name:?} {pattern:?}"
         );
     }
+}
+
+#[test]
+fn dot_directory_paths_resolve_without_escaping_the_share_root() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let root = client.open("", 1, 1).await;
+        let directory = client.open("directory", 2, 1).await;
+        let file = client.open(".\\directory\\file", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"inside"))
+            .await;
+        for path in [
+            "directory\\.\\file",
+            "..\\directory\\file",
+            "directory\\..\\directory\\file",
+        ] {
+            let alias = client.open(path, 1, 0).await;
+            assert_eq!(alias.persistent, file.persistent);
+            assert_eq!(&client.read(alias, 0, 6).await[80..], b"inside");
+            client.close(alias).await;
+        }
+        for (path, expected) in [
+            (".", root),
+            ("..", root),
+            ("directory\\.", directory),
+            ("directory\\..", root),
+        ] {
+            let alias = client.open(path, 1, 1).await;
+            assert_eq!(alias.persistent, expected.persistent);
+            client.close(alias).await;
+        }
+        for path in [".", "..", "..\\..\\.."] {
+            assert_eq!(
+                response_status(&client.open_result(path, 1, 7, 2, 1).await),
+                Status::OBJECT_PATH_SYNTAX_BAD
+            );
+        }
+        let clamped = client.open("directory\\..\\..\\clamped", 2, 0).await;
+        let alias = client.open("clamped", 1, 0).await;
+        assert_eq!(alias.persistent, clamped.persistent);
+        assert_eq!(
+            response_status(
+                &client
+                    .open_result("directory\\file\\..\\other", 1, 7, 2, 0)
+                    .await
+            ),
+            Status::NOT_A_DIRECTORY
+        );
+        let overlong = format!("{}.", "..\\".repeat(10_920));
+        assert_eq!(
+            response_status(&client.open_result(&overlong, 1, 7, 1, 1).await),
+            Status::NAME_TOO_LONG
+        );
+        client.close(alias).await;
+        client.close(clamped).await;
+        client.close(file).await;
+        client.close(directory).await;
+        client.close(root).await;
+    });
 }
 
 #[test]

@@ -133,7 +133,8 @@ fn invalid_names_do_not_change_the_source() {
         let file = client.open("source", 2, 0).await;
         for (name, status) in [
             ("trailing\\".into(), Status::OBJECT_NAME_INVALID),
-            ("..\\outside".into(), Status::OBJECT_PATH_SYNTAX_BAD),
+            (".".into(), Status::OBJECT_NAME_INVALID),
+            ("..".into(), Status::OBJECT_NAME_INVALID),
             ("wild*card".into(), Status::OBJECT_NAME_INVALID),
             ("control\u{1f}".into(), Status::OBJECT_NAME_INVALID),
             ("x".repeat(256), Status::NAME_TOO_LONG),
@@ -149,6 +150,17 @@ fn invalid_names_do_not_change_the_source() {
             let unchanged = client.open("source", 1, 0).await;
             client.close(unchanged).await;
         }
+        let response = client
+            .set(
+                file,
+                FileInformationClass::RENAME.0,
+                &data("..\\..\\inside", false),
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let alias = client.open("inside", 1, 0).await;
+        assert_eq!(alias.persistent, file.persistent);
+        client.close(alias).await;
         client.close(file).await;
     });
 }

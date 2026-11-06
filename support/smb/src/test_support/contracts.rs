@@ -942,6 +942,21 @@ pub async fn data_and_identity<F: Fixture>(fixture: &F) {
     }
     let directory = open(fs, "directory", CreateDisposition::CREATE, true, &request).await;
     let root = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+    for path in [".\\data", "..\\data", "directory\\..\\..\\data"] {
+        let alias = open(fs, path, CreateDisposition::OPEN, false, &request).await;
+        assert_eq!(fs.metadata(&alias, &request).await.unwrap().id, initial.id);
+        assert_eq!(
+            read_bytes(fs, &alias, 0, 10, &request).await,
+            b"\0\0\0ab\0\0\0\0\0"
+        );
+        fs.close(&alias, &request).await.unwrap();
+    }
+    let root_id = fs.metadata(&root, &request).await.unwrap().id;
+    for path in [".", "..", "directory\\.."] {
+        let alias = open(fs, path, CreateDisposition::OPEN, true, &request).await;
+        assert_eq!(fs.metadata(&alias, &request).await.unwrap().id, root_id);
+        fs.close(&alias, &request).await.unwrap();
+    }
     let mut entries = fs.list(&root, &request).await.unwrap();
     entries.retain(|entry| entry.name != "." && entry.name != "..");
     entries.sort_by(|a, b| a.name.cmp(&b.name));

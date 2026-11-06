@@ -276,6 +276,9 @@ impl MemoryFs {
 }
 
 fn components(name: &str) -> Result<Vec<&str>, Status> {
+    if name.encode_utf16().count() > MAX_PATH_LENGTH {
+        return Err(Status::NAME_TOO_LONG);
+    }
     if name.starts_with('\\') {
         return Err(Status::OBJECT_PATH_SYNTAX_BAD);
     }
@@ -283,9 +286,6 @@ fn components(name: &str) -> Result<Vec<&str>, Status> {
         return Err(Status::OBJECT_NAME_INVALID);
     }
     let parts: Vec<_> = name.split('\\').filter(|s| !s.is_empty()).collect();
-    if parts.iter().any(|s| *s == "." || *s == "..") {
-        return Err(Status::OBJECT_PATH_SYNTAX_BAD);
-    }
     if parts.iter().any(|part| {
         part.chars().any(|character| {
             character < ' ' || matches!(character, '"' | '|' | '<' | '>' | '*' | '?')
@@ -641,7 +641,11 @@ fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
         if !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute() {
             return Err(Status::ACCESS_DENIED);
         }
-        parent = child(state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?;
+        parent = match *part {
+            "." => parent,
+            ".." => state.nodes[&parent].parent,
+            _ => child(state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?,
+        };
         if !state.nodes[&parent].metadata.is_directory() {
             return Err(Status::NOT_A_DIRECTORY);
         }
@@ -891,6 +895,14 @@ impl FileSystem for MemoryFs {
     ) -> Result<(MemoryFile, u32), Status> {
         let mut options = options;
         let parts = components(name)?;
+        if matches!(parts.last().copied(), Some("." | ".."))
+            && !matches!(
+                options.disposition(),
+                CreateDisposition::OPEN | CreateDisposition::OPEN_IF
+            )
+        {
+            return Err(Status::OBJECT_PATH_SYNTAX_BAD);
+        }
         let mut state = self.0.lock();
         let parent = resolve_directory(&state, &parts[..parts.len().saturating_sub(1)])?;
         if !parts.is_empty()
@@ -898,7 +910,9 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::ACCESS_DENIED);
         }
-        let existing = match parts.last() {
+        let existing = match parts.last().copied() {
+            Some(".") => Some(parent),
+            Some("..") => Some(state.nodes[&parent].parent),
             Some(name) => child(&state, parent, name),
             None => Some(1),
         };
@@ -1104,11 +1118,11 @@ impl FileSystem for MemoryFs {
         replace: bool,
         _request: &RequestContext,
     ) -> Result<(), Status> {
-        if name.encode_utf16().count() > MAX_PATH_LENGTH {
-            return Err(Status::NAME_TOO_LONG);
-        }
         let parts = components(name)?;
-        if name.ends_with('\\') || parts.is_empty() {
+        if name.ends_with('\\')
+            || parts.is_empty()
+            || matches!(parts.last().copied(), Some("." | ".."))
+        {
             return Err(Status::OBJECT_NAME_INVALID);
         }
         let mut state = self.0.lock();

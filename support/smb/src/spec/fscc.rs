@@ -419,6 +419,43 @@ wire!(
     }
 );
 wire!(
+    /// FileId64ExtdDirectoryInformation prefix: [MS-FSCC] §2.4.19.
+    FileId64ExtdDirectoryInformation, 80 {
+        full: FileFullDirectoryInformation,
+        reparse_point_tag: U32,
+        file_id: U64,
+    }
+);
+wire!(
+    /// FileId64ExtdBothDirectoryInformation prefix: [MS-FSCC] §2.4.18.
+    FileId64ExtdBothDirectoryInformation, 106 {
+        extended: FileId64ExtdDirectoryInformation,
+        short_name: DirectoryShortName,
+    }
+);
+wire!(
+    /// FileIdExtdDirectoryInformation prefix: [MS-FSCC] §2.4.23.
+    FileIdExtdDirectoryInformation, 88 {
+        full: FileFullDirectoryInformation,
+        reparse_point_tag: U32,
+        file_id: [u8; 16],
+    }
+);
+wire!(
+    /// FileIdAllExtdDirectoryInformation prefix: [MS-FSCC] §2.4.21.
+    FileIdAllExtdDirectoryInformation, 96 {
+        extended: FileId64ExtdDirectoryInformation,
+        file_id128: [u8; 16],
+    }
+);
+wire!(
+    /// FileIdAllExtdBothDirectoryInformation prefix: [MS-FSCC] §2.4.20.
+    FileIdAllExtdBothDirectoryInformation, 122 {
+        extended: FileIdAllExtdDirectoryInformation,
+        short_name: DirectoryShortName,
+    }
+);
+wire!(
     /// FileNamesInformation fixed prefix: [MS-FSCC] §2.4.33.
     FileNamesInformation, 12 { header: DirectoryEntryHeader, file_name_length: U32 }
 );

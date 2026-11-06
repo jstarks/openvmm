@@ -1438,13 +1438,14 @@ fn directory_queries_distinguish_invalid_classes_optional_classes_and_file_handl
         }
         for class in [60, 78, 79, 80, 81] {
             query.info_class = class;
+            query.flags.set_restart_scans(true);
             assert_eq!(
                 response_status(
                     &client
                         .send(Command::QUERY_DIRECTORY, query.as_bytes())
                         .await
                 ),
-                Status::NOT_SUPPORTED,
+                Status::SUCCESS,
             );
         }
         query.info_class = FileInformationClass::NAMES.0;
@@ -1467,6 +1468,8 @@ fn directory_buffers_distinguish_prefix_overflow_and_exact_unpadded_records() {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
         let mut client = Client::new(&server).await;
         let file = client.open("entry", 2, 0).await;
+        let mut expected_id128 = [0; 16];
+        expected_id128[..8].copy_from_slice(&file.persistent.get().to_le_bytes());
         client.close(file).await;
         for (class, fixed) in [
             (
@@ -1492,6 +1495,26 @@ fn directory_buffers_distinguish_prefix_overflow_and_exact_unpadded_records() {
             (
                 FileInformationClass::ID_FULL_DIRECTORY,
                 size_of::<FileIdFullDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::ID_EXTD_DIRECTORY,
+                size_of::<FileIdExtdDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::ID64_EXTD_DIRECTORY,
+                size_of::<FileId64ExtdDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::ID64_EXTD_BOTH_DIRECTORY,
+                size_of::<FileId64ExtdBothDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::ID_ALL_EXTD_DIRECTORY,
+                size_of::<FileIdAllExtdDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY,
+                size_of::<FileIdAllExtdBothDirectoryInformation>(),
             ),
         ] {
             let root = client.open("", 1, 1).await;
@@ -1519,6 +1542,15 @@ fn directory_buffers_distinguish_prefix_overflow_and_exact_unpadded_records() {
                     assert_eq!(response.len(), 72 + length);
                     assert_eq!(&response[72 + fixed..], &pattern);
                     assert_eq!(&response[72..76], &[0; 4]);
+                    let id128_offset = match class {
+                        FileInformationClass::ID_EXTD_DIRECTORY => Some(72),
+                        FileInformationClass::ID_ALL_EXTD_DIRECTORY
+                        | FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY => Some(80),
+                        _ => None,
+                    };
+                    if let Some(offset) = id128_offset {
+                        assert_eq!(&response[72 + offset..72 + offset + 16], &expected_id128);
+                    }
                 } else {
                     assert_eq!(response[64..], error_body());
                 }

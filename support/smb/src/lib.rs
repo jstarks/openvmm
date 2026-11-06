@@ -589,6 +589,21 @@ fn name_matches(name: &str, pattern: &str) -> bool {
     previous[name.len()]
 }
 
+fn directory_short_name(info: &Metadata) -> Result<DirectoryShortName, Status> {
+    let mut short_name = DirectoryShortName::new_zeroed();
+    if let Some(name) = &info.short_name {
+        let units: Vec<_> = name.encode_utf16().collect();
+        if units.len() > SHORT_NAME_CAPACITY {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        short_name.length = (units.len() * size_of::<U16>()) as u8;
+        for (target, unit) in short_name.name.iter_mut().zip(units) {
+            *target = unit.into();
+        }
+    }
+    Ok(short_name)
+}
+
 fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<u8>, Status> {
     let name = encode_name(&info.name);
     let basic = basic_info(info);
@@ -608,6 +623,11 @@ fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<
         directory,
         ea_size: info.extended_attributes_length.into(),
     };
+    let extended = FileId64ExtdDirectoryInformation {
+        full,
+        reparse_point_tag: info.reparse_tag.into(),
+        file_id: info.id.into(),
+    };
     let mut out = match class {
         FileInformationClass::DIRECTORY => directory.as_bytes().to_vec(),
         FileInformationClass::FULL_DIRECTORY => full.as_bytes().to_vec(),
@@ -625,17 +645,7 @@ fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<
         .as_bytes()
         .to_vec(),
         FileInformationClass::BOTH_DIRECTORY | FileInformationClass::ID_BOTH_DIRECTORY => {
-            let mut short_name = DirectoryShortName::new_zeroed();
-            if let Some(name) = &info.short_name {
-                let units: Vec<_> = name.encode_utf16().collect();
-                if units.len() > SHORT_NAME_CAPACITY {
-                    return Err(Status::INTERNAL_ERROR);
-                }
-                short_name.length = (units.len() * size_of::<U16>()) as u8;
-                for (target, unit) in short_name.name.iter_mut().zip(units) {
-                    *target = unit.into();
-                }
-            }
+            let short_name = directory_short_name(info)?;
             let both = FileBothDirectoryInformation { full, short_name };
             if class == FileInformationClass::BOTH_DIRECTORY {
                 both.as_bytes().to_vec()
@@ -644,6 +654,37 @@ fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<
                     both,
                     reserved: 0.into(),
                     file_id: info.id.into(),
+                }
+                .as_bytes()
+                .to_vec()
+            }
+        }
+        FileInformationClass::ID_EXTD_DIRECTORY => FileIdExtdDirectoryInformation {
+            full,
+            reparse_point_tag: info.reparse_tag.into(),
+            file_id: info.id128.ok_or(Status::NOT_SUPPORTED)?,
+        }
+        .as_bytes()
+        .to_vec(),
+        FileInformationClass::ID64_EXTD_DIRECTORY => extended.as_bytes().to_vec(),
+        FileInformationClass::ID64_EXTD_BOTH_DIRECTORY => FileId64ExtdBothDirectoryInformation {
+            extended,
+            short_name: directory_short_name(info)?,
+        }
+        .as_bytes()
+        .to_vec(),
+        FileInformationClass::ID_ALL_EXTD_DIRECTORY
+        | FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY => {
+            let extended = FileIdAllExtdDirectoryInformation {
+                extended,
+                file_id128: info.id128.ok_or(Status::NOT_SUPPORTED)?,
+            };
+            if class == FileInformationClass::ID_ALL_EXTD_DIRECTORY {
+                extended.as_bytes().to_vec()
+            } else {
+                FileIdAllExtdBothDirectoryInformation {
+                    extended,
+                    short_name: directory_short_name(info)?,
                 }
                 .as_bytes()
                 .to_vec()
@@ -2346,7 +2387,14 @@ impl<B: FileSystem> Connection<B> {
             | FileInformationClass::BOTH_DIRECTORY
             | FileInformationClass::NAMES
             | FileInformationClass::ID_BOTH_DIRECTORY
-            | FileInformationClass::ID_FULL_DIRECTORY => return Err(Status::INVALID_INFO_CLASS),
+            | FileInformationClass::ID_FULL_DIRECTORY
+            | FileInformationClass::ID_EXTD_DIRECTORY
+            | FileInformationClass::ID64_EXTD_DIRECTORY
+            | FileInformationClass::ID64_EXTD_BOTH_DIRECTORY
+            | FileInformationClass::ID_ALL_EXTD_DIRECTORY
+            | FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY => {
+                return Err(Status::INVALID_INFO_CLASS);
+            }
             _ => return Err(Status::NOT_SUPPORTED),
         };
         let maximum = request.output_buffer_length.get();
@@ -2728,12 +2776,18 @@ impl<B: FileSystem> Connection<B> {
             FileInformationClass::NAMES => size_of::<FileNamesInformation>(),
             FileInformationClass::ID_BOTH_DIRECTORY => size_of::<FileIdBothDirectoryInformation>(),
             FileInformationClass::ID_FULL_DIRECTORY => size_of::<FileIdFullDirectoryInformation>(),
-            FileInformationClass::ID_EXTD_DIRECTORY
-            | FileInformationClass::ID64_EXTD_DIRECTORY
-            | FileInformationClass::ID64_EXTD_BOTH_DIRECTORY
-            | FileInformationClass::ID_ALL_EXTD_DIRECTORY
-            | FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY => {
-                return Err(Status::NOT_SUPPORTED);
+            FileInformationClass::ID_EXTD_DIRECTORY => size_of::<FileIdExtdDirectoryInformation>(),
+            FileInformationClass::ID64_EXTD_DIRECTORY => {
+                size_of::<FileId64ExtdDirectoryInformation>()
+            }
+            FileInformationClass::ID64_EXTD_BOTH_DIRECTORY => {
+                size_of::<FileId64ExtdBothDirectoryInformation>()
+            }
+            FileInformationClass::ID_ALL_EXTD_DIRECTORY => {
+                size_of::<FileIdAllExtdDirectoryInformation>()
+            }
+            FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY => {
+                size_of::<FileIdAllExtdBothDirectoryInformation>()
             }
             _ => return Err(Status::INVALID_INFO_CLASS),
         };

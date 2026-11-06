@@ -44,6 +44,10 @@ INFO_LENGTH_MISMATCH. A first filename that does not fit returns BUFFER_OVERFLOW
 as an SMB2 ERROR response, retaining that entry for retry (MS-FSA 2.1.5.6.3;
 MS-SMB2 3.3.4.4). Successful records are aligned between entries, not padded
 after the final entry, so exact-fit buffers do not lose records.
+Extended directory classes 60 and 78-81 include provider reparse tags and
+64-bit/128-bit identities, plus short names where specified. Providers may
+decline formats needing an unsupported 128-bit identity. MemoryFs exposes a
+stable volume-scoped 128-bit identity by extending its own node identity.
 
 ## Run
 
@@ -252,7 +256,7 @@ without frontend read-back or simulated mutation; MemoryFs applies real policy
 changes for semantic testing.
 ControlledFs gates both the call and delivery of its settled result.
 
-Independent byte fixtures verify unaligned embedded bitfields, all six supported
+Independent byte fixtures verify unaligned embedded bitfields, all eleven supported
 directory layouts (with and without short names), and actual CREATE context,
 QUERY_INFO, and READ replies. Literal offsets in these fixtures are deliberate
 independent expectations, not production packet-access logic.

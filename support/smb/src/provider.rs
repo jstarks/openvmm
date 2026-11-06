@@ -82,6 +82,8 @@ pub struct CompressionInformation {
 pub struct Metadata {
     /// Stable identity within this provider.
     pub id: u64,
+    /// Opaque stable 128-bit volume-scoped file identity, when supported.
+    pub id128: Option<[u8; 16]>,
     /// Last component of the object's name.
     pub name: String,
     /// Canonical backslash-prefixed path within the share's virtual volume.

@@ -234,6 +234,7 @@ impl MemoryFs {
         let root = Node {
             metadata: Metadata {
                 id: 1,
+                id128: None,
                 name: String::new(),
                 path: String::new(),
                 short_name: None,
@@ -330,6 +331,9 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     components.reverse();
     metadata.path = format!("\\{}", components.join("\\"));
     metadata.number_of_links = u32::from(!metadata.delete_pending);
+    let mut id128 = [0; 16];
+    id128[..8].copy_from_slice(&metadata.id.to_le_bytes());
+    metadata.id128 = Some(id128);
     if let Some(compression) = &mut metadata.compression {
         compression.compressed_size = metadata.allocation_size;
     }
@@ -1111,6 +1115,7 @@ impl FileSystem for MemoryFs {
                     security,
                     metadata: Metadata {
                         id,
+                        id128: None,
                         name: parts.last().ok_or(Status::OBJECT_NAME_INVALID)?.to_string(),
                         path: String::new(),
                         short_name: None,

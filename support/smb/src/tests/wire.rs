@@ -266,6 +266,7 @@ fn embedded_bitfields_decode_unaligned_create_and_preserve_unknown_bits() {
 fn directory_formats_match_independent_byte_layouts() {
     let info = Metadata {
         id: 0x0807_0605_0403_0201,
+        id128: Some([0xA5; 16]),
         name: "a\u{100}".into(),
         path: "\\a\u{100}".into(),
         short_name: Some("S1".into()),
@@ -286,15 +287,74 @@ fn directory_formats_match_independent_byte_layouts() {
         granted_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
     };
     // Literal fixed lengths and offsets are independent of the encoder's types:
-    // MS-FSCC §§2.4.8, 10, 15, 22, 24, 33.
-    for (class, fixed, short_name, id_offset) in [
-        (FileInformationClass::DIRECTORY, 64, false, None),
-        (FileInformationClass::FULL_DIRECTORY, 68, false, None),
-        (FileInformationClass::BOTH_DIRECTORY, 94, true, None),
-        (FileInformationClass::NAMES, 12, false, None),
-        (FileInformationClass::ID_BOTH_DIRECTORY, 104, true, Some(96)),
-        (FileInformationClass::ID_FULL_DIRECTORY, 80, false, Some(72)),
+    // MS-FSCC §§2.4.8, 10, 15, 18-24, 33.
+    for (class, fixed, short_name, id_offset, id128_offset) in [
+        (FileInformationClass::DIRECTORY, 64, None, None, None),
+        (FileInformationClass::FULL_DIRECTORY, 68, None, None, None),
+        (
+            FileInformationClass::BOTH_DIRECTORY,
+            94,
+            Some(68),
+            None,
+            None,
+        ),
+        (FileInformationClass::NAMES, 12, None, None, None),
+        (
+            FileInformationClass::ID_BOTH_DIRECTORY,
+            104,
+            Some(68),
+            Some(96),
+            None,
+        ),
+        (
+            FileInformationClass::ID_FULL_DIRECTORY,
+            80,
+            None,
+            Some(72),
+            None,
+        ),
+        (
+            FileInformationClass::ID_EXTD_DIRECTORY,
+            88,
+            None,
+            None,
+            Some(72),
+        ),
+        (
+            FileInformationClass::ID64_EXTD_DIRECTORY,
+            80,
+            None,
+            Some(72),
+            None,
+        ),
+        (
+            FileInformationClass::ID64_EXTD_BOTH_DIRECTORY,
+            106,
+            Some(80),
+            Some(72),
+            None,
+        ),
+        (
+            FileInformationClass::ID_ALL_EXTD_DIRECTORY,
+            96,
+            None,
+            Some(72),
+            Some(80),
+        ),
+        (
+            FileInformationClass::ID_ALL_EXTD_BOTH_DIRECTORY,
+            122,
+            Some(96),
+            Some(72),
+            Some(80),
+        ),
     ] {
+        let extended = class.0 >= 60;
+        let mut entry = info.clone();
+        if extended {
+            entry.attributes = 0x420;
+            entry.reparse_tag = 0x8000001b;
+        }
         let mut expected = vec![0; fixed];
         if class == FileInformationClass::NAMES {
             expected[8..12].copy_from_slice(&4u32.to_le_bytes());
@@ -304,30 +364,36 @@ fn directory_formats_match_independent_byte_layouts() {
             }
             expected[40..48].copy_from_slice(&5u64.to_le_bytes());
             expected[48..56].copy_from_slice(&8u64.to_le_bytes());
-            expected[56..60].copy_from_slice(&0x20u32.to_le_bytes());
+            expected[56..60].copy_from_slice(&entry.attributes.to_le_bytes());
             expected[60..64].copy_from_slice(&4u32.to_le_bytes());
             if class != FileInformationClass::DIRECTORY {
                 expected[64..68].copy_from_slice(&8u32.to_le_bytes());
             }
-            if short_name {
-                expected[68] = 4;
-                expected[70..74].copy_from_slice(&[b'S', 0, b'1', 0]);
+            if extended {
+                expected[68..72].copy_from_slice(&0x8000001bu32.to_le_bytes());
+            }
+            if let Some(offset) = short_name {
+                expected[offset] = 4;
+                expected[offset + 2..offset + 6].copy_from_slice(&[b'S', 0, b'1', 0]);
             }
             if let Some(offset) = id_offset {
                 expected[offset..offset + 8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             }
+            if let Some(offset) = id128_offset {
+                expected[offset..offset + 16].fill(0xa5);
+            }
         }
         expected.extend_from_slice(&[b'a', 0, 0, 1]);
         assert_eq!(
-            directory_record(class, &info).unwrap(),
+            directory_record(class, &entry).unwrap(),
             expected,
             "{class:?}"
         );
 
-        let mut no_alias = info.clone();
+        let mut no_alias = entry;
         no_alias.short_name = None;
-        if short_name {
-            expected[68..94].fill(0);
+        if let Some(offset) = short_name {
+            expected[offset..offset + 26].fill(0);
             assert_eq!(
                 directory_record(class, &no_alias).unwrap(),
                 expected,
@@ -335,6 +401,13 @@ fn directory_formats_match_independent_byte_layouts() {
             );
         }
     }
+    let mut missing_id128 = info.clone();
+    missing_id128.id128 = None;
+    assert!(matches!(
+        directory_record(FileInformationClass::ID_EXTD_DIRECTORY, &missing_id128),
+        Err(Status::NOT_SUPPORTED)
+    ));
+    assert!(directory_record(FileInformationClass::ID64_EXTD_DIRECTORY, &missing_id128).is_ok());
     let mut invalid_alias = info;
     invalid_alias.short_name = Some("a".repeat(13));
     assert!(matches!(

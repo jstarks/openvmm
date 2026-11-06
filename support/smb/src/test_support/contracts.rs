@@ -958,6 +958,7 @@ pub async fn data_and_identity<F: Fixture>(fixture: &F) {
     );
     let metadata = fs.metadata(&peer, &request).await.unwrap();
     assert_eq!((metadata.id, metadata.size), (initial.id, 10));
+    assert_eq!(metadata.id128, initial.id128);
     assert_eq!(metadata.number_of_links, 1);
     match fs.read(&peer, 20, 8, &request).await {
         Ok(bytes) => assert!(bytes.is_empty()),

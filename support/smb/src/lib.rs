@@ -2302,6 +2302,33 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let class = FileInformationClass(request.info_class);
         match (request.info_type, class) {
+            (InformationType::SECURITY, _) => {
+                let information = SecurityInformation::from_bits(
+                    request.additional_information.get() & SecurityInformation::VALID,
+                );
+                let system = information.sacl() || information.scope() || information.backup();
+                let dac = information.dacl() || information.attribute() || information.backup();
+                let owner = information.owner()
+                    || information.group()
+                    || information.label()
+                    || information.backup();
+                if (system && !file.access.access_system_security())
+                    || (dac && !file.access.write_dac())
+                    || (owner && !file.access.write_owner())
+                {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let descriptor =
+                    security::SecurityDescriptor::decode(data).map_err(|error| match error {
+                        security::DecodeError::Sid => Status::INVALID_SID,
+                        security::DecodeError::Acl => Status::INVALID_ACL,
+                        security::DecodeError::Descriptor => Status::INVALID_SECURITY_DESCR,
+                    })?;
+                self.server
+                    .backend
+                    .set_security(&file.file, information, &descriptor, context)
+                    .await?;
+            }
             (InformationType::FILE, FileInformationClass::RENAME) => {
                 if data.len() < FILE_RENAME_INFORMATION_MIN_SIZE {
                     return Err(Status::INFO_LENGTH_MISMATCH);

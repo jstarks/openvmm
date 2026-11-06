@@ -40,6 +40,8 @@ pub enum Operation {
     FileSystemInformation,
     /// Selected security descriptor query.
     QuerySecurity,
+    /// Selected security descriptor update.
+    SetSecurity,
     /// Data read.
     Read,
     /// Data write.
@@ -772,6 +774,24 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         let result = self
             .backend
             .query_security(&file.inner, information, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn set_security(
+        &self,
+        file: &Self::File,
+        information: SecurityInformation,
+        descriptor: &SecurityDescriptor,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::SetSecurity, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .set_security(&file.inner, information, descriptor, &context)
             .await;
         call.complete(result, None).await
     }

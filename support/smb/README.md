@@ -136,6 +136,11 @@ MemoryFs exposes owner/group/DACL metadata for its fixed synthetic SYSTEM share
 identity and allow-everyone default policy, not a network client's identity.
 ACL updates and advanced security selectors remain unsupported at this checkpoint;
 no persistent-ACL capability is advertised.
+SET_SECURITY is routed through an optional provider operation after open-right
+checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.
+Providers must apply selected components atomically and enforce their policy on
+future opens and namespace operations; merely storing an ACL is not success.
+ControlledFs gates both the call and delivery of its settled result.
 
 Independent byte fixtures verify unaligned embedded bitfields, all six supported
 directory layouts (with and without short names), and actual CREATE context,

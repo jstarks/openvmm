@@ -37,6 +37,7 @@ const LOCK_WAITER_LIMIT: usize = 1024;
 pub struct MemoryFs(Arc<Mutex<State>>);
 
 struct Node {
+    default_stream: u64,
     metadata: Metadata,
     security: SecurityDescriptor,
     parent: u64,
@@ -262,6 +263,7 @@ impl MemoryFs {
     pub fn new(byte_limit: usize, object_limit: usize) -> Self {
         let now = nt_time();
         let root = Node {
+            default_stream: 0,
             metadata: Metadata {
                 stream_name: None,
                 id: 1,
@@ -425,7 +427,7 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
 
 fn file_metadata(state: &State, file: &MemoryFile) -> Result<Metadata, Status> {
     let mut info = node_metadata(state, file.node)?;
-    if file.stream != 0 {
+    if !is_default_stream(state, file) {
         let stream = state
             .nodes
             .get(&file.node)
@@ -950,6 +952,184 @@ fn open_named_stream(
     Ok((stream, action))
 }
 
+fn rename_stream(
+    state: &mut State,
+    file: &MemoryFile,
+    name: &str,
+    replace: bool,
+) -> Result<(), Status> {
+    let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+    if !AccessMask::from_bits(open.access).delete() {
+        return Err(Status::ACCESS_DENIED);
+    }
+    let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+    let source_default = file.stream == node.default_stream;
+    let directory_stream = source_default && node.metadata.is_directory();
+    let suffix = name.strip_prefix(':').ok_or(Status::INVALID_PARAMETER)?;
+    let mut parts = suffix.split(':');
+    let new_name = parts.next().ok_or(Status::INVALID_PARAMETER)?;
+    let kind = parts.next().unwrap_or(if directory_stream {
+        "$INDEX_ALLOCATION"
+    } else {
+        "$DATA"
+    });
+    if name.ends_with(':')
+        || parts.next().is_some()
+        || new_name.encode_utf16().count() > MAX_COMPONENT_NAME_LENGTH as usize
+    {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    components(kind).map_err(|_| Status::INVALID_PARAMETER)?;
+    if kind.contains(['\\', '/']) {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    if !new_name.is_empty() {
+        components(new_name).map_err(|_| Status::INVALID_PARAMETER)?;
+        if new_name.contains(['\\', '/']) {
+            return Err(Status::INVALID_PARAMETER);
+        }
+    }
+    if directory_stream {
+        return Err(if kind.eq_ignore_ascii_case("$INDEX_ALLOCATION") {
+            Status::INVALID_PARAMETER
+        } else {
+            Status::OBJECT_TYPE_MISMATCH
+        });
+    }
+    if !kind.eq_ignore_ascii_case("$DATA") {
+        return Err(Status::OBJECT_TYPE_MISMATCH);
+    }
+    if node.metadata.is_directory() && (source_default || new_name.is_empty()) {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    let old_name = if source_default {
+        String::new()
+    } else {
+        node.streams
+            .get(&file.stream)
+            .ok_or(Status::FILE_CLOSED)?
+            .name
+            .clone()
+    };
+    if old_name.eq_ignore_ascii_case(new_name) {
+        return Ok(());
+    }
+    let target = if new_name.is_empty() {
+        Some(node.default_stream)
+    } else {
+        node.streams
+            .iter()
+            .find(|(_, stream)| stream.name.eq_ignore_ascii_case(new_name))
+            .map(|(id, _)| *id)
+    };
+    if let Some(target) = target {
+        if !replace {
+            return Err(Status::OBJECT_NAME_COLLISION);
+        }
+        if state
+            .opens
+            .values()
+            .any(|open| open.node == file.node && open.stream == target)
+            || stream_data(node, target)?.1 != 0
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+    }
+    if source_default && target.is_none() && object_count(state) >= state.object_limit {
+        return Err(Status::DISK_FULL);
+    }
+    let next_default = if source_default {
+        Some((
+            state.next_stream,
+            state
+                .next_stream
+                .checked_add(1)
+                .ok_or(Status::INSUFFICIENT_RESOURCES)?,
+        ))
+    } else {
+        None
+    };
+    let old_default_size = node.metadata.size;
+    let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+    let released = if let Some(target) = target {
+        if target == node.default_stream {
+            node.data.len()
+        } else {
+            node.streams
+                .remove(&target)
+                .ok_or(Status::FILE_CLOSED)?
+                .data
+                .len()
+        }
+    } else {
+        0
+    };
+    if new_name.is_empty() {
+        let source = node
+            .streams
+            .remove(&file.stream)
+            .ok_or(Status::FILE_CLOSED)?;
+        node.data = source.data;
+        node.metadata.size = source.size;
+        node.metadata.allocation_size = node.data.len() as u64;
+        node.default_stream = file.stream;
+    } else if let Some((default, next)) = next_default {
+        let data = std::mem::take(&mut node.data);
+        let size = node.metadata.size;
+        node.metadata.size = 0;
+        node.metadata.allocation_size = 0;
+        node.default_stream = default;
+        node.streams.insert(
+            file.stream,
+            NamedStream {
+                name: new_name.to_owned(),
+                size,
+                data,
+                delete_pending: false,
+            },
+        );
+        state.next_stream = next;
+    } else {
+        node.streams
+            .get_mut(&file.stream)
+            .ok_or(Status::FILE_CLOSED)?
+            .name = new_name.to_owned();
+    }
+    node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+    let default_size_changed = old_default_size != node.metadata.size;
+    state.bytes -= released;
+    modified(state, file)?;
+    if !old_name.is_empty() {
+        emit_named(
+            state,
+            file.node,
+            Some(&old_name),
+            NotifyAction::REMOVED_STREAM,
+            NotifyFilter::new().with_stream_name(true),
+        );
+    }
+    if !new_name.is_empty() {
+        emit_named(
+            state,
+            file.node,
+            Some(new_name),
+            NotifyAction::ADDED_STREAM,
+            NotifyFilter::new().with_stream_name(true),
+        );
+    }
+    if default_size_changed {
+        emit(
+            state,
+            file.node,
+            NotifyAction::MODIFIED,
+            NotifyFilter::new()
+                .with_size(true)
+                .with_last_write(!state.opens[&file.open].user_set_write_time),
+        );
+    }
+    Ok(())
+}
+
 fn settable_attributes() -> FileAttributes {
     FileAttributes::new()
         .with_readonly(true)
@@ -999,8 +1179,15 @@ fn update_eas(
     Ok(entries.into_values().collect())
 }
 
+fn is_default_stream(state: &State, file: &MemoryFile) -> bool {
+    state
+        .nodes
+        .get(&file.node)
+        .is_some_and(|node| node.default_stream == file.stream)
+}
+
 fn stream_data(node: &Node, stream: u64) -> Result<(&[u8], u64), Status> {
-    if stream == 0 {
+    if stream == node.default_stream {
         Ok((&node.data, node.metadata.size))
     } else {
         let stream = node.streams.get(&stream).ok_or(Status::FILE_CLOSED)?;
@@ -1009,7 +1196,7 @@ fn stream_data(node: &Node, stream: u64) -> Result<(&[u8], u64), Status> {
 }
 
 fn stream_data_mut(node: &mut Node, stream: u64) -> Result<(&mut Vec<u8>, &mut u64), Status> {
-    if stream == 0 {
+    if stream == node.default_stream {
         Ok((&mut node.data, &mut node.metadata.size))
     } else {
         let stream = node.streams.get_mut(&stream).ok_or(Status::FILE_CLOSED)?;
@@ -1049,7 +1236,12 @@ fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usi
 }
 
 fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
-    allocate_stream(state, node_id, 0, length)
+    let stream = state
+        .nodes
+        .get(&node_id)
+        .ok_or(Status::FILE_CLOSED)?
+        .default_stream;
+    allocate_stream(state, node_id, stream, length)
 }
 
 fn allocate_stream(
@@ -1076,7 +1268,7 @@ fn allocate_stream(
         data.shrink_to_fit();
     }
     *size = (*size).min(length as u64);
-    if stream == 0 {
+    if stream == node.default_stream {
         node.metadata.allocation_size = length as u64;
     }
     state.bytes = new_bytes;
@@ -1120,7 +1312,7 @@ fn modified(state: &mut State, file: &MemoryFile) -> Result<(), Status> {
 
 fn data_changed(state: &mut State, file: &MemoryFile, size_changed: bool) -> Result<(), Status> {
     let write = !state.opens[&file.open].user_set_write_time;
-    if file.stream == 0 {
+    if is_default_stream(state, file) {
         emit(
             state,
             file.node,
@@ -1169,7 +1361,7 @@ impl MemoryFile {
         let empty = !directory || !has_children(&state, self.node);
         // MS-FSA §2.1.5.5 phase 1 applies CREATE's mode at close. A nonempty
         // directory is left intact; SET_INFO disposition is separate link state.
-        if open.stream != 0 {
+        if open.stream != state.nodes[&self.node].default_stream {
             if let Some(stream) = state
                 .nodes
                 .get_mut(&self.node)
@@ -1376,6 +1568,7 @@ impl FileSystem for MemoryFs {
         let delete = options.options().delete_on_close();
         let (id, stream, action) = if let Some(id) = existing {
             let node = &state.nodes[&id];
+            let default = node.default_stream;
             if named.is_none()
                 && options.options().no_ea_knowledge()
                 && node.eas.iter().any(|ea| ea.need_ea)
@@ -1442,7 +1635,8 @@ impl FileSystem for MemoryFs {
                     return Err(Status::ACCESS_DENIED);
                 }
                 for other in state.opens.values().filter(|o| o.node == id) {
-                    if stream_sharing_conflict(options.access, options.share_access, other, 0) {
+                    if stream_sharing_conflict(options.access, options.share_access, other, default)
+                    {
                         return Err(Status::SHARING_VIOLATION);
                     }
                 }
@@ -1475,7 +1669,7 @@ impl FileSystem for MemoryFs {
                     );
                     (
                         id,
-                        0,
+                        default,
                         if options.disposition() == CreateDisposition::SUPERSEDE {
                             CreateAction::SUPERSEDED.0
                         } else {
@@ -1483,7 +1677,7 @@ impl FileSystem for MemoryFs {
                         },
                     )
                 } else {
-                    (id, 0, CreateAction::OPENED.0)
+                    (id, default, CreateAction::OPENED.0)
                 }
             }
         } else {
@@ -1589,6 +1783,7 @@ impl FileSystem for MemoryFs {
             state.nodes.insert(
                 id,
                 Node {
+                    default_stream: 0,
                     security,
                     metadata: Metadata {
                         stream_name: None,
@@ -1638,12 +1833,14 @@ impl FileSystem for MemoryFs {
             }
             (id, stream, CreateAction::CREATED.0)
         };
-        if delete && id == 1 && stream == 0 {
+        if delete && id == 1 && stream == state.nodes[&id].default_stream {
             return Err(Status::DIRECTORY_NOT_EMPTY);
         }
         let open = state.next_open;
         state.next_open = next_open;
-        let notify_deleted = delete && stream == 0 && state.nodes[&id].metadata.is_directory();
+        let notify_deleted = delete
+            && stream == state.nodes[&id].default_stream
+            && state.nodes[&id].metadata.is_directory();
         state.opens.insert(
             open,
             Open {
@@ -1684,8 +1881,11 @@ impl FileSystem for MemoryFs {
         replace: bool,
         _request: &RequestContext,
     ) -> Result<(), Status> {
-        if file.stream != 0 {
-            return Err(Status::NOT_SUPPORTED);
+        if name.starts_with(':') {
+            let mut state = self.0.lock();
+            let result = rename_stream(&mut state, file, name, replace);
+            wake(state);
+            return result;
         }
         let parts = components(name)?;
         if name.ends_with('\\')
@@ -1924,7 +2124,7 @@ impl FileSystem for MemoryFs {
             FileControl::SetZeroData { offset, end } => {
                 if offset > end
                     || end > i64::MAX as u64
-                    || (file.stream == 0 && node.metadata.is_directory())
+                    || (is_default_stream(&state, file) && node.metadata.is_directory())
                 {
                     return Err(Status::INVALID_PARAMETER);
                 }
@@ -1964,7 +2164,7 @@ impl FileSystem for MemoryFs {
                 range,
                 maximum_ranges,
             } => {
-                if (file.stream == 0 && node.metadata.is_directory())
+                if (is_default_stream(&state, file) && node.metadata.is_directory())
                     || range
                         .offset
                         .checked_add(range.length)
@@ -2208,7 +2408,7 @@ impl FileSystem for MemoryFs {
             .ok_or(Status::FILE_CLOSED)?
             .user_set_access_time;
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-        if file.stream == 0 && node.metadata.is_directory() {
+        if file.stream == node.default_stream && node.metadata.is_directory() {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
         let (data, size) = stream_data(node, file.stream)?;
@@ -2243,7 +2443,7 @@ impl FileSystem for MemoryFs {
         let mut state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
-        if file.stream == 0 && node.metadata.is_directory() {
+        if is_default_stream(&state, file) && node.metadata.is_directory() {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
         if data.is_empty() {
@@ -2284,7 +2484,7 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<Vec<Metadata>, Status> {
         let state = self.0.lock();
-        if file.stream != 0
+        if !is_default_stream(&state, file)
             || !state
                 .nodes
                 .get(&file.node)
@@ -2336,7 +2536,9 @@ impl FileSystem for MemoryFs {
             {
                 let mut state = self.0.lock();
                 state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
-                if file.stream == 0 && state.nodes[&file.node].metadata.is_directory() {
+                if is_default_stream(&state, file)
+                    && state.nodes[&file.node].metadata.is_directory()
+                {
                     return Err(Status::INVALID_PARAMETER);
                 }
                 if request.is_cancelled() {
@@ -2408,7 +2610,7 @@ impl FileSystem for MemoryFs {
         range.validate()?;
         let mut state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
-        if file.stream == 0 && state.nodes[&file.node].metadata.is_directory() {
+        if is_default_stream(&state, file) && state.nodes[&file.node].metadata.is_directory() {
             return Err(Status::INVALID_PARAMETER);
         }
         let index = state
@@ -2432,7 +2634,7 @@ impl FileSystem for MemoryFs {
     ) -> Result<(), Status> {
         let mut state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
-        if file.stream == 0
+        if is_default_stream(&state, file)
             && state
                 .nodes
                 .get(&file.node)
@@ -2465,7 +2667,7 @@ impl FileSystem for MemoryFs {
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let user_set_change_time = open.user_set_change_time;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
-        if file.stream == 0 && node.metadata.is_directory() {
+        if is_default_stream(&state, file) && node.metadata.is_directory() {
             return Err(Status::INVALID_PARAMETER);
         }
         let (data, before) = stream_data(node, file.stream)?;
@@ -2531,7 +2733,7 @@ impl FileSystem for MemoryFs {
         if delete && metadata.attributes().readonly() {
             return Err(Status::CANNOT_DELETE);
         }
-        if file.stream != 0 {
+        if !is_default_stream(&state, file) {
             state
                 .nodes
                 .get_mut(&file.node)
@@ -2651,7 +2853,7 @@ impl FileSystem for MemoryFs {
     ) -> Result<NotifyResult, Status> {
         let (changed, id, watch_id) = {
             let mut state = self.0.lock();
-            if file.stream != 0
+            if !is_default_stream(&state, file)
                 || !state
                     .nodes
                     .get(&file.node)
@@ -2938,6 +3140,7 @@ mod tests {
                 ea_operations: Feature::Supported,
                 stream_queries: Feature::Supported,
                 named_streams: Feature::Supported,
+                stream_rename: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -3027,6 +3230,10 @@ mod tests {
     #[test]
     fn contract_named_streams() {
         run_contract(contracts::named_streams);
+    }
+    #[test]
+    fn contract_stream_renames() {
+        run_contract(contracts::stream_renames);
     }
 
     #[test]

@@ -29,7 +29,7 @@ will not need them.
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
-| EAs and named streams | Retained EAs and real named-stream storage, enumeration and lifetime | Both advertised; selected directory/I/O/sharing/deletion stream cases pass; stream rename remains pending |
+| EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; six selected directory/I/O/sharing/deletion/rename stream cases pass |
 | Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
 | Naming | Share-relative namespace and canonical paths | Dot components resolve within the virtual root; case folding is ASCII-only and no short names are generated |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
@@ -75,7 +75,9 @@ streams. Named streams have independent data, EOF, allocation and locks, and
 stream-local sharing with file-wide delete-sharing checks. They work on files
 and directories, charge shared storage/object quotas atomically, and retain
 existing opens through stream-scoped deletion. File metadata/times and identity
-are shared. Stream rename is explicitly unsupported pending its own slice.
+are shared. Colon-prefixed stream renames preserve open data and locks, including
+moves between default and named streams. Replacing an existing stream requires
+an empty, unopened target; its reserved allocation is released.
 
 ## Run
 
@@ -113,10 +115,10 @@ sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
 The harness also checks descriptor component selection/read rights,
 compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
-The CREATE/sharing harness adds nineteen cases covering locked-file opens,
+The CREATE/sharing harness adds eighteen cases covering locked-file opens,
 multiple connections, readonly deletion, leading-backslash rejection, invalid
 impersonation, concurrent/visible directory creation, directory allocation,
-temporary attributes, the no-stream profile, bilateral share modes and readonly
+temporary attributes, bilateral share modes and readonly
 file/directory maximum-access reporting, readonly delete modes/dispositions,
 and basic DOS attributes/unchanged attributes on existing-object opens,
 plus attribute checks on truncating replacement.
@@ -568,7 +570,8 @@ section 2.1.5.15.12. Its typed prefix is 20 bytes; the complete input must be
 at least 24 bytes. Reserved bytes and padding are ignored, the UTF-16 name is
 length-bounded, RootDirectory must be zero, and destinations are share-relative.
 DELETE access is checked by the engine before calling the provider. Extended
-rename flags, hard links and stream rename remain unsupported.
+rename flags and hard links remain unsupported. Colon-prefixed destinations
+select data-stream rename, including default/named moves (MS-FSA 2.1.5.15.12.1).
 
 The provider atomically validates and updates the namespace, preserving the
 source's data, identity, opens, and byte-range locks. Existing target names
@@ -747,16 +750,15 @@ with an EA-buffer context returns ACCESS_DENIED, before provider calls.
 The specifically reserved CREATE context is ignored after framing validation;
 it does not prevent processing other contexts.
 
-MemoryFs deliberately has no EAs or named streams and advertises neither.
-Full-EA/stream queries return INVALID_INFO_CLASS; EA-content queries/sets check
-READ_EA / WRITE_EA. EA-size queries are unrestricted. Structurally invalid EA
-SET lists return EA_LIST_INCONSISTENT, while
-valid unsupported sets return INVALID_DEVICE_REQUEST. Creation EAs fail
-EAS_NOT_SUPPORTED before publication, but existing objects ignore EA bytes,
-including OPEN_IF. Borrowed OpenOptions input preserves atomic native-provider
-creation rather than requiring an open-then-set sequence.
+MemoryFs supports and advertises EAs and named streams. Providers can explicitly
+decline either feature: unsupported snapshots return INVALID_INFO_CLASS, sets
+return INVALID_DEVICE_REQUEST, and creation EAs return EAS_NOT_SUPPORTED before
+publication. EA-content queries/sets check READ_EA / WRITE_EA; EA-size queries
+are unrestricted. Invalid EA SET lists return EA_LIST_INCONSISTENT. Existing
+objects ignore creation EA bytes, including OPEN_IF. Borrowed OpenOptions input
+preserves atomic provider creation rather than requiring an open-then-set sequence.
 
-Full Unicode case-folding, advanced/reinherited ACLs, leases and IOCTLs remain
+Full Unicode case-folding, advanced/reinherited ACLs, leases and broader IOCTLs remain
 future work. Basic rename/move and ACL updates are implemented.
 Unsupported requests receive explicit status errors.
 Memory is allocated for file holes; this is not a sparse-filesystem model.

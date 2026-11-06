@@ -65,6 +65,8 @@ pub struct Expectations {
     pub stream_queries: Feature,
     /// Named data-stream opens, isolated content and stream-scoped deletion.
     pub named_streams: Feature,
+    /// Stream renames, including moving the default stream into a named stream.
+    pub stream_rename: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -662,6 +664,39 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Default/named stream moves preserve data and existing open bindings.
+pub async fn stream_renames<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let base = open(fs, "renames", CreateDisposition::CREATE, false, &request).await;
+    write_all(fs, &base, 0, b"data", &request).await;
+    let result = fs.rename(&base, ":side", false, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().stream_rename) {
+        rejected(result, status);
+    } else {
+        result.unwrap();
+        let alias = open(fs, "renames:side", CreateDisposition::OPEN, false, &request).await;
+        assert_eq!(read_bytes(fs, &alias, 0, 4, &request).await, b"data");
+        let empty = open(fs, "renames", CreateDisposition::OPEN, false, &request).await;
+        match fs.read(&empty, 0, 1, &request).await {
+            Ok(bytes) => assert!(bytes.is_empty()),
+            Err(status) => assert_eq!(status, Status::END_OF_FILE),
+        }
+        fs.close(&empty, &request).await.unwrap();
+        fs.rename(&alias, "::$DATA", true, &request).await.unwrap();
+        fs.close(&alias, &request).await.unwrap();
+        assert!(
+            fs.metadata(&base, &request)
+                .await
+                .unwrap()
+                .stream_name
+                .is_none()
+        );
+    }
+    assert_eq!(read_bytes(fs, &base, 0, 4, &request).await, b"data");
+    fs.close(&base, &request).await.unwrap();
 }
 
 /// Named streams isolate content and retain opens through stream-scoped deletion.

@@ -86,6 +86,7 @@ fn samba_streams() {
             "smb2.streams.sharemodes",
             "smb2.streams.delete",
             "smb2.streams.zero-byte",
+            "smb2.streams.rename",
         ],
     );
 }

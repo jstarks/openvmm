@@ -647,6 +647,183 @@ fn readonly_files_reject_named_stream_delete_on_close() {
 }
 
 #[test]
+fn stream_renames_preserve_open_data_and_move_default_stream_bindings() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let base = client.open("stream-renames", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(base, 0, b"base"))
+            .await;
+        let named = client.open("stream-renames:old", 3, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(named, 0, b"named"))
+            .await;
+        let alias = client.open("stream-renames:old", 1, 0).await;
+        client
+            .ok(
+                Command::LOCK,
+                &locking::body(
+                    named,
+                    &[(
+                        0,
+                        5,
+                        LockFlags::new()
+                            .with_exclusive_lock(true)
+                            .with_fail_immediately(true),
+                    )],
+                ),
+            )
+            .await;
+        let rename = |name: &str, replace: bool| {
+            let name = encode_name(name);
+            let mut data = FileRenameInformation::new_zeroed();
+            data.replace_if_exists = u8::from(replace);
+            data.file_name_length = (name.len() as u32).into();
+            let mut bytes = data.as_bytes().to_vec();
+            bytes.extend(name);
+            bytes
+        };
+        assert_eq!(
+            response_status(&client.set(named, 10, &rename(":new", false)).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.read(alias, 0, 8).await),
+            Status::FILE_LOCK_CONFLICT
+        );
+        assert_eq!(&client.read(named, 0, 8).await[80..], b"named");
+        assert_eq!(
+            response_status(&client.open_result("stream-renames:old", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .set(base, 10, &rename(":former-default:$DATA", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.read(base, 0, 8).await[80..], b"base");
+        let fresh = client.open("stream-renames", 1, 0).await;
+        assert_eq!(
+            response_status(&client.read(fresh, 0, 8).await),
+            Status::END_OF_FILE
+        );
+        client.close(fresh).await;
+        assert_eq!(
+            response_status(&client.set(named, 10, &rename("::$DATA", true)).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.read(alias, 0, 8).await),
+            Status::FILE_LOCK_CONFLICT
+        );
+        client
+            .ok(
+                Command::LOCK,
+                &locking::body(named, &[(0, 5, LockFlags::new().with_unlock(true))]),
+            )
+            .await;
+        assert_eq!(&client.read(alias, 0, 8).await[80..], b"named");
+        let fresh = client.open("stream-renames", 1, 0).await;
+        assert_eq!(&client.read(fresh, 0, 8).await[80..], b"named");
+        for file in [fresh, alias, named, base] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn stream_rename_validation_and_replacement_preserve_data_on_failure() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let source = client.open("rename-validation:source", 3, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(source, 0, b"payload"))
+            .await;
+        let target = client.open("rename-validation:target", 3, 0).await;
+        let rename = |name: &str, replace: bool| {
+            let name = encode_name(name);
+            let mut data = FileRenameInformation::new_zeroed();
+            data.replace_if_exists = u8::from(replace);
+            data.file_name_length = (name.len() as u32).into();
+            let mut bytes = data.as_bytes().to_vec();
+            bytes.extend(name);
+            bytes
+        };
+        for (name, replace, status) in [
+            (":target", false, Status::OBJECT_NAME_COLLISION),
+            (":target", true, Status::INVALID_PARAMETER),
+            (":bad:", false, Status::INVALID_PARAMETER),
+            (
+                ":bad:$INDEX_ALLOCATION",
+                false,
+                Status::OBJECT_TYPE_MISMATCH,
+            ),
+            (":bad:$D?TA", false, Status::INVALID_PARAMETER),
+        ] {
+            assert_eq!(
+                response_status(&client.set(source, 10, &rename(name, replace)).await),
+                status
+            );
+            assert_eq!(&client.read(source, 0, 32).await[80..], b"payload");
+        }
+        client
+            .ok(Command::WRITE, &Client::write_body(target, 0, b"x"))
+            .await;
+        client.close(target).await;
+        assert_eq!(
+            response_status(&client.set(source, 10, &rename(":target", true)).await),
+            Status::INVALID_PARAMETER
+        );
+        let target = client.open("rename-validation:target", 1, 0).await;
+        assert_eq!(
+            response_status(&client.set(target, 20, &0i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.set(target, 19, &16i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        client.close(target).await;
+        assert_eq!(
+            response_status(&client.set(source, 10, &rename(":target", true)).await),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.read(source, 0, 32).await[80..], b"payload");
+        let renamed = client.open("rename-validation:target", 1, 0).await;
+        assert_eq!(&client.read(renamed, 0, 32).await[80..], b"payload");
+        let directory = client.open("rename-directory", 2, 1).await;
+        for (name, status) in [
+            (":new", Status::INVALID_PARAMETER),
+            (":new:$DATA", Status::OBJECT_TYPE_MISMATCH),
+            (":new:$INDEX_ALLOCATION", Status::INVALID_PARAMETER),
+        ] {
+            assert_eq!(
+                response_status(&client.set(directory, 10, &rename(name, false)).await),
+                status
+            );
+        }
+        let data = client.open("rename-directory:data", 3, 0).await;
+        assert_eq!(
+            response_status(&client.set(data, 10, &rename("::$DATA", true)).await),
+            Status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            response_status(&client.set(data, 10, &rename(":new", false)).await),
+            Status::SUCCESS
+        );
+        client.close(data).await;
+        client.close(directory).await;
+        client.close(renamed).await;
+        client.close(source).await;
+    });
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

@@ -10,8 +10,8 @@
 pub mod contracts;
 
 use crate::provider::{
-    BasicInformation, ByteRange, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
-    OpenOptions, RequestContext,
+    BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
+    LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
 };
 use crate::security::SecurityDescriptor;
 use crate::spec::SecurityInformation;
@@ -42,6 +42,8 @@ pub enum Operation {
     Metadata,
     /// Filesystem identity, capabilities and capacity query.
     FileSystemInformation,
+    /// Selected filesystem control.
+    FileControl,
     /// Selected security descriptor query.
     QuerySecurity,
     /// Selected security descriptor update.
@@ -772,6 +774,23 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         let result = self
             .backend
             .filesystem_information(&file.inner, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn file_control(
+        &self,
+        file: &Self::File,
+        control: FileControl,
+        r: &RequestContext,
+    ) -> Result<FileControlResult, Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::FileControl, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .file_control(&file.inner, control, &context)
             .await;
         call.complete(result, None).await
     }

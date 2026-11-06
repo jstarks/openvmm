@@ -30,7 +30,7 @@ will not need them.
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Explicit unsupported storage profile, validation and access checks | Neither capability advertised; no fabricated empty-success replies; fixtures requiring storage are not passes |
-| Caching and IOCTLs | Explicit uncached profile and validated unsupported controls | No oplock/lease grants; ACK/error/identity/bounds/credit regressions; no successful FSCTL operations |
+| Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
 | Naming | Share-relative namespace and canonical paths | Dot components resolve within the virtual root; case folding is ASCII-only and no short names are generated |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
@@ -48,6 +48,12 @@ Extended directory classes 60 and 78-81 include provider reparse tags and
 64-bit/128-bit identities, plus short names where specified. Providers may
 decline formats needing an unsupported 128-bit identity. MemoryFs exposes a
 stable volume-scoped 128-bit identity by extending its own node identity.
+
+Selected FSCTLs use a semantic async provider operation, not arbitrary native
+passthrough. GET_COMPRESSION returns the provider's format for files and
+directories; MemoryFs reports NONE and does not advertise compressed storage.
+Controlled providers can gate, cancel or reject these calls, and CLOSE drains
+their actual results before releasing the open.
 
 ## Run
 

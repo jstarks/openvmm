@@ -69,6 +69,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::Close,
             Operation::Metadata,
             Operation::FileSystemInformation,
+            Operation::FileControl,
             Operation::QuerySecurity,
             Operation::Read,
             Operation::Write,
@@ -206,6 +207,15 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         )
         .await;
         assert_eq!(volume.caller_available_allocation_units, 1021);
+        assert!(matches!(
+            through_gates(
+                fs.file_control(&file, FileControl::GetCompression, &context),
+                &control,
+                Operation::FileControl,
+            )
+            .await,
+            FileControlResult::Compression(0),
+        ));
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
         let range = ByteRange {
             offset: 0,
@@ -263,6 +273,78 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         assert_eq!(ids.len(), calls.len());
         let kinds: BTreeSet<_> = calls.iter().map(|call| call.operation).collect();
         assert_eq!(kinds, operations.into_iter().collect());
+    });
+}
+
+#[test]
+fn pending_filesystem_controls_cancel_or_drain_before_close() {
+    block_on(async {
+        for after in [false, true] {
+            let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+            control
+                .set_plan(
+                    Operation::FileControl,
+                    Plan {
+                        hold_before: !after,
+                        hold_after: after,
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
+            let server = Server::new("memory", fs).unwrap();
+            let mut client = Client::new(&server).await;
+            let file = client.open("controlled", 2, 0).await;
+            let mut body = IoctlRequest::new_zeroed();
+            body.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+            body.file_id = file;
+            body.control_code = FsctlCode::GET_COMPRESSION.0.into();
+            body.flags = IoctlFlags::new().with_fsctl(true);
+            body.max_output_response = 2.into();
+            let packet = request(
+                Command::IOCTL,
+                body.as_bytes(),
+                client.session,
+                client.tree,
+                client.message,
+            );
+            client.message += 1;
+            let mut querying = std::pin::pin!(client.connection.request(packet).unwrap().execute());
+            assert!(futures::poll!(&mut querying).is_pending());
+            let call = control.next_call().await;
+            assert_eq!(call.operation, Operation::FileControl);
+            assert_eq!(control.snapshot(call.id).unwrap().delegated, after);
+            let mut body = CloseRequest::new_zeroed();
+            body.structure_size = CloseRequest::STRUCTURE_SIZE.into();
+            body.file_id = file;
+            let packet = request(
+                Command::CLOSE,
+                body.as_bytes(),
+                client.session,
+                client.tree,
+                client.message,
+            );
+            client.message += 1;
+            let mut closing = std::pin::pin!(client.connection.request(packet).unwrap().execute());
+            assert!(futures::poll!(&mut closing).is_pending());
+            if after {
+                control.release(call.id, Gate::After).unwrap();
+            }
+            let response = querying.await.unwrap();
+            assert_eq!(
+                response_status(&response),
+                if after {
+                    Status::SUCCESS
+                } else {
+                    Status::CANCELLED
+                }
+            );
+            if after {
+                assert_eq!(&response[112..], &[0, 0]);
+            }
+            assert_eq!(response_status(&closing.await.unwrap()), Status::SUCCESS);
+            assert!(control.snapshot(call.id).unwrap().cancel_requested);
+            assert_eq!(successes(&control, Operation::Close), 1);
+        }
     });
 }
 

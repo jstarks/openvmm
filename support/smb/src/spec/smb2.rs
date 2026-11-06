@@ -774,12 +774,13 @@ LockRequest, 48, 48 {
     first_lock: LockElement,
 });
 open_enum! {
-    /// SMB-specific FSCTLs: [MS-SMB2] §2.2.31; shared-VHD constants: [MS-RSVD] §2.2.1.
+    /// FSCTLs: [MS-SMB2] §2.2.31, [MS-FSCC] §2.3 and [MS-RSVD] §2.2.1.
     pub enum FsctlCode: u32 {
         #![expect(missing_docs, reason = "Names follow the cited control-code tables.")]
         DFS_GET_REFERRALS = 0x00060194,
         DFS_GET_REFERRALS_EX = 0x000601b0,
         PIPE_WAIT = 0x00110018,
+        GET_COMPRESSION = 0x0009003c,
         QUERY_NETWORK_INTERFACE_INFO = 0x001401fc,
         VALIDATE_NEGOTIATE_INFO = 0x00140204,
         QUERY_SHARED_VIRTUAL_DISK_SUPPORT = 0x00090300,
@@ -826,6 +827,20 @@ IoctlRequest, 56, 57 {
     output_count: U32,
     max_output_response: U32,
     flags: IoctlFlags,
+    reserved2: U32,
+});
+wire!(
+/// IOCTL response fixed prefix: [MS-SMB2] §2.2.32.
+IoctlResponse, 48, 49 {
+    structure_size: U16,
+    reserved: U16,
+    control_code: U32,
+    file_id: FileId,
+    input_offset: U32,
+    input_count: U32,
+    output_offset: U32,
+    output_count: U32,
+    flags: U32,
     reserved2: U32,
 });
 wire!(

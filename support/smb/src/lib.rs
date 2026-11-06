@@ -28,8 +28,8 @@ use event_listener::Event;
 use inspect::Inspect;
 use parking_lot::Mutex;
 use provider::{
-    BasicInformation, ByteRange, FileSystem, FileSystemInformation, Metadata, NotifyResult,
-    OpenOptions, RequestContext, map_access,
+    BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
+    Metadata, NotifyResult, OpenOptions, RequestContext, map_access,
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1378,6 +1378,11 @@ impl<B: FileSystem> CommandRequest<B> {
                         .query_info(packet, header.tree_id.get(), &self.context)
                         .await
                 }
+                Ok(()) if command == Command::IOCTL => {
+                    connection
+                        .ioctl(packet, header.tree_id.get(), &self.context)
+                        .await
+                }
                 Ok(()) => connection
                     .dispatch(header, command, packet, &self.context, &self.retired)
                     .await
@@ -1733,7 +1738,6 @@ impl<B: FileSystem> Connection<B> {
             Command::READ => self.read(packet, tree, context).await,
             Command::WRITE => self.write(packet, tree, context).await,
             Command::LOCK => self.lock(packet, tree, context).await,
-            Command::IOCTL => self.ioctl(packet, tree, context),
             Command::OPLOCK_BREAK => self.oplock_acknowledgement(packet, tree, context),
             Command::QUERY_DIRECTORY => self.query_directory(packet, tree, context).await,
             Command::SET_INFO => self.set_info(packet, tree, context).await,
@@ -1741,7 +1745,12 @@ impl<B: FileSystem> Connection<B> {
         }
     }
 
-    fn ioctl(&self, packet: &[u8], tree: u32, context: &RequestContext) -> Result<Vec<u8>, Status> {
+    async fn ioctl(
+        &self,
+        packet: &[u8],
+        tree: u32,
+        context: &RequestContext,
+    ) -> Result<(Status, Vec<u8>), Status> {
         let request: IoctlRequest = read_body(packet)?;
         if request.flags.into_bits() != IoctlFlags::new().with_fsctl(true).into_bits() {
             return Err(Status::NOT_SUPPORTED);
@@ -1782,7 +1791,40 @@ impl<B: FileSystem> Connection<B> {
         ) {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
-        Err(Status::NOT_SUPPORTED)
+        let control = match code {
+            FsctlCode::GET_COMPRESSION => {
+                if request.max_output_response.get() < 2 {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                FileControl::GetCompression
+            }
+            _ => return Err(Status::NOT_SUPPORTED),
+        };
+        let file = self.file(request.file_id, tree, context)?;
+        let result = self
+            .server
+            .backend
+            .file_control(&file.file, control, context)
+            .await?;
+        let output = match result {
+            FileControlResult::Compression(format) => format.to_le_bytes().to_vec(),
+        };
+        let mut body = IoctlResponse {
+            structure_size: IoctlResponse::STRUCTURE_SIZE.into(),
+            reserved: 0.into(),
+            control_code: request.control_code,
+            file_id: request.file_id,
+            input_offset: (body_end::<IoctlResponse>() as u32).into(),
+            input_count: 0.into(),
+            output_offset: (body_end::<IoctlResponse>() as u32).into(),
+            output_count: (output.len() as u32).into(),
+            flags: 0.into(),
+            reserved2: 0.into(),
+        }
+        .as_bytes()
+        .to_vec();
+        body.extend_from_slice(&output);
+        Ok((Status::SUCCESS, body))
     }
 
     fn oplock_acknowledgement(

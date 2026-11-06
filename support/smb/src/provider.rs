@@ -137,6 +137,20 @@ impl Metadata {
     }
 }
 
+/// Selected filesystem controls, decoded independently of SMB buffer layouts.
+#[derive(Debug, Clone, Copy)]
+pub enum FileControl {
+    /// Query the stream or directory's COMPRESSION_FORMAT_* state.
+    GetCompression,
+}
+
+/// Semantic result of a selected filesystem control.
+#[derive(Debug)]
+pub enum FileControlResult {
+    /// Current COMPRESSION_FORMAT_* state.
+    Compression(u16),
+}
+
 /// Provider-owned sector geometry and alignment, including synthetic devices.
 #[derive(Debug, Clone, Copy)]
 pub struct SectorSizeInformation {
@@ -352,6 +366,17 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         _request: &RequestContext,
     ) -> Result<FileSystemInformation, Status> {
         Err(Status::NOT_SUPPORTED)
+    }
+    /// Execute a selected filesystem control on this open.
+    /// Unsupported controls fail without effects. The caller retains the future,
+    /// request and open through completion, including cancellation and CLOSE drain.
+    async fn file_control(
+        &self,
+        _file: &Self::File,
+        _control: FileControl,
+        _request: &RequestContext,
+    ) -> Result<FileControlResult, Status> {
+        Err(Status::INVALID_DEVICE_REQUEST)
     }
     /// Query selected security components for the established share identity.
     /// Unsupported security stores reject rather than fabricate an ACL.

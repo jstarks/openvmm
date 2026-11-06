@@ -36,6 +36,65 @@ fn ea_size_queries_do_not_require_ea_content_or_attribute_access() {
 }
 
 #[test]
+fn get_compression_control_reports_storage_state_without_attribute_access() {
+    use crate::test_support::{ControlledFs, Operation, Plan};
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        for (name, options) in [("compressed-file", 0), ("compressed-directory", 1)] {
+            let response = client.open_result(name, 0x00100000, 7, 2, options).await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+            let mut ioctl = IoctlRequest::new_zeroed();
+            ioctl.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+            ioctl.file_id = file;
+            ioctl.control_code = 0x0009003cu32.into();
+            ioctl.flags = IoctlFlags::new().with_fsctl(true);
+            for maximum in [0u32, 1, 2, 4] {
+                ioctl.max_output_response = maximum.into();
+                let response = client.send(Command::IOCTL, ioctl.as_bytes()).await;
+                if maximum < 2 {
+                    assert_eq!(response_status(&response), Status::INVALID_PARAMETER);
+                } else {
+                    assert_eq!(response_status(&response), Status::SUCCESS);
+                    let mut expected = vec![49, 0, 0, 0, 0x3c, 0, 9, 0];
+                    expected.extend_from_slice(file.as_bytes());
+                    for field in [112u32, 0, 112, 2, 0, 0] {
+                        expected.extend_from_slice(&field.to_le_bytes());
+                    }
+                    expected.extend_from_slice(&[0, 0]);
+                    assert_eq!(&response[64..], expected);
+                }
+            }
+            for failure in [Status::INVALID_DEVICE_REQUEST, Status::ACCESS_DENIED] {
+                control
+                    .set_plan(
+                        Operation::FileControl,
+                        Plan {
+                            failure: Some(failure),
+                            ..Plan::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+                    failure,
+                );
+            }
+            control
+                .set_plan(Operation::FileControl, Plan::default())
+                .unwrap();
+            client.close(file).await;
+            assert_eq!(
+                response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+                Status::FILE_CLOSED
+            );
+        }
+    });
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

@@ -4,8 +4,9 @@
 //! A bounded writable in-memory filesystem for synthetic shares.
 
 use crate::provider::{
-    BasicInformation, ByteRange, Change, CompressionInformation, FileSystem, FileSystemInformation,
-    LockId, Metadata, NotifyResult, OpenOptions, RequestContext, SectorSizeInformation,
+    BasicInformation, ByteRange, Change, CompressionInformation, FileControl, FileControlResult,
+    FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
+    SectorSizeInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
@@ -1401,6 +1402,25 @@ impl FileSystem for MemoryFs {
                 partition_alignment: 0,
             }),
         })
+    }
+
+    async fn file_control(
+        &self,
+        file: &MemoryFile,
+        control: FileControl,
+        _request: &RequestContext,
+    ) -> Result<FileControlResult, Status> {
+        let state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        match control {
+            FileControl::GetCompression => Ok(FileControlResult::Compression(
+                node.metadata
+                    .compression
+                    .ok_or(Status::INVALID_DEVICE_REQUEST)?
+                    .format,
+            )),
+        }
     }
 
     async fn query_security(

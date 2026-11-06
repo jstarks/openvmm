@@ -3,6 +3,7 @@
 
 //! A bounded writable in-memory filesystem for synthetic shares.
 
+mod storage;
 use crate::codec::{
     align_up, decode_ea_list, encode_ea_list, symbolic_link, validate_reparse_data,
     validate_reparse_identity,
@@ -30,6 +31,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use storage::Data;
 
 pub(crate) const MAX_COMPONENT_NAME_LENGTH: u32 = 255;
 pub(crate) const NOTIFY_BUFFER_LIMIT: usize = 64 * 1024;
@@ -37,6 +39,7 @@ const NOTIFY_WAITER_LIMIT: usize = 32;
 const NOTIFY_WATCH_LIMIT: usize = 1024;
 const LOCK_LIMIT: usize = 4096;
 const LOCK_WAITER_LIMIT: usize = 1024;
+const SPARSE_EXTENT_LIMIT: usize = 4096;
 
 /// A writable filesystem with a shared byte quota and object limit.
 #[derive(Clone)]
@@ -49,7 +52,7 @@ struct Node {
     default_stream: u64,
     metadata: Metadata,
     security: SecurityDescriptor,
-    data: Vec<u8>,
+    data: Data,
     eas: Vec<ExtendedAttribute>,
     streams: BTreeMap<u64, NamedStream>,
 }
@@ -65,7 +68,7 @@ struct Link {
 struct NamedStream {
     name: String,
     size: u64,
-    data: Vec<u8>,
+    data: Data,
     delete_pending: bool,
     replacement_deleted: bool,
 }
@@ -342,7 +345,7 @@ impl MemoryFs {
                 granted_access: 0,
             },
             security: default_security(true),
-            data: Vec::new(),
+            data: Data::default(),
             eas: Vec::new(),
             streams: BTreeMap::new(),
         };
@@ -1173,7 +1176,7 @@ fn open_named_stream(
             NamedStream {
                 name: name.to_owned(),
                 size: 0,
-                data,
+                data: Data::Dense(data),
                 delete_pending: false,
                 replacement_deleted: false,
             },
@@ -1342,6 +1345,7 @@ fn rename_stream(
             .name = new_name.to_owned();
     }
     node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+    refresh_sparse_attribute(node);
     let default_size_changed = old_default_size != node.metadata.size;
     state.bytes -= released;
     modified(state, file)?;
@@ -1432,7 +1436,7 @@ fn is_default_stream(state: &State, file: &MemoryFile) -> bool {
         .is_some_and(|node| node.default_stream == file.stream)
 }
 
-fn stream_data(node: &Node, stream: u64) -> Result<(&[u8], u64), Status> {
+fn stream_data(node: &Node, stream: u64) -> Result<(&Data, u64), Status> {
     if stream == node.default_stream {
         Ok((&node.data, node.metadata.size))
     } else {
@@ -1441,13 +1445,23 @@ fn stream_data(node: &Node, stream: u64) -> Result<(&[u8], u64), Status> {
     }
 }
 
-fn stream_data_mut(node: &mut Node, stream: u64) -> Result<(&mut Vec<u8>, &mut u64), Status> {
+fn stream_data_mut(node: &mut Node, stream: u64) -> Result<(&mut Data, &mut u64), Status> {
     if stream == node.default_stream {
         Ok((&mut node.data, &mut node.metadata.size))
     } else {
         let stream = node.streams.get_mut(&stream).ok_or(Status::FILE_CLOSED)?;
         Ok((&mut stream.data, &mut stream.size))
     }
+}
+
+fn refresh_sparse_attribute(node: &mut Node) {
+    let sparse =
+        node.data.is_sparse() || node.streams.values().any(|stream| stream.data.is_sparse());
+    node.metadata.attributes = node
+        .metadata
+        .attributes()
+        .with_sparse_file(sparse)
+        .into_bits();
 }
 
 fn stored_bytes(node: &Node) -> usize {
@@ -1480,6 +1494,30 @@ fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usi
         return Err(Status::DISK_FULL);
     }
     Ok(new_bytes)
+}
+
+fn sparse_extent_count(state: &State) -> usize {
+    state
+        .nodes
+        .values()
+        .map(|node| {
+            node.data.extent_count()
+                + node
+                    .streams
+                    .values()
+                    .map(|stream| stream.data.extent_count())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn sparse_extent_room(state: &State, existing: usize) -> Result<usize, Status> {
+    let others = sparse_extent_count(state)
+        .checked_sub(existing)
+        .ok_or(Status::INTERNAL_ERROR)?;
+    SPARSE_EXTENT_LIMIT
+        .checked_sub(others)
+        .ok_or(Status::INSUFFICIENT_RESOURCES)
 }
 
 fn allocate(state: &mut State, node_id: u64, length: usize, released: usize) -> Result<(), Status> {
@@ -1518,16 +1556,17 @@ fn allocate_stream_with_release(
         .checked_add(released)
         .ok_or(Status::INTERNAL_ERROR)?;
     let new_bytes = allocation_charge(state, old_bytes, length)?;
+    let data = stream_data(
+        state.nodes.get(&node_id).ok_or(Status::FILE_CLOSED)?,
+        stream,
+    )?
+    .0;
+    if data.is_sparse() && length != 0 && sparse_extent_room(state, data.extent_count())? == 0 {
+        return Err(Status::INSUFFICIENT_RESOURCES);
+    }
     let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
     let (data, size) = stream_data_mut(node, stream)?;
-    if length > old_len {
-        data.try_reserve_exact(length - old_len)
-            .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
-    }
-    data.resize(length, 0);
-    if length < old_len {
-        data.shrink_to_fit();
-    }
+    data.allocate(length)?;
     *size = (*size).min(length as u64);
     if stream == node.default_stream {
         node.metadata.allocation_size = length as u64;
@@ -1544,6 +1583,21 @@ fn resize_stream(
 ) -> Result<(), Status> {
     let node = state.nodes.get(&node_id).ok_or(Status::FILE_CLOSED)?;
     let (data, size) = stream_data(node, stream)?;
+    if data.is_sparse() {
+        let old_len = data.len();
+        let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
+        let (data, size) = stream_data_mut(node, stream)?;
+        if (length as u64) < *size {
+            data.truncate_sparse(length);
+        }
+        let new_len = data.len();
+        *size = length as u64;
+        if stream == node.default_stream {
+            node.metadata.allocation_size = new_len as u64;
+        }
+        state.bytes = state.bytes - old_len + new_len;
+        return Ok(());
+    }
     let allocation = if length as u64 >= size {
         data.len().max(length)
     } else {
@@ -1646,6 +1700,18 @@ impl MemoryFile {
                     .and_then(|node| node.streams.remove(&open.stream))
                 {
                     state.bytes -= stream.data.len();
+                    if let Some(node) = state.nodes.get_mut(&self.node) {
+                        let attributes = node.metadata.attributes;
+                        refresh_sparse_attribute(node);
+                        if attributes != node.metadata.attributes {
+                            emit(
+                                &mut state,
+                                self.link,
+                                NotifyAction::MODIFIED,
+                                NotifyFilter::new().with_attributes(true),
+                            );
+                        }
+                    }
                     emit_named(
                         &mut state,
                         self.link,
@@ -1695,6 +1761,7 @@ impl inspect::Inspect for MemoryFs {
             .field("byte_limit", state.byte_limit)
             .field("object_limit", state.object_limit)
             .field("generate_short_names", state.generate_short_names)
+            .field("sparse_extents", sparse_extent_count(&state))
             .field(
                 "volume_object_id",
                 format!("{:02x?}", state.object_information.object_id),
@@ -1778,6 +1845,7 @@ impl inspect::Inspect for MemoryFs {
                             .field("parent", state.links[&node.link].parent)
                             .field("size", node.metadata.size)
                             .field("allocation_size", node.metadata.allocation_size)
+                            .field("sparse", node.data.is_sparse())
                             .hex("attributes", node.metadata.attributes)
                             .hex("reparse_tag", node.metadata.reparse_tag)
                             .field(
@@ -1794,6 +1862,7 @@ impl inspect::Inspect for MemoryFs {
                                             .field("name", &stream.name)
                                             .field("size", stream.size)
                                             .field("allocation_size", stream.data.len())
+                                            .field("sparse", stream.data.is_sparse())
                                             .field("delete_pending", stream.delete_pending)
                                             .field(
                                                 "replacement_deleted",
@@ -1960,7 +2029,7 @@ impl FileSystem for MemoryFs {
                     .with_not_content_indexed(false)
                     .with_reparse_point(node.reparse.is_some())
                     .into_bits();
-                    let attributes_changed = attributes != node.metadata.attributes;
+                    let previous_attributes = node.metadata.attributes;
                     let allocation =
                         usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?;
                     let removed: Vec<_> = node
@@ -1986,6 +2055,8 @@ impl FileSystem for MemoryFs {
                     node.data.fill(0);
                     node.metadata.size = 0;
                     node.metadata.attributes = attributes;
+                    refresh_sparse_attribute(node);
+                    let attributes_changed = node.metadata.attributes != previous_attributes;
                     node.metadata.written = nt_time();
                     node.metadata.changed = node.metadata.written;
                     for (_, name, _) in removed {
@@ -2103,7 +2174,7 @@ impl FileSystem for MemoryFs {
                     NamedStream {
                         name: name.to_owned(),
                         size: 0,
-                        data: std::mem::take(&mut data),
+                        data: Data::Dense(std::mem::take(&mut data)),
                         delete_pending: false,
                         replacement_deleted: false,
                     },
@@ -2165,7 +2236,7 @@ impl FileSystem for MemoryFs {
                         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
                         granted_access: 0,
                     },
-                    data,
+                    data: Data::Dense(data),
                     eas,
                     streams,
                 },
@@ -2753,6 +2824,7 @@ impl FileSystem for MemoryFs {
             name: "MEMORY".into(),
             attributes: FileSystemAttributes::new()
                 .with_supports_reparse_points(true)
+                .with_supports_sparse_files(true)
                 .with_supports_object_ids(true)
                 .with_supports_hard_links(true)
                 .with_case_preserved_names(true)
@@ -2796,6 +2868,47 @@ impl FileSystem for MemoryFs {
         let access = AccessMask::from_bits(open.access);
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         match control {
+            FileControl::SetSparse { sparse } => {
+                if is_default_stream(&state, file) && node.metadata.is_directory() {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                if !(access.write_data() || access.write_attributes()) {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let old_len = stream_data(node, file.stream)?.0.len();
+                let maximum_extents =
+                    sparse_extent_room(&state, stream_data(node, file.stream)?.0.extent_count())?;
+                let base = state
+                    .bytes
+                    .checked_sub(old_len)
+                    .ok_or(Status::INTERNAL_ERROR)?;
+                let limit = state
+                    .byte_limit
+                    .checked_sub(base)
+                    .ok_or(Status::INTERNAL_ERROR)?;
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                let (data, size) = stream_data_mut(node, file.stream)?;
+                data.set_sparse(
+                    sparse,
+                    usize::try_from(*size).map_err(|_| Status::DISK_FULL)?,
+                    limit,
+                    maximum_extents,
+                )?;
+                let allocation = data.len();
+                if file.stream == node.default_stream {
+                    node.metadata.allocation_size = allocation as u64;
+                }
+                refresh_sparse_attribute(node);
+                state.bytes = base + allocation;
+                emit(
+                    &mut state,
+                    file.link,
+                    NotifyAction::MODIFIED,
+                    NotifyFilter::new().with_attributes(true),
+                );
+                wake(state);
+                Ok(FileControlResult::Done)
+            }
             FileControl::GetReparsePoint { .. } => Ok(FileControlResult::ReparsePoint(
                 node.reparse.clone().ok_or(Status::NOT_A_REPARSE_POINT)?,
             )),
@@ -3016,12 +3129,17 @@ impl FileSystem for MemoryFs {
                 }
                 let start = usize::try_from(offset).map_err(|_| Status::INTERNAL_ERROR)?;
                 let end = usize::try_from(end).map_err(|_| Status::INTERNAL_ERROR)?;
+                let old_len = stream_data(node, file.stream)?.0.len();
+                let maximum_extents =
+                    sparse_extent_room(&state, stream_data(node, file.stream)?.0.extent_count())?;
                 let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-                stream_data_mut(node, file.stream)?
-                    .0
-                    .get_mut(start..end)
-                    .ok_or(Status::INTERNAL_ERROR)?
-                    .fill(0);
+                let data = stream_data_mut(node, file.stream)?.0;
+                data.zero(start, end, maximum_extents)?;
+                let allocation = data.len();
+                if file.stream == node.default_stream {
+                    node.metadata.allocation_size = allocation as u64;
+                }
+                state.bytes = state.bytes - old_len + allocation;
                 modified(&mut state, file)?;
                 data_changed(&mut state, file, false)?;
                 wake(state);
@@ -3045,16 +3163,10 @@ impl FileSystem for MemoryFs {
                 if range.length != 0 && maximum_ranges == 0 {
                     return Err(Status::BUFFER_TOO_SMALL);
                 }
-                // Dense streams report the queried range, not zero-content holes
-                // or an EOF-clamped extent (MS-FSCC §2.3.51).
-                Ok(FileControlResult::AllocatedRanges {
-                    ranges: if range.length == 0 || stream_data(node, file.stream)?.0.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![range]
-                    },
-                    overflow: false,
-                })
+                let (ranges, overflow) = stream_data(node, file.stream)?
+                    .0
+                    .ranges(range, maximum_ranges);
+                Ok(FileControlResult::AllocatedRanges { ranges, overflow })
             }
         }
     }
@@ -3282,7 +3394,7 @@ impl FileSystem for MemoryFs {
         let file_size = size as usize;
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(file_size);
         let end = start.saturating_add(length).min(file_size);
-        let data = data[start..end].to_vec();
+        let data = data.read(start, end)?;
         let old_accessed = node.metadata.accessed;
         if !user_set_access_time {
             node.metadata.accessed = nt_time();
@@ -3316,6 +3428,12 @@ impl FileSystem for MemoryFs {
         if data.is_empty() {
             return Ok(0);
         }
+        if offset
+            .checked_add(data.len() as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
         if conflicts(
             &state,
             file,
@@ -3332,13 +3450,29 @@ impl FileSystem for MemoryFs {
         let end = offset.checked_add(data.len()).ok_or(Status::DISK_FULL)?;
         let (stored, size) = stream_data(node, file.stream)?;
         let size_changed = end as u64 > size;
-        if end > stored.len() {
-            allocate_stream(&mut state, file.node, file.stream, end)?;
-        }
+        let old_len = stored.len();
+        let maximum_extents = if stored.is_sparse() {
+            sparse_extent_room(&state, stored.extent_count())?
+        } else {
+            0
+        };
+        let base = state
+            .bytes
+            .checked_sub(old_len)
+            .ok_or(Status::INTERNAL_ERROR)?;
+        let limit = state
+            .byte_limit
+            .checked_sub(base)
+            .ok_or(Status::INTERNAL_ERROR)?;
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         let (stored, size) = stream_data_mut(node, file.stream)?;
-        stored[offset..end].copy_from_slice(data);
+        stored.write(offset, data, limit, maximum_extents)?;
+        let allocation = stored.len();
         *size = (*size).max(end as u64);
+        if file.stream == node.default_stream {
+            node.metadata.allocation_size = allocation as u64;
+        }
+        state.bytes = base + allocation;
         modified(&mut state, file)?;
         data_changed(&mut state, file, size_changed)?;
         wake(state);
@@ -3499,6 +3633,9 @@ impl FileSystem for MemoryFs {
         length: u64,
         _request: &RequestContext,
     ) -> Result<(), Status> {
+        if length > i64::MAX as u64 {
+            return Err(Status::INVALID_PARAMETER);
+        }
         let mut state = self.0.lock();
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         if is_default_stream(&state, file)
@@ -4012,6 +4149,7 @@ mod tests {
                 object_id_controls: Feature::Supported,
                 hard_links: Feature::Supported,
                 reparse_controls: Feature::Supported,
+                sparse_files: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -4125,6 +4263,43 @@ mod tests {
     #[test]
     fn contract_reparse_controls() {
         run_contract(contracts::reparse_controls);
+    }
+    #[test]
+    fn contract_sparse_files() {
+        run_contract(contracts::sparse_files);
+    }
+
+    #[test]
+    fn sparse_provider_rejects_unsigned_sizes_without_publishing_them() {
+        block_on(async {
+            let fs = MemoryFs::new(8, 4);
+            let request = RequestContext::new(1);
+            let options = OpenOptions {
+                access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                share_access: 7,
+                disposition: 2,
+                options: 0,
+                attributes: 0,
+                allocation_size: 0,
+                security: None,
+                extended_attributes: None,
+            };
+            let (file, _) = fs.open("sparse", options, &request).await.unwrap();
+            fs.file_control(&file, FileControl::SetSparse { sparse: true }, &request)
+                .await
+                .unwrap();
+            assert_eq!(
+                fs.set_len(&file, u64::MAX, &request).await,
+                Err(Status::INVALID_PARAMETER)
+            );
+            assert_eq!(
+                fs.write(&file, u64::MAX - 1, b"x", &request).await,
+                Err(Status::INVALID_PARAMETER)
+            );
+            let info = fs.metadata(&file, &request).await.unwrap();
+            assert_eq!((info.size, info.allocation_size), (0, 0));
+            fs.close(&file, &request).await.unwrap();
+        });
     }
 
     #[test]
@@ -4444,7 +4619,10 @@ mod tests {
                 state
                     .nodes
                     .values()
-                    .map(|n| n.data.capacity())
+                    .map(|n| match &n.data {
+                        Data::Dense(bytes) => bytes.capacity(),
+                        Data::Sparse(extents) => extents.values().map(Vec::capacity).sum(),
+                    })
                     .sum::<usize>()
                     <= 64
             );

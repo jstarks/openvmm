@@ -837,7 +837,9 @@ fn file_control_output(
             out
         }
         (
-            FileControl::SetReparsePoint { .. } | FileControl::DeleteReparsePoint { .. },
+            FileControl::SetReparsePoint { .. }
+            | FileControl::DeleteReparsePoint { .. }
+            | FileControl::SetSparse { .. },
             FileControlResult::Done,
         ) => Vec::new(),
         (
@@ -2012,6 +2014,17 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
         let control = match code {
+            FsctlCode::SET_SPARSE => FileControl::SetSparse {
+                sparse: if input.is_empty() {
+                    true
+                } else {
+                    FileSetSparseBuffer::read_from_prefix(input)
+                        .map_err(|_| Status::INVALID_PARAMETER)?
+                        .0
+                        .set_sparse
+                        != 0
+                },
+            },
             FsctlCode::GET_REPARSE_POINT => FileControl::GetReparsePoint {
                 maximum: request.max_output_response.get(),
             },
@@ -2101,7 +2114,9 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         if matches!(
             control,
-            FileControl::SetReparsePoint { .. } | FileControl::DeleteReparsePoint { .. }
+            FileControl::SetReparsePoint { .. }
+                | FileControl::DeleteReparsePoint { .. }
+                | FileControl::SetSparse { .. }
         ) && !(file.access.write_data() || file.access.write_attributes())
         {
             return Err(Status::ACCESS_DENIED);

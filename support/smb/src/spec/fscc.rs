@@ -153,8 +153,9 @@ pub struct FileSystemAttributes {
     pub case_preserved_names: bool,
     pub unicode_on_disk: bool,
     pub persistent_acls: bool,
-    #[bits(3)]
+    #[bits(2)]
     other0: u8,
+    pub supports_sparse_files: bool,
     pub supports_reparse_points: bool,
     #[bits(8)]
     other_reparse: u8,
@@ -231,6 +232,13 @@ wire!(
         flags: EaFlags,
         name_length: u8,
         value_length: U16,
+    }
+);
+
+wire!(
+    /// FILE_SET_SPARSE_BUFFER: [MS-FSCC] §2.3.83.
+    FileSetSparseBuffer, 1 {
+        set_sparse: u8,
     }
 );
 wire!(

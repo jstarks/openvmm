@@ -409,10 +409,13 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
             (FsctlCode::CREATE_OR_GET_OBJECT_ID, true),
             (FsctlCode::SET_REPARSE_POINT, false),
             (FsctlCode::SET_REPARSE_POINT, true),
+            (FsctlCode::SET_SPARSE, false),
+            (FsctlCode::SET_SPARSE, true),
         ] {
             let zero = code == FsctlCode::SET_ZERO_DATA;
             let object = code == FsctlCode::CREATE_OR_GET_OBJECT_ID;
             let reparse = code == FsctlCode::SET_REPARSE_POINT;
+            let sparse = code == FsctlCode::SET_SPARSE;
             let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
             control
                 .set_plan(
@@ -499,7 +502,7 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 } else {
                     assert_eq!(
                         &response[112..],
-                        if zero || reparse {
+                        if zero || reparse || sparse {
                             &[][..]
                         } else {
                             &[0, 0][..]
@@ -542,6 +545,11 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                         }
                     }
                 );
+            }
+            if sparse {
+                let info = client.query(observer, 4).await;
+                let attributes = u32::from_le_bytes(info[104..108].try_into().unwrap());
+                assert_eq!(attributes & 0x200 != 0, after);
             }
             client.close(observer).await;
         }

@@ -632,6 +632,237 @@ fn object_id_controls_create_real_shared_file_identity_with_boundaries() {
 }
 
 #[test]
+fn sparse_controls_retain_real_holes_and_bound_allocation_instead_of_logical_size() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(16, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("sparse", 2, 0).await;
+        let empty_query = object_id_ioctl_input(
+            file,
+            0x940cf,
+            &[0i64.to_le_bytes(), 1024i64.to_le_bytes()].concat(),
+        );
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &empty_query).await),
+            Status::BUFFER_TOO_SMALL
+        );
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"ABCDEFGH"))
+            .await;
+        client
+            .ok(Command::IOCTL, &object_id_ioctl(file, 0x900c4, 0))
+            .await;
+        assert_eq!(&client.query(file, 5).await[72..80], &8u64.to_le_bytes());
+        let zero = |start: i64, end: i64| [start.to_le_bytes(), end.to_le_bytes()].concat();
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x980c8, &zero(2, 6)),
+            )
+            .await;
+        assert_eq!(&client.query(file, 5).await[72..80], &4u64.to_le_bytes());
+        assert_eq!(&client.read(file, 0, 8).await[80..], b"AB\0\0\0\0GH");
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::WRITE, &Client::write_body(file, 100, &[1; 32]))
+                    .await
+            ),
+            Status::DISK_FULL
+        );
+        assert_eq!(&client.read(file, 0, 8).await[80..], b"AB\0\0\0\0GH");
+        let mut ranges = object_id_ioctl_input(file, 0x940cf, &zero(0, 100));
+        for (maximum, expected_status, expected) in [
+            (16, Status::BUFFER_OVERFLOW, zero(0, 2)),
+            (32, Status::SUCCESS, [zero(0, 2), zero(6, 2)].concat()),
+        ] {
+            IoctlRequest::mut_from_prefix(&mut ranges)
+                .unwrap()
+                .0
+                .max_output_response = maximum.into();
+            let response = client.send(Command::IOCTL, &ranges).await;
+            assert_eq!(response_status(&response), expected_status);
+            assert_eq!(&response[112..], expected);
+        }
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 2, b"ijkl"))
+            .await;
+        assert_eq!(&client.read(file, 0, 8).await[80..], b"ABijklGH");
+        assert_eq!(&client.query(file, 5).await[72..80], &8u64.to_le_bytes());
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x980c8, &zero(0, 8)),
+            )
+            .await;
+        assert_eq!(
+            response_status(&client.set(file, 20, &(1i64 << 30).to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        client
+            .ok(
+                Command::WRITE,
+                &Client::write_body(file, (1 << 30) - 1, b"Z"),
+            )
+            .await;
+        assert_eq!(&client.read(file, (1 << 30) - 2, 2).await[80..], b"\0Z");
+        assert_eq!(
+            response_status(&client.set(file, 20, &i64::MAX.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.query(file, 5).await[72..80], &1u64.to_le_bytes());
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl_input(file, 0x900c4, &[0]))
+                    .await
+            ),
+            Status::DISK_FULL
+        );
+        assert_eq!(&client.read(file, (1 << 30) - 1, 1).await[80..], b"Z");
+        assert_eq!(
+            response_status(&client.set(file, 20, &8i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        client
+            .ok(Command::IOCTL, &object_id_ioctl_input(file, 0x900c4, &[0]))
+            .await;
+        assert_eq!(
+            &client.query(file, 5).await[72..88],
+            &[8u64.to_le_bytes(), 8u64.to_le_bytes()].concat()
+        );
+        assert_eq!(&client.read(file, 0, 8).await[80..], &[0; 8]);
+        let restricted = client.open_result("sparse", 1, 7, 1, 0).await;
+        let restricted = read_body::<CreateResponse>(&restricted).unwrap().file_id;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl(restricted, 0x900c4, 0))
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        for (access, expected) in [(4, Status::ACCESS_DENIED), (0x100, Status::SUCCESS)] {
+            let opened = client.open_result("sparse", access, 7, 1, 0).await;
+            let opened = read_body::<CreateResponse>(&opened).unwrap().file_id;
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(Command::IOCTL, &object_id_ioctl(opened, 0x900c4, 0))
+                        .await
+                ),
+                expected
+            );
+            client.close(opened).await;
+        }
+        let directory = client.open("directory", 2, 1).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl(directory, 0x900c4, 0))
+                    .await
+            ),
+            Status::INVALID_PARAMETER
+        );
+        for file in [directory, restricted, file] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn sparse_stream_binding_moves_retain_holes_and_release_them_on_final_close() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(8, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let base = client.open("binding", 2, 0).await;
+        client.close(base).await;
+        let side = client.open("binding:side", 3, 0).await;
+        client
+            .ok(Command::IOCTL, &object_id_ioctl(side, 0x900c4, 0))
+            .await;
+        client
+            .ok(Command::WRITE, &Client::write_body(side, 1 << 20, b"data"))
+            .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(side, 10, &namespace_information("::$DATA", true))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let default = client.open("binding", 1, 0).await;
+        assert_eq!(&client.read(default, 1 << 20, 4).await[80..], b"data");
+        assert_eq!(&client.query(default, 5).await[72..80], &4u64.to_le_bytes());
+        client.close(default).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(side, 10, &namespace_information(":back", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let default = client.open("binding", 1, 0).await;
+        assert_eq!(&client.query(default, 5).await[72..88], &[0; 16]);
+        let renamed = client.open("binding:back", 1, 0).await;
+        assert_eq!(&client.read(renamed, 1 << 20, 4).await[80..], b"data");
+        assert_eq!(
+            response_status(&client.set(side, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(side).await;
+        assert_eq!(&client.read(renamed, 1 << 20, 4).await[80..], b"data");
+        client.close(renamed).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(default, 0, b"12345678"))
+            .await;
+        let info = client.query(default, 4).await;
+        assert_eq!(
+            u32::from_le_bytes(info[104..108].try_into().unwrap()) & 0x200,
+            0
+        );
+        client.close(default).await;
+    });
+}
+
+#[test]
+fn sparse_named_stream_deletion_releases_storage_and_clears_the_shared_attribute() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(4, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let base = client.open("base", 2, 0).await;
+        let side = client.open("base:side", 3, 0).await;
+        client
+            .ok(Command::IOCTL, &object_id_ioctl_input(side, 0x900c4, &[2]))
+            .await;
+        client
+            .ok(Command::WRITE, &Client::write_body(side, 100, b"data"))
+            .await;
+        let info = client.query(base, 4).await;
+        assert_ne!(
+            u32::from_le_bytes(info[104..108].try_into().unwrap()) & 0x200,
+            0
+        );
+        assert_eq!(
+            response_status(&client.set(side, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(side).await;
+        let info = client.query(base, 4).await;
+        assert_eq!(
+            u32::from_le_bytes(info[104..108].try_into().unwrap()) & 0x200,
+            0
+        );
+        client
+            .ok(Command::WRITE, &Client::write_body(base, 0, b"full"))
+            .await;
+        client.close(base).await;
+    });
+}
+
+#[test]
 fn reparse_controls_store_real_guid_data_and_return_bounded_prefixes() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
@@ -3155,7 +3386,7 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
             (
                 FileSystemInformationClass::ATTRIBUTE,
                 vec![
-                    134, 0, 197, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
+                    198, 0, 197, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
                     b'R', 0, b'Y', 0,
                 ],
             ),

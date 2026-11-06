@@ -211,6 +211,11 @@ impl Metadata {
 /// Selected filesystem controls, decoded independently of SMB buffer layouts.
 #[derive(Debug, Clone, Copy)]
 pub enum FileControl<'a> {
+    /// Enable sparse allocation or allocate holes before disabling it.
+    SetSparse {
+        /// Desired sparse state of the selected data stream.
+        sparse: bool,
+    },
     /// Query retained reparse data, allowing a bounded partial reply.
     GetReparsePoint {
         /// Maximum encoded output bytes.

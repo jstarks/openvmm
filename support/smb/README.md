@@ -58,9 +58,16 @@ SET_ZERO_DATA requires WRITE_DATA and zeroes only the requested bytes below EOF,
 without allocating or extending the stream. MemoryFs enforces byte-range locks,
 updates automatic modification times and emits last-write notifications.
 QUERY_ALLOCATED_RANGES requires READ_DATA and bounds provider results to the
-requested record capacity. MemoryFs reports its dense queried range, not holes
-inferred from zero bytes; streams with no allocation return no ranges. Sparse
-storage is not yet advertised.
+requested record capacity. Dense streams report the queried range, not holes
+inferred from zero bytes; streams with no allocation return no ranges.
+SET_SPARSE enables real byte-granular sparse backing for each data stream.
+Logical EOF growth does not allocate holes; writes allocate their actual ranges,
+zeroing punches holes and releases quota, and queries return bounded contiguous
+allocated ranges. Disabling sparse storage allocates holes before changing the
+flag, with atomic quota failure. Sparse storage is advertised and shared file
+attributes reflect all surviving streams. Backing storage, not logical EOF,
+consumes the shared byte quota; the volume also bounds allocated sparse extents
+to 4096. This is synthetic byte geometry, not native cluster emulation.
 
 MemoryFs retains case-insensitive ASCII EAs with required-knowledge flags.
 Creation applies them atomically; existing opens ignore CREATE EA input.
@@ -172,6 +179,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_notif
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lock)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_rename)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_directory)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_sparse)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
@@ -202,6 +210,14 @@ handle permissions, and excluding changes to the watched directory itself.
 The lock harness runs seventeen cases covering shared/exclusive I/O enforcement,
 conflicts, pending acquisition, exact unlocks, stacking, zero-length/64-bit
 ranges, cross-connection ownership, arrays, and truncation.
+The sparse harness covers nine cases for flags, absent/oversized input,
+allocation queries and partial output, hole punching and locks.
+The broader malformed-range fixture expects an empty-file nonzero query with
+zero output capacity to succeed, unlike MS-FSA 2.1.5.10.22's buffer check.
+The broader permission fixture expects append-only SET_SPARSE to succeed,
+unlike the write-data/write-attributes requirement in MS-FSA 2.1.5.10.38.
+Those two fixtures are not counted as passing; direct tests retain the public
+rules instead of weakening validation or access grants.
 The rename harness covers eleven cases: simple, modification-time preservation,
 missing DELETE access, source sharing, destination-directory sharing, and
 rejecting directory renames with open descendants, plus metadata-only parent

@@ -76,6 +76,26 @@ fn samba_create_and_sharing() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_sparse() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.ioctl.sparse_file_flag",
+            "smb2.ioctl.sparse_file_attr",
+            "smb2.ioctl.sparse_dir_flag",
+            "smb2.ioctl.sparse_set_nobuf",
+            "smb2.ioctl.sparse_set_oversize",
+            "smb2.ioctl.sparse_qar",
+            "smb2.ioctl.sparse_qar_truncated",
+            "smb2.ioctl.sparse_punch",
+            "smb2.ioctl.sparse_lock",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_streams() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

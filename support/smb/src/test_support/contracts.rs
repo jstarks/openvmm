@@ -77,6 +77,8 @@ pub struct Expectations {
     pub hard_links: Feature,
     /// Retained reparse controls and symbolic-link open errors.
     pub reparse_controls: Feature,
+    /// Sparse storage, hole punching, range queries and dense conversion.
+    pub sparse_files: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -674,6 +676,79 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Sparse streams allocate written bytes, return zero holes and convert back to dense.
+pub async fn sparse_files<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "sparse", CreateDisposition::CREATE, false, &request).await;
+    let control = FileControl::SetSparse { sparse: true };
+    if let Some(status) = unsupported(fixture.expectations().sparse_files) {
+        rejected(fs.file_control(&file, control, &request).await, status);
+    } else {
+        fs.file_control(&file, control, &request).await.unwrap();
+        fs.set_len(&file, 128, &request).await.unwrap();
+        write_all(fs, &file, 64, b"data", &request).await;
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().allocation_size,
+            4
+        );
+        assert_eq!(read_bytes(fs, &file, 63, 6, &request).await, b"\0data\0");
+        fs.file_control(
+            &file,
+            FileControl::SetZeroData {
+                offset: 65,
+                end: 67,
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+        let FileControlResult::AllocatedRanges { ranges, overflow } = fs
+            .file_control(
+                &file,
+                FileControl::QueryAllocatedRanges {
+                    range: ByteRange {
+                        offset: 0,
+                        length: 128,
+                    },
+                    maximum_ranges: 8,
+                },
+                &request,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("missing sparse ranges")
+        };
+        assert!(!overflow);
+        assert_eq!(
+            ranges,
+            [
+                ByteRange {
+                    offset: 64,
+                    length: 1
+                },
+                ByteRange {
+                    offset: 67,
+                    length: 1
+                }
+            ]
+        );
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().allocation_size,
+            2
+        );
+        fs.file_control(&file, FileControl::SetSparse { sparse: false }, &request)
+            .await
+            .unwrap();
+        let metadata = fs.metadata(&file, &request).await.unwrap();
+        assert_eq!(metadata.allocation_size, 128);
+        assert!(!metadata.attributes().sparse_file());
+        assert_eq!(read_bytes(fs, &file, 64, 4, &request).await, b"d\0\0a");
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// Reparse controls retain owner data and remove it without deleting the file.

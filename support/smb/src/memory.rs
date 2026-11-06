@@ -3,18 +3,19 @@
 
 //! A bounded writable in-memory filesystem for synthetic shares.
 
+use crate::codec::{align_up, decode_ea_list, encode_ea_list};
 use crate::provider::{
-    BasicInformation, ByteRange, Change, CompressionInformation, FileControl, FileControlResult,
-    FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
-    SectorSizeInformation,
+    BasicInformation, ByteRange, Change, CompressionInformation, ExtendedAttribute, FileControl,
+    FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
+    OpenOptions, RequestContext, SectorSizeInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
     AccessMask, AceFlags, CreateAction, CreateDisposition, CreateOptions, FILE_DEVICE_DISK,
     FILE_MODE_INFORMATION_MASK, FILE_MODE_INFORMATION_SET_MASK, FileAttributes,
-    FileSystemAttributes, MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter,
-    SectorSizeFlags, SecurityDescriptorControl, SecurityInformation, ShareAccess, Status,
-    TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
+    FileSystemAttributes, MAX_EA_LENGTH, MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction,
+    NotifyFilter, SectorSizeFlags, SecurityDescriptorControl, SecurityInformation, ShareAccess,
+    Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
 use event_listener::Event;
@@ -40,6 +41,7 @@ struct Node {
     security: SecurityDescriptor,
     parent: u64,
     data: Vec<u8>,
+    eas: Vec<ExtendedAttribute>,
 }
 
 struct Open {
@@ -258,6 +260,7 @@ impl MemoryFs {
             parent: 1,
             security: default_security(true),
             data: Vec::new(),
+            eas: Vec::new(),
         };
         Self(Arc::new(Mutex::new(State {
             created: now,
@@ -709,6 +712,44 @@ fn settable_attributes() -> FileAttributes {
         .with_not_content_indexed(true)
 }
 
+fn update_eas(
+    existing: &[ExtendedAttribute],
+    updates: &[ExtendedAttribute],
+) -> Result<Vec<ExtendedAttribute>, Status> {
+    let mut entries = BTreeMap::new();
+    let mut by_name = BTreeMap::new();
+    let mut padded_length = 0usize;
+    for (index, ea) in existing.iter().enumerate() {
+        padded_length += align_up(ea.encoded_len(), 4)?;
+        by_name.insert(ea.name.clone(), index);
+        entries.insert(index, ea.clone());
+    }
+    for (index, update) in updates.iter().enumerate() {
+        update.validate()?;
+        let mut ea = update.clone();
+        ea.name.make_ascii_uppercase();
+        if let Some(previous) = by_name.remove(&ea.name) {
+            let previous = entries.remove(&previous).ok_or(Status::INTERNAL_ERROR)?;
+            padded_length -= align_up(previous.encoded_len(), 4)?;
+        }
+        if !ea.value.is_empty() {
+            padded_length += align_up(ea.encoded_len(), 4)?;
+            let index = existing.len() + index;
+            by_name.insert(ea.name.clone(), index);
+            entries.insert(index, ea);
+        }
+        let final_padding = entries
+            .last_key_value()
+            .map(|(_, ea)| align_up(ea.encoded_len(), 4).map(|length| length - ea.encoded_len()))
+            .transpose()?
+            .unwrap_or(0);
+        if padded_length - final_padding > MAX_EA_LENGTH {
+            return Err(Status::EA_TOO_LARGE);
+        }
+    }
+    Ok(entries.into_values().collect())
+}
+
 fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usize, Status> {
     let new_bytes = state
         .bytes
@@ -817,7 +858,7 @@ impl MemoryFile {
                 name_filter(directory),
             );
             if let Some(node) = state.nodes.remove(&self.node) {
-                state.bytes -= node.data.len();
+                state.bytes -= node.data.len() + node.metadata.extended_attributes_length as usize;
             }
         }
         wake(state);
@@ -953,6 +994,9 @@ impl FileSystem for MemoryFs {
         let delete = options.options().delete_on_close();
         let (id, action) = if let Some(id) = existing {
             let node = &state.nodes[&id];
+            if options.options().no_ea_knowledge() && node.eas.iter().any(|ea| ea.need_ea) {
+                return Err(Status::ACCESS_DENIED);
+            }
             if node.metadata.delete_pending {
                 return Err(Status::DELETE_PENDING);
             }
@@ -1055,9 +1099,6 @@ impl FileSystem for MemoryFs {
             ) {
                 return Err(Status::OBJECT_NAME_NOT_FOUND);
             }
-            if options.extended_attributes.is_some() {
-                return Err(Status::EAS_NOT_SUPPORTED);
-            }
             if !can_add(&state, parent, options.options().directory_file()) {
                 return Err(Status::ACCESS_DENIED);
             }
@@ -1085,6 +1126,11 @@ impl FileSystem for MemoryFs {
                     &system_sid(),
                 )?,
             };
+            let eas = match options.extended_attributes {
+                Some(bytes) => update_eas(&[], &decode_ea_list(bytes)?)?,
+                None => Vec::new(),
+            };
+            let ea_length = encode_ea_list(&eas)?.len();
             let id = state.next_id;
             let next_id = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
             let allocation = if directory {
@@ -1092,7 +1138,11 @@ impl FileSystem for MemoryFs {
             } else {
                 usize::try_from(options.allocation_size).map_err(|_| Status::DISK_FULL)?
             };
-            let new_bytes = allocation_charge(&state, 0, allocation)?;
+            let new_bytes = allocation_charge(
+                &state,
+                0,
+                allocation.checked_add(ea_length).ok_or(Status::DISK_FULL)?,
+            )?;
             let mut data = Vec::new();
             data.try_reserve_exact(allocation)
                 .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
@@ -1130,7 +1180,7 @@ impl FileSystem for MemoryFs {
                         allocation_size: allocation as u64,
                         compression: Some(CompressionInformation::default()),
                         number_of_links: 1,
-                        extended_attributes_length: 0,
+                        extended_attributes_length: ea_length as u32,
                         alignment_requirement: 0,
                         delete_pending: false,
                         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
@@ -1138,6 +1188,7 @@ impl FileSystem for MemoryFs {
                     },
                     parent,
                     data,
+                    eas,
                 },
             );
             state.next_id = next_id;
@@ -1277,7 +1328,7 @@ impl FileSystem for MemoryFs {
                 .nodes
                 .remove(&target)
                 .expect("replacement target was validated under the namespace lock");
-            state.bytes -= node.data.len();
+            state.bytes -= node.data.len() + node.metadata.extended_attributes_length as usize;
         }
         emit(
             &mut state,
@@ -1379,6 +1430,7 @@ impl FileSystem for MemoryFs {
             attributes: FileSystemAttributes::new()
                 .with_case_preserved_names(true)
                 .with_unicode_on_disk(true)
+                .with_extended_attributes(true)
                 .into_bits(),
             maximum_component_name_length: MAX_COMPONENT_NAME_LENGTH,
             device_type: FILE_DEVICE_DISK,
@@ -1488,6 +1540,65 @@ impl FileSystem for MemoryFs {
                 })
             }
         }
+    }
+
+    async fn query_eas(
+        &self,
+        file: &MemoryFile,
+        _request: &RequestContext,
+    ) -> Result<Vec<ExtendedAttribute>, Status> {
+        let state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        if !AccessMask::from_bits(open.access).read_ea() {
+            return Err(Status::ACCESS_DENIED);
+        }
+        Ok(state
+            .nodes
+            .get(&file.node)
+            .ok_or(Status::FILE_CLOSED)?
+            .eas
+            .clone())
+    }
+
+    async fn set_eas(
+        &self,
+        file: &MemoryFile,
+        attributes: &[ExtendedAttribute],
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        if !AccessMask::from_bits(open.access).write_ea() {
+            return Err(Status::ACCESS_DENIED);
+        }
+        let user_set_change_time = open.user_set_change_time;
+        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        if node.metadata.attributes().reparse_point() {
+            return Err(Status::EAS_NOT_SUPPORTED);
+        }
+        let eas = update_eas(&node.eas, attributes)?;
+        let length = encode_ea_list(&eas)?.len();
+        let new_bytes = allocation_charge(
+            &state,
+            node.metadata.extended_attributes_length as usize,
+            length,
+        )?;
+        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+        node.eas = eas;
+        node.metadata.extended_attributes_length = length as u32;
+        node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+        if !user_set_change_time {
+            node.metadata.changed = nt_time();
+        }
+        state.bytes = new_bytes;
+        emit(
+            &mut state,
+            file.node,
+            NotifyAction::MODIFIED,
+            NotifyFilter::new().with_ea(true).with_attributes(true),
+        );
+        wake(state);
+        Ok(())
     }
 
     async fn query_security(
@@ -2335,7 +2446,8 @@ mod tests {
                 directory_acl_updates: Feature::Supported,
                 acl_inheritance: Feature::Supported,
                 security_creation: Feature::Supported,
-                creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
+                creation_eas: Feature::Supported,
+                ea_operations: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -2413,6 +2525,10 @@ mod tests {
     #[test]
     fn contract_creation_eas() {
         run_contract(contracts::creation_eas);
+    }
+    #[test]
+    fn contract_extended_attributes() {
+        run_contract(contracts::extended_attributes);
     }
 
     #[test]

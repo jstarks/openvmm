@@ -15,7 +15,8 @@
 
 use super::Operation;
 use crate::provider::{
-    BasicInformation, ByteRange, Change, FileSystem, NotifyResult, OpenOptions, RequestContext,
+    BasicInformation, ByteRange, Change, ExtendedAttribute, FileSystem, NotifyResult, OpenOptions,
+    RequestContext,
 };
 use crate::spec::{
     AccessMask, CreateAction, CreateDisposition, CreateOptions, FileAttributes, NotifyAction,
@@ -58,6 +59,8 @@ pub struct Expectations {
     pub security_creation: Feature,
     /// Atomic EA creation, or explicit rejection by a store without EAs.
     pub creation_eas: Feature,
+    /// Retained EA snapshots and atomic named updates.
+    pub ea_operations: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -655,6 +658,60 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// EA updates retain values, delete empty values and enforce required knowledge.
+pub async fn extended_attributes<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "attributes", CreateDisposition::CREATE, false, &request).await;
+    let mut ea = ExtendedAttribute {
+        name: b"attribute".to_vec(),
+        value: b"value".to_vec(),
+        need_ea: true,
+    };
+    if let Some(status) = unsupported(fixture.expectations().ea_operations) {
+        rejected(fs.query_eas(&file, &request).await, status);
+        rejected(fs.set_eas(&file, &[ea], &request).await, status);
+        assert_eq!(
+            fs.metadata(&file, &request)
+                .await
+                .unwrap()
+                .extended_attributes_length,
+            0
+        );
+    } else {
+        assert!(fs.query_eas(&file, &request).await.unwrap().is_empty());
+        fs.set_eas(&file, &[ea.clone()], &request).await.unwrap();
+        ea.name.make_ascii_uppercase();
+        assert_eq!(
+            fs.query_eas(&file, &request).await.unwrap(),
+            vec![ea.clone()]
+        );
+        assert_eq!(
+            fs.metadata(&file, &request)
+                .await
+                .unwrap()
+                .extended_attributes_length as usize,
+            ea.encoded_len()
+        );
+        rejected(
+            fs.open(
+                "attributes",
+                OpenOptions {
+                    options: CreateOptions::new().with_no_ea_knowledge(true).into_bits(),
+                    ..options(CreateDisposition::OPEN, false)
+                },
+                &request,
+            )
+            .await,
+            Status::ACCESS_DENIED,
+        );
+        ea.value.clear();
+        fs.set_eas(&file, &[ea], &request).await.unwrap();
+        assert!(fs.query_eas(&file, &request).await.unwrap().is_empty());
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// Creation EAs are ignored for existing objects. Unsupported new-object EAs

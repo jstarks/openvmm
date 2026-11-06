@@ -58,6 +58,11 @@ open_enum! {
         CANNOT_DELETE = 0xc0000121,
         INFO_LENGTH_MISMATCH = 0xc0000004,
         EAS_NOT_SUPPORTED = 0xc000004f,
+        EA_TOO_LARGE = 0xc0000050,
+        NONEXISTENT_EA_ENTRY = 0xc0000051,
+        NO_EAS_ON_FILE = 0xc0000052,
+        NO_MORE_EAS = 0x80000012,
+        INVALID_EA_NAME = 0x80000013,
         NONE_MAPPED = 0xc0000073,
         INVALID_ACL = 0xc0000077,
         INVALID_SID = 0xc0000078,
@@ -214,6 +219,18 @@ pub struct QueryDirectoryFlags {
     #[bits(3)]
     reserved1: u8,
 }
+
+/// QUERY_INFO EA enumeration flags: [MS-SMB2] §§2.2.37, 3.3.5.20.1.
+#[bitfield(u32, repr = U32, from = U32::new, into = super::u32_from_le, conversion = false)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct EaQueryFlags {
+    pub restart_scan: bool,
+    pub return_single_entry: bool,
+    pub index_specified: bool,
+    #[bits(29)]
+    reserved: u32,
+}
+le_bitfield_conversions!(EaQueryFlags, u32, U32);
 
 /// READ flags: [MS-SMB2] §2.2.19.
 #[bitfield(u8)]

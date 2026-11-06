@@ -10,8 +10,8 @@
 pub mod contracts;
 
 use crate::provider::{
-    BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
-    LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
+    BasicInformation, ByteRange, ExtendedAttribute, FileControl, FileControlResult, FileSystem,
+    FileSystemInformation, LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
 };
 use crate::security::SecurityDescriptor;
 use crate::spec::SecurityInformation;
@@ -48,6 +48,10 @@ pub enum Operation {
     QuerySecurity,
     /// Selected security descriptor update.
     SetSecurity,
+    /// Retained extended-attribute snapshot.
+    QueryEas,
+    /// Atomic extended-attribute mutation.
+    SetEas,
     /// Data read.
     Read,
     /// Data write.
@@ -791,6 +795,36 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         let result = self
             .backend
             .file_control(&file.inner, control, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn query_eas(
+        &self,
+        file: &Self::File,
+        r: &RequestContext,
+    ) -> Result<Vec<ExtendedAttribute>, Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::QueryEas, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self.backend.query_eas(&file.inner, &context).await;
+        call.complete(result, None).await
+    }
+
+    async fn set_eas(
+        &self,
+        file: &Self::File,
+        attributes: &[ExtendedAttribute],
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::SetEas, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .set_eas(&file.inner, attributes, &context)
             .await;
         call.complete(result, None).await
     }

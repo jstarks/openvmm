@@ -70,6 +70,8 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::Metadata,
             Operation::FileSystemInformation,
             Operation::FileControl,
+            Operation::QueryEas,
+            Operation::SetEas,
             Operation::QuerySecurity,
             Operation::Read,
             Operation::Write,
@@ -262,6 +264,21 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             }
             other => panic!("unexpected allocation query result: {other:?}"),
         }
+        let ea = provider::ExtendedAttribute {
+            name: b"EA".to_vec(),
+            value: b"value".to_vec(),
+            need_ea: false,
+        };
+        through_gates(
+            fs.set_eas(&file, std::slice::from_ref(&ea), &context),
+            &control,
+            Operation::SetEas,
+        )
+        .await;
+        assert_eq!(
+            through_gates(fs.query_eas(&file, &context), &control, Operation::QueryEas).await,
+            vec![ea],
+        );
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
         let range = ByteRange {
             offset: 0,
@@ -486,7 +503,11 @@ fn allocated_range_queries_observe_earlier_writes_on_the_same_open() {
 #[test]
 fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
     block_on(async {
-        for operation in [Operation::SetAllocationSize, Operation::SetMode] {
+        for operation in [
+            Operation::SetAllocationSize,
+            Operation::SetMode,
+            Operation::SetEas,
+        ] {
             for after in [false, true] {
                 let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
                 control
@@ -505,6 +526,8 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                 let opened = client.connection.state.lock().files[&file.volatile.get()].clone();
                 let data = if operation == Operation::SetMode {
                     6u32.to_le_bytes().to_vec()
+                } else if operation == Operation::SetEas {
+                    vec![0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v']
                 } else {
                     32i64.to_le_bytes().to_vec()
                 };
@@ -513,6 +536,8 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                 body.info_type = InformationType::FILE;
                 body.info_class = if operation == Operation::SetMode {
                     16
+                } else if operation == Operation::SetEas {
+                    15
                 } else {
                     19
                 };
@@ -569,11 +594,26 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                     );
                 } else {
                     let reopened = client.open("update", 1, 0).await;
-                    let response = client.query(reopened, 5).await;
-                    assert_eq!(
-                        &response[72..80],
-                        &(if after { 32u64 } else { 0 }).to_le_bytes()
-                    );
+                    if operation == Operation::SetEas {
+                        let response = client.query(reopened, 15).await;
+                        assert_eq!(
+                            response_status(&response),
+                            if after {
+                                Status::SUCCESS
+                            } else {
+                                Status::NO_EAS_ON_FILE
+                            }
+                        );
+                        if after {
+                            assert_eq!(&response[72..], &[0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v']);
+                        }
+                    } else {
+                        let response = client.query(reopened, 5).await;
+                        assert_eq!(
+                            &response[72..80],
+                            &(if after { 32u64 } else { 0 }).to_le_bytes()
+                        );
+                    }
                     client.close(reopened).await;
                 }
             }

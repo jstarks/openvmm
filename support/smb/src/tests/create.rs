@@ -686,9 +686,25 @@ fn create_security_applies_before_visibility_and_ignores_existing_context_bytes(
 }
 
 #[test]
-fn unsupported_eas_and_streams_have_explicit_profiles_and_existing_eas_are_ignored() {
+fn ea_validation_precedes_provider_rejection_and_existing_eas_are_ignored() {
+    use crate::test_support::{ControlledFs, Operation, Plan};
     block_on(async {
-        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        for (operation, failure) in [
+            (Operation::QueryEas, Status::INVALID_INFO_CLASS),
+            (Operation::SetEas, Status::INVALID_DEVICE_REQUEST),
+        ] {
+            control
+                .set_plan(
+                    operation,
+                    Plan {
+                        failure: Some(failure),
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
+        }
+        let server = Server::new("memory", fs).unwrap();
         let mut client = Client::new(&server).await;
         let file = client.open("eas", 2, 0).await;
         for class in [15, 22] {
@@ -744,6 +760,15 @@ fn unsupported_eas_and_streams_have_explicit_profiles_and_existing_eas_are_ignor
             .await;
         let existing = read_body::<CreateResponse>(&response).unwrap().file_id;
         client.close(existing).await;
+        control
+            .plan_next(
+                Operation::OpenExtendedAttributes,
+                Plan {
+                    failure: Some(Status::EAS_NOT_SUPPORTED),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
         assert_eq!(
             response_status(
                 &client
@@ -767,9 +792,314 @@ fn unsupported_eas_and_streams_have_explicit_profiles_and_existing_eas_are_ignor
             response[72..76].try_into().unwrap(),
         ));
         assert!(!flags.named_streams());
-        assert!(!flags.extended_attributes());
+        assert!(flags.extended_attributes());
         assert!(!flags.persistent_acls());
         client.close(limited).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn retained_eas_create_query_update_and_require_knowledge_when_marked() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let ea = [0, 0, 0, 0, 128, 1, 1, 0, b'A', 0, b'v'];
+        let extra = contexts(&[(CreateContextName::EA_BUFFER, &ea)]);
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body("retained-eas", 0x001f01ff, 7, 2, 0, &extra),
+            )
+            .await;
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(&client.query(file, 7).await[72..], &15u32.to_le_bytes());
+        assert_eq!(&client.query(file, 15).await[72..], &ea);
+        assert_eq!(
+            response_status(&client.query(file, 15).await),
+            Status::NO_MORE_EAS,
+        );
+        assert_eq!(
+            response_status(&client.open_result("retained-eas", 1, 7, 1, 0x200).await),
+            Status::ACCESS_DENIED,
+        );
+        let second = [0, 0, 0, 0, 0, 1, 2, 0, b'b', 0, b'W', b'Q'];
+        assert_eq!(
+            response_status(&client.set(file, 15, &second).await),
+            Status::SUCCESS
+        );
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILE;
+        query.info_class = 15;
+        query.file_id = file;
+        query.output_buffer_length = 1024.into();
+        query.flags = 3.into();
+        assert_eq!(
+            &client.ok(Command::QUERY_INFO, query.as_bytes()).await[72..],
+            &ea
+        );
+        let mut expected = second;
+        expected[8] = b'B';
+        assert_eq!(&client.query(file, 15).await[72..], &expected);
+        let update = [0, 0, 0, 0, 0, 1, 1, 0, b'a', 0, b'z'];
+        assert_eq!(
+            response_status(&client.set(file, 15, &update).await),
+            Status::SUCCESS
+        );
+        let response = client.open_result("retained-eas", 1, 7, 1, 0x200).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        client
+            .close(read_body::<CreateResponse>(&response).unwrap().file_id)
+            .await;
+        query.flags = 1.into();
+        let response = client.ok(Command::QUERY_INFO, query.as_bytes()).await;
+        let mut expected = expected.to_vec();
+        expected[..4].copy_from_slice(&12u32.to_le_bytes());
+        let mut last = update;
+        last[8] = b'A';
+        expected.extend_from_slice(&last);
+        assert_eq!(&response[72..], expected);
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn ea_queries_preserve_complete_records_cursor_and_named_index_precedence() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let a = [0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v'];
+        let b = [0, 0, 0, 0, 0, 1, 2, 0, b'B', 0, b'W', b'Q'];
+        let mut all = a.to_vec();
+        all[..4].copy_from_slice(&12u32.to_le_bytes());
+        all.push(0);
+        all.extend_from_slice(&b);
+        let extra = contexts(&[(CreateContextName::EA_BUFFER, &all)]);
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body("ea-query", 0x1f01ff, 7, 2, 0, &extra),
+            )
+            .await;
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILE;
+        query.info_class = 15;
+        query.file_id = file;
+        query.flags = 1.into();
+        for (maximum, status) in [
+            (0u32, Status::INFO_LENGTH_MISMATCH),
+            (7, Status::INFO_LENGTH_MISMATCH),
+            (8, Status::BUFFER_TOO_SMALL),
+            (10, Status::BUFFER_TOO_SMALL),
+            (11, Status::BUFFER_OVERFLOW),
+            (12, Status::BUFFER_OVERFLOW),
+            (24, Status::SUCCESS),
+        ] {
+            query.output_buffer_length = maximum.into();
+            let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+            assert_eq!(response_status(&response), status);
+            if status == Status::BUFFER_OVERFLOW {
+                assert_eq!(&response[72..], &a);
+            }
+            if status == Status::SUCCESS {
+                assert_eq!(&response[72..], &all);
+            }
+        }
+        query.output_buffer_length = (MAX_TRANSFER_SIZE as u32 + 1).into();
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_INFO, query.as_bytes()).await),
+            Status::INVALID_PARAMETER
+        );
+        query.flags = 5.into();
+        query.additional_information = 2.into();
+        query.output_buffer_length = 12.into();
+        assert_eq!(
+            &client.ok(Command::QUERY_INFO, query.as_bytes()).await[72..],
+            &b
+        );
+        for index in [0u32, 3] {
+            query.additional_information = index.into();
+            assert_eq!(
+                response_status(&client.send(Command::QUERY_INFO, query.as_bytes()).await),
+                Status::NONEXISTENT_EA_ENTRY
+            );
+        }
+        let names = [8, 0, 0, 0, 1, b'b', 0, 0, 0, 0, 0, 0, 1, b'a', 0];
+        query.input_buffer_offset = (body_end::<QueryInfoRequest>() as u16).into();
+        query.input_buffer_length = (names.len() as u32).into();
+        query.output_buffer_length = 64.into();
+        query.flags = 7.into();
+        query.additional_information = 0.into();
+        let mut body = query.as_bytes().to_vec();
+        body.extend_from_slice(&names);
+        assert_eq!(&client.ok(Command::QUERY_INFO, &body).await[72..], &b);
+        query.flags = 5.into();
+        body = query.as_bytes().to_vec();
+        body.extend_from_slice(&names);
+        let mut expected = b.to_vec();
+        expected[..4].copy_from_slice(&12u32.to_le_bytes());
+        expected.extend_from_slice(&a);
+        assert_eq!(&client.ok(Command::QUERY_INFO, &body).await[72..], expected);
+        let mut later_missing = names;
+        later_missing[13] = b'X';
+        query.flags = 7.into();
+        body = query.as_bytes().to_vec();
+        body.extend_from_slice(&later_missing);
+        assert_eq!(&client.ok(Command::QUERY_INFO, &body).await[72..], &b);
+        query.flags = 5.into();
+        query.output_buffer_length = 12.into();
+        body = query.as_bytes().to_vec();
+        body.extend_from_slice(&later_missing);
+        let response = client.send(Command::QUERY_INFO, &body).await;
+        assert_eq!(response_status(&response), Status::BUFFER_OVERFLOW);
+        assert_eq!(&response[72..], &b);
+        query.output_buffer_length = 64.into();
+        for (offset, value, status) in [
+            (5usize, b'X', Status::NONEXISTENT_EA_ENTRY),
+            (0, 4, Status::EA_LIST_INCONSISTENT),
+            (5, b'/', Status::INVALID_EA_NAME),
+        ] {
+            let mut malformed = names;
+            malformed[offset] = value;
+            let mut body = query.as_bytes().to_vec();
+            body.extend_from_slice(&malformed);
+            assert_eq!(
+                response_status(&client.send(Command::QUERY_INFO, &body).await),
+                status
+            );
+        }
+        query.flags = 0.into();
+        query.input_buffer_length = 0.into();
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_INFO, query.as_bytes()).await),
+            Status::NO_MORE_EAS
+        );
+        let deletes = [
+            12, 0, 0, 0, 0, 1, 0, 0, b'A', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, b'B', 0,
+        ];
+        assert_eq!(
+            response_status(&client.set(file, 15, &deletes).await),
+            Status::SUCCESS
+        );
+        query.flags = 1.into();
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_INFO, query.as_bytes()).await),
+            Status::NO_EAS_ON_FILE
+        );
+        assert_eq!(
+            response_status(&client.set(file, 15, &a).await),
+            Status::SUCCESS
+        );
+        query.flags = 0.into();
+        assert_eq!(
+            &client.ok(Command::QUERY_INFO, query.as_bytes()).await[72..],
+            &a
+        );
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn ea_storage_limits_fail_atomically_and_deletion_releases_the_charge() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(32, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let ea = [0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v'];
+        let extra = contexts(&[(CreateContextName::EA_BUFFER, &ea)]);
+        let combined = contexts(&[
+            (CreateContextName::EA_BUFFER, &ea),
+            (CreateContextName::ALLOCATION_SIZE, &24u64.to_le_bytes()),
+        ]);
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::CREATE,
+                        &create_body("combined", 0x1f01ff, 7, 2, 0, &combined)
+                    )
+                    .await
+            ),
+            Status::DISK_FULL,
+        );
+        assert_eq!(
+            response_status(&client.open_result("combined", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body("quota-ea", 0x1f01ff, 7, 2, 0, &extra),
+            )
+            .await;
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(&client.set(file, 19, &16i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        let mut update = vec![0, 0, 0, 0, 0, 1, 9, 0, b'A', 0];
+        update.extend_from_slice(&[b'x'; 9]);
+        assert_eq!(
+            response_status(&client.set(file, 15, &update).await),
+            Status::DISK_FULL
+        );
+        for (byte, value) in [(4usize, 1u8), (8, b'/')] {
+            let mut malformed = ea;
+            malformed[byte] = value;
+            assert_eq!(
+                response_status(&client.set(file, 15, &malformed).await),
+                Status::INVALID_EA_NAME
+            );
+        }
+        let mut oversized = vec![0, 0, 0, 0, 0, 1, 255, 255, b'A', 0];
+        oversized.resize(10 + u16::MAX as usize, b'x');
+        assert_eq!(
+            response_status(&client.set(file, 15, &oversized).await),
+            Status::EA_TOO_LARGE
+        );
+        assert_eq!(&client.query(file, 15).await[72..], &ea);
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::CREATE, &create_body("no-room", 1, 7, 2, 0, &extra))
+                    .await
+            ),
+            Status::DISK_FULL
+        );
+        assert_eq!(
+            response_status(&client.open_result("no-room", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .set(file, 15, &[0, 0, 0, 0, 0, 1, 0, 0, b'A', 0])
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.query(file, 15).await),
+            Status::NO_EAS_ON_FILE
+        );
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body("now-room", 0x1f01ff, 7, 2, 0, &extra),
+            )
+            .await;
+        let other = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(&client.set(other, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(other).await;
+        assert_eq!(
+            response_status(&client.set(file, 19, &32i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
         client.close(file).await;
     });
 }
@@ -1018,8 +1348,19 @@ fn malformed_create_context_chains_do_not_create_files() {
 
 #[test]
 fn unsupported_eas_fail_before_creation_and_are_ignored_on_explicit_open() {
+    use crate::test_support::{ControlledFs, Operation, Plan};
     block_on(async {
-        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        control
+            .plan_next(
+                Operation::OpenExtendedAttributes,
+                Plan {
+                    failure: Some(Status::EAS_NOT_SUPPORTED),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let server = Server::new("memory", fs).unwrap();
         let mut client = Client::new(&server).await;
         let data = contexts(&[(CreateContextName::EA_BUFFER, &[0; 8])]);
         let response = client

@@ -834,7 +834,7 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
             (
                 FileSystemInformationClass::ATTRIBUTE,
                 vec![
-                    6, 0, 0, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
+                    6, 0, 128, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
                     b'R', 0, b'Y', 0,
                 ],
             ),

@@ -193,13 +193,32 @@ pub const NT_TICKS_PER_SECOND: u64 = 10_000_000;
 /// Difference between the NT and Unix epochs, in NT ticks: [MS-DTYP] §2.3.3.
 pub const UNIX_EPOCH_NT_TIME: u64 = 116_444_736_000_000_000;
 
+/// Maximum combined stored EA length: [MS-FSA] §2.1.5.15.6.
+pub const MAX_EA_LENGTH: usize = 64 * 1024 - 5;
+
+/// FILE_FULL_EA_INFORMATION flags: [MS-FSCC] §2.4.16.
+#[bitfield(u8)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct EaFlags {
+    #[bits(7)]
+    reserved: u8,
+    pub need_ea: bool,
+}
+
 wire!(
     /// FILE_FULL_EA_INFORMATION prefix, followed by name, NUL and value: [MS-FSCC] §2.4.16.
     FileFullEaInformation, 8 {
         next_entry_offset: U32,
-        flags: u8,
+        flags: EaFlags,
         name_length: u8,
         value_length: U16,
+    }
+);
+wire!(
+    /// FILE_GET_EA_INFORMATION name-list prefix: [MS-FSCC] §2.4.16.1.
+    FileGetEaInformation, 5 {
+        next_entry_offset: U32,
+        name_length: u8,
     }
 );
 wire!(

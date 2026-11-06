@@ -29,7 +29,7 @@ will not need them.
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
-| EAs and named streams | Explicit unsupported storage profile, validation and access checks | Neither capability advertised; no fabricated empty-success replies; fixtures requiring storage are not passes |
+| EAs and named streams | Retained EAs with atomic CREATE/set, bounded enumeration and access checks | EAs advertised; named streams remain unsupported; stream-dependent fixtures are not passes |
 | Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
 | Naming | Share-relative namespace and canonical paths | Dot components resolve within the virtual root; case folding is ASCII-only and no short names are generated |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
@@ -61,6 +61,14 @@ QUERY_ALLOCATED_RANGES requires READ_DATA and bounds provider results to the
 requested record capacity. MemoryFs reports its dense queried range, not holes
 inferred from zero bytes; streams with no allocation return no ranges. Sparse
 storage is not yet advertised.
+
+MemoryFs retains case-insensitive ASCII EAs with required-knowledge flags.
+Creation applies them atomically; existing opens ignore CREATE EA input.
+SET_INFO replaces named values or deletes empty ones, enforces the combined
+64 KiB minus five limit and charges EA storage against the shared byte quota.
+QUERY_INFO returns complete aligned records with per-open continuation,
+restart/single-entry/indexed queries and explicit name lists. EA mutations
+preserve open grants, update metadata and notify EA/attribute watchers.
 
 ## Run
 

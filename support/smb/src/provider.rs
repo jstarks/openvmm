@@ -62,6 +62,64 @@ impl RequestContext {
     }
 }
 
+/// One named extended attribute, shared by all opens of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedAttribute {
+    /// ASCII name, matched without ASCII case.
+    pub name: Vec<u8>,
+    /// Opaque contents; an empty value in an update deletes this name.
+    pub value: Vec<u8>,
+    /// The file requires an application that understands EAs.
+    pub need_ea: bool,
+}
+
+impl ExtendedAttribute {
+    /// Validate the public EA name and value constraints.
+    pub fn validate(&self) -> Result<(), Status> {
+        validate_ea_name(&self.name)?;
+        if self.value.len() > u16::MAX as usize {
+            return Err(Status::EA_TOO_LARGE);
+        }
+        Ok(())
+    }
+
+    /// Unaligned FILE_FULL_EA_INFORMATION record length.
+    pub fn encoded_len(&self) -> usize {
+        8 + self.name.len() + 1 + self.value.len()
+    }
+}
+
+pub(crate) fn validate_ea_name(name: &[u8]) -> Result<(), Status> {
+    if name.is_empty()
+        || name.len() >= 255
+        || !name.is_ascii()
+        || name.iter().any(|byte| {
+            *byte < 0x20
+                || matches!(
+                    *byte,
+                    b'\\'
+                        | b'/'
+                        | b':'
+                        | b'*'
+                        | b'?'
+                        | b'"'
+                        | b'<'
+                        | b'>'
+                        | b'|'
+                        | b','
+                        | b'+'
+                        | b'='
+                        | b'['
+                        | b']'
+                        | b';'
+                )
+        })
+    {
+        return Err(Status::INVALID_EA_NAME);
+    }
+    Ok(())
+}
+
 /// Provider-reported compression state, independent of wire layouts.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompressionInformation {
@@ -399,6 +457,26 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         _control: FileControl,
         _request: &RequestContext,
     ) -> Result<FileControlResult, Status> {
+        Err(Status::INVALID_DEVICE_REQUEST)
+    }
+    /// Return a coherent, ordered EA snapshot. Empty means no EAs, not unsupported.
+    /// Stored encoded EA data is bounded by MS-FSA's 64 KiB minus five limit.
+    async fn query_eas(
+        &self,
+        _file: &Self::File,
+        _request: &RequestContext,
+    ) -> Result<Vec<ExtendedAttribute>, Status> {
+        Err(Status::INVALID_DEVICE_REQUEST)
+    }
+    /// Atomically replace named EAs, delete empty values and preserve other names.
+    /// Reject invalid names/values, unsupported storage and capacity failures
+    /// without modifying any EA. Existing opens and their access grants survive.
+    async fn set_eas(
+        &self,
+        _file: &Self::File,
+        _attributes: &[ExtendedAttribute],
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
         Err(Status::INVALID_DEVICE_REQUEST)
     }
     /// Query selected security components for the established share identity.

@@ -3,6 +3,7 @@
 
 //! Checked packet access and serialization; wire declarations live in `spec`.
 
+use crate::provider::{ExtendedAttribute, validate_ea_name};
 use crate::spec::*;
 use zerocopy::little_endian::U16;
 use zerocopy::{FromBytes, IntoBytes};
@@ -80,6 +81,101 @@ pub(crate) fn validate_ea_list(mut bytes: &[u8]) -> Result<(), Status> {
         bytes = &bytes[next..];
     }
     Ok(())
+}
+
+pub(crate) fn decode_ea_list(mut bytes: &[u8]) -> Result<Vec<ExtendedAttribute>, Status> {
+    validate_ea_list(bytes)?;
+    let mut entries = Vec::new();
+    while !bytes.is_empty() {
+        let (entry, rest) = FileFullEaInformation::read_from_prefix(bytes)
+            .map_err(|_| Status::EA_LIST_INCONSISTENT)?;
+        if entry.flags.into_bits()
+            != EaFlags::new()
+                .with_need_ea(entry.flags.need_ea())
+                .into_bits()
+        {
+            return Err(Status::INVALID_EA_NAME);
+        }
+        let name_length = entry.name_length as usize;
+        let value_start = name_length + 1;
+        let ea = ExtendedAttribute {
+            name: rest
+                .get(..name_length)
+                .ok_or(Status::EA_LIST_INCONSISTENT)?
+                .to_vec(),
+            value: rest
+                .get(value_start..value_start + entry.value_length.get() as usize)
+                .ok_or(Status::EA_LIST_INCONSISTENT)?
+                .to_vec(),
+            need_ea: entry.flags.need_ea(),
+        };
+        ea.validate()?;
+        entries.push(ea);
+        if entry.next_entry_offset.get() == 0 {
+            break;
+        }
+        bytes = bytes
+            .get(entry.next_entry_offset.get() as usize..)
+            .ok_or(Status::EA_LIST_INCONSISTENT)?;
+    }
+    Ok(entries)
+}
+
+pub(crate) fn encode_ea_list(entries: &[ExtendedAttribute]) -> Result<Vec<u8>, Status> {
+    let mut out = Vec::new();
+    let mut previous = None;
+    for entry in entries {
+        entry.validate()?;
+        if let Some(previous) = previous {
+            let start = align_up(out.len(), 4)?;
+            out.resize(start, 0);
+            FileFullEaInformation::mut_from_prefix(&mut out[previous..])
+                .map_err(|_| Status::INTERNAL_ERROR)?
+                .0
+                .next_entry_offset = ((start - previous) as u32).into();
+        }
+        previous = Some(out.len());
+        out.extend_from_slice(
+            FileFullEaInformation {
+                next_entry_offset: 0.into(),
+                flags: EaFlags::new().with_need_ea(entry.need_ea),
+                name_length: entry.name.len() as u8,
+                value_length: (entry.value.len() as u16).into(),
+            }
+            .as_bytes(),
+        );
+        out.extend_from_slice(&entry.name);
+        out.push(0);
+        out.extend_from_slice(&entry.value);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_ea_names(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>, Status> {
+    let mut names = Vec::new();
+    while !bytes.is_empty() {
+        let (entry, rest) = FileGetEaInformation::read_from_prefix(bytes)
+            .map_err(|_| Status::EA_LIST_INCONSISTENT)?;
+        let length = entry.name_length as usize;
+        if rest.get(length) != Some(&0) {
+            return Err(Status::EA_LIST_INCONSISTENT);
+        }
+        let name = rest.get(..length).ok_or(Status::EA_LIST_INCONSISTENT)?;
+        validate_ea_name(name)?;
+        names.push(name.to_vec());
+        let next = entry.next_entry_offset.get() as usize;
+        if next == 0 {
+            break;
+        }
+        if next < size_of::<FileGetEaInformation>() + length + 1
+            || !next.is_multiple_of(4)
+            || next >= bytes.len()
+        {
+            return Err(Status::EA_LIST_INCONSISTENT);
+        }
+        bytes = &bytes[next..];
+    }
+    Ok(names)
 }
 
 pub(crate) fn align_up(length: usize, alignment: usize) -> Result<usize, Status> {

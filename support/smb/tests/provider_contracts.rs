@@ -34,7 +34,8 @@ impl Fixture for MemoryFixture {
             directory_acl_updates: Feature::Supported,
             acl_inheritance: Feature::Supported,
             security_creation: Feature::Supported,
-            creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
+            creation_eas: Feature::Supported,
+            ea_operations: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -69,6 +70,8 @@ impl ControlledFixture {
             Operation::Rename,
             Operation::Lock,
             Operation::Notify,
+            Operation::QueryEas,
+            Operation::SetEas,
         ] {
             control
                 .set_plan(
@@ -93,7 +96,8 @@ impl ControlledFixture {
                 directory_acl_updates: Feature::Unsupported(Status::NOT_SUPPORTED),
                 acl_inheritance: Feature::Unsupported(Status::NOT_SUPPORTED),
                 security_creation: Feature::Unsupported(Status::NOT_SUPPORTED),
-                creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
+                creation_eas: Feature::Supported,
+                ea_operations: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -217,9 +221,19 @@ fn declared_unsupported_security_creation_is_exercised() {
 }
 
 #[test]
-fn exported_ea_creation_contract_checks_no_storage_profile() {
+fn exported_ea_creation_contract_checks_retained_storage() {
     let fixture = MemoryFixture(MemoryFs::new(1024, 32));
     block_on(contracts::creation_eas(&fixture));
+}
+
+#[test]
+fn exported_extended_attribute_contract_checks_storage_and_declines() {
+    block_on(contracts::extended_attributes(&MemoryFixture(
+        MemoryFs::new(1024, 32),
+    )));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::extended_attributes(&fixture));
+    fixture.assert_rejected(&[Operation::QueryEas, Operation::SetEas]);
 }
 
 #[test]
@@ -294,7 +308,8 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             directory_acl_updates: Feature::Supported,
             acl_inheritance: Feature::Supported,
             security_creation: Feature::Supported,
-            creation_eas: Feature::Unsupported(Status::EAS_NOT_SUPPORTED),
+            creation_eas: Feature::Supported,
+            ea_operations: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

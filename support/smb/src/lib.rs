@@ -148,6 +148,7 @@ struct OpenFile<F> {
     tree: u32,
     position: AtomicI64,
     directory: Mutex<Option<DirectorySearch>>,
+    ea_cursor: futures::lock::Mutex<u32>,
     closing: AtomicBool,
     closed: AtomicBool,
     close_gate: futures::lock::Mutex<()>,
@@ -395,6 +396,7 @@ impl<F> Inspect for OpenFile<F> {
             .hex("access", self.access.into_bits())
             .hex("mode", self.mode.load(Ordering::Relaxed))
             .field("position", self.position.load(Ordering::Relaxed))
+            .field("ea_index", self.ea_cursor.try_lock().map(|index| *index))
             .field("is_directory", self.is_directory)
             .field("tree", self.tree)
             .field("closing", self.closing.load(Ordering::Acquire))
@@ -2261,6 +2263,7 @@ impl<B: FileSystem> Connection<B> {
             tree,
             position: AtomicI64::new(0),
             directory: Mutex::new(None),
+            ea_cursor: futures::lock::Mutex::new(1),
             closing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             close_gate: futures::lock::Mutex::new(()),
@@ -2456,7 +2459,7 @@ impl<B: FileSystem> Connection<B> {
         context: &RequestContext,
     ) -> Result<(Status, Vec<u8>), Status> {
         let request: QueryInfoRequest = read_body(packet)?;
-        variable::<QueryInfoRequest>(
+        let input = variable::<QueryInfoRequest>(
             packet,
             request.input_buffer_offset.get() as usize,
             request.input_buffer_length.get() as usize,
@@ -2534,7 +2537,133 @@ impl<B: FileSystem> Connection<B> {
             if !file.access.read_ea() {
                 return Err(Status::ACCESS_DENIED);
             }
-            return Err(Status::INVALID_INFO_CLASS);
+            if request.output_buffer_length.get() as usize > MAX_TRANSFER_SIZE
+                || input.len() > MAX_TRANSFER_SIZE
+            {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            if request.output_buffer_length.get() < size_of::<FileFullEaInformation>() as u32 {
+                return Err(Status::INFO_LENGTH_MISMATCH);
+            }
+            let names = if input.is_empty() {
+                None
+            } else {
+                Some(decode_ea_names(input)?)
+            };
+            let flags = EaQueryFlags::from_bits(request.flags.get());
+            let indexed = names.is_none() && flags.index_specified();
+            let mut cursor = file.ea_cursor.lock().await;
+            if context.is_cancelled() {
+                return Err(Status::CANCELLED);
+            }
+            let entries = self.server.backend.query_eas(&file.file, context).await?;
+            if encode_ea_list(&entries)
+                .map_err(|_| Status::INTERNAL_ERROR)?
+                .len()
+                > MAX_EA_LENGTH
+            {
+                return Err(Status::INTERNAL_ERROR);
+            }
+            if flags.restart_scan() && names.is_none() && !indexed {
+                *cursor = 1;
+            }
+            if indexed
+                && (request.additional_information.get() == 0
+                    || request.additional_information.get() as usize > entries.len())
+            {
+                return Err(Status::NONEXISTENT_EA_ENTRY);
+            }
+            if entries.is_empty() {
+                return Err(Status::NO_EAS_ON_FILE);
+            }
+            let start = if indexed {
+                request.additional_information.get()
+            } else {
+                *cursor
+            };
+            let selected: Vec<_> = if let Some(names) = &names {
+                let mut lookup = BTreeMap::new();
+                for entry in &entries {
+                    if lookup
+                        .insert(entry.name.to_ascii_uppercase(), entry)
+                        .is_some()
+                    {
+                        return Err(Status::INTERNAL_ERROR);
+                    }
+                }
+                let mut selected = Vec::new();
+                for name in names {
+                    selected.push(
+                        lookup
+                            .get(&name.to_ascii_uppercase())
+                            .copied()
+                            .ok_or(Status::NONEXISTENT_EA_ENTRY),
+                    );
+                }
+                selected
+            } else {
+                entries
+                    .get(start.saturating_sub(1) as usize..)
+                    .ok_or(Status::NO_MORE_EAS)?
+                    .iter()
+                    .map(Ok)
+                    .collect()
+            };
+            if selected.is_empty() {
+                return Err(Status::NO_MORE_EAS);
+            }
+            let mut length = 0;
+            let mut count = 0;
+            for (index, entry) in selected.iter().enumerate() {
+                if let Some(names) = &names {
+                    let start = if count == 0 { 0 } else { align_up(length, 4)? };
+                    // Do not query later names after the output buffer is full.
+                    if start + size_of::<FileFullEaInformation>() + names[index].len() + 1
+                        > request.output_buffer_length.get() as usize
+                    {
+                        break;
+                    }
+                }
+                let entry = entry.as_ref().map_err(|status| *status)?;
+                let next_length = if count == 0 {
+                    entry.encoded_len()
+                } else {
+                    align_up(length, 4)? + entry.encoded_len()
+                };
+                if next_length > request.output_buffer_length.get() as usize {
+                    break;
+                }
+                length = next_length;
+                count += 1;
+                if flags.return_single_entry() {
+                    break;
+                }
+            }
+            if count == 0 {
+                return Err(Status::BUFFER_TOO_SMALL);
+            }
+            let bytes = encode_ea_list(
+                &selected[..count]
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_ref()
+                            .map(|entry| (**entry).clone())
+                            .map_err(|_| Status::INTERNAL_ERROR)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(|_| Status::INTERNAL_ERROR)?;
+            if names.is_none() && !indexed {
+                *cursor = start + count as u32;
+            }
+            let status = if count < selected.len() && !flags.return_single_entry() {
+                Status::BUFFER_OVERFLOW
+            } else {
+                Status::SUCCESS
+            };
+            return buffer_response(bytes, request.output_buffer_length.get())
+                .map(|body| (status, body));
         }
         if class == FileInformationClass::STREAM {
             return Err(Status::INVALID_INFO_CLASS);
@@ -2742,8 +2871,11 @@ impl<B: FileSystem> Connection<B> {
                 if !file.access.write_ea() {
                     return Err(Status::ACCESS_DENIED);
                 }
-                validate_ea_list(data)?;
-                return Err(Status::INVALID_DEVICE_REQUEST);
+                let attributes = decode_ea_list(data)?;
+                self.server
+                    .backend
+                    .set_eas(&file.file, &attributes, context)
+                    .await?;
             }
             (InformationType::SECURITY, _) => {
                 let information = SecurityInformation::from_bits(

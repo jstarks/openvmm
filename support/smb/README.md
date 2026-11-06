@@ -25,13 +25,13 @@ will not need them.
 | Compounds and credits | Bounded admission, inherited identities, error propagation, pending replies and cancellation | Implemented; selected compound/async cases; retain committed CLOSE and compound-tail policies |
 | File metadata | Supported query classes, attributes/timestamps, allocation, EOF, mode and position | Implemented subset; broaden applicable getinfo/setinfo cases and classify unsupported-class dependencies |
 | Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/11 implemented; broader fixtures may require quota/object-ID classes |
-| Namespace and enumeration | Directory continuation, rename/move, sharing, replacement and deletion | Implemented subset; broaden directory/rename cases; no generated short names or hard links |
+| Namespace and enumeration | Directory continuation, rename/move, short-name assignment, sharing, replacement and deletion | Implemented subset; explicit aliases resolve/query/enumerate; no automatic short-name generation or hard links |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; six selected directory/I/O/sharing/deletion/rename stream cases pass |
 | Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
-| Naming | Share-relative namespace and canonical paths | Dot components resolve within the virtual root; case folding is ASCII-only and no short names are generated |
+| Naming | Share-relative namespace and canonical paths | Dot components and explicit short aliases resolve within the virtual root; case folding is ASCII-only |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
 Compatibility work proceeds by selecting applicable Samba cases, checking any
@@ -78,6 +78,15 @@ existing opens through stream-scoped deletion. File metadata/times and identity
 are shared. Colon-prefixed stream renames preserve open data and locks, including
 moves between default and named streams. Replacing an existing stream requires
 an empty, unopened target; its reserved allocation is released.
+
+SET_INFO FileShortNameInformation delegates explicit 8.3 alias assignment/removal
+to the provider after framing and DELETE-access validation. Providers own restore
+privilege and filesystem eligibility; their errors are preserved. MemoryFs treats
+its fixed synthetic system identity as having restore access. It validates write
+rights, stream/directory eligibility and namespace-wide uniqueness, preserves
+existing opens, and publishes ordered alias notifications. Alias opens, directory
+matching and alternate-name queries use real stored names. Automatic short-name
+generation is still unimplemented; this is not a native privilege model.
 
 ## Run
 
@@ -156,7 +165,7 @@ Provider crates should enable that feature as a dev-dependency, implement
 `contracts::Fixture`, and register the same scenario functions as separate
 tests on their own executor. Each invocation needs a fresh, empty, isolated,
 writable filesystem; the fixture owns any native driver and temporary resources.
-Declare filesystem-information, allocation, file-mode, basic-information,
+Declare filesystem-information, allocation, file-mode, basic-information, short-name,
 rename, locking, and notification expectations explicitly.
 Creation-allocation expectations are independent from SET_ALLOCATION support;
 declare explicitly whether the provider honors or ignores creation hints.
@@ -736,8 +745,8 @@ FileCompressionInformation returns provider-owned compression metadata.
 MemoryFs reports its actual allocated bytes with COMPRESSION_FORMAT_NONE; this
 query does not claim compression storage or require READ_ATTRIBUTES.
 FileNormalizedNameInformation remains NOT_SUPPORTED as required for SMB 2.1.
-Alternate-name queries use optional provider short names; the memory provider
-does not generate 8.3 aliases.
+Alternate-name queries use provider short names. MemoryFs retains explicitly
+assigned 8.3 aliases but does not generate them automatically.
 
 FileAttributeTagInformation reports provider attributes and reparse tags with
 READ_ATTRIBUTES and fixed-buffer checks. MemoryFs has no reparse objects and

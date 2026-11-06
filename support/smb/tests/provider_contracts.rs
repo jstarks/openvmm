@@ -39,6 +39,7 @@ impl Fixture for MemoryFixture {
             stream_queries: Feature::Supported,
             named_streams: Feature::Supported,
             stream_rename: Feature::Supported,
+            short_names: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -71,6 +72,7 @@ impl ControlledFixture {
             Operation::OpenSecurity,
             Operation::SetBasic,
             Operation::Rename,
+            Operation::SetShortName,
             Operation::Lock,
             Operation::Notify,
             Operation::QueryEas,
@@ -106,6 +108,7 @@ impl ControlledFixture {
                 stream_queries: Feature::Unsupported(Status::NOT_SUPPORTED),
                 named_streams: Feature::Unsupported(Status::NOT_SUPPORTED),
                 stream_rename: Feature::Unsupported(Status::NOT_SUPPORTED),
+                short_names: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -270,6 +273,15 @@ fn exported_stream_rename_contract_checks_storage_and_declines() {
     block_on(contracts::stream_renames(&fixture));
     fixture.assert_rejected(&[Operation::Rename]);
 }
+#[test]
+fn exported_short_name_contract_checks_aliases_and_declines() {
+    block_on(contracts::short_names(&MemoryFixture(MemoryFs::new(
+        1024, 32,
+    ))));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::short_names(&fixture));
+    fixture.assert_rejected(&[Operation::SetShortName]);
+}
 
 #[test]
 fn declared_unsupported_locks_are_exercised() {
@@ -348,6 +360,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             stream_queries: Feature::Supported,
             named_streams: Feature::Supported,
             stream_rename: Feature::Supported,
+            short_names: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

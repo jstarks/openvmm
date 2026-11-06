@@ -77,6 +77,8 @@ pub enum Operation {
     SetBasic,
     /// Namespace rename or move.
     Rename,
+    /// Short-name assignment or removal.
+    SetShortName,
     /// Directory change notification.
     Notify,
     /// Byte-range lock.
@@ -614,6 +616,27 @@ impl<B: Inspect> Inspect for ControlledFs<B> {
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
 
+    async fn set_short_name(
+        &self,
+        file: &Self::File,
+        name: &str,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call = self.controller.begin(
+            Operation::SetShortName,
+            Some(file.id),
+            Some(name),
+            None,
+            None,
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .set_short_name(&file.inner, name, &context)
+            .await;
+        call.complete(result, None).await
+    }
     async fn rename(
         &self,
         file: &Self::File,

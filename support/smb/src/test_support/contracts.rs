@@ -67,6 +67,8 @@ pub struct Expectations {
     pub named_streams: Feature,
     /// Stream renames, including moving the default stream into a named stream.
     pub stream_rename: Feature,
+    /// Explicit short-name assignment, lookup and removal.
+    pub short_names: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -664,6 +666,67 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Short-name aliases support lookup, collision checks and removal without rebinding opens.
+pub async fn short_names<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "long-file", CreateDisposition::CREATE, false, &request).await;
+    write_all(fs, &file, 0, b"data", &request).await;
+    let result = fs.set_short_name(&file, "SHORT.TXT", &request).await;
+    if let Some(status) = unsupported(fixture.expectations().short_names) {
+        rejected(result, status);
+    } else {
+        result.unwrap();
+        let root = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+        let entries: Vec<_> = fs
+            .list(&root, &request)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| !matches!(entry.name.as_str(), "." | ".."))
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "long-file");
+        assert_eq!(entries[0].short_name.as_deref(), Some("SHORT.TXT"));
+        let alias = open(fs, "short.txt", CreateDisposition::OPEN, false, &request).await;
+        assert_eq!(read_bytes(fs, &alias, 0, 4, &request).await, b"data");
+        let other = open(fs, "other-file", CreateDisposition::CREATE, false, &request).await;
+        rejected(
+            fs.set_short_name(&other, "SHORT.TXT", &request).await,
+            Status::OBJECT_NAME_COLLISION,
+        );
+        fs.set_short_name(&file, "NEW.TXT", &request).await.unwrap();
+        rejected(
+            fs.open(
+                "SHORT.TXT",
+                options(CreateDisposition::OPEN, false),
+                &request,
+            )
+            .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+        fs.set_short_name(&file, "", &request).await.unwrap();
+        assert!(
+            fs.metadata(&file, &request)
+                .await
+                .unwrap()
+                .short_name
+                .is_none()
+        );
+        rejected(
+            fs.open("NEW.TXT", options(CreateDisposition::OPEN, false), &request)
+                .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+        assert_eq!(read_bytes(fs, &alias, 0, 4, &request).await, b"data");
+        fs.close(&other, &request).await.unwrap();
+        fs.close(&alias, &request).await.unwrap();
+        fs.close(&root, &request).await.unwrap();
+    }
+    assert_eq!(read_bytes(fs, &file, 0, 4, &request).await, b"data");
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// Default/named stream moves preserve data and existing open bindings.

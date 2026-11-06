@@ -2931,6 +2931,25 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let class = FileInformationClass(request.info_class);
         match (request.info_type, class) {
+            (InformationType::FILE, FileInformationClass::SHORT_NAME) => {
+                if data.len() < FILE_NAME_INFORMATION_MIN_BUFFER_SIZE {
+                    return Err(Status::INFO_LENGTH_MISMATCH);
+                }
+                if !file.access.delete() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let (info, rest) = FileNameInformation::read_from_prefix(data)
+                    .map_err(|_| Status::INFO_LENGTH_MISMATCH)?;
+                let length = info.file_name_length.get() as usize;
+                if !length.is_multiple_of(2) {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                let name = decode_name(rest.get(..length).ok_or(Status::INVALID_PARAMETER)?)?;
+                self.server
+                    .backend
+                    .set_short_name(&file.file, &name, context)
+                    .await?;
+            }
             (InformationType::FILE, FileInformationClass::FULL_EA) => {
                 if !file.access.write_ea() {
                     return Err(Status::ACCESS_DENIED);

@@ -84,6 +84,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::SetMode,
             Operation::SetDeleteOnClose,
             Operation::SetBasic,
+            Operation::SetShortName,
             Operation::Rename,
             Operation::Lock,
             Operation::Unlock,
@@ -200,6 +201,12 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         )
         .await;
         through_gates(
+            fs.set_short_name(&file, "SHORT.TXT", &context),
+            &control,
+            Operation::SetShortName,
+        )
+        .await;
+        through_gates(
             fs.set_delete_on_close(&file, true, &context),
             &control,
             Operation::SetDeleteOnClose,
@@ -209,6 +216,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             through_gates(fs.metadata(&file, &context), &control, Operation::Metadata).await;
         assert_eq!(metadata.size, 3);
         assert_eq!(metadata.name, "renamed");
+        assert_eq!(metadata.short_name.as_deref(), Some("SHORT.TXT"));
         assert_eq!(metadata.written, 30);
         assert!(metadata.delete_pending);
         let descriptor = through_gates(
@@ -536,6 +544,7 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
             Operation::SetAllocationSize,
             Operation::SetMode,
             Operation::SetEas,
+            Operation::SetShortName,
         ] {
             for after in [false, true] {
                 let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
@@ -557,6 +566,11 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                     6u32.to_le_bytes().to_vec()
                 } else if operation == Operation::SetEas {
                     vec![0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v']
+                } else if operation == Operation::SetShortName {
+                    let name = encode_name("SHORT.TXT");
+                    let mut bytes = (name.len() as u32).to_le_bytes().to_vec();
+                    bytes.extend(name);
+                    bytes
                 } else {
                     32i64.to_le_bytes().to_vec()
                 };
@@ -567,6 +581,8 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                     16
                 } else if operation == Operation::SetEas {
                     15
+                } else if operation == Operation::SetShortName {
+                    40
                 } else {
                     19
                 };
@@ -635,6 +651,19 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                         );
                         if after {
                             assert_eq!(&response[72..], &[0, 0, 0, 0, 0, 1, 1, 0, b'A', 0, b'v']);
+                        }
+                    } else if operation == Operation::SetShortName {
+                        let response = client.query(reopened, 21).await;
+                        assert_eq!(
+                            response_status(&response),
+                            if after {
+                                Status::SUCCESS
+                            } else {
+                                Status::OBJECT_NAME_NOT_FOUND
+                            }
+                        );
+                        if after {
+                            assert_eq!(&response[76..], encode_name("SHORT.TXT"));
                         }
                     } else {
                         let response = client.query(reopened, 5).await;

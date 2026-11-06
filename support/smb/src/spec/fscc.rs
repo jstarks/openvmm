@@ -63,6 +63,7 @@ open_enum! {
         ATTRIBUTE_TAG = 35,
         ID_BOTH_DIRECTORY = 37,
         ID_FULL_DIRECTORY = 38,
+        SHORT_NAME = 40,
         NORMALIZED_NAME = 48,
         ID_EXTD_DIRECTORY = 60,
         ID64_EXTD_DIRECTORY = 78,
@@ -291,7 +292,7 @@ wire!(
     FileInternalInformation, 8 { index_number: U64 }
 );
 wire!(
-    /// FileNameInformation/alternate-name fixed prefix: [MS-FSCC] §§2.4.32, 2.4.5.
+    /// Name/alternate-name/short-name prefix: [MS-FSCC] §§2.4.32, 2.4.5, 2.4.46.
     FileNameInformation, 4 { file_name_length: U32 }
 );
 wire!(

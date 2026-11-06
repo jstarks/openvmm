@@ -594,6 +594,18 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         info: BasicInformation,
         request: &RequestContext,
     ) -> Result<(), Status>;
+    /// Assign or remove a short name (MS-FSA §2.1.5.15.14).
+    /// An empty name removes the alias. Validate 8.3 syntax, restore access,
+    /// stream eligibility, directory-wide uniqueness and ordered notifications.
+    /// The caller checks DELETE access; preserve existing opens and object identity.
+    async fn set_short_name(
+        &self,
+        _file: &Self::File,
+        _name: &str,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
     /// Rename this open's object to a share-root-relative name (MS-FSA §2.1.5.15.12).
     /// The caller checks DELETE access. Preserve object identity, data, locks and
     /// existing source opens; enforce destination sharing and replacement rules.

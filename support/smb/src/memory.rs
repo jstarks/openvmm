@@ -161,7 +161,16 @@ fn emit_named(
         name.push(':');
         name.push_str(stream);
     }
-    let mut parent = node.parent;
+    emit_directory_entry(state, node.parent, name, action, filter);
+}
+
+fn emit_directory_entry(
+    state: &mut State,
+    mut parent: u64,
+    mut name: String,
+    action: NotifyAction,
+    filter: NotifyFilter,
+) {
     let mut depth = 0;
     loop {
         for open in state.opens.values_mut().filter(|open| open.node == parent) {
@@ -390,8 +399,15 @@ fn components(name: &str) -> Result<Vec<&str>, Status> {
 
 fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
     state.nodes.iter().find_map(|(&id, node)| {
-        (id != 1 && node.parent == parent && node.metadata.name.eq_ignore_ascii_case(name))
-            .then_some(id)
+        (id != 1
+            && node.parent == parent
+            && (node.metadata.name.eq_ignore_ascii_case(name)
+                || node
+                    .metadata
+                    .short_name
+                    .as_ref()
+                    .is_some_and(|short| short.eq_ignore_ascii_case(name))))
+        .then_some(id)
     })
 }
 
@@ -1874,6 +1890,110 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
+    async fn set_short_name(
+        &self,
+        file: &MemoryFile,
+        name: &str,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        if !name.is_empty() {
+            let (base, extension) = name.split_once('.').unwrap_or((name, ""));
+            if !name.is_ascii()
+                || name.contains(' ')
+                || !(1..=8).contains(&base.len())
+                || (name.contains('.') && !(1..=3).contains(&extension.len()))
+                || extension.contains('.')
+                || name.contains(['\\', '/'])
+                || components(name).is_err()
+            {
+                return Err(Status::INVALID_PARAMETER);
+            }
+        }
+        let mut state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let user_set_change_time = open.user_set_change_time;
+        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        if file.node == 1 || !is_default_stream(&state, file) {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if !AccessMask::from_bits(open.access).delete()
+            || !(AccessMask::from_bits(open.access).write_data()
+                || AccessMask::from_bits(open.access).write_attributes())
+            || node.metadata.delete_pending
+            || open.delete_on_close
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
+        let directory = node.metadata.is_directory();
+        if directory
+            && state
+                .opens
+                .values()
+                .any(|open| open.node != file.node && beneath(&state, open.node, file.node))
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
+        let parent = node.parent;
+        let old = node.metadata.short_name.clone();
+        if old.as_deref().unwrap_or("") == name {
+            return Ok(());
+        }
+        if !name.is_empty() && child(&state, parent, name).is_some_and(|id| id != file.node) {
+            return Err(Status::OBJECT_NAME_COLLISION);
+        }
+        state
+            .nodes
+            .get_mut(&file.node)
+            .ok_or(Status::FILE_CLOSED)?
+            .metadata
+            .short_name = (!name.is_empty()).then(|| name.to_owned());
+        let filter = name_filter(directory);
+        if let Some(old) = old {
+            emit_directory_entry(
+                &mut state,
+                parent,
+                old,
+                if name.is_empty() {
+                    NotifyAction::REMOVED
+                } else {
+                    NotifyAction::RENAMED_OLD_NAME
+                },
+                filter,
+            );
+        }
+        if !name.is_empty() {
+            emit_directory_entry(
+                &mut state,
+                parent,
+                name.to_owned(),
+                NotifyAction::RENAMED_NEW_NAME,
+                filter,
+            );
+            let now = nt_time();
+            let metadata = &mut state
+                .nodes
+                .get_mut(&file.node)
+                .ok_or(Status::FILE_CLOSED)?
+                .metadata;
+            if !user_set_change_time {
+                metadata.changed = now;
+            }
+            if !directory {
+                metadata.attributes = metadata.attributes().with_archive(true).into_bits();
+            }
+            let metadata = &mut state
+                .nodes
+                .get_mut(&parent)
+                .ok_or(Status::FILE_CLOSED)?
+                .metadata;
+            metadata.written = now;
+            metadata.accessed = now;
+            metadata.changed = now;
+        }
+        wake(state);
+        Ok(())
+    }
+
     async fn rename(
         &self,
         file: &MemoryFile,
@@ -1960,6 +2080,9 @@ impl FileSystem for MemoryFs {
         // MS-FSA §2.1.5.15.12 uses metadata notification, not a new-name record,
         // when replacing an exact-case destination.
         let moving = parent != old_parent;
+        let short_collision = source.metadata.short_name.as_ref().is_some_and(|name| {
+            child(&state, parent, name).is_some_and(|id| id != file.node && Some(id) != target)
+        });
         let filter = name_filter(directory);
         let new_name = new_name.to_string();
         if let Some(target) = target {
@@ -1991,6 +2114,9 @@ impl FileSystem for MemoryFs {
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         node.parent = parent;
         node.metadata.name = new_name;
+        if short_collision {
+            node.metadata.short_name = None;
+        }
         if !user_set_change_time {
             node.metadata.changed = now;
         }
@@ -3141,6 +3267,7 @@ mod tests {
                 stream_queries: Feature::Supported,
                 named_streams: Feature::Supported,
                 stream_rename: Feature::Supported,
+                short_names: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -3234,6 +3361,10 @@ mod tests {
     #[test]
     fn contract_stream_renames() {
         run_contract(contracts::stream_renames);
+    }
+    #[test]
+    fn contract_short_names() {
+        run_contract(contracts::short_names);
     }
 
     #[test]

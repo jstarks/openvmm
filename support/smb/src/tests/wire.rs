@@ -824,6 +824,269 @@ fn stream_rename_validation_and_replacement_preserve_data_on_failure() {
 }
 
 #[test]
+fn short_names_are_real_aliases_with_query_and_collision_semantics() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("long-file-name", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"data"))
+            .await;
+        let root = client.open("", 1, 1).await;
+        let filter = NotifyFilter::new().with_file_name(true);
+        let mut watching =
+            std::pin::pin!(notify::accept(&mut client, root, filter, false, 4096).execute());
+        assert!(futures::poll!(&mut watching).is_pending());
+        let short = |name: &str| {
+            let name = encode_name(name);
+            let mut bytes = (name.len() as u32).to_le_bytes().to_vec();
+            bytes.extend(name);
+            bytes.resize(bytes.len().max(8), 0);
+            bytes
+        };
+        assert_eq!(
+            response_status(&client.set(file, 40, &short("SHORT.TXT")).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            notify::changes(&watching.await.unwrap()),
+            [(NotifyAction::RENAMED_NEW_NAME, "SHORT.TXT".into())]
+        );
+        assert_eq!(
+            &client.query(file, 21).await[76..],
+            encode_name("SHORT.TXT")
+        );
+        let alias = client.open("short.txt", 1, 0).await;
+        assert_eq!(&client.read(alias, 0, 4).await[80..], b"data");
+        assert_eq!(
+            response_status(
+                &client
+                    .open_result(
+                        "SHORT.TXT",
+                        AccessMask::FILE_ALL_ACCESS.into_bits(),
+                        7,
+                        2,
+                        0
+                    )
+                    .await
+            ),
+            Status::OBJECT_NAME_COLLISION
+        );
+        let other = client.open("other-file", 2, 0).await;
+        assert_eq!(
+            response_status(&client.set(other, 40, &short("SHORT.TXT")).await),
+            Status::OBJECT_NAME_COLLISION
+        );
+        assert_eq!(
+            response_status(&client.set(file, 40, &short("NEW.TXT")).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.open_result("SHORT.TXT", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(&client.read(alias, 0, 4).await[80..], b"data");
+        assert_eq!(
+            response_status(&client.set(file, 40, &short("")).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.query(file, 21).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            response_status(&client.open_result("NEW.TXT", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            notify::changes(
+                &client
+                    .send(
+                        Command::CHANGE_NOTIFY,
+                        &notify::body(root, filter, false, 4096)
+                    )
+                    .await
+            ),
+            [
+                (NotifyAction::ADDED, "other-file".into()),
+                (NotifyAction::RENAMED_OLD_NAME, "SHORT.TXT".into()),
+                (NotifyAction::RENAMED_NEW_NAME, "NEW.TXT".into()),
+                (NotifyAction::REMOVED, "NEW.TXT".into()),
+            ]
+        );
+        for file in [alias, other, file, root] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn short_name_validation_preserves_existing_names() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("short-validation", 2, 0).await;
+        for name in [
+            "123456789",
+            "A.LONG",
+            "A.",
+            ".TXT",
+            "A B",
+            "A.B.C",
+            "é",
+            "A?B",
+        ] {
+            let name = encode_name(name);
+            let mut data = (name.len() as u32).to_le_bytes().to_vec();
+            data.extend(name);
+            data.resize(data.len().max(8), 0);
+            assert_eq!(
+                response_status(&client.set(file, 40, &data).await),
+                Status::INVALID_PARAMETER
+            );
+        }
+        for (data, status) in [
+            (vec![0; 7], Status::INFO_LENGTH_MISMATCH),
+            (vec![1, 0, 0, 0, 0, 0, 0, 0], Status::INVALID_PARAMETER),
+            (vec![8, 0, 0, 0, 0, 0, 0, 0], Status::INVALID_PARAMETER),
+        ] {
+            assert_eq!(response_status(&client.set(file, 40, &data).await), status);
+        }
+        assert_eq!(
+            response_status(&client.query(file, 21).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        let mut data = 10u32.to_le_bytes().to_vec();
+        data.extend(encode_name("SHORT"));
+        let root = client.open("", 1, 1).await;
+        assert_eq!(
+            response_status(&client.set(root, 40, &data).await),
+            Status::INVALID_PARAMETER
+        );
+        let named = client.open("short-validation:side", 3, 0).await;
+        assert_eq!(
+            response_status(&client.set(named, 40, &data).await),
+            Status::INVALID_PARAMETER
+        );
+        for access in [
+            AccessMask::FILE_GENERIC_READ.into_bits(),
+            AccessMask::new().with_delete(true).into_bits(),
+        ] {
+            let response = client
+                .open_result("short-validation", access, 7, 1, 0)
+                .await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            let restricted = read_body::<CreateResponse>(&response).unwrap().file_id;
+            assert_eq!(
+                response_status(&client.set(restricted, 40, &data).await),
+                Status::ACCESS_DENIED
+            );
+            client.close(restricted).await;
+        }
+        let directory = client.open("long-directory", 2, 1).await;
+        let child = client.open("long-directory\\child", 2, 0).await;
+        assert_eq!(
+            response_status(&client.set(directory, 40, &data).await),
+            Status::ACCESS_DENIED
+        );
+        client.close(child).await;
+        assert_eq!(
+            response_status(&client.set(directory, 40, &data).await),
+            Status::SUCCESS
+        );
+        let alias = client.open("SHORT\\child", 1, 0).await;
+        client.close(alias).await;
+        let mut short = 16u32.to_le_bytes().to_vec();
+        short.extend(encode_name("FILE.TXT"));
+        assert_eq!(
+            response_status(&client.set(file, 40, &short).await),
+            Status::SUCCESS
+        );
+        let destination = client.open("destination", 2, 1).await;
+        let target = client.open("destination\\FILE.TXT", 2, 0).await;
+        let target_id = client.query(target, 6).await[72..].to_vec();
+        let name = encode_name("destination\\moved");
+        let mut rename = FileRenameInformation::new_zeroed();
+        rename.file_name_length = (name.len() as u32).into();
+        let mut bytes = rename.as_bytes().to_vec();
+        bytes.extend(name);
+        assert_eq!(
+            response_status(&client.set(file, 10, &bytes).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(&client.query(file, 21).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        let alias = client.open("destination\\FILE.TXT", 1, 0).await;
+        assert_eq!(&client.query(alias, 6).await[72..], target_id);
+        client.close(alias).await;
+        client.close(target).await;
+        client.close(destination).await;
+        for file in [directory, named, root] {
+            client.close(file).await;
+        }
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn short_name_framing_and_delete_access_precede_provider_policy() {
+    use crate::test_support::{ControlledFs, Operation, Plan};
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("provider-policy", 2, 0).await;
+        let response = client
+            .open_result(
+                "provider-policy",
+                AccessMask::FILE_GENERIC_READ.into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let restricted = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let mut bytes = 10u32.to_le_bytes().to_vec();
+        bytes.extend(encode_name("SHORT"));
+        assert_eq!(
+            response_status(&client.set(restricted, 40, &bytes).await),
+            Status::ACCESS_DENIED
+        );
+        assert_eq!(
+            response_status(&client.set(file, 40, &bytes[..7]).await),
+            Status::INFO_LENGTH_MISMATCH
+        );
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.operation == Operation::SetShortName)
+        );
+        for status in [Status::NOT_SUPPORTED, Status::PRIVILEGE_NOT_HELD] {
+            control
+                .set_plan(
+                    Operation::SetShortName,
+                    Plan {
+                        failure: Some(status),
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(response_status(&client.set(file, 40, &bytes).await), status);
+        }
+        assert_eq!(
+            response_status(&client.query(file, 21).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        client.close(restricted).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

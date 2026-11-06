@@ -36,6 +36,7 @@ pub struct MemoryFs(Arc<Mutex<State>>);
 
 struct Node {
     metadata: Metadata,
+    security: SecurityDescriptor,
     parent: u64,
     data: Vec<u8>,
 }
@@ -251,6 +252,7 @@ impl MemoryFs {
                 granted_access: 0,
             },
             parent: 1,
+            security: default_security(true),
             data: Vec::new(),
         };
         Self(Arc::new(Mutex::new(State {
@@ -322,19 +324,79 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     components.reverse();
     metadata.path = format!("\\{}", components.join("\\"));
     metadata.number_of_links = u32::from(!metadata.delete_pending);
-    metadata.maximal_access = maximal_access(&metadata);
+    metadata.maximal_access = maximal_access(&state.nodes[&id]);
     Ok(metadata)
 }
 
-fn maximal_access(metadata: &Metadata) -> u32 {
-    AccessMask::FILE_ALL_ACCESS
-        .with_write_data(!metadata.attributes().readonly())
-        .with_append_data(!metadata.attributes().readonly())
-        .into_bits()
+fn maximal_access(node: &Node) -> u32 {
+    allowed_access(node, true)
+}
+
+fn system_sid() -> Sid {
+    Sid::new([0, 0, 0, 0, 0, 5], &[18]).expect("well-known SID")
+}
+
+fn owner_rights_sid() -> Sid {
+    Sid::new([0, 0, 0, 0, 0, 3], &[4]).expect("well-known SID")
+}
+
+fn allowed_access(node: &Node, maximum: bool) -> u32 {
+    let all = AccessMask::FILE_ALL_ACCESS.into_bits();
+    let mut granted = all;
+    if let AclState::Present(acl) = &node.security.dacl {
+        let owner = node.security.owner.as_ref() == Some(&system_sid());
+        let owner_rights = owner_rights_sid();
+        let implicit_owner = owner
+            && !acl.entries().any(|ace| {
+                ace.access()
+                    .is_some_and(|ace| !ace.flags.inherit_only() && ace.sid == owner_rights)
+            });
+        let implicit = if implicit_owner {
+            AccessMask::new()
+                .with_read_control(true)
+                .with_write_dac(true)
+                .into_bits()
+        } else {
+            0
+        };
+        granted = implicit;
+        let mut denied = 0;
+        let world = Sid::new([0, 0, 0, 0, 0, 1], &[0]).expect("well-known SID");
+        for ace in acl.entries() {
+            // Stored MemoryFs DACLs contain only validated basic access ACEs.
+            let ace = ace.access().expect("supported memory ACL");
+            if ace.flags.inherit_only()
+                || !(ace.sid == system_sid()
+                    || ace.sid == world
+                    || (owner && ace.sid == owner_rights))
+            {
+                continue;
+            }
+            let mask = crate::provider::map_access(ace.mask) & all;
+            if ace.deny {
+                denied |= if maximum { mask } else { mask & !granted };
+            } else {
+                granted |= mask & !denied;
+            }
+        }
+        granted = implicit | (granted & !denied);
+    }
+    // Directory security updates are unsupported; every parent retains its
+    // default DELETE_CHILD grant, which independently authorizes child DELETE.
+    if !node.metadata.is_directory() {
+        granted |= AccessMask::new().with_delete(true).into_bits();
+    }
+    if node.metadata.attributes().readonly() {
+        granted &= !AccessMask::new()
+            .with_write_data(true)
+            .with_append_data(true)
+            .into_bits();
+    }
+    granted & all
 }
 
 fn default_security(directory: bool) -> SecurityDescriptor {
-    let system = Sid::new([0, 0, 0, 0, 0, 5], &[18]).expect("well-known SID");
+    let system = system_sid();
     let world = Sid::new([0, 0, 0, 0, 0, 1], &[0]).expect("well-known SID");
     let dacl = Acl::access(&[AccessAce {
         deny: false,
@@ -651,7 +713,11 @@ impl FileSystem for MemoryFs {
             if options.options().non_directory_file() && node.metadata.is_directory() {
                 return Err(Status::FILE_IS_A_DIRECTORY);
             }
-            options.access = grant_access(maximal_access(&node.metadata), options.access, delete)?;
+            options.access = grant_access(
+                allowed_access(node, options.access().maximum_allowed()),
+                options.access,
+                delete,
+            )?;
             if node.metadata.attributes().readonly()
                 && (options.access().write_data() || options.access().append_data() || delete)
             {
@@ -727,6 +793,7 @@ impl FileSystem for MemoryFs {
             state.nodes.insert(
                 id,
                 Node {
+                    security: default_security(directory),
                     metadata: Metadata {
                         id,
                         name: parts.last().ok_or(Status::OBJECT_NAME_INVALID)?.to_string(),
@@ -1024,7 +1091,7 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::NOT_SUPPORTED);
         }
-        let mut descriptor = default_security(node.metadata.is_directory());
+        let mut descriptor = node.security.clone();
         if !information.owner() {
             descriptor.owner = None;
         }
@@ -1036,6 +1103,99 @@ impl FileSystem for MemoryFs {
             descriptor.control.set_dacl_present(false);
         }
         Ok(descriptor)
+    }
+
+    async fn set_security(
+        &self,
+        file: &MemoryFile,
+        information: SecurityInformation,
+        descriptor: &SecurityDescriptor,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let access = AccessMask::from_bits(open.access);
+        if (information.dacl() && !access.write_dac())
+            || ((information.owner() || information.group()) && !access.write_owner())
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
+        let user_set_change_time = open.user_set_change_time;
+        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let supported = SecurityInformation::new()
+            .with_owner(true)
+            .with_group(true)
+            .with_dacl(true)
+            .into_bits();
+        if node.metadata.is_directory()
+            || information.into_bits() & !supported != 0
+            || descriptor.control.server_security()
+            || descriptor.control.dacl_trusted()
+            || descriptor.control.dacl_auto_inherit_required()
+        {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        if information.owner() && descriptor.owner.as_ref() != Some(&system_sid()) {
+            return Err(Status::INVALID_OWNER);
+        }
+        if information.group() && descriptor.group.is_none() {
+            return Err(Status::INVALID_PRIMARY_GROUP);
+        }
+        if information.dacl() {
+            if let AclState::Present(acl) = &descriptor.dacl {
+                for ace in acl.entries() {
+                    let ace = ace.access().ok_or(Status::NOT_SUPPORTED)?;
+                    if ace.flags.into_bits() & 0xe0 != 0
+                        || crate::provider::map_access(ace.mask)
+                            & !AccessMask::FILE_ALL_ACCESS.into_bits()
+                            != 0
+                    {
+                        return Err(Status::NOT_SUPPORTED);
+                    }
+                }
+            }
+        }
+        if information.owner() {
+            node.security.owner.clone_from(&descriptor.owner);
+            node.security
+                .control
+                .set_owner_defaulted(descriptor.control.owner_defaulted());
+        }
+        if information.group() {
+            node.security.group.clone_from(&descriptor.group);
+            node.security
+                .control
+                .set_group_defaulted(descriptor.control.group_defaulted());
+        }
+        if information.dacl() {
+            node.security.dacl.clone_from(&descriptor.dacl);
+            node.security
+                .control
+                .set_dacl_present(descriptor.dacl != AclState::Absent);
+            node.security
+                .control
+                .set_dacl_defaulted(descriptor.control.dacl_defaulted());
+            node.security
+                .control
+                .set_dacl_protected(descriptor.control.dacl_protected());
+            node.security
+                .control
+                .set_dacl_auto_inherited(descriptor.control.dacl_auto_inherited());
+        }
+        if information.into_bits() != 0 {
+            node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+            if !user_set_change_time {
+                node.metadata.changed = nt_time();
+            }
+            emit(
+                &mut state,
+                file.node,
+                NotifyAction::MODIFIED,
+                NotifyFilter::new().with_security(true),
+            );
+        }
+        wake(state);
+        Ok(())
     }
 
     async fn read(
@@ -1614,6 +1774,7 @@ mod tests {
                 allocation: Feature::Supported,
                 file_mode: Feature::Supported,
                 security_queries: Feature::Supported,
+                file_acl_updates: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -1666,6 +1827,11 @@ mod tests {
     #[test]
     fn contract_security_queries() {
         run_contract(contracts::security_queries);
+    }
+
+    #[test]
+    fn contract_file_acl_updates() {
+        run_contract(contracts::file_acl_updates);
     }
 
     #[test]

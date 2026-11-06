@@ -132,10 +132,16 @@ Security queries use the optional provider operation and enforce READ_CONTROL
 or ACCESS_SYSTEM_SECURITY as appropriate. Unknown selector bits are ignored.
 Undersized replies return BUFFER_TOO_SMALL with the required length, never a
 partial descriptor. Unsupported providers have no default descriptor fallback.
-MemoryFs exposes owner/group/DACL metadata for its fixed synthetic SYSTEM share
-identity and allow-everyone default policy, not a network client's identity.
-ACL updates and advanced security selectors remain unsupported at this checkpoint;
-no persistent-ACL capability is advertised.
+MemoryFs uses a fixed synthetic SYSTEM share identity with World membership,
+no privilege bypass, and an allow-everyone default DACL, not a network client's
+identity. File OWNER/GROUP/DACL updates are atomic and affect future opens,
+not existing grants. Basic ordered allow/deny ACEs, generic masks, OWNER_RIGHTS,
+inherit-only ACEs and distinct null/empty DACLs are supported. Owner assignment
+is restricted to SYSTEM; group metadata may contain any valid SID.
+Directory security updates/inheritance, CREATE security contexts, SACLs,
+advanced ACEs and security selectors are still unsupported. All parents retain
+their default DELETE_CHILD access, which independently authorizes child DELETE.
+No persistent-ACL capability is advertised until the directory policy is complete.
 SET_SECURITY is routed through an optional provider operation after open-right
 checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.
 Providers must apply selected components atomically and enforce their policy on

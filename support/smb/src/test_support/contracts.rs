@@ -45,6 +45,8 @@ pub struct Expectations {
     pub file_mode: Feature,
     /// Basic owner/group/DACL descriptor queries.
     pub security_queries: Feature,
+    /// File DACL updates and future-open enforcement, without privilege bypass.
+    pub file_acl_updates: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -282,6 +284,58 @@ pub async fn security_queries<F: Fixture>(fixture: &F) {
             );
             assert_eq!(selected.sacl, AclState::Absent);
         }
+    }
+    fs.close(&file, &request).await.unwrap();
+}
+
+/// File ACL changes must affect future opens, retain old grants and preserve
+/// unselected owner/group components. Fixtures use an identity without DACL bypass.
+pub async fn file_acl_updates<F: Fixture>(fixture: &F) {
+    use crate::security::{Acl, AclState, SecurityDescriptor};
+    use crate::spec::SecurityInformation;
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "acl", CreateDisposition::CREATE, false, &request).await;
+    let information = SecurityInformation::new().with_dacl(true);
+    let mut descriptor = SecurityDescriptor::empty();
+    descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+    if let Some(status) = unsupported(fixture.expectations().file_acl_updates) {
+        rejected(
+            fs.set_security(&file, information, &descriptor, &request)
+                .await,
+            status,
+        );
+    } else {
+        let all = information.with_owner(true).with_group(true);
+        let before = fs.query_security(&file, all, &request).await.unwrap();
+        let grant = fs.metadata(&file, &request).await.unwrap().granted_access;
+        fs.set_security(&file, information, &descriptor, &request)
+            .await
+            .unwrap();
+        let actual = fs.query_security(&file, all, &request).await.unwrap();
+        assert_eq!(actual.owner, before.owner);
+        assert_eq!(actual.group, before.group);
+        assert_eq!(actual.dacl, descriptor.dacl);
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().granted_access,
+            grant
+        );
+        let read = OpenOptions {
+            access: AccessMask::new().with_read_data(true).into_bits(),
+            ..options(CreateDisposition::OPEN, false)
+        };
+        rejected(fs.open("acl", read, &request).await, Status::ACCESS_DENIED);
+        write_all(fs, &file, 0, b"old grant", &request).await;
+        assert_eq!(read_bytes(fs, &file, 0, 9, &request).await, b"old grant");
+        fs.set_security(&file, information, &before, &request)
+            .await
+            .unwrap();
+        let (reopened, _) = fs.open("acl", read, &request).await.unwrap();
+        assert_eq!(
+            read_bytes(fs, &reopened, 0, 9, &request).await,
+            b"old grant"
+        );
+        fs.close(&reopened, &request).await.unwrap();
     }
     fs.close(&file, &request).await.unwrap();
 }

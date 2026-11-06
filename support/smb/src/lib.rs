@@ -3003,6 +3003,25 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let class = FileInformationClass(request.info_class);
         match (request.info_type, class) {
+            (InformationType::FILE, FileInformationClass::LINK) => {
+                if data.len() < FILE_LINK_INFORMATION_MIN_SIZE {
+                    return Err(Status::INFO_LENGTH_MISMATCH);
+                }
+                let (info, rest) = FileLinkInformation::read_from_prefix(data)
+                    .map_err(|_| Status::INFO_LENGTH_MISMATCH)?;
+                let length = info.file_name_length.get() as usize;
+                if info.root_directory.get() != 0 || length == 0 || !length.is_multiple_of(2) {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                let name = decode_name(rest.get(..length).ok_or(Status::INVALID_PARAMETER)?)?;
+                if name.starts_with('\\') {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                self.server
+                    .backend
+                    .link(&file.file, &name, info.replace_if_exists != 0, context)
+                    .await?;
+            }
             (InformationType::FILESYSTEM, _)
                 if FileSystemInformationClass(request.info_class)
                     == FileSystemInformationClass::OBJECT_ID =>

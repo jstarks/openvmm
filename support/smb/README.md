@@ -25,7 +25,7 @@ will not need them.
 | Compounds and credits | Bounded admission, inherited identities, error propagation, pending replies and cancellation | Implemented; selected compound/async cases; retain committed CLOSE and compound-tail policies |
 | File metadata | Supported query classes, attributes/timestamps, allocation, EOF, mode and position | Implemented subset; broaden applicable getinfo/setinfo cases and classify unsupported-class dependencies |
 | Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/8/11 implemented; object-ID metadata can be set; quota controls remain |
-| Namespace and enumeration | Directory continuation, rename/move, short-name assignment, sharing, replacement and deletion | Implemented subset; explicit aliases resolve/query/enumerate; no automatic short-name generation or hard links |
+| Namespace and enumeration | Directory continuation, rename/move, hard links, short names, sharing, replacement and deletion | Link-scoped names/deletion and shared-file identity implemented; no automatic short-name generation |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
@@ -112,6 +112,17 @@ WRITE_DATA or WRITE_ATTRIBUTES; restore access for assignment belongs to the
 provider (the synthetic system identity has it). The actual object-ID capability
 is advertised. This does not provide a USN journal, an NTFS object-ID index
 namespace or persistent/native GUID generation.
+
+Hard-link SET_INFO requests use typed FileLinkInformation and provider-owned
+destination validation. MemoryFs stores namespace links separately from shared
+file data: handles retain the opened link, while file IDs, streams, locks,
+security and object IDs remain shared. Rename and deletion affect the selected
+link, and storage is released only with the last link. Live link counts are
+maintained without scanning the volume during enumeration. Namespace links and
+streams count toward the object limit; data is charged once. At most one link
+per file has a short name. Open replacement targets remain denied in the
+uncached profile. Hard links are advertised; direct/provider/wire/cancellation
+tests cover them, not the lease-dependent independent hard-link fixture.
 
 ## Run
 
@@ -604,7 +615,7 @@ section 2.1.5.15.12. Its typed prefix is 20 bytes; the complete input must be
 at least 24 bytes. Reserved bytes and padding are ignored, the UTF-16 name is
 length-bounded, RootDirectory must be zero, and destinations are share-relative.
 DELETE access is checked by the engine before calling the provider. Extended
-rename flags and hard links remain unsupported. Colon-prefixed destinations
+rename flags remain unsupported. Colon-prefixed destinations
 select data-stream rename, including default/named moves (MS-FSA 2.1.5.15.12.1).
 
 The provider atomically validates and updates the namespace, preserving the

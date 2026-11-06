@@ -47,6 +47,7 @@ open_enum! {
         ACCESS = 8,
         NAME = 9,
         RENAME = 10,
+        LINK = 11,
         NAMES = 12,
         DISPOSITION = 13,
         POSITION = 14,
@@ -158,8 +159,9 @@ pub struct FileSystemAttributes {
     #[bits(1)]
     other_object: u8,
     pub named_streams: bool,
-    #[bits(4)]
+    #[bits(3)]
     other1: u8,
+    pub supports_hard_links: bool,
     pub extended_attributes: bool,
     #[bits(8)]
     other2: u8,
@@ -180,6 +182,8 @@ pub const FILE_MODE_INFORMATION_SET_MASK: u32 = 0x00000036;
 pub const FILE_ALL_INFORMATION_MIN_BUFFER_SIZE: usize = 104;
 /// Minimum alternate-name buffer: [MS-FSA] §2.1.5.12.4.
 pub const FILE_NAME_INFORMATION_MIN_BUFFER_SIZE: usize = 8;
+/// Minimum complete link input with native alignment: [MS-FSA] §2.1.5.15.7.
+pub const FILE_LINK_INFORMATION_MIN_SIZE: usize = 24;
 /// Linked directory records are eight-byte aligned: [MS-FSCC] §2.4.
 pub const DIRECTORY_ALIGNMENT: usize = 8;
 /// FILE_STREAM_INFORMATION records align between entries: [MS-FSCC] §2.4.49.
@@ -277,6 +281,15 @@ wire!(
         chunk_shift: u8,
         cluster_shift: u8,
         reserved: [u8; 3],
+    }
+);
+wire!(
+    /// FILE_LINK_INFORMATION_TYPE_2 prefix: [MS-FSCC] §2.4.28.2.
+    FileLinkInformation, 20 {
+        replace_if_exists: u8,
+        reserved: [u8; 7],
+        root_directory: U64,
+        file_name_length: U32,
     }
 );
 wire!(

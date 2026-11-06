@@ -42,6 +42,7 @@ impl Fixture for MemoryFixture {
             short_names: Feature::Supported,
             volume_object_ids: Feature::Supported,
             object_id_controls: Feature::Supported,
+            hard_links: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -74,6 +75,7 @@ impl ControlledFixture {
             Operation::OpenSecurity,
             Operation::SetBasic,
             Operation::Rename,
+            Operation::Link,
             Operation::SetShortName,
             Operation::SetVolumeObjectId,
             Operation::FileControl,
@@ -115,6 +117,7 @@ impl ControlledFixture {
                 short_names: Feature::Unsupported(Status::NOT_SUPPORTED),
                 volume_object_ids: Feature::Unsupported(Status::NOT_SUPPORTED),
                 object_id_controls: Feature::Unsupported(Status::NOT_SUPPORTED),
+                hard_links: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -306,6 +309,15 @@ fn exported_object_id_control_contract_checks_identity_and_declines() {
     block_on(contracts::object_id_controls(&fixture));
     fixture.assert_rejected(&[Operation::FileControl]);
 }
+#[test]
+fn exported_hard_link_contract_checks_namespace_and_declines() {
+    block_on(contracts::hard_links(&MemoryFixture(MemoryFs::new(
+        1024, 32,
+    ))));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::hard_links(&fixture));
+    fixture.assert_rejected(&[Operation::Link]);
+}
 
 #[test]
 fn declared_unsupported_locks_are_exercised() {
@@ -387,6 +399,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             short_names: Feature::Supported,
             volume_object_ids: Feature::Supported,
             object_id_controls: Feature::Supported,
+            hard_links: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

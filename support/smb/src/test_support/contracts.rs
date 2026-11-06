@@ -73,6 +73,8 @@ pub struct Expectations {
     pub volume_object_ids: Feature,
     /// Per-file object-ID query/create/set/delete/extension controls.
     pub object_id_controls: Feature,
+    /// Shared-file hard links with link-scoped metadata and deletion.
+    pub hard_links: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -670,6 +672,50 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Hard links share file identity/data while retaining independent namespace lifetime.
+pub async fn hard_links<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "source", CreateDisposition::CREATE, false, &request).await;
+    write_all(fs, &file, 0, b"data", &request).await;
+    let result = fs.link(&file, "alias", false, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().hard_links) {
+        rejected(result, status);
+        rejected(
+            fs.open("alias", options(CreateDisposition::OPEN, false), &request)
+                .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+    } else {
+        result.unwrap();
+        let alias = open(fs, "alias", CreateDisposition::OPEN, false, &request).await;
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().id,
+            fs.metadata(&alias, &request).await.unwrap().id
+        );
+        assert_eq!(fs.metadata(&alias, &request).await.unwrap().name, "alias");
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().number_of_links,
+            2
+        );
+        fs.set_delete_on_close(&file, true, &request).await.unwrap();
+        assert_eq!(
+            fs.metadata(&alias, &request).await.unwrap().number_of_links,
+            1
+        );
+        fs.close(&file, &request).await.unwrap();
+        assert_eq!(read_bytes(fs, &alias, 0, 4, &request).await, b"data");
+        rejected(
+            fs.open("source", options(CreateDisposition::OPEN, false), &request)
+                .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+        fs.close(&alias, &request).await.unwrap();
+        return;
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// File object IDs are shared, unique, and retained until explicitly removed.

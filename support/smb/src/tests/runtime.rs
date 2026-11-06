@@ -87,6 +87,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::SetShortName,
             Operation::SetVolumeObjectId,
             Operation::Rename,
+            Operation::Link,
             Operation::Lock,
             Operation::Unlock,
             Operation::RollbackLock,
@@ -199,6 +200,12 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             fs.rename(&file, "directory\\renamed", false, &context),
             &control,
             Operation::Rename,
+        )
+        .await;
+        through_gates(
+            fs.link(&file, "directory\\alias", false, &context),
+            &control,
+            Operation::Link,
         )
         .await;
         through_gates(
@@ -587,6 +594,7 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
             Operation::SetEas,
             Operation::SetShortName,
             Operation::SetVolumeObjectId,
+            Operation::Link,
         ] {
             for after in [false, true] {
                 let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
@@ -615,6 +623,13 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                     bytes
                 } else if operation == Operation::SetVolumeObjectId {
                     vec![9; 64]
+                } else if operation == Operation::Link {
+                    let name = encode_name("added-link");
+                    let mut info = FileLinkInformation::new_zeroed();
+                    info.file_name_length = (name.len() as u32).into();
+                    let mut bytes = info.as_bytes().to_vec();
+                    bytes.extend(name);
+                    bytes
                 } else {
                     32i64.to_le_bytes().to_vec()
                 };
@@ -633,6 +648,8 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                     40
                 } else if operation == Operation::SetVolumeObjectId {
                     8
+                } else if operation == Operation::Link {
+                    11
                 } else {
                     19
                 };
@@ -728,6 +745,25 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                         } else {
                             assert_ne!(&response[72..88], &[9; 16]);
                             assert_eq!(&response[88..], &[0; 48]);
+                        }
+                    } else if operation == Operation::Link {
+                        assert_eq!(
+                            &client.query(reopened, 5).await[88..92],
+                            &(if after { 2u32 } else { 1 }).to_le_bytes()
+                        );
+                        let response = client.open_result("added-link", 1, 7, 1, 0).await;
+                        assert_eq!(
+                            response_status(&response),
+                            if after {
+                                Status::SUCCESS
+                            } else {
+                                Status::OBJECT_NAME_NOT_FOUND
+                            }
+                        );
+                        if after {
+                            client
+                                .close(read_body::<CreateResponse>(&response).unwrap().file_id)
+                                .await;
                         }
                     } else {
                         let response = client.query(reopened, 5).await;

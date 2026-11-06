@@ -100,6 +100,7 @@ open_enum! {
         FILE_IS_A_DIRECTORY = 0xc00000ba,
         DUPLICATE_NAME = 0xc00000bd,
         OBJECTID_NOT_FOUND = 0xc00002f0,
+        TOO_MANY_LINKS = 0xc0000265,
         NOT_SUPPORTED = 0xc00000bb,
         BAD_NETWORK_NAME = 0xc00000cc,
         DIRECTORY_NOT_EMPTY = 0xc0000101,

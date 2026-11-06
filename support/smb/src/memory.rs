@@ -38,14 +38,22 @@ const LOCK_WAITER_LIMIT: usize = 1024;
 pub struct MemoryFs(Arc<Mutex<State>>);
 
 struct Node {
+    link: u64,
     object_id: ObjectIdInformation,
     default_stream: u64,
     metadata: Metadata,
     security: SecurityDescriptor,
-    parent: u64,
     data: Vec<u8>,
     eas: Vec<ExtendedAttribute>,
     streams: BTreeMap<u64, NamedStream>,
+}
+
+struct Link {
+    node: u64,
+    parent: u64,
+    name: String,
+    short_name: Option<String>,
+    delete_pending: bool,
 }
 
 struct NamedStream {
@@ -63,6 +71,7 @@ impl NamedStream {
 }
 
 struct Open {
+    link: u64,
     node: u64,
     stream: u64,
     access: u32,
@@ -91,8 +100,10 @@ struct State {
     created: u64,
     object_information: VolumeObjectInformation,
     nodes: BTreeMap<u64, Node>,
+    links: BTreeMap<u64, Link>,
     opens: BTreeMap<u64, Open>,
     next_id: u64,
+    next_link: u64,
     next_open: u64,
     next_stream: u64,
     next_notify: u64,
@@ -150,29 +161,29 @@ fn wake(state: MutexGuard<'_, State>) {
     changed.notify(usize::MAX);
 }
 
-fn emit(state: &mut State, node: u64, action: NotifyAction, filter: NotifyFilter) {
-    emit_named(state, node, None, action, filter);
+fn emit(state: &mut State, link: u64, action: NotifyAction, filter: NotifyFilter) {
+    emit_named(state, link, None, action, filter);
 }
 
 fn emit_named(
     state: &mut State,
-    node: u64,
+    link: u64,
     stream: Option<&str>,
     action: NotifyAction,
     filter: NotifyFilter,
 ) {
-    let Some(node) = state.nodes.get(&node) else {
+    let Some(link) = state.links.get(&link) else {
         return;
     };
-    if node.parent == node.metadata.id {
+    if link.parent == link.node {
         return;
     }
-    let mut name = node.metadata.name.clone();
+    let mut name = link.name.clone();
     if let Some(stream) = stream {
         name.push(':');
         name.push_str(stream);
     }
-    emit_directory_entry(state, node.parent, name, action, filter);
+    emit_directory_entry(state, link.parent, name, action, filter);
 }
 
 fn emit_directory_entry(
@@ -211,11 +222,12 @@ fn emit_directory_entry(
         let Some(node) = state.nodes.get(&parent) else {
             break;
         };
-        if node.parent == parent {
+        let link = &state.links[&node.link];
+        if link.parent == parent {
             break;
         }
-        name = format!("{}\\{name}", node.metadata.name);
-        parent = node.parent;
+        name = format!("{}\\{name}", link.name);
+        parent = link.parent;
         depth += 1;
     }
 }
@@ -224,6 +236,17 @@ fn name_filter(directory: bool) -> NotifyFilter {
     NotifyFilter::new()
         .with_dir_name(directory)
         .with_file_name(!directory)
+}
+
+fn replacement_filter() -> NotifyFilter {
+    NotifyFilter::new()
+        .with_attributes(true)
+        .with_size(true)
+        .with_last_write(true)
+        .with_last_access(true)
+        .with_creation(true)
+        .with_security(true)
+        .with_ea(true)
 }
 
 fn delete_watches(state: &mut State, node: u64) {
@@ -260,6 +283,7 @@ impl Drop for NotifyWaiter {
 
 /// An open object whose lifetime reserves sharing rights in the provider.
 pub struct MemoryFile {
+    link: u64,
     state: Arc<Mutex<State>>,
     node: u64,
     stream: u64,
@@ -283,6 +307,7 @@ impl MemoryFs {
     pub fn new(byte_limit: usize, object_limit: usize) -> Self {
         let now = nt_time();
         let root = Node {
+            link: 1,
             object_id: ObjectIdInformation::default(),
             default_stream: 0,
             metadata: Metadata {
@@ -308,7 +333,6 @@ impl MemoryFs {
                 maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
                 granted_access: 0,
             },
-            parent: 1,
             security: default_security(true),
             data: Vec::new(),
             eas: Vec::new(),
@@ -327,8 +351,19 @@ impl MemoryFs {
                 }
             },
             nodes: BTreeMap::from([(1, root)]),
+            links: BTreeMap::from([(
+                1,
+                Link {
+                    node: 1,
+                    parent: 1,
+                    name: String::new(),
+                    short_name: None,
+                    delete_pending: false,
+                },
+            )]),
             opens: BTreeMap::new(),
             next_id: 2,
+            next_link: 2,
             next_open: 1,
             next_stream: 1,
             next_notify: 1,
@@ -418,12 +453,11 @@ fn components(name: &str) -> Result<Vec<&str>, Status> {
 }
 
 fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
-    state.nodes.iter().find_map(|(&id, node)| {
+    state.links.iter().find_map(|(&id, link)| {
         (id != 1
-            && node.parent == parent
-            && (node.metadata.name.eq_ignore_ascii_case(name)
-                || node
-                    .metadata
+            && link.parent == parent
+            && (link.name.eq_ignore_ascii_case(name)
+                || link
                     .short_name
                     .as_ref()
                     .is_some_and(|short| short.eq_ignore_ascii_case(name))))
@@ -432,37 +466,46 @@ fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
 }
 
 fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
+    let link = state.nodes.get(&id).ok_or(Status::FILE_CLOSED)?.link;
+    link_metadata(state, link)
+}
+
+fn link_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
+    let link = state.links.get(&id).ok_or(Status::FILE_CLOSED)?;
+    let node_id = link.node;
     let mut metadata = state
         .nodes
-        .get(&id)
+        .get(&node_id)
         .ok_or(Status::FILE_CLOSED)?
         .metadata
         .clone();
     let mut components = Vec::new();
+    metadata.name = link.name.clone();
+    metadata.short_name = link.short_name.clone();
+    metadata.delete_pending = link.delete_pending;
     let mut current = id;
     loop {
-        let node = state.nodes.get(&current).ok_or(Status::FILE_CLOSED)?;
-        if node.parent == current {
+        let link = state.links.get(&current).ok_or(Status::FILE_CLOSED)?;
+        if link.parent == link.node {
             break;
         }
-        components.push(node.metadata.name.as_str());
-        current = node.parent;
+        components.push(link.name.as_str());
+        current = state.nodes[&link.parent].link;
     }
     components.reverse();
     metadata.path = format!("\\{}", components.join("\\"));
-    metadata.number_of_links = u32::from(!metadata.delete_pending);
     let mut id128 = [0; 16];
     id128[..8].copy_from_slice(&metadata.id.to_le_bytes());
     metadata.id128 = Some(id128);
     if let Some(compression) = &mut metadata.compression {
         compression.compressed_size = metadata.allocation_size;
     }
-    metadata.maximal_access = acl_access(&state.nodes[&id].security);
+    metadata.maximal_access = acl_access(&state.nodes[&node_id].security);
     Ok(metadata)
 }
 
 fn file_metadata(state: &State, file: &MemoryFile) -> Result<Metadata, Status> {
-    let mut info = node_metadata(state, file.node)?;
+    let mut info = link_metadata(state, file.link)?;
     if !is_default_stream(state, file) {
         let stream = state
             .nodes
@@ -541,10 +584,11 @@ fn acl_access(security: &SecurityDescriptor) -> u32 {
 }
 
 fn allowed_access(state: &State, id: u64) -> u32 {
-    let node = &state.nodes[&id];
+    let link = &state.links[&id];
+    let node = &state.nodes[&link.node];
     let mut granted = acl_access(&node.security);
-    if node.parent != id {
-        let parent = AccessMask::from_bits(acl_access(&state.nodes[&node.parent].security));
+    if link.parent != link.node {
+        let parent = AccessMask::from_bits(acl_access(&state.nodes[&link.parent].security));
         granted |= AccessMask::new()
             .with_delete(parent.delete_child())
             .with_read_attributes(parent.read_data())
@@ -783,9 +827,52 @@ fn grant_access(available: u32, requested: u32, delete: bool) -> Result<u32, Sta
 fn has_children(state: &State, node: u64) -> bool {
     // Pending links remain directory entries until their last open closes.
     state
-        .nodes
+        .links
         .values()
-        .any(|child| child.parent == node && child.metadata.id != node)
+        .any(|child| child.parent == node && child.node != node)
+}
+
+fn remove_link(state: &mut State, id: u64) {
+    let link = state.links.remove(&id).expect("validated link exists");
+    if !link.delete_pending {
+        state
+            .nodes
+            .get_mut(&link.node)
+            .expect("linked node exists")
+            .metadata
+            .number_of_links -= 1;
+    }
+    if let Some(next) = state
+        .links
+        .iter()
+        .find_map(|(&id, other)| (other.node == link.node).then_some(id))
+    {
+        state
+            .nodes
+            .get_mut(&link.node)
+            .expect("linked node exists")
+            .link = next;
+    } else if let Some(node) = state.nodes.remove(&link.node) {
+        state.bytes -= stored_bytes(&node);
+    }
+}
+
+fn set_link_deleted(state: &mut State, id: u64, deleted: bool) {
+    let link = state.links.get_mut(&id).expect("open link exists");
+    if link.delete_pending != deleted {
+        let count = &mut state
+            .nodes
+            .get_mut(&link.node)
+            .expect("linked node exists")
+            .metadata
+            .number_of_links;
+        if deleted {
+            *count -= 1;
+        } else {
+            *count += 1;
+        }
+        link.delete_pending = deleted;
+    }
 }
 
 fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
@@ -796,17 +883,19 @@ fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
         }
         parent = match *part {
             "." => parent,
-            ".." => state.nodes[&parent].parent,
-            _ => child(state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?,
+            ".." => state.links[&state.nodes[&parent].link].parent,
+            _ => {
+                state.links[&child(state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?].node
+            }
         };
         if !state.nodes[&parent].metadata.is_directory() {
             return Err(Status::NOT_A_DIRECTORY);
         }
-        if state.nodes[&parent].metadata.delete_pending {
+        if state.links[&state.nodes[&parent].link].delete_pending {
             return Err(Status::DELETE_PENDING);
         }
     }
-    if state.nodes[&parent].metadata.delete_pending {
+    if state.links[&state.nodes[&parent].link].delete_pending {
         return Err(Status::DELETE_PENDING);
     }
     Ok(parent)
@@ -817,12 +906,16 @@ fn beneath(state: &State, mut node: u64, ancestor: u64) -> bool {
         if node == ancestor {
             return true;
         }
-        let parent = state.nodes[&node].parent;
+        let parent = state.links[&state.nodes[&node].link].parent;
         if parent == node {
             return false;
         }
         node = parent;
     }
+}
+
+fn beneath_open(state: &State, open: &Open, ancestor: u64) -> bool {
+    open.node == ancestor || beneath(state, state.links[&open.link].parent, ancestor)
 }
 
 fn share_categories(access: u32) -> u32 {
@@ -855,6 +948,7 @@ fn stream_sharing_conflict(access: u32, sharing: u32, other: &Open, stream: u64)
 fn open_named_stream(
     state: &mut State,
     id: u64,
+    link: u64,
     name: &str,
     options: &mut OpenOptions<'_>,
 ) -> Result<(u64, u32), Status> {
@@ -903,7 +997,7 @@ fn open_named_stream(
             .into_bits();
     }
     let readonly = node.metadata.attributes().readonly() && !node.metadata.is_directory();
-    let mut available = AccessMask::from_bits(allowed_access(state, id));
+    let mut available = AccessMask::from_bits(allowed_access(state, link));
     if readonly && options.access().maximum_allowed() {
         available.set_write_data(false);
         available.set_append_data(false);
@@ -935,7 +1029,7 @@ fn open_named_stream(
         node.metadata.changed = node.metadata.written;
         emit_named(
             state,
-            id,
+            link,
             Some(&name),
             NotifyAction::MODIFIED_STREAM,
             NotifyFilter::new()
@@ -980,7 +1074,7 @@ fn open_named_stream(
         state.next_stream = next_stream;
         emit_named(
             state,
-            id,
+            link,
             Some(name),
             NotifyAction::ADDED_STREAM,
             NotifyFilter::new().with_stream_name(true),
@@ -1144,7 +1238,7 @@ fn rename_stream(
     if !old_name.is_empty() {
         emit_named(
             state,
-            file.node,
+            file.link,
             Some(&old_name),
             NotifyAction::REMOVED_STREAM,
             NotifyFilter::new().with_stream_name(true),
@@ -1153,7 +1247,7 @@ fn rename_stream(
     if !new_name.is_empty() {
         emit_named(
             state,
-            file.node,
+            file.link,
             Some(new_name),
             NotifyAction::ADDED_STREAM,
             NotifyFilter::new().with_stream_name(true),
@@ -1162,7 +1256,7 @@ fn rename_stream(
     if default_size_changed {
         emit(
             state,
-            file.node,
+            file.link,
             NotifyAction::MODIFIED,
             NotifyFilter::new()
                 .with_size(true)
@@ -1257,7 +1351,7 @@ fn stored_bytes(node: &Node) -> usize {
 }
 
 fn object_count(state: &State) -> usize {
-    state.nodes.len()
+    state.links.len()
         + state
             .nodes
             .values()
@@ -1371,7 +1465,7 @@ fn data_changed(state: &mut State, file: &MemoryFile, size_changed: bool) -> Res
     if is_default_stream(state, file) {
         emit(
             state,
-            file.node,
+            file.link,
             NotifyAction::MODIFIED,
             NotifyFilter::new()
                 .with_size(size_changed)
@@ -1386,7 +1480,7 @@ fn data_changed(state: &mut State, file: &MemoryFile, size_changed: bool) -> Res
             .ok_or(Status::FILE_CLOSED)?;
         emit_named(
             state,
-            file.node,
+            file.link,
             Some(&name),
             NotifyAction::MODIFIED_STREAM,
             NotifyFilter::new()
@@ -1443,7 +1537,7 @@ impl MemoryFile {
                     state.bytes -= stream.data.len();
                     emit_named(
                         &mut state,
-                        self.node,
+                        self.link,
                         Some(&stream.name),
                         NotifyAction::REMOVED_STREAM,
                         NotifyFilter::new().with_stream_name(true),
@@ -1451,29 +1545,22 @@ impl MemoryFile {
                 }
             }
         } else if open.delete_on_close && (!directory || empty) {
-            state
-                .nodes
-                .get_mut(&self.node)
-                .expect("open's node exists")
-                .metadata
-                .delete_pending = true;
+            set_link_deleted(&mut state, self.link, true);
             if directory {
                 delete_watches(&mut state, self.node);
             }
         }
-        if state.nodes[&self.node].metadata.delete_pending
-            && !state.opens.values().any(|o| o.node == self.node)
+        if state.links[&self.link].delete_pending
+            && !state.opens.values().any(|o| o.link == self.link)
             && empty
         {
             emit(
                 &mut state,
-                self.node,
+                self.link,
                 NotifyAction::REMOVED,
                 name_filter(directory),
             );
-            if let Some(node) = state.nodes.remove(&self.node) {
-                state.bytes -= stored_bytes(&node);
-            }
+            remove_link(&mut state, self.link);
         }
         wake(state);
     }
@@ -1545,6 +1632,7 @@ impl inspect::Inspect for MemoryFs {
                         resp.child(&id.to_string(), |req| {
                             req.respond()
                                 .field("node", open.node)
+                                .field("link", open.link)
                                 .field("stream", open.stream)
                                 .field("registration", watch.id)
                                 .hex("filter", watch.filter.into_bits())
@@ -1557,18 +1645,30 @@ impl inspect::Inspect for MemoryFs {
                     }
                 }
             })
+            .child("links", |req| {
+                let mut resp = req.respond();
+                for (id, link) in &state.links {
+                    resp.child(&id.to_string(), |req| {
+                        req.respond()
+                            .field("node", link.node)
+                            .field("parent", link.parent)
+                            .field("name", &link.name)
+                            .field("delete_pending", link.delete_pending);
+                    });
+                }
+            })
             .child("nodes", |req| {
                 let mut resp = req.respond();
                 for (id, node) in &state.nodes {
                     resp.child(&id.to_string(), |req| {
                         req.respond()
-                            .field("name", &node.metadata.name)
-                            .field("parent", node.parent)
+                            .field("name", &state.links[&node.link].name)
+                            .field("parent", state.links[&node.link].parent)
                             .field("size", node.metadata.size)
                             .field("allocation_size", node.metadata.allocation_size)
                             .hex("attributes", node.metadata.attributes)
                             .field("object_id", format!("{:02x?}", node.object_id.object_id))
-                            .field("delete_pending", node.metadata.delete_pending)
+                            .field("delete_pending", state.links[&node.link].delete_pending)
                             .child("streams", |req| {
                                 let mut resp = req.respond();
                                 for (id, stream) in &node.streams {
@@ -1621,17 +1721,19 @@ impl FileSystem for MemoryFs {
             return Err(Status::ACCESS_DENIED);
         }
         let existing = match parts.last().copied() {
-            Some(".") => Some(parent),
-            Some("..") => Some(state.nodes[&parent].parent),
+            Some(".") => Some(state.nodes[&parent].link),
+            Some("..") => Some(state.nodes[&state.links[&state.nodes[&parent].link].parent].link),
             Some(name) => child(&state, parent, name),
             None => Some(1),
         };
+        let link = existing.unwrap_or(state.next_link);
         let next_open = state
             .next_open
             .checked_add(1)
             .ok_or(Status::INSUFFICIENT_RESOURCES)?;
         let delete = options.options().delete_on_close();
-        let (id, stream, action) = if let Some(id) = existing {
+        let (id, stream, action) = if let Some(link) = existing {
+            let id = state.links[&link].node;
             let node = &state.nodes[&id];
             let default = node.default_stream;
             if named.is_none()
@@ -1640,11 +1742,11 @@ impl FileSystem for MemoryFs {
             {
                 return Err(Status::ACCESS_DENIED);
             }
-            if node.metadata.delete_pending {
+            if state.links[&link].delete_pending {
                 return Err(Status::DELETE_PENDING);
             }
             if let Some(name) = named {
-                let (stream, action) = open_named_stream(&mut state, id, name, &mut options)?;
+                let (stream, action) = open_named_stream(&mut state, id, link, name, &mut options)?;
                 (id, stream, action)
             } else {
                 if force_data && node.metadata.is_directory() {
@@ -1686,7 +1788,7 @@ impl FileSystem for MemoryFs {
                         .with_delete(supersede || options.access().delete())
                         .into_bits();
                 }
-                let mut available = AccessMask::from_bits(allowed_access(&state, id));
+                let mut available = AccessMask::from_bits(allowed_access(&state, link));
                 if options.access().maximum_allowed() && node.metadata.attributes().readonly() {
                     available.set_write_data(false);
                     available.set_append_data(false);
@@ -1747,7 +1849,7 @@ impl FileSystem for MemoryFs {
                     for (_, name, _) in removed {
                         emit_named(
                             &mut state,
-                            id,
+                            link,
                             Some(&name),
                             NotifyAction::REMOVED_STREAM,
                             NotifyFilter::new().with_stream_name(true),
@@ -1755,7 +1857,7 @@ impl FileSystem for MemoryFs {
                     }
                     emit(
                         &mut state,
-                        id,
+                        link,
                         NotifyAction::MODIFIED,
                         NotifyFilter::new()
                             .with_attributes(attributes_changed)
@@ -1782,6 +1884,10 @@ impl FileSystem for MemoryFs {
             ) {
                 return Err(Status::OBJECT_NAME_NOT_FOUND);
             }
+            let next_link = state
+                .next_link
+                .checked_add(1)
+                .ok_or(Status::INSUFFICIENT_RESOURCES)?;
             if !can_add(&state, parent, options.options().directory_file()) {
                 return Err(Status::ACCESS_DENIED);
             }
@@ -1879,6 +1985,7 @@ impl FileSystem for MemoryFs {
             state.nodes.insert(
                 id,
                 Node {
+                    link,
                     object_id: ObjectIdInformation::default(),
                     default_stream: 0,
                     security,
@@ -1909,20 +2016,35 @@ impl FileSystem for MemoryFs {
                         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
                         granted_access: 0,
                     },
-                    parent,
                     data,
                     eas,
                     streams,
                 },
             );
+            state.links.insert(
+                link,
+                Link {
+                    node: id,
+                    parent,
+                    name: parts.last().unwrap_or(&"").to_string(),
+                    short_name: None,
+                    delete_pending: false,
+                },
+            );
+            state.next_link = next_link;
             state.next_id = next_id;
             state.next_stream = next_stream;
             state.bytes = new_bytes;
-            emit(&mut state, id, NotifyAction::ADDED, name_filter(directory));
+            emit(
+                &mut state,
+                link,
+                NotifyAction::ADDED,
+                name_filter(directory),
+            );
             if let Some(name) = named {
                 emit_named(
                     &mut state,
-                    id,
+                    link,
                     Some(name),
                     NotifyAction::ADDED_STREAM,
                     NotifyFilter::new().with_stream_name(true),
@@ -1941,6 +2063,7 @@ impl FileSystem for MemoryFs {
         state.opens.insert(
             open,
             Open {
+                link,
                 node: id,
                 stream,
                 access: options.access,
@@ -1957,6 +2080,7 @@ impl FileSystem for MemoryFs {
         wake(state);
         Ok((
             MemoryFile {
+                link,
                 state: self.0.clone(),
                 node: id,
                 stream,
@@ -1994,13 +2118,14 @@ impl FileSystem for MemoryFs {
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let user_set_change_time = open.user_set_change_time;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let link = state.links.get(&file.link).ok_or(Status::FILE_CLOSED)?;
         if file.node == 1 || !is_default_stream(&state, file) {
             return Err(Status::INVALID_PARAMETER);
         }
         if !AccessMask::from_bits(open.access).delete()
             || !(AccessMask::from_bits(open.access).write_data()
                 || AccessMask::from_bits(open.access).write_attributes())
-            || node.metadata.delete_pending
+            || link.delete_pending
             || open.delete_on_close
         {
             return Err(Status::ACCESS_DENIED);
@@ -2010,23 +2135,29 @@ impl FileSystem for MemoryFs {
             && state
                 .opens
                 .values()
-                .any(|open| open.node != file.node && beneath(&state, open.node, file.node))
+                .any(|open| open.node != file.node && beneath_open(&state, open, file.node))
         {
             return Err(Status::ACCESS_DENIED);
         }
-        let parent = node.parent;
-        let old = node.metadata.short_name.clone();
+        let parent = link.parent;
+        let old = link.short_name.clone();
         if old.as_deref().unwrap_or("") == name {
             return Ok(());
         }
-        if !name.is_empty() && child(&state, parent, name).is_some_and(|id| id != file.node) {
+        if !name.is_empty()
+            && state.links.iter().any(|(&id, link)| {
+                id != file.link && link.node == file.node && link.short_name.is_some()
+            })
+        {
+            return Err(Status::OBJECT_NAME_COLLISION);
+        }
+        if !name.is_empty() && child(&state, parent, name).is_some_and(|id| id != file.link) {
             return Err(Status::OBJECT_NAME_COLLISION);
         }
         state
-            .nodes
-            .get_mut(&file.node)
+            .links
+            .get_mut(&file.link)
             .ok_or(Status::FILE_CLOSED)?
-            .metadata
             .short_name = (!name.is_empty()).then(|| name.to_owned());
         let filter = name_filter(directory);
         if let Some(old) = old {
@@ -2090,6 +2221,175 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
+    async fn link(
+        &self,
+        file: &MemoryFile,
+        name: &str,
+        replace: bool,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        let parts = components(name)?;
+        if parts.is_empty()
+            || name.ends_with('\\')
+            || matches!(parts.last().copied(), Some("." | ".."))
+        {
+            return Err(Status::OBJECT_NAME_INVALID);
+        }
+        let mut state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let user_set_change_time = open.user_set_change_time;
+        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        if !is_default_stream(&state, file) {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if node.metadata.is_directory() {
+            return Err(Status::FILE_IS_A_DIRECTORY);
+        }
+        if state.links[&file.link].delete_pending {
+            return Err(Status::ACCESS_DENIED);
+        }
+        if state
+            .links
+            .values()
+            .filter(|link| link.node == file.node)
+            .count()
+            >= 1024
+        {
+            return Err(Status::TOO_MANY_LINKS);
+        }
+        let parent = resolve_directory(&state, &parts[..parts.len() - 1])?;
+        if !can_add(&state, parent, false)
+            || !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute()
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
+        if state.opens.values().any(|open| {
+            open.node == parent
+                && stream_sharing_conflict(
+                    AccessMask::new().with_write_data(true).into_bits(),
+                    ShareAccess::ALL.into_bits(),
+                    open,
+                    0,
+                )
+        }) {
+            return Err(Status::SHARING_VIOLATION);
+        }
+        let name = parts.last().ok_or(Status::OBJECT_NAME_INVALID)?;
+        let target = child(&state, parent, name);
+        if let Some(target) = target {
+            if !replace {
+                return Err(Status::OBJECT_NAME_COLLISION);
+            }
+            let link = &state.links[&target];
+            if link.delete_pending {
+                return Err(Status::DELETE_PENDING);
+            }
+            if link.node == file.node {
+                if link.name == **name {
+                    return Ok(());
+                }
+                emit(
+                    &mut state,
+                    target,
+                    NotifyAction::REMOVED,
+                    name_filter(false),
+                );
+                state
+                    .links
+                    .get_mut(&target)
+                    .expect("validated target link exists")
+                    .name = name.to_string();
+                let now = nt_time();
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                if !user_set_change_time {
+                    node.metadata.changed = now;
+                }
+                node.metadata.attributes =
+                    node.metadata.attributes().with_archive(true).into_bits();
+                let metadata = &mut state
+                    .nodes
+                    .get_mut(&parent)
+                    .ok_or(Status::FILE_CLOSED)?
+                    .metadata;
+                metadata.written = now;
+                metadata.accessed = now;
+                metadata.changed = now;
+                emit(&mut state, target, NotifyAction::ADDED, name_filter(false));
+                wake(state);
+                return Ok(());
+            }
+            let metadata = &state.nodes[&link.node].metadata;
+            if metadata.is_directory()
+                || metadata.attributes().readonly()
+                || !AccessMask::from_bits(allowed_access(&state, target)).delete()
+                || state.opens.values().any(|open| open.link == target)
+            {
+                return Err(Status::ACCESS_DENIED);
+            }
+            if link.delete_pending {
+                return Err(Status::DELETE_PENDING);
+            }
+        } else if object_count(&state) >= state.object_limit {
+            return Err(Status::DISK_FULL);
+        }
+        let link = state.next_link;
+        let next = link.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
+        let exact = target.is_some_and(|id| state.links[&id].name == **name);
+        if let Some(target) = target {
+            if !exact {
+                emit(
+                    &mut state,
+                    target,
+                    NotifyAction::REMOVED,
+                    name_filter(false),
+                );
+            }
+            remove_link(&mut state, target);
+        }
+        state.links.insert(
+            link,
+            Link {
+                node: file.node,
+                parent,
+                name: name.to_string(),
+                short_name: None,
+                delete_pending: false,
+            },
+        );
+        state.next_link = next;
+        let now = nt_time();
+        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+        node.metadata.number_of_links += 1;
+        if !user_set_change_time {
+            node.metadata.changed = now;
+        }
+        node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
+        let metadata = &mut state
+            .nodes
+            .get_mut(&parent)
+            .ok_or(Status::FILE_CLOSED)?
+            .metadata;
+        metadata.written = now;
+        metadata.accessed = now;
+        metadata.changed = now;
+        emit(
+            &mut state,
+            link,
+            if exact {
+                NotifyAction::MODIFIED
+            } else {
+                NotifyAction::ADDED
+            },
+            if exact {
+                replacement_filter()
+            } else {
+                name_filter(false)
+            },
+        );
+        wake(state);
+        Ok(())
+    }
+
     async fn rename(
         &self,
         file: &MemoryFile,
@@ -2114,11 +2414,12 @@ impl FileSystem for MemoryFs {
         let opened = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let user_set_change_time = opened.user_set_change_time;
         let source = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let source_link = state.links.get(&file.link).ok_or(Status::FILE_CLOSED)?;
         if file.node == 1 {
             return Err(Status::ACCESS_DENIED);
         }
         let directory = source.metadata.is_directory();
-        let old_parent = source.parent;
+        let old_parent = source_link.parent;
         let new_name = parts.last().ok_or(Status::OBJECT_NAME_INVALID)?;
         let parent = resolve_directory(&state, &parts[..parts.len() - 1])?;
         let parent_access = AccessMask::new()
@@ -2131,7 +2432,7 @@ impl FileSystem for MemoryFs {
         }) {
             return Err(Status::SHARING_VIOLATION);
         }
-        if source.metadata.delete_pending {
+        if source_link.delete_pending {
             return Err(Status::ACCESS_DENIED);
         }
         if directory
@@ -2139,11 +2440,11 @@ impl FileSystem for MemoryFs {
                 || state
                     .opens
                     .values()
-                    .any(|open| open.node != file.node && beneath(&state, open.node, file.node)))
+                    .any(|open| open.node != file.node && beneath_open(&state, open, file.node)))
         {
             return Err(Status::ACCESS_DENIED);
         }
-        if parent == old_parent && source.metadata.name == *new_name {
+        if parent == old_parent && source_link.name == *new_name {
             return Ok(());
         }
         if !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute()
@@ -2151,23 +2452,25 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::ACCESS_DENIED);
         }
-        let target = child(&state, parent, new_name).filter(|&id| id != file.node);
-        let exact_target = target.is_some_and(|id| state.nodes[&id].metadata.name == *new_name);
+        let target = child(&state, parent, new_name).filter(|&id| id != file.link);
+        let same_file = target.is_some_and(|id| state.links[&id].node == file.node);
+        let exact_target = target.is_some_and(|id| state.links[&id].name == *new_name);
         if let Some(target) = target {
-            if !replace {
+            if !replace && !same_file {
                 return Err(Status::OBJECT_NAME_COLLISION);
             }
-            let metadata = &state.nodes[&target].metadata;
-            if metadata.is_directory() || metadata.attributes().readonly() {
+            let target_link = &state.links[&target];
+            let metadata = &state.nodes[&target_link.node].metadata;
+            if !same_file && (metadata.is_directory() || metadata.attributes().readonly()) {
                 return Err(Status::ACCESS_DENIED);
             }
-            if metadata.delete_pending {
+            if target_link.delete_pending {
                 return Err(Status::DELETE_PENDING);
             }
-            if !AccessMask::from_bits(allowed_access(&state, target)).delete() {
+            if !same_file && !AccessMask::from_bits(allowed_access(&state, target)).delete() {
                 return Err(Status::ACCESS_DENIED);
             }
-            if state.opens.values().any(|open| open.node == target) {
+            if state.opens.values().any(|open| open.link == target) {
                 return Err(Status::ACCESS_DENIED);
             }
         }
@@ -2176,8 +2479,13 @@ impl FileSystem for MemoryFs {
         // MS-FSA §2.1.5.15.12 uses metadata notification, not a new-name record,
         // when replacing an exact-case destination.
         let moving = parent != old_parent;
-        let short_collision = source.metadata.short_name.as_ref().is_some_and(|name| {
-            child(&state, parent, name).is_some_and(|id| id != file.node && Some(id) != target)
+        let target_short_name = if same_file {
+            target.and_then(|id| state.links[&id].short_name.clone())
+        } else {
+            None
+        };
+        let short_collision = source_link.short_name.as_ref().is_some_and(|name| {
+            child(&state, parent, name).is_some_and(|id| id != file.link && Some(id) != target)
         });
         let filter = name_filter(directory);
         let new_name = new_name.to_string();
@@ -2190,15 +2498,11 @@ impl FileSystem for MemoryFs {
                     name_filter(false),
                 );
             }
-            let node = state
-                .nodes
-                .remove(&target)
-                .expect("replacement target was validated under the namespace lock");
-            state.bytes -= stored_bytes(&node);
+            remove_link(&mut state, target);
         }
         emit(
             &mut state,
-            file.node,
+            file.link,
             if moving || exact_target {
                 NotifyAction::REMOVED
             } else {
@@ -2207,12 +2511,15 @@ impl FileSystem for MemoryFs {
             filter,
         );
         let now = nt_time();
-        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-        node.parent = parent;
-        node.metadata.name = new_name;
-        if short_collision {
-            node.metadata.short_name = None;
+        let link = state.links.get_mut(&file.link).ok_or(Status::FILE_CLOSED)?;
+        link.parent = parent;
+        link.name = new_name;
+        if same_file {
+            link.short_name = target_short_name;
+        } else if short_collision {
+            link.short_name = None;
         }
+        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         if !user_set_change_time {
             node.metadata.changed = now;
         }
@@ -2230,17 +2537,7 @@ impl FileSystem for MemoryFs {
             metadata.changed = now;
         }
         let (action, filter) = if exact_target {
-            (
-                NotifyAction::MODIFIED,
-                NotifyFilter::new()
-                    .with_attributes(true)
-                    .with_size(true)
-                    .with_last_write(true)
-                    .with_last_access(true)
-                    .with_creation(true)
-                    .with_security(true)
-                    .with_ea(true),
-            )
+            (NotifyAction::MODIFIED, replacement_filter())
         } else {
             (
                 if moving {
@@ -2251,13 +2548,13 @@ impl FileSystem for MemoryFs {
                 filter,
             )
         };
-        emit(&mut state, file.node, action, filter);
+        emit(&mut state, file.link, action, filter);
         if !directory && !exact_target {
             // File renames also invalidate attribute/creation watches, even
             // when those values are unchanged. Replacement already reports this.
             emit(
                 &mut state,
-                file.node,
+                file.link,
                 NotifyAction::MODIFIED,
                 NotifyFilter::new()
                     .with_attributes(true)
@@ -2298,6 +2595,7 @@ impl FileSystem for MemoryFs {
             name: "MEMORY".into(),
             attributes: FileSystemAttributes::new()
                 .with_supports_object_ids(true)
+                .with_supports_hard_links(true)
                 .with_case_preserved_names(true)
                 .with_unicode_on_disk(true)
                 .with_extended_attributes(true)
@@ -2555,7 +2853,7 @@ impl FileSystem for MemoryFs {
         state.bytes = new_bytes;
         emit(
             &mut state,
-            file.node,
+            file.link,
             NotifyAction::MODIFIED,
             NotifyFilter::new().with_ea(true).with_attributes(true),
         );
@@ -2683,7 +2981,7 @@ impl FileSystem for MemoryFs {
             }
             emit(
                 &mut state,
-                file.node,
+                file.link,
                 NotifyAction::MODIFIED,
                 NotifyFilter::new().with_security(true),
             );
@@ -2736,7 +3034,7 @@ impl FileSystem for MemoryFs {
         if changed {
             emit(
                 &mut state,
-                file.node,
+                file.link,
                 NotifyAction::MODIFIED,
                 NotifyFilter::new().with_last_access(true),
             );
@@ -2806,18 +3104,18 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::NOT_A_DIRECTORY);
         }
-        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let _node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         let mut current = node_metadata(&state, file.node)?;
         current.name = ".".to_owned();
-        let mut parent = node_metadata(&state, node.parent)?;
+        let mut parent = node_metadata(&state, state.links[&file.link].parent)?;
         parent.name = "..".to_owned();
         let mut entries = vec![current, parent];
         entries.extend(
             state
-                .nodes
-                .values()
-                .filter(|n| n.parent == file.node && n.metadata.id != file.node)
-                .map(|n| node_metadata(&state, n.metadata.id))
+                .links
+                .iter()
+                .filter(|(_, link)| link.parent == file.node && link.node != file.node)
+                .map(|(&id, _)| link_metadata(&state, id))
                 .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(entries)
@@ -3064,8 +3362,7 @@ impl FileSystem for MemoryFs {
         if delete && directory {
             delete_watches(&mut state, file.node);
         }
-        let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-        node.metadata.delete_pending = delete;
+        set_link_deleted(&mut state, file.link, delete);
         wake(state);
         Ok(())
     }
@@ -3150,7 +3447,7 @@ impl FileSystem for MemoryFs {
             .with_creation(node.metadata.created != before.created)
             .with_last_access(node.metadata.accessed != before.accessed)
             .with_last_write(node.metadata.written != before.written);
-        emit(&mut state, file.node, NotifyAction::MODIFIED, filter);
+        emit(&mut state, file.link, NotifyAction::MODIFIED, filter);
         wake(state);
         Ok(())
     }
@@ -3456,6 +3753,7 @@ mod tests {
                 short_names: Feature::Supported,
                 volume_object_ids: Feature::Supported,
                 object_id_controls: Feature::Supported,
+                hard_links: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -3561,6 +3859,10 @@ mod tests {
     #[test]
     fn contract_object_id_controls() {
         run_contract(contracts::object_id_controls);
+    }
+    #[test]
+    fn contract_hard_links() {
+        run_contract(contracts::hard_links);
     }
 
     #[test]

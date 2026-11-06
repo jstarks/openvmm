@@ -23,6 +23,426 @@ fn object_id_ioctl_input(file: FileId, code: u32, input: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn namespace_information(name: &str, replace: bool) -> Vec<u8> {
+    let name = encode_name(name);
+    let mut bytes = vec![0; 20];
+    bytes[0] = u8::from(replace);
+    bytes[16..20].copy_from_slice(&(name.len() as u32).to_le_bytes());
+    bytes.extend(name);
+    bytes
+}
+
+#[test]
+fn hard_links_share_data_identity_and_streams_but_keep_namespace_lifetimes() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let original = client.open("original", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(original, 0, b"data"))
+            .await;
+        let side = client.open("original:side", 3, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(side, 0, b"side"))
+            .await;
+        client.close(side).await;
+        let folder = client.open("folder", 2, 1).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(original, 11, &namespace_information("folder\\alias", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let alias = client.open("folder\\alias", 1, 0).await;
+        let object = client
+            .ok(Command::IOCTL, &object_id_ioctl(original, 0x900c0, 64))
+            .await;
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(alias, 0x9009c, 64))
+                .await[112..],
+            &object[112..]
+        );
+        assert_eq!(
+            &client.query(alias, 6).await[72..],
+            &client.query(original, 6).await[72..]
+        );
+        assert_eq!(
+            &client.query(original, 5).await[88..92],
+            &2u32.to_le_bytes()
+        );
+        assert_eq!(
+            &client.query(alias, 18).await[172..],
+            encode_name("\\folder\\alias")
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .set(folder, 10, &namespace_information("moved-folder", false))
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        let side = client.open("folder\\alias:side", 1, 0).await;
+        assert_eq!(&client.read(side, 0, 4).await[80..], b"side");
+        client.close(side).await;
+        client
+            .ok(
+                Command::LOCK,
+                &locking::body(
+                    original,
+                    &[(
+                        0,
+                        4,
+                        LockFlags::new()
+                            .with_exclusive_lock(true)
+                            .with_fail_immediately(true),
+                    )],
+                ),
+            )
+            .await;
+        assert_eq!(
+            response_status(&client.read(alias, 0, 4).await),
+            Status::FILE_LOCK_CONFLICT
+        );
+        client
+            .ok(
+                Command::LOCK,
+                &locking::body(original, &[(0, 4, LockFlags::new().with_unlock(true))]),
+            )
+            .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(alias, 10, &namespace_information("folder\\renamed", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            &client.query(original, 18).await[172..],
+            encode_name("\\original")
+        );
+        assert_eq!(
+            &client.query(alias, 18).await[172..],
+            encode_name("\\folder\\renamed")
+        );
+        let later = client.open("after-link", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(later, 0, b"later"))
+            .await;
+        assert_eq!(
+            &client.query(later, 18).await[172..],
+            encode_name("\\after-link")
+        );
+        assert_eq!(
+            response_status(&client.set(alias, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            &client.query(original, 5).await[88..92],
+            &1u32.to_le_bytes()
+        );
+        assert_eq!(
+            response_status(&client.set(alias, 13, &[0]).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            &client.query(original, 5).await[88..92],
+            &2u32.to_le_bytes()
+        );
+        assert_eq!(
+            response_status(&client.set(alias, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(alias).await;
+        assert_eq!(&client.read(original, 0, 4).await[80..], b"data");
+        assert_eq!(
+            response_status(&client.open_result("folder\\renamed", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        for file in [later, folder, original] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn hard_link_replacement_keeps_other_links_and_open_data_alive() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let original = client.open("source", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(original, 0, b"new"))
+            .await;
+        let target = client.open("target", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(target, 0, b"old"))
+            .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(target, 11, &namespace_information("retained", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let retained = client.open("retained", 1, 0).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(original, 11, &namespace_information("target", false))
+                    .await
+            ),
+            Status::OBJECT_NAME_COLLISION
+        );
+        client.close(target).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(original, 11, &namespace_information("target", true))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let target = client.open("target", 1, 0).await;
+        assert_eq!(&client.read(target, 0, 3).await[80..], b"new");
+        assert_eq!(&client.read(retained, 0, 3).await[80..], b"old");
+        assert_eq!(
+            &client.query(retained, 5).await[88..92],
+            &1u32.to_le_bytes()
+        );
+        assert_eq!(
+            &client.query(original, 5).await[88..92],
+            &2u32.to_le_bytes()
+        );
+        assert_ne!(
+            &client.query(retained, 6).await[72..],
+            &client.query(original, 6).await[72..]
+        );
+        for file in [target, retained, original] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn hard_link_validation_limits_and_short_names_do_not_mutate_on_failure() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(4, 4)).unwrap();
+        let mut client = Client::new(&server).await;
+        let source = client.open("source", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(source, 0, b"data"))
+            .await;
+        let folder = client.open("folder", 2, 1).await;
+        let mut bad_root = namespace_information("bad", false);
+        bad_root[8] = 1;
+        for (data, status) in [
+            (vec![0; 23], Status::INFO_LENGTH_MISMATCH),
+            (
+                namespace_information("\\invalid", false),
+                Status::INVALID_PARAMETER,
+            ),
+            (bad_root, Status::INVALID_PARAMETER),
+        ] {
+            assert_eq!(
+                response_status(&client.set(source, 11, &data).await),
+                status
+            );
+        }
+        assert_eq!(
+            response_status(
+                &client
+                    .set(folder, 11, &namespace_information("dir-link", false))
+                    .await
+            ),
+            Status::FILE_IS_A_DIRECTORY
+        );
+        let named = client.open("source:side", 3, 0).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(
+                        named,
+                        11,
+                        &namespace_information("invalid-stream-link", false)
+                    )
+                    .await
+            ),
+            Status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            response_status(&client.set(named, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(named).await;
+        let response = client
+            .open_result(
+                "source",
+                AccessMask::new().with_synchronize(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let restricted = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(
+                        restricted,
+                        11,
+                        &namespace_information("folder\\alias", false)
+                    )
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .set(source, 11, &namespace_information("over-limit", false))
+                    .await
+            ),
+            Status::DISK_FULL
+        );
+        let alias = client.open("folder\\alias", 1, 0).await;
+        let mut short = 6u32.to_le_bytes().to_vec();
+        short.extend(encode_name("ONE"));
+        assert_eq!(
+            response_status(&client.set(source, 40, &short).await),
+            Status::SUCCESS
+        );
+        short[4..].copy_from_slice(&encode_name("TWO"));
+        assert_eq!(
+            response_status(&client.set(alias, 40, &short).await),
+            Status::OBJECT_NAME_COLLISION
+        );
+        assert_eq!(&client.read(alias, 0, 4).await[80..], b"data");
+        assert_eq!(&client.query(source, 5).await[88..92], &2u32.to_le_bytes());
+        for file in [alias, restricted, folder, source] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn same_file_link_replacement_and_rename_keep_target_namespace_metadata() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let source = client.open("source", 2, 0).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(source, 11, &namespace_information("alias", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let alias = client.open("alias", 1, 0).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(source, 11, &namespace_information("ALIAS", true))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            &client.query(alias, 18).await[172..],
+            encode_name("\\ALIAS")
+        );
+        let mut short = 6u32.to_le_bytes().to_vec();
+        short.extend(encode_name("ONE"));
+        assert_eq!(
+            response_status(&client.set(source, 40, &short).await),
+            Status::SUCCESS
+        );
+        client.close(source).await;
+        assert_eq!(
+            response_status(
+                &client
+                    .set(alias, 10, &namespace_information("source", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.query(alias, 21).await[76..], encode_name("ONE"));
+        assert_eq!(&client.query(alias, 5).await[88..92], &1u32.to_le_bytes());
+        client.close(alias).await;
+    });
+}
+
+#[test]
+fn hard_link_notifications_follow_created_replaced_and_removed_links() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();
+        let mut client = Client::new(&server).await;
+        let source = client.open("source", 2, 0).await;
+        let target = client.open("target", 2, 0).await;
+        client.close(target).await;
+        let root = client.open("", 1, 1).await;
+        let attributes = client.open("", 1, 1).await;
+        let names = NotifyFilter::new().with_file_name(true);
+        let attrs = NotifyFilter::new().with_attributes(true);
+        let mut watching =
+            std::pin::pin!(notify::accept(&mut client, root, names, false, 4096).execute());
+        let mut metadata =
+            std::pin::pin!(notify::accept(&mut client, attributes, attrs, false, 4096).execute());
+        assert!(futures::poll!(&mut watching).is_pending());
+        assert!(futures::poll!(&mut metadata).is_pending());
+        assert_eq!(
+            response_status(
+                &client
+                    .set(source, 11, &namespace_information("alias", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .set(source, 11, &namespace_information("target", true))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            notify::changes(&watching.await.unwrap()),
+            [(NotifyAction::ADDED, "alias".into())]
+        );
+        assert_eq!(
+            notify::changes(&metadata.await.unwrap()),
+            [(NotifyAction::MODIFIED, "target".into())]
+        );
+        let alias = client.open("alias", 1, 0).await;
+        assert_eq!(
+            response_status(&client.set(alias, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(alias).await;
+        assert_eq!(
+            notify::changes(
+                &client
+                    .send(
+                        Command::CHANGE_NOTIFY,
+                        &notify::body(root, names, false, 4096)
+                    )
+                    .await
+            ),
+            [(NotifyAction::REMOVED, "alias".into())]
+        );
+        for file in [source, root, attributes] {
+            client.close(file).await;
+        }
+    });
+}
 #[test]
 fn object_id_mutations_enforce_collisions_bounds_and_extension_access() {
     block_on(async {
@@ -2189,7 +2609,7 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
             (
                 FileSystemInformationClass::ATTRIBUTE,
                 vec![
-                    6, 0, 133, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
+                    6, 0, 197, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
                     b'R', 0, b'Y', 0,
                 ],
             ),

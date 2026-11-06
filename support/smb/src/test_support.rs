@@ -77,6 +77,8 @@ pub enum Operation {
     SetBasic,
     /// Namespace rename or move.
     Rename,
+    /// Hard-link creation or replacement.
+    Link,
     /// Short-name assignment or removal.
     SetShortName,
     /// Volume identity and extension metadata update.
@@ -617,6 +619,24 @@ impl<B: Inspect> Inspect for ControlledFs<B> {
 #[async_trait]
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
+
+    async fn link(
+        &self,
+        file: &Self::File,
+        name: &str,
+        replace: bool,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::Link, Some(file.id), Some(name), None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .link(&file.inner, name, replace, &context)
+            .await;
+        call.complete(result, None).await
+    }
 
     async fn set_volume_object_id(
         &self,

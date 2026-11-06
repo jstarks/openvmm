@@ -507,6 +507,46 @@ impl ByteRange {
     }
 }
 
+/// Target information returned when open resolution stops at a symbolic link.
+#[derive(Debug, Clone)]
+pub struct SymbolicLink {
+    /// Target path used by the client to retry.
+    pub substitute_name: String,
+    /// User-facing target name.
+    pub print_name: String,
+    /// Whether the target is relative to the link's containing directory.
+    pub relative: bool,
+    /// Original, unparsed suffix, including separators or a stream suffix.
+    pub unparsed_suffix: String,
+}
+
+/// Provider open failure, including data needed for a symbolic-link response.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    /// Ordinary filesystem failure.
+    #[error("filesystem open failed: {0:?}")]
+    Status(Status),
+    /// A client must evaluate the link and retry the open.
+    #[error("filesystem open stopped at a symbolic link")]
+    SymbolicLink(SymbolicLink),
+}
+
+impl OpenError {
+    /// Status used for protocol completion and diagnostics.
+    pub fn status(&self) -> Status {
+        match self {
+            Self::Status(status) => *status,
+            Self::SymbolicLink(_) => Status::STOPPED_ON_SYMLINK,
+        }
+    }
+}
+
+impl From<Status> for OpenError {
+    fn from(status: Status) -> Self {
+        Self::Status(status)
+    }
+}
+
 /// The object store behind a share.
 ///
 /// Handles own their open lifetime: dropping one releases its share-access
@@ -529,6 +569,18 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         options: OpenOptions<'_>,
         request: &RequestContext,
     ) -> Result<(Self::File, u32), Status>;
+    /// Open with semantic error data when path resolution encounters a symbolic link.
+    /// Providers without reparse support may retain their ordinary open implementation.
+    async fn open_with_reparse(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        request: &RequestContext,
+    ) -> Result<(Self::File, u32), OpenError> {
+        self.open(name, options, request)
+            .await
+            .map_err(OpenError::Status)
+    }
     /// Finalize an open after its other operations have settled. Must be idempotent.
     async fn close(&self, file: &Self::File, request: &RequestContext) -> Result<(), Status>;
     /// Get current metadata for an open object.

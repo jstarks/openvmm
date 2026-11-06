@@ -749,10 +749,17 @@ fn reparse_controls_validate_symlinks_without_silently_following_them() {
                 &object_id_ioctl_input(file, 0x900a4, &input),
             )
             .await;
+        let error = client.open_result("symbolic", 1, 7, 1, 0).await;
+        assert_eq!(response_status(&error), Status::STOPPED_ON_SYMLINK);
+        assert_eq!(&error[64..72], &[9, 0, 0, 0, 52, 0, 0, 0]);
         assert_eq!(
-            response_status(&client.open_result("symbolic", 1, 7, 1, 0).await),
-            Status::IO_REPARSE_TAG_NOT_HANDLED
+            &error[72..100],
+            &[
+                48, 0, 0, 0, b'S', b'Y', b'M', b'L', 12, 0, 0, 160, 36, 0, 0, 0, 0, 0, 12, 0, 12,
+                0, 12, 0, 1, 0, 0, 0,
+            ]
         );
+        assert_eq!(&error[100..], encode_name("targettarget"));
         let response = client
             .open_result("symbolic", 0x1f01ff, 7, 1, 0x00200000)
             .await;
@@ -774,6 +781,111 @@ fn reparse_controls_validate_symlinks_without_silently_following_them() {
         client.close(opened).await;
         client.close(file).await;
     });
+}
+
+#[test]
+fn symbolic_link_create_errors_preserve_intermediate_suffix_and_open_reparse_scope() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(2048, 24)).unwrap();
+        let mut client = Client::new(&server).await;
+        let folder = client.open("parent", 2, 1).await;
+        let link = client.open("parent\\link", 2, 1).await;
+        let target = encode_name("..\\target");
+        let print = encode_name("display");
+        let mut data = vec![0; 20];
+        data[..4].copy_from_slice(&0xa000000cu32.to_le_bytes());
+        data[4..6].copy_from_slice(&((12 + target.len() + print.len()) as u16).to_le_bytes());
+        data[10..12].copy_from_slice(&(target.len() as u16).to_le_bytes());
+        data[12..14].copy_from_slice(&(target.len() as u16).to_le_bytes());
+        data[14..16].copy_from_slice(&(print.len() as u16).to_le_bytes());
+        data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&target);
+        data.extend_from_slice(&print);
+        client
+            .ok(Command::IOCTL, &object_id_ioctl_input(link, 0x900a4, &data))
+            .await;
+        for (name, suffix, options) in [
+            ("parent\\link\\child", "\\child", 0),
+            (
+                "parent\\link\\\u{1f980}:side",
+                "\\\u{1f980}:side",
+                0x00200000,
+            ),
+            ("parent\\\\link\\\\missing\\leaf", "\\\\missing\\leaf", 0),
+            ("parent\\link\\..\\leaf", "\\..\\leaf", 0),
+            ("parent\\link:side", ":side", 0),
+        ] {
+            let response = client.open_result(name, 0x1f01ff, 7, 3, options).await;
+            assert_eq!(
+                response_status(&response),
+                Status::STOPPED_ON_SYMLINK,
+                "{name}"
+            );
+            assert_eq!(
+                u16::from_le_bytes(response[86..88].try_into().unwrap()) as usize,
+                suffix.encode_utf16().count() * 2
+            );
+            assert_eq!(&response[100..100 + target.len()], target);
+            assert_eq!(&response[100 + target.len()..], print);
+        }
+        let response = client
+            .open_result("parent\\link", 0x1f01ff, 7, 1, 0x00200001)
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        client
+            .close(read_body::<CreateResponse>(&response).unwrap().file_id)
+            .await;
+        let mut delete = data[..8].to_vec();
+        delete[4..6].fill(0);
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(link, 0x900ac, &delete),
+            )
+            .await;
+        assert_eq!(
+            response_status(&client.open_result("parent\\link\\child", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        client.close(link).await;
+        client.close(folder).await;
+    });
+}
+
+#[test]
+fn symbolic_link_error_rejects_invalid_provider_paths_and_preserves_absolute_targets() {
+    let make = || SymbolicLink {
+        substitute_name: "\\??\\UNC\\server\\share\\target".into(),
+        print_name: "\\\\server\\share\\target".into(),
+        relative: false,
+        unparsed_suffix: "\\child".into(),
+    };
+    let bytes = symbolic_link_error("link\\child", make()).unwrap();
+    assert_eq!(&bytes[32..36], &[0; 4]);
+    let mut bad = make();
+    bad.relative = true;
+    assert!(matches!(
+        symbolic_link_error("link\\child", bad),
+        Err(Status::INTERNAL_ERROR)
+    ));
+    let mut bad = make();
+    bad.unparsed_suffix = "\\other".into();
+    assert!(matches!(
+        symbolic_link_error("link\\child", bad),
+        Err(Status::INTERNAL_ERROR)
+    ));
+    let mut bad = make();
+    bad.print_name.push('\0');
+    assert!(matches!(
+        symbolic_link_error("link\\child", bad),
+        Err(Status::INTERNAL_ERROR)
+    ));
+    let mut bad = make();
+    bad.substitute_name = "x".repeat(8192);
+    assert!(matches!(
+        symbolic_link_error("link\\child", bad),
+        Err(Status::INTERNAL_ERROR)
+    ));
 }
 
 #[test]

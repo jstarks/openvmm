@@ -4,13 +4,14 @@
 //! A bounded writable in-memory filesystem for synthetic shares.
 
 use crate::codec::{
-    align_up, decode_ea_list, encode_ea_list, validate_reparse_data, validate_reparse_identity,
+    align_up, decode_ea_list, encode_ea_list, symbolic_link, validate_reparse_data,
+    validate_reparse_identity,
 };
 use crate::provider::{
     BasicInformation, ByteRange, Change, CompressionInformation, ExtendedAttribute, FileControl,
     FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
-    ObjectIdInformation, OpenOptions, ReparsePoint, RequestContext, SectorSizeInformation,
-    StreamInformation, VolumeObjectInformation,
+    ObjectIdInformation, OpenError, OpenOptions, ReparsePoint, RequestContext,
+    SectorSizeInformation, StreamInformation, VolumeObjectInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
@@ -881,10 +882,34 @@ fn set_link_deleted(state: &mut State, id: u64, deleted: bool) {
 }
 
 fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
+    resolve_open_directory(state, parts, None).map_err(|error| error.status())
+}
+
+fn reparse_open_error(node: &Node, suffix: &str) -> OpenError {
+    match &node.reparse {
+        Some(point) if point.tag == IO_REPARSE_TAG_SYMLINK => {
+            match symbolic_link(&point.data, suffix) {
+                Ok(link) => OpenError::SymbolicLink(link),
+                Err(status) => OpenError::Status(status),
+            }
+        }
+        _ => Status::IO_REPARSE_TAG_NOT_HANDLED.into(),
+    }
+}
+
+fn resolve_open_directory(
+    state: &State,
+    parts: &[&str],
+    full_name: Option<&str>,
+) -> Result<u64, OpenError> {
     let mut parent = 1;
+    let mut consumed = 0;
     for part in parts {
+        if let Some(name) = full_name {
+            consumed += name[consumed..].find(part).ok_or(Status::INTERNAL_ERROR)? + part.len();
+        }
         if !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute() {
-            return Err(Status::ACCESS_DENIED);
+            return Err(Status::ACCESS_DENIED.into());
         }
         parent = match *part {
             "." => parent,
@@ -893,18 +918,21 @@ fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
                 state.links[&child(state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?].node
             }
         };
-        if !state.nodes[&parent].metadata.is_directory() {
-            return Err(Status::NOT_A_DIRECTORY);
+        if state.links[&state.nodes[&parent].link].delete_pending {
+            return Err(Status::DELETE_PENDING.into());
         }
         if state.nodes[&parent].metadata.reparse_tag & 0x20000000 != 0 {
-            return Err(Status::IO_REPARSE_TAG_NOT_HANDLED);
+            return Err(match full_name {
+                Some(name) => reparse_open_error(&state.nodes[&parent], &name[consumed..]),
+                None => Status::IO_REPARSE_TAG_NOT_HANDLED.into(),
+            });
         }
-        if state.links[&state.nodes[&parent].link].delete_pending {
-            return Err(Status::DELETE_PENDING);
+        if !state.nodes[&parent].metadata.is_directory() {
+            return Err(Status::NOT_A_DIRECTORY.into());
         }
     }
     if state.links[&state.nodes[&parent].link].delete_pending {
-        return Err(Status::DELETE_PENDING);
+        return Err(Status::DELETE_PENDING.into());
     }
     Ok(parent)
 }
@@ -1713,10 +1741,21 @@ impl FileSystem for MemoryFs {
         &self,
         name: &str,
         options: OpenOptions<'_>,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<(MemoryFile, u32), Status> {
+        self.open_with_reparse(name, options, request)
+            .await
+            .map_err(|error| error.status())
+    }
+
+    async fn open_with_reparse(
+        &self,
+        full_name: &str,
+        options: OpenOptions<'_>,
+        _request: &RequestContext,
+    ) -> Result<(MemoryFile, u32), OpenError> {
         let mut options = options;
-        let (name, named, force_data) = stream_path(name, &mut options)?;
+        let (name, named, force_data) = stream_path(full_name, &mut options)?;
         let parts = components(name)?;
         if named.is_none()
             && matches!(parts.last().copied(), Some("." | ".."))
@@ -1725,14 +1764,18 @@ impl FileSystem for MemoryFs {
                 CreateDisposition::OPEN | CreateDisposition::OPEN_IF
             )
         {
-            return Err(Status::OBJECT_PATH_SYNTAX_BAD);
+            return Err(Status::OBJECT_PATH_SYNTAX_BAD.into());
         }
         let mut state = self.0.lock();
-        let parent = resolve_directory(&state, &parts[..parts.len().saturating_sub(1)])?;
+        let parent = resolve_open_directory(
+            &state,
+            &parts[..parts.len().saturating_sub(1)],
+            Some(full_name),
+        )?;
         if !parts.is_empty()
             && !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute()
         {
-            return Err(Status::ACCESS_DENIED);
+            return Err(Status::ACCESS_DENIED.into());
         }
         let existing = match parts.last().copied() {
             Some(".") => Some(state.nodes[&parent].link),
@@ -1749,39 +1792,43 @@ impl FileSystem for MemoryFs {
         let (id, stream, action) = if let Some(link) = existing {
             let id = state.links[&link].node;
             let node = &state.nodes[&id];
+            if state.links[&link].delete_pending {
+                return Err(Status::DELETE_PENDING.into());
+            }
             if node.metadata.reparse_tag & 0x20000000 != 0
                 && !options.options().open_reparse_point()
             {
-                return Err(Status::IO_REPARSE_TAG_NOT_HANDLED);
+                let end = match parts.last() {
+                    Some(part) => name.rfind(part).ok_or(Status::INTERNAL_ERROR)? + part.len(),
+                    None => 0,
+                };
+                return Err(reparse_open_error(node, &full_name[end..]));
             }
             let default = node.default_stream;
             if named.is_none()
                 && options.options().no_ea_knowledge()
                 && node.eas.iter().any(|ea| ea.need_ea)
             {
-                return Err(Status::ACCESS_DENIED);
-            }
-            if state.links[&link].delete_pending {
-                return Err(Status::DELETE_PENDING);
+                return Err(Status::ACCESS_DENIED.into());
             }
             if let Some(name) = named {
                 let (stream, action) = open_named_stream(&mut state, id, link, name, &mut options)?;
                 (id, stream, action)
             } else {
                 if force_data && node.metadata.is_directory() {
-                    return Err(Status::FILE_IS_A_DIRECTORY);
+                    return Err(Status::FILE_IS_A_DIRECTORY.into());
                 }
                 if options.disposition() == CreateDisposition::CREATE {
-                    return Err(Status::OBJECT_NAME_COLLISION);
+                    return Err(Status::OBJECT_NAME_COLLISION.into());
                 }
                 if options.options().directory_file() && !node.metadata.is_directory() {
-                    return Err(Status::NOT_A_DIRECTORY);
+                    return Err(Status::NOT_A_DIRECTORY.into());
                 }
                 if options.options().non_directory_file() && node.metadata.is_directory() {
-                    return Err(Status::FILE_IS_A_DIRECTORY);
+                    return Err(Status::FILE_IS_A_DIRECTORY.into());
                 }
                 if delete && node.metadata.attributes().readonly() {
-                    return Err(Status::CANNOT_DELETE);
+                    return Err(Status::CANNOT_DELETE.into());
                 }
                 let replacement = matches!(
                     options.disposition(),
@@ -1791,12 +1838,12 @@ impl FileSystem for MemoryFs {
                 );
                 if replacement {
                     if node.metadata.is_directory() {
-                        return Err(Status::FILE_IS_A_DIRECTORY);
+                        return Err(Status::FILE_IS_A_DIRECTORY.into());
                     }
                     if (node.metadata.attributes().hidden() && !options.attributes().hidden())
                         || (node.metadata.attributes().system() && !options.attributes().system())
                     {
-                        return Err(Status::ACCESS_DENIED);
+                        return Err(Status::ACCESS_DENIED.into());
                     }
                     let supersede = options.disposition() == CreateDisposition::SUPERSEDE;
                     options.access = options
@@ -1818,7 +1865,7 @@ impl FileSystem for MemoryFs {
                     && node.metadata.attributes().readonly()
                     && (options.access().write_data() || options.access().append_data())
                 {
-                    return Err(Status::ACCESS_DENIED);
+                    return Err(Status::ACCESS_DENIED.into());
                 }
                 for other in state.opens.values().filter(|o| o.node == id) {
                     if stream_sharing_conflict(options.access, options.share_access, other, default)
@@ -1826,7 +1873,7 @@ impl FileSystem for MemoryFs {
                             && other.stream != default
                             && !ShareAccess::from_bits(other.sharing).delete())
                     {
-                        return Err(Status::SHARING_VIOLATION);
+                        return Err(Status::SHARING_VIOLATION.into());
                     }
                 }
                 if replacement {
@@ -1902,21 +1949,21 @@ impl FileSystem for MemoryFs {
                 options.disposition(),
                 CreateDisposition::OPEN | CreateDisposition::OVERWRITE
             ) {
-                return Err(Status::OBJECT_NAME_NOT_FOUND);
+                return Err(Status::OBJECT_NAME_NOT_FOUND.into());
             }
             let next_link = state
                 .next_link
                 .checked_add(1)
                 .ok_or(Status::INSUFFICIENT_RESOURCES)?;
             if !can_add(&state, parent, options.options().directory_file()) {
-                return Err(Status::ACCESS_DENIED);
+                return Err(Status::ACCESS_DENIED.into());
             }
             if delete && options.attributes().readonly() {
-                return Err(Status::CANNOT_DELETE);
+                return Err(Status::CANNOT_DELETE.into());
             }
             let directory = options.options().directory_file();
             if directory && options.attributes().temporary() {
-                return Err(Status::INVALID_PARAMETER);
+                return Err(Status::INVALID_PARAMETER.into());
             }
             if named.is_some() {
                 options.access = options.access().with_write_data(true).into_bits();
@@ -1930,7 +1977,7 @@ impl FileSystem for MemoryFs {
                 .checked_add(1 + usize::from(named.is_some()))
                 .is_none_or(|count| count > state.object_limit)
             {
-                return Err(Status::DISK_FULL);
+                return Err(Status::DISK_FULL.into());
             }
             let security = match options.security {
                 Some(bytes) => creation_security(&state.nodes[&parent].security, directory, bytes)?,
@@ -2074,7 +2121,7 @@ impl FileSystem for MemoryFs {
             (id, stream, CreateAction::CREATED.0)
         };
         if delete && id == 1 && stream == state.nodes[&id].default_stream {
-            return Err(Status::DIRECTORY_NOT_EMPTY);
+            return Err(Status::DIRECTORY_NOT_EMPTY.into());
         }
         let open = state.next_open;
         state.next_open = next_open;

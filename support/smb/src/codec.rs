@@ -3,7 +3,7 @@
 
 //! Checked packet access and serialization; wire declarations live in `spec`.
 
-use crate::provider::{ExtendedAttribute, validate_ea_name};
+use crate::provider::{ExtendedAttribute, SymbolicLink, validate_ea_name};
 use crate::spec::*;
 use zerocopy::little_endian::U16;
 use zerocopy::{FromBytes, IntoBytes};
@@ -119,6 +119,24 @@ pub(crate) fn decode_reparse_data(
         validate_reparse_data(header.tag.get(), guid, data)?;
     }
     Ok((header.tag.get(), guid, data))
+}
+
+pub(crate) fn symbolic_link(data: &[u8], unparsed_suffix: &str) -> Result<SymbolicLink, Status> {
+    validate_reparse_data(IO_REPARSE_TAG_SYMLINK, None, data)?;
+    let (info, path) = SymbolicLinkReparseData::read_from_prefix(data)
+        .map_err(|_| Status::IO_REPARSE_DATA_INVALID)?;
+    let name = |offset: u16, length: u16| {
+        decode_name(&path[usize::from(offset)..usize::from(offset) + usize::from(length)])
+    };
+    Ok(SymbolicLink {
+        substitute_name: name(
+            info.substitute_name_offset.get(),
+            info.substitute_name_length.get(),
+        )?,
+        print_name: name(info.print_name_offset.get(), info.print_name_length.get())?,
+        relative: info.flags.get() == 1,
+        unparsed_suffix: unparsed_suffix.to_owned(),
+    })
 }
 
 pub(crate) fn decode<T: SmbBody>(bytes: &[u8]) -> Result<T, Status> {

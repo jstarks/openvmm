@@ -7,6 +7,28 @@ use bitfield_struct::bitfield;
 use open_enum::open_enum;
 use zerocopy::little_endian::{U16, U32, U64};
 
+/// Symbolic-link error prefix: [MS-SMB2] §2.2.2.2.1.
+#[repr(C)]
+#[derive(
+    Debug, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
+)]
+#[expect(
+    missing_docs,
+    reason = "Field names follow the cited symbolic-link error table."
+)]
+pub struct SymbolicLinkErrorResponse {
+    pub symlink_length: U32,
+    pub symlink_error_tag: U32,
+    pub reparse_tag: U32,
+    pub reparse_data_length: U16,
+    pub unparsed_path_length: U16,
+    pub substitute_name_offset: U16,
+    pub substitute_name_length: U16,
+    pub print_name_offset: U16,
+    pub print_name_length: U16,
+    pub flags: U32,
+}
+
 /// Synchronous SMB2 header length: [MS-SMB2] §2.2.1.2.
 pub const HEADER_SIZE: usize = 64;
 /// ProtocolId: [MS-SMB2] §2.2.1.
@@ -70,6 +92,7 @@ open_enum! {
         INTERNAL_ERROR = 0xc00000e5,
         INVALID_INFO_CLASS = 0xc0000003,
         BUFFER_OVERFLOW = 0x80000005,
+        STOPPED_ON_SYMLINK = 0x8000002d,
         EA_LIST_INCONSISTENT = 0x80000014,
         NO_MORE_FILES = 0x80000006,
         INVALID_HANDLE = 0xc0000008,

@@ -11,7 +11,7 @@ pub mod contracts;
 
 use crate::provider::{
     BasicInformation, ByteRange, ExtendedAttribute, FileControl, FileControlResult, FileSystem,
-    FileSystemInformation, LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
+    FileSystemInformation, LockId, Metadata, NotifyResult, OpenError, OpenOptions, RequestContext,
     StreamInformation,
 };
 use crate::security::SecurityDescriptor;
@@ -541,13 +541,23 @@ impl Call {
     }
 
     async fn complete<T>(
-        mut self,
+        self,
         result: Result<T, Status>,
         transferred: Option<usize>,
     ) -> Result<T, Status> {
+        let status = result.as_ref().err().copied().unwrap_or(Status::SUCCESS);
+        self.complete_with_status(result, status, transferred).await
+    }
+
+    async fn complete_with_status<T, E: From<Status>>(
+        mut self,
+        result: Result<T, E>,
+        status: Status,
+        transferred: Option<usize>,
+    ) -> Result<T, E> {
         self.update(|info| {
             info.phase = Phase::After;
-            info.status = Some(result.as_ref().err().copied().unwrap_or(Status::SUCCESS));
+            info.status = Some(status);
             info.transferred = transferred;
         });
         self.gate(Gate::After).await?;
@@ -788,6 +798,17 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         options: OpenOptions<'_>,
         r: &RequestContext,
     ) -> Result<(Self::File, u32), Status> {
+        self.open_with_reparse(name, options, r)
+            .await
+            .map_err(|error| error.status())
+    }
+
+    async fn open_with_reparse(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        r: &RequestContext,
+    ) -> Result<(Self::File, u32), OpenError> {
         let mut call = self.controller.begin(
             if options.security.is_some() {
                 Operation::OpenSecurity
@@ -807,13 +828,17 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         let context = call.prepare().await?;
         let result = self
             .backend
-            .open(name, options, &context)
+            .open_with_reparse(name, options, &context)
             .await
             .map(|(inner, action)| (ControlledFile { inner, id: call.id }, action));
         if result.is_ok() {
             call.update(|info| info.handle = Some(call.id));
         }
-        call.complete(result, None).await
+        let status = result
+            .as_ref()
+            .err()
+            .map_or(Status::SUCCESS, OpenError::status);
+        call.complete_with_status(result, status, None).await
     }
 
     async fn close(&self, file: &Self::File, r: &RequestContext) -> Result<(), Status> {

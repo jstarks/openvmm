@@ -972,6 +972,64 @@ fn selected_write_completion_order_and_late_close_cancellation_preserve_committe
 }
 
 #[test]
+fn controlled_symbolic_link_errors_retain_payload_after_late_cancellation() {
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let setup = RequestContext::new(1);
+        let options = OpenOptions {
+            access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+            share_access: 7,
+            disposition: 3,
+            options: 0,
+            attributes: 0,
+            allocation_size: 0,
+            security: None,
+            extended_attributes: None,
+        };
+        let (file, _) = fs.open("link", options, &setup).await.unwrap();
+        fs.file_control(
+            &file,
+            FileControl::SetReparsePoint {
+                tag: 0xa000000c,
+                guid: None,
+                data: &[0, 0, 2, 0, 2, 0, 0, 0, 1, 0, 0, 0, b't', 0],
+            },
+            &setup,
+        )
+        .await
+        .unwrap();
+        control
+            .set_plan(
+                Operation::Open,
+                Plan {
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let context = RequestContext::new(2);
+        let mut open = std::pin::pin!(fs.open_with_reparse("link\\child", options, &context));
+        assert!(futures::poll!(&mut open).is_pending());
+        let call = control.next_call().await;
+        assert_eq!(
+            control.snapshot(call.id).unwrap().status,
+            Some(Status::STOPPED_ON_SYMLINK)
+        );
+        context.cancel();
+        control.release(call.id, Gate::After).unwrap();
+        match open.await {
+            Err(OpenError::SymbolicLink(link)) => {
+                assert_eq!(link.substitute_name, "t");
+                assert_eq!(link.unparsed_suffix, "\\child");
+                assert!(link.relative);
+            }
+            _ => panic!("controlled open lost symbolic-link data"),
+        }
+        fs.close(&file, &setup).await.unwrap();
+    });
+}
+
+#[test]
 fn controlled_call_errors_and_abandonment_do_not_claim_completion() {
     block_on(async {
         use crate::test_support::ControlError;

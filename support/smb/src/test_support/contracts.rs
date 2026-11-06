@@ -16,7 +16,7 @@
 use super::Operation;
 use crate::provider::{
     BasicInformation, ByteRange, Change, ExtendedAttribute, FileControl, FileControlResult,
-    FileSystem, NotifyResult, OpenOptions, RequestContext, StreamInformation,
+    FileSystem, NotifyResult, OpenError, OpenOptions, RequestContext, StreamInformation,
 };
 use crate::spec::{
     AccessMask, CreateAction, CreateDisposition, CreateOptions, FileAttributes, NotifyAction,
@@ -75,7 +75,7 @@ pub struct Expectations {
     pub object_id_controls: Feature,
     /// Shared-file hard links with link-scoped metadata and deletion.
     pub hard_links: Feature,
-    /// Retained reparse query/set/delete controls.
+    /// Retained reparse controls and symbolic-link open errors.
     pub reparse_controls: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
@@ -737,6 +737,43 @@ pub async fn reparse_controls<F: Fixture>(fixture: &F) {
             Status::NOT_A_REPARSE_POINT,
         );
         assert_eq!(fs.metadata(&file, &request).await.unwrap().reparse_tag, 0);
+        fs.file_control(
+            &file,
+            FileControl::SetReparsePoint {
+                tag: 0xa000000c,
+                guid: None,
+                data: &[0, 0, 2, 0, 2, 0, 0, 0, 1, 0, 0, 0, b't', 0],
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+        match fs
+            .open_with_reparse("reparse", options(CreateDisposition::OPEN, false), &request)
+            .await
+        {
+            Err(OpenError::SymbolicLink(link)) => {
+                assert_eq!(link.substitute_name, "t");
+                assert_eq!(link.print_name, "");
+                assert!(link.relative);
+                assert_eq!(link.unparsed_suffix, "");
+            }
+            _ => panic!("missing semantic symbolic-link error"),
+        }
+        let mut reparse_options = options(CreateDisposition::OPEN, false);
+        reparse_options.options = reparse_options
+            .options()
+            .with_open_reparse_point(true)
+            .into_bits();
+        let (opened, _) = fs
+            .open_with_reparse("reparse", reparse_options, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.metadata(&opened, &request).await.unwrap().id,
+            fs.metadata(&file, &request).await.unwrap().id
+        );
+        fs.close(&opened, &request).await.unwrap();
     }
     fs.close(&file, &request).await.unwrap();
 }

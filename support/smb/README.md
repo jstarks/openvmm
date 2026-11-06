@@ -120,9 +120,13 @@ write rights and atomic shared-quota accounting, updates actual attributes/tags,
 and releases stored bytes on deletion. Its synthetic system identity has
 symbolic-link creation access. Partial GET replies preserve the full data length
 and return BUFFER_OVERFLOW as specified by MS-FSCC 2.3.28. Reparse capability is
-advertised for these controls; name-surrogate traversal is not yet implemented
-and fails explicitly rather than opening the underlying file. Final-component
-FILE_OPEN_REPARSE_POINT opens retain access to the reparse object itself.
+advertised for these controls. Symbolic-link CREATE failures return semantic
+provider target/print names, flags and the original unparsed suffix as an SMB2
+STOPPED_ON_SYMLINK error. Clients evaluate targets and retry; the server does
+not access host paths or silently open underlying data. Final-component
+FILE_OPEN_REPARSE_POINT opens access the reparse object itself, but do not
+bypass intermediate links. Other name-surrogate tags, including mount points,
+remain explicit IO_REPARSE_TAG_NOT_HANDLED failures.
 
 Hard-link SET_INFO requests use typed FileLinkInformation and provider-owned
 destination validation. MemoryFs stores namespace links separately from shared

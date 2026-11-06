@@ -29,7 +29,8 @@ use inspect::Inspect;
 use parking_lot::Mutex;
 use provider::{
     BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
-    Metadata, NotifyResult, OpenOptions, RequestContext, StreamInformation, map_access,
+    Metadata, NotifyResult, OpenError, OpenOptions, RequestContext, StreamInformation,
+    SymbolicLink, map_access,
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -234,6 +235,50 @@ fn error_body() -> Vec<u8> {
     .to_vec();
     body.push(0);
     body
+}
+
+fn symbolic_link_error(name: &str, link: SymbolicLink) -> Result<Vec<u8>, Status> {
+    let substitute = encode_name(&link.substitute_name);
+    let print = encode_name(&link.print_name);
+    let suffix = link.unparsed_suffix.encode_utf16().count() * 2;
+    if substitute.is_empty()
+        || link.substitute_name.contains('\0')
+        || link.print_name.contains('\0')
+        || (link.relative && link.substitute_name.starts_with('\\'))
+        || !name.ends_with(&link.unparsed_suffix)
+        || (!link.unparsed_suffix.is_empty() && !link.unparsed_suffix.starts_with(['\\', ':']))
+        || 20 + substitute.len() + print.len() > MAX_REPARSE_DATA_SIZE
+        || suffix > u16::MAX as usize
+    {
+        return Err(Status::INTERNAL_ERROR);
+    }
+    let length = size_of::<SymbolicLinkErrorResponse>() + substitute.len() + print.len();
+    let mut out = ErrorResponse {
+        structure_size: ErrorResponse::STRUCTURE_SIZE.into(),
+        context_count: 0,
+        reserved: 0,
+        byte_count: (length as u32).into(),
+    }
+    .as_bytes()
+    .to_vec();
+    out.extend_from_slice(
+        SymbolicLinkErrorResponse {
+            symlink_length: ((length - 4) as u32).into(),
+            symlink_error_tag: 0x4c4d5953.into(),
+            reparse_tag: IO_REPARSE_TAG_SYMLINK.into(),
+            reparse_data_length: ((12 + substitute.len() + print.len()) as u16).into(),
+            unparsed_path_length: (suffix as u16).into(),
+            substitute_name_offset: 0.into(),
+            substitute_name_length: (substitute.len() as u16).into(),
+            print_name_offset: (substitute.len() as u16).into(),
+            print_name_length: (print.len() as u16).into(),
+            flags: u32::from(link.relative).into(),
+        }
+        .as_bytes(),
+    );
+    out.extend_from_slice(&substitute);
+    out.extend_from_slice(&print);
+    Ok(out)
 }
 
 fn notify_body(bytes: &[u8]) -> Vec<u8> {
@@ -1557,6 +1602,16 @@ impl<B: FileSystem> CommandRequest<B> {
                         .ioctl(packet, header.tree_id.get(), &self.context)
                         .await
                 }
+                Ok(()) if command == Command::CREATE => {
+                    connection
+                        .create(
+                            packet,
+                            header.tree_id.get(),
+                            header.session_id.get(),
+                            &self.context,
+                        )
+                        .await
+                }
                 Ok(()) => connection
                     .dispatch(header, command, packet, &self.context, &self.retired)
                     .await
@@ -1866,10 +1921,6 @@ impl<B: FileSystem> Connection<B> {
                 }
                 .as_bytes()
                 .to_vec())
-            }
-            Command::CREATE => {
-                self.create(packet, tree, header.session_id.get(), context)
-                    .await
             }
             Command::CLOSE => {
                 let request: CloseRequest = read_body(packet)?;
@@ -2260,7 +2311,7 @@ impl<B: FileSystem> Connection<B> {
         tree: u32,
         session: u64,
         context: &RequestContext,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<(Status, Vec<u8>), Status> {
         let request: CreateRequest = read_body(packet)?;
         let name = decode_name(variable::<CreateRequest>(
             packet,
@@ -2392,10 +2443,10 @@ impl<B: FileSystem> Connection<B> {
             }
             id
         };
-        let (file, action) = self
+        let opened = self
             .server
             .backend
-            .open(
+            .open_with_reparse(
                 &name,
                 OpenOptions {
                     access: access.into_bits(),
@@ -2409,7 +2460,18 @@ impl<B: FileSystem> Connection<B> {
                 },
                 context,
             )
-            .await?;
+            .await;
+        let (file, action) = match opened {
+            Ok(opened) => opened,
+            Err(OpenError::SymbolicLink(link)) => {
+                return symbolic_link_error(&name, link)
+                    .map(|body| (Status::STOPPED_ON_SYMLINK, body));
+            }
+            Err(OpenError::Status(Status::STOPPED_ON_SYMLINK)) => {
+                return Err(Status::INTERNAL_ERROR);
+            }
+            Err(OpenError::Status(status)) => return Err(status),
+        };
         let info = match self.server.backend.metadata(&file, context).await {
             Ok(info) => info,
             Err(error) => {
@@ -2529,7 +2591,7 @@ impl<B: FileSystem> Connection<B> {
         .as_bytes()
         .to_vec();
         response.extend_from_slice(&response_contexts);
-        Ok(response)
+        Ok((Status::SUCCESS, response))
     }
 
     async fn read(

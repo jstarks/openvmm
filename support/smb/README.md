@@ -546,9 +546,13 @@ controls, including zero/no-change and -1/-2 automatic-update suppression/reset.
 Alternate-name queries use optional provider short names; the memory provider
 does not generate 8.3 aliases.
 
-Non-default streams, Unicode
-case-folding, rename, ACL updates, leases, and IOCTLs
-remain future work. Unsupported requests receive explicit status errors.
+FileAttributeTagInformation reports provider attributes and reparse tags with
+READ_ATTRIBUTES and fixed-buffer checks. MemoryFs has no reparse objects and
+ignores CREATE's non-settable REPARSE_POINT attribute.
+
+Non-default streams, EAs, full Unicode case-folding, advanced/reinherited ACLs,
+leases and IOCTLs remain future work. Basic rename/move and ACL updates are
+implemented. Unsupported requests receive explicit status errors.
 Memory is allocated for file holes; this is not a sparse-filesystem model.
 
 Full filesystem- and dialect-specific torture suites are not expected to

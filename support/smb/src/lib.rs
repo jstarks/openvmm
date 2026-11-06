@@ -2143,6 +2143,7 @@ impl<B: FileSystem> Connection<B> {
             FileInformationClass::ALL => FILE_ALL_INFORMATION_MIN_BUFFER_SIZE,
             FileInformationClass::ALTERNATE_NAME => FILE_NAME_INFORMATION_MIN_BUFFER_SIZE,
             FileInformationClass::NETWORK_OPEN => size_of::<FileNetworkOpenInformation>(),
+            FileInformationClass::ATTRIBUTE_TAG => size_of::<FileAttributeTagInformation>(),
             FileInformationClass::DIRECTORY
             | FileInformationClass::FULL_DIRECTORY
             | FileInformationClass::BOTH_DIRECTORY
@@ -2183,6 +2184,7 @@ impl<B: FileSystem> Connection<B> {
                 FileInformationClass::BASIC
                     | FileInformationClass::ALL
                     | FileInformationClass::NETWORK_OPEN
+                    | FileInformationClass::ATTRIBUTE_TAG
             )
             && !file.access.read_attributes()
         {
@@ -2199,6 +2201,13 @@ impl<B: FileSystem> Connection<B> {
                 FileInformationClass::INTERNAL => out.extend_from_slice(
                     FileInternalInformation {
                         index_number: info.id.into(),
+                    }
+                    .as_bytes(),
+                ),
+                FileInformationClass::ATTRIBUTE_TAG => out.extend_from_slice(
+                    FileAttributeTagInformation {
+                        file_attributes: info.attributes(),
+                        reparse_tag: info.reparse_tag.into(),
                     }
                     .as_bytes(),
                 ),

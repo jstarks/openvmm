@@ -75,6 +75,8 @@ pub struct Metadata {
     pub short_name: Option<String>,
     /// Windows file attribute bits.
     pub attributes: u32,
+    /// Provider-owned reparse tag; zero when REPARSE_POINT is clear.
+    pub reparse_tag: u32,
     /// Creation time.
     pub created: u64,
     /// Last data access time.

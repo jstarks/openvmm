@@ -57,6 +57,7 @@ open_enum! {
         END_OF_FILE = 20,
         ALTERNATE_NAME = 21,
         NETWORK_OPEN = 34,
+        ATTRIBUTE_TAG = 35,
         ID_BOTH_DIRECTORY = 37,
         ID_FULL_DIRECTORY = 38,
     }
@@ -169,6 +170,13 @@ pub const NT_TICKS_PER_SECOND: u64 = 10_000_000;
 /// Difference between the NT and Unix epochs, in NT ticks: [MS-DTYP] §2.3.3.
 pub const UNIX_EPOCH_NT_TIME: u64 = 116_444_736_000_000_000;
 
+wire!(
+    /// FileAttributeTagInformation: [MS-FSCC] §2.4.6.
+    FileAttributeTagInformation, 8 {
+        file_attributes: FileAttributes,
+        reparse_tag: U32,
+    }
+);
 wire!(
     /// FileBasicInformation: [MS-FSCC] §2.4.7. Signed times also encode update controls.
     FileBasicInformation, 40 {

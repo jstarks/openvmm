@@ -5,6 +5,40 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn attribute_tag_queries_report_real_metadata_and_require_read_attributes() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let mut body = create_body("tag", AccessMask::FILE_ALL_ACCESS.into_bits(), 7, 2, 0, &[]);
+        let create =
+            CreateRequest::mut_from_bytes(&mut body[..size_of::<CreateRequest>()]).unwrap();
+        create.file_attributes.set_reparse_point(true);
+        let response = client.ok(Command::CREATE, &body).await;
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let response = client.query(file, 35).await;
+        assert_eq!(&response[72..], &[0x20, 0, 0, 0, 0, 0, 0, 0]);
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILE;
+        query.info_class = 35;
+        query.file_id = file;
+        query.output_buffer_length = 7.into();
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_INFO, query.as_bytes()).await),
+            Status::INFO_LENGTH_MISMATCH
+        );
+        let response = client.open_result("tag", 1, 7, 1, 0).await;
+        let limited = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(&client.query(limited, 35).await),
+            Status::ACCESS_DENIED
+        );
+        client.close(limited).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn embedded_bitfields_decode_unaligned_create_and_preserve_unknown_bits() {
     // Independent MS-SMB2 §2.2.13 fixture: access/attributes/options at 24/28/40.
     let mut bytes = [0; 1 + 56];
@@ -44,6 +78,7 @@ fn directory_formats_match_independent_byte_layouts() {
         path: "\\a\u{100}".into(),
         short_name: Some("S1".into()),
         attributes: FileAttributes::new().with_archive(true).into_bits(),
+        reparse_tag: 0,
         created: 1,
         accessed: 2,
         written: 3,

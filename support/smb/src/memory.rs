@@ -238,6 +238,7 @@ impl MemoryFs {
                 path: String::new(),
                 short_name: None,
                 attributes: FileAttributes::new().with_directory(true).into_bits(),
+                reparse_tag: 0,
                 created: now,
                 accessed: now,
                 written: now,
@@ -1016,8 +1017,10 @@ impl FileSystem for MemoryFs {
                                 .with_directory(false)
                                 .with_normal(false)
                                 .with_archive(true)
+                                .with_reparse_point(false)
                                 .into_bits()
                         },
+                        reparse_tag: 0,
                         created: now,
                         accessed: now,
                         written: now,

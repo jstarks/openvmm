@@ -31,7 +31,7 @@ will not need them.
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
 | Caching and IOCTLs | Uncached profile and selected provider-backed controls | Compression/zero/range and object-ID controls use actual provider state; unsupported controls remain errors; no oplock/lease grants |
-| Naming | Share-relative namespace and canonical paths | Dot components and explicit short aliases resolve within the virtual root; case folding is ASCII-only |
+| Naming | Share-relative namespace and canonical paths | Dot components/aliases resolve within the virtual root; Unicode BMP simple uppercase is shared by lookup, streams and wildcard matching |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
 Compatibility work proceeds by selecting applicable Samba cases, checking any
@@ -99,6 +99,13 @@ names receive deterministic unique ASCII `prefix~number` aliases with bounded
 extensions, checking both long names and aliases. The selected generation
 algorithm is implementation-specific, not an NTFS/OEM-codepage emulation.
 Only one link per file carries an alias. This is not a native privilege model.
+
+The synthetic namespace uses ordinal UTF-16 simple uppercase for case-insensitive
+lookup, stream identity, alias collisions and directory expressions. It does not
+normalize Unicode or expand one character into several; supplementary UTF-16
+pairs retain their identity. The Unicode version follows Rust's
+`char::UNICODE_VERSION`, not a particular native filesystem's upcase table.
+ASCII-only protocol tokens and EA names retain their separate grammar.
 
 FileFsObjectIdInformation queries and sets use optional provider-owned volume
 identity and 48-byte extension metadata, separate from per-file object IDs.

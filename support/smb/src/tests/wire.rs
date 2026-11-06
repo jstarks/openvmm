@@ -2073,6 +2073,91 @@ fn stream_rename_validation_and_replacement_preserve_data_on_failure() {
 }
 
 #[test]
+fn unicode_namespace_matching_is_shared_by_paths_streams_links_and_aliases() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(2048, 24)).unwrap();
+        let mut client = Client::new(&server).await;
+        let folder = client.open("caf\u{e9}", 2, 1).await;
+        let file = client.open("caf\u{e9}\\\u{3c2}.txt", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"file"))
+            .await;
+        let alias = client.open("CAF\u{c9}\\\u{3a3}.TXT", 1, 0).await;
+        assert_eq!(alias.persistent, file.persistent);
+        assert_eq!(&client.read(alias, 0, 4).await[80..], b"file");
+        assert_eq!(
+            response_status(
+                &client
+                    .open_result("CAF\u{c9}\\\u{3c3}.TXT", 1, 7, 2, 0)
+                    .await
+            ),
+            Status::OBJECT_NAME_COLLISION
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .set(
+                        file,
+                        11,
+                        &namespace_information("CAF\u{c9}\\\u{3a3}.txt", false)
+                    )
+                    .await
+            ),
+            Status::OBJECT_NAME_COLLISION
+        );
+        let stream = client.open("CAF\u{c9}\\\u{3c3}.TXT:\u{430}", 3, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(stream, 0, b"stream"))
+            .await;
+        let stream_alias = client.open("caf\u{e9}\\\u{3c2}.txt:\u{410}", 1, 0).await;
+        assert_eq!(&client.read(stream_alias, 0, 6).await[80..], b"stream");
+        assert_eq!(
+            response_status(
+                &client
+                    .set(stream, 10, &namespace_information(":\u{410}2", false))
+                    .await
+            ),
+            Status::SUCCESS
+        );
+        let renamed = client.open("caf\u{e9}\\\u{3c2}.txt:\u{430}2", 1, 0).await;
+        assert_eq!(&client.read(renamed, 0, 6).await[80..], b"stream");
+        for file in [renamed, stream_alias, stream, alias, file, folder] {
+            client.close(file).await;
+        }
+        let composed = client.open("\u{e9}", 2, 0).await;
+        let decomposed = client.open("e\u{301}", 2, 0).await;
+        let sharp = client.open("\u{df}", 2, 0).await;
+        let expanded = client.open("SS", 2, 0).await;
+        assert_ne!(composed.persistent, decomposed.persistent);
+        assert_ne!(sharp.persistent, expanded.persistent);
+        for file in [composed, decomposed, sharp, expanded] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn generated_short_aliases_check_unicode_long_name_collisions() {
+    block_on(async {
+        let server = Server::new(
+            "memory",
+            MemoryFs::new(1024, 16).with_short_name_generation(),
+        )
+        .unwrap();
+        let mut client = Client::new(&server).await;
+        let occupied = client.open("\u{131}~1.txt", 2, 0).await;
+        let file = client.open("i        .txt", 2, 0).await;
+        assert_eq!(&client.query(file, 21).await[76..], encode_name("I~2.TXT"));
+        let alias = client.open("I~1.TXT", 1, 0).await;
+        assert_eq!(alias.persistent, occupied.persistent);
+        assert_ne!(alias.persistent, file.persistent);
+        for file in [alias, file, occupied] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
 fn configured_short_names_are_unique_real_aliases_for_files_and_directories() {
     block_on(async {
         let server = Server::new(

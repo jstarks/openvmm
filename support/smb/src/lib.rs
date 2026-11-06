@@ -14,6 +14,7 @@
 mod codec;
 mod compound;
 mod credits;
+mod namespace;
 pub use compound::Request;
 pub mod memory;
 pub mod provider;
@@ -579,7 +580,7 @@ fn name_matches(name: &str, pattern: &str) -> bool {
         return true;
     }
     if !pattern.contains(['*', '?', '<', '>', '"']) {
-        return name.eq_ignore_ascii_case(pattern);
+        return namespace::equal(name, pattern);
     }
     const STAR: u16 = b'*' as u16;
     const QUESTION: u16 = b'?' as u16;
@@ -587,13 +588,7 @@ fn name_matches(name: &str, pattern: &str) -> bool {
     const DOS_QUESTION: u16 = b'>' as u16;
     const DOS_DOT: u16 = b'"' as u16;
     const DOT: u16 = b'.' as u16;
-    let fold = |unit: u16| {
-        if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) {
-            unit - u16::from(b'a' - b'A')
-        } else {
-            unit
-        }
-    };
+    let fold = namespace::upcase;
     let name: Vec<_> = name.encode_utf16().map(fold).collect();
     let last_dot = name.iter().rposition(|&unit| unit == DOT);
     let mut previous = vec![false; name.len() + 1];

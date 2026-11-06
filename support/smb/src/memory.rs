@@ -7,6 +7,7 @@ use crate::codec::{
     align_up, decode_ea_list, encode_ea_list, symbolic_link, validate_reparse_data,
     validate_reparse_identity,
 };
+use crate::namespace;
 use crate::provider::{
     BasicInformation, ByteRange, Change, CompressionInformation, ExtendedAttribute, FileControl,
     FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
@@ -422,7 +423,7 @@ fn generated_short_name(
         .iter()
         .filter(|(id, link)| link.parent == parent && !exclude.contains(id))
         .flat_map(|(_, link)| std::iter::once(&link.name).chain(link.short_name.iter()))
-        .map(|name| name.to_ascii_uppercase())
+        .map(|name| namespace::key(name))
         .collect();
     let (base, extension) = name.rsplit_once('.').unwrap_or((name, ""));
     let clean = |name: &str| {
@@ -451,7 +452,7 @@ fn generated_short_name(
             candidate.push('.');
             candidate.push_str(extension);
         }
-        if !used.contains(&candidate) {
+        if !used.contains(&namespace::key(&candidate)) {
             return Ok(Some(candidate));
         }
     }
@@ -535,11 +536,11 @@ fn child(state: &State, parent: u64, name: &str) -> Option<u64> {
     state.links.iter().find_map(|(&id, link)| {
         (id != 1
             && link.parent == parent
-            && (link.name.eq_ignore_ascii_case(name)
+            && (namespace::equal(&link.name, name)
                 || link
                     .short_name
                     .as_ref()
-                    .is_some_and(|short| short.eq_ignore_ascii_case(name))))
+                    .is_some_and(|short| namespace::equal(short, name))))
         .then_some(id)
     })
 }
@@ -1068,7 +1069,7 @@ fn open_named_stream(
     let existing = node
         .streams
         .iter()
-        .find(|(_, stream)| stream.name.eq_ignore_ascii_case(name))
+        .find(|(_, stream)| namespace::equal(&stream.name, name))
         .map(|(id, stream)| (*id, stream));
     if existing.is_some_and(|(_, stream)| stream.is_deleted()) {
         return Err(Status::DELETE_PENDING);
@@ -1255,7 +1256,7 @@ fn rename_stream(
             .name
             .clone()
     };
-    if old_name.eq_ignore_ascii_case(new_name) {
+    if namespace::equal(&old_name, new_name) {
         return Ok(());
     }
     let target = if new_name.is_empty() {
@@ -1263,7 +1264,7 @@ fn rename_stream(
     } else {
         node.streams
             .iter()
-            .find(|(_, stream)| stream.name.eq_ignore_ascii_case(new_name))
+            .find(|(_, stream)| namespace::equal(&stream.name, new_name))
             .map(|(id, _)| *id)
     };
     if let Some(target) = target {

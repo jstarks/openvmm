@@ -1203,6 +1203,18 @@ fn filename_wildcards_follow_dos_period_and_end_of_name_rules() {
         ("name..", "name\"", false),
         ("\u{1f600}", "?", false),
         ("\u{1f600}", "??", true),
+        ("caf\u{e9}.txt", "CAF\u{c9}.TXT", true),
+        ("caf\u{e9}.txt", "CAF\u{c9}.*", true),
+        ("\u{3c2}.txt", "\u{3a3}.*", true),
+        ("\u{1f80}.txt", "\u{1f88}.TXT", true),
+        ("\u{1fb3}.txt", "\u{1fbc}.*", true),
+        ("\u{131}.txt", "I.TXT", true),
+        ("\u{130}.txt", "i.txt", false),
+        ("\u{df}.txt", "SS.TXT", false),
+        ("\u{fb00}.txt", "FF.*", false),
+        ("\u{212a}.txt", "K.TXT", false),
+        ("\u{e9}.txt", "e\u{301}.txt", false),
+        ("\u{10428}.txt", "\u{10400}.txt", false),
     ] {
         assert_eq!(
             name_matches(name, pattern),
@@ -1284,6 +1296,8 @@ fn directory_search_accepts_standard_and_dos_wildcards() {
             let file = client.open(&format!("patterns\\{name}"), 2, 0).await;
             client.close(file).await;
         }
+        let unicode = client.open("patterns\\caf\u{e9}.uni", 2, 0).await;
+        client.close(unicode).await;
         for (pattern, expected) in [
             ("*.txt", Some("report.txt")),
             ("REPORT.?xt", Some("report.txt")),
@@ -1297,6 +1311,9 @@ fn directory_search_accepts_standard_and_dos_wildcards() {
             ("p????", Some("plain")),
             ("missing*", None),
             ("plain?", None),
+            ("CAF\u{c9}.UNI", Some("caf\u{e9}.uni")),
+            ("CAF\u{c9}.*", Some("caf\u{e9}.uni")),
+            ("caf?.uni", Some("caf\u{e9}.uni")),
         ] {
             let directory = client.open("patterns", 1, 1).await;
             let name = encode_name(pattern);

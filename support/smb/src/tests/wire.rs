@@ -609,6 +609,50 @@ fn data_stream_names_use_stream_rules_instead_of_filename_rules() {
 }
 
 #[test]
+fn supersede_of_a_new_named_stream_does_not_add_delete_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let write = AccessMask::new().with_write_data(true).into_bits();
+        let first = client
+            .open_result("stream-supersede:first", write, 0, 3, 0)
+            .await;
+        assert_eq!(response_status(&first), Status::SUCCESS);
+        let first = read_body::<CreateResponse>(&first).unwrap().file_id;
+        let second = client
+            .open_result("stream-supersede:second", write, 0, 0, 0)
+            .await;
+        assert_eq!(response_status(&second), Status::SUCCESS);
+        let second = read_body::<CreateResponse>(&second).unwrap().file_id;
+        assert_eq!(&client.query(second, 8).await[72..], &write.to_le_bytes());
+        assert_eq!(
+            response_status(
+                &client
+                    .open_result(
+                        "stream-supersede:third",
+                        write | AccessMask::new().with_delete(true).into_bits(),
+                        0,
+                        0,
+                        0
+                    )
+                    .await
+            ),
+            Status::SHARING_VIOLATION
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .open_result("stream-supersede:second", write, 0, 0, 0)
+                    .await
+            ),
+            Status::SHARING_VIOLATION
+        );
+        client.close(second).await;
+        client.close(first).await;
+    });
+}
+
+#[test]
 fn named_stream_creation_is_atomic_under_byte_and_object_limits() {
     block_on(async {
         for (bytes, objects) in [(32usize, 32usize), (1024, 2)] {

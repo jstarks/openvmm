@@ -29,7 +29,7 @@ will not need them.
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
-| EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; eleven selected naming/directory/I/O/sharing/deletion/rename/attribute/permission stream cases pass |
+| EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; twelve selected naming/directory/I/O/sharing/deletion/rename/attribute/permission stream cases pass |
 | Caching and IOCTLs | Uncached profile and selected provider-backed controls | GET_COMPRESSION reports real provider state; unsupported controls remain errors; no oplock/lease grants |
 | Naming | Share-relative namespace and canonical paths | Dot components and explicit short aliases resolve within the virtual root; case folding is ASCII-only |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |

@@ -885,7 +885,8 @@ fn open_named_stream(
                     || options.access().write_data(),
             )
             .with_delete(
-                options.disposition() == CreateDisposition::SUPERSEDE || options.access().delete(),
+                (replacement && options.disposition() == CreateDisposition::SUPERSEDE)
+                    || options.access().delete(),
             )
             .into_bits();
     }

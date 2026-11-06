@@ -17,6 +17,7 @@ mod credits;
 pub use compound::Request;
 pub mod memory;
 pub mod provider;
+pub mod security;
 pub mod spec;
 pub mod tcp;
 #[cfg(any(test, feature = "test-support"))]

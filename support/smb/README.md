@@ -108,7 +108,7 @@ stop, and wire/transport behavior remain engine/runtime tests.
 
 ## Protocol Representation
 
-`spec::{smb2, fscc, ntlm, tcp}` contains public-specification layouts and named
+`spec::{smb2, fscc, security, ntlm, tcp}` contains public-specification layouts and named
 values, with section references at their declarations. It contains no server
 policy or filesystem operations. Fixed layouts use zerocopy endian wrappers;
 embedded bitfield types derive zerocopy and use alignment-one little-endian
@@ -120,6 +120,13 @@ layout size, checked at compile time. The private `codec` module bounds-checks
 header-relative fields against those layouts and validates linked CREATE
 contexts. Handlers encode named response structures rather than individual
 byte offsets. Implementation limits live outside `spec`.
+
+The portable `security` module bounds-checks self-relative descriptor offsets,
+SID counts, ACL lengths and ACE extents without native handles. It distinguishes
+absent/null/empty ACLs and preserves opaque ACE bodies for native providers.
+Structural decoding is not an access check: interpreting or rejecting unsupported
+ACE kinds remains a provider obligation. These primitives alone do not enable
+security descriptor requests or advertise ACL support.
 
 Independent byte fixtures verify unaligned embedded bitfields, all six supported
 directory layouts (with and without short names), and actual CREATE context,

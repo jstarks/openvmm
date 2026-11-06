@@ -80,8 +80,10 @@ macro_rules! le_bitfield_conversions {
 
 pub mod fscc;
 pub mod ntlm;
+pub mod security;
 pub mod smb2;
 pub mod tcp;
 
 pub use fscc::*;
+pub use security::*;
 pub use smb2::*;

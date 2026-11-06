@@ -4,6 +4,62 @@
 use super::*;
 use test_with_tracing::test;
 
+#[test]
+fn execute_only_permits_reads_without_granting_directory_enumeration() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("execute", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"code"))
+            .await;
+        client.close(file).await;
+        let access = AccessMask::new()
+            .with_execute(true)
+            .with_read_attributes(true)
+            .into_bits();
+        let response = client.open_result("execute", access, 7, 1, 0).await;
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(&client.query(file, 8).await[72..], &access.to_le_bytes());
+        assert_eq!(&client.read(file, 0, 4).await[80..], b"code");
+        client.close(file).await;
+        let directory = client.open("directory", 2, 1).await;
+        client.close(directory).await;
+        let response = client.open_result("directory", access, 7, 1, 1).await;
+        let directory = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let mut query = QueryDirectoryRequest::new_zeroed();
+        query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+        query.info_class = FileInformationClass::NAMES.0;
+        query.file_id = directory;
+        query.output_buffer_length = 4096.into();
+        query.name_offset = (body_end::<QueryDirectoryRequest>() as u16).into();
+        query.name_length = 2.into();
+        let mut body = query.as_bytes().to_vec();
+        body.extend_from_slice(&encode_name("*"));
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_DIRECTORY, &body).await),
+            Status::ACCESS_DENIED
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::CHANGE_NOTIFY,
+                        &notify::body(
+                            directory,
+                            NotifyFilter::new().with_file_name(true),
+                            false,
+                            4096
+                        )
+                    )
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        client.close(directory).await;
+    });
+}
+
 fn contexts(values: &[(CreateContextName, &[u8])]) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut previous = None;

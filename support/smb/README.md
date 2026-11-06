@@ -350,6 +350,8 @@ separately from maximal access for the established identity. The engine does not
 expand that request to blanket FILE_ALL_ACCESS. Existing opens retain their grants
 when attributes or security change; new opens are checked against current state.
 MemoryFs maximum access on readonly objects excludes data write/append rights.
+FILE_EXECUTE authorizes SMB READ without adding FILE_READ_DATA to the reported
+grant. On directories it means traversal, not enumeration or change-notify access.
 
 Allocation updates (19) reserve space without extending EOF and can truncate
 data when reduced. MemoryFs charges reservations to its quota, hides bytes beyond

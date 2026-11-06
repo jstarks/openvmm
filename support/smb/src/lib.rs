@@ -1978,7 +1978,8 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::INVALID_PARAMETER);
         }
         let file = self.file(request.file_id, tree, context)?;
-        if !file.access.read_data() {
+        // MS-SMB2 §3.3.5.12 authorizes READ through EXECUTE without adding LIST_DIRECTORY.
+        if !file.access.read_data() && !file.access.execute() {
             return Err(Status::ACCESS_DENIED);
         }
         let bytes = if request.length.get() == 0 {

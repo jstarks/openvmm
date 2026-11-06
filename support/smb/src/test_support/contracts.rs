@@ -297,6 +297,31 @@ pub async fn maximum_allowed_access<F: Fixture>(fixture: &F) {
         original.granted_access,
         AccessMask::FILE_ALL_ACCESS.into_bits()
     );
+    write_all(fs, &file, 0, b"code", &request).await;
+    let execute = AccessMask::new()
+        .with_execute(true)
+        .with_read_attributes(true)
+        .into_bits();
+    let (executable, _) = fs
+        .open(
+            "grants",
+            OpenOptions {
+                access: execute,
+                ..options(CreateDisposition::OPEN, false)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.metadata(&executable, &request)
+            .await
+            .unwrap()
+            .granted_access,
+        execute
+    );
+    assert_eq!(read_bytes(fs, &executable, 0, 4, &request).await, b"code");
+    fs.close(&executable, &request).await.unwrap();
     let maximum = OpenOptions {
         access: AccessMask::new().with_maximum_allowed(true).into_bits(),
         ..options(CreateDisposition::OPEN, false)

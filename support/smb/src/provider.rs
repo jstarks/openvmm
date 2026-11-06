@@ -306,6 +306,7 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         Err(Status::INVALID_DEVICE_REQUEST)
     }
     /// Read at most `length` bytes from a default data stream.
+    /// SMB authorizes READ through either FILE_READ_DATA or FILE_EXECUTE.
     /// At EOF, an empty result or STATUS_END_OF_FILE is accepted by the engine.
     async fn read(
         &self,
@@ -474,10 +475,5 @@ pub fn map_access(mut access: u32) -> u32 {
             access = (access & !generic.into_bits()) | specific.into_bits();
         }
     }
-    let mut mask = AccessMask::from_bits(access);
-    if mask.execute() {
-        // MS-SMB2 §3.3.5.12 permits READ through FILE_EXECUTE as well as FILE_READ_DATA.
-        mask.set_read_data(true);
-    }
-    mask.into_bits()
+    access
 }

@@ -842,6 +842,7 @@ fn file_control_output(
             | FileControl::SetSparse { .. },
             FileControlResult::Done,
         ) => Vec::new(),
+        (FileControl::SetCompression { .. }, FileControlResult::Done) => Vec::new(),
         (
             FileControl::GetObjectId | FileControl::CreateOrGetObjectId,
             FileControlResult::ObjectId(info),
@@ -2072,6 +2073,16 @@ impl<B: FileSystem> Connection<B> {
                 }
                 FileControl::GetCompression
             }
+            FsctlCode::SET_COMPRESSION => {
+                let format = U16::read_from_prefix(input)
+                    .map_err(|_| Status::INVALID_PARAMETER)?
+                    .0
+                    .get();
+                if format > 2 {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                FileControl::SetCompression { format }
+            }
             FsctlCode::SET_ZERO_DATA => {
                 let info = FileZeroDataInformation::read_from_prefix(input)
                     .map_err(|_| Status::INVALID_PARAMETER)?
@@ -2112,6 +2123,9 @@ impl<B: FileSystem> Connection<B> {
             _ => return Err(Status::NOT_SUPPORTED),
         };
         let file = self.file(request.file_id, tree, context)?;
+        if matches!(control, FileControl::SetCompression { .. }) && !file.access.write_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
         if matches!(
             control,
             FileControl::SetReparsePoint { .. }
@@ -2410,6 +2424,9 @@ impl<B: FileSystem> Connection<B> {
             .with_complete_if_oplocked(false)
             .with_synchronous_io_alert(false)
             .with_synchronous_io_nonalert(false)
+            .with_no_compression(
+                request.create_options.no_compression() && !request.create_options.directory_file(),
+            )
             .with_open_for_free_space_query(false);
         if options.open_by_file_id() {
             return Err(Status::NOT_SUPPORTED);

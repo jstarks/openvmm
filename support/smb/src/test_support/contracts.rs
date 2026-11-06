@@ -79,6 +79,8 @@ pub struct Expectations {
     pub reparse_controls: Feature,
     /// Sparse storage, hole punching, range queries and dense conversion.
     pub sparse_files: Feature,
+    /// Real compression-state mutation and readable compressed backing.
+    pub compression: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -676,6 +678,47 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Compression changes real backing while preserving ordinary data access.
+pub async fn compression<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "compressed", CreateDisposition::CREATE, false, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().compression) {
+        rejected(
+            fs.file_control(&file, FileControl::SetCompression { format: 1 }, &request)
+                .await,
+            status,
+        );
+    } else {
+        fs.file_control(&file, FileControl::SetCompression { format: 1 }, &request)
+            .await
+            .unwrap();
+        write_all(fs, &file, 0, &[b'A'; 64], &request).await;
+        assert_eq!(read_bytes(fs, &file, 0, 64, &request).await, [b'A'; 64]);
+        let info = fs.metadata(&file, &request).await.unwrap();
+        assert!(info.attributes().compressed());
+        assert_eq!(info.compression.unwrap().format, 2);
+        assert!(matches!(
+            fs.file_control(&file, FileControl::GetCompression, &request)
+                .await
+                .unwrap(),
+            FileControlResult::Compression(2)
+        ));
+        fs.file_control(&file, FileControl::SetCompression { format: 0 }, &request)
+            .await
+            .unwrap();
+        assert!(
+            !fs.metadata(&file, &request)
+                .await
+                .unwrap()
+                .attributes()
+                .compressed()
+        );
+        assert_eq!(read_bytes(fs, &file, 0, 64, &request).await, [b'A'; 64]);
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// Sparse streams allocate written bytes, return zero holes and convert back to dense.

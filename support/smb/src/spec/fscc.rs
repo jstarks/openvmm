@@ -153,7 +153,8 @@ pub struct FileSystemAttributes {
     pub case_preserved_names: bool,
     pub unicode_on_disk: bool,
     pub persistent_acls: bool,
-    #[bits(2)]
+    pub file_compression: bool,
+    #[bits(1)]
     other0: u8,
     pub supports_sparse_files: bool,
     pub supports_reparse_points: bool,

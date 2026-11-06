@@ -3,13 +3,21 @@
 
 //! Byte-granular dense and sparse backing, independent of logical EOF.
 
-use crate::provider::ByteRange;
+use super::compression::Compressed;
+use crate::provider::{ByteRange, CompressionInformation};
 use crate::spec::Status;
 use std::collections::BTreeMap;
 
 pub(super) enum Data {
     Dense(Vec<u8>),
     Sparse(BTreeMap<usize, Vec<u8>>),
+    Compressed(Compressed),
+}
+
+enum Edit<'a> {
+    Preserve,
+    Write(usize, &'a [u8]),
+    Zero(usize, usize),
 }
 
 impl Default for Data {
@@ -32,6 +40,7 @@ impl Data {
         match self {
             Self::Dense(bytes) => bytes.len(),
             Self::Sparse(extents) => extents.values().map(Vec::len).sum(),
+            Self::Compressed(data) => data.allocation(),
         }
     }
 
@@ -43,10 +52,25 @@ impl Data {
         matches!(self, Self::Sparse(_))
     }
 
+    pub(super) fn is_compressed(&self) -> bool {
+        matches!(self, Self::Compressed(_))
+    }
+
+    pub(super) fn compression_information(&self) -> CompressionInformation {
+        CompressionInformation {
+            compressed_size: self.len() as u64,
+            format: if self.is_compressed() { 2 } else { 0 },
+            unit_shift: if self.is_compressed() { 12 } else { 0 },
+            chunk_shift: if self.is_compressed() { 12 } else { 0 },
+            cluster_shift: 0,
+        }
+    }
+
     pub(super) fn extent_count(&self) -> usize {
         match self {
             Self::Dense(_) => 0,
             Self::Sparse(extents) => extents.len(),
+            Self::Compressed(data) => data.count(),
         }
     }
 
@@ -56,10 +80,14 @@ impl Data {
             Self::Sparse(extents) => extents
                 .last_key_value()
                 .map_or(0, |(start, bytes)| start + bytes.len()),
+            Self::Compressed(data) => data.length(),
         }
     }
 
     pub(super) fn read(&self, start: usize, end: usize) -> Result<Vec<u8>, Status> {
+        if let Self::Compressed(data) = self {
+            return data.read(start, end);
+        }
         let mut out = zeros(end - start)?;
         match self {
             Self::Dense(bytes) => {
@@ -75,11 +103,17 @@ impl Data {
                     }
                 }
             }
+            Self::Compressed(_) => return Err(Status::INTERNAL_ERROR),
         }
         Ok(out)
     }
 
-    pub(super) fn allocate(&mut self, length: usize) -> Result<(), Status> {
+    pub(super) fn allocate(&mut self, length: usize, maximum_extents: usize) -> Result<(), Status> {
+        if self.is_compressed() {
+            *self =
+                self.rebuild_compressed(length, Edit::Preserve, length, length, maximum_extents)?;
+            return Ok(());
+        }
         match self {
             Self::Dense(bytes) => {
                 if length > bytes.len() {
@@ -100,6 +134,7 @@ impl Data {
                     BTreeMap::from([(0, bytes)])
                 });
             }
+            Self::Compressed(_) => return Err(Status::INTERNAL_ERROR),
         }
         Ok(())
     }
@@ -116,7 +151,7 @@ impl Data {
         }
         if sparse {
             let Self::Dense(bytes) = self else {
-                return Err(Status::INTERNAL_ERROR);
+                return Err(Status::NOT_SUPPORTED);
             };
             if !bytes.is_empty() && maximum_extents == 0 {
                 return Err(Status::INSUFFICIENT_RESOURCES);
@@ -140,6 +175,100 @@ impl Data {
         Ok(())
     }
 
+    pub(super) fn set_compression(
+        &mut self,
+        compressed: bool,
+        logical_size: usize,
+        limit: usize,
+        maximum_extents: usize,
+    ) -> Result<(), Status> {
+        if compressed == self.is_compressed() {
+            return Ok(());
+        }
+        if compressed {
+            if self.is_sparse() {
+                return Err(Status::NOT_SUPPORTED);
+            }
+            let reservation = if self.span() > logical_size {
+                self.span()
+            } else {
+                0
+            };
+            *self = self.rebuild_compressed(
+                self.span(),
+                Edit::Preserve,
+                reservation,
+                limit,
+                maximum_extents,
+            )?;
+        } else {
+            if logical_size > limit {
+                return Err(Status::DISK_FULL);
+            }
+            *self = Self::Dense(self.read(0, logical_size)?);
+        }
+        Ok(())
+    }
+
+    fn rebuild_compressed(
+        &self,
+        length: usize,
+        edit: Edit<'_>,
+        reservation: usize,
+        limit: usize,
+        maximum_extents: usize,
+    ) -> Result<Self, Status> {
+        if reservation > limit {
+            return Err(Status::DISK_FULL);
+        }
+        let mut data = Compressed::build(length, maximum_extents, |start, end| {
+            let mut bytes = zeros(end - start)?;
+            let copied_end = end.min(self.span());
+            if start < copied_end {
+                bytes[..copied_end - start].copy_from_slice(&self.read(start, copied_end)?);
+            }
+            match edit {
+                Edit::Preserve => {}
+                Edit::Write(offset, input) => {
+                    let from = start.max(offset);
+                    let to = end.min(offset + input.len());
+                    if from < to {
+                        bytes[from - start..to - start]
+                            .copy_from_slice(&input[from - offset..to - offset]);
+                    }
+                }
+                Edit::Zero(offset, beyond) => {
+                    let from = start.max(offset);
+                    let to = end.min(beyond);
+                    if from < to {
+                        bytes[from - start..to - start].fill(0);
+                    }
+                }
+            }
+            Ok(bytes)
+        })?;
+        if data.allocation() > limit {
+            return Err(Status::DISK_FULL);
+        }
+        data.reserve(reservation)?;
+        Ok(Self::Compressed(data))
+    }
+
+    pub(super) fn resize_compressed(
+        &mut self,
+        length: usize,
+        limit: usize,
+        maximum_extents: usize,
+    ) -> Result<(), Status> {
+        let Self::Compressed(data) = self else {
+            return Err(Status::INTERNAL_ERROR);
+        };
+        let reservation = data.reservation().min(length);
+        *self =
+            self.rebuild_compressed(length, Edit::Preserve, reservation, limit, maximum_extents)?;
+        Ok(())
+    }
+
     pub(super) fn truncate_sparse(&mut self, length: usize) {
         if let Self::Sparse(extents) = self {
             extents.retain(|&start, bytes| {
@@ -153,10 +282,11 @@ impl Data {
         }
     }
 
-    pub(super) fn fill(&mut self, value: u8) {
+    pub(super) fn fill_zero(&mut self) {
         match self {
-            Self::Dense(bytes) => bytes.fill(value),
-            Self::Sparse(extents) => extents.values_mut().for_each(|bytes| bytes.fill(value)),
+            Self::Dense(bytes) => bytes.fill(0),
+            Self::Sparse(extents) => extents.values_mut().for_each(|bytes| bytes.fill(0)),
+            Self::Compressed(data) => data.fill_zero(),
         }
     }
 
@@ -174,7 +304,7 @@ impl Data {
                     return Err(Status::DISK_FULL);
                 }
                 if end > bytes.len() {
-                    self.allocate(end)?;
+                    self.allocate(end, maximum_extents)?;
                 }
                 let Self::Dense(bytes) = self else {
                     return Err(Status::INTERNAL_ERROR);
@@ -216,6 +346,17 @@ impl Data {
                 }
                 extents.insert(from, bytes);
             }
+            Self::Compressed(data) => {
+                let length = data.length().max(end);
+                let reservation = data.reservation();
+                *self = self.rebuild_compressed(
+                    length,
+                    Edit::Write(start, input),
+                    reservation,
+                    limit,
+                    maximum_extents,
+                )?;
+            }
         }
         Ok(())
     }
@@ -224,6 +365,7 @@ impl Data {
         &mut self,
         start: usize,
         end: usize,
+        limit: usize,
         maximum_extents: usize,
     ) -> Result<(), Status> {
         match self {
@@ -259,6 +401,17 @@ impl Data {
                 }
                 extents.extend(fragments);
             }
+            Self::Compressed(data) => {
+                let length = data.length();
+                let reservation = data.reservation();
+                *self = self.rebuild_compressed(
+                    length,
+                    Edit::Zero(start, end),
+                    reservation,
+                    limit,
+                    maximum_extents,
+                )?;
+            }
         }
 
         Ok(())
@@ -269,7 +422,7 @@ impl Data {
             return (Vec::new(), false);
         }
         match self {
-            Self::Dense(_) => (vec![range], false),
+            Self::Dense(_) | Self::Compressed(_) => (vec![range], false),
             Self::Sparse(extents) => {
                 let end = range.offset + range.length;
                 let mut ranges = Vec::new();
@@ -304,7 +457,7 @@ mod tests {
         data.write(0, b"AAAA", 32, 2).unwrap();
         data.write(8, b"BBBB", 32, 2).unwrap();
         let original = data.read(0, 12).unwrap();
-        assert_eq!(data.zero(1, 2, 2), Err(Status::INSUFFICIENT_RESOURCES));
+        assert_eq!(data.zero(1, 2, 32, 2), Err(Status::INSUFFICIENT_RESOURCES));
         assert_eq!(
             data.write(6, b"x", 32, 2),
             Err(Status::INSUFFICIENT_RESOURCES)
@@ -313,7 +466,7 @@ mod tests {
         assert_eq!(data.len(), 8);
         data.write(4, b"CCCC", 32, 2).unwrap();
         assert_eq!(data.read(0, 12).unwrap(), b"AAAACCCCBBBB");
-        data.zero(1, 11, 2).unwrap();
+        data.zero(1, 11, 32, 2).unwrap();
         assert_eq!(data.len(), 2);
         assert_eq!(data.read(0, 12).unwrap(), b"A\0\0\0\0\0\0\0\0\0\0B");
     }

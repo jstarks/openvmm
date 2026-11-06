@@ -76,6 +76,25 @@ fn samba_create_and_sharing() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_compression() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.ioctl.compress_file_flag",
+            "smb2.ioctl.compress_dir_inherit",
+            "smb2.ioctl.compress_invalid_format",
+            "smb2.ioctl.compress_invalid_buf",
+            "smb2.ioctl.compress_query_file_attr",
+            "smb2.ioctl.compress_create_with_attr",
+            "smb2.ioctl.compress_set_file_attr",
+            "smb2.ioctl.compress_perms",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_sparse() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

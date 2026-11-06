@@ -632,6 +632,304 @@ fn object_id_controls_create_real_shared_file_identity_with_boundaries() {
 }
 
 #[test]
+fn compression_controls_store_readable_lznt1_data_and_report_actual_allocation() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(32768, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("compressed", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, &[b'A'; 4096]))
+            .await;
+        for invalid in [&[][..], &[0][..], &[3, 0][..]] {
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(
+                            Command::IOCTL,
+                            &object_id_ioctl_input(file, 0x9c040, invalid)
+                        )
+                        .await
+                ),
+                Status::INVALID_PARAMETER
+            );
+        }
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x9c040, &[1, 0]),
+            )
+            .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl(file, 0x900c4, 0))
+                    .await
+            ),
+            Status::NOT_SUPPORTED
+        );
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(file, 0x9003c, 2))
+                .await[112..],
+            &[2, 0]
+        );
+        let info = client.query(file, 28).await;
+        assert_eq!(
+            &info[72..88],
+            &[4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 12, 12, 0, 0, 0, 0]
+        );
+        assert_eq!(&client.read(file, 0, 4096).await[80..], &[b'A'; 4096]);
+        let raw: Vec<_> = (0..4096).map(|i| (i % 251) as u8).collect();
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 4096, &raw))
+            .await;
+        assert_eq!(&client.read(file, 4096, 4096).await[80..], raw);
+        assert_eq!(
+            &client.query(file, 5).await[72..88],
+            &[4100u64.to_le_bytes(), 8192u64.to_le_bytes()].concat()
+        );
+        let zero = [1i64.to_le_bytes(), 3i64.to_le_bytes()].concat();
+        client
+            .ok(Command::IOCTL, &object_id_ioctl_input(file, 0x980c8, &zero))
+            .await;
+        assert_eq!(&client.read(file, 0, 4).await[80..], b"A\0\0A");
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x9c040, &[0, 0]),
+            )
+            .await;
+        assert_eq!(
+            &client.query(file, 5).await[72..88],
+            &[8192u64.to_le_bytes(), 8192u64.to_le_bytes()].concat()
+        );
+        assert_eq!(&client.read(file, 4096, 4096).await[80..], raw);
+        for (access, expected) in [(1, Status::ACCESS_DENIED), (2, Status::SUCCESS)] {
+            let opened = client.open_result("compressed", access, 7, 1, 0).await;
+            let opened = read_body::<CreateResponse>(&opened).unwrap().file_id;
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(
+                            Command::IOCTL,
+                            &object_id_ioctl_input(opened, 0x9c040, &[0, 0])
+                        )
+                        .await
+                ),
+                expected
+            );
+            client.close(opened).await;
+        }
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn compressed_creation_reservations_and_replacement_keep_allocation_atomic() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(8192, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let directory = client.open("compressed-parent", 2, 1).await;
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(directory, 0x9c040, &[1, 0]),
+            )
+            .await;
+        let context = |allocation: u64| {
+            let mut contexts = Vec::new();
+            append_create_context(
+                &mut contexts,
+                &mut None,
+                CreateContextName::ALLOCATION_SIZE,
+                &allocation.to_le_bytes(),
+            );
+            contexts
+        };
+        let opened = client
+            .ok(
+                Command::CREATE,
+                &create_body(
+                    "compressed-parent\\reserved",
+                    0x1f01ff,
+                    7,
+                    2,
+                    0,
+                    &context(512),
+                ),
+            )
+            .await;
+        let file = read_body::<CreateResponse>(&opened).unwrap().file_id;
+        assert_eq!(
+            &client.query(file, 5).await[72..88],
+            &[512u64.to_le_bytes(), 0u64.to_le_bytes()].concat()
+        );
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"abc"))
+            .await;
+        assert_eq!(&client.query(file, 5).await[72..80], &512u64.to_le_bytes());
+        let failed = client
+            .send(
+                Command::CREATE,
+                &create_body(
+                    "compressed-parent\\reserved",
+                    0x1f01ff,
+                    7,
+                    4,
+                    0,
+                    &context(16384),
+                ),
+            )
+            .await;
+        assert_eq!(response_status(&failed), Status::DISK_FULL);
+        assert_eq!(&client.read(file, 0, 3).await[80..], b"abc");
+        let replaced = client
+            .ok(
+                Command::CREATE,
+                &create_body(
+                    "compressed-parent\\reserved",
+                    0x1f01ff,
+                    7,
+                    4,
+                    0,
+                    &context(32),
+                ),
+            )
+            .await;
+        let replaced = read_body::<CreateResponse>(&replaced).unwrap().file_id;
+        assert_eq!(
+            &client.query(file, 5).await[72..88],
+            &[32u64.to_le_bytes(), 0u64.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(file, 0x9003c, 2))
+                .await[112..],
+            &[2, 0]
+        );
+        assert_eq!(
+            response_status(&client.set(file, 20, &64i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(&client.read(file, 0, 64).await[80..], &[0; 64]);
+        for file in [replaced, file, directory] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
+fn compression_inheritance_stream_policy_and_failed_decompression_preserve_state() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(8192, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let folder = client.open("policy", 2, 1).await;
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(folder, 0x9c040, &[2, 0]),
+            )
+            .await;
+        for (name, options, expected) in [
+            ("policy\\uncompressed", 0x8000, 0),
+            ("policy\\subdirectory", 0x8001, 2),
+        ] {
+            let opened = client.open_result(name, 0x1f01ff, 7, 2, options).await;
+            assert_eq!(response_status(&opened), Status::SUCCESS);
+            let opened = read_body::<CreateResponse>(&opened).unwrap().file_id;
+            let state = client
+                .ok(Command::IOCTL, &object_id_ioctl(opened, 0x9003c, 2))
+                .await;
+            assert_eq!(&state[112..], &[expected, 0]);
+            client.close(opened).await;
+        }
+        let child = client.open("policy\\child", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(child, 0, &[b'B'; 4096]))
+            .await;
+        assert_eq!(&client.query(child, 5).await[72..80], &4u64.to_le_bytes());
+        let side = client.open("policy\\child:side", 3, 0).await;
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(side, 0x9003c, 2))
+                .await[112..],
+            &[2, 0]
+        );
+        let raw: Vec<_> = (0..4096).map(|i| (i % 251) as u8).collect();
+        client
+            .ok(Command::WRITE, &Client::write_body(side, 0, &raw))
+            .await;
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(folder, 0x9c040, &[0, 0]),
+            )
+            .await;
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(child, 0x9003c, 2))
+                .await[112..],
+            &[2, 0]
+        );
+        let plain = client.open("policy\\plain", 2, 0).await;
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(plain, 0x9003c, 2))
+                .await[112..],
+            &[0, 0]
+        );
+        assert_eq!(
+            response_status(&client.set(plain, 20, &4092i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::IOCTL,
+                        &object_id_ioctl_input(child, 0x9c040, &[0, 0])
+                    )
+                    .await
+            ),
+            Status::DISK_FULL
+        );
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(child, 0x9003c, 2))
+                .await[112..],
+            &[2, 0]
+        );
+        assert_eq!(&client.read(child, 0, 4096).await[80..], &[b'B'; 4096]);
+        assert_eq!(
+            response_status(&client.set(plain, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        client.close(plain).await;
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(child, 0x9c040, &[0, 0]),
+            )
+            .await;
+        let info = client.query(child, 4).await;
+        assert_eq!(
+            u32::from_le_bytes(info[104..108].try_into().unwrap()) & 0x800,
+            0
+        );
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(side, 0x9003c, 2))
+                .await[112..],
+            &[2, 0]
+        );
+        assert_eq!(&client.read(side, 0, 4096).await[80..], raw);
+        for file in [side, child, folder] {
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
 fn sparse_controls_retain_real_holes_and_bound_allocation_instead_of_logical_size() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(16, 16)).unwrap();
@@ -652,6 +950,17 @@ fn sparse_controls_retain_real_holes_and_bound_allocation_instead_of_logical_siz
         client
             .ok(Command::IOCTL, &object_id_ioctl(file, 0x900c4, 0))
             .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::IOCTL,
+                        &object_id_ioctl_input(file, 0x9c040, &[2, 0])
+                    )
+                    .await
+            ),
+            Status::NOT_SUPPORTED
+        );
         assert_eq!(&client.query(file, 5).await[72..80], &8u64.to_le_bytes());
         let zero = |start: i64, end: i64| [start.to_le_bytes(), end.to_le_bytes()].concat();
         client
@@ -3386,7 +3695,7 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
             (
                 FileSystemInformationClass::ATTRIBUTE,
                 vec![
-                    198, 0, 197, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
+                    214, 0, 197, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
                     b'R', 0, b'Y', 0,
                 ],
             ),

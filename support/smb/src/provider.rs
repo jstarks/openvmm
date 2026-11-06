@@ -256,6 +256,11 @@ pub enum FileControl<'a> {
     },
     /// Query the stream or directory's COMPRESSION_FORMAT_* state.
     GetCompression,
+    /// Set COMPRESSION_FORMAT_NONE, DEFAULT, or LZNT1 on a stream/directory.
+    SetCompression {
+        /// Validated COMPRESSION_FORMAT_* identifier.
+        format: u16,
+    },
     /// Zero [offset, end) without extending EOF or moving the open's position.
     SetZeroData {
         /// First byte to zero.

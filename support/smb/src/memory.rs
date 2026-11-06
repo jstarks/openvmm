@@ -3,6 +3,7 @@
 
 //! A bounded writable in-memory filesystem for synthetic shares.
 
+mod compression;
 mod storage;
 use crate::codec::{
     align_up, decode_ea_list, encode_ea_list, symbolic_link, validate_reparse_data,
@@ -25,6 +26,7 @@ use crate::spec::{
     TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
+use compression::CHUNK_SIZE;
 use event_listener::Event;
 use futures::FutureExt;
 use parking_lot::{Mutex, MutexGuard};
@@ -39,7 +41,7 @@ const NOTIFY_WAITER_LIMIT: usize = 32;
 const NOTIFY_WATCH_LIMIT: usize = 1024;
 const LOCK_LIMIT: usize = 4096;
 const LOCK_WAITER_LIMIT: usize = 1024;
-const SPARSE_EXTENT_LIMIT: usize = 4096;
+const BACKING_EXTENT_LIMIT: usize = 4096;
 
 /// A writable filesystem with a shared byte quota and object limit.
 #[derive(Clone)]
@@ -580,9 +582,7 @@ fn link_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     let mut id128 = [0; 16];
     id128[..8].copy_from_slice(&metadata.id.to_le_bytes());
     metadata.id128 = Some(id128);
-    if let Some(compression) = &mut metadata.compression {
-        compression.compressed_size = metadata.allocation_size;
-    }
+    metadata.compression = Some(state.nodes[&node_id].data.compression_information());
     metadata.maximal_access = acl_access(&state.nodes[&node_id].security);
     Ok(metadata)
 }
@@ -605,9 +605,7 @@ fn file_metadata(state: &State, file: &MemoryFile) -> Result<Metadata, Status> {
         info.size = stream.size;
         info.allocation_size = stream.data.len() as u64;
         info.delete_pending = stream.is_deleted() || info.number_of_links == 0;
-        if let Some(compression) = &mut info.compression {
-            compression.compressed_size = info.allocation_size;
-        }
+        info.compression = Some(stream.data.compression_information());
     }
     Ok(info)
 }
@@ -1136,7 +1134,7 @@ fn open_named_stream(
         let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
         let data = node.streams.get_mut(&stream).ok_or(Status::FILE_CLOSED)?;
         let name = data.name.clone();
-        data.data.fill(0);
+        data.data.fill_zero();
         data.size = 0;
         node.metadata.written = nt_time();
         node.metadata.changed = node.metadata.written;
@@ -1170,13 +1168,14 @@ fn open_named_stream(
         data.try_reserve_exact(allocation)
             .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
         data.resize(allocation, 0);
+        let data = created_data(state, data, state.nodes[&id].data.is_compressed())?;
         let node = state.nodes.get_mut(&id).ok_or(Status::FILE_CLOSED)?;
         node.streams.insert(
             stream,
             NamedStream {
                 name: name.to_owned(),
                 size: 0,
-                data: Data::Dense(data),
+                data,
                 delete_pending: false,
                 replacement_deleted: false,
             },
@@ -1345,7 +1344,7 @@ fn rename_stream(
             .name = new_name.to_owned();
     }
     node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
-    refresh_sparse_attribute(node);
+    refresh_storage_attributes(node);
     let default_size_changed = old_default_size != node.metadata.size;
     state.bytes -= released;
     modified(state, file)?;
@@ -1454,13 +1453,14 @@ fn stream_data_mut(node: &mut Node, stream: u64) -> Result<(&mut Data, &mut u64)
     }
 }
 
-fn refresh_sparse_attribute(node: &mut Node) {
+fn refresh_storage_attributes(node: &mut Node) {
     let sparse =
         node.data.is_sparse() || node.streams.values().any(|stream| stream.data.is_sparse());
     node.metadata.attributes = node
         .metadata
         .attributes()
         .with_sparse_file(sparse)
+        .with_compressed(node.data.is_compressed())
         .into_bits();
 }
 
@@ -1496,7 +1496,7 @@ fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usi
     Ok(new_bytes)
 }
 
-fn sparse_extent_count(state: &State) -> usize {
+fn backing_extent_count(state: &State) -> usize {
     state
         .nodes
         .values()
@@ -1511,13 +1511,22 @@ fn sparse_extent_count(state: &State) -> usize {
         .sum()
 }
 
-fn sparse_extent_room(state: &State, existing: usize) -> Result<usize, Status> {
-    let others = sparse_extent_count(state)
+fn backing_extent_room(state: &State, existing: usize) -> Result<usize, Status> {
+    let others = backing_extent_count(state)
         .checked_sub(existing)
         .ok_or(Status::INTERNAL_ERROR)?;
-    SPARSE_EXTENT_LIMIT
+    BACKING_EXTENT_LIMIT
         .checked_sub(others)
         .ok_or(Status::INSUFFICIENT_RESOURCES)
+}
+
+fn created_data(state: &State, bytes: Vec<u8>, compressed: bool) -> Result<Data, Status> {
+    let mut data = Data::Dense(bytes);
+    if compressed {
+        let allocation = data.len();
+        data.set_compression(true, 0, allocation, backing_extent_room(state, 0)?)?;
+    }
+    Ok(data)
 }
 
 fn allocate(state: &mut State, node_id: u64, length: usize, released: usize) -> Result<(), Status> {
@@ -1561,12 +1570,17 @@ fn allocate_stream_with_release(
         stream,
     )?
     .0;
-    if data.is_sparse() && length != 0 && sparse_extent_room(state, data.extent_count())? == 0 {
+    let maximum_extents = if data.is_sparse() || data.is_compressed() {
+        backing_extent_room(state, data.extent_count())?
+    } else {
+        0
+    };
+    if data.is_sparse() && length != 0 && maximum_extents == 0 {
         return Err(Status::INSUFFICIENT_RESOURCES);
     }
     let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
     let (data, size) = stream_data_mut(node, stream)?;
-    data.allocate(length)?;
+    data.allocate(length, maximum_extents)?;
     *size = (*size).min(length as u64);
     if stream == node.default_stream {
         node.metadata.allocation_size = length as u64;
@@ -1583,6 +1597,28 @@ fn resize_stream(
 ) -> Result<(), Status> {
     let node = state.nodes.get(&node_id).ok_or(Status::FILE_CLOSED)?;
     let (data, size) = stream_data(node, stream)?;
+    if data.is_compressed() {
+        let old_len = data.len();
+        let maximum_extents = backing_extent_room(state, data.extent_count())?;
+        let base = state
+            .bytes
+            .checked_sub(old_len)
+            .ok_or(Status::INTERNAL_ERROR)?;
+        let limit = state
+            .byte_limit
+            .checked_sub(base)
+            .ok_or(Status::INTERNAL_ERROR)?;
+        let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
+        let (data, size) = stream_data_mut(node, stream)?;
+        data.resize_compressed(length, limit, maximum_extents)?;
+        let allocation = data.len();
+        *size = length as u64;
+        if stream == node.default_stream {
+            node.metadata.allocation_size = allocation as u64;
+        }
+        state.bytes = base + allocation;
+        return Ok(());
+    }
     if data.is_sparse() {
         let old_len = data.len();
         let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
@@ -1702,7 +1738,7 @@ impl MemoryFile {
                     state.bytes -= stream.data.len();
                     if let Some(node) = state.nodes.get_mut(&self.node) {
                         let attributes = node.metadata.attributes;
-                        refresh_sparse_attribute(node);
+                        refresh_storage_attributes(node);
                         if attributes != node.metadata.attributes {
                             emit(
                                 &mut state,
@@ -1761,7 +1797,7 @@ impl inspect::Inspect for MemoryFs {
             .field("byte_limit", state.byte_limit)
             .field("object_limit", state.object_limit)
             .field("generate_short_names", state.generate_short_names)
-            .field("sparse_extents", sparse_extent_count(&state))
+            .field("backing_extents", backing_extent_count(&state))
             .field(
                 "volume_object_id",
                 format!("{:02x?}", state.object_information.object_id),
@@ -1846,6 +1882,7 @@ impl inspect::Inspect for MemoryFs {
                             .field("size", node.metadata.size)
                             .field("allocation_size", node.metadata.allocation_size)
                             .field("sparse", node.data.is_sparse())
+                            .field("compressed", node.data.is_compressed())
                             .hex("attributes", node.metadata.attributes)
                             .hex("reparse_tag", node.metadata.reparse_tag)
                             .field(
@@ -1863,6 +1900,7 @@ impl inspect::Inspect for MemoryFs {
                                             .field("size", stream.size)
                                             .field("allocation_size", stream.data.len())
                                             .field("sparse", stream.data.is_sparse())
+                                            .field("compressed", stream.data.is_compressed())
                                             .field("delete_pending", stream.delete_pending)
                                             .field(
                                                 "replacement_deleted",
@@ -2052,10 +2090,10 @@ impl FileSystem for MemoryFs {
                     for (stream, _, _) in &removed {
                         node.streams.remove(stream);
                     }
-                    node.data.fill(0);
+                    node.data.fill_zero();
                     node.metadata.size = 0;
                     node.metadata.attributes = attributes;
-                    refresh_sparse_attribute(node);
+                    refresh_storage_attributes(node);
                     let attributes_changed = node.metadata.attributes != previous_attributes;
                     node.metadata.written = nt_time();
                     node.metadata.changed = node.metadata.written;
@@ -2168,13 +2206,15 @@ impl FileSystem for MemoryFs {
             } else {
                 state.next_stream
             };
+            let compressed = state.nodes[&parent].data.is_compressed()
+                && (directory || !options.options().no_compression());
             let streams = if let Some(name) = named {
                 BTreeMap::from([(
                     stream,
                     NamedStream {
                         name: name.to_owned(),
                         size: 0,
-                        data: Data::Dense(std::mem::take(&mut data)),
+                        data: created_data(&state, std::mem::take(&mut data), compressed)?,
                         delete_pending: false,
                         replacement_deleted: false,
                     },
@@ -2183,6 +2223,7 @@ impl FileSystem for MemoryFs {
                 BTreeMap::new()
             };
             let now = nt_time();
+            let data = created_data(&state, data, compressed)?;
             let short_name = generated_short_name(
                 &state,
                 parent,
@@ -2193,6 +2234,7 @@ impl FileSystem for MemoryFs {
                 FileAttributes::from_bits(options.attributes & settable_attributes().into_bits())
                     .with_readonly(!directory && options.attributes().readonly())
                     .with_directory(directory)
+                    .with_compressed(compressed)
                     .with_archive(!directory || options.attributes().archive())
                     .with_not_content_indexed(
                         state.nodes[&parent]
@@ -2236,7 +2278,7 @@ impl FileSystem for MemoryFs {
                         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
                         granted_access: 0,
                     },
-                    data: Data::Dense(data),
+                    data,
                     eas,
                     streams,
                 },
@@ -2825,6 +2867,7 @@ impl FileSystem for MemoryFs {
             attributes: FileSystemAttributes::new()
                 .with_supports_reparse_points(true)
                 .with_supports_sparse_files(true)
+                .with_file_compression(true)
                 .with_supports_object_ids(true)
                 .with_supports_hard_links(true)
                 .with_case_preserved_names(true)
@@ -2868,6 +2911,61 @@ impl FileSystem for MemoryFs {
         let access = AccessMask::from_bits(open.access);
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         match control {
+            FileControl::SetCompression { format } => {
+                if format > 2 {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                if !access.write_data() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                if node.metadata.attributes().encrypted() {
+                    return Err(Status::INVALID_DEVICE_REQUEST);
+                }
+                let (data, size) = stream_data(node, file.stream)?;
+                let enabled = format != 0;
+                if enabled == data.is_compressed() {
+                    return Ok(FileControlResult::Done);
+                }
+                if enabled && data.is_sparse() {
+                    return Err(Status::NOT_SUPPORTED);
+                }
+                let old_len = data.len();
+                let maximum_extents = backing_extent_room(&state, data.extent_count())?;
+                let base = state
+                    .bytes
+                    .checked_sub(old_len)
+                    .ok_or(Status::INTERNAL_ERROR)?;
+                let limit = state
+                    .byte_limit
+                    .checked_sub(base)
+                    .ok_or(Status::INTERNAL_ERROR)?;
+                if enabled {
+                    let rounded = align_up(old_len, CHUNK_SIZE).map_err(|_| Status::DISK_FULL)?;
+                    allocation_charge(&state, old_len, rounded)?;
+                }
+                let size = usize::try_from(size).map_err(|_| Status::DISK_FULL)?;
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                let data = stream_data_mut(node, file.stream)?.0;
+                data.set_compression(enabled, size, limit, maximum_extents)?;
+                let allocation = data.len();
+                let default = file.stream == node.default_stream;
+                if default {
+                    node.metadata.allocation_size = allocation as u64;
+                }
+                refresh_storage_attributes(node);
+                node.metadata.changed = nt_time();
+                state.bytes = base + allocation;
+                emit(
+                    &mut state,
+                    file.link,
+                    NotifyAction::MODIFIED,
+                    NotifyFilter::new()
+                        .with_attributes(true)
+                        .with_size(default && old_len != allocation),
+                );
+                wake(state);
+                Ok(FileControlResult::Done)
+            }
             FileControl::SetSparse { sparse } => {
                 if is_default_stream(&state, file) && node.metadata.is_directory() {
                     return Err(Status::INVALID_PARAMETER);
@@ -2877,7 +2975,7 @@ impl FileSystem for MemoryFs {
                 }
                 let old_len = stream_data(node, file.stream)?.0.len();
                 let maximum_extents =
-                    sparse_extent_room(&state, stream_data(node, file.stream)?.0.extent_count())?;
+                    backing_extent_room(&state, stream_data(node, file.stream)?.0.extent_count())?;
                 let base = state
                     .bytes
                     .checked_sub(old_len)
@@ -2898,7 +2996,7 @@ impl FileSystem for MemoryFs {
                 if file.stream == node.default_stream {
                     node.metadata.allocation_size = allocation as u64;
                 }
-                refresh_sparse_attribute(node);
+                refresh_storage_attributes(node);
                 state.bytes = base + allocation;
                 emit(
                     &mut state,
@@ -3096,9 +3194,9 @@ impl FileSystem for MemoryFs {
                 Ok(FileControlResult::Done)
             }
             FileControl::GetCompression => Ok(FileControlResult::Compression(
-                node.metadata
-                    .compression
-                    .ok_or(Status::INVALID_DEVICE_REQUEST)?
+                stream_data(node, file.stream)?
+                    .0
+                    .compression_information()
                     .format,
             )),
             FileControl::SetZeroData { offset, end } => {
@@ -3131,10 +3229,18 @@ impl FileSystem for MemoryFs {
                 let end = usize::try_from(end).map_err(|_| Status::INTERNAL_ERROR)?;
                 let old_len = stream_data(node, file.stream)?.0.len();
                 let maximum_extents =
-                    sparse_extent_room(&state, stream_data(node, file.stream)?.0.extent_count())?;
+                    backing_extent_room(&state, stream_data(node, file.stream)?.0.extent_count())?;
+                let base = state
+                    .bytes
+                    .checked_sub(old_len)
+                    .ok_or(Status::INTERNAL_ERROR)?;
+                let limit = state
+                    .byte_limit
+                    .checked_sub(base)
+                    .ok_or(Status::INTERNAL_ERROR)?;
                 let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
                 let data = stream_data_mut(node, file.stream)?.0;
-                data.zero(start, end, maximum_extents)?;
+                data.zero(start, end, limit, maximum_extents)?;
                 let allocation = data.len();
                 if file.stream == node.default_stream {
                     node.metadata.allocation_size = allocation as u64;
@@ -3451,8 +3557,8 @@ impl FileSystem for MemoryFs {
         let (stored, size) = stream_data(node, file.stream)?;
         let size_changed = end as u64 > size;
         let old_len = stored.len();
-        let maximum_extents = if stored.is_sparse() {
-            sparse_extent_room(&state, stored.extent_count())?
+        let maximum_extents = if stored.is_sparse() || stored.is_compressed() {
+            backing_extent_room(&state, stored.extent_count())?
         } else {
             0
         };
@@ -4150,6 +4256,7 @@ mod tests {
                 hard_links: Feature::Supported,
                 reparse_controls: Feature::Supported,
                 sparse_files: Feature::Supported,
+                compression: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -4267,6 +4374,10 @@ mod tests {
     #[test]
     fn contract_sparse_files() {
         run_contract(contracts::sparse_files);
+    }
+    #[test]
+    fn contract_compression() {
+        run_contract(contracts::compression);
     }
 
     #[test]
@@ -4622,6 +4733,7 @@ mod tests {
                     .map(|n| match &n.data {
                         Data::Dense(bytes) => bytes.capacity(),
                         Data::Sparse(extents) => extents.values().map(Vec::capacity).sum(),
+                        Data::Compressed(data) => data.capacity(),
                     })
                     .sum::<usize>()
                     <= 64

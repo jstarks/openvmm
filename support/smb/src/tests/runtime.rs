@@ -411,12 +411,16 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
             (FsctlCode::SET_REPARSE_POINT, true),
             (FsctlCode::SET_SPARSE, false),
             (FsctlCode::SET_SPARSE, true),
+            (FsctlCode::SET_COMPRESSION, false),
+            (FsctlCode::SET_COMPRESSION, true),
         ] {
             let zero = code == FsctlCode::SET_ZERO_DATA;
             let object = code == FsctlCode::CREATE_OR_GET_OBJECT_ID;
             let reparse = code == FsctlCode::SET_REPARSE_POINT;
             let sparse = code == FsctlCode::SET_SPARSE;
-            let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+            let compression = code == FsctlCode::SET_COMPRESSION;
+            let (fs, control) =
+                ControlledFs::new(MemoryFs::new(if compression { 8192 } else { 1024 }, 16));
             control
                 .set_plan(
                     Operation::FileControl,
@@ -454,6 +458,11 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 bytes.extend_from_slice(&[0x37, 0, 0, 0, 4, 0, 0, 0]);
                 bytes.extend_from_slice(&[1; 16]);
                 bytes.extend_from_slice(b"data");
+            } else if compression {
+                body.input_offset = 120.into();
+                body.input_count = 2.into();
+                bytes = body.as_bytes().to_vec();
+                bytes.extend_from_slice(&[1, 0]);
             } else {
                 bytes = body.as_bytes().to_vec();
             }
@@ -502,7 +511,7 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 } else {
                     assert_eq!(
                         &response[112..],
-                        if zero || reparse || sparse {
+                        if zero || reparse || sparse || compression {
                             &[][..]
                         } else {
                             &[0, 0][..]
@@ -550,6 +559,19 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 let info = client.query(observer, 4).await;
                 let attributes = u32::from_le_bytes(info[104..108].try_into().unwrap());
                 assert_eq!(attributes & 0x200 != 0, after);
+            }
+            if compression {
+                control
+                    .set_plan(Operation::FileControl, Plan::default())
+                    .unwrap();
+                let mut query = IoctlRequest::new_zeroed();
+                query.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+                query.file_id = observer;
+                query.control_code = FsctlCode::GET_COMPRESSION.0.into();
+                query.flags = IoctlFlags::new().with_fsctl(true);
+                query.max_output_response = 2.into();
+                let response = client.ok(Command::IOCTL, query.as_bytes()).await;
+                assert_eq!(&response[112..], &[if after { 2 } else { 0 }, 0]);
             }
             client.close(observer).await;
         }

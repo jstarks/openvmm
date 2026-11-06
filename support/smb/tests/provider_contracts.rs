@@ -45,6 +45,7 @@ impl Fixture for MemoryFixture {
             hard_links: Feature::Supported,
             reparse_controls: Feature::Supported,
             sparse_files: Feature::Supported,
+            compression: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -122,6 +123,7 @@ impl ControlledFixture {
                 hard_links: Feature::Unsupported(Status::NOT_SUPPORTED),
                 reparse_controls: Feature::Unsupported(Status::NOT_SUPPORTED),
                 sparse_files: Feature::Unsupported(Status::NOT_SUPPORTED),
+                compression: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -332,6 +334,15 @@ fn exported_sparse_contract_checks_storage_and_declines() {
     fixture.assert_rejected(&[Operation::FileControl]);
 }
 #[test]
+fn exported_compression_contract_checks_backing_and_declines() {
+    block_on(contracts::compression(&MemoryFixture(MemoryFs::new(
+        1024, 32,
+    ))));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::compression(&fixture));
+    fixture.assert_rejected(&[Operation::FileControl]);
+}
+#[test]
 fn exported_reparse_contract_checks_retained_data_and_declines() {
     block_on(contracts::reparse_controls(&MemoryFixture(MemoryFs::new(
         1024, 32,
@@ -424,6 +435,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             hard_links: Feature::Supported,
             reparse_controls: Feature::Supported,
             sparse_files: Feature::Supported,
+            compression: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

@@ -51,7 +51,14 @@ stable volume-scoped 128-bit identity by extending its own node identity.
 
 Selected FSCTLs use a semantic async provider operation, not arbitrary native
 passthrough. GET_COMPRESSION returns the provider's format for files and
-directories; MemoryFs reports NONE and does not advertise compressed storage.
+directories. SET_COMPRESSION validates NONE/DEFAULT/LZNT1 and requires
+write-data access. MemoryFs stores real LZNT1 chunk bodies, using
+distance-one run matches and literal fallback rather than claiming an optimal
+encoder. Zero units have no payload. Queries report actual stored allocation
+and compression geometry. Directory compression is inherited by future
+children, and named streams retain independent state. Decompression and
+rewrites fail atomically when quota is insufficient. Sparse/compressed
+combinations currently return NOT_SUPPORTED without changing either state.
 Controlled providers can gate, cancel or reject these calls, and CLOSE drains
 their actual results before releasing the open.
 SET_ZERO_DATA requires WRITE_DATA and zeroes only the requested bytes below EOF,
@@ -67,7 +74,8 @@ allocated ranges. Disabling sparse storage allocates holes before changing the
 flag, with atomic quota failure. Sparse storage is advertised and shared file
 attributes reflect all surviving streams. Backing storage, not logical EOF,
 consumes the shared byte quota; the volume also bounds allocated sparse extents
-to 4096. This is synthetic byte geometry, not native cluster emulation.
+to 4096 shared sparse extents/compression chunks. This is synthetic byte
+geometry, not native cluster emulation.
 
 MemoryFs retains case-insensitive ASCII EAs with required-knowledge flags.
 Creation applies them atomically; existing opens ignore CREATE EA input.
@@ -180,6 +188,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lock)
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_rename)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_directory)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_sparse)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_compression)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
@@ -218,6 +227,11 @@ The broader permission fixture expects append-only SET_SPARSE to succeed,
 unlike the write-data/write-attributes requirement in MS-FSA 2.1.5.10.38.
 Those two fixtures are not counted as passing; direct tests retain the public
 rules instead of weakening validation or access grants.
+The compression harness covers eight cases for state, inheritance, malformed
+inputs, attributes and write-data access. The broader inherit-disable fixture
+expects FILE_NO_COMPRESSION to disable directory inheritance; MS-SMB2 2.2.13
+requires that bit to be ignored when FILE_DIRECTORY_FILE is set. It is not
+counted as passing; direct tests preserve the public directory rule.
 The rename harness covers eleven cases: simple, modification-time preservation,
 missing DELETE access, source sharing, destination-directory sharing, and
 rejecting directory renames with open descendants, plus metadata-only parent
@@ -252,6 +266,13 @@ Unexpected unsupported errors fail; an unsupported profile exercises rejection
 rather than silently skipping a test. These are test expectations, not runtime
 SMB capability advertisement. Read-only providers will need separate scenarios
 that do not assume successful creation or mutation.
+
+MemoryFs coverage is not a minimum feature requirement for other providers.
+For example, a provider without compression leaves `file_compression` clear,
+can decline optional compression metadata, and rejects compression controls.
+The default `FileSystem::file_control` already returns INVALID_DEVICE_REQUEST;
+providers implementing other controls can retain that fallback for compression.
+Contract expectations mark the feature unsupported and verify the rejection.
 
 The fixture's `wait_until_pending` hook must observe an actual registered watch
 or contended lock wait. A first pending poll or worker-queue submission is not

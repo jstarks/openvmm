@@ -420,7 +420,10 @@ pub struct CreateOptions {
     other1: u8,
     pub delete_on_close: bool,
     pub open_by_file_id: bool,
-    #[bits(7)]
+    #[bits(1)]
+    other_backup: u8,
+    pub no_compression: bool,
+    #[bits(5)]
     other2: u32,
     pub open_reparse_point: bool,
     #[bits(1)]
@@ -835,6 +838,7 @@ open_enum! {
         DFS_GET_REFERRALS_EX = 0x000601b0,
         PIPE_WAIT = 0x00110018,
         GET_COMPRESSION = 0x0009003c,
+        SET_COMPRESSION = 0x0009c040,
         SET_OBJECT_ID = 0x00090098,
         GET_OBJECT_ID = 0x0009009c,
         DELETE_OBJECT_ID = 0x000900a0,

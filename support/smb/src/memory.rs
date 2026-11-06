@@ -7,7 +7,7 @@ use crate::codec::{align_up, decode_ea_list, encode_ea_list};
 use crate::provider::{
     BasicInformation, ByteRange, Change, CompressionInformation, ExtendedAttribute, FileControl,
     FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
-    OpenOptions, RequestContext, SectorSizeInformation, StreamInformation,
+    OpenOptions, RequestContext, SectorSizeInformation, StreamInformation, VolumeObjectInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
@@ -79,6 +79,7 @@ struct Watch {
 
 struct State {
     created: u64,
+    object_information: VolumeObjectInformation,
     nodes: BTreeMap<u64, Node>,
     opens: BTreeMap<u64, Open>,
     next_id: u64,
@@ -304,6 +305,15 @@ impl MemoryFs {
         };
         Self(Arc::new(Mutex::new(State {
             created: now,
+            object_information: {
+                let mut object_id = [0; 16];
+                object_id[..8].copy_from_slice(&now.to_le_bytes());
+                object_id[8..].copy_from_slice(b"MemoryFS");
+                VolumeObjectInformation {
+                    object_id,
+                    extended_info: [0; 48],
+                }
+            },
             nodes: BTreeMap::from([(1, root)]),
             opens: BTreeMap::new(),
             next_id: 2,
@@ -1456,6 +1466,10 @@ impl inspect::Inspect for MemoryFs {
             .field("bytes", state.bytes)
             .field("byte_limit", state.byte_limit)
             .field("object_limit", state.object_limit)
+            .field(
+                "volume_object_id",
+                format!("{:02x?}", state.object_information.object_id),
+            )
             .field("watch_count", state.watches)
             .field("watch_limit", NOTIFY_WATCH_LIMIT)
             .field(
@@ -1994,6 +2008,21 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
+    async fn set_volume_object_id(
+        &self,
+        file: &MemoryFile,
+        information: VolumeObjectInformation,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        if !AccessMask::from_bits(open.access).write_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
+        state.object_information = information;
+        Ok(())
+    }
+
     async fn rename(
         &self,
         file: &MemoryFile,
@@ -2227,6 +2256,7 @@ impl FileSystem for MemoryFs {
                 sector_alignment: 0,
                 partition_alignment: 0,
             }),
+            object_information: Some(state.object_information),
         })
     }
 
@@ -3268,6 +3298,7 @@ mod tests {
                 named_streams: Feature::Supported,
                 stream_rename: Feature::Supported,
                 short_names: Feature::Supported,
+                volume_object_ids: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -3365,6 +3396,10 @@ mod tests {
     #[test]
     fn contract_short_names() {
         run_contract(contracts::short_names);
+    }
+    #[test]
+    fn contract_volume_object_ids() {
+        run_contract(contracts::volume_object_ids);
     }
 
     #[test]

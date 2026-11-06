@@ -661,8 +661,17 @@ fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
             sector_alignment: u32::MAX,
             partition_alignment: 512,
         }),
+        object_information: Some(provider::VolumeObjectInformation {
+            object_id: [7; 16],
+            extended_info: [9; 48],
+        }),
     };
     for (class, maximum, expected) in [
+        (FileSystemInformationClass::OBJECT_ID, 64, {
+            let mut out = vec![7; 16];
+            out.extend_from_slice(&[9; 48]);
+            out
+        }),
         (
             FileSystemInformationClass::SECTOR_SIZE,
             28,
@@ -722,6 +731,11 @@ fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
         );
     }
     info.sector_size = None;
+    info.object_information = None;
+    assert_eq!(
+        filesystem_response(&info, FileSystemInformationClass::OBJECT_ID, 64).err(),
+        Some(Status::INVALID_PARAMETER)
+    );
     assert_eq!(
         filesystem_response(&info, FileSystemInformationClass::SECTOR_SIZE, 28).err(),
         Some(Status::NOT_SUPPORTED)

@@ -367,6 +367,13 @@ wire!(
     }
 );
 wire!(
+    /// FileFsObjectIdInformation: [MS-FSCC] §2.5.6.
+    FileFsObjectIdInformation, 64 {
+        object_id: [u8; 16],
+        extended_info: [u8; 48],
+    }
+);
+wire!(
     /// FileFsSectorSizeInformation: [MS-FSCC] §2.5.7.
     FileFsSectorSizeInformation, 28 {
         logical_bytes_per_sector: U32,

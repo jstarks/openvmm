@@ -85,6 +85,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::SetDeleteOnClose,
             Operation::SetBasic,
             Operation::SetShortName,
+            Operation::SetVolumeObjectId,
             Operation::Rename,
             Operation::Lock,
             Operation::Unlock,
@@ -230,6 +231,19 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             fs.filesystem_information(&file, &context),
             &control,
             Operation::FileSystemInformation,
+        )
+        .await;
+        through_gates(
+            fs.set_volume_object_id(
+                &file,
+                provider::VolumeObjectInformation {
+                    object_id: [7; 16],
+                    extended_info: [9; 48],
+                },
+                &context,
+            ),
+            &control,
+            Operation::SetVolumeObjectId,
         )
         .await;
         assert_eq!(volume.caller_available_allocation_units, 1021);
@@ -545,6 +559,7 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
             Operation::SetMode,
             Operation::SetEas,
             Operation::SetShortName,
+            Operation::SetVolumeObjectId,
         ] {
             for after in [false, true] {
                 let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
@@ -571,18 +586,26 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                     let mut bytes = (name.len() as u32).to_le_bytes().to_vec();
                     bytes.extend(name);
                     bytes
+                } else if operation == Operation::SetVolumeObjectId {
+                    vec![9; 64]
                 } else {
                     32i64.to_le_bytes().to_vec()
                 };
                 let mut body = SetInfoRequest::new_zeroed();
                 body.structure_size = SetInfoRequest::STRUCTURE_SIZE.into();
-                body.info_type = InformationType::FILE;
+                body.info_type = if operation == Operation::SetVolumeObjectId {
+                    InformationType::FILESYSTEM
+                } else {
+                    InformationType::FILE
+                };
                 body.info_class = if operation == Operation::SetMode {
                     16
                 } else if operation == Operation::SetEas {
                     15
                 } else if operation == Operation::SetShortName {
                     40
+                } else if operation == Operation::SetVolumeObjectId {
+                    8
                 } else {
                     19
                 };
@@ -664,6 +687,20 @@ fn metadata_updates_cancel_before_effect_and_close_drains_committed_results() {
                         );
                         if after {
                             assert_eq!(&response[76..], encode_name("SHORT.TXT"));
+                        }
+                    } else if operation == Operation::SetVolumeObjectId {
+                        let mut query = QueryInfoRequest::new_zeroed();
+                        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+                        query.info_type = InformationType::FILESYSTEM;
+                        query.info_class = 8;
+                        query.file_id = reopened;
+                        query.output_buffer_length = 64.into();
+                        let response = client.ok(Command::QUERY_INFO, query.as_bytes()).await;
+                        if after {
+                            assert_eq!(&response[72..], &[9; 64]);
+                        } else {
+                            assert_ne!(&response[72..88], &[9; 16]);
+                            assert_eq!(&response[88..], &[0; 48]);
                         }
                     } else {
                         let response = client.query(reopened, 5).await;

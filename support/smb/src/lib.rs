@@ -833,6 +833,7 @@ fn filesystem_response(
         FileSystemInformationClass::DEVICE => size_of::<FileFsDeviceInformation>(),
         FileSystemInformationClass::ATTRIBUTE => size_of::<FileFsAttributeInformation>(),
         FileSystemInformationClass::SECTOR_SIZE => size_of::<FileFsSectorSizeInformation>(),
+        FileSystemInformationClass::OBJECT_ID => size_of::<FileFsObjectIdInformation>(),
         _ => return Err(Status::INVALID_PARAMETER),
     };
     if (maximum as usize) < minimum {
@@ -840,6 +841,19 @@ fn filesystem_response(
     }
     let mut out = Vec::new();
     match class {
+        FileSystemInformationClass::OBJECT_ID => {
+            let object = info.object_information.ok_or(Status::INVALID_PARAMETER)?;
+            if object.object_id == [0; 16] {
+                return Err(Status::OBJECT_NAME_NOT_FOUND);
+            }
+            out.extend_from_slice(
+                FileFsObjectIdInformation {
+                    object_id: object.object_id,
+                    extended_info: object.extended_info,
+                }
+                .as_bytes(),
+            );
+        }
         FileSystemInformationClass::VOLUME => {
             let label: String = info
                 .label
@@ -2562,6 +2576,7 @@ impl<B: FileSystem> Connection<B> {
                 | FileSystemInformationClass::FULL_SIZE
                 | FileSystemInformationClass::DEVICE
                 | FileSystemInformationClass::SECTOR_SIZE
+                | FileSystemInformationClass::OBJECT_ID
                 | FileSystemInformationClass::ATTRIBUTE => {}
                 FileSystemInformationClass::LABEL
                 | FileSystemInformationClass::DRIVER_PATH
@@ -2931,6 +2946,28 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let class = FileInformationClass(request.info_class);
         match (request.info_type, class) {
+            (InformationType::FILESYSTEM, _)
+                if FileSystemInformationClass(request.info_class)
+                    == FileSystemInformationClass::OBJECT_ID =>
+            {
+                if !file.access.write_data() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let info = FileFsObjectIdInformation::read_from_prefix(data)
+                    .map_err(|_| Status::INVALID_INFO_CLASS)?
+                    .0;
+                self.server
+                    .backend
+                    .set_volume_object_id(
+                        &file.file,
+                        provider::VolumeObjectInformation {
+                            object_id: info.object_id,
+                            extended_info: info.extended_info,
+                        },
+                        context,
+                    )
+                    .await?;
+            }
             (InformationType::FILE, FileInformationClass::SHORT_NAME) => {
                 if data.len() < FILE_NAME_INFORMATION_MIN_BUFFER_SIZE {
                     return Err(Status::INFO_LENGTH_MISMATCH);

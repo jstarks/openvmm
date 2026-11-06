@@ -1087,6 +1087,143 @@ fn short_name_framing_and_delete_access_precede_provider_policy() {
 }
 
 #[test]
+fn volume_object_ids_are_shared_mutable_metadata_with_fixed_wire_bounds() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let root = client.open("", 1, 1).await;
+        let file = client.open("volume-identity", 2, 0).await;
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILESYSTEM;
+        query.info_class = 8;
+        query.file_id = root;
+        for maximum in [0, 63, 64] {
+            query.output_buffer_length = maximum.into();
+            let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+            assert_eq!(
+                response_status(&response),
+                if maximum < 64 {
+                    Status::INFO_LENGTH_MISMATCH
+                } else {
+                    Status::SUCCESS
+                }
+            );
+            if maximum == 64 {
+                assert_ne!(&response[72..88], &[0; 16]);
+                assert_eq!(&response[88..], &[0; 48]);
+            }
+        }
+        let mut set = SetInfoRequest::new_zeroed();
+        set.structure_size = SetInfoRequest::STRUCTURE_SIZE.into();
+        set.info_type = InformationType::FILESYSTEM;
+        set.info_class = 8;
+        set.file_id = file;
+        set.buffer_offset = (body_end::<SetInfoRequest>() as u16).into();
+        let expected: Vec<u8> = (1..=64).collect();
+        for length in [0, 63, 64] {
+            set.buffer_length = (length as u32).into();
+            let mut bytes = set.as_bytes().to_vec();
+            bytes.extend_from_slice(&expected[..length]);
+            assert_eq!(
+                response_status(&client.send(Command::SET_INFO, &bytes).await),
+                if length < 64 {
+                    Status::INVALID_INFO_CLASS
+                } else {
+                    Status::SUCCESS
+                }
+            );
+        }
+        for id in [root, file] {
+            query.file_id = id;
+            let response = client.ok(Command::QUERY_INFO, query.as_bytes()).await;
+            assert_eq!(&response[72..], expected);
+        }
+        let mut bytes = set.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 64]);
+        client.ok(Command::SET_INFO, &bytes).await;
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_INFO, query.as_bytes()).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        client.close(file).await;
+        client.close(root).await;
+    });
+}
+
+#[test]
+fn volume_object_id_set_access_and_provider_errors_preserve_metadata() {
+    use crate::test_support::{ControlledFs, Operation, Plan};
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("volume-policy", 2, 0).await;
+        let response = client
+            .open_result(
+                "volume-policy",
+                AccessMask::new().with_synchronize(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let restricted = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILESYSTEM;
+        query.info_class = 8;
+        query.file_id = restricted;
+        query.output_buffer_length = 64.into();
+        let before = client.ok(Command::QUERY_INFO, query.as_bytes()).await[72..].to_vec();
+        let mut set = SetInfoRequest::new_zeroed();
+        set.structure_size = SetInfoRequest::STRUCTURE_SIZE.into();
+        set.info_type = InformationType::FILESYSTEM;
+        set.info_class = 8;
+        set.file_id = restricted;
+        set.buffer_offset = (body_end::<SetInfoRequest>() as u16).into();
+        set.buffer_length = 64.into();
+        let mut bytes = set.as_bytes().to_vec();
+        bytes.extend_from_slice(&[7; 64]);
+        assert_eq!(
+            response_status(&client.send(Command::SET_INFO, &bytes).await),
+            Status::ACCESS_DENIED
+        );
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.operation == Operation::SetVolumeObjectId)
+        );
+        set.file_id = file;
+        for status in [Status::INVALID_PARAMETER, Status::PRIVILEGE_NOT_HELD] {
+            control
+                .set_plan(
+                    Operation::SetVolumeObjectId,
+                    Plan {
+                        failure: Some(status),
+                        ..Plan::default()
+                    },
+                )
+                .unwrap();
+            let mut bytes = set.as_bytes().to_vec();
+            bytes.extend_from_slice(&[7; 64]);
+            assert_eq!(
+                response_status(&client.send(Command::SET_INFO, &bytes).await),
+                status
+            );
+        }
+        assert_eq!(
+            &client.ok(Command::QUERY_INFO, query.as_bytes()).await[72..],
+            before
+        );
+        client.close(restricted).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

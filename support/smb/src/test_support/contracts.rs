@@ -69,6 +69,8 @@ pub struct Expectations {
     pub stream_rename: Feature,
     /// Explicit short-name assignment, lookup and removal.
     pub short_names: Feature,
+    /// Atomic volume object-ID and extension metadata updates.
+    pub volume_object_ids: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -666,6 +668,35 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Volume object-ID metadata is shared across opens and updates atomically.
+pub async fn volume_object_ids<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "volume", CreateDisposition::CREATE, false, &request).await;
+    let information = crate::provider::VolumeObjectInformation {
+        object_id: [7; 16],
+        extended_info: [9; 48],
+    };
+    let result = fs.set_volume_object_id(&file, information, &request).await;
+    if let Some(status) = unsupported(fixture.expectations().volume_object_ids) {
+        rejected(result, status);
+    } else {
+        result.unwrap();
+        let root = open(fs, "", CreateDisposition::OPEN, true, &request).await;
+        for opened in [&file, &root] {
+            assert_eq!(
+                fs.filesystem_information(opened, &request)
+                    .await
+                    .unwrap()
+                    .object_information,
+                Some(information)
+            );
+        }
+        fs.close(&root, &request).await.unwrap();
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// Short-name aliases support lookup, collision checks and removal without rebinding opens.

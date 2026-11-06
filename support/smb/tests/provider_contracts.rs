@@ -40,6 +40,7 @@ impl Fixture for MemoryFixture {
             named_streams: Feature::Supported,
             stream_rename: Feature::Supported,
             short_names: Feature::Supported,
+            volume_object_ids: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -73,6 +74,7 @@ impl ControlledFixture {
             Operation::SetBasic,
             Operation::Rename,
             Operation::SetShortName,
+            Operation::SetVolumeObjectId,
             Operation::Lock,
             Operation::Notify,
             Operation::QueryEas,
@@ -109,6 +111,7 @@ impl ControlledFixture {
                 named_streams: Feature::Unsupported(Status::NOT_SUPPORTED),
                 stream_rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 short_names: Feature::Unsupported(Status::NOT_SUPPORTED),
+                volume_object_ids: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -282,6 +285,15 @@ fn exported_short_name_contract_checks_aliases_and_declines() {
     block_on(contracts::short_names(&fixture));
     fixture.assert_rejected(&[Operation::SetShortName]);
 }
+#[test]
+fn exported_volume_object_id_contract_checks_shared_metadata_and_declines() {
+    block_on(contracts::volume_object_ids(&MemoryFixture(MemoryFs::new(
+        1024, 32,
+    ))));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::volume_object_ids(&fixture));
+    fixture.assert_rejected(&[Operation::SetVolumeObjectId]);
+}
 
 #[test]
 fn declared_unsupported_locks_are_exercised() {
@@ -361,6 +373,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             named_streams: Feature::Supported,
             stream_rename: Feature::Supported,
             short_names: Feature::Supported,
+            volume_object_ids: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

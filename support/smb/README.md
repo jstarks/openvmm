@@ -24,7 +24,7 @@ will not need them.
 | CREATE and data I/O | Sharing, access grants, dispositions, EOF, short I/O, flush and close | Implemented; selected CREATE/read/write/mkdir cases and provider contracts |
 | Compounds and credits | Bounded admission, inherited identities, error propagation, pending replies and cancellation | Implemented; selected compound/async cases; retain committed CLOSE and compound-tail policies |
 | File metadata | Supported query classes, attributes/timestamps, allocation, EOF, mode and position | Implemented subset; broaden applicable getinfo/setinfo cases and classify unsupported-class dependencies |
-| Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/11 implemented; broader fixtures may require quota/object-ID classes |
+| Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/8/11 implemented; object-ID metadata can be set; quota controls remain |
 | Namespace and enumeration | Directory continuation, rename/move, short-name assignment, sharing, replacement and deletion | Implemented subset; explicit aliases resolve/query/enumerate; no automatic short-name generation or hard links |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
@@ -87,6 +87,14 @@ rights, stream/directory eligibility and namespace-wide uniqueness, preserves
 existing opens, and publishes ordered alias notifications. Alias opens, directory
 matching and alternate-name queries use real stored names. Automatic short-name
 generation is still unimplemented; this is not a native privilege model.
+
+FileFsObjectIdInformation queries and sets use optional provider-owned volume
+identity and 48-byte extension metadata, separate from per-file object IDs.
+MemoryFs assigns an initial synthetic volume ID and retains atomic updates
+visible through every open. An all-zero ID represents no assigned identity and
+queries return OBJECT_NAME_NOT_FOUND. Unsupported snapshots/updates are explicit
+errors. SET requires WRITE_DATA and participates in cancellation/CLOSE draining.
+This does not implement per-file object-ID controls, quotas or persistent identity.
 
 ## Run
 

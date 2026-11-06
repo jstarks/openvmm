@@ -79,6 +79,8 @@ pub enum Operation {
     Rename,
     /// Short-name assignment or removal.
     SetShortName,
+    /// Volume identity and extension metadata update.
+    SetVolumeObjectId,
     /// Directory change notification.
     Notify,
     /// Byte-range lock.
@@ -616,6 +618,27 @@ impl<B: Inspect> Inspect for ControlledFs<B> {
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
 
+    async fn set_volume_object_id(
+        &self,
+        file: &Self::File,
+        information: crate::provider::VolumeObjectInformation,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call = self.controller.begin(
+            Operation::SetVolumeObjectId,
+            Some(file.id),
+            None,
+            None,
+            None,
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .set_volume_object_id(&file.inner, information, &context)
+            .await;
+        call.complete(result, None).await
+    }
     async fn set_short_name(
         &self,
         file: &Self::File,

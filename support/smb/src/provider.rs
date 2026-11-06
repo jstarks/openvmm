@@ -297,6 +297,17 @@ pub struct FileSystemInformation {
     pub bytes_per_sector: u32,
     /// Extended geometry when supported; None declines this optional query.
     pub sector_size: Option<SectorSizeInformation>,
+    /// Optional volume object-ID metadata, separate from per-file object IDs.
+    pub object_information: Option<VolumeObjectInformation>,
+}
+
+/// Provider-owned volume identity and extension metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeObjectInformation {
+    /// Provider-owned 16-byte volume GUID; all zero denotes no assigned identity.
+    pub object_id: [u8; 16],
+    /// Stored volume extension metadata, not file contents.
+    pub extended_info: [u8; 48],
 }
 
 /// Parameters of an SMB open, after protocol validation.
@@ -594,6 +605,16 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         info: BasicInformation,
         request: &RequestContext,
     ) -> Result<(), Status>;
+    /// Update volume identity and extension metadata (MS-FSA §2.1.5.16.8).
+    /// The caller checks WRITE_DATA; updates are atomic and visible through all opens.
+    async fn set_volume_object_id(
+        &self,
+        _file: &Self::File,
+        _information: VolumeObjectInformation,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::INVALID_PARAMETER)
+    }
     /// Assign or remove a short name (MS-FSA §2.1.5.15.14).
     /// An empty name removes the alias. Validate 8.3 syntax, restore access,
     /// stream eligibility, directory-wide uniqueness and ordered notifications.

@@ -39,6 +39,12 @@ mismatch against public specifications, and adding small deterministic Rust
 regressions before fixing the behavior. Stateful fuzzing and a broader hardening
 harness are deferred; they are not represented as completed validation.
 
+Directory buffers smaller than the selected record's fixed prefix return
+INFO_LENGTH_MISMATCH. A first filename that does not fit returns BUFFER_OVERFLOW
+as an SMB2 ERROR response, retaining that entry for retry (MS-FSA 2.1.5.6.3;
+MS-SMB2 3.3.4.4). Successful records are aligned between entries, not padded
+after the final entry, so exact-fit buffers do not lose records.
+
 ## Run
 
 ```bash

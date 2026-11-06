@@ -2706,6 +2706,10 @@ impl<B: FileSystem> Connection<B> {
                 return Err(Status::OBJECT_NAME_INVALID);
             }
         }
+        let maximum = (request.output_buffer_length.get() as usize).min(MAX_TRANSFER_SIZE);
+        if maximum < fixed {
+            return Err(Status::INFO_LENGTH_MISMATCH);
+        }
         let mut entries = self.server.backend.list(&file.file, context).await?;
         entries.sort_unstable_by(|left, right| directory_key(left).cmp(&directory_key(right)));
         let mut directory = file.directory.lock();
@@ -2721,7 +2725,6 @@ impl<B: FileSystem> Connection<B> {
             });
         }
         let search = directory.as_mut().ok_or(Status::INVALID_PARAMETER)?;
-        let maximum = (request.output_buffer_length.get() as usize).min(MAX_TRANSFER_SIZE);
         let mut out = Vec::new();
         let mut previous = None;
         for info in &entries {
@@ -2750,27 +2753,26 @@ impl<B: FileSystem> Connection<B> {
                 .count()
                 .checked_mul(size_of::<U16>())
                 .ok_or(Status::INTERNAL_ERROR)?;
-            let entry_len = align_up(
-                fixed
-                    .checked_add(name_length)
-                    .ok_or(Status::INTERNAL_ERROR)?,
-                DIRECTORY_ALIGNMENT,
-            )?;
-            if out.len() + entry_len > maximum {
+            let entry_len = fixed
+                .checked_add(name_length)
+                .ok_or(Status::INTERNAL_ERROR)?;
+            let start = align_up(out.len(), DIRECTORY_ALIGNMENT)?;
+            let end = start.checked_add(entry_len).ok_or(Status::INTERNAL_ERROR)?;
+            if end > maximum {
                 if out.is_empty() {
-                    return Err(Status::BUFFER_TOO_SMALL);
+                    // SMB2 3.3.4.4 requires an ERROR response, not partial directory data.
+                    return Err(Status::BUFFER_OVERFLOW);
                 }
                 break;
             }
             let record = directory_record(class, info)?;
-            let start = out.len();
             if let Some(previous) = previous {
                 let (header, _) = DirectoryEntryHeader::mut_from_prefix(&mut out[previous..])
                     .expect("encoded directory record");
                 header.next_entry_offset = ((start - previous) as u32).into();
             }
+            out.resize(start, 0);
             out.extend_from_slice(&record);
-            out.resize(start + entry_len, 0);
             previous = Some(start);
             search.after = Some((order, id, name.to_owned()));
             search.cursor = search.cursor.saturating_add(1);

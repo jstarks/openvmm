@@ -1401,6 +1401,100 @@ fn directory_continuation_observes_live_entries_and_preserves_its_pattern() {
 }
 
 #[test]
+fn directory_buffers_distinguish_prefix_overflow_and_exact_unpadded_records() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("entry", 2, 0).await;
+        client.close(file).await;
+        for (class, fixed) in [
+            (
+                FileInformationClass::DIRECTORY,
+                size_of::<FileDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::FULL_DIRECTORY,
+                size_of::<FileFullDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::BOTH_DIRECTORY,
+                size_of::<FileBothDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::NAMES,
+                size_of::<FileNamesInformation>(),
+            ),
+            (
+                FileInformationClass::ID_BOTH_DIRECTORY,
+                size_of::<FileIdBothDirectoryInformation>(),
+            ),
+            (
+                FileInformationClass::ID_FULL_DIRECTORY,
+                size_of::<FileIdFullDirectoryInformation>(),
+            ),
+        ] {
+            let root = client.open("", 1, 1).await;
+            let pattern = encode_name("entry");
+            let mut query = QueryDirectoryRequest::new_zeroed();
+            query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+            query.info_class = class.0;
+            query.file_id = root;
+            query.name_offset = (body_end::<QueryDirectoryRequest>() as u16).into();
+            query.name_length = (pattern.len() as u16).into();
+            for (length, expected) in [
+                (fixed - 1, Status::INFO_LENGTH_MISMATCH),
+                (fixed, Status::BUFFER_OVERFLOW),
+                (fixed + 3, Status::BUFFER_OVERFLOW),
+                (fixed + pattern.len(), Status::SUCCESS),
+            ] {
+                query.output_buffer_length = (length as u32).into();
+                let mut body = query.as_bytes().to_vec();
+                body.extend_from_slice(&pattern);
+                let response = client.send(Command::QUERY_DIRECTORY, &body).await;
+                assert_eq!(response_status(&response), expected, "{class:?} {length}");
+                if expected == Status::SUCCESS {
+                    let buffer = read_body::<BufferResponse>(&response).unwrap();
+                    assert_eq!(buffer.output_buffer_length.get() as usize, length);
+                    assert_eq!(response.len(), 72 + length);
+                    assert_eq!(&response[72 + fixed..], &pattern);
+                    assert_eq!(&response[72..76], &[0; 4]);
+                } else {
+                    assert_eq!(response[64..], error_body());
+                }
+            }
+            query.name_length = 0.into();
+            let exhausted = client
+                .send(Command::QUERY_DIRECTORY, query.as_bytes())
+                .await;
+            assert_eq!(response_status(&exhausted), Status::NO_MORE_FILES);
+            client.close(root).await;
+        }
+        for name in ["filea", "fileb"] {
+            let file = client.open(name, 2, 0).await;
+            client.close(file).await;
+        }
+        let root = client.open("", 1, 1).await;
+        let mut query = QueryDirectoryRequest::new_zeroed();
+        query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+        query.info_class = FileInformationClass::NAMES.0;
+        query.file_id = root;
+        query.name_offset = (body_end::<QueryDirectoryRequest>() as u16).into();
+        query.name_length = 10.into();
+        query.output_buffer_length = 46.into();
+        let mut body = query.as_bytes().to_vec();
+        body.extend_from_slice(&encode_name("file?"));
+        let response = client.ok(Command::QUERY_DIRECTORY, &body).await;
+        assert_eq!(response.len(), 72 + 46);
+        assert_eq!(&response[72..76], &24u32.to_le_bytes());
+        assert_eq!(&response[84..94], &encode_name("filea"));
+        assert_eq!(&response[94..96], &[0; 2]);
+        assert_eq!(&response[96..100], &[0; 4]);
+        assert_eq!(&response[108..118], &encode_name("fileb"));
+        client.close(root).await;
+    });
+}
+
+#[test]
 fn directory_pagination_and_small_buffer_do_not_lose_entries() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
@@ -1421,7 +1515,7 @@ fn directory_pagination_and_small_buffer_do_not_lose_entries() {
                     .send(Command::QUERY_DIRECTORY, query.as_bytes())
                     .await
             ),
-            Status::BUFFER_TOO_SMALL
+            Status::INFO_LENGTH_MISMATCH
         );
         query.output_buffer_length = 16.into();
         let current = client.ok(Command::QUERY_DIRECTORY, query.as_bytes()).await;

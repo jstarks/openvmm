@@ -5,6 +5,71 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn memory_creation_preserves_dos_attributes_without_fabricating_storage_features() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let requested = FileAttributes::new()
+            .with_readonly(true)
+            .with_hidden(true)
+            .with_system(true)
+            .with_sparse_file(true)
+            .with_compressed(true)
+            .with_encrypted(true)
+            .with_reparse_point(true)
+            .with_integrity_stream(true)
+            .with_pinned(true)
+            .with_not_content_indexed(true);
+        for (name, options, expected) in [
+            ("attributes-file", 0, 0x27u32),
+            ("attributes-directory", 1, 0x16),
+        ] {
+            let mut body = create_body(
+                name,
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                7,
+                2,
+                options,
+                &[],
+            );
+            CreateRequest::mut_from_prefix(&mut body)
+                .unwrap()
+                .0
+                .file_attributes = requested;
+            let response = client.ok(Command::CREATE, &body).await;
+            let created = read_body::<CreateResponse>(&response).unwrap();
+            assert_eq!(created.file_attributes.into_bits(), expected);
+            let basic = client
+                .query(created.file_id, FileInformationClass::BASIC.0)
+                .await;
+            let basic = FileBasicInformation::read_from_bytes(&basic[72..]).unwrap();
+            assert_eq!(basic.file_attributes.into_bits(), expected);
+            client.close(created.file_id).await;
+        }
+        let mut body = create_body(
+            "temporary-directory",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            2,
+            1,
+            &[],
+        );
+        CreateRequest::mut_from_prefix(&mut body)
+            .unwrap()
+            .0
+            .file_attributes = FileAttributes::new().with_temporary(true);
+        assert_eq!(
+            response_status(&client.send(Command::CREATE, &body).await),
+            Status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            response_status(&client.open_result("temporary-directory", 1, 7, 1, 1).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+    });
+}
+
+#[test]
 fn create_rejects_invalid_attributes_paths_and_impersonation_before_provider_calls() {
     use crate::test_support::ControlledFs;
     block_on(async {

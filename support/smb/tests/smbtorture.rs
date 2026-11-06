@@ -67,6 +67,8 @@ fn samba_create_and_sharing() {
             "smb2.maximum_allowed.read_only_file",
             "smb2.maximum_allowed.read_only_dir",
             "smb2.delete-on-close-perms.READONLY",
+            "smb2.winattr",
+            "smb2.winattr2",
         ],
     );
 }

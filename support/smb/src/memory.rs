@@ -689,6 +689,17 @@ fn sharing_conflict(access: u32, sharing: u32, other: &Open) -> bool {
         && (access & !other.sharing != 0 || other_access & !sharing != 0)
 }
 
+fn settable_attributes() -> FileAttributes {
+    FileAttributes::new()
+        .with_readonly(true)
+        .with_hidden(true)
+        .with_system(true)
+        .with_archive(true)
+        .with_temporary(true)
+        .with_offline(true)
+        .with_not_content_indexed(true)
+}
+
 fn allocate(state: &mut State, node_id: u64, length: usize) -> Result<(), Status> {
     let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
     let old_len = node.data.len();
@@ -1012,6 +1023,10 @@ impl FileSystem for MemoryFs {
             if delete && options.attributes().readonly() {
                 return Err(Status::CANNOT_DELETE);
             }
+            let directory = options.options().directory_file();
+            if directory && options.attributes().temporary() {
+                return Err(Status::INVALID_PARAMETER);
+            }
             options.access = grant_access(
                 AccessMask::FILE_ALL_ACCESS.into_bits(),
                 options.access,
@@ -1020,7 +1035,6 @@ impl FileSystem for MemoryFs {
             if state.nodes.len() >= state.object_limit {
                 return Err(Status::DISK_FULL);
             }
-            let directory = options.options().directory_file();
             let security = match options.security {
                 Some(bytes) => creation_security(&state.nodes[&parent].security, directory, bytes)?,
                 None => inherited_security(
@@ -1033,6 +1047,18 @@ impl FileSystem for MemoryFs {
             let id = state.next_id;
             state.next_id = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
             let now = nt_time();
+            let attributes =
+                FileAttributes::from_bits(options.attributes & settable_attributes().into_bits())
+                    .with_readonly(!directory && options.attributes().readonly())
+                    .with_directory(directory)
+                    .with_archive(!directory || options.attributes().archive())
+                    .with_not_content_indexed(
+                        state.nodes[&parent]
+                            .metadata
+                            .attributes()
+                            .not_content_indexed(),
+                    )
+                    .into_bits();
             state.nodes.insert(
                 id,
                 Node {
@@ -1042,17 +1068,7 @@ impl FileSystem for MemoryFs {
                         name: parts.last().ok_or(Status::OBJECT_NAME_INVALID)?.to_string(),
                         path: String::new(),
                         short_name: None,
-                        attributes: if directory {
-                            FileAttributes::new().with_directory(true).into_bits()
-                        } else {
-                            options
-                                .attributes()
-                                .with_directory(false)
-                                .with_normal(false)
-                                .with_archive(true)
-                                .with_reparse_point(false)
-                                .into_bits()
-                        },
+                        attributes,
                         reparse_tag: 0,
                         created: now,
                         accessed: now,
@@ -1828,14 +1844,7 @@ impl FileSystem for MemoryFs {
         let now = nt_time();
         if info.attributes != 0 {
             // MS-FSA §2.1.5.15.2 defines this update mask and protects root HIDDEN/SYSTEM.
-            let mut valid = FileAttributes::new()
-                .with_readonly(true)
-                .with_hidden(true)
-                .with_system(true)
-                .with_archive(true)
-                .with_temporary(true)
-                .with_offline(true)
-                .with_not_content_indexed(true);
+            let mut valid = settable_attributes();
             if file.node == 1 {
                 valid = valid.with_hidden(false).with_system(false);
             }

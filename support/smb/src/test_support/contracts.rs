@@ -1855,6 +1855,72 @@ pub async fn basic_information<F: Fixture>(fixture: &F) {
         assert!(!after.attributes().hidden());
         assert_eq!((after.id, after.size), (before.id, before.size));
         fs.set_delete_on_close(&file, true, &request).await.unwrap();
+        let (directory, _) = fs
+            .open(
+                "attributes-directory",
+                OpenOptions {
+                    attributes: FileAttributes::new()
+                        .with_hidden(true)
+                        .with_system(true)
+                        .into_bits(),
+                    ..options(CreateDisposition::CREATE, true)
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+        let metadata = fs.metadata(&directory, &request).await.unwrap();
+        assert!(metadata.attributes().hidden() && metadata.attributes().system());
+        fs.set_basic(
+            &directory,
+            BasicInformation {
+                attributes: FileAttributes::new()
+                    .with_not_content_indexed(true)
+                    .into_bits(),
+                ..info
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+        let child = open(
+            fs,
+            "attributes-directory\\child",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        assert!(
+            fs.metadata(&child, &request)
+                .await
+                .unwrap()
+                .attributes()
+                .not_content_indexed()
+        );
+        fs.close(&child, &request).await.unwrap();
+        fs.close(&directory, &request).await.unwrap();
+        rejected(
+            fs.open(
+                "temporary-directory",
+                OpenOptions {
+                    attributes: FileAttributes::new().with_temporary(true).into_bits(),
+                    ..options(CreateDisposition::CREATE, true)
+                },
+                &request,
+            )
+            .await,
+            Status::INVALID_PARAMETER,
+        );
+        rejected(
+            fs.open(
+                "temporary-directory",
+                options(CreateDisposition::OPEN, true),
+                &request,
+            )
+            .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
     }
     fs.close(&file, &request).await.unwrap();
 }

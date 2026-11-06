@@ -74,11 +74,12 @@ per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests driv
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
 The harness also checks compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
-The CREATE/sharing harness adds sixteen cases covering locked-file opens,
+The CREATE/sharing harness adds eighteen cases covering locked-file opens,
 multiple connections, readonly deletion, leading-backslash rejection, invalid
 impersonation, concurrent/visible directory creation, directory allocation,
 temporary attributes, the no-stream profile, bilateral share modes and readonly
-file/directory maximum-access reporting and readonly delete modes/dispositions.
+file/directory maximum-access reporting, readonly delete modes/dispositions,
+and basic DOS attributes/unchanged attributes on existing-object opens.
 The feature-enabled async harness gates real provider reads, writes, and
 flushes on the server's poller. Its four async compound cases include READ/WRITE
 checks requiring pending replies, rather than only allowing synchronous fallback.
@@ -150,6 +151,14 @@ retains directory traversal/type checks rather than blindly deleting path text.
 Opening dot aliases preserves identity and canonical metadata paths. Literal
 dot names cannot be published by CREATE or rename. Pathnames are bounded at
 32,760 UTF-16 units.
+
+MemoryFs creation preserves supported DOS attributes on files and directories,
+inherits the parent's not-content-indexed flag, forces ARCHIVE for files and
+DIRECTORY for directories, and rejects temporary-directory creation before
+publication (MS-FSA 2.1.5.1.1). Readonly directory creation remains ignored in
+this profile. Unsupported compression, encryption, sparse, reparse and other
+storage flags are not fabricated. Basic attribute updates use the same settable
+mask; opening an existing object does not apply creation attributes.
 
 Metadata-only opens do not participate in data/execute/delete sharing conflicts
 (MS-FSA 2.1.5.1.2.2). This exemption works in both open orders, even when either

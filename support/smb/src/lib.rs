@@ -29,9 +29,9 @@ use event_listener::Event;
 use inspect::Inspect;
 use parking_lot::Mutex;
 use provider::{
-    BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
-    Metadata, NotifyResult, OpenError, OpenOptions, RequestContext, StreamInformation,
-    SymbolicLink, map_access,
+    BasicInformation, ByteRange, CachingGrant, CachingRequest, FileControl, FileControlResult,
+    FileSystem, FileSystemInformation, Metadata, NotifyResult, OpenError, OpenOptions, Opened,
+    RequestContext, StreamInformation, SymbolicLink, map_access,
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2473,7 +2473,7 @@ impl<B: FileSystem> Connection<B> {
         let opened = self
             .server
             .backend
-            .open_with_reparse(
+            .open_with_caching(
                 &name,
                 OpenOptions {
                     access: access.into_bits(),
@@ -2485,10 +2485,16 @@ impl<B: FileSystem> Connection<B> {
                     security,
                     extended_attributes,
                 },
+                // Keep the wire profile uncached until break delivery is integrated.
+                CachingRequest::None,
                 context,
             )
             .await;
-        let (file, action) = match opened {
+        let Opened {
+            file,
+            action,
+            caching,
+        } = match opened {
             Ok(opened) => opened,
             Err(OpenError::SymbolicLink(link)) => {
                 return symbolic_link_error(&name, link)
@@ -2499,6 +2505,12 @@ impl<B: FileSystem> Connection<B> {
             }
             Err(OpenError::Status(status)) => return Err(status),
         };
+        if !matches!(caching, CachingGrant::None) {
+            let cleanup =
+                RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
+            self.server.backend.close(&file, &cleanup).await?;
+            return Err(Status::INTERNAL_ERROR);
+        }
         let info = match self.server.backend.metadata(&file, context).await {
             Ok(info) => info,
             Err(error) => {

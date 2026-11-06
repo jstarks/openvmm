@@ -239,6 +239,7 @@ impl Client<MemoryFs> {
     }
 }
 
+mod caching;
 mod compound;
 mod create;
 mod locking;

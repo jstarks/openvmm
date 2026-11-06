@@ -3,6 +3,13 @@
 
 //! Filesystem semantics independent of host files and VM resources.
 
+pub mod caching;
+
+pub use caching::{
+    Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingState,
+    LeaseIdentity, Opened, Oplock,
+};
+
 use crate::security::SecurityDescriptor;
 use crate::spec::{
     AccessMask, CreateDisposition, CreateOptions, FileAttributes, FileNotifyInformation,
@@ -590,6 +597,31 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         self.open(name, options, request)
             .await
             .map_err(OpenError::Status)
+    }
+    /// Open and optionally acquire provider-coordinated caching rights.
+    ///
+    /// Supporting providers resolve identity and order conflicts before destructive
+    /// open effects, then acquire rights before returning the result. This entry
+    /// point does not require separate frontend pathname lookup or a speculative
+    /// ordinary open. Grants cover all mutations, including external writers when
+    /// permitted. Providers may decline caching while still opening successfully.
+    ///
+    /// The default preserves ordinary/reparse open semantics and grants no rights.
+    /// The caller retains the future through completion, including cancellation,
+    /// and must close any successful open even if its result cannot be published.
+    async fn open_with_caching(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        _caching: CachingRequest,
+        request: &RequestContext,
+    ) -> Result<Opened<Self::File>, OpenError> {
+        let (file, action) = self.open_with_reparse(name, options, request).await?;
+        Ok(Opened {
+            file,
+            action,
+            caching: CachingGrant::None,
+        })
     }
     /// Finalize an open after its other operations have settled. Must be idempotent.
     async fn close(&self, file: &Self::File, request: &RequestContext) -> Result<(), Status>;

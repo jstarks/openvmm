@@ -166,6 +166,30 @@ per file has a short name. Open replacement targets remain denied in the
 uncached profile. Hard links are advertised; direct/provider/wire/cancellation
 tests cover them, not the lease-dependent independent hard-link fixture.
 
+## Provider Caching Boundary
+
+`FileSystem::open_with_caching` accepts semantic oplock or client-scoped lease
+requests and returns an `Opened` object containing the actual grant. Its default
+delegates to `open_with_reparse` and grants nothing, so existing providers need
+no changes. Supporting providers coordinate conflicting effects before opening
+or truncating objects and acquire rights before returning. No frontend
+pathname lookup or separate speculative open is required.
+
+Grants retain a provider-owned `Caching` control for queued break delivery and
+acknowledgment. Each break has a provider identity so late completions cannot
+acknowledge a newer break. Controls do not keep closed files alive; shared
+leases survive until their last associated open closes. The engine is responsible
+for wire routing, acknowledgment validation and timers; providers own coherence
+with filesystem effects, including external mutations when permitted.
+`ControlledFs` forwards these requests and retains actual grants, breaks and
+acknowledgment results across deterministic scheduling and late cancellation.
+
+This is the provider foundation, not enabled wire caching. The frontend currently
+requests no caching, rejects unsolicited grants with cleanup, and continues to
+advertise/grant no oplocks or leases. Wire grant/break/ACK integration and the
+reusable software-only implementation remain separate work. The interface does
+not require MemoryFs or other providers to implement caching individually.
+
 ## Run
 
 ```bash

@@ -10,9 +10,10 @@
 pub mod contracts;
 
 use crate::provider::{
-    BasicInformation, ByteRange, ExtendedAttribute, FileControl, FileControlResult, FileSystem,
-    FileSystemInformation, LockId, Metadata, NotifyResult, OpenError, OpenOptions, RequestContext,
-    StreamInformation,
+    BasicInformation, ByteRange, Caching, CachingBreak, CachingBreakId, CachingGrant,
+    CachingRequest, CachingState, ExtendedAttribute, FileControl, FileControlResult, FileSystem,
+    FileSystemInformation, LockId, Metadata, NotifyResult, OpenError, OpenOptions, Opened,
+    RequestContext, StreamInformation,
 };
 use crate::security::SecurityDescriptor;
 use crate::spec::SecurityInformation;
@@ -39,6 +40,10 @@ pub enum Operation {
     OpenSecurity,
     /// Open with an atomic creation EA list.
     OpenExtendedAttributes,
+    /// Provider caching break delivery.
+    CachingBreak,
+    /// Provider caching break completion.
+    CachingAck,
     /// Explicit close.
     Close,
     /// Metadata query.
@@ -626,6 +631,57 @@ impl<B: Inspect> Inspect for ControlledFs<B> {
     }
 }
 
+struct ControlledCaching {
+    inner: Arc<dyn Caching>,
+    controller: Controller,
+    handle: u64,
+}
+
+impl Inspect for ControlledCaching {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        req.respond()
+            .field("backend", self.inner.as_ref())
+            .field("handle", self.handle)
+            .field("control", &self.controller);
+    }
+}
+
+#[async_trait]
+impl Caching for ControlledCaching {
+    async fn wait_for_break(&self, r: &RequestContext) -> Result<CachingBreak, Status> {
+        let mut call = self.controller.begin(
+            Operation::CachingBreak,
+            Some(self.handle),
+            None,
+            None,
+            None,
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self.inner.wait_for_break(&context).await;
+        call.complete(result, None).await
+    }
+
+    async fn acknowledge(
+        &self,
+        id: CachingBreakId,
+        state: CachingState,
+        r: &RequestContext,
+    ) -> Result<CachingState, Status> {
+        let mut call = self.controller.begin(
+            Operation::CachingAck,
+            Some(self.handle),
+            None,
+            None,
+            None,
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self.inner.acknowledge(id, state, &context).await;
+        call.complete(result, None).await
+    }
+}
+
 #[async_trait]
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
@@ -809,6 +865,19 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         options: OpenOptions<'_>,
         r: &RequestContext,
     ) -> Result<(Self::File, u32), OpenError> {
+        let opened = self
+            .open_with_caching(name, options, CachingRequest::None, r)
+            .await?;
+        Ok((opened.file, opened.action))
+    }
+
+    async fn open_with_caching(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        caching: CachingRequest,
+        r: &RequestContext,
+    ) -> Result<Opened<Self::File>, OpenError> {
         let mut call = self.controller.begin(
             if options.security.is_some() {
                 Operation::OpenSecurity
@@ -828,9 +897,43 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         let context = call.prepare().await?;
         let result = self
             .backend
-            .open_with_reparse(name, options, &context)
+            .open_with_caching(name, options, caching, &context)
             .await
-            .map(|(inner, action)| (ControlledFile { inner, id: call.id }, action));
+            .map(|opened| {
+                let wrap = |inner| -> Arc<dyn Caching> {
+                    Arc::new(ControlledCaching {
+                        inner,
+                        controller: self.controller.clone(),
+                        handle: call.id,
+                    })
+                };
+                let caching = match opened.caching {
+                    CachingGrant::None => CachingGrant::None,
+                    CachingGrant::Oplock { level, control } => CachingGrant::Oplock {
+                        level,
+                        control: wrap(control),
+                    },
+                    CachingGrant::Lease {
+                        identity,
+                        state,
+                        breaking,
+                        control,
+                    } => CachingGrant::Lease {
+                        identity,
+                        state,
+                        breaking,
+                        control: wrap(control),
+                    },
+                };
+                Opened {
+                    file: ControlledFile {
+                        inner: opened.file,
+                        id: call.id,
+                    },
+                    action: opened.action,
+                    caching,
+                }
+            });
         if result.is_ok() {
             call.update(|info| info.handle = Some(call.id));
         }

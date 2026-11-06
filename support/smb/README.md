@@ -140,7 +140,9 @@ inherit-only ACEs and distinct null/empty DACLs are supported. Owner assignment
 is restricted to SYSTEM; group metadata may contain any valid SID.
 Directory security updates/inheritance, CREATE security contexts, SACLs,
 advanced ACEs and security selectors are still unsupported. All parents retain
-their default DELETE_CHILD access, which independently authorizes child DELETE.
+their default DELETE_CHILD / LIST_DIRECTORY access, independently authorizing
+child DELETE / READ_ATTRIBUTES. Maximum grants check each individual right with
+the same ordered DACL policy as explicit requests (MS-FSA 2.1.5.1.2.1).
 No persistent-ACL capability is advertised until the directory policy is complete.
 SET_SECURITY is routed through an optional provider operation after open-right
 checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.

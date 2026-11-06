@@ -426,6 +426,22 @@ fn rejected_file_security_updates_are_atomic_and_directory_policy_is_explicit() 
         let response = client.open_result("acl", read, 7, 1, 0).await;
         let allowed = read_body::<CreateResponse>(&response).unwrap().file_id;
         client.close(allowed).await;
+        let response = client
+            .open_result(
+                "acl",
+                AccessMask::new().with_maximum_allowed(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        let maximum = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let access = client.query(maximum, 8).await;
+        assert!(
+            AccessMask::from_bits(u32::from_le_bytes(access[72..76].try_into().unwrap()))
+                .read_data()
+        );
+        client.close(maximum).await;
         descriptor.dacl = AclState::Present(
             Acl::access(&[AccessAce {
                 deny: false,
@@ -442,6 +458,18 @@ fn rejected_file_security_updates_are_atomic_and_directory_policy_is_explicit() 
             response_status(&client.open_result("acl", read, 7, 1, 0).await),
             Status::ACCESS_DENIED
         );
+        let response = client
+            .open_result(
+                "acl",
+                AccessMask::new().with_read_attributes(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        let attributes = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client.query(attributes, 4).await;
+        client.close(attributes).await;
         let directory = client.open("directory", 2, 1).await;
         assert_eq!(
             response_status(

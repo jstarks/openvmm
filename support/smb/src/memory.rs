@@ -329,7 +329,7 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
 }
 
 fn maximal_access(node: &Node) -> u32 {
-    allowed_access(node, true)
+    allowed_access(node)
 }
 
 fn system_sid() -> Sid {
@@ -340,7 +340,7 @@ fn owner_rights_sid() -> Sid {
     Sid::new([0, 0, 0, 0, 0, 3], &[4]).expect("well-known SID")
 }
 
-fn allowed_access(node: &Node, maximum: bool) -> u32 {
+fn allowed_access(node: &Node) -> u32 {
     let all = AccessMask::FILE_ALL_ACCESS.into_bits();
     let mut granted = all;
     if let AclState::Present(acl) = &node.security.dacl {
@@ -374,7 +374,9 @@ fn allowed_access(node: &Node, maximum: bool) -> u32 {
             }
             let mask = crate::provider::map_access(ace.mask) & all;
             if ace.deny {
-                denied |= if maximum { mask } else { mask & !granted };
+                // MS-FSA §2.1.5.1.2.1 checks each individual right even for
+                // MAXIMUM_ALLOWED, preserving earlier allows for that right.
+                denied |= mask & !granted;
             } else {
                 granted |= mask & !denied;
             }
@@ -382,9 +384,13 @@ fn allowed_access(node: &Node, maximum: bool) -> u32 {
         granted = implicit | (granted & !denied);
     }
     // Directory security updates are unsupported; every parent retains its
-    // default DELETE_CHILD grant, which independently authorizes child DELETE.
+    // default DELETE_CHILD and LIST_DIRECTORY grants, independently authorizing
+    // child DELETE and READ_ATTRIBUTES (MS-FSA §2.1.5.1.2.1).
     if !node.metadata.is_directory() {
-        granted |= AccessMask::new().with_delete(true).into_bits();
+        granted |= AccessMask::new()
+            .with_delete(true)
+            .with_read_attributes(true)
+            .into_bits();
     }
     if node.metadata.attributes().readonly() {
         granted &= !AccessMask::new()
@@ -713,11 +719,7 @@ impl FileSystem for MemoryFs {
             if options.options().non_directory_file() && node.metadata.is_directory() {
                 return Err(Status::FILE_IS_A_DIRECTORY);
             }
-            options.access = grant_access(
-                allowed_access(node, options.access().maximum_allowed()),
-                options.access,
-                delete,
-            )?;
+            options.access = grant_access(allowed_access(node), options.access, delete)?;
             if node.metadata.attributes().readonly()
                 && (options.access().write_data() || options.access().append_data() || delete)
             {

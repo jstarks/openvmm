@@ -553,7 +553,8 @@ impl inspect::Inspect for MemoryFs {
                         req.respond()
                             .field("name", &node.metadata.name)
                             .field("parent", node.parent)
-                            .field("size", node.data.len())
+                            .field("size", node.metadata.size)
+                            .field("allocation_size", node.metadata.allocation_size)
                             .hex("attributes", node.metadata.attributes)
                             .field("delete_pending", node.metadata.delete_pending);
                     });

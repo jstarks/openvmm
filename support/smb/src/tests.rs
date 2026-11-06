@@ -331,6 +331,22 @@ fn allocation_reservations_consume_quota_and_failed_growth_is_atomic() {
             Status::SUCCESS
         );
         assert_eq!(
+            runtime::inspect_text(
+                &format!("nodes/{}/size", first.persistent.get()),
+                &server.backend
+            )
+            .await,
+            "4"
+        );
+        assert_eq!(
+            runtime::inspect_text(
+                &format!("nodes/{}/allocation_size", first.persistent.get()),
+                &server.backend
+            )
+            .await,
+            "32"
+        );
+        assert_eq!(
             response_status(&client.set(first, 19, &64i64.to_le_bytes()).await),
             Status::DISK_FULL
         );

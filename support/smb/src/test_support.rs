@@ -13,6 +13,8 @@ use crate::provider::{
     BasicInformation, ByteRange, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
     OpenOptions, RequestContext,
 };
+use crate::security::SecurityDescriptor;
+use crate::spec::SecurityInformation;
 use crate::spec::{NotifyFilter, Status};
 use async_trait::async_trait;
 use event_listener::Event;
@@ -36,6 +38,8 @@ pub enum Operation {
     Metadata,
     /// Filesystem identity, capabilities and capacity query.
     FileSystemInformation,
+    /// Selected security descriptor query.
+    QuerySecurity,
     /// Data read.
     Read,
     /// Data write.
@@ -751,6 +755,23 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         let result = self
             .backend
             .filesystem_information(&file.inner, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn query_security(
+        &self,
+        file: &Self::File,
+        information: SecurityInformation,
+        r: &RequestContext,
+    ) -> Result<SecurityDescriptor, Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::QuerySecurity, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .query_security(&file.inner, information, &context)
             .await;
         call.complete(result, None).await
     }

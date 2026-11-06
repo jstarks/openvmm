@@ -7,11 +7,13 @@ use crate::provider::{
     BasicInformation, ByteRange, Change, FileSystem, FileSystemInformation, LockId, Metadata,
     NotifyResult, OpenOptions, RequestContext,
 };
+use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
-    AccessMask, CreateAction, CreateDisposition, CreateOptions, FILE_DEVICE_DISK,
+    AccessMask, AceFlags, CreateAction, CreateDisposition, CreateOptions, FILE_DEVICE_DISK,
     FILE_MODE_INFORMATION_MASK, FILE_MODE_INFORMATION_SET_MASK, FileAttributes,
     FileSystemAttributes, MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter,
-    ShareAccess, Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
+    SecurityDescriptorControl, SecurityInformation, ShareAccess, Status, TIME_RESTORE,
+    TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
 use event_listener::Event;
@@ -329,6 +331,29 @@ fn maximal_access(metadata: &Metadata) -> u32 {
         .with_write_data(!metadata.attributes().readonly())
         .with_append_data(!metadata.attributes().readonly())
         .into_bits()
+}
+
+fn default_security(directory: bool) -> SecurityDescriptor {
+    let system = Sid::new([0, 0, 0, 0, 0, 5], &[18]).expect("well-known SID");
+    let world = Sid::new([0, 0, 0, 0, 0, 1], &[0]).expect("well-known SID");
+    let dacl = Acl::access(&[AccessAce {
+        deny: false,
+        flags: AceFlags::new()
+            .with_object_inherit(directory)
+            .with_container_inherit(directory),
+        mask: AccessMask::FILE_ALL_ACCESS.into_bits(),
+        sid: world,
+    }])
+    .expect("one bounded default ACE");
+    SecurityDescriptor {
+        owner: Some(system.clone()),
+        group: Some(system),
+        dacl: AclState::Present(dacl),
+        control: SecurityDescriptorControl::new()
+            .with_self_relative(true)
+            .with_dacl_present(true),
+        ..SecurityDescriptor::empty()
+    }
 }
 
 fn grant_access(available: u32, requested: u32, delete: bool) -> Result<u32, Status> {
@@ -978,6 +1003,41 @@ impl FileSystem for MemoryFs {
         })
     }
 
+    async fn query_security(
+        &self,
+        file: &MemoryFile,
+        information: SecurityInformation,
+        _request: &RequestContext,
+    ) -> Result<SecurityDescriptor, Status> {
+        let state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        let information =
+            SecurityInformation::from_bits(information.into_bits() & SecurityInformation::VALID);
+        if information.into_bits()
+            & !SecurityInformation::new()
+                .with_owner(true)
+                .with_group(true)
+                .with_dacl(true)
+                .into_bits()
+            != 0
+        {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        let mut descriptor = default_security(node.metadata.is_directory());
+        if !information.owner() {
+            descriptor.owner = None;
+        }
+        if !information.group() {
+            descriptor.group = None;
+        }
+        if !information.dacl() {
+            descriptor.dacl = AclState::Absent;
+            descriptor.control.set_dacl_present(false);
+        }
+        Ok(descriptor)
+    }
+
     async fn read(
         &self,
         file: &MemoryFile,
@@ -1553,6 +1613,7 @@ mod tests {
                 filesystem_information: Feature::Supported,
                 allocation: Feature::Supported,
                 file_mode: Feature::Supported,
+                security_queries: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -1600,6 +1661,11 @@ mod tests {
     #[test]
     fn contract_maximum_allowed_access() {
         run_contract(contracts::maximum_allowed_access);
+    }
+
+    #[test]
+    fn contract_security_queries() {
+        run_contract(contracts::security_queries);
     }
 
     #[test]

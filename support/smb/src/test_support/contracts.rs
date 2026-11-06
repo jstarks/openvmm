@@ -43,6 +43,8 @@ pub struct Expectations {
     pub allocation: Feature,
     /// Per-open I/O mode updates.
     pub file_mode: Feature,
+    /// Basic owner/group/DACL descriptor queries.
+    pub security_queries: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -226,6 +228,62 @@ pub async fn filesystem_information<F: Fixture>(fixture: &F) {
         fs.close(&file, &request).await.unwrap();
     }
     fs.close(&root, &request).await.unwrap();
+}
+
+/// Security queries return only selected components and retain the same
+/// descriptor components across different selections.
+pub async fn security_queries<F: Fixture>(fixture: &F) {
+    use crate::security::AclState;
+    use crate::spec::SecurityInformation;
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "security", CreateDisposition::CREATE, false, &request).await;
+    let all = SecurityInformation::new()
+        .with_owner(true)
+        .with_group(true)
+        .with_dacl(true);
+    if let Some(status) = unsupported(fixture.expectations().security_queries) {
+        rejected(fs.query_security(&file, all, &request).await, status);
+    } else {
+        let full = fs.query_security(&file, all, &request).await.unwrap();
+        for information in [
+            SecurityInformation::new(),
+            SecurityInformation::new().with_owner(true),
+            SecurityInformation::new().with_group(true),
+            SecurityInformation::new().with_dacl(true),
+        ] {
+            let selected = fs
+                .query_security(&file, information, &request)
+                .await
+                .unwrap();
+            assert_eq!(
+                selected.owner,
+                if information.owner() {
+                    full.owner.clone()
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                selected.group,
+                if information.group() {
+                    full.group.clone()
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                selected.dacl,
+                if information.dacl() {
+                    full.dacl.clone()
+                } else {
+                    AclState::Absent
+                }
+            );
+            assert_eq!(selected.sacl, AclState::Absent);
+        }
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// MAXIMUM_ALLOWED is resolved by the provider, not expanded to blanket rights.

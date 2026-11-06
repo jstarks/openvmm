@@ -30,6 +30,7 @@ fn samba_read_write_smoke() {
             "smb2.read.access",
             "smb2.create.open",
             "smb2.mkdir",
+            "smb2.getinfo.qsec_buffercheck",
             "smb2.compound.create-write-close",
             "smb2.compound.related5",
             "smb2.compound_find.compound_find_related",

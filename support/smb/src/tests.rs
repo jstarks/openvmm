@@ -231,6 +231,7 @@ mod notify;
 mod pending;
 mod rename;
 mod runtime;
+mod security;
 mod wire;
 
 #[test]

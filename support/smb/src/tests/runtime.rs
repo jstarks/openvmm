@@ -69,6 +69,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::Close,
             Operation::Metadata,
             Operation::FileSystemInformation,
+            Operation::QuerySecurity,
             Operation::Read,
             Operation::Write,
             Operation::Flush,
@@ -188,6 +189,13 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         assert_eq!(metadata.name, "renamed");
         assert_eq!(metadata.written, 30);
         assert!(metadata.delete_pending);
+        let descriptor = through_gates(
+            fs.query_security(&file, SecurityInformation::new().with_owner(true), &context),
+            &control,
+            Operation::QuerySecurity,
+        )
+        .await;
+        assert!(descriptor.owner.is_some());
         let volume = through_gates(
             fs.filesystem_information(&file, &context),
             &control,

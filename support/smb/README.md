@@ -128,6 +128,15 @@ Structural decoding is not an access check: interpreting or rejecting unsupporte
 ACE kinds remains a provider obligation. These primitives alone do not enable
 security descriptor requests or advertise ACL support.
 
+Security queries use the optional provider operation and enforce READ_CONTROL
+or ACCESS_SYSTEM_SECURITY as appropriate. Unknown selector bits are ignored.
+Undersized replies return BUFFER_TOO_SMALL with the required length, never a
+partial descriptor. Unsupported providers have no default descriptor fallback.
+MemoryFs exposes owner/group/DACL metadata for its fixed synthetic SYSTEM share
+identity and allow-everyone default policy, not a network client's identity.
+ACL updates and advanced security selectors remain unsupported at this checkpoint;
+no persistent-ACL capability is advertised.
+
 Independent byte fixtures verify unaligned embedded bitfields, all six supported
 directory layouts (with and without short names), and actual CREATE context,
 QUERY_INFO, and READ replies. Literal offsets in these fixtures are deliberate

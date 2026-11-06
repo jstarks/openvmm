@@ -3,9 +3,10 @@
 
 //! Filesystem semantics independent of host files and VM resources.
 
+use crate::security::SecurityDescriptor;
 use crate::spec::{
     AccessMask, CreateDisposition, CreateOptions, FileAttributes, FileNotifyInformation,
-    NOTIFY_ALIGNMENT, NotifyAction, NotifyFilter, Status,
+    NOTIFY_ALIGNMENT, NotifyAction, NotifyFilter, SecurityInformation, Status,
 };
 use async_trait::async_trait;
 use event_listener::Event;
@@ -293,6 +294,16 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         _request: &RequestContext,
     ) -> Result<FileSystemInformation, Status> {
         Err(Status::NOT_SUPPORTED)
+    }
+    /// Query selected security components for the established share identity.
+    /// Unsupported security stores reject rather than fabricate an ACL.
+    async fn query_security(
+        &self,
+        _file: &Self::File,
+        _information: SecurityInformation,
+        _request: &RequestContext,
+    ) -> Result<SecurityDescriptor, Status> {
+        Err(Status::INVALID_DEVICE_REQUEST)
     }
     /// Read at most `length` bytes from a default data stream.
     /// At EOF, an empty result or STATUS_END_OF_FILE is accepted by the engine.

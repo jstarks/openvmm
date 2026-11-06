@@ -2068,6 +2068,40 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let info_type = request.info_type;
         let class = FileInformationClass(request.info_class);
+        if info_type == InformationType::SECURITY {
+            let information = SecurityInformation::from_bits(
+                request.additional_information.get() & SecurityInformation::VALID,
+            );
+            if (information.owner()
+                || information.group()
+                || information.dacl()
+                || information.label())
+                && !file.access.read_control()
+                || information.sacl() && !file.access.access_system_security()
+            {
+                return Err(Status::ACCESS_DENIED);
+            }
+            let descriptor = self
+                .server
+                .backend
+                .query_security(&file.file, information, context)
+                .await?;
+            let bytes = descriptor.encode();
+            if bytes.len() > request.output_buffer_length.get() as usize {
+                let mut body = ErrorResponse {
+                    structure_size: ErrorResponse::STRUCTURE_SIZE.into(),
+                    context_count: 0,
+                    reserved: 0,
+                    byte_count: 4.into(),
+                }
+                .as_bytes()
+                .to_vec();
+                body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                return Ok((Status::BUFFER_TOO_SMALL, body));
+            }
+            return buffer_response(bytes, request.output_buffer_length.get())
+                .map(|body| (Status::SUCCESS, body));
+        }
         if info_type == InformationType::FILESYSTEM {
             let class = FileSystemInformationClass(request.info_class);
             match class {

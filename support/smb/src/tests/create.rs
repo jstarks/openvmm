@@ -81,6 +81,86 @@ fn returned_contexts(packet: &[u8]) -> Vec<CreateContext<'_>> {
 }
 
 #[test]
+fn create_security_applies_before_visibility_and_ignores_existing_context_bytes() {
+    use crate::security::{Acl, AclState, SecurityDescriptor};
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let mut descriptor = SecurityDescriptor::empty();
+        descriptor.control.set_dacl_protected(true);
+        descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+        let encoded = descriptor.encode();
+        let data = contexts(&[(CreateContextName::SECURITY_DESCRIPTOR, &encoded)]);
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body(
+                    "secured",
+                    AccessMask::FILE_ALL_ACCESS.into_bits(),
+                    7,
+                    2,
+                    0,
+                    &data,
+                ),
+            )
+            .await;
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client
+            .ok(
+                Command::WRITE,
+                &Client::write_body(file, 0, b"creation grant"),
+            )
+            .await;
+        assert_eq!(
+            response_status(&client.open_result("secured", 1, 7, 1, 0).await),
+            Status::ACCESS_DENIED
+        );
+        let malformed = contexts(&[(CreateContextName::SECURITY_DESCRIPTOR, &[0; 20])]);
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body(
+                    "secured",
+                    AccessMask::new().with_read_control(true).into_bits(),
+                    7,
+                    3,
+                    0,
+                    &malformed,
+                ),
+            )
+            .await;
+        let existing = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client.close(existing).await;
+        let response = client
+            .send(
+                Command::CREATE,
+                &create_body("invalid", 1, 7, 2, 0, &malformed),
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::INVALID_SECURITY_DESCR);
+        assert_eq!(
+            response_status(&client.open_result("invalid", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        descriptor.control.set_dacl_protected(false);
+        let encoded = descriptor.encode();
+        let data = contexts(&[(CreateContextName::SECURITY_DESCRIPTOR, &encoded)]);
+        let response = client
+            .ok(
+                Command::CREATE,
+                &create_body("inherited", 1, 7, 2, 0, &data),
+            )
+            .await;
+        let inherited = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client.close(inherited).await;
+        let response = client.open_result("inherited", 1, 7, 1, 0).await;
+        let reopened = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client.close(reopened).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn create_context_queries_return_stable_ids_and_backend_maximal_access() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(8, 16)).unwrap();

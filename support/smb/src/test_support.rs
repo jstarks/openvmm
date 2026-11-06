@@ -32,6 +32,8 @@ const CAPACITY: usize = 256;
 pub enum Operation {
     /// Open/create.
     Open,
+    /// Open with an atomic creation security descriptor.
+    OpenSecurity,
     /// Explicit close.
     Close,
     /// Metadata query.
@@ -704,12 +706,21 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
     async fn open(
         &self,
         name: &str,
-        options: OpenOptions,
+        options: OpenOptions<'_>,
         r: &RequestContext,
     ) -> Result<(Self::File, u32), Status> {
-        let mut call = self
-            .controller
-            .begin(Operation::Open, None, Some(name), None, None, r)?;
+        let mut call = self.controller.begin(
+            if options.security.is_some() {
+                Operation::OpenSecurity
+            } else {
+                Operation::Open
+            },
+            None,
+            Some(name),
+            None,
+            None,
+            r,
+        )?;
         let context = call.prepare().await?;
         let result = self
             .backend

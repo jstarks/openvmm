@@ -150,7 +150,7 @@ pub struct FileSystemInformation {
 
 /// Parameters of an SMB open, after protocol validation.
 #[derive(Debug, Clone, Copy)]
-pub struct OpenOptions {
+pub struct OpenOptions<'a> {
     /// Specific access rights, with generic bits mapped. MAXIMUM_ALLOWED is
     /// retained for the provider to resolve against the established identity.
     pub access: u32,
@@ -162,9 +162,13 @@ pub struct OpenOptions {
     pub options: u32,
     /// Requested Windows file attributes.
     pub attributes: u32,
+    /// Optional self-relative DTYP descriptor, applied atomically only on creation.
+    /// Ignore it for existing objects, including malformed bytes. New-object
+    /// validation must finish before publication; unsupported policy must fail.
+    pub security: Option<&'a [u8]>,
 }
 
-impl OpenOptions {
+impl OpenOptions<'_> {
     /// Decoded access rights.
     pub fn access(&self) -> AccessMask {
         AccessMask::from_bits(self.access)
@@ -276,7 +280,7 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     async fn open(
         &self,
         name: &str,
-        options: OpenOptions,
+        options: OpenOptions<'_>,
         request: &RequestContext,
     ) -> Result<(Self::File, u32), Status>;
     /// Finalize an open after its other operations have settled. Must be idempotent.

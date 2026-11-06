@@ -32,6 +32,7 @@ impl Fixture for MemoryFixture {
             file_acl_updates: Feature::Supported,
             directory_acl_updates: Feature::Supported,
             acl_inheritance: Feature::Supported,
+            security_creation: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -61,6 +62,7 @@ impl ControlledFixture {
             Operation::SetMode,
             Operation::QuerySecurity,
             Operation::SetSecurity,
+            Operation::OpenSecurity,
             Operation::SetBasic,
             Operation::Rename,
             Operation::Lock,
@@ -87,6 +89,7 @@ impl ControlledFixture {
                 file_acl_updates: Feature::Unsupported(Status::NOT_SUPPORTED),
                 directory_acl_updates: Feature::Unsupported(Status::NOT_SUPPORTED),
                 acl_inheritance: Feature::Unsupported(Status::NOT_SUPPORTED),
+                security_creation: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -203,6 +206,13 @@ fn declared_unsupported_acl_inheritance_is_exercised() {
 }
 
 #[test]
+fn declared_unsupported_security_creation_is_exercised() {
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::security_creation(&fixture));
+    fixture.assert_rejected(&[Operation::OpenSecurity]);
+}
+
+#[test]
 fn declared_unsupported_locks_are_exercised() {
     let fixture = ControlledFixture::rejecting();
     block_on(contracts::lock_conflicts_and_io(&fixture));
@@ -272,6 +282,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             file_acl_updates: Feature::Supported,
             directory_acl_updates: Feature::Supported,
             acl_inheritance: Feature::Supported,
+            security_creation: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

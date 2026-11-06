@@ -52,6 +52,8 @@ pub struct Expectations {
     pub directory_acl_updates: Feature,
     /// Basic inherited file/container ACEs and no-propagate behavior.
     pub acl_inheritance: Feature,
+    /// Atomic security descriptors on creation; ignored for existing objects.
+    pub security_creation: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -91,7 +93,7 @@ pub trait Fixture {
     ) -> impl Future<Output = ()>;
 }
 
-fn options(disposition: CreateDisposition, directory: bool) -> OpenOptions {
+fn options(disposition: CreateDisposition, directory: bool) -> OpenOptions<'static> {
     OpenOptions {
         access: AccessMask::FILE_ALL_ACCESS.into_bits(),
         share_access: ShareAccess::ALL.into_bits(),
@@ -100,6 +102,7 @@ fn options(disposition: CreateDisposition, directory: bool) -> OpenOptions {
             .with_directory_file(directory)
             .into_bits(),
         attributes: 0,
+        security: None,
     }
 }
 
@@ -579,6 +582,67 @@ pub async fn acl_inheritance<F: Fixture>(fixture: &F) {
         fs.close(&directory, &request).await.unwrap();
     }
     fs.close(&parent, &request).await.unwrap();
+}
+
+/// Creation applies security before publication and preserves the initial grant.
+/// Existing opens ignore descriptor bytes; rejected creations leave no object.
+pub async fn security_creation<F: Fixture>(fixture: &F) {
+    use crate::security::{Acl, AclState, SecurityDescriptor};
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let mut descriptor = SecurityDescriptor::empty();
+    descriptor.control.set_dacl_protected(true);
+    descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+    let encoded = descriptor.encode();
+    let create = OpenOptions {
+        security: Some(encoded.as_slice()),
+        ..options(CreateDisposition::CREATE, false)
+    };
+    if let Some(status) = unsupported(fixture.expectations().security_creation) {
+        rejected(fs.open("secured", create, &request).await, status);
+        rejected(
+            fs.open("secured", options(CreateDisposition::OPEN, false), &request)
+                .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+    } else {
+        let (file, _) = fs.open("secured", create, &request).await.unwrap();
+        let read = OpenOptions {
+            access: AccessMask::new().with_read_data(true).into_bits(),
+            ..options(CreateDisposition::OPEN, false)
+        };
+        rejected(
+            fs.open("secured", read, &request).await,
+            Status::ACCESS_DENIED,
+        );
+        let existing = OpenOptions {
+            access: AccessMask::new().with_read_control(true).into_bits(),
+            disposition: CreateDisposition::OPEN_IF.0,
+            security: Some(&[0; 20]),
+            ..options(CreateDisposition::OPEN, false)
+        };
+        let (reopened, _) = fs.open("secured", existing, &request).await.unwrap();
+        fs.close(&reopened, &request).await.unwrap();
+        write_all(fs, &file, 0, b"created grant", &request).await;
+        fs.close(&file, &request).await.unwrap();
+        rejected(
+            fs.open(
+                "invalid",
+                OpenOptions {
+                    security: Some(&[0; 20]),
+                    ..options(CreateDisposition::CREATE, false)
+                },
+                &request,
+            )
+            .await,
+            Status::INVALID_SECURITY_DESCR,
+        );
+    }
+    rejected(
+        fs.open("invalid", options(CreateDisposition::OPEN, false), &request)
+            .await,
+        Status::OBJECT_NAME_NOT_FOUND,
+    );
 }
 
 /// MAXIMUM_ALLOWED is resolved by the provider, not expanded to blanket rights.

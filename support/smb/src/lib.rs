@@ -1735,6 +1735,7 @@ impl<B: FileSystem> Connection<B> {
         let mut names = BTreeSet::new();
         let mut maximal_access = None;
         let mut disk_id = false;
+        let mut security = None;
         for context in contexts {
             if !names.insert(context.name) {
                 return Err(Status::INVALID_PARAMETER);
@@ -1765,9 +1766,7 @@ impl<B: FileSystem> Connection<B> {
                 Some(CreateContextName::EA_BUFFER)
                     if request.disposition() == CreateDisposition::OPEN => {}
                 Some(CreateContextName::EA_BUFFER) => return Err(Status::EAS_NOT_SUPPORTED),
-                Some(CreateContextName::SECURITY_DESCRIPTOR)
-                    if request.disposition() == CreateDisposition::OPEN => {}
-                Some(CreateContextName::SECURITY_DESCRIPTOR) => return Err(Status::NOT_SUPPORTED),
+                Some(CreateContextName::SECURITY_DESCRIPTOR) => security = Some(context.data),
                 Some(CreateContextName::TIMEWARP)
                     if context.data.len() == size_of::<TimewarpContext>() =>
                 {
@@ -1839,6 +1838,7 @@ impl<B: FileSystem> Connection<B> {
                     disposition: request.create_disposition.get(),
                     options: options.into_bits(),
                     attributes: request.file_attributes.into_bits(),
+                    security,
                 },
                 context,
             )
@@ -2319,11 +2319,7 @@ impl<B: FileSystem> Connection<B> {
                     return Err(Status::ACCESS_DENIED);
                 }
                 let descriptor =
-                    security::SecurityDescriptor::decode(data).map_err(|error| match error {
-                        security::DecodeError::Sid => Status::INVALID_SID,
-                        security::DecodeError::Acl => Status::INVALID_ACL,
-                        security::DecodeError::Descriptor => Status::INVALID_SECURITY_DESCR,
-                    })?;
+                    security::SecurityDescriptor::decode(data).map_err(Status::from)?;
                 self.server
                     .backend
                     .set_security(&file.file, information, &descriptor, context)

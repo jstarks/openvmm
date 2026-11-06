@@ -436,8 +436,12 @@ fn default_security(directory: bool) -> SecurityDescriptor {
 fn inherited_security(
     parent: &SecurityDescriptor,
     directory: bool,
+    owner: &Sid,
+    group: &Sid,
 ) -> Result<SecurityDescriptor, Status> {
     let mut descriptor = default_security(directory);
+    descriptor.owner = Some(owner.clone());
+    descriptor.group = Some(group.clone());
     let AclState::Present(acl) = &parent.dacl else {
         return Ok(descriptor);
     };
@@ -456,8 +460,10 @@ fn inherited_security(
             && (ace.flags.object_inherit() || ace.flags.container_inherit());
         let mut mapped = ace.clone();
         mapped.mask = crate::provider::map_access(ace.mask);
-        if ace.sid == creator_owner || ace.sid == creator_group {
-            mapped.sid = system_sid();
+        if ace.sid == creator_owner {
+            mapped.sid = owner.clone();
+        } else if ace.sid == creator_group {
+            mapped.sid = group.clone();
         }
         // Effective ACEs specialize generic information; container templates
         // retain it for the next generation.
@@ -480,6 +486,127 @@ fn inherited_security(
         descriptor.dacl =
             AclState::Present(Acl::access(&entries).map_err(|_| Status::INSUFFICIENT_RESOURCES)?);
         descriptor.control.set_dacl_auto_inherited(true);
+    }
+    Ok(descriptor)
+}
+
+fn validate_security(
+    descriptor: &SecurityDescriptor,
+    information: SecurityInformation,
+) -> Result<(), Status> {
+    let supported = SecurityInformation::new()
+        .with_owner(true)
+        .with_group(true)
+        .with_dacl(true)
+        .into_bits();
+    if information.into_bits() & !supported != 0
+        || descriptor.control.server_security()
+        || descriptor.control.dacl_trusted()
+        || descriptor.control.dacl_auto_inherit_required()
+    {
+        return Err(Status::NOT_SUPPORTED);
+    }
+    if information.owner() && descriptor.owner.as_ref() != Some(&system_sid()) {
+        return Err(Status::INVALID_OWNER);
+    }
+    if information.group() && descriptor.group.is_none() {
+        return Err(Status::INVALID_PRIMARY_GROUP);
+    }
+    if information.dacl() {
+        if let AclState::Present(acl) = &descriptor.dacl {
+            for ace in acl.entries() {
+                let ace = ace.access().ok_or(Status::NOT_SUPPORTED)?;
+                if ace.flags.into_bits() & 0xe0 != 0
+                    || crate::provider::map_access(ace.mask)
+                        & !AccessMask::FILE_ALL_ACCESS.into_bits()
+                        != 0
+                {
+                    return Err(Status::NOT_SUPPORTED);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn creation_security(
+    parent: &SecurityDescriptor,
+    directory: bool,
+    bytes: &[u8],
+) -> Result<SecurityDescriptor, Status> {
+    let mut descriptor = SecurityDescriptor::decode(bytes).map_err(Status::from)?;
+    descriptor.owner.get_or_insert_with(system_sid);
+    descriptor.group.get_or_insert_with(system_sid);
+    validate_security(
+        &descriptor,
+        SecurityInformation::new()
+            .with_owner(true)
+            .with_group(true)
+            .with_dacl(true),
+    )?;
+    if descriptor.sacl != AclState::Absent {
+        return Err(Status::NOT_SUPPORTED);
+    }
+    let owner = descriptor.owner.as_ref().expect("owner was defaulted");
+    let group = descriptor.group.as_ref().expect("group was defaulted");
+    let inherited = inherited_security(parent, directory, owner, group)?;
+    let protected = descriptor.control.dacl_protected();
+    if descriptor.dacl == AclState::Absent {
+        if protected {
+            descriptor.dacl = default_security(directory).dacl;
+        } else {
+            descriptor.dacl = inherited.dacl;
+            descriptor
+                .control
+                .set_dacl_auto_inherited(inherited.control.dacl_auto_inherited());
+        }
+        return Ok(descriptor);
+    }
+    let mut entries = Vec::new();
+    let creator_owner = Sid::new([0, 0, 0, 0, 0, 3], &[0]).expect("well-known SID");
+    let creator_group = Sid::new([0, 0, 0, 0, 0, 3], &[1]).expect("well-known SID");
+    if let AclState::Present(acl) = &descriptor.dacl {
+        for ace in acl.entries() {
+            let mut ace = ace.access().expect("creation policy was validated");
+            if ace.flags.inherited() && !protected {
+                continue;
+            }
+            ace.flags.set_inherited(false);
+            let mut mapped = ace.clone();
+            if !ace.flags.inherit_only() {
+                mapped.mask = crate::provider::map_access(ace.mask);
+                if ace.sid == creator_owner {
+                    mapped.sid = owner.clone();
+                } else if ace.sid == creator_group {
+                    mapped.sid = group.clone();
+                }
+            }
+            if directory
+                && !ace.flags.inherit_only()
+                && (ace.flags.object_inherit() || ace.flags.container_inherit())
+                && (mapped.mask != ace.mask || mapped.sid != ace.sid)
+            {
+                mapped.flags = AceFlags::new();
+                entries.push(mapped);
+                ace.flags.set_inherit_only(true);
+                entries.push(ace);
+            } else {
+                entries.push(mapped);
+            }
+        }
+    }
+    if !protected && inherited.control.dacl_auto_inherited() {
+        if let AclState::Present(acl) = inherited.dacl {
+            entries.extend(
+                acl.entries()
+                    .map(|ace| ace.access().expect("supported inherited ACL")),
+            );
+        }
+        descriptor.control.set_dacl_auto_inherited(true);
+    }
+    if !entries.is_empty() || matches!(descriptor.dacl, AclState::Present(_)) {
+        descriptor.dacl =
+            AclState::Present(Acl::access(&entries).map_err(|_| Status::INSUFFICIENT_RESOURCES)?);
     }
     Ok(descriptor)
 }
@@ -752,7 +879,7 @@ impl FileSystem for MemoryFs {
     async fn open(
         &self,
         name: &str,
-        options: OpenOptions,
+        options: OpenOptions<'_>,
         _request: &RequestContext,
     ) -> Result<(MemoryFile, u32), Status> {
         let mut options = options;
@@ -860,7 +987,15 @@ impl FileSystem for MemoryFs {
                 return Err(Status::DISK_FULL);
             }
             let directory = options.options().directory_file();
-            let security = inherited_security(&state.nodes[&parent].security, directory)?;
+            let security = match options.security {
+                Some(bytes) => creation_security(&state.nodes[&parent].security, directory, bytes)?,
+                None => inherited_security(
+                    &state.nodes[&parent].security,
+                    directory,
+                    &system_sid(),
+                    &system_sid(),
+                )?,
+            };
             let id = state.next_id;
             state.next_id = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
             let now = nt_time();
@@ -1204,38 +1339,7 @@ impl FileSystem for MemoryFs {
         }
         let user_set_change_time = open.user_set_change_time;
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
-        let supported = SecurityInformation::new()
-            .with_owner(true)
-            .with_group(true)
-            .with_dacl(true)
-            .into_bits();
-        if information.into_bits() & !supported != 0
-            || descriptor.control.server_security()
-            || descriptor.control.dacl_trusted()
-            || descriptor.control.dacl_auto_inherit_required()
-        {
-            return Err(Status::NOT_SUPPORTED);
-        }
-        if information.owner() && descriptor.owner.as_ref() != Some(&system_sid()) {
-            return Err(Status::INVALID_OWNER);
-        }
-        if information.group() && descriptor.group.is_none() {
-            return Err(Status::INVALID_PRIMARY_GROUP);
-        }
-        if information.dacl() {
-            if let AclState::Present(acl) = &descriptor.dacl {
-                for ace in acl.entries() {
-                    let ace = ace.access().ok_or(Status::NOT_SUPPORTED)?;
-                    if ace.flags.into_bits() & 0xe0 != 0
-                        || crate::provider::map_access(ace.mask)
-                            & !AccessMask::FILE_ALL_ACCESS.into_bits()
-                            != 0
-                    {
-                        return Err(Status::NOT_SUPPORTED);
-                    }
-                }
-            }
-        }
+        validate_security(descriptor, information)?;
         if information.owner() {
             node.security.owner.clone_from(&descriptor.owner);
             node.security
@@ -1846,6 +1950,125 @@ mod tests {
     struct ContractFixture(MemoryFs);
 
     #[test]
+    fn creation_security_specializes_explicit_creator_templates_and_rejects_sacls() {
+        block_on(async {
+            let fs = MemoryFs::new(1024, 16);
+            let context = RequestContext::new(1);
+            let world = Sid::new([0, 0, 0, 0, 0, 1], &[0]).unwrap();
+            let creator_group = Sid::new([0, 0, 0, 0, 0, 3], &[1]).unwrap();
+            let mut descriptor = SecurityDescriptor::empty();
+            descriptor.group = Some(world.clone());
+            descriptor.control.set_dacl_protected(true);
+            descriptor.dacl = AclState::Present(
+                Acl::access(&[
+                    AccessAce {
+                        deny: false,
+                        flags: AceFlags::new(),
+                        mask: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                        sid: world.clone(),
+                    },
+                    AccessAce {
+                        deny: false,
+                        flags: AceFlags::new()
+                            .with_object_inherit(true)
+                            .with_container_inherit(true),
+                        mask: AccessMask::new().with_generic_read(true).into_bits(),
+                        sid: creator_group.clone(),
+                    },
+                ])
+                .unwrap(),
+            );
+            let encoded = descriptor.encode();
+            let options = OpenOptions {
+                access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                share_access: 7,
+                disposition: 2,
+                options: 1,
+                attributes: 0,
+                security: Some(encoded.as_slice()),
+            };
+            let (directory, _) = fs.open("explicit", options, &context).await.unwrap();
+            let actual = fs
+                .query_security(
+                    &directory,
+                    SecurityInformation::new().with_group(true).with_dacl(true),
+                    &context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(actual.group, Some(world.clone()));
+            let AclState::Present(acl) = actual.dacl else {
+                panic!("missing explicit ACL")
+            };
+            let entries: Vec<_> = acl.entries().map(|ace| ace.access().unwrap()).collect();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries[1].sid, world);
+            assert_eq!(entries[1].mask, AccessMask::FILE_GENERIC_READ.into_bits());
+            assert!(!entries[1].flags.object_inherit());
+            assert_eq!(entries[2].sid, creator_group);
+            assert!(entries[2].flags.inherit_only());
+            let (file, _) = fs
+                .open(
+                    "explicit\\file",
+                    OpenOptions {
+                        options: 0,
+                        security: None,
+                        ..options
+                    },
+                    &context,
+                )
+                .await
+                .unwrap();
+            fs.write(&file, 0, b"created", &context).await.unwrap();
+            let read = OpenOptions {
+                access: 1,
+                disposition: 1,
+                options: 0,
+                security: None,
+                ..options
+            };
+            let (reopened, _) = fs.open("explicit\\file", read, &context).await.unwrap();
+            assert_eq!(
+                fs.read(&reopened, 0, 7, &context).await.unwrap(),
+                b"created"
+            );
+            assert_eq!(
+                fs.open(
+                    "explicit\\file",
+                    OpenOptions { access: 2, ..read },
+                    &context
+                )
+                .await
+                .err(),
+                Some(Status::ACCESS_DENIED)
+            );
+            descriptor.sacl = AclState::Null;
+            let rejected = descriptor.encode();
+            assert_eq!(
+                fs.open(
+                    "sacl",
+                    OpenOptions {
+                        options: 0,
+                        security: Some(&rejected),
+                        ..options
+                    },
+                    &context
+                )
+                .await
+                .err(),
+                Some(Status::NOT_SUPPORTED)
+            );
+            assert_eq!(
+                fs.open("sacl", read, &context).await.err(),
+                Some(Status::OBJECT_NAME_NOT_FOUND)
+            );
+            for file in [reopened, file, directory] {
+                fs.close(&file, &context).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn inherited_creator_templates_preserve_generic_information_for_descendants() {
         for rid in [0, 1] {
             let creator = Sid::new([0, 0, 0, 0, 0, 3], &[rid]).unwrap();
@@ -1863,7 +2086,8 @@ mod tests {
                 }])
                 .unwrap(),
             );
-            let directory = inherited_security(&parent, true).unwrap();
+            let directory =
+                inherited_security(&parent, true, &system_sid(), &system_sid()).unwrap();
             let AclState::Present(acl) = &directory.dacl else {
                 panic!("missing inherited ACL")
             };
@@ -1878,7 +2102,8 @@ mod tests {
             assert_eq!(entries[1].sid, creator);
             assert_eq!(entries[1].mask, generic);
             assert!(entries[1].flags.inherit_only() && entries[1].flags.inherited());
-            let child = inherited_security(&directory, false).unwrap();
+            let child =
+                inherited_security(&directory, false, &system_sid(), &system_sid()).unwrap();
             let AclState::Present(acl) = child.dacl else {
                 panic!("missing inherited ACL")
             };
@@ -1906,6 +2131,7 @@ mod tests {
                 file_acl_updates: Feature::Supported,
                 directory_acl_updates: Feature::Supported,
                 acl_inheritance: Feature::Supported,
+                security_creation: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -1976,6 +2202,11 @@ mod tests {
     }
 
     #[test]
+    fn contract_security_creation() {
+        run_contract(contracts::security_creation);
+    }
+
+    #[test]
     fn contract_allocation_reservations() {
         run_contract(contracts::allocation_reservations);
     }
@@ -2041,6 +2272,7 @@ mod tests {
                 disposition: CreateDisposition::CREATE.0,
                 options: 0,
                 attributes: 0,
+                security: None,
             };
             let (source, _) = fs.open("source", options, &request).await.unwrap();
             let (target, _) = fs.open("target", options, &request).await.unwrap();
@@ -2140,6 +2372,7 @@ mod tests {
                 disposition: CreateDisposition::OPEN_IF.0,
                 options: CreateOptions::new().with_directory_file(true).into_bits(),
                 attributes: 0,
+                security: None,
             };
             let (watched, _) = fs.open("generation", options, &context).await.unwrap();
             let (deleting, _) = fs.open("generation", options, &context).await.unwrap();
@@ -2230,6 +2463,7 @@ mod tests {
                 disposition: CreateDisposition::OPEN.0,
                 options: 0,
                 attributes: 0,
+                security: None,
             };
             let filter = NotifyFilter::new().with_file_name(true);
             let mut opens = Vec::new();
@@ -2268,6 +2502,7 @@ mod tests {
                 disposition: CreateDisposition::CREATE.0,
                 options: 0,
                 attributes: 0,
+                security: None,
             };
             let (first, _) = fs.open("first", options, &request).await.unwrap();
             fs.write(&first, 0, &[1; 64], &request).await.unwrap();

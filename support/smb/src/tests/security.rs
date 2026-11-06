@@ -303,6 +303,7 @@ fn security_update_gates_preserve_cancellation_and_backend_rejection() {
                     disposition: 2,
                     options: 0,
                     attributes: 0,
+                    security: None,
                 },
                 &context,
             )
@@ -507,6 +508,7 @@ fn late_security_update_cancellation_retains_applied_policy() {
             disposition: 2,
             options: 0,
             attributes: 0,
+            security: None,
         };
         let (file, _) = fs.open("acl", options, &context).await.unwrap();
         control
@@ -625,6 +627,73 @@ fn directory_acl_updates_control_traversal_creation_and_parent_fallbacks() {
         client.close(reopened).await;
         client.close(child).await;
         client.close(directory).await;
+    });
+}
+
+#[test]
+fn creation_security_gates_keep_new_object_policy_set_before_result_delivery() {
+    use crate::security::Acl;
+    use crate::test_support::{ControlledFs, Gate, Operation, Plan};
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        control
+            .set_plan(
+                Operation::OpenSecurity,
+                Plan {
+                    hold_before: true,
+                    hold_after: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let mut descriptor = SecurityDescriptor::empty();
+        descriptor.control.set_dacl_protected(true);
+        descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+        let bytes = descriptor.encode();
+        let options = OpenOptions {
+            access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+            share_access: 7,
+            disposition: 2,
+            options: 0,
+            attributes: 0,
+            security: Some(&bytes),
+        };
+        let context = RequestContext::new(1);
+        let mut future = std::pin::pin!(fs.open("secured", options, &context));
+        assert!(futures::poll!(&mut future).is_pending());
+        let call = control.next_call().await;
+        assert_eq!(call.operation, Operation::OpenSecurity);
+        let read = OpenOptions {
+            access: 1,
+            disposition: 1,
+            security: None,
+            ..options
+        };
+        assert_eq!(
+            fs.open("secured", read, &RequestContext::new(2))
+                .await
+                .err(),
+            Some(Status::OBJECT_NAME_NOT_FOUND)
+        );
+        control.release(call.id, Gate::Before).unwrap();
+        assert!(futures::poll!(&mut future).is_pending());
+        assert_eq!(
+            fs.open("secured", read, &RequestContext::new(3))
+                .await
+                .err(),
+            Some(Status::ACCESS_DENIED)
+        );
+        context.cancel();
+        control.release(call.id, Gate::After).unwrap();
+        let (file, _) = future.await.unwrap();
+        assert_eq!(
+            fs.metadata(&file, &RequestContext::new(4))
+                .await
+                .unwrap()
+                .granted_access,
+            AccessMask::FILE_ALL_ACCESS.into_bits()
+        );
+        fs.close(&file, &RequestContext::new(5)).await.unwrap();
     });
 }
 

@@ -148,11 +148,16 @@ the synthetic token's default DACL is used. Creation retains the requested grant
 even when the newly assigned ACL denies subsequent opens (MS-FSA 2.1.5.1.1).
 The effective/template split follows the public
 [ACE inheritance rules](https://learn.microsoft.com/en-us/windows/win32/secauthz/ace-inheritance-rules).
-Automatic reinheritance requests, CREATE security contexts, SACLs, advanced ACEs
-and security selectors are still unsupported.
+CREATE security descriptors travel in borrowed OpenOptions input and are decoded
+only for new objects under the provider's namespace lock. Explicit/protected and
+parent-inherited basic ACLs are assembled before publication, never by opening
+then setting security. Existing objects ignore the bytes even for OPEN_IF.
+Malformed/unsupported new descriptors fail without creating an object.
+Automatic reinheritance requests, SACLs, advanced ACEs and security selectors
+are still unsupported.
 Maximum grants check each individual right with
 the same ordered DACL policy as explicit requests (MS-FSA 2.1.5.1.2.1).
-No persistent-ACL capability is advertised while CREATE security is incomplete.
+The persistent-ACL capability remains off pending broader security interoperability.
 SET_SECURITY is routed through an optional provider operation after open-right
 checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.
 Providers must apply selected components atomically and enforce their policy on
@@ -534,7 +539,7 @@ subset of QUERY_INFO/SET_INFO, plus ECHO. CREATE validates linked context
 containers and returns maximal-access (`MxAc`) and on-disk-ID (`QFid`) responses.
 Unsupported preallocation, durable-handle requests, and leases are explicitly
 declined without response contexts. EA creation returns `STATUS_EAS_NOT_SUPPORTED`;
-security descriptors and snapshots remain unsupported.
+snapshots remain unsupported; security descriptors are applied atomically on creation.
 
 Basic-information updates support DOS attributes and per-open timestamp
 controls, including zero/no-change and -1/-2 automatic-update suppression/reset.

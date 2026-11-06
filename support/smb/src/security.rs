@@ -24,6 +24,16 @@ pub enum DecodeError {
     Descriptor,
 }
 
+impl From<DecodeError> for Status {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Sid => Self::INVALID_SID,
+            DecodeError::Acl => Self::INVALID_ACL,
+            DecodeError::Descriptor => Self::INVALID_SECURITY_DESCR,
+        }
+    }
+}
+
 /// A validated SID packet, independent of OS handles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sid(Vec<u8>);

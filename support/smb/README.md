@@ -9,6 +9,36 @@ raw NTLM token exchange accommodates test clients without authenticating or
 verifying credentials. This must not be used as a network authentication
 service. The example binds only to loopback.
 
+## Compatibility Checklist
+
+This is the current SMB 2.1, writable MemoryFs test profile, not a claim of
+Windows guest compatibility. "Implemented" means the listed behavior has direct
+tests; selected Samba cases provide additional independent evidence, not proof
+that an entire suite passes. Provider-optional features must be rejected honestly
+when unavailable. Their absence does not establish that a future vSMB guest
+will not need them.
+
+| Area | Required behavior in this profile | Evidence and remaining checks |
+|------|-----------------------------------|-------------------------------|
+| Sessions and trees | Guest setup, scoped trees, disconnect/logoff and cleanup | Implemented; `smb2.connect`, `smb2.tcon`, lifecycle regressions |
+| CREATE and data I/O | Sharing, access grants, dispositions, EOF, short I/O, flush and close | Implemented; selected CREATE/read/write/mkdir cases and provider contracts |
+| Compounds and credits | Bounded admission, inherited identities, error propagation, pending replies and cancellation | Implemented; selected compound/async cases; retain committed CLOSE and compound-tail policies |
+| File metadata | Supported query classes, attributes/timestamps, allocation, EOF, mode and position | Implemented subset; broaden applicable getinfo/setinfo cases and classify unsupported-class dependencies |
+| Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7 implemented; broader fixtures may require quota/object-ID/sector classes outside this profile |
+| Namespace and enumeration | Directory continuation, rename/move, sharing, replacement and deletion | Implemented subset; broaden directory/rename cases; no generated short names or hard links |
+| Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
+| Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Seventeen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
+| Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Four selected ACL cases plus direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
+| EAs and named streams | Explicit unsupported storage profile, validation and access checks | Neither capability advertised; no fabricated empty-success replies; fixtures requiring storage are not passes |
+| Caching and IOCTLs | Explicit uncached profile and validated unsupported controls | No oplock/lease grants; ACK/error/identity/bounds/credit regressions; no successful FSCTL operations |
+| Naming | Share-relative namespace and canonical paths | ASCII-insensitive lookup; full Unicode folding, dot-component normalization and short-name generation remain limitations |
+| Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
+
+Compatibility work proceeds by selecting applicable Samba cases, checking any
+mismatch against public specifications, and adding small deterministic Rust
+regressions before fixing the behavior. Stateful fuzzing and a broader hardening
+harness are deferred; they are not represented as completed validation.
+
 ## Run
 
 ```bash

@@ -471,6 +471,15 @@ fn rejected_file_security_updates_are_atomic_and_directory_policy_is_explicit() 
         client.query(attributes, 4).await;
         client.close(attributes).await;
         let directory = client.open("directory", 2, 1).await;
+        descriptor.dacl = AclState::Present(
+            Acl::access(&[AccessAce {
+                deny: false,
+                flags: AceFlags::new().with_object_inherit(true),
+                mask: read,
+                sid: Sid::new([0, 0, 0, 0, 0, 1], &[0]).unwrap(),
+            }])
+            .unwrap(),
+        );
         assert_eq!(
             response_status(
                 &client
@@ -538,6 +547,83 @@ fn late_security_update_cancellation_retains_applied_policy() {
             descriptor.dacl
         );
         fs.close(&file, &RequestContext::new(103)).await.unwrap();
+    });
+}
+
+#[test]
+fn directory_acl_updates_control_traversal_creation_and_parent_fallbacks() {
+    use crate::security::{AccessAce, Acl, Sid};
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let directory = client.open("directory", 2, 1).await;
+        let child = client.open("directory\\child", 2, 0).await;
+        let mut descriptor = SecurityDescriptor::empty();
+        descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+        client
+            .ok(Command::SET_INFO, &set(child, 4, &descriptor.encode()))
+            .await;
+        client
+            .ok(Command::SET_INFO, &set(directory, 4, &descriptor.encode()))
+            .await;
+        assert_eq!(
+            response_status(&client.open_result("directory\\child", 1, 7, 1, 0).await),
+            Status::ACCESS_DENIED
+        );
+        assert_eq!(
+            response_status(&client.open_result("directory\\new", 1, 7, 2, 0).await),
+            Status::ACCESS_DENIED
+        );
+        let world = Sid::new([0, 0, 0, 0, 0, 1], &[0]).unwrap();
+        descriptor.dacl = AclState::Present(
+            Acl::access(&[AccessAce {
+                deny: false,
+                flags: AceFlags::new(),
+                sid: world,
+                mask: AccessMask::new().with_execute(true).into_bits(),
+            }])
+            .unwrap(),
+        );
+        client
+            .ok(Command::SET_INFO, &set(directory, 4, &descriptor.encode()))
+            .await;
+        for access in [
+            AccessMask::new().with_read_attributes(true).into_bits(),
+            AccessMask::new().with_delete(true).into_bits(),
+        ] {
+            assert_eq!(
+                response_status(
+                    &client
+                        .open_result("directory\\child", access, 7, 1, 0)
+                        .await
+                ),
+                Status::ACCESS_DENIED
+            );
+        }
+        assert_eq!(
+            response_status(&client.open_result("directory\\new", 1, 7, 2, 0).await),
+            Status::ACCESS_DENIED
+        );
+        descriptor.dacl = AclState::Null;
+        client
+            .ok(Command::SET_INFO, &set(directory, 4, &descriptor.encode()))
+            .await;
+        let response = client
+            .open_result(
+                "directory\\child",
+                AccessMask::new()
+                    .with_read_attributes(true)
+                    .with_delete(true)
+                    .into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        let reopened = read_body::<CreateResponse>(&response).unwrap().file_id;
+        client.close(reopened).await;
+        client.close(child).await;
+        client.close(directory).await;
     });
 }
 

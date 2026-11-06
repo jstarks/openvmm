@@ -324,12 +324,8 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     components.reverse();
     metadata.path = format!("\\{}", components.join("\\"));
     metadata.number_of_links = u32::from(!metadata.delete_pending);
-    metadata.maximal_access = maximal_access(&state.nodes[&id]);
+    metadata.maximal_access = allowed_access(state, id);
     Ok(metadata)
-}
-
-fn maximal_access(node: &Node) -> u32 {
-    allowed_access(node)
 }
 
 fn system_sid() -> Sid {
@@ -340,11 +336,11 @@ fn owner_rights_sid() -> Sid {
     Sid::new([0, 0, 0, 0, 0, 3], &[4]).expect("well-known SID")
 }
 
-fn allowed_access(node: &Node) -> u32 {
+fn acl_access(security: &SecurityDescriptor) -> u32 {
     let all = AccessMask::FILE_ALL_ACCESS.into_bits();
     let mut granted = all;
-    if let AclState::Present(acl) = &node.security.dacl {
-        let owner = node.security.owner.as_ref() == Some(&system_sid());
+    if let AclState::Present(acl) = &security.dacl {
+        let owner = security.owner.as_ref() == Some(&system_sid());
         let owner_rights = owner_rights_sid();
         let implicit_owner = owner
             && !acl.entries().any(|ace| {
@@ -383,13 +379,17 @@ fn allowed_access(node: &Node) -> u32 {
         }
         granted = implicit | (granted & !denied);
     }
-    // Directory security updates are unsupported; every parent retains its
-    // default DELETE_CHILD and LIST_DIRECTORY grants, independently authorizing
-    // child DELETE and READ_ATTRIBUTES (MS-FSA §2.1.5.1.2.1).
-    if !node.metadata.is_directory() {
+    granted & all
+}
+
+fn allowed_access(state: &State, id: u64) -> u32 {
+    let node = &state.nodes[&id];
+    let mut granted = acl_access(&node.security);
+    if node.parent != id {
+        let parent = AccessMask::from_bits(acl_access(&state.nodes[&node.parent].security));
         granted |= AccessMask::new()
-            .with_delete(true)
-            .with_read_attributes(true)
+            .with_delete(parent.delete_child())
+            .with_read_attributes(parent.read_data())
             .into_bits();
     }
     if node.metadata.attributes().readonly() {
@@ -398,7 +398,16 @@ fn allowed_access(node: &Node) -> u32 {
             .with_append_data(true)
             .into_bits();
     }
-    granted & all
+    granted
+}
+
+fn can_add(state: &State, parent: u64, directory: bool) -> bool {
+    let access = AccessMask::from_bits(acl_access(&state.nodes[&parent].security));
+    if directory {
+        access.append_data()
+    } else {
+        access.write_data()
+    }
 }
 
 fn default_security(directory: bool) -> SecurityDescriptor {
@@ -452,6 +461,9 @@ fn has_children(state: &State, node: u64) -> bool {
 fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
     let mut parent = 1;
     for part in parts {
+        if !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute() {
+            return Err(Status::ACCESS_DENIED);
+        }
         parent = child(state, parent, part).ok_or(Status::OBJECT_PATH_NOT_FOUND)?;
         if !state.nodes[&parent].metadata.is_directory() {
             return Err(Status::NOT_A_DIRECTORY);
@@ -696,6 +708,11 @@ impl FileSystem for MemoryFs {
         let parts = components(name)?;
         let mut state = self.0.lock();
         let parent = resolve_directory(&state, &parts[..parts.len().saturating_sub(1)])?;
+        if !parts.is_empty()
+            && !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute()
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
         let existing = match parts.last() {
             Some(name) => child(&state, parent, name),
             None => Some(1),
@@ -719,7 +736,7 @@ impl FileSystem for MemoryFs {
             if options.options().non_directory_file() && node.metadata.is_directory() {
                 return Err(Status::FILE_IS_A_DIRECTORY);
             }
-            options.access = grant_access(allowed_access(node), options.access, delete)?;
+            options.access = grant_access(allowed_access(&state, id), options.access, delete)?;
             if node.metadata.attributes().readonly()
                 && (options.access().write_data() || options.access().append_data() || delete)
             {
@@ -779,6 +796,9 @@ impl FileSystem for MemoryFs {
                 CreateDisposition::OPEN | CreateDisposition::OVERWRITE
             ) {
                 return Err(Status::OBJECT_NAME_NOT_FOUND);
+            }
+            if !can_add(&state, parent, options.options().directory_file()) {
+                return Err(Status::ACCESS_DENIED);
             }
             options.access = grant_access(
                 AccessMask::FILE_ALL_ACCESS.into_bits(),
@@ -921,6 +941,11 @@ impl FileSystem for MemoryFs {
         if parent == old_parent && source.metadata.name == *new_name {
             return Ok(());
         }
+        if !AccessMask::from_bits(acl_access(&state.nodes[&parent].security)).execute()
+            || !can_add(&state, parent, directory)
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
         let target = child(&state, parent, new_name).filter(|&id| id != file.node);
         let exact_target = target.is_some_and(|id| state.nodes[&id].metadata.name == *new_name);
         if let Some(target) = target {
@@ -933,6 +958,9 @@ impl FileSystem for MemoryFs {
             }
             if metadata.delete_pending {
                 return Err(Status::DELETE_PENDING);
+            }
+            if !AccessMask::from_bits(allowed_access(&state, target)).delete() {
+                return Err(Status::ACCESS_DENIED);
             }
             if state.opens.values().any(|open| open.node == target) {
                 return Err(Status::ACCESS_DENIED);
@@ -1129,8 +1157,7 @@ impl FileSystem for MemoryFs {
             .with_group(true)
             .with_dacl(true)
             .into_bits();
-        if node.metadata.is_directory()
-            || information.into_bits() & !supported != 0
+        if information.into_bits() & !supported != 0
             || descriptor.control.server_security()
             || descriptor.control.dacl_trusted()
             || descriptor.control.dacl_auto_inherit_required()
@@ -1147,6 +1174,11 @@ impl FileSystem for MemoryFs {
             if let AclState::Present(acl) = &descriptor.dacl {
                 for ace in acl.entries() {
                     let ace = ace.access().ok_or(Status::NOT_SUPPORTED)?;
+                    if node.metadata.is_directory()
+                        && (ace.flags.object_inherit() || ace.flags.container_inherit())
+                    {
+                        return Err(Status::NOT_SUPPORTED);
+                    }
                     if ace.flags.into_bits() & 0xe0 != 0
                         || crate::provider::map_access(ace.mask)
                             & !AccessMask::FILE_ALL_ACCESS.into_bits()
@@ -1185,9 +1217,12 @@ impl FileSystem for MemoryFs {
                 .set_dacl_auto_inherited(descriptor.control.dacl_auto_inherited());
         }
         if information.into_bits() != 0 {
-            node.metadata.attributes = node.metadata.attributes().with_archive(true).into_bits();
-            if !user_set_change_time {
-                node.metadata.changed = nt_time();
+            if !node.metadata.is_directory() {
+                node.metadata.attributes =
+                    node.metadata.attributes().with_archive(true).into_bits();
+                if !user_set_change_time {
+                    node.metadata.changed = nt_time();
+                }
             }
             emit(
                 &mut state,
@@ -1777,6 +1812,7 @@ mod tests {
                 file_mode: Feature::Supported,
                 security_queries: Feature::Supported,
                 file_acl_updates: Feature::Supported,
+                directory_acl_updates: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -1834,6 +1870,11 @@ mod tests {
     #[test]
     fn contract_file_acl_updates() {
         run_contract(contracts::file_acl_updates);
+    }
+
+    #[test]
+    fn contract_directory_acl_updates() {
+        run_contract(contracts::directory_acl_updates);
     }
 
     #[test]

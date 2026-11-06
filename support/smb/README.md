@@ -138,12 +138,14 @@ identity. File OWNER/GROUP/DACL updates are atomic and affect future opens,
 not existing grants. Basic ordered allow/deny ACEs, generic masks, OWNER_RIGHTS,
 inherit-only ACEs and distinct null/empty DACLs are supported. Owner assignment
 is restricted to SYSTEM; group metadata may contain any valid SID.
-Directory security updates/inheritance, CREATE security contexts, SACLs,
-advanced ACEs and security selectors are still unsupported. All parents retain
-their default DELETE_CHILD / LIST_DIRECTORY access, independently authorizing
-child DELETE / READ_ATTRIBUTES. Maximum grants check each individual right with
+Directory DACL updates also govern traversal, child creation and rename
+destinations. Parent DELETE_CHILD / LIST_DIRECTORY rights independently authorize
+child DELETE / READ_ATTRIBUTES and are checked against the actual parent ACL.
+Inheritable directory ACEs, automatic inheritance, CREATE security contexts,
+SACLs, advanced ACEs and security selectors are still unsupported.
+Maximum grants check each individual right with
 the same ordered DACL policy as explicit requests (MS-FSA 2.1.5.1.2.1).
-No persistent-ACL capability is advertised until the directory policy is complete.
+No persistent-ACL capability is advertised until inheritance is complete.
 SET_SECURITY is routed through an optional provider operation after open-right
 checks and bounded descriptor decoding. The default rejects INVALID_DEVICE_REQUEST.
 Providers must apply selected components atomically and enforce their policy on

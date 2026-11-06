@@ -47,6 +47,9 @@ pub struct Expectations {
     pub security_queries: Feature,
     /// File DACL updates and future-open enforcement, without privilege bypass.
     pub file_acl_updates: Feature,
+    /// Directory DACL updates and namespace authorization, excluding inheritance.
+    /// Supporting fixtures also support file ACL updates and rename.
+    pub directory_acl_updates: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -338,6 +341,125 @@ pub async fn file_acl_updates<F: Fixture>(fixture: &F) {
         fs.close(&reopened, &request).await.unwrap();
     }
     fs.close(&file, &request).await.unwrap();
+}
+
+/// Directory DACL changes govern creation and rename destinations. Supporting
+/// fixtures also support rename; rejected operations leave the namespace intact.
+pub async fn directory_acl_updates<F: Fixture>(fixture: &F) {
+    use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
+    use crate::spec::{AceFlags, SecurityInformation};
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let directory = open(fs, "directory", CreateDisposition::CREATE, true, &request).await;
+    let source = open(fs, "source", CreateDisposition::CREATE, false, &request).await;
+    let mut descriptor = SecurityDescriptor::empty();
+    descriptor.control.set_dacl_protected(true);
+    descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+    let information = SecurityInformation::new().with_dacl(true);
+    if let Some(status) = unsupported(fixture.expectations().directory_acl_updates) {
+        rejected(
+            fs.set_security(&directory, information, &descriptor, &request)
+                .await,
+            status,
+        );
+    } else {
+        fs.set_security(&directory, information, &descriptor, &request)
+            .await
+            .unwrap();
+        rejected(
+            fs.open(
+                "directory\\new",
+                options(CreateDisposition::CREATE, false),
+                &request,
+            )
+            .await,
+            Status::ACCESS_DENIED,
+        );
+        rejected(
+            fs.open(
+                "directory\\subdirectory",
+                options(CreateDisposition::CREATE, true),
+                &request,
+            )
+            .await,
+            Status::ACCESS_DENIED,
+        );
+        rejected(
+            fs.rename(&source, "directory\\moved", false, &request)
+                .await,
+            Status::ACCESS_DENIED,
+        );
+        descriptor.dacl = AclState::Null;
+        fs.set_security(&directory, information, &descriptor, &request)
+            .await
+            .unwrap();
+        let file = open(
+            fs,
+            "directory\\new",
+            CreateDisposition::CREATE,
+            false,
+            &request,
+        )
+        .await;
+        fs.rename(&source, "directory\\moved", false, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.metadata(&source, &request).await.unwrap().path,
+            "\\directory\\moved"
+        );
+        let target_id = fs.metadata(&file, &request).await.unwrap().id;
+        descriptor.dacl = AclState::Present(Acl::access(&[]).unwrap());
+        fs.set_security(&file, information, &descriptor, &request)
+            .await
+            .unwrap();
+        fs.close(&file, &request).await.unwrap();
+        descriptor.dacl = AclState::Present(
+            Acl::access(&[AccessAce {
+                deny: false,
+                flags: AceFlags::new(),
+                mask: AccessMask::new()
+                    .with_execute(true)
+                    .with_write_data(true)
+                    .into_bits(),
+                sid: Sid::new([0, 0, 0, 0, 0, 1], &[0]).unwrap(),
+            }])
+            .unwrap(),
+        );
+        fs.set_security(&directory, information, &descriptor, &request)
+            .await
+            .unwrap();
+        rejected(
+            fs.rename(&source, "directory\\new", true, &request).await,
+            Status::ACCESS_DENIED,
+        );
+        assert_eq!(
+            fs.metadata(&source, &request).await.unwrap().path,
+            "\\directory\\moved"
+        );
+        let (target, _) = fs
+            .open(
+                "directory\\new",
+                OpenOptions {
+                    access: AccessMask::new().with_read_control(true).into_bits(),
+                    ..options(CreateDisposition::OPEN, false)
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fs.metadata(&target, &request).await.unwrap().id, target_id);
+        fs.close(&target, &request).await.unwrap();
+        descriptor.dacl = AclState::Null;
+        fs.set_security(&directory, information, &descriptor, &request)
+            .await
+            .unwrap();
+        fs.rename(&source, "directory\\new", true, &request)
+            .await
+            .unwrap();
+    }
+    fs.close(&source, &request).await.unwrap();
+    fs.close(&directory, &request).await.unwrap();
 }
 
 /// MAXIMUM_ALLOWED is resolved by the provider, not expanded to blanket rights.

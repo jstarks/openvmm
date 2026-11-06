@@ -1104,6 +1104,169 @@ fn per_open_rights_and_stale_file_ids_are_enforced() {
 }
 
 #[test]
+fn filename_wildcards_follow_dos_period_and_end_of_name_rules() {
+    for (name, pattern, expected) in [
+        ("", "", true),
+        ("", "*", false),
+        ("x", "", false),
+        ("plain", "*.*", true),
+        ("report.txt", "*.TXT", true),
+        ("report.txt", "*.bin", false),
+        ("report.txt", "**.txt", true),
+        ("report.txt", "report?txt", true),
+        ("a.b.c", "<.c", true),
+        ("a.b.c", "<c", true),
+        ("a.b.c", "<", false),
+        ("a.", "<", true),
+        ("file.ext", "file.<", true),
+        ("file.a.ext", "file.<", false),
+        ("a.txt", "a>>>.txt", true),
+        ("ab.txt", "a>>>.txt", true),
+        ("abcd.txt", "a>>>.txt", true),
+        ("abcde.txt", "a>>>.txt", false),
+        ("a", "a>", true),
+        ("a.", "a>", false),
+        ("a.", "a>\"", true),
+        ("name", "name\"", true),
+        ("name.", "name\"", true),
+        ("name..", "name\"", false),
+        ("\u{1f600}", "?", false),
+        ("\u{1f600}", "??", true),
+    ] {
+        assert_eq!(
+            name_matches(name, pattern),
+            expected,
+            "{name:?} {pattern:?}"
+        );
+    }
+}
+
+#[test]
+fn directory_search_accepts_standard_and_dos_wildcards() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let directory = client.open("patterns", 2, 1).await;
+        client.close(directory).await;
+        for name in ["report.txt", "other.bin", "plain"] {
+            let file = client.open(&format!("patterns\\{name}"), 2, 0).await;
+            client.close(file).await;
+        }
+        for (pattern, expected) in [
+            ("*.txt", Some("report.txt")),
+            ("REPORT.?xt", Some("report.txt")),
+            ("*PORT.TXT", Some("report.txt")),
+            ("report>.txt", Some("report.txt")),
+            ("<.txt", Some("report.txt")),
+            ("report\"txt", Some("report.txt")),
+            ("report.txt>>>", Some("report.txt")),
+            ("plain\"", Some("plain")),
+            ("plain>", Some("plain")),
+            ("p????", Some("plain")),
+            ("missing*", None),
+            ("plain?", None),
+        ] {
+            let directory = client.open("patterns", 1, 1).await;
+            let name = encode_name(pattern);
+            let mut query = QueryDirectoryRequest::new_zeroed();
+            query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+            query.file_id = directory;
+            query.info_class = FileInformationClass::NAMES.0;
+            query.flags = QueryDirectoryFlags::new().with_return_single_entry(true);
+            query.output_buffer_length = 256.into();
+            query.name_offset = (body_end::<QueryDirectoryRequest>() as u16).into();
+            query.name_length = (name.len() as u16).into();
+            let mut body = query.as_bytes().to_vec();
+            body.extend_from_slice(&name);
+            let response = client.send(Command::QUERY_DIRECTORY, &body).await;
+            if let Some(expected) = expected {
+                assert_eq!(response_status(&response), Status::SUCCESS, "{pattern}");
+                let record = FileNamesInformation::read_from_prefix(&response[72..])
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    decode_name(&response[84..84 + record.file_name_length.get() as usize])
+                        .unwrap(),
+                    expected
+                );
+            } else {
+                assert_eq!(
+                    response_status(&response),
+                    Status::NO_SUCH_FILE,
+                    "{pattern}"
+                );
+            }
+            assert_eq!(
+                response_status(&client.send(Command::QUERY_DIRECTORY, &body).await),
+                Status::NO_MORE_FILES,
+                "{pattern}"
+            );
+            client.close(directory).await;
+        }
+        let directory = client.open("patterns", 1, 1).await;
+        for (pattern, status) in [
+            ("sub\\*".to_owned(), Status::OBJECT_NAME_INVALID),
+            ("sub/*".to_owned(), Status::OBJECT_NAME_INVALID),
+            ("stream:*".to_owned(), Status::OBJECT_NAME_INVALID),
+            ("x".repeat(256), Status::NAME_TOO_LONG),
+            ("x".repeat(255), Status::NO_SUCH_FILE),
+        ] {
+            let mut query = QueryDirectoryRequest::new_zeroed();
+            query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+            query.file_id = directory;
+            query.info_class = FileInformationClass::NAMES.0;
+            query.flags = QueryDirectoryFlags::new().with_restart_scans(true);
+            query.output_buffer_length = 256.into();
+            query.name_offset = (body_end::<QueryDirectoryRequest>() as u16).into();
+            let name = encode_name(&pattern);
+            query.name_length = (name.len() as u16).into();
+            let mut body = query.as_bytes().to_vec();
+            body.extend_from_slice(&name);
+            assert_eq!(
+                response_status(&client.send(Command::QUERY_DIRECTORY, &body).await),
+                status
+            );
+        }
+        let source = client.open("patterns\\report.txt", 1, 0).await;
+        let mut query = QueryDirectoryRequest::new_zeroed();
+        query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+        query.file_id = directory;
+        query.info_class = FileInformationClass::NAMES.0;
+        query.flags = QueryDirectoryFlags::new().with_restart_scans(true);
+        query.output_buffer_length = 256.into();
+        query.name_offset = (body_end::<QueryDirectoryRequest>() as u16).into();
+        query.name_length = 8.into();
+        let mut body = query.as_bytes().to_vec();
+        body.extend_from_slice(&encode_name("new*"));
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_DIRECTORY, &body).await),
+            Status::NO_MORE_FILES
+        );
+        let mut rename = FileRenameInformation::new_zeroed();
+        let name = encode_name("patterns\\new-name");
+        rename.file_name_length = (name.len() as u32).into();
+        let mut input = rename.as_bytes().to_vec();
+        input.extend_from_slice(&name);
+        assert_eq!(
+            response_status(&client.set(source, 10, &input).await),
+            Status::SUCCESS
+        );
+        query.flags.set_restart_scans(false);
+        body[..size_of::<QueryDirectoryRequest>()].copy_from_slice(query.as_bytes());
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_DIRECTORY, &body).await),
+            Status::NO_MORE_FILES
+        );
+        query.flags.set_restart_scans(true);
+        body[..size_of::<QueryDirectoryRequest>()].copy_from_slice(query.as_bytes());
+        let response = client.ok(Command::QUERY_DIRECTORY, &body).await;
+        assert_eq!(&response[84..100], &encode_name("new-name"));
+        client.close(source).await;
+        client.close(directory).await;
+    });
+}
+
+#[test]
 fn directory_continuation_observes_live_entries_and_preserves_its_pattern() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

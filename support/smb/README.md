@@ -322,11 +322,28 @@ reset the cursor and pattern. FileIndex resumption is optional in MS-SMB2
 3.3.5.18; this profile returns zero indices and ignores INDEX_SPECIFIED while
 continuing normally. It does not advertise fabricated native index positions.
 
+Patterns follow MS-FSA 2.1.4.4: `*`, `?`, DOS_STAR (`<`), DOS_QM (`>`) and
+DOS_DOT (`"`), including `*.*` matching extensionless names. Matching operates
+on UTF-16 units and retains the current ASCII-only case-insensitive policy.
+Provider-supplied short names are matched too; none are fabricated. A first
+search with no matching entries returns NO_SUCH_FILE; continuation returns
+NO_MORE_FILES. Empty patterns select all names.
+
+Search patterns are limited to one 255-UTF-16-unit component in this core
+profile. Longer patterns return NAME_TOO_LONG; separators, streams and control
+characters are invalid. The matcher uses bounded prefix states, not recursive
+backtracking. Direct tests cover ordinary and DOS operators, periods/end of
+name, surrogate pairs, validation and continuation.
+
 Seven selected Samba directory cases cover ordinary and deleted-entry scans,
 700-file continuation/restart/reopen paths, changed attributes, unspecified
 ordering, 2000 long filenames, and enumeration across repeated renames.
 The short-name-dependent `one` and index-dependent `file-index` cases are not
 counted as passing coverage.
+The checkout-built source3 `smbclient` probe was blocked at session setup,
+before any wildcard request: it does not accept this raw unsigned-guest test
+exchange. That is a harness limitation, not passing wildcard interoperability
+evidence or a reason to add network authentication.
 
 ## Directory Change Notifications
 

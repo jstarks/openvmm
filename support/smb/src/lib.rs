@@ -79,6 +79,7 @@ pub(crate) const MAX_REQUESTS: usize = 32;
 pub const MAX_TRANSFER_SIZE: usize = 1024 * 1024;
 /// Implementation packet bound including fixed fields and context overhead.
 pub const MAX_MESSAGE_SIZE: usize = MAX_TRANSFER_SIZE + 1024;
+const MAX_SEARCH_PATTERN_LENGTH: usize = 255;
 const MAX_TREES: usize = 1024;
 const MAX_OPENS: usize = 1024;
 
@@ -520,6 +521,72 @@ fn directory_key(info: &Metadata) -> (u8, u64, &str) {
         _ => 2,
     };
     (order, info.id, &info.name)
+}
+
+// MS-FSA §2.1.4.4, using bounded UTF-16 prefix states rather than backtracking.
+fn name_matches(name: &str, pattern: &str) -> bool {
+    if name.is_empty() || pattern.is_empty() {
+        return name == pattern;
+    }
+    if pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    if !pattern.contains(['*', '?', '<', '>', '"']) {
+        return name.eq_ignore_ascii_case(pattern);
+    }
+    const STAR: u16 = b'*' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    const DOS_STAR: u16 = b'<' as u16;
+    const DOS_QUESTION: u16 = b'>' as u16;
+    const DOS_DOT: u16 = b'"' as u16;
+    const DOT: u16 = b'.' as u16;
+    let fold = |unit: u16| {
+        if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) {
+            unit - u16::from(b'a' - b'A')
+        } else {
+            unit
+        }
+    };
+    let name: Vec<_> = name.encode_utf16().map(fold).collect();
+    let last_dot = name.iter().rposition(|&unit| unit == DOT);
+    let mut previous = vec![false; name.len() + 1];
+    let mut next = vec![false; name.len() + 1];
+    previous[0] = true;
+    for token in pattern.encode_utf16().map(fold) {
+        next.fill(false);
+        let mut running = false;
+        for offset in 0..=name.len() {
+            match token {
+                STAR | DOS_STAR => {
+                    running |= previous[offset];
+                    next[offset] |= running;
+                    if offset < name.len() {
+                        next[offset + 1] |= running;
+                    }
+                    if token == DOS_STAR && last_dot == Some(offset) {
+                        running = false;
+                    }
+                }
+                DOS_QUESTION if offset == name.len() || name[offset] == DOT => {
+                    next[offset] |= previous[offset];
+                }
+                DOS_DOT if offset == name.len() => {
+                    next[offset] |= previous[offset];
+                }
+                _ if offset < name.len()
+                    && (token == QUESTION
+                        || token == DOS_QUESTION
+                        || (token == DOS_DOT && name[offset] == DOT)
+                        || token == name[offset]) =>
+                {
+                    next[offset + 1] |= previous[offset];
+                }
+                _ => {}
+            }
+        }
+        std::mem::swap(&mut previous, &mut next);
+    }
+    previous[name.len()]
 }
 
 fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<u8>, Status> {
@@ -2626,20 +2693,29 @@ impl<B: FileSystem> Connection<B> {
         if !file.access.read_data() {
             return Err(Status::ACCESS_DENIED);
         }
-        let restart = file.directory.lock().is_none() || flags.restart_scans() || flags.reopen();
-        if restart
-            && pattern != "*"
-            && pattern != "*.*"
-            && pattern.contains(['*', '?', '<', '>', '"'])
-        {
-            return Err(Status::NOT_SUPPORTED);
+        let first = file.directory.lock().is_none();
+        let restart = first || flags.restart_scans() || flags.reopen();
+        if restart {
+            if pattern.encode_utf16().count() > MAX_SEARCH_PATTERN_LENGTH {
+                return Err(Status::NAME_TOO_LONG);
+            }
+            if pattern
+                .chars()
+                .any(|character| character < ' ' || matches!(character, '\\' | '/' | ':' | '|'))
+            {
+                return Err(Status::OBJECT_NAME_INVALID);
+            }
         }
         let mut entries = self.server.backend.list(&file.file, context).await?;
         entries.sort_unstable_by(|left, right| directory_key(left).cmp(&directory_key(right)));
         let mut directory = file.directory.lock();
         if restart {
             *directory = Some(DirectorySearch {
-                pattern,
+                pattern: if pattern.is_empty() {
+                    "*".into()
+                } else {
+                    pattern
+                },
                 after: None,
                 cursor: 0,
             });
@@ -2649,13 +2725,23 @@ impl<B: FileSystem> Connection<B> {
         let mut out = Vec::new();
         let mut previous = None;
         for info in &entries {
-            if search.after.as_ref().is_some_and(|(order, id, name)| {
-                directory_key(info) <= (*order, *id, name.as_str())
-            }) || !(search.pattern.is_empty()
-                || search.pattern == "*"
-                || search.pattern == "*.*"
-                || info.name.eq_ignore_ascii_case(&search.pattern))
+            let (order, id, name) = directory_key(info);
+            if search
+                .after
+                .as_ref()
+                .is_some_and(|(after_order, after_id, after_name)| {
+                    (order, id, name) <= (*after_order, *after_id, after_name.as_str())
+                })
             {
+                continue;
+            }
+            if !(name_matches(&info.name, &search.pattern)
+                || info
+                    .short_name
+                    .as_ref()
+                    .is_some_and(|name| name_matches(name, &search.pattern)))
+            {
+                search.after = Some((order, id, name.to_owned()));
                 continue;
             }
             let name_length = info
@@ -2686,7 +2772,6 @@ impl<B: FileSystem> Connection<B> {
             out.extend_from_slice(&record);
             out.resize(start + entry_len, 0);
             previous = Some(start);
-            let (order, id, name) = directory_key(info);
             search.after = Some((order, id, name.to_owned()));
             search.cursor = search.cursor.saturating_add(1);
             if flags.return_single_entry() {
@@ -2694,7 +2779,11 @@ impl<B: FileSystem> Connection<B> {
             }
         }
         if out.is_empty() {
-            return Err(Status::NO_MORE_FILES);
+            return Err(if first {
+                Status::NO_SUCH_FILE
+            } else {
+                Status::NO_MORE_FILES
+            });
         }
         buffer_response(out, request.output_buffer_length.get())
     }

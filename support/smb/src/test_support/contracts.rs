@@ -1771,6 +1771,54 @@ pub async fn basic_information<F: Fixture>(fixture: &F) {
         fs.set_basic(
             &file,
             BasicInformation {
+                attributes: FileAttributes::new().with_readonly(true).into_bits(),
+                ..info
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+        rejected(
+            fs.set_delete_on_close(&file, true, &request).await,
+            Status::CANNOT_DELETE,
+        );
+        assert!(!fs.metadata(&file, &request).await.unwrap().delete_pending);
+        fs.set_delete_on_close(&file, false, &request)
+            .await
+            .unwrap();
+        let mode = OpenOptions {
+            options: CreateOptions::new().with_delete_on_close(true).into_bits(),
+            ..options(CreateDisposition::OPEN, false)
+        };
+        rejected(
+            fs.open("basic", mode, &request).await,
+            Status::CANNOT_DELETE,
+        );
+        rejected(
+            fs.open(
+                "readonly-mode",
+                OpenOptions {
+                    disposition: CreateDisposition::CREATE.0,
+                    attributes: FileAttributes::new().with_readonly(true).into_bits(),
+                    ..mode
+                },
+                &request,
+            )
+            .await,
+            Status::CANNOT_DELETE,
+        );
+        rejected(
+            fs.open(
+                "readonly-mode",
+                options(CreateDisposition::OPEN, false),
+                &request,
+            )
+            .await,
+            Status::OBJECT_NAME_NOT_FOUND,
+        );
+        fs.set_basic(
+            &file,
+            BasicInformation {
                 attributes: FileAttributes::new().with_normal(true).into_bits(),
                 ..info
             },
@@ -1781,6 +1829,7 @@ pub async fn basic_information<F: Fixture>(fixture: &F) {
         let after = fs.metadata(&file, &request).await.unwrap();
         assert!(!after.attributes().hidden());
         assert_eq!((after.id, after.size), (before.id, before.size));
+        fs.set_delete_on_close(&file, true, &request).await.unwrap();
     }
     fs.close(&file, &request).await.unwrap();
 }

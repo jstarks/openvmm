@@ -917,6 +917,9 @@ impl FileSystem for MemoryFs {
             if options.options().non_directory_file() && node.metadata.is_directory() {
                 return Err(Status::FILE_IS_A_DIRECTORY);
             }
+            if delete && node.metadata.attributes().readonly() {
+                return Err(Status::CANNOT_DELETE);
+            }
             let mut available = AccessMask::from_bits(allowed_access(&state, id));
             if options.access().maximum_allowed() && node.metadata.attributes().readonly() {
                 available.set_write_data(false);
@@ -925,7 +928,7 @@ impl FileSystem for MemoryFs {
             }
             options.access = grant_access(available.into_bits(), options.access, delete)?;
             if node.metadata.attributes().readonly()
-                && (options.access().write_data() || options.access().append_data() || delete)
+                && (options.access().write_data() || options.access().append_data())
             {
                 return Err(Status::ACCESS_DENIED);
             }
@@ -987,6 +990,9 @@ impl FileSystem for MemoryFs {
             }
             if !can_add(&state, parent, options.options().directory_file()) {
                 return Err(Status::ACCESS_DENIED);
+            }
+            if delete && options.attributes().readonly() {
+                return Err(Status::CANNOT_DELETE);
             }
             options.access = grant_access(
                 AccessMask::FILE_ALL_ACCESS.into_bits(),
@@ -1746,15 +1752,19 @@ impl FileSystem for MemoryFs {
         _request: &RequestContext,
     ) -> Result<(), Status> {
         let mut state = self.0.lock();
-        if delete && (file.node == 1 || has_children(&state, file.node)) {
-            return Err(Status::DIRECTORY_NOT_EMPTY);
-        }
-        let directory = state
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let metadata = &state
             .nodes
             .get(&file.node)
             .ok_or(Status::FILE_CLOSED)?
-            .metadata
-            .is_directory();
+            .metadata;
+        if delete && metadata.attributes().readonly() {
+            return Err(Status::CANNOT_DELETE);
+        }
+        let directory = metadata.is_directory();
+        if delete && (file.node == 1 || has_children(&state, file.node)) {
+            return Err(Status::DIRECTORY_NOT_EMPTY);
+        }
         let open = state.opens.get_mut(&file.open).ok_or(Status::FILE_CLOSED)?;
         open.notify_deleted |= delete && directory;
         if delete && directory {

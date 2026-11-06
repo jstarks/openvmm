@@ -74,11 +74,11 @@ per-open read rights, CREATE/open fixtures, and mkdir semantics. Unit tests driv
 sharing, deletion, quotas, malformed requests, and fragmented TCP frames.
 The harness also checks compound CREATE/write/close, invalid inherited file
 identity, and related/unrelated directory continuation.
-The CREATE/sharing harness adds fourteen cases covering locked-file opens,
+The CREATE/sharing harness adds sixteen cases covering locked-file opens,
 multiple connections, readonly deletion, leading-backslash rejection, invalid
 impersonation, concurrent/visible directory creation, directory allocation,
 temporary attributes, the no-stream profile, bilateral share modes and readonly
-maximum-access reporting.
+file/directory maximum-access reporting and readonly delete modes/dispositions.
 The feature-enabled async harness gates real provider reads, writes, and
 flushes on the server's poller. Its four async compound cases include READ/WRITE
 checks requiring pending replies, rather than only allowing synchronous fallback.
@@ -529,6 +529,10 @@ entries until their last open closes. A retained handle can continue using
 the object and clear its disposition; there is no separate irreversible
 "committed delete" flag. Clearing disposition does not clear an open's mode.
 Links, data, and quota are released only at actual final deletion.
+Readonly objects reject both delete-on-close opens and explicit true disposition
+with CANNOT_DELETE, without changing namespace or pending state. Clearing
+disposition remains allowed; clearing readonly permits a later delete retry.
+Creating a readonly object with delete-on-close fails before publication.
 
 A mode-bearing directory open has its own notify-deleted marker, but closing
 it while nonempty must not invalidate watches on other opens. The inspector

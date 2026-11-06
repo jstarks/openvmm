@@ -632,6 +632,225 @@ fn object_id_controls_create_real_shared_file_identity_with_boundaries() {
 }
 
 #[test]
+fn reparse_controls_store_real_guid_data_and_return_bounded_prefixes() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("reparse", 2, 0).await;
+        let mut input = vec![0x37, 0, 0, 0, 4, 0, 0xff, 0xff];
+        input.extend_from_slice(&[1; 16]);
+        input.extend_from_slice(b"data");
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl(file, 0x900a8, 64))
+                    .await
+            ),
+            Status(0xc0000275)
+        );
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x900a4, &input),
+            )
+            .await;
+        let tag = client.query(file, 35).await;
+        assert_eq!(&tag[72..76], &0x420u32.to_le_bytes());
+        assert_eq!(&tag[76..80], &0x37u32.to_le_bytes());
+        for maximum in [23, 24, 28] {
+            let response = client
+                .send(Command::IOCTL, &object_id_ioctl(file, 0x900a8, maximum))
+                .await;
+            assert_eq!(
+                response_status(&response),
+                if maximum < 24 {
+                    Status::BUFFER_TOO_SMALL
+                } else if maximum < 28 {
+                    Status::BUFFER_OVERFLOW
+                } else {
+                    Status::SUCCESS
+                }
+            );
+            if maximum >= 24 {
+                let mut expected = input.clone();
+                expected[6..8].fill(0);
+                assert_eq!(&response[112..], &expected[..maximum as usize]);
+            }
+        }
+        let mut delete = input[..24].to_vec();
+        delete[4..6].fill(0);
+        let mut wrong = delete.clone();
+        wrong[8] = 2;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::IOCTL,
+                        &object_id_ioctl_input(file, 0x900ac, &wrong)
+                    )
+                    .await
+            ),
+            Status(0xc00002b2)
+        );
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x900ac, &delete),
+            )
+            .await;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::IOCTL, &object_id_ioctl(file, 0x900a8, 64))
+                    .await
+            ),
+            Status(0xc0000275)
+        );
+        assert_eq!(
+            &client.query(file, 35).await[72..80],
+            &[0x20, 0, 0, 0, 0, 0, 0, 0]
+        );
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn reparse_controls_validate_symlinks_without_silently_following_them() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("symbolic", 2, 0).await;
+        let name = encode_name("target");
+        let mut data = vec![0; 12];
+        data[2..4].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        data[6..8].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        data.extend(name);
+        let mut input = 0xa000000cu32.to_le_bytes().to_vec();
+        input.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        input.extend_from_slice(&[0xff, 0xff]);
+        input.extend_from_slice(&data);
+        let mut invalid = input.clone();
+        invalid[10] = 0xff;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::IOCTL,
+                        &object_id_ioctl_input(file, 0x900a4, &invalid)
+                    )
+                    .await
+            ),
+            Status::IO_REPARSE_DATA_INVALID
+        );
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x900a4, &input),
+            )
+            .await;
+        assert_eq!(
+            response_status(&client.open_result("symbolic", 1, 7, 1, 0).await),
+            Status::IO_REPARSE_TAG_NOT_HANDLED
+        );
+        let response = client
+            .open_result("symbolic", 0x1f01ff, 7, 1, 0x00200000)
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let opened = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let get = client
+            .ok(Command::IOCTL, &object_id_ioctl(opened, 0x900a8, 1024))
+            .await;
+        input[6..8].fill(0);
+        assert_eq!(&get[112..], input);
+        let mut delete = input[..8].to_vec();
+        delete[4..6].fill(0);
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x900ac, &delete),
+            )
+            .await;
+        client.close(opened).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn reparse_assignment_is_atomic_under_quota_and_enforces_owner_and_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(28, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("reparse-quota", 2, 0).await;
+        let mut input = vec![0x37, 0, 0, 0, 4, 0, 0, 0];
+        input.extend_from_slice(&[1; 16]);
+        input.extend_from_slice(b"data");
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x900a4, &input),
+            )
+            .await;
+        for (mut bad, status) in [
+            (input.clone(), Status::IO_REPARSE_TAG_MISMATCH),
+            (input.clone(), Status::REPARSE_ATTRIBUTE_CONFLICT),
+            (input.clone(), Status::DISK_FULL),
+        ] {
+            match status {
+                Status::IO_REPARSE_TAG_MISMATCH => bad[0] = 0x38,
+                Status::REPARSE_ATTRIBUTE_CONFLICT => bad[8] = 2,
+                _ => {
+                    bad[4] = 5;
+                    bad.push(0);
+                }
+            }
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(Command::IOCTL, &object_id_ioctl_input(file, 0x900a4, &bad))
+                        .await
+                ),
+                status
+            );
+        }
+        let response = client.open_result("reparse-quota", 1, 7, 1, 0).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let restricted = read_body::<CreateResponse>(&response).unwrap().file_id;
+        assert_eq!(
+            response_status(
+                &client
+                    .send(
+                        Command::IOCTL,
+                        &object_id_ioctl_input(restricted, 0x900a4, &input)
+                    )
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        assert_eq!(
+            &client
+                .ok(Command::IOCTL, &object_id_ioctl(file, 0x900a8, 64))
+                .await[112..],
+            input
+        );
+        let mut delete = input[..24].to_vec();
+        delete[4..6].fill(0);
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x900ac, &delete),
+            )
+            .await;
+        assert_eq!(
+            response_status(&client.set(file, 20, &28i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        client.close(restricted).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn ea_size_queries_do_not_require_ea_content_or_attribute_access() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
@@ -2609,7 +2828,7 @@ fn core_replies_match_literal_buffer_and_context_layouts() {
             (
                 FileSystemInformationClass::ATTRIBUTE,
                 vec![
-                    6, 0, 197, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
+                    134, 0, 197, 0, 255, 0, 0, 0, 12, 0, 0, 0, b'M', 0, b'E', 0, b'M', 0, b'O', 0,
                     b'R', 0, b'Y', 0,
                 ],
             ),

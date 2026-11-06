@@ -101,6 +101,12 @@ open_enum! {
         DUPLICATE_NAME = 0xc00000bd,
         OBJECTID_NOT_FOUND = 0xc00002f0,
         TOO_MANY_LINKS = 0xc0000265,
+        NOT_A_REPARSE_POINT = 0xc0000275,
+        IO_REPARSE_TAG_INVALID = 0xc0000276,
+        IO_REPARSE_TAG_MISMATCH = 0xc0000277,
+        IO_REPARSE_DATA_INVALID = 0xc0000278,
+        IO_REPARSE_TAG_NOT_HANDLED = 0xc0000279,
+        REPARSE_ATTRIBUTE_CONFLICT = 0xc00002b2,
         NOT_SUPPORTED = 0xc00000bb,
         BAD_NETWORK_NAME = 0xc00000cc,
         DIRECTORY_NOT_EMPTY = 0xc0000101,
@@ -391,8 +397,11 @@ pub struct CreateOptions {
     other1: u8,
     pub delete_on_close: bool,
     pub open_by_file_id: bool,
-    #[bits(9)]
+    #[bits(7)]
     other2: u32,
+    pub open_reparse_point: bool,
+    #[bits(1)]
+    other_reparse: u8,
     pub open_for_free_space_query: bool,
     #[bits(8)]
     other3: u8,
@@ -808,6 +817,9 @@ open_enum! {
         DELETE_OBJECT_ID = 0x000900a0,
         SET_OBJECT_ID_EXTENDED = 0x000900bc,
         CREATE_OR_GET_OBJECT_ID = 0x000900c0,
+        SET_REPARSE_POINT = 0x000900a4,
+        GET_REPARSE_POINT = 0x000900a8,
+        DELETE_REPARSE_POINT = 0x000900ac,
         SET_ZERO_DATA = 0x000980c8,
         QUERY_ALLOCATED_RANGES = 0x000940cf,
         QUERY_NETWORK_INTERFACE_INFO = 0x001401fc,

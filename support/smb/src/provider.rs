@@ -210,7 +210,28 @@ impl Metadata {
 
 /// Selected filesystem controls, decoded independently of SMB buffer layouts.
 #[derive(Debug, Clone, Copy)]
-pub enum FileControl {
+pub enum FileControl<'a> {
+    /// Query retained reparse data, allowing a bounded partial reply.
+    GetReparsePoint {
+        /// Maximum encoded output bytes.
+        maximum: u32,
+    },
+    /// Atomically assign or replace reparse data of the same tag/owner.
+    SetReparsePoint {
+        /// Reparse tag.
+        tag: u32,
+        /// Required owner GUID for non-Microsoft tags.
+        guid: Option<[u8; 16]>,
+        /// Borrowed owner-specific data retained through completion.
+        data: &'a [u8],
+    },
+    /// Remove reparse data after matching its tag and owner.
+    DeleteReparsePoint {
+        /// Expected reparse tag.
+        tag: u32,
+        /// Expected owner GUID for non-Microsoft tags.
+        guid: Option<[u8; 16]>,
+    },
     /// Query an assigned file object ID.
     GetObjectId,
     /// Atomically create an object ID if absent, or return the existing ID.
@@ -249,6 +270,8 @@ pub enum FileControl {
 /// Semantic result of a selected filesystem control.
 #[derive(Debug)]
 pub enum FileControlResult {
+    /// Retained reparse tag, owner and data.
+    ReparsePoint(ReparsePoint),
     /// Assigned file object identity and birth/domain metadata.
     ObjectId(ObjectIdInformation),
     /// A mutation completed without output data.
@@ -262,6 +285,24 @@ pub enum FileControlResult {
         /// More records remain than fit in the requested limit.
         overflow: bool,
     },
+}
+
+/// Provider-owned reparse metadata shared by all links and streams of the file.
+#[derive(Debug, Clone)]
+pub struct ReparsePoint {
+    /// Reparse tag.
+    pub tag: u32,
+    /// Owner GUID for a non-Microsoft tag.
+    pub guid: Option<[u8; 16]>,
+    /// Owner-specific data.
+    pub data: Vec<u8>,
+}
+
+impl ReparsePoint {
+    /// Charged encoded size, including tag/length and optional owner GUID.
+    pub fn encoded_len(&self) -> usize {
+        8 + usize::from(self.guid.is_some()) * 16 + self.data.len()
+    }
 }
 
 /// File object-ID metadata, shared by all streams and opens of the file.
@@ -510,7 +551,7 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     async fn file_control(
         &self,
         _file: &Self::File,
-        _control: FileControl,
+        _control: FileControl<'_>,
         _request: &RequestContext,
     ) -> Result<FileControlResult, Status> {
         Err(Status::INVALID_DEVICE_REQUEST)

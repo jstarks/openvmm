@@ -858,7 +858,7 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
     async fn file_control(
         &self,
         file: &Self::File,
-        control: FileControl,
+        control: FileControl<'_>,
         r: &RequestContext,
     ) -> Result<FileControlResult, Status> {
         let mut call =

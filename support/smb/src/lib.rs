@@ -767,11 +767,39 @@ fn stream_response(
 }
 
 fn file_control_output(
-    control: FileControl,
+    control: FileControl<'_>,
     result: FileControlResult,
 ) -> Result<(Status, Vec<u8>), Status> {
     let mut status = Status::SUCCESS;
     let output = match (control, result) {
+        (FileControl::GetReparsePoint { maximum }, FileControlResult::ReparsePoint(info)) => {
+            validate_reparse_data(info.tag, info.guid, &info.data)
+                .map_err(|_| Status::INTERNAL_ERROR)?;
+            let header = size_of::<ReparseDataHeader>() + usize::from(info.guid.is_some()) * 16;
+            if (maximum as usize) < header {
+                return Err(Status::BUFFER_TOO_SMALL);
+            }
+            let mut out = ReparseDataHeader {
+                tag: info.tag.into(),
+                data_length: (info.data.len() as u16).into(),
+                reserved: 0.into(),
+            }
+            .as_bytes()
+            .to_vec();
+            if let Some(guid) = info.guid {
+                out.extend_from_slice(&guid);
+            }
+            let count = info.data.len().min(maximum as usize - header);
+            out.extend_from_slice(&info.data[..count]);
+            if count < info.data.len() {
+                status = Status::BUFFER_OVERFLOW;
+            }
+            out
+        }
+        (
+            FileControl::SetReparsePoint { .. } | FileControl::DeleteReparsePoint { .. },
+            FileControlResult::Done,
+        ) => Vec::new(),
         (
             FileControl::GetObjectId | FileControl::CreateOrGetObjectId,
             FileControlResult::ObjectId(info),
@@ -1938,6 +1966,17 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::INVALID_DEVICE_REQUEST);
         }
         let control = match code {
+            FsctlCode::GET_REPARSE_POINT => FileControl::GetReparsePoint {
+                maximum: request.max_output_response.get(),
+            },
+            FsctlCode::SET_REPARSE_POINT => {
+                let (tag, guid, data) = decode_reparse_data(input, false)?;
+                FileControl::SetReparsePoint { tag, guid, data }
+            }
+            FsctlCode::DELETE_REPARSE_POINT => {
+                let (tag, guid, _) = decode_reparse_data(input, true)?;
+                FileControl::DeleteReparsePoint { tag, guid }
+            }
             FsctlCode::GET_OBJECT_ID | FsctlCode::CREATE_OR_GET_OBJECT_ID => {
                 if request.max_output_response.get() < size_of::<FileObjectIdBuffer>() as u32 {
                     return Err(Status::INVALID_PARAMETER);
@@ -2014,6 +2053,13 @@ impl<B: FileSystem> Connection<B> {
             _ => return Err(Status::NOT_SUPPORTED),
         };
         let file = self.file(request.file_id, tree, context)?;
+        if matches!(
+            control,
+            FileControl::SetReparsePoint { .. } | FileControl::DeleteReparsePoint { .. }
+        ) && !(file.access.write_data() || file.access.write_attributes())
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
         if matches!(control, FileControl::SetObjectIdExtended { .. })
             && !(file.access.write_data() || file.access.write_attributes())
         {

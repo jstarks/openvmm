@@ -153,8 +153,11 @@ pub struct FileSystemAttributes {
     pub case_preserved_names: bool,
     pub unicode_on_disk: bool,
     pub persistent_acls: bool,
-    #[bits(12)]
-    other0: u16,
+    #[bits(3)]
+    other0: u8,
+    pub supports_reparse_points: bool,
+    #[bits(8)]
+    other_reparse: u8,
     pub supports_object_ids: bool,
     #[bits(1)]
     other_object: u8,
@@ -192,6 +195,12 @@ pub const STREAM_ALIGNMENT: usize = 8;
 pub const SHORT_NAME_CAPACITY: usize = 12;
 /// Maximum pathname length in UTF-16 code units: [MS-FSCC] §2.1.5.
 pub const MAX_PATH_LENGTH: usize = 32_760;
+/// Maximum complete reparse buffer: [MS-FSA] §2.1.5.10.37.
+pub const MAX_REPARSE_DATA_SIZE: usize = 16 * 1024;
+/// Symbolic-link tag: [MS-FSCC] §2.1.2.1.
+pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000000c;
+/// Mount-point tag: [MS-FSCC] §2.1.2.1.
+pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa0000003;
 /// Leave a timestamp unchanged: [MS-FSCC] §2.4.7.
 pub const TIME_UNCHANGED: i64 = 0;
 /// Suppress automatic timestamp updates on this open: [MS-FSA] §2.1.5.15.2.
@@ -380,6 +389,33 @@ wire!(
         end_of_file: U64,
         file_attributes: FileAttributes,
         reserved: U32,
+    }
+);
+wire!(
+    /// Common reparse prefix: [MS-FSCC] §§2.1.2.2–3.
+    ReparseDataHeader, 8 {
+        tag: U32,
+        data_length: U16,
+        reserved: U16,
+    }
+);
+wire!(
+    /// Symbolic-link owner-data prefix: [MS-FSCC] §2.1.2.4.
+    SymbolicLinkReparseData, 12 {
+        substitute_name_offset: U16,
+        substitute_name_length: U16,
+        print_name_offset: U16,
+        print_name_length: U16,
+        flags: U32,
+    }
+);
+wire!(
+    /// Mount-point owner-data prefix: [MS-FSCC] §2.1.2.5.
+    MountPointReparseData, 8 {
+        substitute_name_offset: U16,
+        substitute_name_length: U16,
+        print_name_offset: U16,
+        print_name_length: U16,
     }
 );
 wire!(

@@ -75,6 +75,8 @@ pub struct Expectations {
     pub object_id_controls: Feature,
     /// Shared-file hard links with link-scoped metadata and deletion.
     pub hard_links: Feature,
+    /// Retained reparse query/set/delete controls.
+    pub reparse_controls: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -672,6 +674,71 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Reparse controls retain owner data and remove it without deleting the file.
+pub async fn reparse_controls<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "reparse", CreateDisposition::CREATE, false, &request).await;
+    let set = FileControl::SetReparsePoint {
+        tag: 0x37,
+        guid: Some([1; 16]),
+        data: b"data",
+    };
+    if let Some(status) = unsupported(fixture.expectations().reparse_controls) {
+        for control in [
+            set,
+            FileControl::GetReparsePoint { maximum: 64 },
+            FileControl::DeleteReparsePoint {
+                tag: 0x37,
+                guid: Some([1; 16]),
+            },
+        ] {
+            rejected(fs.file_control(&file, control, &request).await, status);
+        }
+    } else {
+        fs.file_control(&file, set, &request).await.unwrap();
+        let FileControlResult::ReparsePoint(point) = fs
+            .file_control(
+                &file,
+                FileControl::GetReparsePoint { maximum: 64 },
+                &request,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("missing reparse data")
+        };
+        assert_eq!(point.tag, 0x37);
+        assert_eq!(point.guid, Some([1; 16]));
+        assert_eq!(point.data, b"data");
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().reparse_tag,
+            0x37
+        );
+        fs.file_control(
+            &file,
+            FileControl::DeleteReparsePoint {
+                tag: 0x37,
+                guid: Some([1; 16]),
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+        rejected(
+            fs.file_control(
+                &file,
+                FileControl::GetReparsePoint { maximum: 64 },
+                &request,
+            )
+            .await,
+            Status::NOT_A_REPARSE_POINT,
+        );
+        assert_eq!(fs.metadata(&file, &request).await.unwrap().reparse_tag, 0);
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// Hard links share file identity/data while retaining independent namespace lifetime.

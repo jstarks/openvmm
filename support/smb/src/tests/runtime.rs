@@ -407,9 +407,12 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
             (FsctlCode::SET_ZERO_DATA, true),
             (FsctlCode::CREATE_OR_GET_OBJECT_ID, false),
             (FsctlCode::CREATE_OR_GET_OBJECT_ID, true),
+            (FsctlCode::SET_REPARSE_POINT, false),
+            (FsctlCode::SET_REPARSE_POINT, true),
         ] {
             let zero = code == FsctlCode::SET_ZERO_DATA;
             let object = code == FsctlCode::CREATE_OR_GET_OBJECT_ID;
+            let reparse = code == FsctlCode::SET_REPARSE_POINT;
             let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
             control
                 .set_plan(
@@ -441,6 +444,13 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 bytes = body.as_bytes().to_vec();
                 bytes.extend_from_slice(&1i64.to_le_bytes());
                 bytes.extend_from_slice(&2i64.to_le_bytes());
+            } else if reparse {
+                body.input_offset = 120.into();
+                body.input_count = 28.into();
+                bytes = body.as_bytes().to_vec();
+                bytes.extend_from_slice(&[0x37, 0, 0, 0, 4, 0, 0, 0]);
+                bytes.extend_from_slice(&[1; 16]);
+                bytes.extend_from_slice(b"data");
             } else {
                 bytes = body.as_bytes().to_vec();
             }
@@ -487,7 +497,14 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                     assert_eq!(response.len(), 176);
                     assert_ne!(&response[112..128], &[0; 16]);
                 } else {
-                    assert_eq!(&response[112..], if zero { &[][..] } else { &[0, 0][..] });
+                    assert_eq!(
+                        &response[112..],
+                        if zero || reparse {
+                            &[][..]
+                        } else {
+                            &[0, 0][..]
+                        }
+                    );
                 }
             }
             assert_eq!(response_status(&closing.await.unwrap()), Status::SUCCESS);
@@ -497,14 +514,20 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                 &client.read(observer, 0, 3).await[80..],
                 if zero && after { b"a\0c" } else { b"abc" },
             );
-            if object {
+            if object || reparse {
                 control
                     .set_plan(Operation::FileControl, Plan::default())
                     .unwrap();
                 let mut query = IoctlRequest::new_zeroed();
                 query.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
                 query.file_id = observer;
-                query.control_code = FsctlCode::GET_OBJECT_ID.0.into();
+                query.control_code = (if object {
+                    FsctlCode::GET_OBJECT_ID
+                } else {
+                    FsctlCode::GET_REPARSE_POINT
+                })
+                .0
+                .into();
                 query.flags = IoctlFlags::new().with_fsctl(true);
                 query.max_output_response = 64.into();
                 assert_eq!(
@@ -512,7 +535,11 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
                     if after {
                         Status::SUCCESS
                     } else {
-                        Status::OBJECTID_NOT_FOUND
+                        if object {
+                            Status::OBJECTID_NOT_FOUND
+                        } else {
+                            Status::NOT_A_REPARSE_POINT
+                        }
                     }
                 );
             }

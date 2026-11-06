@@ -3,20 +3,23 @@
 
 //! A bounded writable in-memory filesystem for synthetic shares.
 
-use crate::codec::{align_up, decode_ea_list, encode_ea_list};
+use crate::codec::{
+    align_up, decode_ea_list, encode_ea_list, validate_reparse_data, validate_reparse_identity,
+};
 use crate::provider::{
     BasicInformation, ByteRange, Change, CompressionInformation, ExtendedAttribute, FileControl,
     FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
-    ObjectIdInformation, OpenOptions, RequestContext, SectorSizeInformation, StreamInformation,
-    VolumeObjectInformation,
+    ObjectIdInformation, OpenOptions, ReparsePoint, RequestContext, SectorSizeInformation,
+    StreamInformation, VolumeObjectInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
     AccessMask, AceFlags, CreateAction, CreateDisposition, CreateOptions, FILE_DEVICE_DISK,
     FILE_MODE_INFORMATION_MASK, FILE_MODE_INFORMATION_SET_MASK, FileAttributes,
-    FileSystemAttributes, MAX_EA_LENGTH, MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction,
-    NotifyFilter, SectorSizeFlags, SecurityDescriptorControl, SecurityInformation, ShareAccess,
-    Status, TIME_RESTORE, TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
+    FileSystemAttributes, IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, MAX_EA_LENGTH,
+    MAX_PATH_LENGTH, NT_TICKS_PER_SECOND, NotifyAction, NotifyFilter, SectorSizeFlags,
+    SecurityDescriptorControl, SecurityInformation, ShareAccess, Status, TIME_RESTORE,
+    TIME_SUPPRESS, TIME_UNCHANGED, UNIX_EPOCH_NT_TIME,
 };
 use async_trait::async_trait;
 use event_listener::Event;
@@ -38,6 +41,7 @@ const LOCK_WAITER_LIMIT: usize = 1024;
 pub struct MemoryFs(Arc<Mutex<State>>);
 
 struct Node {
+    reparse: Option<ReparsePoint>,
     link: u64,
     object_id: ObjectIdInformation,
     default_stream: u64,
@@ -307,6 +311,7 @@ impl MemoryFs {
     pub fn new(byte_limit: usize, object_limit: usize) -> Self {
         let now = nt_time();
         let root = Node {
+            reparse: None,
             link: 1,
             object_id: ObjectIdInformation::default(),
             default_stream: 0,
@@ -891,6 +896,9 @@ fn resolve_directory(state: &State, parts: &[&str]) -> Result<u64, Status> {
         if !state.nodes[&parent].metadata.is_directory() {
             return Err(Status::NOT_A_DIRECTORY);
         }
+        if state.nodes[&parent].metadata.reparse_tag & 0x20000000 != 0 {
+            return Err(Status::IO_REPARSE_TAG_NOT_HANDLED);
+        }
         if state.links[&state.nodes[&parent].link].delete_pending {
             return Err(Status::DELETE_PENDING);
         }
@@ -1342,6 +1350,7 @@ fn stream_data_mut(node: &mut Node, stream: u64) -> Result<(&mut Vec<u8>, &mut u
 
 fn stored_bytes(node: &Node) -> usize {
     node.data.len()
+        + node.reparse.as_ref().map_or(0, ReparsePoint::encoded_len)
         + node.metadata.extended_attributes_length as usize
         + node
             .streams
@@ -1667,6 +1676,11 @@ impl inspect::Inspect for MemoryFs {
                             .field("size", node.metadata.size)
                             .field("allocation_size", node.metadata.allocation_size)
                             .hex("attributes", node.metadata.attributes)
+                            .hex("reparse_tag", node.metadata.reparse_tag)
+                            .field(
+                                "reparse_bytes",
+                                node.reparse.as_ref().map_or(0, ReparsePoint::encoded_len),
+                            )
                             .field("object_id", format!("{:02x?}", node.object_id.object_id))
                             .field("delete_pending", state.links[&node.link].delete_pending)
                             .child("streams", |req| {
@@ -1735,6 +1749,11 @@ impl FileSystem for MemoryFs {
         let (id, stream, action) = if let Some(link) = existing {
             let id = state.links[&link].node;
             let node = &state.nodes[&id];
+            if node.metadata.reparse_tag & 0x20000000 != 0
+                && !options.options().open_reparse_point()
+            {
+                return Err(Status::IO_REPARSE_TAG_NOT_HANDLED);
+            }
             let default = node.default_stream;
             if named.is_none()
                 && options.options().no_ea_knowledge()
@@ -1817,6 +1836,7 @@ impl FileSystem for MemoryFs {
                     )
                     .with_archive(true)
                     .with_not_content_indexed(false)
+                    .with_reparse_point(node.reparse.is_some())
                     .into_bits();
                     let attributes_changed = attributes != node.metadata.attributes;
                     let allocation =
@@ -1985,6 +2005,7 @@ impl FileSystem for MemoryFs {
             state.nodes.insert(
                 id,
                 Node {
+                    reparse: None,
                     link,
                     object_id: ObjectIdInformation::default(),
                     default_stream: 0,
@@ -2594,6 +2615,7 @@ impl FileSystem for MemoryFs {
             supports_objects: true,
             name: "MEMORY".into(),
             attributes: FileSystemAttributes::new()
+                .with_supports_reparse_points(true)
                 .with_supports_object_ids(true)
                 .with_supports_hard_links(true)
                 .with_case_preserved_names(true)
@@ -2629,7 +2651,7 @@ impl FileSystem for MemoryFs {
     async fn file_control(
         &self,
         file: &MemoryFile,
-        control: FileControl,
+        control: FileControl<'_>,
         _request: &RequestContext,
     ) -> Result<FileControlResult, Status> {
         let mut state = self.0.lock();
@@ -2637,6 +2659,104 @@ impl FileSystem for MemoryFs {
         let access = AccessMask::from_bits(open.access);
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         match control {
+            FileControl::GetReparsePoint { .. } => Ok(FileControlResult::ReparsePoint(
+                node.reparse.clone().ok_or(Status::NOT_A_REPARSE_POINT)?,
+            )),
+            FileControl::SetReparsePoint { tag, guid, data } => {
+                if !(access.write_data() || access.write_attributes()) {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                validate_reparse_data(tag, guid, data)?;
+                if tag == IO_REPARSE_TAG_MOUNT_POINT && !node.metadata.is_directory() {
+                    return Err(Status::NOT_A_DIRECTORY);
+                }
+                if node.metadata.is_directory() && has_children(&state, file.node) {
+                    return Err(Status::DIRECTORY_NOT_EMPTY);
+                }
+                if tag == IO_REPARSE_TAG_SYMLINK && stream_data(node, file.stream)?.1 != 0 {
+                    return Err(Status::IO_REPARSE_DATA_INVALID);
+                }
+                if let Some(old) = &node.reparse {
+                    if old.tag != tag {
+                        return Err(Status::IO_REPARSE_TAG_MISMATCH);
+                    }
+                    if old.guid != guid {
+                        return Err(Status::REPARSE_ATTRIBUTE_CONFLICT);
+                    }
+                } else if !node.eas.is_empty() {
+                    return Err(Status::EAS_NOT_SUPPORTED);
+                }
+                let old = node.reparse.as_ref().map_or(0, ReparsePoint::encoded_len);
+                let new = 8 + usize::from(guid.is_some()) * 16 + data.len();
+                let charge = allocation_charge(&state, old, new)?;
+                let mut stored = Vec::new();
+                stored
+                    .try_reserve_exact(data.len())
+                    .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
+                stored.extend_from_slice(data);
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                node.reparse = Some(ReparsePoint {
+                    tag,
+                    guid,
+                    data: stored,
+                });
+                node.metadata.reparse_tag = tag;
+                node.metadata.attributes = node
+                    .metadata
+                    .attributes()
+                    .with_reparse_point(true)
+                    .with_archive(
+                        !node.metadata.is_directory() || node.metadata.attributes().archive(),
+                    )
+                    .into_bits();
+                node.metadata.changed = nt_time();
+                state.bytes = charge;
+                emit(
+                    &mut state,
+                    file.link,
+                    NotifyAction::MODIFIED,
+                    NotifyFilter::new().with_attributes(true),
+                );
+                wake(state);
+                Ok(FileControlResult::Done)
+            }
+            FileControl::DeleteReparsePoint { tag, guid } => {
+                if !(access.write_data() || access.write_attributes()) {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                validate_reparse_identity(tag, guid, 0)?;
+                let old = node.reparse.as_ref().ok_or(Status::NOT_A_REPARSE_POINT)?;
+                if old.tag != tag {
+                    return Err(Status::IO_REPARSE_TAG_MISMATCH);
+                }
+                if old.guid != guid {
+                    return Err(Status::REPARSE_ATTRIBUTE_CONFLICT);
+                }
+                let charge = old.encoded_len();
+                let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
+                node.reparse = None;
+                node.metadata.reparse_tag = 0;
+                node.metadata.attributes = node
+                    .metadata
+                    .attributes()
+                    .with_reparse_point(false)
+                    .with_archive(
+                        !node.metadata.is_directory() || node.metadata.attributes().archive(),
+                    )
+                    .into_bits();
+                node.metadata.changed = nt_time();
+                state.bytes -= charge;
+                emit(
+                    &mut state,
+                    file.link,
+                    NotifyAction::MODIFIED,
+                    NotifyFilter::new()
+                        .with_attributes(true)
+                        .with_last_access(true),
+                );
+                wake(state);
+                Ok(FileControlResult::Done)
+            }
             FileControl::GetObjectId => {
                 if node.object_id.object_id == [0; 16] {
                     return Err(Status::OBJECTID_NOT_FOUND);
@@ -3754,6 +3874,7 @@ mod tests {
                 volume_object_ids: Feature::Supported,
                 object_id_controls: Feature::Supported,
                 hard_links: Feature::Supported,
+                reparse_controls: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -3863,6 +3984,10 @@ mod tests {
     #[test]
     fn contract_hard_links() {
         run_contract(contracts::hard_links);
+    }
+    #[test]
+    fn contract_reparse_controls() {
+        run_contract(contracts::reparse_controls);
     }
 
     #[test]

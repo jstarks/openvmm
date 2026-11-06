@@ -8,6 +8,119 @@ use crate::spec::*;
 use zerocopy::little_endian::U16;
 use zerocopy::{FromBytes, IntoBytes};
 
+fn validate_reparse_tag(tag: u32) -> Result<(), Status> {
+    if tag <= 1
+        || (tag & 0x40000000 != 0 && tag & 0x80000000 == 0)
+        || tag & 0x30000000 == 0x30000000
+    {
+        return Err(Status::IO_REPARSE_TAG_INVALID);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reparse_identity(
+    tag: u32,
+    guid: Option<[u8; 16]>,
+    length: usize,
+) -> Result<(), Status> {
+    validate_reparse_tag(tag)?;
+    if (tag & 0x80000000 == 0) != guid.is_some()
+        || guid == Some([0; 16])
+        || 8 + usize::from(guid.is_some()) * 16 + length > MAX_REPARSE_DATA_SIZE
+    {
+        return Err(Status::IO_REPARSE_DATA_INVALID);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reparse_data(
+    tag: u32,
+    guid: Option<[u8; 16]>,
+    data: &[u8],
+) -> Result<(), Status> {
+    validate_reparse_identity(tag, guid, data.len())?;
+    let (path, offsets) = if tag == IO_REPARSE_TAG_SYMLINK {
+        let (info, path) = SymbolicLinkReparseData::read_from_prefix(data)
+            .map_err(|_| Status::IO_REPARSE_DATA_INVALID)?;
+        if info.flags.get() > 1 {
+            return Err(Status::IO_REPARSE_DATA_INVALID);
+        }
+        (
+            path,
+            [
+                (
+                    info.substitute_name_offset.get(),
+                    info.substitute_name_length.get(),
+                ),
+                (info.print_name_offset.get(), info.print_name_length.get()),
+            ],
+        )
+    } else if tag == IO_REPARSE_TAG_MOUNT_POINT {
+        let (info, path) = MountPointReparseData::read_from_prefix(data)
+            .map_err(|_| Status::IO_REPARSE_DATA_INVALID)?;
+        (
+            path,
+            [
+                (
+                    info.substitute_name_offset.get(),
+                    info.substitute_name_length.get(),
+                ),
+                (info.print_name_offset.get(), info.print_name_length.get()),
+            ],
+        )
+    } else {
+        return Ok(());
+    };
+    if offsets[0].1 == 0 {
+        return Err(Status::IO_REPARSE_DATA_INVALID);
+    }
+    for (offset, length) in offsets {
+        if offset % 2 != 0 || length % 2 != 0 {
+            return Err(Status::IO_REPARSE_DATA_INVALID);
+        }
+        let name = path
+            .get(usize::from(offset)..usize::from(offset) + usize::from(length))
+            .ok_or(Status::IO_REPARSE_DATA_INVALID)?;
+        let name = decode_name(name).map_err(|_| Status::IO_REPARSE_DATA_INVALID)?;
+        if tag == IO_REPARSE_TAG_MOUNT_POINT
+            && name.split('\\').any(|part| matches!(part, "." | ".."))
+        {
+            return Err(Status::IO_REPARSE_DATA_INVALID);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_reparse_data(
+    bytes: &[u8],
+    deleting: bool,
+) -> Result<(u32, Option<[u8; 16]>, &[u8]), Status> {
+    let (header, rest) =
+        ReparseDataHeader::read_from_prefix(bytes).map_err(|_| Status::IO_REPARSE_DATA_INVALID)?;
+    validate_reparse_tag(header.tag.get())?;
+    let (guid, data) = if header.tag.get() & 0x80000000 == 0 {
+        let guid = rest.get(..16).ok_or(Status::IO_REPARSE_DATA_INVALID)?;
+        (
+            Some(
+                guid.try_into()
+                    .map_err(|_| Status::IO_REPARSE_DATA_INVALID)?,
+            ),
+            &rest[16..],
+        )
+    } else {
+        (None, rest)
+    };
+    if data.len() != usize::from(header.data_length.get()) || (deleting && !data.is_empty()) {
+        return Err(Status::IO_REPARSE_DATA_INVALID);
+    }
+    if deleting {
+        validate_reparse_identity(header.tag.get(), guid, 0)?;
+    } else {
+        validate_reparse_data(header.tag.get(), guid, data)?;
+    }
+    Ok((header.tag.get(), guid, data))
+}
+
 pub(crate) fn decode<T: SmbBody>(bytes: &[u8]) -> Result<T, Status> {
     let (value, _) = T::read_from_prefix(bytes).map_err(|_| Status::INVALID_PARAMETER)?;
     if value.structure_size() != T::STRUCTURE_SIZE {

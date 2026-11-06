@@ -113,6 +113,17 @@ provider (the synthetic system identity has it). The actual object-ID capability
 is advertised. This does not provide a USN journal, an NTFS object-ID index
 namespace or persistent/native GUID generation.
 
+GET_REPARSE_POINT, SET_REPARSE_POINT and DELETE_REPARSE_POINT use retained
+provider-owned tag/GUID/data, with validated Microsoft and GUID framing and
+symbolic-link/mount-point payloads. MemoryFs enforces ownership, eligibility,
+write rights and atomic shared-quota accounting, updates actual attributes/tags,
+and releases stored bytes on deletion. Its synthetic system identity has
+symbolic-link creation access. Partial GET replies preserve the full data length
+and return BUFFER_OVERFLOW as specified by MS-FSCC 2.3.28. Reparse capability is
+advertised for these controls; name-surrogate traversal is not yet implemented
+and fails explicitly rather than opening the underlying file. Final-component
+FILE_OPEN_REPARSE_POINT opens retain access to the reparse object itself.
+
 Hard-link SET_INFO requests use typed FileLinkInformation and provider-owned
 destination validation. MemoryFs stores namespace links separately from shared
 file data: handles retain the opened link, while file IDs, streams, locks,

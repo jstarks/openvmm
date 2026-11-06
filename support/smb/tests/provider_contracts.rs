@@ -43,6 +43,7 @@ impl Fixture for MemoryFixture {
             volume_object_ids: Feature::Supported,
             object_id_controls: Feature::Supported,
             hard_links: Feature::Supported,
+            reparse_controls: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -118,6 +119,7 @@ impl ControlledFixture {
                 volume_object_ids: Feature::Unsupported(Status::NOT_SUPPORTED),
                 object_id_controls: Feature::Unsupported(Status::NOT_SUPPORTED),
                 hard_links: Feature::Unsupported(Status::NOT_SUPPORTED),
+                reparse_controls: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -318,6 +320,15 @@ fn exported_hard_link_contract_checks_namespace_and_declines() {
     block_on(contracts::hard_links(&fixture));
     fixture.assert_rejected(&[Operation::Link]);
 }
+#[test]
+fn exported_reparse_contract_checks_retained_data_and_declines() {
+    block_on(contracts::reparse_controls(&MemoryFixture(MemoryFs::new(
+        1024, 32,
+    ))));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::reparse_controls(&fixture));
+    fixture.assert_rejected(&[Operation::FileControl]);
+}
 
 #[test]
 fn declared_unsupported_locks_are_exercised() {
@@ -400,6 +411,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             volume_object_ids: Feature::Supported,
             object_id_controls: Feature::Supported,
             hard_links: Feature::Supported,
+            reparse_controls: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

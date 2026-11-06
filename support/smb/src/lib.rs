@@ -711,6 +711,61 @@ fn buffer_response(bytes: Vec<u8>, maximum: u32) -> Result<Vec<u8>, Status> {
     Ok(out)
 }
 
+fn file_control_output(
+    control: FileControl,
+    result: FileControlResult,
+) -> Result<(Status, Vec<u8>), Status> {
+    let mut status = Status::SUCCESS;
+    let output = match (control, result) {
+        (FileControl::GetCompression, FileControlResult::Compression(format)) => {
+            format.to_le_bytes().to_vec()
+        }
+        (FileControl::SetZeroData { .. }, FileControlResult::Done) => Vec::new(),
+        (
+            FileControl::QueryAllocatedRanges {
+                range,
+                maximum_ranges,
+            },
+            FileControlResult::AllocatedRanges { ranges, overflow },
+        ) => {
+            if ranges.len() > maximum_ranges
+                || (range.length == 0 && (!ranges.is_empty() || overflow))
+            {
+                return Err(Status::INTERNAL_ERROR);
+            }
+            let mut out = Vec::new();
+            let mut previous_end = 0;
+            for allocated in ranges {
+                let end = allocated
+                    .offset
+                    .checked_add(allocated.length)
+                    .filter(|end| *end <= i64::MAX as u64)
+                    .ok_or(Status::INTERNAL_ERROR)?;
+                if allocated.length == 0
+                    || !allocated.overlaps(range)
+                    || allocated.offset < previous_end
+                {
+                    return Err(Status::INTERNAL_ERROR);
+                }
+                previous_end = end;
+                out.extend_from_slice(
+                    FileAllocatedRangeBuffer {
+                        file_offset: (allocated.offset as i64).into(),
+                        length: (allocated.length as i64).into(),
+                    }
+                    .as_bytes(),
+                );
+            }
+            if overflow {
+                status = Status::BUFFER_OVERFLOW;
+            }
+            out
+        }
+        _ => return Err(Status::INTERNAL_ERROR),
+    };
+    Ok((status, output))
+}
+
 fn filesystem_response(
     info: &FileSystemInformation,
     class: FileSystemInformationClass,
@@ -1811,24 +1866,52 @@ impl<B: FileSystem> Connection<B> {
                 }
                 FileControl::SetZeroData { offset, end }
             }
+            FsctlCode::QUERY_ALLOCATED_RANGES => {
+                let info = FileAllocatedRangeBuffer::read_from_prefix(input)
+                    .map_err(|_| Status::INVALID_PARAMETER)?
+                    .0;
+                let offset =
+                    u64::try_from(info.file_offset.get()).map_err(|_| Status::INVALID_PARAMETER)?;
+                let length =
+                    u64::try_from(info.length.get()).map_err(|_| Status::INVALID_PARAMETER)?;
+                offset
+                    .checked_add(length)
+                    .filter(|end| *end <= i64::MAX as u64)
+                    .ok_or(Status::INVALID_PARAMETER)?;
+                if length != 0
+                    && request.max_output_response.get()
+                        < size_of::<FileAllocatedRangeBuffer>() as u32
+                {
+                    return Err(Status::BUFFER_TOO_SMALL);
+                }
+                FileControl::QueryAllocatedRanges {
+                    range: ByteRange { offset, length },
+                    maximum_ranges: request.max_output_response.get() as usize
+                        / size_of::<FileAllocatedRangeBuffer>(),
+                }
+            }
             _ => return Err(Status::NOT_SUPPORTED),
         };
         let file = self.file(request.file_id, tree, context)?;
         if matches!(control, FileControl::SetZeroData { .. }) && !file.access.write_data() {
             return Err(Status::ACCESS_DENIED);
         }
+        if matches!(control, FileControl::QueryAllocatedRanges { .. }) && !file.access.read_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
+        if matches!(
+            control,
+            FileControl::SetZeroData { .. } | FileControl::QueryAllocatedRanges { .. }
+        ) && file.is_directory
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
         let result = self
             .server
             .backend
             .file_control(&file.file, control, context)
             .await?;
-        let output = match (control, result) {
-            (FileControl::GetCompression, FileControlResult::Compression(format)) => {
-                format.to_le_bytes().to_vec()
-            }
-            (FileControl::SetZeroData { .. }, FileControlResult::Done) => Vec::new(),
-            _ => return Err(Status::INTERNAL_ERROR),
-        };
+        let (status, output) = file_control_output(control, result)?;
         let mut body = IoctlResponse {
             structure_size: IoctlResponse::STRUCTURE_SIZE.into(),
             reserved: 0.into(),
@@ -1849,7 +1932,7 @@ impl<B: FileSystem> Connection<B> {
         .as_bytes()
         .to_vec();
         body.extend_from_slice(&output);
-        Ok((Status::SUCCESS, body))
+        Ok((status, body))
     }
 
     fn oplock_acknowledgement(

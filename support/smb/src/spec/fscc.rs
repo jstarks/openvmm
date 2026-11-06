@@ -221,6 +221,13 @@ wire!(
     }
 );
 wire!(
+    /// FILE_ALLOCATED_RANGE_BUFFER: [MS-FSCC] §§2.3.51-2.3.52.
+    FileAllocatedRangeBuffer, 16 {
+        file_offset: I64,
+        length: I64,
+    }
+);
+wire!(
     /// FILE_ZERO_DATA_INFORMATION: [MS-FSCC] §2.3.85.
     FileZeroDataInformation, 16 {
         file_offset: I64,

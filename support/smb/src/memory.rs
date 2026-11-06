@@ -1458,6 +1458,35 @@ impl FileSystem for MemoryFs {
                 wake(state);
                 Ok(FileControlResult::Done)
             }
+            FileControl::QueryAllocatedRanges {
+                range,
+                maximum_ranges,
+            } => {
+                if node.metadata.is_directory()
+                    || range
+                        .offset
+                        .checked_add(range.length)
+                        .is_none_or(|end| end > i64::MAX as u64)
+                {
+                    return Err(Status::INVALID_PARAMETER);
+                }
+                if !access.read_data() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                if range.length != 0 && maximum_ranges == 0 {
+                    return Err(Status::BUFFER_TOO_SMALL);
+                }
+                // Dense streams report the queried range, not zero-content holes
+                // or an EOF-clamped extent (MS-FSCC §2.3.51).
+                Ok(FileControlResult::AllocatedRanges {
+                    ranges: if range.length == 0 || node.data.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![range]
+                    },
+                    overflow: false,
+                })
+            }
         }
     }
 

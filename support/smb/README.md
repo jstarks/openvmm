@@ -57,6 +57,10 @@ their actual results before releasing the open.
 SET_ZERO_DATA requires WRITE_DATA and zeroes only the requested bytes below EOF,
 without allocating or extending the stream. MemoryFs enforces byte-range locks,
 updates automatic modification times and emits last-write notifications.
+QUERY_ALLOCATED_RANGES requires READ_DATA and bounds provider results to the
+requested record capacity. MemoryFs reports its dense queried range, not holes
+inferred from zero bytes; streams with no allocation return no ranges. Sparse
+storage is not yet advertised.
 
 ## Run
 

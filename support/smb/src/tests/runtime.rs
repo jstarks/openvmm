@@ -233,6 +233,35 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             through_gates(fs.read(&file, 0, 3, &context), &control, Operation::Read).await,
             b"a\0c",
         );
+        let result = through_gates(
+            fs.file_control(
+                &file,
+                FileControl::QueryAllocatedRanges {
+                    range: ByteRange {
+                        offset: 0,
+                        length: 3,
+                    },
+                    maximum_ranges: 1,
+                },
+                &context,
+            ),
+            &control,
+            Operation::FileControl,
+        )
+        .await;
+        match result {
+            FileControlResult::AllocatedRanges { ranges, overflow } => {
+                assert_eq!(
+                    ranges,
+                    vec![ByteRange {
+                        offset: 0,
+                        length: 3
+                    }]
+                );
+                assert!(!overflow);
+            }
+            other => panic!("unexpected allocation query result: {other:?}"),
+        }
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
         let range = ByteRange {
             offset: 0,
@@ -387,6 +416,70 @@ fn pending_filesystem_controls_cancel_or_drain_before_close() {
             );
             client.close(observer).await;
         }
+    });
+}
+
+#[test]
+fn allocated_range_queries_observe_earlier_writes_on_the_same_open() {
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        control
+            .set_plan(
+                Operation::Write,
+                Plan {
+                    hold_before: true,
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("ordered-control", 2, 0).await;
+        let packet = request(
+            Command::WRITE,
+            &Client::write_body(file, 0, b"abc"),
+            client.session,
+            client.tree,
+            client.message,
+        );
+        client.message += 1;
+        let mut writing = std::pin::pin!(client.connection.request(packet).unwrap().execute());
+        assert!(futures::poll!(&mut writing).is_pending());
+        let call = control.next_call().await;
+        assert_eq!(call.operation, Operation::Write);
+        let mut ioctl = IoctlRequest::new_zeroed();
+        ioctl.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+        ioctl.file_id = file;
+        ioctl.control_code = FsctlCode::QUERY_ALLOCATED_RANGES.0.into();
+        ioctl.flags = IoctlFlags::new().with_fsctl(true);
+        ioctl.input_count = 16.into();
+        ioctl.input_offset = 120.into();
+        ioctl.max_output_response = 16.into();
+        let mut bytes = ioctl.as_bytes().to_vec();
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&3i64.to_le_bytes());
+        let packet = request(
+            Command::IOCTL,
+            &bytes,
+            client.session,
+            client.tree,
+            client.message,
+        );
+        client.message += 1;
+        let mut querying = std::pin::pin!(client.connection.request(packet).unwrap().execute());
+        assert!(futures::poll!(&mut querying).is_pending());
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|call| call.operation == Operation::FileControl)
+        );
+        control.release(call.id, Gate::Before).unwrap();
+        assert_eq!(response_status(&writing.await.unwrap()), Status::SUCCESS);
+        let response = querying.await.unwrap();
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        assert_eq!(&response[112..], &bytes[size_of::<IoctlRequest>()..]);
+        client.close(file).await;
     });
 }
 

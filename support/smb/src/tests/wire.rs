@@ -232,6 +232,142 @@ fn zero_data_control_obeys_cross_connection_and_owner_byte_range_locks() {
 }
 
 #[test]
+fn allocated_range_control_reports_dense_storage_and_validates_ranges_and_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("allocated-ranges", 2, 0).await;
+        let mut ioctl = IoctlRequest::new_zeroed();
+        ioctl.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+        ioctl.file_id = file;
+        ioctl.control_code = 0x000940cfu32.into();
+        ioctl.flags = IoctlFlags::new().with_fsctl(true);
+        ioctl.input_count = 16.into();
+        ioctl.input_offset = 120.into();
+        ioctl.max_output_response = 16.into();
+        let make_body = |ioctl: &IoctlRequest, offset: i64, length: i64| {
+            let mut body = ioctl.as_bytes().to_vec();
+            body.extend_from_slice(&offset.to_le_bytes());
+            body.extend_from_slice(&length.to_le_bytes());
+            body
+        };
+        let empty = client.ok(Command::IOCTL, &make_body(&ioctl, 0, 8)).await;
+        assert_eq!(empty.len(), 112);
+        assert_eq!(&empty[96..104], &[0; 8]);
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, &[0; 8]))
+            .await;
+        for (offset, length) in [(0i64, 8i64), (2, 3), (16, 8)] {
+            let response = client
+                .ok(Command::IOCTL, &make_body(&ioctl, offset, length))
+                .await;
+            let mut expected = offset.to_le_bytes().to_vec();
+            expected.extend_from_slice(&length.to_le_bytes());
+            assert_eq!(&response[112..], expected);
+        }
+        for maximum in [0u32, 15, 16, 17] {
+            ioctl.max_output_response = maximum.into();
+            let response = client.send(Command::IOCTL, &make_body(&ioctl, 0, 8)).await;
+            assert_eq!(
+                response_status(&response),
+                if maximum < 16 {
+                    Status::BUFFER_TOO_SMALL
+                } else {
+                    Status::SUCCESS
+                }
+            );
+            let response = client.ok(Command::IOCTL, &make_body(&ioctl, 0, 0)).await;
+            assert_eq!(response.len(), 112);
+        }
+        for (offset, length) in [(-1, 0), (0, -1), (i64::MAX, 1)] {
+            assert_eq!(
+                response_status(
+                    &client
+                        .send(Command::IOCTL, &make_body(&ioctl, offset, length))
+                        .await
+                ),
+                Status::INVALID_PARAMETER,
+            );
+        }
+        let no_read = client.open_result("allocated-ranges", 0x20, 7, 1, 0).await;
+        let no_read = read_body::<CreateResponse>(&no_read).unwrap().file_id;
+        ioctl.file_id = no_read;
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &make_body(&ioctl, 0, 8)).await),
+            Status::ACCESS_DENIED,
+        );
+        client.close(no_read).await;
+        let directory = client.open("ranges-directory", 2, 1).await;
+        ioctl.file_id = directory;
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &make_body(&ioctl, 0, 8)).await),
+            Status::INVALID_PARAMETER,
+        );
+        client.close(directory).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn allocated_range_output_preserves_partial_records_and_provider_bounds() {
+    let control = FileControl::QueryAllocatedRanges {
+        range: ByteRange {
+            offset: 4,
+            length: 12,
+        },
+        maximum_ranges: 1,
+    };
+    let (status, data) = file_control_output(
+        control,
+        FileControlResult::AllocatedRanges {
+            ranges: vec![ByteRange {
+                offset: 6,
+                length: 2,
+            }],
+            overflow: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(status, Status::BUFFER_OVERFLOW);
+    let mut expected = 6i64.to_le_bytes().to_vec();
+    expected.extend_from_slice(&2i64.to_le_bytes());
+    assert_eq!(data, expected);
+    for ranges in [
+        vec![ByteRange {
+            offset: 6,
+            length: 0,
+        }],
+        vec![ByteRange {
+            offset: 32,
+            length: 2,
+        }],
+        vec![ByteRange {
+            offset: u64::MAX,
+            length: 2,
+        }],
+        vec![
+            ByteRange {
+                offset: 6,
+                length: 2
+            };
+            2
+        ],
+    ] {
+        assert_eq!(
+            file_control_output(
+                control,
+                FileControlResult::AllocatedRanges {
+                    ranges,
+                    overflow: false
+                }
+            )
+            .err(),
+            Some(Status::INTERNAL_ERROR),
+        );
+    }
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

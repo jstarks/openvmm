@@ -149,6 +149,13 @@ pub enum FileControl {
         /// Exclusive end, clamped to EOF; both offsets must fit signed 64 bits.
         end: u64,
     },
+    /// Query allocated byte ranges intersecting a nonnegative signed-64-bit range.
+    QueryAllocatedRanges {
+        /// Queried interval; offset plus length must fit signed 64 bits.
+        range: ByteRange,
+        /// Maximum records to return; report overflow if more remain.
+        maximum_ranges: usize,
+    },
 }
 
 /// Semantic result of a selected filesystem control.
@@ -158,6 +165,13 @@ pub enum FileControlResult {
     Done,
     /// Current COMPRESSION_FORMAT_* state.
     Compression(u16),
+    /// Contiguous allocated ranges, bounded by the request's record limit.
+    AllocatedRanges {
+        /// Nonempty intersecting ranges in increasing offset order.
+        ranges: Vec<ByteRange>,
+        /// More records remain than fit in the requested limit.
+        overflow: bool,
+    },
 }
 
 /// Provider-owned sector geometry and alignment, including synthetic devices.

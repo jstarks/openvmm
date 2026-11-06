@@ -111,6 +111,61 @@ fn create_context_queries_return_stable_ids_and_backend_maximal_access() {
 }
 
 #[test]
+fn maximum_allowed_uses_provider_grants_and_readonly_constraints() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("readonly", 2, 0).await;
+        let mut basic = FileBasicInformation::new_zeroed();
+        basic.file_attributes = FileAttributes::new().with_readonly(true);
+        assert_eq!(
+            response_status(&client.set(file, 4, basic.as_bytes()).await),
+            Status::SUCCESS
+        );
+        client.close(file).await;
+        let response = client
+            .open_result(
+                "readonly",
+                AccessMask::new().with_maximum_allowed(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let access = client.query(file, 8).await;
+        let access = AccessMask::from_bits(u32::from_le_bytes(access[72..76].try_into().unwrap()));
+        assert!(access.read_data());
+        assert!(!access.write_data());
+        assert!(!access.append_data());
+        assert!(!access.maximum_allowed());
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::WRITE, &Client::write_body(file, 0, b"x"))
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        client.close(file).await;
+        let response = client
+            .open_result(
+                "readonly",
+                AccessMask::new()
+                    .with_maximum_allowed(true)
+                    .with_write_data(true)
+                    .into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        assert_eq!(response_status(&response), Status::ACCESS_DENIED);
+    });
+}
+
+#[test]
 fn malformed_create_context_chains_do_not_create_files() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 32)).unwrap();

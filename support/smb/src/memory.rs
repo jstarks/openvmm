@@ -246,6 +246,7 @@ impl MemoryFs {
                 alignment_requirement: 0,
                 delete_pending: false,
                 maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                granted_access: 0,
             },
             parent: 1,
             data: Vec::new(),
@@ -319,7 +320,32 @@ fn node_metadata(state: &State, id: u64) -> Result<Metadata, Status> {
     components.reverse();
     metadata.path = format!("\\{}", components.join("\\"));
     metadata.number_of_links = u32::from(!metadata.delete_pending);
+    metadata.maximal_access = maximal_access(&metadata);
     Ok(metadata)
+}
+
+fn maximal_access(metadata: &Metadata) -> u32 {
+    AccessMask::FILE_ALL_ACCESS
+        .with_write_data(!metadata.attributes().readonly())
+        .with_append_data(!metadata.attributes().readonly())
+        .into_bits()
+}
+
+fn grant_access(available: u32, requested: u32, delete: bool) -> Result<u32, Status> {
+    let mask = AccessMask::from_bits(requested);
+    let requested = mask.with_maximum_allowed(false).into_bits();
+    if requested & !available != 0 {
+        return Err(Status::ACCESS_DENIED);
+    }
+    let granted = if mask.maximum_allowed() {
+        available
+    } else {
+        requested
+    };
+    if delete && !AccessMask::from_bits(granted).delete() {
+        return Err(Status::ACCESS_DENIED);
+    }
+    Ok(granted)
 }
 
 fn has_children(state: &State, node: u64) -> bool {
@@ -573,6 +599,7 @@ impl FileSystem for MemoryFs {
         options: OpenOptions,
         _request: &RequestContext,
     ) -> Result<(MemoryFile, u32), Status> {
+        let mut options = options;
         let parts = components(name)?;
         let mut state = self.0.lock();
         let parent = resolve_directory(&state, &parts[..parts.len().saturating_sub(1)])?;
@@ -585,9 +612,6 @@ impl FileSystem for MemoryFs {
             .checked_add(1)
             .ok_or(Status::INSUFFICIENT_RESOURCES)?;
         let delete = options.options().delete_on_close();
-        if delete && !options.access().delete() {
-            return Err(Status::ACCESS_DENIED);
-        }
         let (id, action) = if let Some(id) = existing {
             let node = &state.nodes[&id];
             if node.metadata.delete_pending {
@@ -602,6 +626,7 @@ impl FileSystem for MemoryFs {
             if options.options().non_directory_file() && node.metadata.is_directory() {
                 return Err(Status::FILE_IS_A_DIRECTORY);
             }
+            options.access = grant_access(maximal_access(&node.metadata), options.access, delete)?;
             if node.metadata.attributes().readonly()
                 && (options.access().write_data() || options.access().append_data() || delete)
             {
@@ -662,6 +687,11 @@ impl FileSystem for MemoryFs {
             ) {
                 return Err(Status::OBJECT_NAME_NOT_FOUND);
             }
+            options.access = grant_access(
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                options.access,
+                delete,
+            )?;
             if state.nodes.len() >= state.object_limit {
                 return Err(Status::DISK_FULL);
             }
@@ -698,6 +728,7 @@ impl FileSystem for MemoryFs {
                         alignment_requirement: 0,
                         delete_pending: false,
                         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                        granted_access: 0,
                     },
                     parent,
                     data: Vec::new(),
@@ -909,7 +940,11 @@ impl FileSystem for MemoryFs {
         file: &MemoryFile,
         _request: &RequestContext,
     ) -> Result<Metadata, Status> {
-        node_metadata(&self.0.lock(), file.node)
+        let state = self.0.lock();
+        let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let mut metadata = node_metadata(&state, file.node)?;
+        metadata.granted_access = open.access;
+        Ok(metadata)
     }
 
     async fn filesystem_information(
@@ -1560,6 +1595,11 @@ mod tests {
     #[test]
     fn contract_filesystem_information() {
         run_contract(contracts::filesystem_information);
+    }
+
+    #[test]
+    fn contract_maximum_allowed_access() {
+        run_contract(contracts::maximum_allowed_access);
     }
 
     #[test]

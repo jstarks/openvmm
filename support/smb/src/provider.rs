@@ -97,6 +97,9 @@ pub struct Metadata {
     pub delete_pending: bool,
     /// Maximal access for the share's established identity, not the current open.
     pub maximal_access: u32,
+    /// Actual logical rights granted to this open, without generic/MAXIMUM_ALLOWED bits.
+    /// Directory enumeration entries need not populate this field.
+    pub granted_access: u32,
 }
 
 impl Metadata {
@@ -147,7 +150,8 @@ pub struct FileSystemInformation {
 /// Parameters of an SMB open, after protocol validation.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
-    /// Specific file access rights, with generic bits already mapped.
+    /// Specific access rights, with generic bits mapped. MAXIMUM_ALLOWED is
+    /// retained for the provider to resolve against the established identity.
     pub access: u32,
     /// FILE_SHARE_READ/WRITE/DELETE bits.
     pub share_access: u32,

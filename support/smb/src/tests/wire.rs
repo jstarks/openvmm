@@ -55,6 +55,7 @@ fn directory_formats_match_independent_byte_layouts() {
         alignment_requirement: 511,
         delete_pending: false,
         maximal_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+        granted_access: AccessMask::FILE_ALL_ACCESS.into_bits(),
     };
     // Literal fixed lengths and offsets are independent of the encoder's types:
     // MS-FSCC §§2.4.8, 10, 15, 22, 24, 33.

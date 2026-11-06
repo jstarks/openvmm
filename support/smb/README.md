@@ -329,6 +329,12 @@ Variable name replies retain the full name length and return partial complete
 UTF-16 code units with BUFFER_OVERFLOW. Explicit EA-size queries require READ_EA;
 providers report actual EA lengths, with no EAs in the current MemoryFs profile.
 
+The provider resolves MAXIMUM_ALLOWED and reports actual per-open grants
+separately from maximal access for the established identity. The engine does not
+expand that request to blanket FILE_ALL_ACCESS. Existing opens retain their grants
+when attributes or security change; new opens are checked against current state.
+MemoryFs maximum access on readonly objects excludes data write/append rights.
+
 Allocation updates (19) reserve space without extending EOF and can truncate
 data when reduced. MemoryFs charges reservations to its quota, hides bytes beyond
 EOF, preserves zero-filled gaps and retains reservations during EOF growth.

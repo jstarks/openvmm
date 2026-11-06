@@ -1803,13 +1803,6 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::INVALID_PARAMETER);
         }
         let access = map_access(request.desired_access.into_bits());
-        let access_mask = AccessMask::from_bits(access);
-        let access = if access_mask.maximum_allowed() {
-            access_mask.with_maximum_allowed(false).into_bits()
-                | AccessMask::FILE_ALL_ACCESS.into_bits()
-        } else {
-            access
-        };
         let access = AccessMask::from_bits(access);
         let access = if options.no_intermediate_buffering() {
             access.with_append_data(false)
@@ -1862,6 +1855,7 @@ impl<B: FileSystem> Connection<B> {
             persistent: info.id.into(),
             volatile: volatile.into(),
         };
+        let access = AccessMask::from_bits(info.granted_access);
         let file = Arc::new(OpenFile {
             file,
             identity: info.id,

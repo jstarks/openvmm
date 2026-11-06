@@ -228,6 +228,51 @@ pub async fn filesystem_information<F: Fixture>(fixture: &F) {
     fs.close(&root, &request).await.unwrap();
 }
 
+/// MAXIMUM_ALLOWED is resolved by the provider, not expanded to blanket rights.
+/// Actual grants are per-open and distinct from the identity's current maximum.
+pub async fn maximum_allowed_access<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "grants", CreateDisposition::CREATE, false, &request).await;
+    let original = fs.metadata(&file, &request).await.unwrap();
+    assert_eq!(
+        original.granted_access,
+        AccessMask::FILE_ALL_ACCESS.into_bits()
+    );
+    let maximum = OpenOptions {
+        access: AccessMask::new().with_maximum_allowed(true).into_bits(),
+        ..options(CreateDisposition::OPEN, false)
+    };
+    let (peer, _) = fs.open("grants", maximum, &request).await.unwrap();
+    let metadata = fs.metadata(&peer, &request).await.unwrap();
+    assert_eq!(metadata.granted_access, metadata.maximal_access);
+    assert!(!AccessMask::from_bits(metadata.granted_access).maximum_allowed());
+    fs.close(&peer, &request).await.unwrap();
+    let info = BasicInformation {
+        created: 0,
+        accessed: 0,
+        written: 0,
+        changed: 0,
+        attributes: FileAttributes::new().with_readonly(true).into_bits(),
+    };
+    if let Some(status) = unsupported(fixture.expectations().basic_information) {
+        rejected(fs.set_basic(&file, info, &request).await, status);
+    } else {
+        fs.set_basic(&file, info, &request).await.unwrap();
+        let (peer, _) = fs.open("grants", maximum, &request).await.unwrap();
+        let metadata = fs.metadata(&peer, &request).await.unwrap();
+        let granted = AccessMask::from_bits(metadata.granted_access);
+        assert!(granted.read_data());
+        assert!(!granted.write_data() && !granted.append_data());
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().granted_access,
+            original.granted_access
+        );
+        fs.close(&peer, &request).await.unwrap();
+    }
+    fs.close(&file, &request).await.unwrap();
+}
+
 /// Allocation reserves space without extending EOF; writes in that space
 /// expose zero-filled gaps and allocation zero truncates the stream.
 pub async fn allocation_reservations<F: Fixture>(fixture: &F) {

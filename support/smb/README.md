@@ -563,6 +563,17 @@ future work. Basic rename/move and ACL updates are implemented.
 Unsupported requests receive explicit status errors.
 Memory is allocated for file holes; this is not a sparse-filesystem model.
 
+The current profile grants no oplocks or leases and advertises no leasing
+capability. Lease contexts are ignored as required for that profile. Unsolicited
+oplock acknowledgments validate the open then return INVALID_DEVICE_STATE;
+lease acknowledgments return OBJECT_NAME_NOT_FOUND because no lease table exists.
+IOCTL validates FSCTL flags, file/server-wide identity, input bounds/alignment,
+transaction limits and multi-credit sizes before declining unsupported controls.
+Server-wide controls preserve their all-ones no-file sentinel in compounds.
+The profile allows no filesystem controls; shared-VHD controls explicitly return
+INVALID_DEVICE_REQUEST. No snapshots, server-side copy, reparse mutation,
+resiliency or interface-discovery success is fabricated.
+
 Full filesystem- and dialect-specific torture suites are not expected to
 pass yet. For example, `smb2.rw.invalid` includes a particular filesystem
 maximum-file-size expectation, whereas this provider reports quota

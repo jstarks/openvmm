@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use thiserror::Error;
+use zerocopy::little_endian::U16;
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
 /// Failure that cannot be represented by a response to a valid SMB header.
@@ -547,7 +548,7 @@ fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<
                 if units.len() > SHORT_NAME_CAPACITY {
                     return Err(Status::INTERNAL_ERROR);
                 }
-                short_name.length = (units.len() * size_of::<zerocopy::little_endian::U16>()) as u8;
+                short_name.length = (units.len() * size_of::<U16>()) as u8;
                 for (target, unit) in short_name.name.iter_mut().zip(units) {
                     *target = unit.into();
                 }
@@ -867,6 +868,18 @@ impl<B: FileSystem> Connection<B> {
         }
         let mut open = None;
         let mut retired = Vec::new();
+        if error.is_none() && command == Command::IOCTL {
+            match read_body::<IoctlRequest>(&request.packet) {
+                Err(status) => error = Some(status),
+                Ok(ioctl)
+                    if ioctl.flags.into_bits()
+                        != IoctlFlags::new().with_fsctl(true).into_bits() =>
+                {
+                    error = Some(Status::NOT_SUPPORTED);
+                }
+                Ok(_) => {}
+            }
+        }
         if error.is_none() {
             let file_id = compound::request_file_id(&mut request.packet, None);
             match file_id {
@@ -1576,10 +1589,77 @@ impl<B: FileSystem> Connection<B> {
             Command::READ => self.read(packet, tree, context).await,
             Command::WRITE => self.write(packet, tree, context).await,
             Command::LOCK => self.lock(packet, tree, context).await,
+            Command::IOCTL => self.ioctl(packet, tree, context),
+            Command::OPLOCK_BREAK => self.oplock_acknowledgement(packet, tree, context),
             Command::QUERY_DIRECTORY => self.query_directory(packet, tree, context).await,
             Command::SET_INFO => self.set_info(packet, tree, context).await,
             _ => Err(Status::NOT_SUPPORTED),
         }
+    }
+
+    fn ioctl(&self, packet: &[u8], tree: u32, context: &RequestContext) -> Result<Vec<u8>, Status> {
+        let request: IoctlRequest = read_body(packet)?;
+        if request.flags.into_bits() != IoctlFlags::new().with_fsctl(true).into_bits() {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        let code = FsctlCode(request.control_code.get());
+        if code.uses_file() {
+            let _ = self.file(request.file_id, tree, context)?;
+        } else if request.file_id.persistent.get() != u64::MAX
+            || request.file_id.volatile.get() != u64::MAX
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if [
+            request.input_count.get(),
+            request.max_input_response.get(),
+            request.max_output_response.get(),
+        ]
+        .into_iter()
+        .any(|length| length as usize > MAX_TRANSFER_SIZE)
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if request.input_count.get() != 0
+            && !(request.input_offset.get() as usize).is_multiple_of(8)
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        variable::<IoctlRequest>(
+            packet,
+            request.input_offset.get() as usize,
+            request.input_count.get() as usize,
+        )?;
+        if matches!(
+            code,
+            FsctlCode::QUERY_SHARED_VIRTUAL_DISK_SUPPORT
+                | FsctlCode::SVHDX_SYNC_TUNNEL_REQUEST
+                | FsctlCode::SVHDX_ASYNC_TUNNEL_REQUEST
+        ) {
+            return Err(Status::INVALID_DEVICE_REQUEST);
+        }
+        Err(Status::NOT_SUPPORTED)
+    }
+
+    fn oplock_acknowledgement(
+        &self,
+        packet: &[u8],
+        tree: u32,
+        context: &RequestContext,
+    ) -> Result<Vec<u8>, Status> {
+        let size =
+            U16::read_from_prefix(packet.get(HEADER_SIZE..).ok_or(Status::INVALID_PARAMETER)?)
+                .map_err(|_| Status::INVALID_PARAMETER)?
+                .0
+                .get();
+        if size == LeaseBreakAcknowledgement::STRUCTURE_SIZE {
+            let _: LeaseBreakAcknowledgement = read_body(packet)?;
+            return Err(Status::OBJECT_NAME_NOT_FOUND);
+        }
+        let request: OplockBreakAcknowledgement = read_body(packet)?;
+        let _ = self.file(request.file_id, tree, context)?;
+        // No caching rights are granted, so no open can be awaiting a break ACK.
+        Err(Status::INVALID_DEVICE_STATE)
     }
 
     async fn lock(
@@ -1674,10 +1754,10 @@ impl<B: FileSystem> Connection<B> {
         let dialects = variable::<NegotiateRequest>(
             packet,
             body_end::<NegotiateRequest>(),
-            request.dialect_count.get() as usize * size_of::<zerocopy::little_endian::U16>(),
+            request.dialect_count.get() as usize * size_of::<U16>(),
         )?;
         if !dialects
-            .chunks_exact(size_of::<zerocopy::little_endian::U16>())
+            .chunks_exact(size_of::<U16>())
             .any(|p| u16::from_le_bytes([p[0], p[1]]) == DIALECT_210)
         {
             return Err(Status::NOT_SUPPORTED);
@@ -2558,7 +2638,7 @@ impl<B: FileSystem> Connection<B> {
                 .name
                 .encode_utf16()
                 .count()
-                .checked_mul(size_of::<zerocopy::little_endian::U16>())
+                .checked_mul(size_of::<U16>())
                 .ok_or(Status::INTERNAL_ERROR)?;
             let entry_len = align_up(
                 fixed

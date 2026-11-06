@@ -65,6 +65,21 @@ pub(super) fn charge(packet: &[u8], header: &Header) -> Result<u32, Status> {
         Command::CHANGE_NOTIFY => read_body::<ChangeNotifyRequest>(packet)?
             .output_buffer_length
             .get(),
+        Command::IOCTL => {
+            let request: IoctlRequest = read_body(packet)?;
+            request
+                .input_count
+                .get()
+                .checked_add(request.output_count.get())
+                .zip(
+                    request
+                        .max_input_response
+                        .get()
+                        .checked_add(request.max_output_response.get()),
+                )
+                .map(|(input, output)| input.max(output))
+                .ok_or(Status::INVALID_PARAMETER)?
+        }
         _ => 0,
     };
     let required = payload.saturating_sub(1) / CREDIT_PAYLOAD_SIZE + 1;
@@ -108,7 +123,26 @@ pub(super) fn request_file_id(
         Command::SET_INFO => file!(SetInfoRequest),
         Command::QUERY_DIRECTORY => file!(QueryDirectoryRequest),
         Command::LOCK => file!(LockRequest),
-        Command::IOCTL => file!(IoctlRequest),
+        Command::IOCTL => {
+            let request: IoctlRequest = decode(bytes)?;
+            if !FsctlCode(request.control_code.get()).uses_file() {
+                Ok(None)
+            } else {
+                file!(IoctlRequest)
+            }
+        }
+        Command::OPLOCK_BREAK => {
+            let size = U16::read_from_prefix(bytes)
+                .map_err(|_| Status::INVALID_PARAMETER)?
+                .0
+                .get();
+            if size == LeaseBreakAcknowledgement::STRUCTURE_SIZE {
+                let _: LeaseBreakAcknowledgement = decode(bytes)?;
+                Ok(None)
+            } else {
+                file!(OplockBreakAcknowledgement)
+            }
+        }
         Command::CHANGE_NOTIFY => file!(ChangeNotifyRequest),
         _ => Ok(None),
     }

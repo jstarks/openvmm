@@ -4,6 +4,43 @@
 use super::*;
 use test_with_tracing::test;
 
+#[test]
+fn server_wide_ioctl_keeps_no_file_sentinel_in_related_compounds() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let mut ioctl = IoctlRequest::new_zeroed();
+        ioctl.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+        ioctl.control_code = FsctlCode::VALIDATE_NEGOTIATE_INFO.0.into();
+        ioctl.file_id = FileId::RELATED;
+        ioctl.flags = IoctlFlags::new().with_fsctl(true);
+        let bytes = packet(
+            &mut client,
+            vec![
+                (
+                    Command::CREATE,
+                    create_body(
+                        "ioctl",
+                        AccessMask::FILE_ALL_ACCESS.into_bits(),
+                        7,
+                        2,
+                        0,
+                        &[],
+                    ),
+                ),
+                (Command::IOCTL, ioctl.as_bytes().to_vec()),
+            ],
+            true,
+        );
+        let response = client.connection.process(&bytes).await.unwrap();
+        let replies = responses(&response);
+        assert_eq!(response_status(replies[0]), Status::SUCCESS);
+        assert_eq!(response_status(replies[1]), Status::NOT_SUPPORTED);
+        let file = read_body::<CreateResponse>(replies[0]).unwrap().file_id;
+        client.close(file).await;
+    });
+}
+
 pub(super) fn packet<B: FileSystem>(
     client: &mut Client<B>,
     commands: Vec<(Command, Vec<u8>)>,

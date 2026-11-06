@@ -95,6 +95,7 @@ open_enum! {
         NAME_TOO_LONG = 0xc0000106,
         FILE_CLOSED = 0xc0000128,
         INVALID_LOCK_RANGE = 0xc00001a1,
+        INVALID_DEVICE_STATE = 0xc0000184,
         USER_SESSION_DELETED = 0xc0000203,
         NETWORK_NAME_DELETED = 0xc00000c9,
     }
@@ -762,8 +763,47 @@ LockRequest, 48, 48 {
     file_id: FileId,
     first_lock: LockElement,
 });
+open_enum! {
+    /// SMB-specific FSCTLs: [MS-SMB2] §2.2.31; shared-VHD constants: [MS-RSVD] §2.2.1.
+    pub enum FsctlCode: u32 {
+        #![expect(missing_docs, reason = "Names follow the cited control-code tables.")]
+        DFS_GET_REFERRALS = 0x00060194,
+        DFS_GET_REFERRALS_EX = 0x000601b0,
+        PIPE_WAIT = 0x00110018,
+        QUERY_NETWORK_INTERFACE_INFO = 0x001401fc,
+        VALIDATE_NEGOTIATE_INFO = 0x00140204,
+        QUERY_SHARED_VIRTUAL_DISK_SUPPORT = 0x00090300,
+        SVHDX_SYNC_TUNNEL_REQUEST = 0x00090304,
+        SVHDX_ASYNC_TUNNEL_REQUEST = 0x00090364,
+    }
+}
+
+impl FsctlCode {
+    /// These requests address the server/share instead of an open (§3.3.5.15).
+    pub fn uses_file(self) -> bool {
+        !matches!(
+            self,
+            Self::DFS_GET_REFERRALS
+                | Self::DFS_GET_REFERRALS_EX
+                | Self::PIPE_WAIT
+                | Self::QUERY_NETWORK_INTERFACE_INFO
+                | Self::VALIDATE_NEGOTIATE_INFO
+        )
+    }
+}
+
+/// IOCTL flags: [MS-SMB2] §2.2.31.
+#[bitfield(u32, repr = U32, from = U32::new, into = super::u32_from_le, conversion = false)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct IoctlFlags {
+    pub fsctl: bool,
+    #[bits(31)]
+    reserved: u32,
+}
+le_bitfield_conversions!(IoctlFlags, u32, U32);
+
 wire!(
-/// IOCTL request fixed prefix: [MS-SMB2] §2.2.31. Only compound identity is processed.
+/// IOCTL request fixed prefix: [MS-SMB2] §2.2.31.
 IoctlRequest, 56, 57 {
     structure_size: U16,
     reserved: U16,
@@ -775,8 +815,27 @@ IoctlRequest, 56, 57 {
     output_offset: U32,
     output_count: U32,
     max_output_response: U32,
-    flags: U32,
+    flags: IoctlFlags,
     reserved2: U32,
+});
+wire!(
+/// Oplock break acknowledgment: [MS-SMB2] §2.2.25.1.
+OplockBreakAcknowledgement, 24, 24 {
+    structure_size: U16,
+    oplock_level: OplockLevel,
+    reserved: u8,
+    reserved2: U32,
+    file_id: FileId,
+});
+wire!(
+/// Lease break acknowledgment: [MS-SMB2] §2.2.25.2.
+LeaseBreakAcknowledgement, 36, 36 {
+    structure_size: U16,
+    reserved: U16,
+    flags: U32,
+    lease_key: [u8; 16],
+    lease_state: U32,
+    lease_duration: U64,
 });
 /// Notification scope: [MS-SMB2] §2.2.35.
 #[bitfield(u16, repr = U16, from = U16::new, into = super::u16_from_le, conversion = false)]

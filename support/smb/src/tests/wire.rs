@@ -5,6 +5,167 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("ioctl", 2, 0).await;
+        let mut ioctl = IoctlRequest::new_zeroed();
+        ioctl.structure_size = IoctlRequest::STRUCTURE_SIZE.into();
+        ioctl.file_id = file;
+        ioctl.control_code = 0xdeadbeefu32.into();
+        ioctl.flags = IoctlFlags::new().with_fsctl(true);
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::NOT_SUPPORTED
+        );
+        ioctl.input_count = 1.into();
+        ioctl.input_offset = (body_end::<IoctlRequest>() as u32).into();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::INVALID_PARAMETER
+        );
+        let mut body = ioctl.as_bytes().to_vec();
+        body.push(0);
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &body).await),
+            Status::NOT_SUPPORTED
+        );
+        ioctl.input_offset = (body_end::<IoctlRequest>() as u32 + 1).into();
+        body = ioctl.as_bytes().to_vec();
+        body.extend_from_slice(&[0; 2]);
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, &body).await),
+            Status::INVALID_PARAMETER
+        );
+        ioctl.input_count = 0.into();
+        ioctl.input_offset = 0.into();
+        ioctl.output_offset = u32::MAX.into();
+        ioctl.output_count = 1.into();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::NOT_SUPPORTED
+        );
+        ioctl.output_count = 0.into();
+        ioctl.max_output_response = (MAX_TRANSFER_SIZE as u32 + 1).into();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::INVALID_PARAMETER
+        );
+        ioctl.max_output_response = (CREDIT_PAYLOAD_SIZE + 1).into();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::NOT_SUPPORTED
+        );
+        let mut packet = request(
+            Command::IOCTL,
+            ioctl.as_bytes(),
+            client.session,
+            client.tree,
+            client.message,
+        );
+        Header::mut_from_prefix(&mut packet)
+            .unwrap()
+            .0
+            .credit_charge = 1.into();
+        client.message += 2;
+        assert_eq!(
+            response_status(&client.connection.process(&packet).await.unwrap()),
+            Status::INVALID_PARAMETER
+        );
+        ioctl.max_output_response = 0.into();
+        ioctl.file_id = FileId::RELATED;
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::FILE_CLOSED
+        );
+        ioctl.flags = IoctlFlags::new();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::NOT_SUPPORTED
+        );
+        ioctl.flags = IoctlFlags::new().with_fsctl(true);
+        ioctl.control_code = FsctlCode::VALIDATE_NEGOTIATE_INFO.0.into();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::NOT_SUPPORTED
+        );
+        ioctl.file_id = file;
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::INVALID_PARAMETER
+        );
+        ioctl.control_code = FsctlCode::QUERY_SHARED_VIRTUAL_DISK_SUPPORT.0.into();
+        assert_eq!(
+            response_status(&client.send(Command::IOCTL, ioctl.as_bytes()).await),
+            Status::INVALID_DEVICE_REQUEST
+        );
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn uncached_opens_decline_leases_and_reject_unsolicited_break_acknowledgements() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut connection = server.connect();
+        let response = connection
+            .process(&request(Command::NEGOTIATE, &negotiate_body(), 0, 0, 0))
+            .await
+            .unwrap();
+        let capabilities = read_body::<NegotiateResponse>(&response)
+            .unwrap()
+            .capabilities;
+        assert!(!capabilities.leasing());
+        assert!(!capabilities.directory_leasing());
+        let mut client = Client::new(&server).await;
+        let mut extra = Vec::new();
+        let mut last = None;
+        append_create_context(
+            &mut extra,
+            &mut last,
+            CreateContextName::REQUEST_LEASE,
+            &[1],
+        );
+        for level in [
+            OplockLevel::NONE,
+            OplockLevel::LEVEL_II,
+            OplockLevel::EXCLUSIVE,
+            OplockLevel::BATCH,
+            OplockLevel::LEASE,
+        ] {
+            let mut body = create_body("uncached", 1, 7, 3, 0, &extra);
+            CreateRequest::mut_from_bytes(&mut body[..size_of::<CreateRequest>()])
+                .unwrap()
+                .requested_oplock_level = level;
+            let response = client.ok(Command::CREATE, &body).await;
+            let response = read_body::<CreateResponse>(&response).unwrap();
+            assert_eq!(response.oplock_level, OplockLevel::NONE);
+            assert_eq!(response.contexts_length.get(), 0);
+            let file = response.file_id;
+            let mut ack = OplockBreakAcknowledgement::new_zeroed();
+            ack.structure_size = OplockBreakAcknowledgement::STRUCTURE_SIZE.into();
+            ack.file_id = file;
+            assert_eq!(
+                response_status(&client.send(Command::OPLOCK_BREAK, ack.as_bytes()).await),
+                Status::INVALID_DEVICE_STATE
+            );
+            client.close(file).await;
+            assert_eq!(
+                response_status(&client.send(Command::OPLOCK_BREAK, ack.as_bytes()).await),
+                Status::FILE_CLOSED
+            );
+        }
+        let mut lease = LeaseBreakAcknowledgement::new_zeroed();
+        lease.structure_size = LeaseBreakAcknowledgement::STRUCTURE_SIZE.into();
+        assert_eq!(
+            response_status(&client.send(Command::OPLOCK_BREAK, lease.as_bytes()).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+    });
+}
+
+#[test]
 fn attribute_tag_queries_report_real_metadata_and_require_read_attributes() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

@@ -36,6 +36,20 @@ fn request(command: Command, body: &[u8], session: u64, tree: u32, message: u64)
             }
             Command::CHANGE_NOTIFY => decode::<ChangeNotifyRequest>(body)
                 .map(|request| request.output_buffer_length.get()),
+            Command::IOCTL => decode::<IoctlRequest>(body).and_then(|request| {
+                request
+                    .input_count
+                    .get()
+                    .checked_add(request.output_count.get())
+                    .zip(
+                        request
+                            .max_input_response
+                            .get()
+                            .checked_add(request.max_output_response.get()),
+                    )
+                    .map(|(input, output)| input.max(output))
+                    .ok_or(Status::INVALID_PARAMETER)
+            }),
             _ => Ok(0),
         }
         .unwrap_or(0);

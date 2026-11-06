@@ -166,6 +166,9 @@ publication (MS-FSA 2.1.5.1.1). Readonly directory creation remains ignored in
 this profile. Unsupported compression, encryption, sparse, reparse and other
 storage flags are not fabricated. Basic attribute updates use the same settable
 mask; opening an existing object does not apply creation attributes.
+After a directory's READONLY bit is set through basic metadata, it remains
+observable but does not prohibit explicitly requested directory write/append
+rights (MS-FSA 2.1.5.1.2.1). Readonly data-file restrictions are unchanged.
 
 OVERWRITE/OVERWRITE_IF/SUPERSEDE preserve existing HIDDEN/SYSTEM requirements
 before truncation, check their implied data/delete/metadata rights, and apply

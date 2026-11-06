@@ -980,7 +980,8 @@ impl FileSystem for MemoryFs {
                 available.set_delete_child(false);
             }
             options.access = grant_access(available.into_bits(), options.access, delete)?;
-            if node.metadata.attributes().readonly()
+            if !node.metadata.is_directory()
+                && node.metadata.attributes().readonly()
                 && (options.access().write_data() || options.access().append_data())
             {
                 return Err(Status::ACCESS_DENIED);

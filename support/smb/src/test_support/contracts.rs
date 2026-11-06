@@ -1874,6 +1874,31 @@ pub async fn basic_information<F: Fixture>(fixture: &F) {
         fs.set_basic(
             &directory,
             BasicInformation {
+                attributes: FileAttributes::new().with_readonly(true).into_bits(),
+                ..info
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+        let directory_alias = open(
+            fs,
+            "attributes-directory",
+            CreateDisposition::OPEN,
+            true,
+            &request,
+        )
+        .await;
+        let metadata = fs.metadata(&directory_alias, &request).await.unwrap();
+        assert!(metadata.attributes().readonly());
+        assert_eq!(
+            metadata.granted_access,
+            AccessMask::FILE_ALL_ACCESS.into_bits()
+        );
+        fs.close(&directory_alias, &request).await.unwrap();
+        fs.set_basic(
+            &directory,
+            BasicInformation {
                 attributes: FileAttributes::new()
                     .with_not_content_indexed(true)
                     .into_bits(),

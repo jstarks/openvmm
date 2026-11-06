@@ -30,7 +30,6 @@ fn samba_read_write_smoke() {
             "smb2.read.access",
             "smb2.create.open",
             "smb2.mkdir",
-            "smb2.dir.find",
             "smb2.getinfo.qsec_buffercheck",
             "smb2.getinfo.granted",
             "smb2.acls-with-sysacl.OWNER-RIGHTS",
@@ -41,6 +40,24 @@ fn samba_read_write_smoke() {
             "smb2.compound.related5",
             "smb2.compound_find.compound_find_related",
             "smb2.compound_find.compound_find_unrelated",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_directory() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &[
+            "smb2.dir.find",
+            "smb2.dir.fixed",
+            "smb2.dir.many",
+            "smb2.dir.modify",
+            "smb2.dir.sorted",
+            "smb2.dir.large-files",
+            "smb2.dir.1kfiles_rename",
         ],
     );
 }

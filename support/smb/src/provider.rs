@@ -348,6 +348,7 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     /// Make accepted writes durable according to the provider's storage model.
     async fn flush(&self, file: &Self::File, request: &RequestContext) -> Result<(), Status>;
     /// Return the current children of an open directory.
+    /// The engine may request fresh snapshots when continuing an enumeration.
     async fn list(
         &self,
         directory: &Self::File,

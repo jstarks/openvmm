@@ -146,13 +146,20 @@ struct OpenFile<F> {
     is_directory: bool,
     tree: u32,
     position: AtomicI64,
-    directory: Mutex<Option<(Vec<Metadata>, usize)>>,
+    directory: Mutex<Option<DirectorySearch>>,
     closing: AtomicBool,
     closed: AtomicBool,
     close_gate: futures::lock::Mutex<()>,
     active: Mutex<Vec<Activity>>,
     changed: Event,
     close_error: Mutex<Option<Status>>,
+}
+
+struct DirectorySearch {
+    pattern: String,
+    // Resume by stable identity and link name, not an offset into a stale snapshot.
+    after: Option<(u8, u64, String)>,
+    cursor: usize,
 }
 
 struct Activity {
@@ -395,7 +402,7 @@ impl<F> Inspect for OpenFile<F> {
             .field("active_operations", self.active.lock().len())
             .field(
                 "directory_cursor",
-                self.directory.lock().as_ref().map(|(_, cursor)| *cursor),
+                self.directory.lock().as_ref().map(|search| search.cursor),
             );
     }
 }
@@ -504,6 +511,15 @@ fn ea_size(info: &Metadata) -> Result<u32, Status> {
             .checked_add(4)
             .ok_or(Status::INTERNAL_ERROR)
     }
+}
+
+fn directory_key(info: &Metadata) -> (u8, u64, &str) {
+    let order = match info.name.as_str() {
+        "." => 0,
+        ".." => 1,
+        _ => 2,
+    };
+    (order, info.id, &info.name)
 }
 
 fn directory_record(class: FileInformationClass, info: &Metadata) -> Result<Vec<u8>, Status> {
@@ -2602,35 +2618,42 @@ impl<B: FileSystem> Connection<B> {
             _ => return Err(Status::NOT_SUPPORTED),
         };
         let flags = request.flags;
-        if flags.index_specified() {
-            return Err(Status::NOT_SUPPORTED);
-        }
         let file = self.file(request.file_id, tree, context)?;
         if !file.access.read_data() {
             return Err(Status::ACCESS_DENIED);
         }
-        if file.directory.lock().is_none() || flags.restart_scans() || flags.reopen() {
-            if pattern != "*" && pattern != "*.*" && pattern.contains(['*', '?', '<', '>', '"']) {
-                return Err(Status::NOT_SUPPORTED);
-            }
-            let entries = self.server.backend.list(&file.file, context).await?;
-            let entries = entries
-                .into_iter()
-                .filter(|n| {
-                    pattern.is_empty()
-                        || pattern == "*"
-                        || pattern == "*.*"
-                        || n.name.eq_ignore_ascii_case(&pattern)
-                })
-                .collect();
-            *file.directory.lock() = Some((entries, 0));
+        let restart = file.directory.lock().is_none() || flags.restart_scans() || flags.reopen();
+        if restart
+            && pattern != "*"
+            && pattern != "*.*"
+            && pattern.contains(['*', '?', '<', '>', '"'])
+        {
+            return Err(Status::NOT_SUPPORTED);
         }
+        let mut entries = self.server.backend.list(&file.file, context).await?;
+        entries.sort_unstable_by(|left, right| directory_key(left).cmp(&directory_key(right)));
         let mut directory = file.directory.lock();
-        let (entries, cursor) = directory.as_mut().ok_or(Status::INVALID_PARAMETER)?;
+        if restart {
+            *directory = Some(DirectorySearch {
+                pattern,
+                after: None,
+                cursor: 0,
+            });
+        }
+        let search = directory.as_mut().ok_or(Status::INVALID_PARAMETER)?;
         let maximum = (request.output_buffer_length.get() as usize).min(MAX_TRANSFER_SIZE);
         let mut out = Vec::new();
         let mut previous = None;
-        while let Some(info) = entries.get(*cursor) {
+        for info in &entries {
+            if search.after.as_ref().is_some_and(|(order, id, name)| {
+                directory_key(info) <= (*order, *id, name.as_str())
+            }) || !(search.pattern.is_empty()
+                || search.pattern == "*"
+                || search.pattern == "*.*"
+                || info.name.eq_ignore_ascii_case(&search.pattern))
+            {
+                continue;
+            }
             let name_length = info
                 .name
                 .encode_utf16()
@@ -2659,7 +2682,9 @@ impl<B: FileSystem> Connection<B> {
             out.extend_from_slice(&record);
             out.resize(start + entry_len, 0);
             previous = Some(start);
-            *cursor += 1;
+            let (order, id, name) = directory_key(info);
+            search.after = Some((order, id, name.to_owned()));
+            search.cursor = search.cursor.saturating_add(1);
             if flags.return_single_entry() {
                 break;
             }

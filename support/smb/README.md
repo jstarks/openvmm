@@ -59,6 +59,7 @@ cargo nextest run --profile agent -p smb --features test-support --run-ignored o
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_notify)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lock)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_rename)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_directory)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
     -E 'test(samba_notify_corrected_client)'
@@ -300,6 +301,26 @@ recommended error propagation. Mixed-style `invalid3` and unknown-command
 `invalid4` fixtures expect behavior different from the normative validation rules.
 `compound_find_close` requests 128 credits and creates 5000 objects, outside this
 test server's 32-credit/4096-object profile. None are counted as passing coverage.
+
+## Directory Enumeration
+
+Each continuation queries the provider's current listing rather than retaining
+a whole-directory metadata snapshot. Per-open state contains only the search
+pattern, last identity/link-name key and returned-entry count. Deleted entries
+disappear, changed metadata is refreshed, and new entries after the resume key
+can appear without a restart. Ordering is implementation-specific; entries
+before the key require restarting the scan.
+
+An unflagged continuation retains its original pattern. RESTART_SCANS and REOPEN
+reset the cursor and pattern. FileIndex resumption is optional in MS-SMB2
+3.3.5.18; this profile returns zero indices and ignores INDEX_SPECIFIED while
+continuing normally. It does not advertise fabricated native index positions.
+
+Seven selected Samba directory cases cover ordinary and deleted-entry scans,
+700-file continuation/restart/reopen paths, changed attributes, unspecified
+ordering, 2000 long filenames, and enumeration across repeated renames.
+The short-name-dependent `one` and index-dependent `file-index` cases are not
+counted as passing coverage.
 
 ## Directory Change Notifications
 

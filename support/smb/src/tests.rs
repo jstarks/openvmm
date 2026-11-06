@@ -1104,6 +1104,77 @@ fn per_open_rights_and_stale_file_ids_are_enforced() {
 }
 
 #[test]
+fn directory_continuation_observes_live_entries_and_preserves_its_pattern() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let mut peer = Client::new(&server).await;
+        let directory = client.open("live", 2, 1).await;
+        let removed = peer.open("live\\removed", 2, 0).await;
+        let changed = peer.open("live\\changed", 2, 0).await;
+        let mut query = QueryDirectoryRequest::new_zeroed();
+        query.structure_size = QueryDirectoryRequest::STRUCTURE_SIZE.into();
+        query.info_class = FileInformationClass::DIRECTORY.0;
+        query.file_id = directory;
+        query.flags = QueryDirectoryFlags::new().with_return_single_entry(true);
+        query.output_buffer_length = 512.into();
+        let first = client.ok(Command::QUERY_DIRECTORY, query.as_bytes()).await;
+        assert_eq!(&first[136..138], &encode_name("."));
+        assert_eq!(
+            response_status(&peer.set(removed, 13, &[1]).await),
+            Status::SUCCESS
+        );
+        peer.close(removed).await;
+        peer.ok(Command::WRITE, &Client::write_body(changed, 0, b"new"))
+            .await;
+        peer.close(changed).await;
+        let added = peer.open("live\\added", 2, 0).await;
+        peer.close(added).await;
+        for (name, size) in [("..", None), ("changed", Some(3)), ("added", Some(0))] {
+            let response = client.ok(Command::QUERY_DIRECTORY, query.as_bytes()).await;
+            let record = FileDirectoryInformation::read_from_prefix(&response[72..])
+                .unwrap()
+                .0;
+            assert_eq!(
+                decode_name(&response[136..136 + record.file_name_length.get() as usize]).unwrap(),
+                name
+            );
+            if let Some(size) = size {
+                assert_eq!(record.end_of_file.get(), size);
+            }
+        }
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::QUERY_DIRECTORY, query.as_bytes())
+                    .await
+            ),
+            Status::NO_MORE_FILES
+        );
+        query.flags.set_restart_scans(true);
+        query.name_offset = (body_end::<QueryDirectoryRequest>() as u16).into();
+        query.name_length = 14.into();
+        let mut body = query.as_bytes().to_vec();
+        body.extend_from_slice(&encode_name("changed"));
+        let response = client.ok(Command::QUERY_DIRECTORY, &body).await;
+        assert_eq!(&response[136..150], &encode_name("changed"));
+        query.flags.set_restart_scans(false);
+        query.name_length = 10.into();
+        let mut body = query.as_bytes().to_vec();
+        body.extend_from_slice(&encode_name("added"));
+        assert_eq!(
+            response_status(&client.send(Command::QUERY_DIRECTORY, &body).await),
+            Status::NO_MORE_FILES
+        );
+        query.flags.set_reopen(true);
+        body[..size_of::<QueryDirectoryRequest>()].copy_from_slice(query.as_bytes());
+        let response = client.ok(Command::QUERY_DIRECTORY, &body).await;
+        assert_eq!(&response[136..146], &encode_name("added"));
+        client.close(directory).await;
+    });
+}
+
+#[test]
 fn directory_pagination_and_small_buffer_do_not_lose_entries() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
@@ -1128,6 +1199,7 @@ fn directory_pagination_and_small_buffer_do_not_lose_entries() {
         );
         query.output_buffer_length = 16.into();
         let current = client.ok(Command::QUERY_DIRECTORY, query.as_bytes()).await;
+        query.flags.set_index_specified(true);
         let parent = client.ok(Command::QUERY_DIRECTORY, query.as_bytes()).await;
         assert_eq!(&current[84..86], &encode_name("."));
         assert_eq!(&parent[84..88], &encode_name(".."));

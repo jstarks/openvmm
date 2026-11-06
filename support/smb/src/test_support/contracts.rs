@@ -16,7 +16,7 @@
 use super::Operation;
 use crate::provider::{
     BasicInformation, ByteRange, Change, ExtendedAttribute, FileSystem, NotifyResult, OpenOptions,
-    RequestContext,
+    RequestContext, StreamInformation,
 };
 use crate::spec::{
     AccessMask, CreateAction, CreateDisposition, CreateOptions, FileAttributes, NotifyAction,
@@ -61,6 +61,8 @@ pub struct Expectations {
     pub creation_eas: Feature,
     /// Retained EA snapshots and atomic named updates.
     pub ea_operations: Feature,
+    /// Data-stream snapshots, independent of named-stream creation support.
+    pub stream_queries: Feature,
     /// Basic metadata mutation.
     pub basic_information: Feature,
     /// Atomic namespace rename and replacement.
@@ -658,6 +660,39 @@ pub async fn security_creation<F: Fixture>(fixture: &F) {
             .await,
         Status::OBJECT_NAME_NOT_FOUND,
     );
+}
+
+/// Data-stream queries describe actual lengths and omit directory/index streams.
+pub async fn stream_information<F: Fixture>(fixture: &F) {
+    let fs = fixture.filesystem();
+    let request = RequestContext::new(1);
+    let file = open(fs, "streams", CreateDisposition::CREATE, false, &request).await;
+    write_all(fs, &file, 0, b"data", &request).await;
+    if let Some(status) = unsupported(fixture.expectations().stream_queries) {
+        rejected(fs.query_streams(&file, &request).await, status);
+    } else {
+        if unsupported(fixture.expectations().allocation).is_none() {
+            fs.set_allocation_size(&file, 16, &request).await.unwrap();
+        }
+        let info = fs.metadata(&file, &request).await.unwrap();
+        assert_eq!(
+            fs.query_streams(&file, &request).await.unwrap(),
+            vec![StreamInformation {
+                name: String::new(),
+                size: 4,
+                allocation_size: info.allocation_size,
+            }]
+        );
+        let directory = open(fs, "directory", CreateDisposition::CREATE, true, &request).await;
+        assert!(
+            fs.query_streams(&directory, &request)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        fs.close(&directory, &request).await.unwrap();
+    }
+    fs.close(&file, &request).await.unwrap();
 }
 
 /// EA updates retain values, delete empty values and enforce required knowledge.

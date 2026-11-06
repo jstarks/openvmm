@@ -69,6 +69,10 @@ SET_INFO replaces named values or deletes empty ones, enforces the combined
 QUERY_INFO returns complete aligned records with per-open continuation,
 restart/single-entry/indexed queries and explicit name lists. EA mutations
 preserve open grants, update metadata and notify EA/attribute watchers.
+Stream-information queries use provider-owned names, lengths and allocation.
+MemoryFs currently reports its default data stream, excluding directory/index
+streams. The frontend also encodes named-provider snapshots and bounded complete
+records; named-stream opens/storage remain pending and are not advertised yet.
 
 ## Run
 

@@ -72,6 +72,7 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
             Operation::FileControl,
             Operation::QueryEas,
             Operation::SetEas,
+            Operation::QueryStreams,
             Operation::QuerySecurity,
             Operation::Read,
             Operation::Write,
@@ -278,6 +279,19 @@ fn every_provider_operation_can_be_gated_without_fabricating_filesystem_results(
         assert_eq!(
             through_gates(fs.query_eas(&file, &context), &control, Operation::QueryEas).await,
             vec![ea],
+        );
+        assert_eq!(
+            through_gates(
+                fs.query_streams(&file, &context),
+                &control,
+                Operation::QueryStreams
+            )
+            .await,
+            vec![StreamInformation {
+                name: String::new(),
+                size: 3,
+                allocation_size: 3
+            }],
         );
         through_gates(fs.flush(&file, &context), &control, Operation::Flush).await;
         let range = ByteRange {

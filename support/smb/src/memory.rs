@@ -7,7 +7,7 @@ use crate::codec::{align_up, decode_ea_list, encode_ea_list};
 use crate::provider::{
     BasicInformation, ByteRange, Change, CompressionInformation, ExtendedAttribute, FileControl,
     FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
-    OpenOptions, RequestContext, SectorSizeInformation,
+    OpenOptions, RequestContext, SectorSizeInformation, StreamInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
@@ -1601,6 +1601,25 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
+    async fn query_streams(
+        &self,
+        file: &MemoryFile,
+        _request: &RequestContext,
+    ) -> Result<Vec<StreamInformation>, Status> {
+        let state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
+        Ok(if node.metadata.is_directory() {
+            Vec::new()
+        } else {
+            vec![StreamInformation {
+                name: String::new(),
+                size: node.metadata.size,
+                allocation_size: node.metadata.allocation_size,
+            }]
+        })
+    }
+
     async fn query_security(
         &self,
         file: &MemoryFile,
@@ -2448,6 +2467,7 @@ mod tests {
                 security_creation: Feature::Supported,
                 creation_eas: Feature::Supported,
                 ea_operations: Feature::Supported,
+                stream_queries: Feature::Supported,
                 basic_information: Feature::Supported,
                 rename: Feature::Supported,
                 locks: Feature::Supported,
@@ -2529,6 +2549,10 @@ mod tests {
     #[test]
     fn contract_extended_attributes() {
         run_contract(contracts::extended_attributes);
+    }
+    #[test]
+    fn contract_stream_information() {
+        run_contract(contracts::stream_information);
     }
 
     #[test]

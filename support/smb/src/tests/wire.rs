@@ -368,6 +368,97 @@ fn allocated_range_output_preserves_partial_records_and_provider_bounds() {
 }
 
 #[test]
+fn stream_queries_report_actual_default_stream_without_attribute_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("stream-query", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"data"))
+            .await;
+        assert_eq!(
+            response_status(&client.set(file, 19, &16i64.to_le_bytes()).await),
+            Status::SUCCESS
+        );
+        let response = client.open_result("stream-query", 0x100000, 7, 1, 0).await;
+        let limited = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let mut query = QueryInfoRequest::new_zeroed();
+        query.structure_size = QueryInfoRequest::STRUCTURE_SIZE.into();
+        query.info_type = InformationType::FILE;
+        query.info_class = 22;
+        query.file_id = limited;
+        for maximum in [0u32, 23, 24, 37, 38, 40] {
+            query.output_buffer_length = maximum.into();
+            let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
+            if maximum < 24 {
+                assert_eq!(response_status(&response), Status::INFO_LENGTH_MISMATCH);
+            } else if maximum < 38 {
+                assert_eq!(response_status(&response), Status::BUFFER_OVERFLOW);
+                assert_eq!(response.len(), 72);
+            } else {
+                assert_eq!(response_status(&response), Status::SUCCESS);
+                let mut expected = vec![0, 0, 0, 0, 14, 0, 0, 0];
+                expected.extend_from_slice(&4i64.to_le_bytes());
+                expected.extend_from_slice(&16i64.to_le_bytes());
+                expected.extend_from_slice(&[
+                    b':', 0, b':', 0, b'$', 0, b'D', 0, b'A', 0, b'T', 0, b'A', 0,
+                ]);
+                assert_eq!(&response[72..], expected);
+            }
+        }
+        assert_eq!(
+            response_status(&client.query(limited, 4).await),
+            Status::ACCESS_DENIED
+        );
+        let directory = client.open("streams-directory", 2, 1).await;
+        query.file_id = directory;
+        let response = client.ok(Command::QUERY_INFO, query.as_bytes()).await;
+        assert_eq!(response.len(), 72);
+        client.close(directory).await;
+        client.close(limited).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn stream_output_preserves_provider_sizes_unicode_and_record_boundaries() {
+    let streams = [
+        StreamInformation {
+            name: String::new(),
+            size: 4,
+            allocation_size: 16,
+        },
+        StreamInformation {
+            name: "\u{e9}".to_owned(),
+            size: 1,
+            allocation_size: 8,
+        },
+    ];
+    let (status, body) = stream_response(&streams, 80).unwrap();
+    assert_eq!(status, Status::SUCCESS);
+    let mut expected = vec![40, 0, 0, 0, 14, 0, 0, 0];
+    expected.extend_from_slice(&4i64.to_le_bytes());
+    expected.extend_from_slice(&16i64.to_le_bytes());
+    expected.extend_from_slice(&[
+        b':', 0, b':', 0, b'$', 0, b'D', 0, b'A', 0, b'T', 0, b'A', 0, 0, 0,
+    ]);
+    expected.extend_from_slice(&[0, 0, 0, 0, 16, 0, 0, 0]);
+    expected.extend_from_slice(&1i64.to_le_bytes());
+    expected.extend_from_slice(&8i64.to_le_bytes());
+    expected.extend_from_slice(&[
+        b':', 0, 0xe9, 0, b':', 0, b'$', 0, b'D', 0, b'A', 0, b'T', 0, b'A', 0,
+    ]);
+    assert_eq!(&body[8..], expected);
+    for maximum in [38u32, 40, 79] {
+        let (status, body) = stream_response(&streams, maximum).unwrap();
+        assert_eq!(status, Status::BUFFER_OVERFLOW);
+        assert_eq!(body.len(), 46);
+        assert_eq!(&body[8..12], &[0; 4]);
+        assert_eq!(&body[12..], &expected[4..38]);
+    }
+}
+
+#[test]
 fn ioctl_profile_validates_identity_bounds_flags_and_credits() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();

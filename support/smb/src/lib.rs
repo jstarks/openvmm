@@ -29,7 +29,7 @@ use inspect::Inspect;
 use parking_lot::Mutex;
 use provider::{
     BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
-    Metadata, NotifyResult, OpenOptions, RequestContext, map_access,
+    Metadata, NotifyResult, OpenOptions, RequestContext, StreamInformation, map_access,
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -711,6 +711,59 @@ fn buffer_response(bytes: Vec<u8>, maximum: u32) -> Result<Vec<u8>, Status> {
     .to_vec();
     out.extend_from_slice(&bytes);
     Ok(out)
+}
+
+fn stream_response(
+    streams: &[StreamInformation],
+    maximum: u32,
+) -> Result<(Status, Vec<u8>), Status> {
+    if maximum as usize > MAX_TRANSFER_SIZE {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    if (maximum as usize) < size_of::<FileStreamInformation>() {
+        return Err(Status::INFO_LENGTH_MISMATCH);
+    }
+    let mut status = Status::SUCCESS;
+    let mut out = Vec::new();
+    let mut previous = None;
+    for stream in streams {
+        if stream.name.contains([':', '\0']) || stream.name.encode_utf16().count() > MAX_PATH_LENGTH
+        {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        let size = i64::try_from(stream.size).map_err(|_| Status::INTERNAL_ERROR)?;
+        let allocation =
+            i64::try_from(stream.allocation_size).map_err(|_| Status::INTERNAL_ERROR)?;
+        let name_length = (stream.name.encode_utf16().count() + 7) * 2;
+        let start = if out.is_empty() {
+            0
+        } else {
+            align_up(out.len(), STREAM_ALIGNMENT)?
+        };
+        if start + size_of::<FileStreamInformation>() + name_length > maximum as usize {
+            status = Status::BUFFER_OVERFLOW;
+            break;
+        }
+        out.resize(start, 0);
+        if let Some(previous) = previous {
+            FileStreamInformation::mut_from_prefix(&mut out[previous..])
+                .map_err(|_| Status::INTERNAL_ERROR)?
+                .0
+                .next_entry_offset = ((start - previous) as u32).into();
+        }
+        previous = Some(start);
+        out.extend_from_slice(
+            FileStreamInformation {
+                next_entry_offset: 0.into(),
+                stream_name_length: (name_length as u32).into(),
+                stream_size: size.into(),
+                stream_allocation_size: allocation.into(),
+            }
+            .as_bytes(),
+        );
+        out.extend_from_slice(&encode_name(&format!(":{}:$DATA", stream.name)));
+    }
+    buffer_response(out, maximum).map(|body| (status, body))
 }
 
 fn file_control_output(
@@ -2666,7 +2719,18 @@ impl<B: FileSystem> Connection<B> {
                 .map(|body| (status, body));
         }
         if class == FileInformationClass::STREAM {
-            return Err(Status::INVALID_INFO_CLASS);
+            if request.output_buffer_length.get() as usize > MAX_TRANSFER_SIZE {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            if request.output_buffer_length.get() < size_of::<FileStreamInformation>() as u32 {
+                return Err(Status::INFO_LENGTH_MISMATCH);
+            }
+            let streams = self
+                .server
+                .backend
+                .query_streams(&file.file, context)
+                .await?;
+            return stream_response(&streams, request.output_buffer_length.get());
         }
         let minimum = match class {
             FileInformationClass::BASIC => size_of::<FileBasicInformation>(),

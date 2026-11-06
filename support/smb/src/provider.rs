@@ -120,6 +120,17 @@ pub(crate) fn validate_ea_name(name: &[u8]) -> Result<(), Status> {
     Ok(())
 }
 
+/// One data stream of a file or directory, independent of its open handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInformation {
+    /// Unqualified stream name; empty identifies the default data stream.
+    pub name: String,
+    /// Logical length.
+    pub size: u64,
+    /// Actual allocation, which may differ from logical length.
+    pub allocation_size: u64,
+}
+
 /// Provider-reported compression state, independent of wire layouts.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompressionInformation {
@@ -478,6 +489,16 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         _request: &RequestContext,
     ) -> Result<(), Status> {
         Err(Status::INVALID_DEVICE_REQUEST)
+    }
+    /// Return a coherent snapshot of this file's data streams.
+    /// Directory/index streams are not data streams. Empty is an actual empty
+    /// list, not an unsupported-store fallback.
+    async fn query_streams(
+        &self,
+        _file: &Self::File,
+        _request: &RequestContext,
+    ) -> Result<Vec<StreamInformation>, Status> {
+        Err(Status::INVALID_INFO_CLASS)
     }
     /// Query selected security components for the established share identity.
     /// Unsupported security stores reject rather than fabricate an ACL.

@@ -36,6 +36,7 @@ impl Fixture for MemoryFixture {
             security_creation: Feature::Supported,
             creation_eas: Feature::Supported,
             ea_operations: Feature::Supported,
+            stream_queries: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,
@@ -72,6 +73,7 @@ impl ControlledFixture {
             Operation::Notify,
             Operation::QueryEas,
             Operation::SetEas,
+            Operation::QueryStreams,
         ] {
             control
                 .set_plan(
@@ -98,6 +100,7 @@ impl ControlledFixture {
                 security_creation: Feature::Unsupported(Status::NOT_SUPPORTED),
                 creation_eas: Feature::Supported,
                 ea_operations: Feature::Unsupported(Status::NOT_SUPPORTED),
+                stream_queries: Feature::Unsupported(Status::NOT_SUPPORTED),
                 basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
                 rename: Feature::Unsupported(Status::NOT_SUPPORTED),
                 locks: Feature::Unsupported(Status::NOT_SUPPORTED),
@@ -235,6 +238,15 @@ fn exported_extended_attribute_contract_checks_storage_and_declines() {
     block_on(contracts::extended_attributes(&fixture));
     fixture.assert_rejected(&[Operation::QueryEas, Operation::SetEas]);
 }
+#[test]
+fn exported_stream_information_contract_checks_storage_and_declines() {
+    block_on(contracts::stream_information(&MemoryFixture(
+        MemoryFs::new(1024, 32),
+    )));
+    let fixture = ControlledFixture::rejecting();
+    block_on(contracts::stream_information(&fixture));
+    fixture.assert_rejected(&[Operation::QueryStreams]);
+}
 
 #[test]
 fn declared_unsupported_locks_are_exercised() {
@@ -310,6 +322,7 @@ fn pending_checkpoint_keeps_driving_the_operation() {
             security_creation: Feature::Supported,
             creation_eas: Feature::Supported,
             ea_operations: Feature::Supported,
+            stream_queries: Feature::Supported,
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Supported,

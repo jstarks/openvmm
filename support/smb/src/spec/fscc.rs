@@ -178,6 +178,8 @@ pub const FILE_ALL_INFORMATION_MIN_BUFFER_SIZE: usize = 104;
 pub const FILE_NAME_INFORMATION_MIN_BUFFER_SIZE: usize = 8;
 /// Linked directory records are eight-byte aligned: [MS-FSCC] §2.4.
 pub const DIRECTORY_ALIGNMENT: usize = 8;
+/// FILE_STREAM_INFORMATION records align between entries: [MS-FSCC] §2.4.49.
+pub const STREAM_ALIGNMENT: usize = 8;
 /// ShortName contains at most twelve UTF-16 code units: [MS-FSCC] §2.4.8.
 pub const SHORT_NAME_CAPACITY: usize = 12;
 /// Maximum pathname length in UTF-16 code units: [MS-FSCC] §2.1.5.
@@ -237,6 +239,15 @@ wire!(
         change_time: I64,
         file_attributes: FileAttributes,
         reserved: U32,
+    }
+);
+wire!(
+    /// FILE_STREAM_INFORMATION prefix: [MS-FSCC] §2.4.49.
+    FileStreamInformation, 24 {
+        next_entry_offset: U32,
+        stream_name_length: U32,
+        stream_size: I64,
+        stream_allocation_size: I64,
     }
 );
 wire!(

@@ -12,6 +12,7 @@ pub mod contracts;
 use crate::provider::{
     BasicInformation, ByteRange, ExtendedAttribute, FileControl, FileControlResult, FileSystem,
     FileSystemInformation, LockId, Metadata, NotifyResult, OpenOptions, RequestContext,
+    StreamInformation,
 };
 use crate::security::SecurityDescriptor;
 use crate::spec::SecurityInformation;
@@ -52,6 +53,8 @@ pub enum Operation {
     QueryEas,
     /// Atomic extended-attribute mutation.
     SetEas,
+    /// File data-stream snapshot.
+    QueryStreams,
     /// Data read.
     Read,
     /// Data write.
@@ -826,6 +829,19 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
             .backend
             .set_eas(&file.inner, attributes, &context)
             .await;
+        call.complete(result, None).await
+    }
+
+    async fn query_streams(
+        &self,
+        file: &Self::File,
+        r: &RequestContext,
+    ) -> Result<Vec<StreamInformation>, Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::QueryStreams, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self.backend.query_streams(&file.inner, &context).await;
         call.complete(result, None).await
     }
 

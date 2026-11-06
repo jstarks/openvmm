@@ -693,6 +693,7 @@ fn ea_validation_precedes_provider_rejection_and_existing_eas_are_ignored() {
         for (operation, failure) in [
             (Operation::QueryEas, Status::INVALID_INFO_CLASS),
             (Operation::SetEas, Status::INVALID_DEVICE_REQUEST),
+            (Operation::QueryStreams, Status::INVALID_INFO_CLASS),
         ] {
             control
                 .set_plan(

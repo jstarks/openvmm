@@ -2515,11 +2515,14 @@ impl<B: FileSystem> Connection<B> {
             .with_complete_if_oplocked(false)
             .with_synchronous_io_alert(false)
             .with_synchronous_io_nonalert(false)
+            .with_open_remote_instance(false)
+            .with_open_requiring_oplock(false)
+            .with_disallow_exclusive(false)
             .with_no_compression(
                 request.create_options.no_compression() && !request.create_options.directory_file(),
             )
             .with_open_for_free_space_query(false);
-        if options.open_by_file_id() {
+        if options.open_by_file_id() || options.reserve_opfilter() {
             return Err(Status::NOT_SUPPORTED);
         }
         if options.no_ea_knowledge() && extended_attributes.is_some() {

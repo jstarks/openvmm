@@ -39,6 +39,10 @@ mismatch against public specifications, and adding small deterministic Rust
 regressions before fixing the behavior. Stateful fuzzing and a broader hardening
 harness are deferred; they are not represented as completed validation.
 
+CREATE rejects FILE_OPEN_BY_FILE_ID and FILE_RESERVE_OPFILTER before provider
+effects. Remote-instance, requiring-oplock and disallow-exclusive options are
+ignored as required by SMB 2.1, rather than forwarded as native open requirements.
+
 Directory buffers smaller than the selected record's fixed prefix return
 INFO_LENGTH_MISMATCH. A first filename that does not fit returns BUFFER_OVERFLOW
 as an SMB2 ERROR response, retaining that entry for retry (MS-FSA 2.1.5.6.3;

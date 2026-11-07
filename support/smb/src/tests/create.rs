@@ -5,6 +5,73 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn reserve_opfilter_is_rejected_before_open_or_replacement_effects() {
+    use crate::test_support::ControlledFs;
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("existing", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"keep"))
+            .await;
+        for (name, disposition, options) in [
+            ("absent", 2, 0x00100000),
+            ("existing", 1, 0x00100000),
+            ("existing", 4, 0x00100000),
+            ("", 1, 0x00100001),
+        ] {
+            let before = control.calls().len();
+            let bytes = create_body(
+                name,
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                7,
+                disposition,
+                options,
+                &[],
+            );
+            assert_eq!(
+                response_status(&client.send(Command::CREATE, &bytes).await),
+                Status::NOT_SUPPORTED
+            );
+            assert_eq!(control.calls().len(), before);
+        }
+        assert_eq!(&client.read(file, 0, 4).await[80..], b"keep");
+        assert_eq!(
+            response_status(&client.open_result("absent", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn ignored_remote_and_oplock_create_options_do_not_change_open_behavior() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        for options in [0x400, 0x10000, 0x20000, 0x30400] {
+            let response = client
+                .open_result(
+                    "ignored",
+                    AccessMask::FILE_ALL_ACCESS.into_bits(),
+                    7,
+                    3,
+                    options,
+                )
+                .await;
+            assert_eq!(response_status(&response), Status::SUCCESS);
+            let file = read_body::<CreateResponse>(&response).unwrap().file_id;
+            client
+                .ok(Command::WRITE, &Client::write_body(file, 0, b"data"))
+                .await;
+            assert_eq!(&client.read(file, 0, 4).await[80..], b"data");
+            client.close(file).await;
+        }
+    });
+}
+
+#[test]
 fn compression_information_reports_actual_memory_allocation_without_read_attributes() {
     block_on(async {
         let server = Server::new("memory", MemoryFs::new(128, 16)).unwrap();

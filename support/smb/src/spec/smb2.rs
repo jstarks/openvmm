@@ -419,15 +419,19 @@ pub struct CreateOptions {
     other0: u8,
     pub complete_if_oplocked: bool,
     pub no_ea_knowledge: bool,
-    #[bits(2)]
+    pub open_remote_instance: bool,
+    #[bits(1)]
     other1: u8,
     pub delete_on_close: bool,
     pub open_by_file_id: bool,
     #[bits(1)]
     other_backup: u8,
     pub no_compression: bool,
-    #[bits(5)]
+    pub open_requiring_oplock: bool,
+    pub disallow_exclusive: bool,
+    #[bits(2)]
     other2: u32,
+    pub reserve_opfilter: bool,
     pub open_reparse_point: bool,
     #[bits(1)]
     other_reparse: u8,

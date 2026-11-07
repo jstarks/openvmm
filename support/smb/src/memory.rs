@@ -980,7 +980,15 @@ fn creation_security(
 
 fn grant_access(available: u32, requested: u32, delete: bool) -> Result<u32, Status> {
     let mask = AccessMask::from_bits(requested);
-    let requested = mask.with_maximum_allowed(false).into_bits();
+    // The synthetic SYSTEM identity has security privilege, but it is only
+    // granted when requested explicitly, never through MAXIMUM_ALLOWED.
+    let available = AccessMask::from_bits(available)
+        .with_access_system_security(false)
+        .into_bits();
+    let requested = mask
+        .with_maximum_allowed(false)
+        .with_access_system_security(false)
+        .into_bits();
     if requested & !available != 0 {
         return Err(Status::ACCESS_DENIED);
     }
@@ -992,7 +1000,9 @@ fn grant_access(available: u32, requested: u32, delete: bool) -> Result<u32, Sta
     if delete && !AccessMask::from_bits(granted).delete() {
         return Err(Status::ACCESS_DENIED);
     }
-    Ok(granted)
+    Ok(AccessMask::from_bits(granted)
+        .with_access_system_security(mask.access_system_security())
+        .into_bits())
 }
 
 fn has_children(state: &State, node: u64) -> bool {
@@ -3776,27 +3786,28 @@ impl FileSystem for MemoryFs {
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         let information =
             SecurityInformation::from_bits(information.into_bits() & SecurityInformation::VALID);
-        if information.into_bits()
-            & !SecurityInformation::new()
-                .with_owner(true)
-                .with_group(true)
-                .with_dacl(true)
-                .into_bits()
-            != 0
-        {
+        if node.security.sacl != AclState::Absent {
             return Err(Status::NOT_SUPPORTED);
         }
         let mut descriptor = node.security.clone();
-        if !information.owner() {
+        if !information.owner() && !information.backup() {
             descriptor.owner = None;
+            descriptor.control.set_owner_defaulted(false);
         }
-        if !information.group() {
+        if !information.group() && !information.backup() {
             descriptor.group = None;
+            descriptor.control.set_group_defaulted(false);
         }
-        if !information.dacl() {
+        if !information.dacl() && !information.backup() {
             descriptor.dacl = AclState::Absent;
             descriptor.control.set_dacl_present(false);
+            descriptor.control.set_dacl_defaulted(false);
+            descriptor.control.set_dacl_protected(false);
+            descriptor.control.set_dacl_auto_inherited(false);
+            descriptor.control.set_dacl_auto_inherit_required(false);
         }
+        // This profile stores no audit, label, attribute or policy ACEs.
+        // Their absence is queryable without inventing a SACL or native policy.
         Ok(descriptor)
     }
 

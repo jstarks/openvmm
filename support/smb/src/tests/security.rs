@@ -421,9 +421,74 @@ fn security_queries_select_components_and_report_required_buffer_size() {
                     .send(Command::QUERY_INFO, &query(file, 16, 4096))
                     .await
             ),
-            Status::NOT_SUPPORTED
+            Status::SUCCESS
         );
         client.close(limited).await;
+        client.close(file).await;
+    });
+}
+
+#[test]
+fn extended_queries_return_actual_absence_and_backup_requires_explicit_security_access() {
+    block_on(async {
+        let server = Server::new("memory", MemoryFs::new(1024, 16)).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("security", 2, 0).await;
+        for information in [0x10, 0x20, 0x40, 0x70] {
+            let response = client
+                .ok(Command::QUERY_INFO, &query(file, information, 4096))
+                .await;
+            let descriptor = SecurityDescriptor::decode(&response[72..]).unwrap();
+            assert!(descriptor.owner.is_none());
+            assert!(descriptor.group.is_none());
+            assert_eq!(descriptor.dacl, AclState::Absent);
+            assert_eq!(descriptor.sacl, AclState::Absent);
+        }
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::QUERY_INFO, &query(file, 0x10000, 4096))
+                    .await
+            ),
+            Status::ACCESS_DENIED
+        );
+        let access = AccessMask::FILE_ALL_ACCESS
+            .with_access_system_security(true)
+            .into_bits();
+        let response = client.open_result("security", access, 7, 1, 0).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        let privileged = read_body::<CreateResponse>(&response).unwrap().file_id;
+        for information in [8, 0x10000] {
+            let response = client
+                .ok(Command::QUERY_INFO, &query(privileged, information, 4096))
+                .await;
+            let descriptor = SecurityDescriptor::decode(&response[72..]).unwrap();
+            assert_eq!(descriptor.sacl, AclState::Absent);
+            assert_eq!(descriptor.owner.is_some(), information == 0x10000);
+            assert_eq!(descriptor.group.is_some(), information == 0x10000);
+            assert_eq!(
+                matches!(descriptor.dacl, AclState::Present(_)),
+                information == 0x10000
+            );
+        }
+        let response = client
+            .open_result(
+                "security",
+                AccessMask::new().with_maximum_allowed(true).into_bits(),
+                7,
+                1,
+                0,
+            )
+            .await;
+        let maximum = read_body::<CreateResponse>(&response).unwrap().file_id;
+        let response = client.query(maximum, 8).await;
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        assert_eq!(
+            &response[72..],
+            &AccessMask::FILE_ALL_ACCESS.into_bits().to_le_bytes()
+        );
+        client.close(maximum).await;
+        client.close(privileged).await;
         client.close(file).await;
     });
 }

@@ -2891,9 +2891,13 @@ impl<B: FileSystem> Connection<B> {
             if (information.owner()
                 || information.group()
                 || information.dacl()
-                || information.label())
+                || information.label()
+                || information.attribute()
+                || information.scope()
+                || information.backup())
                 && !file.access.read_control()
-                || information.sacl() && !file.access.access_system_security()
+                || (information.sacl() || information.backup())
+                    && !file.access.access_system_security()
             {
                 return Err(Status::ACCESS_DENIED);
             }

@@ -100,6 +100,9 @@ an empty, unopened target; its reserved allocation is released.
 Data-stream names follow MS-FSCC 2.1.5.3 rather than filename restrictions:
 wildcards, punctuation and non-NUL controls can be literal stream-name characters;
 separators, NUL and names longer than 255 UTF-16 units are rejected.
+Stream rename targets begin with `:` (MS-FSA 2.1.5.15.12). A fully qualified
+`base:stream` target follows file-name validation and returns OBJECT_NAME_INVALID;
+it is not an alternate spelling of stream-only rename.
 Default-stream replacement removes closed named streams and uses their released
 allocation in the same atomic reservation. Live named opens must share deletion:
 their data/locks and quota charges remain until final close, with new opens
@@ -186,6 +189,14 @@ streams count toward the object limit; data is charged once. At most one link
 per file has a short name. Open replacement targets remain denied in the
 uncached profile. Hard links are advertised; direct/provider/wire/cancellation
 tests cover them, not the lease-dependent independent hard-link fixture.
+
+Security queries project actual owner/group/DACL components and the absence of
+stored audit, integrity-label, resource-attribute and central-policy ACEs.
+Backup queries return the complete supported descriptor. The synthetic SYSTEM
+identity can explicitly request ACCESS_SYSTEM_SECURITY; MAXIMUM_ALLOWED does
+not implicitly grant that privilege. Query authorization still applies, and
+unsupported SACL/security mutation policies remain explicit errors. Empty
+queried components do not establish native audit or mandatory-label enforcement.
 
 ## Provider Caching Boundary
 

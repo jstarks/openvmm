@@ -37,7 +37,7 @@ use provider::{
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use thiserror::Error;
 use zerocopy::little_endian::U16;
@@ -89,6 +89,8 @@ const MAX_OPENS: usize = 1024;
 
 /// Shared configuration and object store for one share.
 pub struct Server<B: FileSystem> {
+    leases: Mutex<BTreeMap<provider::LeaseIdentity, Weak<OpenCaching>>>,
+    caching_changed: Arc<Event>,
     name: String,
     backend: B,
     guid: guid::Guid,
@@ -106,6 +108,8 @@ impl<B: FileSystem> Server<B> {
             return Err(Status::OBJECT_NAME_INVALID);
         }
         Ok(Arc::new(Self {
+            leases: Mutex::new(BTreeMap::new()),
+            caching_changed: Arc::new(Event::new()),
             name,
             backend,
             guid: guid::Guid::new_random(),
@@ -119,6 +123,8 @@ impl<B: FileSystem> Server<B> {
     /// Start an independent protocol connection sharing this provider.
     pub fn connect(self: &Arc<Self>) -> Connection<B> {
         let state = Arc::new(Mutex::new(ConnectionState {
+            client_guid: [0; 16],
+            leasing: false,
             negotiated: false,
             session: 0,
             session_active: false,
@@ -140,13 +146,14 @@ impl<B: FileSystem> Server<B> {
         Connection {
             server: self.clone(),
             state,
-            caching_changed: Arc::new(Event::new()),
+            caching_changed: self.caching_changed.clone(),
+            caching_stop: RequestContext::new(self.next_request.fetch_add(1, Ordering::Relaxed)),
         }
     }
 }
 
 struct OpenFile<F> {
-    caching: Option<OpenCaching>,
+    caching: Option<Arc<OpenCaching>>,
     file: F,
     identity: u64,
     access: AccessMask,
@@ -180,12 +187,15 @@ struct Activity {
 
 /// Protocol state for one connection. Dropping it closes all provider opens.
 pub struct Connection<B: FileSystem> {
+    caching_stop: RequestContext,
     server: Arc<Server<B>>,
     state: Arc<Mutex<ConnectionState<B::File>>>,
     caching_changed: Arc<Event>,
 }
 
 struct ConnectionState<F> {
+    client_guid: [u8; 16],
+    leasing: bool,
     caching_enabled: bool,
     negotiated: bool,
     session: u64,
@@ -358,6 +368,7 @@ impl<B: FileSystem> Clone for Connection<B> {
             server: self.server.clone(),
             state: self.state.clone(),
             caching_changed: self.caching_changed.clone(),
+            caching_stop: self.caching_stop.clone(),
         }
     }
 }
@@ -391,9 +402,10 @@ impl<F> OpenFile<F> {
     }
 
     fn retire(&self) {
-        self.closing.store(true, Ordering::Release);
-        if let Some(caching) = &self.caching {
-            caching.stop.cancel();
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            if let Some(caching) = &self.caching {
+                caching.retire();
+            }
         }
         for activity in self.active.lock().iter() {
             activity.context.cancel();
@@ -466,6 +478,12 @@ impl<F> Inspect for OpenFile<F> {
                 "directory_cursor",
                 self.directory.lock().as_ref().map(|search| search.cursor),
             );
+    }
+}
+
+impl<F> Drop for OpenFile<F> {
+    fn drop(&mut self) {
+        self.retire();
     }
 }
 
@@ -1514,6 +1532,7 @@ impl<B: FileSystem> Connection<B> {
         let files = {
             let mut state = self.state.lock();
             state.disconnected = true;
+            self.caching_stop.cancel();
             state.trees.clear();
             state.session_active = false;
             for info in state.requests.values() {
@@ -1549,9 +1568,12 @@ impl<B: FileSystem> Connection<B> {
     pub(crate) fn cancel_all(&self) {
         let mut state = self.state.lock();
         state.disconnected = true;
+        self.caching_stop.cancel();
         for file in state.files.values() {
             if let Some(caching) = &file.caching {
-                caching.stop.cancel();
+                if caching.lease().is_none() {
+                    caching.stop.cancel();
+                }
             }
         }
         self.caching_changed.notify(usize::MAX);
@@ -2219,8 +2241,29 @@ impl<B: FileSystem> Connection<B> {
                 .0
                 .get();
         if size == LeaseBreakAcknowledgement::STRUCTURE_SIZE {
-            let _: LeaseBreakAcknowledgement = read_body(packet)?;
-            return Err(Status::OBJECT_NAME_NOT_FOUND);
+            let request: LeaseBreakAcknowledgement = read_body(packet)?;
+            let identity = self.lease_identity(request.lease_key)?;
+            let lease = self
+                .server
+                .leases
+                .lock()
+                .get(&identity)
+                .and_then(Weak::upgrade)
+                .filter(|lease| lease.members() != 0)
+                .ok_or(Status::OBJECT_NAME_NOT_FOUND)?;
+            let state = lease
+                .acknowledge_lease(request.lease_state.get(), context)
+                .await?;
+            return Ok(LeaseBreakAcknowledgement {
+                structure_size: LeaseBreakAcknowledgement::STRUCTURE_SIZE.into(),
+                reserved: 0.into(),
+                flags: 0.into(),
+                lease_key: identity.key,
+                lease_state: state.bits().into(),
+                lease_duration: 0.into(),
+            }
+            .as_bytes()
+            .to_vec());
         }
         let request: OplockBreakAcknowledgement = read_body(packet)?;
         let file = self.file(request.file_id, tree, context)?;
@@ -2334,6 +2377,8 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::NOT_SUPPORTED);
         }
         state.negotiated = true;
+        state.client_guid = request.client_guid;
+        state.leasing = state.caching_enabled && self.server.backend.supports_leases();
         Ok(NegotiateResponse {
             structure_size: NegotiateResponse::STRUCTURE_SIZE.into(),
             security_mode: SecurityMode::new().with_signing_enabled(true),
@@ -2345,7 +2390,9 @@ impl<B: FileSystem> Connection<B> {
                 .as_bytes()
                 .try_into()
                 .map_err(|_| Status::INVALID_PARAMETER)?,
-            capabilities: Capabilities::new().with_large_mtu(true),
+            capabilities: Capabilities::new()
+                .with_large_mtu(true)
+                .with_leasing(state.leasing),
             max_transact_size: (MAX_TRANSFER_SIZE as u32).into(),
             max_read_size: (MAX_TRANSFER_SIZE as u32).into(),
             max_write_size: (MAX_TRANSFER_SIZE as u32).into(),
@@ -2389,6 +2436,7 @@ impl<B: FileSystem> Connection<B> {
         let mut security = None;
         let mut extended_attributes = None;
         let mut allocation_size = 0;
+        let mut lease_request = None;
         for context in contexts {
             if context.name == RESERVED_CREATE_CONTEXT_NAME {
                 continue;
@@ -2424,7 +2472,20 @@ impl<B: FileSystem> Connection<B> {
                         .allocation_size
                         .get();
                 }
-                Some(CreateContextName::REQUEST_LEASE) => {}
+                Some(CreateContextName::REQUEST_LEASE) => {
+                    if request.requested_oplock_level == OplockLevel::LEASE
+                        && self.state.lock().leasing
+                    {
+                        let lease = LeaseContext::read_from_bytes(context.data)
+                            .map_err(|_| Status::INVALID_PARAMETER)?;
+                        lease_request = Some(CachingRequest::Lease {
+                            identity: self.lease_identity(lease.lease_key)?,
+                            // Unsupported permission combinations acquire no caching rights.
+                            state: provider::CachingState::from_bits(lease.lease_state.get() & 7)
+                                .unwrap_or(provider::CachingState::None),
+                        });
+                    }
+                }
                 Some(CreateContextName::EA_BUFFER) => extended_attributes = Some(context.data),
                 Some(CreateContextName::SECURITY_DESCRIPTOR) => security = Some(context.data),
                 Some(CreateContextName::TIMEWARP)
@@ -2505,6 +2566,7 @@ impl<B: FileSystem> Connection<B> {
             match request.requested_oplock_level {
                 OplockLevel::EXCLUSIVE => CachingRequest::Oplock(provider::Oplock::Exclusive),
                 OplockLevel::BATCH => CachingRequest::Oplock(provider::Oplock::Batch),
+                OplockLevel::LEASE => lease_request.unwrap_or(CachingRequest::None),
                 _ => CachingRequest::None,
             }
         } else {
@@ -2544,12 +2606,24 @@ impl<B: FileSystem> Connection<B> {
             }
             Err(OpenError::Status(status)) => return Err(status),
         };
-        let caching = match OpenCaching::from_grant(
-            caching,
-            request.requested_oplock_level,
-            caching_enabled,
-            RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed)),
-        ) {
+        let info = match self.server.backend.metadata(&file, context).await {
+            Ok(info) => info,
+            Err(error) => {
+                let cleanup =
+                    RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
+                self.server.backend.close(&file, &cleanup).await?;
+                return Err(error);
+            }
+        };
+        let caching = match self
+            .attach_caching(
+                caching,
+                request.requested_oplock_level,
+                caching_request,
+                RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed)),
+            )
+            .await
+        {
             Ok(caching) => caching,
             Err(error) => {
                 let cleanup =
@@ -2560,16 +2634,7 @@ impl<B: FileSystem> Connection<B> {
         };
         let oplock_level = caching
             .as_ref()
-            .map_or(OplockLevel::NONE, OpenCaching::level);
-        let info = match self.server.backend.metadata(&file, context).await {
-            Ok(info) => info,
-            Err(error) => {
-                let cleanup =
-                    RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
-                self.server.backend.close(&file, &cleanup).await?;
-                return Err(error);
-            }
-        };
+            .map_or(OplockLevel::NONE, |caching| caching.level());
         let file_id = FileId {
             persistent: info.id.into(),
             volatile: volatile.into(),
@@ -2622,6 +2687,23 @@ impl<B: FileSystem> Connection<B> {
         self.caching_changed.notify(usize::MAX);
         let mut response_contexts = Vec::new();
         let mut previous = None;
+        if let Some(caching) = &file.caching {
+            if let Some(identity) = caching.lease() {
+                let snapshot = caching.lease_snapshot();
+                append_create_context(
+                    &mut response_contexts,
+                    &mut previous,
+                    CreateContextName::REQUEST_LEASE,
+                    LeaseContext {
+                        lease_key: identity.key,
+                        lease_state: snapshot.state.bits().into(),
+                        lease_flags: (if snapshot.breaking { 2 } else { 0 }).into(),
+                        lease_duration: 0.into(),
+                    }
+                    .as_bytes(),
+                );
+            }
+        }
         if let Some(timestamp) = maximal_access {
             let unchanged = timestamp == Some(info.changed);
             append_create_context(

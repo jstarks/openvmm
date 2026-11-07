@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Software oplocks for stores whose mutations are all mediated by the provider.
+//! Software caching for stores whose mutations are all mediated by the provider.
 //!
 //! Call admission and registration while holding the provider's object-store
 //! lock. Release that lock before waiting, then resolve and validate again.
@@ -9,10 +9,11 @@
 //! synchronous lock. All opens, including uncached opens, need a reservation.
 
 use super::{
-    Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingState, Oplock,
+    Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingSnapshot,
+    CachingState, LeaseIdentity, Oplock,
 };
 use crate::provider::RequestContext;
-use crate::spec::Status;
+use crate::spec::{AccessMask, Status};
 use async_trait::async_trait;
 use event_listener::Event;
 use futures::FutureExt;
@@ -22,6 +23,18 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 const OPEN_LIMIT: usize = 4096;
+const WRITE_CACHING: u32 = 0x4;
+const HANDLE_CACHING: u32 = 0x2;
+
+fn significant(access: u32, lease: bool) -> bool {
+    let stat = AccessMask::new()
+        .with_read_attributes(true)
+        .with_write_attributes(true)
+        .with_synchronize(true)
+        .with_read_control(lease)
+        .into_bits();
+    access & !stat != 0
+}
 
 /// Stable provider file/stream identity; never a pathname or protocol FileId.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +45,7 @@ pub struct CachingKey {
     pub stream: u64,
 }
 
-/// Shared, bounded classic-oplock admission state.
+/// Shared, bounded oplock and lease admission state.
 #[derive(Clone, Default)]
 pub struct SoftwareCaching(Arc<Mutex<Table>>);
 
@@ -43,17 +56,20 @@ struct Table {
 }
 
 struct Entry {
+    lease: Option<LeaseIdentity>,
     key: CachingKey,
-    data_access: bool,
+    access: u32,
     control: Arc<Control>,
 }
 
 struct Control {
+    instance: u64,
     state: Mutex<ControlState>,
     changed: Event,
 }
 
 struct ControlState {
+    owners: usize,
     held: CachingState,
     pending: Option<CachingBreak>,
     desired: CachingState,
@@ -105,6 +121,10 @@ impl Drop for SoftwareOpen {
             table.lock().opens.remove(&self.id);
         }
         let mut state = self.control.state.lock();
+        state.owners -= 1;
+        if state.owners != 0 {
+            return;
+        }
         state.closed = true;
         state.held = CachingState::None;
         state.pending = None;
@@ -113,6 +133,31 @@ impl Drop for SoftwareOpen {
 }
 
 impl SoftwareCaching {
+    /// Reject reuse of a client lease identity for a different file or stream,
+    /// before publishing any creation or replacement effects.
+    pub fn validate_lease(&self, key: CachingKey, request: CachingRequest) -> Result<(), Status> {
+        if let CachingRequest::Lease { identity, .. } = request {
+            if self
+                .0
+                .lock()
+                .opens
+                .values()
+                .any(|entry| entry.lease == Some(identity) && entry.key != key)
+            {
+                return Err(Status::INVALID_PARAMETER);
+            }
+        }
+        Ok(())
+    }
+
+    /// Named streams do not share lease caching with the default stream.
+    /// The older classic profile conservatively revokes its default-stream grants.
+    pub fn prepare_named_open(&self, file: u64) -> Result<Option<CachingWait>, Status> {
+        self.prepare(|_, entry| {
+            (entry.key.file == file && entry.lease.is_none()).then_some(CachingState::None)
+        })
+    }
+
     /// Check the reservation budget before publishing any open effects.
     pub fn check_capacity(&self) -> Result<(), Status> {
         let table = self.0.lock();
@@ -132,6 +177,7 @@ impl SoftwareCaching {
     ) -> Result<Option<CachingWait>, Status> {
         self.prepare(|_, entry| {
             if entry.key == key
+                && entry.lease.is_none()
                 && significant_access
                 && entry.control.state.lock().held == CachingState::ReadWriteHandle
             {
@@ -146,18 +192,39 @@ impl SoftwareCaching {
         })
     }
 
-    /// Admit a data open or replacement after ordinary sharing/access validation.
+    /// Admit an open or replacement after ordinary sharing/access validation.
     /// Replacement breaks every stream of the file before destructive effects.
     pub fn prepare_open(
         &self,
         key: CachingKey,
-        data_access: bool,
+        access: u32,
         replacement: bool,
+        delete: bool,
+        request: CachingRequest,
     ) -> Result<Option<CachingWait>, Status> {
+        let lease = match request {
+            CachingRequest::Lease { identity, .. } => Some(identity),
+            _ => None,
+        };
         self.prepare(|_, entry| {
+            if lease.is_some() && lease == entry.lease {
+                return None;
+            }
             if replacement && entry.key.file == key.file {
                 Some(CachingState::None)
-            } else if data_access && entry.key == key {
+            } else if entry.key == key {
+                if entry.lease.is_some() {
+                    let state = entry.control.state.lock().held;
+                    let remove = (if significant(access, true) {
+                        WRITE_CACHING
+                    } else {
+                        0
+                    }) | (if delete { HANDLE_CACHING } else { 0 });
+                    return CachingState::from_bits(state.bits() & !remove);
+                }
+                if !significant(access, false) {
+                    return None;
+                }
                 match entry.control.state.lock().held {
                     CachingState::ReadWrite | CachingState::ReadWriteHandle => {
                         Some(CachingState::Read)
@@ -170,7 +237,7 @@ impl SoftwareCaching {
         })
     }
 
-    /// Admit a file mutation, including shared metadata changes through streams.
+    /// Admit a stream data mutation.
     /// An exclusive owner's writes may flush dirty data during its break;
     /// level-II owners must invalidate their own read caching.
     pub fn prepare_mutation(
@@ -178,12 +245,89 @@ impl SoftwareCaching {
         key: CachingKey,
         owner: &SoftwareOpen,
     ) -> Result<Option<CachingWait>, Status> {
+        self.prepare_change(key, owner, false, false)
+    }
+
+    /// Shared file metadata invalidates foreign caches across streams.
+    pub fn prepare_metadata(
+        &self,
+        key: CachingKey,
+        owner: &SoftwareOpen,
+    ) -> Result<Option<CachingWait>, Status> {
+        self.prepare_change(key, owner, true, false)
+    }
+
+    /// Namespace effects relinquish cached foreign handles before publication.
+    pub fn prepare_namespace(
+        &self,
+        key: CachingKey,
+        owner: &SoftwareOpen,
+    ) -> Result<Option<CachingWait>, Status> {
+        self.prepare_change(key, owner, true, true)
+    }
+
+    /// Handle caching may need a break even when sharing validation failed.
+    pub fn prepare_sharing(
+        &self,
+        key: CachingKey,
+        request: CachingRequest,
+    ) -> Result<Option<CachingWait>, Status> {
+        let lease = match request {
+            CachingRequest::Lease { identity, .. } => Some(identity),
+            _ => None,
+        };
+        self.prepare(|_, entry| {
+            if entry.key != key || (lease.is_some() && entry.lease == lease) {
+                return None;
+            }
+            let state = entry.control.state.lock().held;
+            CachingState::from_bits(state.bits() & !HANDLE_CACHING)
+        })
+    }
+
+    fn prepare_change(
+        &self,
+        key: CachingKey,
+        owner: &SoftwareOpen,
+        metadata: bool,
+        namespace: bool,
+    ) -> Result<Option<CachingWait>, Status> {
         let owns_table = Weak::ptr_eq(&owner.table, &Arc::downgrade(&self.0));
+        let lease = self
+            .0
+            .lock()
+            .opens
+            .get(&owner.id)
+            .and_then(|entry| entry.lease);
         self.prepare(|id, entry| {
+            if entry.lease.is_some() {
+                if (if metadata {
+                    entry.key.file != key.file
+                } else {
+                    entry.key != key
+                }) || (owns_table && entry.lease == lease)
+                {
+                    return None;
+                }
+                if namespace {
+                    return CachingState::from_bits(
+                        entry.control.state.lock().held.bits() & !HANDLE_CACHING,
+                    );
+                }
+                return Some(CachingState::None);
+            }
             if entry.key.file != key.file {
                 return None;
             }
             let exclusive_owner = owns_table && id == owner.id;
+            if namespace {
+                if exclusive_owner {
+                    return None;
+                }
+                return CachingState::from_bits(
+                    entry.control.state.lock().held.bits() & !HANDLE_CACHING,
+                );
+            }
             if exclusive_owner
                 && matches!(
                     entry.control.state.lock().held,
@@ -212,9 +356,8 @@ impl SoftwareCaching {
                 continue;
             }
             if state.pending.is_some() {
-                if desired == CachingState::None {
-                    state.desired = desired;
-                }
+                state.desired = CachingState::from_bits(state.desired.bits() & desired.bits())
+                    .ok_or(Status::INVALID_PARAMETER)?;
             } else if state.held != desired {
                 state.next = state
                     .next
@@ -240,7 +383,7 @@ impl SoftwareCaching {
     pub fn register(
         &self,
         key: CachingKey,
-        data_access: bool,
+        access: u32,
         eligible: bool,
         requested: CachingRequest,
     ) -> Result<(SoftwareOpen, CachingGrant), Status> {
@@ -251,7 +394,19 @@ impl SoftwareCaching {
         let another = table
             .opens
             .values()
-            .any(|entry| entry.key == key && entry.data_access);
+            .any(|entry| entry.key == key && significant(entry.access, matches!(requested, CachingRequest::Lease { .. }))
+                && !matches!(requested, CachingRequest::Lease { identity, .. } if entry.lease == Some(identity)));
+        let lease = match requested {
+            CachingRequest::Lease { identity, .. } if eligible => Some(identity),
+            _ => None,
+        };
+        let shared = lease.and_then(|identity| {
+            table
+                .opens
+                .values()
+                .find(|entry| entry.lease == Some(identity) && entry.key == key)
+                .map(|entry| entry.control.clone())
+        });
         let level = match requested {
             CachingRequest::Oplock(Oplock::Exclusive) if eligible => Some(if another {
                 Oplock::LevelII
@@ -266,38 +421,80 @@ impl SoftwareCaching {
             CachingRequest::Oplock(Oplock::LevelII) if eligible => Some(Oplock::LevelII),
             _ => None,
         };
-        let control = Arc::new(Control {
-            state: Mutex::new(ControlState {
-                held: match level {
-                    Some(Oplock::Exclusive) => CachingState::ReadWrite,
-                    Some(Oplock::Batch) => CachingState::ReadWriteHandle,
-                    Some(_) => CachingState::Read,
-                    None => CachingState::None,
-                },
-                desired: CachingState::None,
-                pending: None,
-                delivered: false,
-                next: 0,
-                closed: false,
-            }),
-            changed: Event::new(),
-        });
+        let control = if let Some(control) = shared {
+            let mut state = control.state.lock();
+            if let CachingRequest::Lease {
+                state: requested, ..
+            } = requested
+            {
+                if (!another || requested.bits() & WRITE_CACHING == 0)
+                    && state.pending.is_none()
+                    && state.held.bits() & requested.bits() == state.held.bits()
+                {
+                    state.held = requested;
+                }
+            }
+            state.owners += 1;
+            drop(state);
+            control
+        } else {
+            Arc::new(Control {
+                instance: table.next + 1,
+                state: Mutex::new(ControlState {
+                    owners: 1,
+                    held: if lease.is_some() {
+                        match requested {
+                            CachingRequest::Lease { state, .. } if another => {
+                                CachingState::from_bits(state.bits() & !WRITE_CACHING)
+                                    .ok_or(Status::INVALID_PARAMETER)?
+                            }
+                            CachingRequest::Lease { state, .. } => state,
+                            _ => CachingState::None,
+                        }
+                    } else {
+                        match level {
+                            Some(Oplock::Exclusive) => CachingState::ReadWrite,
+                            Some(Oplock::Batch) => CachingState::ReadWriteHandle,
+                            Some(_) => CachingState::Read,
+                            None => CachingState::None,
+                        }
+                    },
+                    desired: CachingState::None,
+                    pending: None,
+                    delivered: false,
+                    next: 0,
+                    closed: false,
+                }),
+                changed: Event::new(),
+            })
+        };
         table.next += 1;
         let id = table.next;
         table.opens.insert(
             id,
             Entry {
+                lease,
                 key,
-                data_access,
+                access,
                 control: control.clone(),
             },
         );
-        let grant = match level {
-            Some(level) => CachingGrant::Oplock {
-                level,
+        let grant = if let Some(identity) = lease {
+            let state = control.snapshot();
+            CachingGrant::Lease {
+                identity,
+                state: state.state,
+                breaking: state.breaking,
                 control: control.clone(),
-            },
-            None => CachingGrant::None,
+            }
+        } else {
+            match level {
+                Some(level) => CachingGrant::Oplock {
+                    level,
+                    control: control.clone(),
+                },
+                None => CachingGrant::None,
+            }
         };
         Ok((
             SoftwareOpen {
@@ -330,6 +527,15 @@ impl Inspect for Control {
 
 #[async_trait]
 impl Caching for Control {
+    fn snapshot(&self) -> CachingSnapshot {
+        let state = self.state.lock();
+        CachingSnapshot {
+            instance: self.instance,
+            state: state.held,
+            breaking: state.pending.is_some(),
+        }
+    }
+
     async fn wait_for_break(&self, request: &RequestContext) -> Result<CachingBreak, Status> {
         loop {
             let changed = self.changed.listen();
@@ -371,17 +577,19 @@ impl Caching for Control {
         if pending.id != id || !state.delivered {
             return Err(Status::INVALID_DEVICE_STATE);
         }
-        if rights != CachingState::None && rights != pending.state {
+        if rights.bits() & pending.state.bits() != rights.bits() {
             return Err(Status::INVALID_PARAMETER);
         }
-        if rights != CachingState::None && state.desired == CachingState::None {
+        let subsequent = CachingState::from_bits(rights.bits() & state.desired.bits())
+            .ok_or(Status::INVALID_PARAMETER)?;
+        if subsequent != rights {
             state.next = state
                 .next
                 .checked_add(1)
                 .ok_or(Status::INSUFFICIENT_RESOURCES)?;
             state.pending = Some(CachingBreak {
                 id: CachingBreakId(state.next),
-                state: CachingState::None,
+                state: subsequent,
             });
             state.delivered = false;
         } else {

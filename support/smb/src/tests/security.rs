@@ -7,7 +7,7 @@ use test_with_tracing::test;
 
 struct NoopSecurityFs {
     inner: MemoryFs,
-    calls: std::sync::atomic::AtomicUsize,
+    calls: AtomicUsize,
 }
 
 impl Inspect for NoopSecurityFs {
@@ -120,7 +120,7 @@ fn frontend_security_validation_is_independent_of_successful_provider_effects() 
             "memory",
             NoopSecurityFs {
                 inner: MemoryFs::new(1024, 16),
-                calls: std::sync::atomic::AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
             },
         )
         .unwrap();

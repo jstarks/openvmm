@@ -310,6 +310,12 @@ enum OpenAttempt {
     Wait(CachingWait),
 }
 
+enum CacheChange {
+    Data,
+    Metadata,
+    Namespace,
+}
+
 /// Current time in the Windows NT epoch.
 pub(crate) fn nt_time() -> u64 {
     const NANOSECONDS_PER_NT_TICK: u128 = 1_000_000_000 / NT_TICKS_PER_SECOND as u128;
@@ -323,7 +329,7 @@ pub(crate) fn nt_time() -> u64 {
 }
 
 impl MemoryFs {
-    /// Opt into software-managed classic oplocks before opening any objects.
+    /// Opt into software-managed oplocks and SMB 2.1 leases before opening objects.
     /// All mutations through clones of this store participate in coordination.
     pub fn with_oplocks(self) -> Result<Self, Status> {
         {
@@ -342,6 +348,7 @@ impl MemoryFs {
         &'a self,
         file: &MemoryFile,
         request: &RequestContext,
+        change: CacheChange,
     ) -> Result<MutexGuard<'a, State>, Status> {
         loop {
             let wait = {
@@ -352,13 +359,15 @@ impl MemoryFs {
                         if request.is_cancelled() {
                             return Err(Status::CANCELLED);
                         }
-                        table.prepare_mutation(
-                            CachingKey {
-                                file: file.node,
-                                stream: file.stream,
-                            },
-                            owner,
-                        )?
+                        let key = CachingKey {
+                            file: file.node,
+                            stream: file.stream,
+                        };
+                        match change {
+                            CacheChange::Data => table.prepare_mutation(key, owner)?,
+                            CacheChange::Metadata => table.prepare_metadata(key, owner)?,
+                            CacheChange::Namespace => table.prepare_namespace(key, owner)?,
+                        }
                     }
                     _ => None,
                 };
@@ -2013,6 +2022,32 @@ impl MemoryFs {
             None => Some(1),
         };
         let link = existing.unwrap_or(state.next_link);
+        let target_id = existing
+            .map(|link| state.links[&link].node)
+            .unwrap_or(state.next_id);
+        let target_stream = match named {
+            Some(name) => state
+                .nodes
+                .get(&target_id)
+                .and_then(|node| {
+                    node.streams
+                        .iter()
+                        .find(|(_, stream)| namespace::equal(&stream.name, name))
+                        .map(|(id, _)| *id)
+                })
+                .unwrap_or(state.next_stream),
+            None => state
+                .nodes
+                .get(&target_id)
+                .map_or(0, |node| node.default_stream),
+        };
+        let target_key = CachingKey {
+            file: target_id,
+            stream: target_stream,
+        };
+        if let Some(caching) = &state.caching {
+            caching.validate_lease(target_key, caching_request)?;
+        }
         let next_open = state
             .next_open
             .checked_add(1)
@@ -2042,13 +2077,20 @@ impl MemoryFs {
             }
             if let Some(name) = named {
                 if let Some(caching) = &state.caching {
+                    if let Some(wait) = caching.prepare_named_open(id)? {
+                        return Ok(OpenAttempt::Wait(wait));
+                    }
                     if let Some(wait) = caching.prepare_open(
-                        CachingKey {
-                            file: id,
-                            stream: default,
-                        },
-                        true,
-                        true,
+                        target_key,
+                        options.access,
+                        matches!(
+                            options.disposition(),
+                            CreateDisposition::OVERWRITE
+                                | CreateDisposition::OVERWRITE_IF
+                                | CreateDisposition::SUPERSEDE
+                        ),
+                        delete,
+                        caching_request,
                     )? {
                         return Ok(OpenAttempt::Wait(wait));
                     }
@@ -2131,21 +2173,30 @@ impl MemoryFs {
                             && other.stream != default
                             && !ShareAccess::from_bits(other.sharing).delete())
                     {
+                        if let Some(caching) = &state.caching {
+                            if let Some(wait) = caching.prepare_sharing(
+                                CachingKey {
+                                    file: id,
+                                    stream: default,
+                                },
+                                caching_request,
+                            )? {
+                                return Ok(OpenAttempt::Wait(wait));
+                            }
+                        }
                         return Err(Status::SHARING_VIOLATION.into());
                     }
                 }
                 if let Some(caching) = &state.caching {
-                    let data = options.access().read_data()
-                        || options.access().write_data()
-                        || options.access().append_data()
-                        || options.access().execute();
                     if let Some(wait) = caching.prepare_open(
                         CachingKey {
                             file: id,
                             stream: default,
                         },
-                        data,
+                        options.access,
                         replacement,
+                        delete,
+                        caching_request,
                     )? {
                         return Ok(OpenAttempt::Wait(wait));
                     }
@@ -2419,20 +2470,28 @@ impl MemoryFs {
                 || options.access().write_data()
                 || options.access().append_data()
                 || options.access().execute();
-            let eligible = data
-                && stream == state.nodes[&id].default_stream
-                && !state.nodes[&id].metadata.is_directory()
-                && !state
-                    .opens
-                    .values()
-                    .any(|open| open.node == id && open.stream != stream)
-                && !state
-                    .locks
-                    .iter()
-                    .any(|lock| lock.node == id && lock.stream == stream);
+            let eligible = if matches!(caching_request, CachingRequest::Lease { .. }) {
+                (stream != state.nodes[&id].default_stream
+                    || !state.nodes[&id].metadata.is_directory())
+                    && !state
+                        .locks
+                        .iter()
+                        .any(|lock| lock.node == id && lock.stream == stream)
+            } else {
+                data && stream == state.nodes[&id].default_stream
+                    && !state.nodes[&id].metadata.is_directory()
+                    && !state
+                        .opens
+                        .values()
+                        .any(|open| open.node == id && open.stream != stream)
+                    && !state
+                        .locks
+                        .iter()
+                        .any(|lock| lock.node == id && lock.stream == stream)
+            };
             let (reservation, grant) = caching.register(
                 CachingKey { file: id, stream },
-                data,
+                options.access,
                 eligible,
                 caching_request,
             )?;
@@ -2476,6 +2535,10 @@ impl MemoryFs {
 #[async_trait]
 impl FileSystem for MemoryFs {
     type File = MemoryFile;
+
+    fn supports_leases(&self) -> bool {
+        self.0.lock().caching.is_some()
+    }
 
     async fn open(
         &self,
@@ -2527,12 +2590,14 @@ impl FileSystem for MemoryFs {
         &self,
         file: &MemoryFile,
         name: &str,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<(), Status> {
         if !name.is_empty() && !valid_short_name(name) {
             return Err(Status::INVALID_PARAMETER);
         }
-        let mut state = self.0.lock();
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Namespace)
+            .await?;
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let user_set_change_time = open.user_set_change_time;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
@@ -2825,10 +2890,12 @@ impl FileSystem for MemoryFs {
         file: &MemoryFile,
         name: &str,
         replace: bool,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<(), Status> {
         if name.starts_with(':') {
-            let mut state = self.0.lock();
+            let mut state = self
+                .lock_mutation(file, request, CacheChange::Namespace)
+                .await?;
             let result = rename_stream(&mut state, file, name, replace);
             wake(state);
             return result;
@@ -2840,7 +2907,9 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::OBJECT_NAME_INVALID);
         }
-        let mut state = self.0.lock();
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Namespace)
+            .await?;
         let opened = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let user_set_change_time = opened.user_set_change_time;
         let source = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
@@ -3081,7 +3150,8 @@ impl FileSystem for MemoryFs {
         ) {
             self.0.lock()
         } else {
-            self.lock_mutation(file, request).await?
+            self.lock_mutation(file, request, CacheChange::Metadata)
+                .await?
         };
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let access = AccessMask::from_bits(open.access);
@@ -3477,7 +3547,9 @@ impl FileSystem for MemoryFs {
         attributes: &[ExtendedAttribute],
         request: &RequestContext,
     ) -> Result<(), Status> {
-        let mut state = self.lock_mutation(file, request).await?;
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Metadata)
+            .await?;
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         if !AccessMask::from_bits(open.access).write_ea() {
             return Err(Status::ACCESS_DENIED);
@@ -3584,7 +3656,9 @@ impl FileSystem for MemoryFs {
         descriptor: &SecurityDescriptor,
         request: &RequestContext,
     ) -> Result<(), Status> {
-        let mut state = self.lock_mutation(file, request).await?;
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Metadata)
+            .await?;
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let access = AccessMask::from_bits(open.access);
         if (information.dacl() && !access.write_dac())
@@ -3701,7 +3775,7 @@ impl FileSystem for MemoryFs {
         data: &[u8],
         request: &RequestContext,
     ) -> Result<usize, Status> {
-        let mut state = self.lock_mutation(file, request).await?;
+        let mut state = self.lock_mutation(file, request, CacheChange::Data).await?;
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
         if is_default_stream(&state, file) && node.metadata.is_directory() {
@@ -3817,7 +3891,7 @@ impl FileSystem for MemoryFs {
         loop {
             let listener = changed.listen();
             {
-                let mut state = self.lock_mutation(file, request).await?;
+                let mut state = self.lock_mutation(file, request, CacheChange::Data).await?;
                 state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
                 if is_default_stream(&state, file)
                     && state.nodes[&file.node].metadata.is_directory()
@@ -3918,7 +3992,7 @@ impl FileSystem for MemoryFs {
         if length > i64::MAX as u64 {
             return Err(Status::INVALID_PARAMETER);
         }
-        let mut state = self.lock_mutation(file, request).await?;
+        let mut state = self.lock_mutation(file, request, CacheChange::Data).await?;
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         if is_default_stream(&state, file)
             && state
@@ -3949,7 +4023,7 @@ impl FileSystem for MemoryFs {
         length: u64,
         request: &RequestContext,
     ) -> Result<(), Status> {
-        let mut state = self.lock_mutation(file, request).await?;
+        let mut state = self.lock_mutation(file, request, CacheChange::Data).await?;
         let open = state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let user_set_change_time = open.user_set_change_time;
         let node = state.nodes.get(&file.node).ok_or(Status::FILE_CLOSED)?;
@@ -4007,9 +4081,11 @@ impl FileSystem for MemoryFs {
         &self,
         file: &MemoryFile,
         delete: bool,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<(), Status> {
-        let mut state = self.0.lock();
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Namespace)
+            .await?;
         state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
         let metadata = &state
             .nodes
@@ -4055,7 +4131,9 @@ impl FileSystem for MemoryFs {
         {
             return Err(Status::INVALID_PARAMETER);
         }
-        let mut state = self.lock_mutation(file, request).await?;
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Metadata)
+            .await?;
         let directory = state
             .nodes
             .get(&file.node)

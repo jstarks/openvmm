@@ -100,6 +100,42 @@ fn samba_oplock_batch() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_lease_request() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096)
+            .with_oplocks()
+            .unwrap(),
+        std::future::pending(),
+        &["smb2.lease.request"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_lease_breaks() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096)
+            .with_oplocks()
+            .unwrap(),
+        std::future::pending(),
+        &["smb2.lease.break"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_lease_nobreakself() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096)
+            .with_oplocks()
+            .unwrap(),
+        std::future::pending(),
+        &["smb2.lease.nobreakself"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_compression() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

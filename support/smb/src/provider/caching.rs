@@ -38,13 +38,55 @@ pub enum CachingState {
     ReadWriteHandle,
 }
 
+impl CachingState {
+    /// Lease permission bits: READ=1, HANDLE=2 and WRITE=4.
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Read => 1,
+            Self::ReadWrite => 5,
+            Self::ReadHandle => 3,
+            Self::ReadWriteHandle => 7,
+        }
+    }
+
+    /// Decode a supported combination; write/handle caching require read caching.
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            0 => Some(Self::None),
+            1 => Some(Self::Read),
+            3 => Some(Self::ReadHandle),
+            5 => Some(Self::ReadWrite),
+            7 => Some(Self::ReadWriteHandle),
+            _ => None,
+        }
+    }
+}
+
 /// Client-scoped lease identity, independent of a connection or open handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LeaseIdentity {
+    /// Engine-assigned service namespace, separating services sharing a provider.
+    pub authority: [u8; 16],
     /// Client identity established at protocol negotiation.
     pub client_guid: [u8; 16],
     /// Opaque client-assigned lease key.
     pub key: [u8; 16],
+}
+
+/// Current provider state, including an outstanding break.
+///
+/// Re-read this when publishing a shared lease open: an earlier open result may
+/// have raced with an acknowledgment, close or another open's lease upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachingSnapshot {
+    /// Provider-scoped control identity, never reused during the provider lifetime.
+    /// Reopened leases may reuse client keys but must get a new control identity.
+    pub instance: u64,
+    /// Rights still held by this caching reservation.
+    pub state: CachingState,
+    /// A break is outstanding, whether or not its notification was delivered.
+    pub breaking: bool,
 }
 
 /// Caching requested as part of opening a filesystem object.
@@ -133,6 +175,9 @@ pub struct CachingBreak {
 /// until its last associated open closes, not merely the open delivering a break.
 #[async_trait]
 pub trait Caching: Inspect + Send + Sync {
+    /// Get a coherent current snapshot without filesystem or protocol effects.
+    fn snapshot(&self) -> CachingSnapshot;
+
     /// Wait for the next break. The caller serializes waits for each control.
     ///
     /// Cancellation removes this waiter, not the caching reservation or a queued

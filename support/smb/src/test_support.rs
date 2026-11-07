@@ -11,9 +11,9 @@ pub mod contracts;
 
 use crate::provider::{
     BasicInformation, ByteRange, Caching, CachingBreak, CachingBreakId, CachingGrant,
-    CachingRequest, CachingState, ExtendedAttribute, FileControl, FileControlResult, FileSystem,
-    FileSystemInformation, LockId, Metadata, NotifyResult, OpenError, OpenOptions, Opened,
-    RequestContext, StreamInformation,
+    CachingRequest, CachingSnapshot, CachingState, ExtendedAttribute, FileControl,
+    FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
+    OpenError, OpenOptions, Opened, RequestContext, StreamInformation,
 };
 use crate::security::SecurityDescriptor;
 use crate::spec::SecurityInformation;
@@ -648,6 +648,9 @@ impl Inspect for ControlledCaching {
 
 #[async_trait]
 impl Caching for ControlledCaching {
+    fn snapshot(&self) -> CachingSnapshot {
+        self.inner.snapshot()
+    }
     async fn wait_for_break(&self, r: &RequestContext) -> Result<CachingBreak, Status> {
         let mut call = self.controller.begin(
             Operation::CachingBreak,
@@ -685,6 +688,10 @@ impl Caching for ControlledCaching {
 #[async_trait]
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
+
+    fn supports_leases(&self) -> bool {
+        self.backend.supports_leases()
+    }
 
     async fn link(
         &self,

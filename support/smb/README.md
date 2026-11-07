@@ -30,7 +30,7 @@ will not need them.
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
-| Caching and IOCTLs | Uncached default, opt-in classic oplocks and selected provider-backed controls | Exclusive/level-II and batch grants, cross-connection breaks/ACKs and write invalidation have direct tests plus Samba exclusive1/exclusive2/batch1; leases remain unsupported |
+| Caching and IOCTLs | Uncached default, opt-in oplocks/SMB 2.1 leases and provider-backed controls | Real grants, shared lease lifetime and routed breaks/ACKs have direct tests plus Samba exclusive1/exclusive2/batch1 and lease request/break/nobreakself; lease-v2 and directory leasing remain unsupported |
 | Naming | Share-relative namespace and canonical paths | Dot components/aliases resolve within the virtual root; Unicode BMP simple uppercase is shared by lookup, streams and wildcard matching |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
@@ -184,7 +184,7 @@ with filesystem effects, including external mutations when permitted.
 `ControlledFs` forwards these requests and retains actual grants, breaks and
 acknowledgment results across deterministic scheduling and late cancellation.
 
-The driver-aware connection runtime forwards classic oplock requests, routes
+The driver-aware connection runtime forwards oplock and lease requests, routes
 unsolicited break notifications and validates acknowledgments. Unacknowledged
 breaks revoke caching after 35 seconds. Close and disconnect release reservations
 without waiting for a client to read notifications or send an acknowledgment.
@@ -205,14 +205,31 @@ call admission and registration under their own store lock and wait outside it.
 This first implementation is shared provider infrastructure, not a transparent
 wrapper around arbitrary providers.
 
-Software grants currently cover exclusive/level-II and batch caching on default
-file streams only, not directories or leases. Batch open breaks precede ordinary
+Classic grants cover exclusive/level-II and batch caching on default file streams
+only, not directories. Batch open breaks precede ordinary
 sharing checks; stat-only opens retain the grant. After a batch downgrade, a
-write self-invalidates level-II caching. Named-stream opens
-conservatively revoke default-stream caching and suppress new grants while
-they remain open. Those unsupported caching requests may be
+write self-invalidates level-II caching. Named-stream opens conservatively revoke
+default-stream classic caching and suppress new classic grants while they remain
+open. Unsupported caching requests may be
 declined without failing the open. Host providers with external mutations must
 coordinate those mutators rather than use this software-only guarantee.
+
+SMB 2.1 leases support read, read/handle, read/write and read/write/handle caching,
+including independent named-stream leases. The provider scopes keys by service
+authority and negotiated client GUID, rejects a key reused for another object
+before creation effects, and shares one control across the lease's opens.
+Closing one handle does not release other handles' grants. A current provider
+snapshot and non-reused control identity prevent delayed open results from
+republishing revoked rights or resurrecting a closed lease instance.
+The engine routes one lease watcher per control and transfers an outstanding
+break to a surviving connection after disconnect. Read-only lease breaks need
+no client ACK; other breaks require one. Writes do not break the writer's own
+lease. Foreign writes, metadata and namespace effects are admitted before
+publication, including relinquishing handle caching when sharing checks fail.
+Lease acquisition/upgrade is constrained by other significant opens. The lease
+capability is advertised only when provider configuration and runtime support it.
+Directory leases, lease-v2 epochs/parent keys and native external-mutator
+coordination remain outside this profile.
 
 ## Run
 
@@ -239,6 +256,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_spars
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_compression)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oplock_exclusive)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oplock_batch)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_request) | test(samba_lease_breaks) | test(samba_lease_nobreakself)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
@@ -289,6 +307,12 @@ The batch harness adds `smb2.oplock.batch1`, also failing first: a break before
 a sharing-violation result, no duplicate break on a second failure, and a
 write-triggered self-break to none. These are three selected cases, not lease
 or full oplock-suite coverage.
+The three lease harnesses cover `smb2.lease.request`, `smb2.lease.break` and
+`smb2.lease.nobreakself`. Each fixture requires the lease capability rather than
+skipping an uncached server. Request and contention runs exposed real failures
+before passing; the contention matrix checks READ/HANDLE/WRITE bits independently
+and caught an initially swapped HANDLE/WRITE mapping. This is selected SMB 2.1
+coverage, not the entire lease suite.
 The rename harness covers eleven cases: simple, modification-time preservation,
 missing DELETE access, source sharing, destination-directory sharing, and
 rejecting directory renames with open descendants, plus metadata-only parent

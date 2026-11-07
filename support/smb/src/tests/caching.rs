@@ -4,8 +4,8 @@
 use super::*;
 use crate::memory::MemoryFile;
 use crate::provider::{
-    Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingState,
-    LeaseIdentity, Opened, Oplock,
+    Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingSnapshot,
+    CachingState, LeaseIdentity, Opened, Oplock,
 };
 use crate::test_support::{ControlledFs, Gate, Operation, Phase, Plan};
 use async_trait::async_trait;
@@ -66,6 +66,15 @@ impl Inspect for BreakControl {
 
 #[async_trait]
 impl Caching for BreakControl {
+    fn snapshot(&self) -> CachingSnapshot {
+        let state = self.state.lock();
+        CachingSnapshot {
+            instance: 1,
+            state: state.rights,
+            breaking: state.pending.is_some(),
+        }
+    }
+
     async fn wait_for_break(&self, request: &RequestContext) -> Result<CachingBreak, Status> {
         loop {
             let listener = self.changed.listen();
@@ -317,6 +326,7 @@ fn options() -> OpenOptions<'static> {
 fn lease() -> CachingRequest {
     CachingRequest::Lease {
         identity: LeaseIdentity {
+            authority: [0x20; 16],
             client_guid: [0x31; 16],
             key: [0x42; 16],
         },

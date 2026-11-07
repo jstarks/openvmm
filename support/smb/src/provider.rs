@@ -6,8 +6,8 @@
 pub mod caching;
 
 pub use caching::{
-    Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingState,
-    LeaseIdentity, Opened, Oplock,
+    Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingSnapshot,
+    CachingState, LeaseIdentity, Opened, Oplock,
 };
 
 use crate::security::SecurityDescriptor;
@@ -575,6 +575,12 @@ impl From<Status> for OpenError {
 pub trait FileSystem: Inspect + Send + Sync + 'static {
     /// Provider-owned open object, not an OS handle or protocol file ID.
     type File: Send + Sync;
+
+    /// Whether lease acquisition is supported by this provider configuration.
+    /// The engine advertises leases only when both provider and runtime support them.
+    fn supports_leases(&self) -> bool {
+        false
+    }
 
     /// Open an object and return its handle and SMB create-action value.
     /// Validate filename components before publishing a new object (MS-FSCC §2.1.5.2).

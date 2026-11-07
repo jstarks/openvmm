@@ -73,6 +73,7 @@ open_enum! {
     pub enum Status: u32 {
         #![expect(missing_docs, reason = "Status names follow the cited NTSTATUS table.")]
         SUCCESS = 0,
+        UNSUCCESSFUL = 0xc0000001,
         PENDING = 0x00000103,
         NOTIFY_CLEANUP = 0x0000010b,
         NOTIFY_ENUM_DIR = 0x0000010c,
@@ -139,6 +140,7 @@ open_enum! {
         INVALID_LOCK_RANGE = 0xc00001a1,
         INVALID_DEVICE_STATE = 0xc0000184,
         INVALID_OPLOCK_PROTOCOL = 0xc00000e3,
+        REQUEST_NOT_ACCEPTED = 0xc00000d0,
         USER_SESSION_DELETED = 0xc0000203,
         NETWORK_NAME_DELETED = 0xc00000c9,
     }
@@ -921,6 +923,27 @@ OplockBreakAcknowledgement, 24, 24 {
     reserved: u8,
     reserved2: U32,
     file_id: FileId,
+});
+wire!(
+/// SMB 2.1 lease CREATE context: [MS-SMB2] 2.2.13.2.8 and 2.2.14.2.8.
+LeaseContext, 32 {
+    lease_key: [u8; 16],
+    lease_state: U32,
+    lease_flags: U32,
+    lease_duration: U64,
+});
+wire!(
+/// Lease break notification: [MS-SMB2] 2.2.23.2.
+LeaseBreakNotification, 44, 44 {
+    structure_size: U16,
+    new_epoch: U16,
+    flags: U32,
+    lease_key: [u8; 16],
+    current_state: U32,
+    new_state: U32,
+    break_reason: U32,
+    access_hint: U32,
+    share_hint: U32,
 });
 wire!(
 /// Lease break acknowledgment: [MS-SMB2] §2.2.25.2.

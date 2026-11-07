@@ -214,6 +214,16 @@ fn samba_volume_quotas() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_sparse_compressed() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096),
+        std::future::pending(),
+        &["smb2.ioctl.sparse_compressed"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_compression() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

@@ -61,8 +61,15 @@ distance-one run matches and literal fallback rather than claiming an optimal
 encoder. Zero units have no payload. Queries report actual stored allocation
 and compression geometry. Directory compression is inherited by future
 children, and named streams retain independent state. Decompression and
-rewrites fail atomically when quota is insufficient. Sparse/compressed
-combinations currently return NOT_SUPPORTED without changing either state.
+rewrites fail atomically when quota is insufficient. Sparse and compressed
+states can coexist: nonzero LZNT1 chunks are indexed by logical position, with
+holes implicit rather than allocating metadata for each skipped unit.
+Both control orders preserve data and per-stream state. Hole punching releases
+encoded chunks; explicit allocation reservations remain actual reserved bytes.
+Sparse decompression materializes live ranges only, and clearing sparse state
+after decompression allocates logical holes atomically or fails without effects.
+The shared 4096-entry budget bounds candidate/live chunks and sparse extents,
+not the logical size of an otherwise empty sparse/compressed stream.
 Controlled providers can gate, cancel or reject these calls, and CLOSE drains
 their actual results before releasing the open.
 SET_ZERO_DATA requires WRITE_DATA and zeroes only the requested bytes below EOF,
@@ -306,6 +313,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_upgrades) | test(samba_lease_locks) | test(samba_lease_sharing_violation)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_oplock_mixing) | test(samba_lease_multiple_breaks)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_volume_quotas)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_sparse_compressed)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \

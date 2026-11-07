@@ -6,6 +6,7 @@
 //! units are implicit, as in MS-FSA's compressed zero-data allocation rules.
 
 use crate::spec::Status;
+use std::collections::BTreeMap;
 
 pub(super) const CHUNK_SIZE: usize = 4096;
 
@@ -17,8 +18,9 @@ pub(super) struct Chunk {
 }
 
 pub(super) struct Compressed {
-    chunks: Vec<Chunk>,
+    chunks: BTreeMap<usize, Chunk>,
     length: usize,
+    sparse: bool,
     reserved: usize,
     padding: Vec<u8>,
 }
@@ -27,34 +29,53 @@ impl Compressed {
     pub(super) fn build(
         length: usize,
         maximum_chunks: usize,
-        mut read: impl FnMut(usize, usize) -> Result<Vec<u8>, Status>,
+        read: impl FnMut(usize, usize) -> Result<Vec<u8>, Status>,
     ) -> Result<Self, Status> {
         let count = length.div_ceil(CHUNK_SIZE);
         if count > maximum_chunks {
             return Err(Status::INSUFFICIENT_RESOURCES);
         }
-        let mut chunks = Vec::new();
-        chunks
-            .try_reserve_exact(count)
-            .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
-        for start in (0..length).step_by(CHUNK_SIZE) {
+        Self::build_sparse(length, maximum_chunks, 0..count, read)
+    }
+
+    pub(super) fn build_sparse(
+        length: usize,
+        maximum_chunks: usize,
+        indices: impl IntoIterator<Item = usize>,
+        mut read: impl FnMut(usize, usize) -> Result<Vec<u8>, Status>,
+    ) -> Result<Self, Status> {
+        let mut chunks = BTreeMap::new();
+        let mut count = 0;
+        for index in indices {
+            count += 1;
+            if count > maximum_chunks {
+                return Err(Status::INSUFFICIENT_RESOURCES);
+            }
+            if index >= length.div_ceil(CHUNK_SIZE) {
+                return Err(Status::INTERNAL_ERROR);
+            }
+            let start = index * CHUNK_SIZE;
             let end = (start + CHUNK_SIZE).min(length);
             let bytes = read(start, end)?;
             if bytes.len() != end - start {
                 return Err(Status::INTERNAL_ERROR);
             }
-            chunks.push(Chunk::encode(&bytes)?);
+            let chunk = Chunk::encode(&bytes)?;
+            if chunk.allocation() != 0 {
+                chunks.insert(index, chunk);
+            }
         }
         Ok(Self {
             chunks,
             length,
+            sparse: false,
             reserved: 0,
             padding: Vec::new(),
         })
     }
 
     pub(super) fn allocation(&self) -> usize {
-        self.chunks.iter().map(Chunk::allocation).sum::<usize>() + self.padding.len()
+        self.chunks.values().map(Chunk::allocation).sum::<usize>() + self.padding.len()
     }
 
     pub(super) fn length(&self) -> usize {
@@ -67,23 +88,51 @@ impl Compressed {
         self.reserved
     }
 
+    pub(super) fn sparse(&self) -> bool {
+        self.sparse
+    }
+    pub(super) fn set_sparse(&mut self, sparse: bool) {
+        self.sparse = sparse;
+    }
+    pub(super) fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.chunks.keys().copied()
+    }
+    pub(super) fn ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        if self.reserved != 0 {
+            ranges.push((0, self.reserved.min(self.length)));
+        }
+        for (&index, chunk) in &self.chunks {
+            let start = index * CHUNK_SIZE;
+            let end = start + chunk.length;
+            if let Some((_, previous_end)) = ranges.last_mut() {
+                if start <= *previous_end {
+                    *previous_end = (*previous_end).max(end);
+                    continue;
+                }
+            }
+            ranges.push((start, end));
+        }
+        ranges
+    }
+
     #[cfg(test)]
     pub(super) fn capacity(&self) -> usize {
         self.chunks
-            .iter()
+            .values()
             .map(|chunk| chunk.bytes.capacity())
             .sum::<usize>()
             + self.padding.capacity()
     }
 
     pub(super) fn fill_zero(&mut self) {
-        for chunk in &mut self.chunks {
+        for chunk in self.chunks.values_mut() {
             chunk.fill_zero();
         }
     }
 
     pub(super) fn reserve(&mut self, length: usize) -> Result<(), Status> {
-        let payload: usize = self.chunks.iter().map(Chunk::allocation).sum();
+        let payload: usize = self.chunks.values().map(Chunk::allocation).sum();
         let padding = length.saturating_sub(payload);
         self.padding
             .try_reserve_exact(padding.saturating_sub(self.padding.len()))
@@ -103,14 +152,15 @@ impl Compressed {
             .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
         if start != end {
             for index in start / CHUNK_SIZE..end.div_ceil(CHUNK_SIZE) {
-                let bytes = self
-                    .chunks
-                    .get(index)
-                    .ok_or(Status::INTERNAL_ERROR)?
-                    .decode()?;
-                let from = start.saturating_sub(index * CHUNK_SIZE);
-                let to = (end - index * CHUNK_SIZE).min(bytes.len());
-                out.extend_from_slice(bytes.get(from..to).ok_or(Status::INTERNAL_ERROR)?);
+                let chunk_start = index * CHUNK_SIZE;
+                let from = start.saturating_sub(chunk_start);
+                let to = (end - chunk_start).min(CHUNK_SIZE);
+                if let Some(chunk) = self.chunks.get(&index) {
+                    let bytes = chunk.decode()?;
+                    out.extend_from_slice(bytes.get(from..to).ok_or(Status::INTERNAL_ERROR)?);
+                } else {
+                    out.resize(out.len() + to - from, 0);
+                }
             }
         }
         Ok(out)

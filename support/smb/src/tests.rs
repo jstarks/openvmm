@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 use test_with_tracing::test;
 use zerocopy::FromZeros;
 
+mod mixed_storage;
 mod quotas;
 
 struct Client<B: FileSystem = MemoryFs> {

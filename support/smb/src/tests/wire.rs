@@ -659,14 +659,12 @@ fn compression_controls_store_readable_lznt1_data_and_report_actual_allocation()
                 &object_id_ioctl_input(file, 0x9c040, &[1, 0]),
             )
             .await;
-        assert_eq!(
-            response_status(
-                &client
-                    .send(Command::IOCTL, &object_id_ioctl(file, 0x900c4, 0))
-                    .await
-            ),
-            Status::NOT_SUPPORTED
-        );
+        client
+            .ok(Command::IOCTL, &object_id_ioctl(file, 0x900c4, 0))
+            .await;
+        client
+            .ok(Command::IOCTL, &object_id_ioctl_input(file, 0x900c4, &[0]))
+            .await;
         assert_eq!(
             &client
                 .ok(Command::IOCTL, &object_id_ioctl(file, 0x9003c, 2))
@@ -950,17 +948,18 @@ fn sparse_controls_retain_real_holes_and_bound_allocation_instead_of_logical_siz
         client
             .ok(Command::IOCTL, &object_id_ioctl(file, 0x900c4, 0))
             .await;
-        assert_eq!(
-            response_status(
-                &client
-                    .send(
-                        Command::IOCTL,
-                        &object_id_ioctl_input(file, 0x9c040, &[2, 0])
-                    )
-                    .await
-            ),
-            Status::NOT_SUPPORTED
-        );
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x9c040, &[2, 0]),
+            )
+            .await;
+        client
+            .ok(
+                Command::IOCTL,
+                &object_id_ioctl_input(file, 0x9c040, &[0, 0]),
+            )
+            .await;
         assert_eq!(&client.query(file, 5).await[72..80], &8u64.to_le_bytes());
         let zero = |start: i64, end: i64| [start.to_le_bytes(), end.to_le_bytes()].concat();
         client

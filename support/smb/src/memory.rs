@@ -3342,9 +3342,6 @@ impl FileSystem for MemoryFs {
                 if enabled == data.is_compressed() {
                     return Ok(FileControlResult::Done);
                 }
-                if enabled && data.is_sparse() {
-                    return Err(Status::NOT_SUPPORTED);
-                }
                 let old_len = data.len();
                 let maximum_extents = backing_extent_room(&state, data.extent_count())?;
                 let base = state
@@ -3352,7 +3349,7 @@ impl FileSystem for MemoryFs {
                     .checked_sub(old_len)
                     .ok_or(Status::INTERNAL_ERROR)?;
                 let limit = backing_budget(&state, base)?;
-                if enabled {
+                if enabled && !data.is_sparse() {
                     let rounded = align_up(old_len, CHUNK_SIZE).map_err(|_| Status::DISK_FULL)?;
                     allocation_charge(&state, old_len, rounded)?;
                 }

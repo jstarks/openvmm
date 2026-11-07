@@ -3,10 +3,10 @@
 
 //! Byte-granular dense and sparse backing, independent of logical EOF.
 
-use super::compression::Compressed;
+use super::compression::{CHUNK_SIZE, Compressed};
 use crate::provider::{ByteRange, CompressionInformation};
 use crate::spec::Status;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) enum Data {
     Dense(Vec<u8>),
@@ -49,7 +49,11 @@ impl Data {
     }
 
     pub(super) fn is_sparse(&self) -> bool {
-        matches!(self, Self::Sparse(_))
+        match self {
+            Self::Sparse(_) => true,
+            Self::Compressed(data) => data.sparse(),
+            _ => false,
+        }
     }
 
     pub(super) fn is_compressed(&self) -> bool {
@@ -146,6 +150,10 @@ impl Data {
         limit: usize,
         maximum_extents: usize,
     ) -> Result<(), Status> {
+        if let Self::Compressed(data) = self {
+            data.set_sparse(sparse);
+            return Ok(());
+        }
         if sparse == self.is_sparse() {
             return Ok(());
         }
@@ -186,22 +194,55 @@ impl Data {
             return Ok(());
         }
         if compressed {
-            if self.is_sparse() {
-                return Err(Status::NOT_SUPPORTED);
-            }
-            let reservation = if self.span() > logical_size {
+            let reservation = if !self.is_sparse() && self.span() > logical_size {
                 self.span()
             } else {
                 0
             };
+            let length = if self.is_sparse() {
+                self.span().max(logical_size)
+            } else {
+                self.span()
+            };
             *self = self.rebuild_compressed(
-                self.span(),
+                length,
                 Edit::Preserve,
                 reservation,
                 limit,
                 maximum_extents,
             )?;
         } else {
+            if self.is_sparse() {
+                let Self::Compressed(data) = self else {
+                    return Err(Status::INTERNAL_ERROR);
+                };
+                let mut extents = BTreeMap::new();
+                let mut allocation = 0usize;
+                for (start, end) in data.ranges() {
+                    let end = end.min(logical_size);
+                    if start >= end {
+                        continue;
+                    }
+                    let bytes = data.read(start, end)?;
+                    if let (Some(first), Some(last)) = (
+                        bytes.iter().position(|byte| *byte != 0),
+                        bytes.iter().rposition(|byte| *byte != 0),
+                    ) {
+                        allocation = allocation
+                            .checked_add(last + 1 - first)
+                            .ok_or(Status::DISK_FULL)?;
+                        if allocation > limit {
+                            return Err(Status::DISK_FULL);
+                        }
+                        extents.insert(start + first, bytes[first..=last].to_vec());
+                    }
+                }
+                if extents.len() > maximum_extents {
+                    return Err(Status::INSUFFICIENT_RESOURCES);
+                }
+                *self = Self::Sparse(extents);
+                return Ok(());
+            }
             if logical_size > limit {
                 return Err(Status::DISK_FULL);
             }
@@ -221,7 +262,39 @@ impl Data {
         if reservation > limit {
             return Err(Status::DISK_FULL);
         }
-        let mut data = Compressed::build(length, maximum_extents, |start, end| {
+        let sparse = self.is_sparse();
+        let mut indices = BTreeSet::new();
+        if sparse {
+            let mut add = |start: usize, end: usize| -> Result<(), Status> {
+                if start < end {
+                    for index in start / CHUNK_SIZE..end.div_ceil(CHUNK_SIZE) {
+                        indices.insert(index);
+                        if indices.len() > maximum_extents {
+                            return Err(Status::INSUFFICIENT_RESOURCES);
+                        }
+                    }
+                }
+                Ok(())
+            };
+            match self {
+                Self::Sparse(extents) => {
+                    for (&start, bytes) in extents {
+                        add(start, (start + bytes.len()).min(length))?;
+                    }
+                }
+                Self::Compressed(data) => {
+                    for index in data.indices() {
+                        let start = index * CHUNK_SIZE;
+                        add(start, (start + CHUNK_SIZE).min(length))?;
+                    }
+                }
+                _ => return Err(Status::INTERNAL_ERROR),
+            }
+            if let Edit::Write(start, input) = edit {
+                add(start, start + input.len())?;
+            }
+        }
+        let read = |start: usize, end: usize| {
             let mut bytes = zeros(end - start)?;
             let copied_end = end.min(self.span());
             if start < copied_end {
@@ -246,11 +319,17 @@ impl Data {
                 }
             }
             Ok(bytes)
-        })?;
+        };
+        let mut data = if sparse {
+            Compressed::build_sparse(length, maximum_extents, indices, read)?
+        } else {
+            Compressed::build(length, maximum_extents, read)?
+        };
         if data.allocation() > limit {
             return Err(Status::DISK_FULL);
         }
         data.reserve(reservation)?;
+        data.set_sparse(sparse);
         Ok(Self::Compressed(data))
     }
 
@@ -422,7 +501,26 @@ impl Data {
             return (Vec::new(), false);
         }
         match self {
-            Self::Dense(_) | Self::Compressed(_) => (vec![range], false),
+            Self::Dense(_) => (vec![range], false),
+            Self::Compressed(data) if !data.sparse() => (vec![range], false),
+            Self::Compressed(data) => {
+                let end = range.offset + range.length;
+                let mut ranges = Vec::new();
+                for (start, to) in data.ranges() {
+                    let start = (start as u64).max(range.offset);
+                    let to = (to as u64).min(end);
+                    if start < to {
+                        if ranges.len() == maximum {
+                            return (ranges, true);
+                        }
+                        ranges.push(ByteRange {
+                            offset: start,
+                            length: to - start,
+                        });
+                    }
+                }
+                (ranges, false)
+            }
             Self::Sparse(extents) => {
                 let end = range.offset + range.length;
                 let mut ranges = Vec::new();

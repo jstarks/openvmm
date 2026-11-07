@@ -119,6 +119,136 @@ fn ack(key: u8, rights: u32) -> LeaseBreakAcknowledgement {
 }
 
 #[test]
+fn classic_shared_caching_coexists_with_read_but_not_handle_leases() {
+    block_on(async {
+        for rights in [1, 3] {
+            let server =
+                Server::new("memory", MemoryFs::new(1024, 16).with_oplocks().unwrap()).unwrap();
+            let mut a = client(&server, 1).await;
+            let first = created(
+                &a.ok(Command::CREATE, &body("file", 1, rights)).await,
+                1,
+                rights,
+            );
+            for level in [
+                OplockLevel::LEVEL_II,
+                OplockLevel::EXCLUSIVE,
+                OplockLevel::BATCH,
+            ] {
+                let mut bytes = create_body(
+                    "file",
+                    AccessMask::FILE_ALL_ACCESS.into_bits(),
+                    7,
+                    CreateDisposition::OPEN_IF.0,
+                    0,
+                    &[],
+                );
+                CreateRequest::mut_from_prefix(&mut bytes[..])
+                    .unwrap()
+                    .0
+                    .requested_oplock_level = level;
+                let response = a.ok(Command::CREATE, &bytes).await;
+                let open = read_body::<CreateResponse>(&response).unwrap();
+                assert_eq!(
+                    open.oplock_level,
+                    if rights == 1 {
+                        OplockLevel::LEVEL_II
+                    } else {
+                        OplockLevel::NONE
+                    }
+                );
+                a.close(open.file_id).await;
+            }
+            a.close(first).await;
+            let mut bytes = create_body(
+                "file",
+                AccessMask::FILE_ALL_ACCESS.into_bits(),
+                7,
+                CreateDisposition::OPEN_IF.0,
+                0,
+                &[],
+            );
+            CreateRequest::mut_from_prefix(&mut bytes[..])
+                .unwrap()
+                .0
+                .requested_oplock_level = OplockLevel::LEVEL_II;
+            let response = a.ok(Command::CREATE, &bytes).await;
+            let classic = read_body::<CreateResponse>(&response).unwrap();
+            assert_eq!(classic.oplock_level, OplockLevel::LEVEL_II);
+            let leased = created(&a.ok(Command::CREATE, &body("file", 2, 7)).await, 2, 1);
+            let extra = created(&a.ok(Command::CREATE, &body("file", 2, 3)).await, 2, 1);
+            a.close(extra).await;
+            a.close(classic.file_id).await;
+            let extra = created(&a.ok(Command::CREATE, &body("file", 2, 3)).await, 2, 3);
+            a.close(extra).await;
+            a.close(leased).await;
+            a.connection.shutdown().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn a_tightened_pending_break_blocks_both_opens_until_final_ack() {
+    DefaultPool::run_with(async |driver| {
+        let server =
+            Server::new("memory", MemoryFs::new(1024, 16).with_oplocks().unwrap()).unwrap();
+        let mut a = client(&server, 1).await;
+        let mut b = client(&server, 2).await;
+        let mut c = client(&server, 3).await;
+        let first = created(&a.ok(Command::CREATE, &body("file", 1, 7)).await, 1, 7);
+        a.ok(Command::WRITE, &Client::write_body(first, 0, b"keep"))
+            .await;
+        let (sender, receiver) = async_channel::bounded(4);
+        let mut service = std::pin::pin!(a.connection.clone().serve_caching(
+            driver,
+            sender,
+            Duration::from_secs(35)
+        ));
+        let bytes = body("file", 2, 7);
+        let mut opening = Box::pin(b.send(Command::CREATE, &bytes));
+        assert!(futures::poll!(&mut opening).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        change(&receiver.try_recv().unwrap(), 1, 7, 3, 1);
+        let bytes = create_body(
+            "file",
+            AccessMask::FILE_ALL_ACCESS.into_bits(),
+            7,
+            CreateDisposition::OVERWRITE.0,
+            0,
+            &[],
+        );
+        let mut overwriting = Box::pin(c.send(Command::CREATE, &bytes));
+        assert!(futures::poll!(&mut overwriting).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(&a.read(first, 0, 4).await[80..], b"keep");
+        a.ok(Command::OPLOCK_BREAK, ack(1, 3).as_bytes()).await;
+        assert!(futures::poll!(&mut opening).is_pending());
+        assert!(futures::poll!(&mut overwriting).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        change(&receiver.try_recv().unwrap(), 1, 3, 0, 1);
+        assert_eq!(&a.read(first, 0, 4).await[80..], b"keep");
+        a.ok(Command::OPLOCK_BREAK, ack(1, 0).as_bytes()).await;
+        let response = overwriting.await;
+        let second = created(&opening.await, 2, 3);
+        assert_eq!(response_status(&response), Status::SUCCESS);
+        assert_eq!(
+            response_status(&a.read(first, 0, 1).await),
+            Status::END_OF_FILE
+        );
+        a.close(first).await;
+        b.close(second).await;
+        c.close(read_body::<CreateResponse>(&response).unwrap().file_id)
+            .await;
+        a.connection.cancel_all();
+        service.await.unwrap();
+        a.connection.shutdown().await.unwrap();
+        b.connection.shutdown().await.unwrap();
+        c.connection.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn lease_contention_removes_write_not_handle_and_shared_opens_keep_the_grant() {
     DefaultPool::run_with(async |driver| {
         let server =

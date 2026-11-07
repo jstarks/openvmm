@@ -30,7 +30,7 @@ will not need them.
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
-| Caching and IOCTLs | Uncached default, opt-in oplocks/SMB 2.1 leases and provider-backed controls | Real grants, shared lifetime, routed breaks/ACKs and lock-aware admission have direct tests plus selected Samba classic, lease request/break/no-self-break, upgrade matrices, lock1/2/3 and sharing-violation cases; lease-v2 and directory leasing remain unsupported |
+| Caching and IOCTLs | Uncached default, opt-in oplocks/SMB 2.1 leases and provider-backed controls | Real grants, shared lifetime, routed breaks/ACKs and lock-aware admission have direct tests plus selected Samba classic, lease request/break/no-self-break, upgrades, locks, sharing failures, mixed caching and pending-break cases; lease-v2 and directory leasing remain unsupported |
 | Naming | Share-relative namespace and canonical paths | Dot components/aliases resolve within the virtual root; Unicode BMP simple uppercase is shared by lookup, streams and wildcard matching |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
@@ -235,6 +235,13 @@ shared caching, without changing reported physical allocation or logical EOF.
 Lock acquisition invalidates foreign leases before publishing the reservation.
 The lease
 capability is advertised only when provider configuration and runtime support it.
+Explicit level-II requests are supported. Classic level-II grants can share
+read leases but cannot coexist with handle-caching leases. A contended lease
+therefore falls back to read-only rights while a classic grant remains held;
+an upgrade to handle caching is possible after that classic open closes.
+Overlapping operations can tighten an outstanding break. The provider queues
+the additional invalidation after the first ACK, and waiting effects remain
+blocked until the final required rights are released.
 Directory leases, lease-v2 epochs/parent keys and native external-mutator
 coordination remain outside this profile.
 
@@ -265,6 +272,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oploc
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oplock_batch)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_request) | test(samba_lease_breaks) | test(samba_lease_nobreakself)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_upgrades) | test(samba_lease_locks) | test(samba_lease_sharing_violation)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_oplock_mixing) | test(samba_lease_multiple_breaks)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \

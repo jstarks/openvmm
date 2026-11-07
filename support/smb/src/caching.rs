@@ -46,6 +46,7 @@ impl OpenCaching {
             _ => return Err(Status::INTERNAL_ERROR),
         };
         let valid = match requested {
+            OplockLevel::LEVEL_II => level == Oplock::LevelII,
             OplockLevel::EXCLUSIVE => matches!(level, Oplock::Exclusive | Oplock::LevelII),
             OplockLevel::BATCH => true,
             _ => false,

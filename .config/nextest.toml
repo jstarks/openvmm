@@ -67,6 +67,11 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = 'test(loom)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.agent.overrides]]
+# Samba's 24-case matrix includes deliberate waits for absence of breaks.
+filter = 'package(smb) and test(samba_lease_oplock_mixing)'
+slow-timeout = { period = "5s", terminate-after = 12 }
+
 # Profile for AI agent runs. Minimizes output noise: only prints slow, failing,
 # and flaky tests. Agents should use: cargo nextest run -p <pkg> --profile agent
 [profile.agent]

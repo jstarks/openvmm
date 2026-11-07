@@ -176,6 +176,34 @@ fn samba_lease_sharing_violation() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_lease_oplock_mixing() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096)
+            .with_oplocks()
+            .unwrap(),
+        std::future::pending(),
+        &["smb2.lease.oplock"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
+fn samba_lease_multiple_breaks() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096)
+            .with_oplocks()
+            .unwrap(),
+        std::future::pending(),
+        &[
+            "smb2.lease.multibreak",
+            "smb2.lease.breaking1",
+            "smb2.lease.breaking2",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_compression() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

@@ -2461,7 +2461,7 @@ impl<B: FileSystem> Connection<B> {
                 Some(CreateContextName::QUERY_ON_DISK_ID) if context.data.is_empty() => {
                     disk_id = true
                 }
-                // The object store does not grant durable handles or leases.
+                // Durable handles are not supported.
                 Some(CreateContextName::DURABLE_HANDLE_REQUEST)
                     if context.data.len() == size_of::<DurableHandleRequest>() => {}
                 Some(CreateContextName::ALLOCATION_SIZE)
@@ -2564,6 +2564,7 @@ impl<B: FileSystem> Connection<B> {
         let caching_enabled = self.state.lock().caching_enabled;
         let caching_request = if caching_enabled {
             match request.requested_oplock_level {
+                OplockLevel::LEVEL_II => CachingRequest::Oplock(provider::Oplock::LevelII),
                 OplockLevel::EXCLUSIVE => CachingRequest::Oplock(provider::Oplock::Exclusive),
                 OplockLevel::BATCH => CachingRequest::Oplock(provider::Oplock::Batch),
                 OplockLevel::LEASE => lease_request.unwrap_or(CachingRequest::None),

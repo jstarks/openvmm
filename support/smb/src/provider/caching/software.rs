@@ -410,18 +410,30 @@ impl SoftwareCaching {
                 .find(|entry| entry.lease == Some(identity) && entry.key == key)
                 .map(|entry| entry.control.clone())
         });
+        // MS-FSA 2.1.5.18.2: classic level-II and handle caching cannot coexist.
+        let classic_read = table.opens.values().any(|entry| {
+            entry.key == key
+                && entry.lease.is_none()
+                && entry.control.state.lock().held != CachingState::None
+        });
+        let classic_eligible = eligible
+            && !table.opens.values().any(|entry| {
+                entry.key == key
+                    && entry.lease.is_some()
+                    && entry.control.state.lock().held.bits() & HANDLE_CACHING != 0
+            });
         let level = match requested {
-            CachingRequest::Oplock(Oplock::Exclusive) if eligible => Some(if another {
+            CachingRequest::Oplock(Oplock::Exclusive) if classic_eligible => Some(if another {
                 Oplock::LevelII
             } else {
                 Oplock::Exclusive
             }),
-            CachingRequest::Oplock(Oplock::Batch) if eligible => Some(if another {
+            CachingRequest::Oplock(Oplock::Batch) if classic_eligible => Some(if another {
                 Oplock::LevelII
             } else {
                 Oplock::Batch
             }),
-            CachingRequest::Oplock(Oplock::LevelII) if eligible => Some(Oplock::LevelII),
+            CachingRequest::Oplock(Oplock::LevelII) if classic_eligible => Some(Oplock::LevelII),
             _ => None,
         };
         let control = if let Some(control) = shared {
@@ -431,6 +443,7 @@ impl SoftwareCaching {
             } = requested
             {
                 if (!another || requested.bits() & WRITE_CACHING == 0)
+                    && (!classic_read || requested.bits() & HANDLE_CACHING == 0)
                     && (shared_eligible || requested.bits() & WRITE_CACHING != 0)
                     && state.pending.is_none()
                     && state.held.bits() & requested.bits() == state.held.bits()
@@ -443,8 +456,10 @@ impl SoftwareCaching {
             control
         } else {
             let lease_state = match requested {
-                CachingRequest::Lease { state, .. } if another => {
-                    CachingState::from_bits(state.bits() & !WRITE_CACHING)
+                CachingRequest::Lease { state, .. } if another || classic_read => {
+                    let removed = if another { WRITE_CACHING } else { 0 }
+                        | if classic_read { HANDLE_CACHING } else { 0 };
+                    CachingState::from_bits(state.bits() & !removed)
                         .ok_or(Status::INVALID_PARAMETER)?
                 }
                 CachingRequest::Lease { state, .. } => state,

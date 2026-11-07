@@ -187,6 +187,206 @@ fn lease_contention_removes_write_not_handle_and_shared_opens_keep_the_grant() {
 }
 
 #[test]
+fn leases_remain_addressable_with_unbacked_locks_and_locking_breaks_foreign_caches() {
+    DefaultPool::run_with(async |driver| {
+        let server =
+            Server::new("memory", MemoryFs::new(1024, 16).with_oplocks().unwrap()).unwrap();
+        let mut a = client(&server, 1).await;
+        let mut b = client(&server, 2).await;
+        let first = created(&a.ok(Command::CREATE, &body("file", 1, 7)).await, 1, 7);
+        let exclusive = LockFlags::new()
+            .with_exclusive_lock(true)
+            .with_fail_immediately(true);
+        a.ok(Command::LOCK, &locking::body(first, &[(0, 1, exclusive)]))
+            .await;
+        let (sender, receiver) = async_channel::bounded(4);
+        let mut service = std::pin::pin!(a.connection.clone().serve_caching(
+            driver,
+            sender,
+            Duration::from_secs(35)
+        ));
+        let bytes = body("file", 2, 7);
+        let mut opening = Box::pin(b.send(Command::CREATE, &bytes));
+        assert!(futures::poll!(&mut opening).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        change(&receiver.try_recv().unwrap(), 1, 7, 3, 1);
+        a.ok(Command::OPLOCK_BREAK, ack(1, 3).as_bytes()).await;
+        let second = created(&opening.await, 2, 3);
+        let extra = created(&a.ok(Command::CREATE, &body("file", 1, 0)).await, 1, 3);
+        a.close(extra).await;
+
+        let bytes = locking::body(second, &[(100, 1, exclusive)]);
+        let mut locking = Box::pin(b.send(Command::LOCK, &bytes));
+        assert!(futures::poll!(&mut locking).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        change(&receiver.try_recv().unwrap(), 1, 3, 0, 1);
+        assert!(futures::poll!(&mut locking).is_pending());
+        a.ok(Command::OPLOCK_BREAK, ack(1, 0).as_bytes()).await;
+        assert_eq!(response_status(&locking.await), Status::SUCCESS);
+        let extra = created(&a.ok(Command::CREATE, &body("file", 1, 0)).await, 1, 0);
+        a.close(extra).await;
+        let extra = created(&b.ok(Command::CREATE, &body("file", 2, 0)).await, 2, 3);
+        b.close(extra).await;
+        a.close(first).await;
+        b.close(second).await;
+        a.connection.cancel_all();
+        service.await.unwrap();
+        a.connection.shutdown().await.unwrap();
+        b.connection.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn shared_lease_grants_respect_backing_and_readable_ranges_and_unlock_allows_upgrade() {
+    block_on(async {
+        for name in ["file", "file:stream"] {
+            for (allocation, offset, storage) in [
+                (0, 0, None),
+                (16, 0, None),
+                (16, 16, None),
+                (0, 15, Some(FileControl::SetSparse { sparse: true })),
+                (0, 15, Some(FileControl::SetCompression { format: 2 })),
+            ] {
+                let fs = MemoryFs::new(1024, 16).with_oplocks().unwrap();
+                let context = RequestContext::new(1);
+                let options = OpenOptions {
+                    access: AccessMask::FILE_ALL_ACCESS.into_bits(),
+                    share_access: ShareAccess::ALL.into_bits(),
+                    disposition: CreateDisposition::OPEN_IF.0,
+                    options: 0,
+                    attributes: 0,
+                    allocation_size: allocation,
+                    security: None,
+                    extended_attributes: None,
+                };
+                let lease = |key, state| CachingRequest::Lease {
+                    identity: LeaseIdentity {
+                        authority: [1; 16],
+                        client_guid: [1; 16],
+                        key: [key; 16],
+                    },
+                    state,
+                };
+                let first = fs
+                    .open_with_caching(
+                        name,
+                        options,
+                        lease(1, CachingState::ReadWriteHandle),
+                        &context,
+                    )
+                    .await
+                    .unwrap();
+                let control = match first.caching {
+                    CachingGrant::Lease { state, control, .. } => {
+                        assert_eq!(state, CachingState::ReadWriteHandle);
+                        control
+                    }
+                    _ => panic!("missing initial lease"),
+                };
+                let info = fs.metadata(&first.file, &context).await.unwrap();
+                assert_eq!((info.size, info.allocation_size), (0, allocation));
+                let size = if let Some(storage) = storage {
+                    fs.file_control(&first.file, storage, &context)
+                        .await
+                        .unwrap();
+                    fs.set_len(&first.file, 16, &context).await.unwrap();
+                    let info = fs.metadata(&first.file, &context).await.unwrap();
+                    assert_eq!((info.size, info.allocation_size), (16, 0));
+                    16
+                } else {
+                    0
+                };
+                let range = ByteRange { offset, length: 1 };
+                fs.lock(&first.file, range, true, true, &context)
+                    .await
+                    .unwrap();
+                let request = lease(2, CachingState::ReadWriteHandle);
+                let mut opening = Box::pin(fs.open_with_caching(
+                    name,
+                    OpenOptions {
+                        allocation_size: 0,
+                        ..options
+                    },
+                    request,
+                    &context,
+                ));
+                assert!(futures::poll!(&mut opening).is_pending());
+                let change = control.wait_for_break(&context).await.unwrap();
+                assert_eq!(change.state, CachingState::ReadHandle);
+                control
+                    .acknowledge(change.id, change.state, &context)
+                    .await
+                    .unwrap();
+                let second = opening.await.unwrap();
+                let expected = if offset < allocation.max(size) {
+                    CachingState::None
+                } else {
+                    CachingState::ReadHandle
+                };
+                if size != 0 {
+                    assert_eq!(
+                        fs.read(&second.file, offset, 1, &context)
+                            .await
+                            .unwrap_err(),
+                        Status::FILE_LOCK_CONFLICT
+                    );
+                }
+                let second_control = match second.caching {
+                    CachingGrant::Lease {
+                        identity,
+                        state,
+                        control,
+                        ..
+                    } => {
+                        assert_eq!(
+                            identity,
+                            match request {
+                                CachingRequest::Lease { identity, .. } => identity,
+                                _ => unreachable!(),
+                            }
+                        );
+                        assert_eq!(state, expected);
+                        control
+                    }
+                    _ => panic!("a denied grant must retain its lease identity"),
+                };
+                let third = fs
+                    .open_with_caching(
+                        name,
+                        OpenOptions {
+                            allocation_size: 0,
+                            ..options
+                        },
+                        lease(2, CachingState::ReadHandle),
+                        &context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(second_control.snapshot().state, expected);
+                fs.close(&third.file, &context).await.unwrap();
+                fs.unlock(&first.file, range, &context).await.unwrap();
+                let upgraded = fs
+                    .open_with_caching(
+                        name,
+                        OpenOptions {
+                            allocation_size: 0,
+                            ..options
+                        },
+                        lease(2, CachingState::ReadHandle),
+                        &context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(second_control.snapshot().state, CachingState::ReadHandle);
+                fs.close(&upgraded.file, &context).await.unwrap();
+                fs.close(&second.file, &context).await.unwrap();
+                fs.close(&first.file, &context).await.unwrap();
+            }
+        }
+    });
+}
+
+#[test]
 fn a_shared_lease_migrates_to_a_live_connection_after_disconnect() {
     DefaultPool::run_with(async |driver| {
         let server =

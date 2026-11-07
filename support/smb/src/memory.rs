@@ -2471,12 +2471,8 @@ impl MemoryFs {
                 || options.access().append_data()
                 || options.access().execute();
             let eligible = if matches!(caching_request, CachingRequest::Lease { .. }) {
-                (stream != state.nodes[&id].default_stream
-                    || !state.nodes[&id].metadata.is_directory())
-                    && !state
-                        .locks
-                        .iter()
-                        .any(|lock| lock.node == id && lock.stream == stream)
+                stream != state.nodes[&id].default_stream
+                    || !state.nodes[&id].metadata.is_directory()
             } else {
                 data && stream == state.nodes[&id].default_stream
                     && !state.nodes[&id].metadata.is_directory()
@@ -2489,10 +2485,18 @@ impl MemoryFs {
                         .iter()
                         .any(|lock| lock.node == id && lock.stream == stream)
             };
+            let (data, size) = stream_data(&state.nodes[&id], stream)?;
+            // MS-FSA 2.1.5.18 blocks shared grants for allocation-backed locks.
+            // Also protect readable sparse/compressed ranges beyond stored allocation.
+            let caching_end = (data.len() as u64).max(size);
+            let shared_eligible = !state.locks.iter().any(|lock| {
+                lock.node == id && lock.stream == stream && lock.range.offset < caching_end
+            });
             let (reservation, grant) = caching.register(
                 CachingKey { file: id, stream },
                 options.access,
                 eligible,
+                shared_eligible,
                 caching_request,
             )?;
             (Some(reservation), grant)

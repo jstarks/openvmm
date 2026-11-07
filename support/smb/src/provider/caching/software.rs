@@ -380,11 +380,14 @@ impl SoftwareCaching {
 
     /// Register the validated open while still holding the provider lock.
     /// Call check_capacity before committing effects and do not interleave opens.
+    /// `shared_eligible` indicates whether backing locks permit shared read caching.
+    /// A declined lease grant still retains its identity and zero-state context.
     pub fn register(
         &self,
         key: CachingKey,
         access: u32,
         eligible: bool,
+        shared_eligible: bool,
         requested: CachingRequest,
     ) -> Result<(SoftwareOpen, CachingGrant), Status> {
         let mut table = self.0.lock();
@@ -428,6 +431,7 @@ impl SoftwareCaching {
             } = requested
             {
                 if (!another || requested.bits() & WRITE_CACHING == 0)
+                    && (shared_eligible || requested.bits() & WRITE_CACHING != 0)
                     && state.pending.is_none()
                     && state.held.bits() & requested.bits() == state.held.bits()
                 {
@@ -438,18 +442,23 @@ impl SoftwareCaching {
             drop(state);
             control
         } else {
+            let lease_state = match requested {
+                CachingRequest::Lease { state, .. } if another => {
+                    CachingState::from_bits(state.bits() & !WRITE_CACHING)
+                        .ok_or(Status::INVALID_PARAMETER)?
+                }
+                CachingRequest::Lease { state, .. } => state,
+                _ => CachingState::None,
+            };
             Arc::new(Control {
                 instance: table.next + 1,
                 state: Mutex::new(ControlState {
                     owners: 1,
                     held: if lease.is_some() {
-                        match requested {
-                            CachingRequest::Lease { state, .. } if another => {
-                                CachingState::from_bits(state.bits() & !WRITE_CACHING)
-                                    .ok_or(Status::INVALID_PARAMETER)?
-                            }
-                            CachingRequest::Lease { state, .. } => state,
-                            _ => CachingState::None,
+                        if shared_eligible || lease_state.bits() & WRITE_CACHING != 0 {
+                            lease_state
+                        } else {
+                            CachingState::None
                         }
                     } else {
                         match level {

@@ -204,6 +204,16 @@ fn samba_lease_multiple_breaks() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_volume_quotas() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096).with_quotas().unwrap(),
+        std::future::pending(),
+        &["smb2.getinfo.fsinfo", "smb2.getinfo.qfs_buffercheck"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_compression() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

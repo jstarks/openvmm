@@ -10,7 +10,7 @@ pub use caching::{
     CachingState, LeaseIdentity, Opened, Oplock,
 };
 
-use crate::security::SecurityDescriptor;
+use crate::security::{SecurityDescriptor, Sid};
 use crate::spec::{
     AccessMask, CreateDisposition, CreateOptions, FileAttributes, FileNotifyInformation,
     NOTIFY_ALIGNMENT, NotifyAction, NotifyFilter, SecurityInformation, Status,
@@ -400,6 +400,32 @@ pub struct VolumeObjectInformation {
     pub extended_info: [u8; 48],
 }
 
+/// Provider-owned volume quota defaults and actual control state.
+#[derive(Debug, Clone, Copy)]
+pub struct VolumeControlInformation {
+    /// Default warning threshold; u64::MAX means unlimited.
+    pub quota_threshold: u64,
+    /// Default hard limit; u64::MAX means unlimited.
+    pub quota_limit: u64,
+    /// FILE_VC_* flags; the engine ignores reserved and read-only set bits.
+    pub flags: u32,
+}
+
+/// Quota accounting associated with a security principal.
+#[derive(Debug, Clone)]
+pub struct QuotaInformation {
+    /// Principal responsible for allocation under the provider's identity policy.
+    pub sid: Sid,
+    /// Last policy update in NT time; ignored on set.
+    pub changed: i64,
+    /// Actual allocation charged to this principal; ignored on set.
+    pub used: i64,
+    /// Warning threshold; -1 means unlimited.
+    pub threshold: i64,
+    /// Hard limit; -1 means unlimited, -2 deletes an explicit quota on set.
+    pub limit: i64,
+}
+
 /// Parameters of an SMB open, after protocol validation.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions<'a> {
@@ -787,6 +813,42 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         _request: &RequestContext,
     ) -> Result<(), Status> {
         Err(Status::INVALID_PARAMETER)
+    }
+    /// Query actual volume control state; quota-unsupported volumes decline.
+    async fn quota_control(
+        &self,
+        _file: &Self::File,
+        _request: &RequestContext,
+    ) -> Result<VolumeControlInformation, Status> {
+        Err(Status::VOLUME_NOT_UPGRADED)
+    }
+    /// Update defaults atomically. Tracking/enforcement are host configuration,
+    /// not writable flags; preserve actual state and reject unsupported logging.
+    async fn set_quota_control(
+        &self,
+        _file: &Self::File,
+        _information: VolumeControlInformation,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+    /// Return a bounded, SID-unique quota snapshot. The engine owns filtering,
+    /// continuation and required zero records for unknown explicitly requested SIDs.
+    async fn query_quotas(
+        &self,
+        _file: &Self::File,
+        _request: &RequestContext,
+    ) -> Result<Vec<QuotaInformation>, Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+    /// Apply all supplied policies atomically, preserving actual usage.
+    async fn set_quotas(
+        &self,
+        _file: &Self::File,
+        _information: &[QuotaInformation],
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
     }
     /// Assign or remove a short name (MS-FSA §2.1.5.15.14).
     /// An empty name removes the alias. Validate 8.3 syntax, restore access,

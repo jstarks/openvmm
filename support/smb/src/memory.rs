@@ -14,8 +14,9 @@ use crate::provider::caching::software::{CachingKey, CachingWait, SoftwareCachin
 use crate::provider::{
     BasicInformation, ByteRange, CachingGrant, CachingRequest, Change, CompressionInformation,
     ExtendedAttribute, FileControl, FileControlResult, FileSystem, FileSystemInformation, LockId,
-    Metadata, NotifyResult, ObjectIdInformation, OpenError, OpenOptions, Opened, ReparsePoint,
-    RequestContext, SectorSizeInformation, StreamInformation, VolumeObjectInformation,
+    Metadata, NotifyResult, ObjectIdInformation, OpenError, OpenOptions, Opened, QuotaInformation,
+    ReparsePoint, RequestContext, SectorSizeInformation, StreamInformation,
+    VolumeControlInformation, VolumeObjectInformation,
 };
 use crate::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use crate::spec::{
@@ -114,6 +115,9 @@ struct State {
     next_object_id: u64,
     created: u64,
     object_information: VolumeObjectInformation,
+    quota_control: Option<VolumeControlInformation>,
+    quota_changed: i64,
+    quotas: BTreeMap<Vec<u8>, QuotaInformation>,
     nodes: BTreeMap<u64, Node>,
     links: BTreeMap<u64, Link>,
     opens: BTreeMap<u64, Open>,
@@ -329,6 +333,23 @@ pub(crate) fn nt_time() -> u64 {
 }
 
 impl MemoryFs {
+    /// Enable quotas for the synthetic share identity before opening objects.
+    /// All mutations are charged to SYSTEM, independently of descriptor ownership.
+    pub fn with_quotas(self) -> Result<Self, Status> {
+        {
+            let mut state = self.0.lock();
+            if !state.opens.is_empty() {
+                return Err(Status::INVALID_DEVICE_STATE);
+            }
+            state.quota_control.get_or_insert(VolumeControlInformation {
+                quota_threshold: u64::MAX,
+                quota_limit: u64::MAX,
+                flags: 0x0a,
+            });
+        }
+        Ok(self)
+    }
+
     /// Opt into software-managed oplocks and SMB 2.1 leases before opening objects.
     /// All mutations through clones of this store participate in coordination.
     pub fn with_oplocks(self) -> Result<Self, Status> {
@@ -417,6 +438,9 @@ impl MemoryFs {
             streams: BTreeMap::new(),
         };
         Self(Arc::new(Mutex::new(State {
+            quota_control: None,
+            quota_changed: 0,
+            quotas: BTreeMap::new(),
             caching: None,
             generate_short_names: false,
             next_object_id: 1,
@@ -1559,7 +1583,26 @@ fn allocation_charge(state: &State, old_len: usize, length: usize) -> Result<usi
     if new_bytes > state.byte_limit {
         return Err(Status::DISK_FULL);
     }
+    if new_bytes > state.bytes && quota_limit(state).is_some_and(|limit| new_bytes as u64 > limit) {
+        return Err(Status::DISK_FULL);
+    }
     Ok(new_bytes)
+}
+
+fn quota_limit(state: &State) -> Option<u64> {
+    let control = state.quota_control?;
+    let limit = state
+        .quotas
+        .get(system_sid().as_bytes())
+        .map_or(control.quota_limit, |quota| quota.limit as u64);
+    (control.flags & 3 == 2 && limit != u64::MAX).then_some(limit)
+}
+
+fn backing_budget(state: &State, base: usize) -> Result<usize, Status> {
+    let total = quota_limit(state).map_or(state.byte_limit, |limit| {
+        (limit.max(state.bytes as u64).min(state.byte_limit as u64)) as usize
+    });
+    total.checked_sub(base).ok_or(Status::INTERNAL_ERROR)
 }
 
 fn backing_extent_count(state: &State) -> usize {
@@ -1670,10 +1713,7 @@ fn resize_stream(
             .bytes
             .checked_sub(old_len)
             .ok_or(Status::INTERNAL_ERROR)?;
-        let limit = state
-            .byte_limit
-            .checked_sub(base)
-            .ok_or(Status::INTERNAL_ERROR)?;
+        let limit = backing_budget(state, base)?;
         let node = state.nodes.get_mut(&node_id).ok_or(Status::FILE_CLOSED)?;
         let (data, size) = stream_data_mut(node, stream)?;
         data.resize_compressed(length, limit, maximum_extents)?;
@@ -1862,6 +1902,8 @@ impl inspect::Inspect for MemoryFs {
             )
             .field("bytes", state.bytes)
             .field("byte_limit", state.byte_limit)
+            .field("quota_limit", quota_limit(&state))
+            .field("quota_policies", state.quotas.len())
             .field("object_limit", state.object_limit)
             .field("generate_short_names", state.generate_short_names)
             .field("backing_extents", backing_extent_count(&state))
@@ -3097,6 +3139,15 @@ impl FileSystem for MemoryFs {
         let total = i64::try_from(state.byte_limit).map_err(|_| Status::NOT_SUPPORTED)?;
         let available =
             i64::try_from(state.byte_limit - state.bytes).map_err(|_| Status::NOT_SUPPORTED)?;
+        let caller_available = quota_limit(&state).map_or(available, |limit| {
+            available.min(
+                limit
+                    .saturating_sub(state.bytes as u64)
+                    .min(i64::MAX as u64) as i64,
+            )
+        });
+        let caller_total =
+            quota_limit(&state).map_or(total, |limit| total.min(limit.min(i64::MAX as u64) as i64));
         Ok(FileSystemInformation {
             created: state.created,
             serial: 0,
@@ -3113,12 +3164,13 @@ impl FileSystem for MemoryFs {
                 .with_unicode_on_disk(true)
                 .with_extended_attributes(true)
                 .with_named_streams(true)
+                .with_volume_quotas(state.quota_control.is_some())
                 .into_bits(),
             maximum_component_name_length: MAX_COMPONENT_NAME_LENGTH,
             device_type: FILE_DEVICE_DISK,
             device_characteristics: 0,
-            total_allocation_units: total,
-            caller_available_allocation_units: available,
+            total_allocation_units: caller_total,
+            caller_available_allocation_units: caller_available,
             actual_available_allocation_units: available,
             sectors_per_allocation_unit: 1,
             bytes_per_sector: 1,
@@ -3137,6 +3189,110 @@ impl FileSystem for MemoryFs {
             }),
             object_information: Some(state.object_information),
         })
+    }
+
+    async fn quota_control(
+        &self,
+        file: &MemoryFile,
+        _request: &RequestContext,
+    ) -> Result<VolumeControlInformation, Status> {
+        let state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        state.quota_control.ok_or(Status::VOLUME_NOT_UPGRADED)
+    }
+
+    async fn set_quota_control(
+        &self,
+        file: &MemoryFile,
+        information: VolumeControlInformation,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        if [information.quota_threshold, information.quota_limit]
+            .into_iter()
+            .any(|value| value != u64::MAX && value > i64::MAX as u64)
+        {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if information.flags & 0xf0 != 0 || information.flags & 8 == 0 {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Metadata)
+            .await?;
+        if !AccessMask::from_bits(state.opens[&file.open].access).write_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
+        let old = state.quota_control.ok_or(Status::VOLUME_NOT_UPGRADED)?;
+        state.quota_control = Some(VolumeControlInformation {
+            quota_threshold: information.quota_threshold,
+            quota_limit: information.quota_limit,
+            flags: old.flags,
+        });
+        state.quota_changed = nt_time() as i64;
+        Ok(())
+    }
+
+    async fn query_quotas(
+        &self,
+        file: &MemoryFile,
+        _request: &RequestContext,
+    ) -> Result<Vec<QuotaInformation>, Status> {
+        let state = self.0.lock();
+        state.opens.get(&file.open).ok_or(Status::FILE_CLOSED)?;
+        let defaults = state.quota_control.ok_or(Status::NOT_SUPPORTED)?;
+        let mut quotas = state.quotas.clone();
+        let system = system_sid();
+        let quota = quotas
+            .entry(system.as_bytes().to_vec())
+            .or_insert(QuotaInformation {
+                sid: system,
+                changed: state.quota_changed,
+                used: 0,
+                threshold: defaults.quota_threshold as i64,
+                limit: defaults.quota_limit as i64,
+            });
+        quota.used = i64::try_from(state.bytes).map_err(|_| Status::NOT_SUPPORTED)?;
+        Ok(quotas.into_values().collect())
+    }
+
+    async fn set_quotas(
+        &self,
+        file: &MemoryFile,
+        information: &[QuotaInformation],
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut state = self
+            .lock_mutation(file, request, CacheChange::Metadata)
+            .await?;
+        if !AccessMask::from_bits(state.opens[&file.open].access).write_data() {
+            return Err(Status::ACCESS_DENIED);
+        }
+        state.quota_control.ok_or(Status::NOT_SUPPORTED)?;
+        let mut quotas = state.quotas.clone();
+        for quota in information {
+            if quota.threshold < -1 || quota.limit < -2 {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            if quota.limit == -2 {
+                quotas.remove(quota.sid.as_bytes());
+            } else {
+                quotas.insert(
+                    quota.sid.as_bytes().to_vec(),
+                    QuotaInformation {
+                        sid: quota.sid.clone(),
+                        changed: nt_time() as i64,
+                        used: 0,
+                        threshold: quota.threshold,
+                        limit: quota.limit,
+                    },
+                );
+            }
+        }
+        if quotas.len() > 1024 {
+            return Err(Status::INSUFFICIENT_RESOURCES);
+        }
+        state.quotas = quotas;
+        Ok(())
     }
 
     async fn file_control(
@@ -3185,10 +3341,7 @@ impl FileSystem for MemoryFs {
                     .bytes
                     .checked_sub(old_len)
                     .ok_or(Status::INTERNAL_ERROR)?;
-                let limit = state
-                    .byte_limit
-                    .checked_sub(base)
-                    .ok_or(Status::INTERNAL_ERROR)?;
+                let limit = backing_budget(&state, base)?;
                 if enabled {
                     let rounded = align_up(old_len, CHUNK_SIZE).map_err(|_| Status::DISK_FULL)?;
                     allocation_charge(&state, old_len, rounded)?;
@@ -3230,10 +3383,7 @@ impl FileSystem for MemoryFs {
                     .bytes
                     .checked_sub(old_len)
                     .ok_or(Status::INTERNAL_ERROR)?;
-                let limit = state
-                    .byte_limit
-                    .checked_sub(base)
-                    .ok_or(Status::INTERNAL_ERROR)?;
+                let limit = backing_budget(&state, base)?;
                 let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
                 let (data, size) = stream_data_mut(node, file.stream)?;
                 data.set_sparse(
@@ -3484,10 +3634,7 @@ impl FileSystem for MemoryFs {
                     .bytes
                     .checked_sub(old_len)
                     .ok_or(Status::INTERNAL_ERROR)?;
-                let limit = state
-                    .byte_limit
-                    .checked_sub(base)
-                    .ok_or(Status::INTERNAL_ERROR)?;
+                let limit = backing_budget(&state, base)?;
                 let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
                 let data = stream_data_mut(node, file.stream)?.0;
                 data.zero(start, end, limit, maximum_extents)?;
@@ -3820,10 +3967,7 @@ impl FileSystem for MemoryFs {
             .bytes
             .checked_sub(old_len)
             .ok_or(Status::INTERNAL_ERROR)?;
-        let limit = state
-            .byte_limit
-            .checked_sub(base)
-            .ok_or(Status::INTERNAL_ERROR)?;
+        let limit = backing_budget(&state, base)?;
         let node = state.nodes.get_mut(&file.node).ok_or(Status::FILE_CLOSED)?;
         let (stored, size) = stream_data_mut(node, file.stream)?;
         stored.write(offset, data, limit, maximum_extents)?;

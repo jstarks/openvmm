@@ -19,6 +19,7 @@ mod namespace;
 pub use compound::Request;
 pub mod memory;
 pub mod provider;
+mod quota;
 pub mod security;
 pub mod spec;
 pub mod tcp;
@@ -163,6 +164,7 @@ struct OpenFile<F> {
     position: AtomicI64,
     directory: Mutex<Option<DirectorySearch>>,
     ea_cursor: futures::lock::Mutex<u32>,
+    quota_cursor: futures::lock::Mutex<usize>,
     closing: AtomicBool,
     closed: AtomicBool,
     close_gate: futures::lock::Mutex<()>,
@@ -467,6 +469,10 @@ impl<F> Inspect for OpenFile<F> {
             .hex("mode", self.mode.load(Ordering::Relaxed))
             .field("position", self.position.load(Ordering::Relaxed))
             .field("ea_index", self.ea_cursor.try_lock().map(|index| *index))
+            .field(
+                "quota_index",
+                self.quota_cursor.try_lock().map(|index| *index),
+            )
             .field("is_directory", self.is_directory)
             .field("tree", self.tree)
             .field("closing", self.closing.load(Ordering::Acquire))
@@ -956,7 +962,8 @@ fn filesystem_response(
         FileSystemInformationClass::SIZE => size_of::<FileFsSizeInformation>(),
         FileSystemInformationClass::FULL_SIZE => size_of::<FileFsFullSizeInformation>(),
         FileSystemInformationClass::DEVICE => size_of::<FileFsDeviceInformation>(),
-        FileSystemInformationClass::ATTRIBUTE => size_of::<FileFsAttributeInformation>(),
+        // MS-FSA 2.1.5.13.1 includes the first WCHAR and native alignment.
+        FileSystemInformationClass::ATTRIBUTE => 16,
         FileSystemInformationClass::SECTOR_SIZE => size_of::<FileFsSectorSizeInformation>(),
         FileSystemInformationClass::OBJECT_ID => size_of::<FileFsObjectIdInformation>(),
         _ => return Err(Status::INVALID_PARAMETER),
@@ -2655,6 +2662,7 @@ impl<B: FileSystem> Connection<B> {
             position: AtomicI64::new(0),
             directory: Mutex::new(None),
             ea_cursor: futures::lock::Mutex::new(1),
+            quota_cursor: futures::lock::Mutex::new(0),
             closing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             close_gate: futures::lock::Mutex::new(()),
@@ -2912,6 +2920,21 @@ impl<B: FileSystem> Connection<B> {
         }
         if info_type == InformationType::FILESYSTEM {
             let class = FileSystemInformationClass(request.info_class);
+            if class == FileSystemInformationClass::CONTROL {
+                let info = self
+                    .server
+                    .backend
+                    .quota_control(&file.file, context)
+                    .await?;
+                if request.output_buffer_length.get() < 48 {
+                    return Err(Status::INFO_LENGTH_MISMATCH);
+                }
+                return buffer_response(
+                    quota::control_bytes(info),
+                    request.output_buffer_length.get(),
+                )
+                .map(|body| (Status::SUCCESS, body));
+            }
             match class {
                 FileSystemInformationClass::VOLUME
                 | FileSystemInformationClass::SIZE
@@ -2933,6 +2956,11 @@ impl<B: FileSystem> Connection<B> {
                 .filesystem_information(&file.file, context)
                 .await?;
             return filesystem_response(&info, class, request.output_buffer_length.get());
+        }
+        if info_type == InformationType::QUOTA {
+            return self
+                .query_quota(&file, input, request.output_buffer_length.get(), context)
+                .await;
         }
         if info_type != InformationType::FILE {
             return Err(Status::NOT_SUPPORTED);
@@ -3288,6 +3316,29 @@ impl<B: FileSystem> Connection<B> {
         let file = self.file(request.file_id, tree, context)?;
         let class = FileInformationClass(request.info_class);
         match (request.info_type, class) {
+            (InformationType::QUOTA, _) => {
+                if !file.access.write_data() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let information = quota::policies(data)?;
+                self.server
+                    .backend
+                    .set_quotas(&file.file, &information, context)
+                    .await?;
+            }
+            (InformationType::FILESYSTEM, _)
+                if FileSystemInformationClass(request.info_class)
+                    == FileSystemInformationClass::CONTROL =>
+            {
+                if !file.access.write_data() {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let information = quota::control(data)?;
+                self.server
+                    .backend
+                    .set_quota_control(&file.file, information, context)
+                    .await?;
+            }
             (InformationType::FILE, FileInformationClass::LINK) => {
                 if data.len() < FILE_LINK_INFORMATION_MIN_SIZE {
                     return Err(Status::INFO_LENGTH_MISMATCH);

@@ -24,7 +24,7 @@ will not need them.
 | CREATE and data I/O | Sharing, access grants, dispositions, EOF, short I/O, flush and close | Implemented; selected CREATE/read/write/mkdir cases and provider contracts |
 | Compounds and credits | Bounded admission, inherited identities, error propagation, pending replies and cancellation | Implemented; selected compound/async cases; retain committed CLOSE and compound-tail policies |
 | File metadata | Supported query classes, attributes/timestamps, allocation, EOF, mode and position | Implemented subset; broaden applicable getinfo/setinfo cases and classify unsupported-class dependencies |
-| Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/8/11 implemented; object-ID metadata can be set; quota controls remain |
+| Volume metadata | Provider-owned identity, capacity and capability flags | Classes 1/3/4/5/7/8/11 implemented; optional class 6 volume controls and SID quota queries/sets supported; object-ID metadata can be set |
 | Namespace and enumeration | Directory continuation, rename/move, hard links, short names, sharing, replacement and deletion | Link-scoped names/deletion and shared-file identity implemented; automatic short names can be enabled in MemoryFs |
 | Byte-range locks | Shared/exclusive conflicts, waiting, cancellation, unlock and release | Seventeen selected Samba cases and deterministic cross-open/connection tests; cancellation-status fixture differences remain documented |
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
@@ -133,6 +133,23 @@ visible through every open. An all-zero ID represents no assigned identity and
 queries return OBJECT_NAME_NOT_FOUND. Unsupported snapshots/updates are explicit
 errors. SET requires WRITE_DATA and participates in cancellation/CLOSE draining.
 Volume metadata alone does not establish per-file controls, quotas or persistent identity.
+
+Quota support is provider-optional. `MemoryFs::with_quotas()` enables real
+accounting for the synthetic SYSTEM share identity before opens; descriptor
+ownership does not change the identity charged for mutations. Defaults and
+SID-specific policies are retained separately, with atomic bounded updates,
+deletion back to defaults, and actual allocation-based hard limits. Sparse
+logical growth is not charged, but sparse writes, allocation, conversion and
+compressed backing use the quota-aware storage budget. Reducing a quota below
+current usage permits non-growing writes but prevents additional allocation.
+Caller capacity/free space is quota-limited while actual volume free space
+remains physical. Control queries/sets use class 6; enforcement/tracking flags
+are host configuration and ignored on set. Content-index enabling and quota
+event logging are unsupported, not reported as successful effects.
+SID queries support explicit lists, required zero records for unknown requested
+SIDs, start-SID selection and per-open continuation without losing entries on
+small buffers. Quota change-time and usage fields are ignored on set.
+This is synthetic-identity accounting, not native per-owner quota emulation.
 
 Per-file GET_OBJECT_ID, CREATE_OR_GET_OBJECT_ID, SET_OBJECT_ID,
 SET_OBJECT_ID_EXTENDED and DELETE_OBJECT_ID also use semantic provider controls.
@@ -277,6 +294,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oploc
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_request) | test(samba_lease_breaks) | test(samba_lease_nobreakself)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_upgrades) | test(samba_lease_locks) | test(samba_lease_sharing_violation)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_lease_oplock_mixing) | test(samba_lease_multiple_breaks)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_volume_quotas)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \

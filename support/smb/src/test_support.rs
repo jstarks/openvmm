@@ -88,6 +88,14 @@ pub enum Operation {
     SetShortName,
     /// Volume identity and extension metadata update.
     SetVolumeObjectId,
+    /// Query volume quota control state.
+    QuotaControl,
+    /// Update volume quota defaults.
+    SetQuotaControl,
+    /// Snapshot SID-based usage and policy.
+    QueryQuotas,
+    /// Atomically update SID quota policies.
+    SetQuotas,
     /// Directory change notification.
     Notify,
     /// Byte-range lock.
@@ -711,6 +719,67 @@ impl<B: FileSystem> FileSystem for ControlledFs<B> {
         call.complete(result, None).await
     }
 
+    async fn quota_control(
+        &self,
+        file: &Self::File,
+        r: &RequestContext,
+    ) -> Result<crate::provider::VolumeControlInformation, Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::QuotaControl, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self.backend.quota_control(&file.inner, &context).await;
+        call.complete(result, None).await
+    }
+    async fn set_quota_control(
+        &self,
+        file: &Self::File,
+        information: crate::provider::VolumeControlInformation,
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call = self.controller.begin(
+            Operation::SetQuotaControl,
+            Some(file.id),
+            None,
+            None,
+            None,
+            r,
+        )?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .set_quota_control(&file.inner, information, &context)
+            .await;
+        call.complete(result, None).await
+    }
+    async fn query_quotas(
+        &self,
+        file: &Self::File,
+        r: &RequestContext,
+    ) -> Result<Vec<crate::provider::QuotaInformation>, Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::QueryQuotas, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self.backend.query_quotas(&file.inner, &context).await;
+        call.complete(result, None).await
+    }
+    async fn set_quotas(
+        &self,
+        file: &Self::File,
+        information: &[crate::provider::QuotaInformation],
+        r: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call =
+            self.controller
+                .begin(Operation::SetQuotas, Some(file.id), None, None, None, r)?;
+        let context = call.prepare().await?;
+        let result = self
+            .backend
+            .set_quotas(&file.inner, information, &context)
+            .await;
+        call.complete(result, None).await
+    }
     async fn set_volume_object_id(
         &self,
         file: &Self::File,

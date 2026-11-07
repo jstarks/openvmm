@@ -154,8 +154,7 @@ pub struct FileSystemAttributes {
     pub unicode_on_disk: bool,
     pub persistent_acls: bool,
     pub file_compression: bool,
-    #[bits(1)]
-    other0: u8,
+    pub volume_quotas: bool,
     pub supports_sparse_files: bool,
     pub supports_reparse_points: bool,
     #[bits(8)]

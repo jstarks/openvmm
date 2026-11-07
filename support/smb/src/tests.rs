@@ -10,6 +10,8 @@ use std::task::{Context, Poll};
 use test_with_tracing::test;
 use zerocopy::FromZeros;
 
+mod quotas;
+
 struct Client<B: FileSystem = MemoryFs> {
     connection: Connection<B>,
     session: u64,
@@ -688,9 +690,9 @@ fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
             8,
             vec![2, 0, 0, 0, 2, 0, 0, 0],
         ),
-        (FileSystemInformationClass::ATTRIBUTE, 14, {
+        (FileSystemInformationClass::ATTRIBUTE, 16, {
             let mut out = vec![3, 0, 8, 0, 128, 0, 0, 0, 14, 0, 0, 0];
-            out.extend_from_slice(&[b'O', 0]);
+            out.extend_from_slice(&[b'O', 0, b't', 0]);
             out
         }),
         (FileSystemInformationClass::SIZE, 24, {
@@ -724,7 +726,7 @@ fn filesystem_query_encoding_preserves_provider_fields_and_partial_records() {
                 &info,
                 class,
                 if class == FileSystemInformationClass::ATTRIBUTE {
-                    11
+                    15
                 } else {
                     maximum - 1
                 }

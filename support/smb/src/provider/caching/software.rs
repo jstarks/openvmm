@@ -397,7 +397,8 @@ impl SoftwareCaching {
         let another = table
             .opens
             .values()
-            .any(|entry| entry.key == key && significant(entry.access, matches!(requested, CachingRequest::Lease { .. }))
+            .any(|entry| entry.key == key && (significant(entry.access, matches!(requested, CachingRequest::Lease { .. }))
+                || entry.control.state.lock().held != CachingState::None)
                 && !matches!(requested, CachingRequest::Lease { identity, .. } if entry.lease == Some(identity)));
         let lease = match requested {
             CachingRequest::Lease { identity, .. } if eligible => Some(identity),

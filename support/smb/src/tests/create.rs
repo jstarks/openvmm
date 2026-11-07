@@ -5,6 +5,37 @@ use super::*;
 use test_with_tracing::test;
 
 #[test]
+fn undefined_create_options_fail_before_creation_or_truncation() {
+    use crate::test_support::ControlledFs;
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let file = client.open("existing", 2, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(file, 0, b"keep"))
+            .await;
+        for options in [0x80, 0x40000, 0x80000, 0x1000000, 0xf0000000] {
+            for (name, disposition) in [("absent", 2), ("existing", 4)] {
+                let before = control.calls().len();
+                let bytes = create_body(name, 0x001f01ff, 7, disposition, options, &[]);
+                assert_eq!(
+                    response_status(&client.send(Command::CREATE, &bytes).await),
+                    Status::INVALID_PARAMETER
+                );
+                assert_eq!(control.calls().len(), before);
+            }
+        }
+        assert_eq!(&client.read(file, 0, 4).await[80..], b"keep");
+        assert_eq!(
+            response_status(&client.open_result("absent", 1, 7, 1, 0).await),
+            Status::OBJECT_NAME_NOT_FOUND
+        );
+        client.close(file).await;
+    });
+}
+
+#[test]
 fn reserve_opfilter_is_rejected_before_open_or_replacement_effects() {
     use crate::test_support::ControlledFs;
     block_on(async {

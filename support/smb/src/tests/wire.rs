@@ -1884,10 +1884,10 @@ fn stream_queries_report_actual_default_stream_without_attribute_access() {
         query.info_type = InformationType::FILE;
         query.info_class = 22;
         query.file_id = limited;
-        for maximum in [0u32, 23, 24, 37, 38, 40] {
+        for maximum in [0u32, 23, 24, 31, 32, 37, 38, 40] {
             query.output_buffer_length = maximum.into();
             let response = client.send(Command::QUERY_INFO, query.as_bytes()).await;
-            if maximum < 24 {
+            if maximum < 32 {
                 assert_eq!(response_status(&response), Status::INFO_LENGTH_MISMATCH);
             } else if maximum < 38 {
                 assert_eq!(response_status(&response), Status::BUFFER_OVERFLOW);

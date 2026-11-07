@@ -10,6 +10,45 @@ use std::net::TcpListener;
 use std::process::Command;
 use test_with_tracing::test;
 
+macro_rules! smb21_case {
+    ($name:ident, $case:literal) => {
+        #[test]
+        #[ignore = "requires the Samba smbtorture executable"]
+        fn $name() {
+            run_torture(
+                MemoryFs::new(16 * 1024 * 1024, 4096)
+                    .with_short_name_generation()
+                    .with_oplocks()
+                    .unwrap(),
+                std::future::pending(),
+                &["--maximum-runtime=20", $case],
+            );
+        }
+    };
+}
+
+smb21_case!(samba_smb21_getinfo_complex, "smb2.getinfo.complex");
+smb21_case!(
+    samba_smb21_getinfo_file_buffer,
+    "smb2.getinfo.qfile_buffercheck"
+);
+smb21_case!(samba_smb21_fileid_file, "smb2.fileid.fileid");
+smb21_case!(samba_smb21_fileid_dir, "smb2.fileid.fileid-dir");
+smb21_case!(samba_smb21_fileid_unique, "smb2.fileid.unique");
+smb21_case!(samba_smb21_fileid_unique_dir, "smb2.fileid.unique-dir");
+smb21_case!(samba_smb21_setinfo, "smb2.setinfo");
+smb21_case!(samba_smb21_oplock_exclusive3, "smb2.oplock.exclusive3");
+smb21_case!(samba_smb21_oplock_exclusive4, "smb2.oplock.exclusive4");
+smb21_case!(samba_smb21_oplock_exclusive5, "smb2.oplock.exclusive5");
+smb21_case!(samba_smb21_oplock_exclusive9, "smb2.oplock.exclusive9");
+smb21_case!(samba_smb21_oplock_batch2, "smb2.oplock.batch2");
+smb21_case!(samba_smb21_oplock_batch3, "smb2.oplock.batch3");
+smb21_case!(samba_smb21_oplock_batch4, "smb2.oplock.batch4");
+smb21_case!(samba_smb21_lease_statopen, "smb2.lease.statopen");
+smb21_case!(samba_smb21_lease_statopen2, "smb2.lease.statopen2");
+smb21_case!(samba_smb21_lease_statopen3, "smb2.lease.statopen3");
+smb21_case!(samba_smb21_lease_statopen4, "smb2.lease.statopen4");
+
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
 fn samba_read_write_smoke() {

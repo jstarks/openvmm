@@ -119,6 +119,48 @@ fn ack(key: u8, rights: u32) -> LeaseBreakAcknowledgement {
 }
 
 #[test]
+fn stat_only_lease_owners_constrain_foreign_grants_and_same_key_upgrades() {
+    DefaultPool::run_with(async |driver| {
+        let server =
+            Server::new("memory", MemoryFs::new(1024, 16).with_oplocks().unwrap()).unwrap();
+        let mut a = client(&server, 1).await;
+        let mut b = client(&server, 2).await;
+        let mut bytes = body("file", 1, 7);
+        let request = CreateRequest::mut_from_prefix(&mut bytes).unwrap().0;
+        request.desired_access = AccessMask::new().with_read_attributes(true);
+        request.share_access = ShareAccess::new();
+        let first = created(&a.ok(Command::CREATE, &bytes).await, 1, 7);
+        let extra = created(&a.ok(Command::CREATE, &body("file", 1, 0)).await, 1, 7);
+        a.close(extra).await;
+
+        let (sender, receiver) = async_channel::bounded(4);
+        let mut service = std::pin::pin!(a.connection.clone().serve_caching(
+            driver,
+            sender,
+            Duration::from_secs(35)
+        ));
+        let bytes = body("file", 2, 7);
+        let mut opening = Box::pin(b.send(Command::CREATE, &bytes));
+        assert!(futures::poll!(&mut opening).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        change(&receiver.try_recv().unwrap(), 1, 7, 3, 1);
+        a.ok(Command::OPLOCK_BREAK, ack(1, 3).as_bytes()).await;
+        let second = created(&opening.await, 2, 3);
+
+        let extra = created(&a.ok(Command::CREATE, &body("file", 1, 7)).await, 1, 3);
+        a.close(extra).await;
+        b.close(second).await;
+        let extra = created(&a.ok(Command::CREATE, &body("file", 1, 7)).await, 1, 7);
+        a.close(extra).await;
+        a.close(first).await;
+        a.connection.cancel_all();
+        service.await.unwrap();
+        a.connection.shutdown().await.unwrap();
+        b.connection.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn classic_shared_caching_coexists_with_read_but_not_handle_leases() {
     block_on(async {
         for rights in [1, 3] {

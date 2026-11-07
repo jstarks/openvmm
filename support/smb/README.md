@@ -40,7 +40,8 @@ regressions before fixing the behavior. Stateful fuzzing and a broader hardening
 harness are deferred; they are not represented as completed validation.
 
 CREATE rejects FILE_OPEN_BY_FILE_ID and FILE_RESERVE_OPFILTER before provider
-effects. Remote-instance, requiring-oplock and disallow-exclusive options are
+effects, and rejects undefined option bits with INVALID_PARAMETER.
+Remote-instance, requiring-oplock and disallow-exclusive options are
 ignored as required by SMB 2.1, rather than forwarded as native open requirements.
 
 Directory buffers smaller than the selected record's fixed prefix return
@@ -379,6 +380,47 @@ opens, no-delete-sharing parent opens, close-time metadata and concurrent opens.
 explicitly and adds twelve notify cases: tcon, dir, tdis, double, tcp, overflow,
 rmdir1-4, mask-change, and tree. It uses ten operations because the directory fixture assumes that
 count and has a fixed 1000-byte output buffer.
+
+### Broader SMB 2.1 Sampling
+
+The `samba_smb21_*` tests retain eighteen additional independently passing
+cases, bringing selected coverage to 164 cases, not the entire Samba suite.
+Each case uses a fresh MemoryFs/server, automatic short names and real oplocks,
+SMB 2.1 negotiation, and a 20-second child-process limit. Run them with:
+
+```bash
+SMBTORTURE=/path/to/corrected/smbtorture \
+    cargo nextest run --profile agent -p smb --run-ignored only \
+    -E 'test(samba_smb21_)' -j 2
+```
+
+A bounded 32-case expansion initially returned nineteen process successes,
+but four were Samba skips, not passes. After configuring actual short-name
+generation and fixing stat-only lease contention and the 32-byte native minimum
+stream-query buffer, eighteen cases genuinely pass. They cover file identity,
+metadata/stream buffers, SET_INFO, classic contention and stat-only lease opens.
+Undefined CREATE options also exposed a validation bug; a literal-wire
+regression now verifies rejection before creation or truncation. The generated
+CREATE fixture proceeds farther but is not counted as passing.
+
+The fourteen remaining sampled cases are classified explicitly:
+
+| Cases | Classification | Observed limitation or expectation |
+|-------|----------------|------------------------------------|
+| create.case-insensitive-bypass, create.path-length, dir.file-index, read.bug14607 | Four Samba skips | Case-sensitive/interactive/native file-index profiles or a Samba-only padding control; exit success is not evidence of a passing case |
+| getinfo.getinfo_access | Dialect expectation | Requires normalized-name success, which MS-SMB2 3.3.5.20.1 forbids on SMB 2.1 |
+| ea.acl_xattr | Fixture dependency | Requires Samba's configured private NTACL xattr, not ordinary EA functionality |
+| create.blob | Unsupported context | Requires accepting unknown vendor tag FooO; unknown contexts currently return NOT_SUPPORTED |
+| create.aclfile, create.acldir | Descriptor-policy difference | Expects the input ACE order to survive CREATE; MemoryFs places explicit ACEs before regenerated inherited ACEs |
+| create.nulldacl | Descriptor-policy difference | Final assertion expects absent-DACL SET to normalize to a present null DACL; MemoryFs retains the absent/present distinction |
+| dir.one | Metadata expectation | Requires directory EA size to equal FileEaInformation; MS-FSA directory records omit the additional four-byte query header |
+| oplock.exclusive6, rename.share_delete_and_delete_access | Historical rename profile | Requires a DELETE-access parent to block rename; MS-FSA 2.1.5.15.12 now uses all sharing flags, with the older behavior documented in product note 185 |
+| create.gentest | Native matrix/error-ordering expectation | After the reserved-option fix, combines invalid attributes and access and expects access denial first; also asserts historical native flag bitmaps |
+
+These differences are not silently skipped, changed to success, or included
+in the passing total. Descriptor normalization, vendor-context handling and
+native error-ordering expectations remain explicit compatibility-policy
+questions, not proof that the whole frontend is complete.
 
 ### Direct Provider Contracts
 

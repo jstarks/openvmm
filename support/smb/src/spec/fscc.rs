@@ -186,6 +186,8 @@ pub const FILE_MODE_INFORMATION_SET_MASK: u32 = 0x00000036;
 pub const FILE_ALL_INFORMATION_MIN_BUFFER_SIZE: usize = 104;
 /// Minimum alternate-name buffer: [MS-FSA] §2.1.5.12.4.
 pub const FILE_NAME_INFORMATION_MIN_BUFFER_SIZE: usize = 8;
+/// Minimum stream query buffer, including native alignment: [MS-FSA] §2.1.5.12.29.
+pub const FILE_STREAM_INFORMATION_MIN_BUFFER_SIZE: usize = 32;
 /// Minimum complete link input with native alignment: [MS-FSA] §2.1.5.15.7.
 pub const FILE_LINK_INFORMATION_MIN_SIZE: usize = 24;
 /// Linked directory records are eight-byte aligned: [MS-FSCC] §2.4.

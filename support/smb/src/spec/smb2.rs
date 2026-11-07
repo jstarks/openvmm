@@ -443,6 +443,13 @@ pub struct CreateOptions {
 }
 le_bitfield_conversions!(CreateOptions, u32, U32);
 
+impl CreateOptions {
+    /// Whether all options are defined for SMB file opens: [MS-SMB2] §2.2.13.
+    pub fn is_valid(self) -> bool {
+        self.other0() == 0 && self.other2() == 0 && self.other3() == 0
+    }
+}
+
 open_enum! {
     /// CreateDisposition: [MS-SMB2] §2.2.13.
     pub enum CreateDisposition: u32 {

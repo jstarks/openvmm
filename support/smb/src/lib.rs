@@ -2542,6 +2542,7 @@ impl<B: FileSystem> Connection<B> {
             || !request.file_attributes.is_valid()
             || !request.disposition().is_valid()
             || !request.share_access.is_valid()
+            || !options.is_valid()
             || (options.directory_file() && options.non_directory_file())
         {
             return Err(Status::INVALID_PARAMETER);
@@ -3111,7 +3112,7 @@ impl<B: FileSystem> Connection<B> {
             if request.output_buffer_length.get() as usize > MAX_TRANSFER_SIZE {
                 return Err(Status::INVALID_PARAMETER);
             }
-            if request.output_buffer_length.get() < size_of::<FileStreamInformation>() as u32 {
+            if request.output_buffer_length.get() < FILE_STREAM_INFORMATION_MIN_BUFFER_SIZE as u32 {
                 return Err(Status::INFO_LENGTH_MISMATCH);
             }
             let streams = self

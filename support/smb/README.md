@@ -30,7 +30,7 @@ will not need them.
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
-| Caching and IOCTLs | Uncached profile and selected provider-backed controls | Compression/zero/range and object-ID controls use actual provider state; unsupported controls remain errors; no oplock/lease grants |
+| Caching and IOCTLs | Uncached default, opt-in classic oplocks and selected provider-backed controls | Exclusive/level-II grants, cross-connection breaks/ACKs and write invalidation have direct tests plus Samba exclusive1/exclusive2; batch grants and leases remain unsupported by software caching |
 | Naming | Share-relative namespace and canonical paths | Dot components/aliases resolve within the virtual root; Unicode BMP simple uppercase is shared by lookup, streams and wildcard matching |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
@@ -184,11 +184,33 @@ with filesystem effects, including external mutations when permitted.
 `ControlledFs` forwards these requests and retains actual grants, breaks and
 acknowledgment results across deterministic scheduling and late cancellation.
 
-This is the provider foundation, not enabled wire caching. The frontend currently
-requests no caching, rejects unsolicited grants with cleanup, and continues to
-advertise/grant no oplocks or leases. Wire grant/break/ACK integration and the
-reusable software-only implementation remain separate work. The interface does
-not require MemoryFs or other providers to implement caching individually.
+The driver-aware connection runtime forwards classic oplock requests, routes
+unsolicited break notifications and validates acknowledgments. Unacknowledged
+breaks revoke caching after 35 seconds. Close and disconnect release reservations
+without waiting for a client to read notifications or send an acknowledgment.
+Retained notification/provider futures and partial transport progress survive pause.
+`ConnectionTask::new_with_driver` supplies notification service and timers; the
+ordinary constructor and direct `tcp::serve` helper remain uncached.
+
+MemoryFs defaults to no caching. `MemoryFs::with_oplocks()` opts into the shared
+`provider::caching::software::SoftwareCaching` infrastructure before any opens
+exist. The table uses stable file/stream identities, tracks uncached opens too,
+bounds reservations to 4096, and coordinates conflicting opens, data writes,
+length/allocation changes, byte-range locks and storage controls before effects.
+Exclusive owners can flush dirty data while their break awaits acknowledgment;
+level-II writes invalidate read caching, including the writer's. Ordinary sharing
+validation precedes exclusive-oplock breaks, and destructive opens revalidate
+after waits. The helper is independent of MemoryFs storage, but providers must
+call admission and registration under their own store lock and wait outside it.
+This first implementation is shared provider infrastructure, not a transparent
+wrapper around arbitrary providers.
+
+Software grants currently cover exclusive/level-II caching on default file
+streams only, not directories, batch oplocks or leases. Named-stream opens
+conservatively revoke default-stream caching and suppress new grants while
+they remain open. Those unsupported caching requests may be
+declined without failing the open. Host providers with external mutations must
+coordinate those mutators rather than use this software-only guarantee.
 
 ## Run
 
@@ -213,6 +235,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_renam
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_directory)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_sparse)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_compression)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oplock_exclusive)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
@@ -256,6 +279,10 @@ inputs, attributes and write-data access. The broader inherit-disable fixture
 expects FILE_NO_COMPRESSION to disable directory inheritance; MS-SMB2 2.2.13
 requires that bit to be ignored when FILE_DIRECTORY_FILE is set. It is not
 counted as passing; direct tests preserve the public directory rule.
+The opt-in oplock harness adds `smb2.oplock.exclusive1` and `exclusive2`: real
+grants, sharing failures without spurious breaks, and cross-connection downgrade
+notifications acknowledged by Samba. Both failed before implementation. This is
+not batch/lease or full oplock-suite coverage.
 The rename harness covers eleven cases: simple, modification-time preservation,
 missing DELETE access, source sharing, destination-directory sharing, and
 rejecting directory renames with open descendants, plus metadata-only parent

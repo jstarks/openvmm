@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+mod caching;
 mod codec;
 mod compound;
 mod credits;
@@ -24,6 +25,7 @@ pub mod tcp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+use caching::OpenCaching;
 use codec::*;
 use event_listener::Event;
 use inspect::Inspect;
@@ -128,6 +130,7 @@ impl<B: FileSystem> Server<B> {
             window: credits::Window::new(),
             credits_in_use: 0,
             disconnected: false,
+            caching_enabled: false,
             next_async: 1,
         }));
         let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
@@ -137,11 +140,13 @@ impl<B: FileSystem> Server<B> {
         Connection {
             server: self.clone(),
             state,
+            caching_changed: Arc::new(Event::new()),
         }
     }
 }
 
 struct OpenFile<F> {
+    caching: Option<OpenCaching>,
     file: F,
     identity: u64,
     access: AccessMask,
@@ -177,9 +182,11 @@ struct Activity {
 pub struct Connection<B: FileSystem> {
     server: Arc<Server<B>>,
     state: Arc<Mutex<ConnectionState<B::File>>>,
+    caching_changed: Arc<Event>,
 }
 
 struct ConnectionState<F> {
+    caching_enabled: bool,
     negotiated: bool,
     session: u64,
     session_active: bool,
@@ -350,6 +357,7 @@ impl<B: FileSystem> Clone for Connection<B> {
         Self {
             server: self.server.clone(),
             state: self.state.clone(),
+            caching_changed: self.caching_changed.clone(),
         }
     }
 }
@@ -370,7 +378,7 @@ impl<F> OpenFile<F> {
                     Command::FLUSH | Command::SET_INFO | Command::QUERY_DIRECTORY | Command::IOCTL
                 ),
                 notification: command == Command::CHANGE_NOTIFY,
-                locking: command == Command::LOCK,
+                locking: matches!(command, Command::LOCK | Command::OPLOCK_BREAK),
             });
         }
     }
@@ -384,9 +392,13 @@ impl<F> OpenFile<F> {
 
     fn retire(&self) {
         self.closing.store(true, Ordering::Release);
+        if let Some(caching) = &self.caching {
+            caching.stop.cancel();
+        }
         for activity in self.active.lock().iter() {
             activity.context.cancel();
         }
+        self.changed.notify(usize::MAX);
     }
 
     async fn wait(&self, context: &RequestContext, closing: bool) -> Result<(), Status> {
@@ -402,7 +414,7 @@ impl<F> OpenFile<F> {
                         .position(|activity| activity.context.id() == context.id())
                         .ok_or(Status::FILE_CLOSED)?;
                     let current = &active[position];
-                    // Lock waits bypass I/O barriers so UNLOCK can make progress.
+                    // Lock operations and oplock ACKs must unblock waiting I/O.
                     // Notifications have their own FIFO; CLOSE drains all activities.
                     active[..position].iter().any(|earlier| {
                         if current.locking {
@@ -447,6 +459,7 @@ impl<F> Inspect for OpenFile<F> {
             .field("tree", self.tree)
             .field("closing", self.closing.load(Ordering::Acquire))
             .field("closed", self.closed.load(Ordering::Acquire))
+            .field("caching", self.caching.as_ref())
             .field("close_error", inspect::AsDebug(*self.close_error.lock()))
             .field("active_operations", self.active.lock().len())
             .field(
@@ -484,6 +497,7 @@ impl<F> Inspect for ConnectionState<F> {
             .field("credits_in_use", self.credits_in_use)
             .field("trees", inspect::iter_by_index(self.trees.iter()))
             .field("opens", inspect::iter_by_key(self.files.iter()))
+            .field("caching_enabled", self.caching_enabled)
             .child("requests", |req| {
                 let mut resp = req.respond();
                 for (id, info) in &self.requests {
@@ -1478,6 +1492,10 @@ impl<B: FileSystem> Connection<B> {
             return Ok(());
         }
         file.wait(context, true).await?;
+        let _caching = match &file.caching {
+            Some(caching) => Some(caching.gate.lock().await),
+            None => None,
+        };
         if let Err(error) = self.server.backend.close(&file.file, context).await {
             *file.close_error.lock() = Some(error);
             return Err(error);
@@ -1512,6 +1530,7 @@ impl<B: FileSystem> Connection<B> {
             }
             files
         };
+        self.caching_changed.notify(usize::MAX);
         let context = RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
         let mut failure = None;
         for file in files {
@@ -1530,6 +1549,12 @@ impl<B: FileSystem> Connection<B> {
     pub(crate) fn cancel_all(&self) {
         let mut state = self.state.lock();
         state.disconnected = true;
+        for file in state.files.values() {
+            if let Some(caching) = &file.caching {
+                caching.stop.cancel();
+            }
+        }
+        self.caching_changed.notify(usize::MAX);
         for info in state.requests.values() {
             if !matches!(
                 info.command,
@@ -1961,7 +1986,7 @@ impl<B: FileSystem> Connection<B> {
             Command::READ => self.read(packet, tree, context).await,
             Command::WRITE => self.write(packet, tree, context).await,
             Command::LOCK => self.lock(packet, tree, context).await,
-            Command::OPLOCK_BREAK => self.oplock_acknowledgement(packet, tree, context),
+            Command::OPLOCK_BREAK => self.oplock_acknowledgement(packet, tree, context).await,
             Command::QUERY_DIRECTORY => self.query_directory(packet, tree, context).await,
             Command::SET_INFO => self.set_info(packet, tree, context).await,
             _ => Err(Status::NOT_SUPPORTED),
@@ -2182,7 +2207,7 @@ impl<B: FileSystem> Connection<B> {
         Ok((status, body))
     }
 
-    fn oplock_acknowledgement(
+    async fn oplock_acknowledgement(
         &self,
         packet: &[u8],
         tree: u32,
@@ -2198,9 +2223,14 @@ impl<B: FileSystem> Connection<B> {
             return Err(Status::OBJECT_NAME_NOT_FOUND);
         }
         let request: OplockBreakAcknowledgement = read_body(packet)?;
-        let _ = self.file(request.file_id, tree, context)?;
-        // No caching rights are granted, so no open can be awaiting a break ACK.
-        Err(Status::INVALID_DEVICE_STATE)
+        let file = self.file(request.file_id, tree, context)?;
+        let caching = file.caching.as_ref().ok_or(Status::INVALID_DEVICE_STATE)?;
+        caching.acknowledge(request.oplock_level, context).await?;
+        let mut response = request;
+        response.reserved = 0;
+        response.reserved2 = 0.into();
+        response.oplock_level = caching.level();
+        Ok(response.as_bytes().to_vec())
     }
 
     async fn lock(
@@ -2470,6 +2500,16 @@ impl<B: FileSystem> Connection<B> {
             }
             id
         };
+        let caching_enabled = self.state.lock().caching_enabled;
+        let caching_request = if caching_enabled {
+            match request.requested_oplock_level {
+                OplockLevel::EXCLUSIVE => CachingRequest::Oplock(provider::Oplock::Exclusive),
+                OplockLevel::BATCH => CachingRequest::Oplock(provider::Oplock::Batch),
+                _ => CachingRequest::None,
+            }
+        } else {
+            CachingRequest::None
+        };
         let opened = self
             .server
             .backend
@@ -2485,8 +2525,7 @@ impl<B: FileSystem> Connection<B> {
                     security,
                     extended_attributes,
                 },
-                // Keep the wire profile uncached until break delivery is integrated.
-                CachingRequest::None,
+                caching_request,
                 context,
             )
             .await;
@@ -2505,12 +2544,23 @@ impl<B: FileSystem> Connection<B> {
             }
             Err(OpenError::Status(status)) => return Err(status),
         };
-        if !matches!(caching, CachingGrant::None) {
-            let cleanup =
-                RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
-            self.server.backend.close(&file, &cleanup).await?;
-            return Err(Status::INTERNAL_ERROR);
-        }
+        let caching = match OpenCaching::from_grant(
+            caching,
+            request.requested_oplock_level,
+            caching_enabled,
+            RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed)),
+        ) {
+            Ok(caching) => caching,
+            Err(error) => {
+                let cleanup =
+                    RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
+                self.server.backend.close(&file, &cleanup).await?;
+                return Err(error);
+            }
+        };
+        let oplock_level = caching
+            .as_ref()
+            .map_or(OplockLevel::NONE, OpenCaching::level);
         let info = match self.server.backend.metadata(&file, context).await {
             Ok(info) => info,
             Err(error) => {
@@ -2526,6 +2576,7 @@ impl<B: FileSystem> Connection<B> {
         };
         let access = AccessMask::from_bits(info.granted_access);
         let file = Arc::new(OpenFile {
+            caching,
             file,
             identity: info.id,
             access,
@@ -2568,6 +2619,7 @@ impl<B: FileSystem> Connection<B> {
             self.server.backend.close(&file.file, &cleanup).await?;
             return Err(error);
         }
+        self.caching_changed.notify(usize::MAX);
         let mut response_contexts = Vec::new();
         let mut previous = None;
         if let Some(timestamp) = maximal_access {
@@ -2608,7 +2660,7 @@ impl<B: FileSystem> Connection<B> {
         }
         let mut response = CreateResponse {
             structure_size: CreateResponse::STRUCTURE_SIZE.into(),
-            oplock_level: OplockLevel::NONE,
+            oplock_level,
             flags: 0,
             create_action: action.into(),
             creation_time: info.created.into(),

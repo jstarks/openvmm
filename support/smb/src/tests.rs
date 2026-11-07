@@ -244,6 +244,7 @@ mod compound;
 mod create;
 mod locking;
 mod notify;
+mod oplocks;
 mod pending;
 mod rename;
 mod runtime;

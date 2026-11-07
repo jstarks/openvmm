@@ -40,6 +40,7 @@ pub struct ConnectionTask<B: FileSystem, S> {
     packet: Vec<u8>,
     packet_len: usize,
     requests: FuturesUnordered<Operation>,
+    caching: Option<Operation>,
     responses: VecDeque<Response>,
     response_sender: async_channel::Sender<Vec<u8>>,
     response_receiver: Pin<Box<async_channel::Receiver<Vec<u8>>>>,
@@ -62,6 +63,7 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
             packet: Vec::new(),
             packet_len: 0,
             requests: FuturesUnordered::new(),
+            caching: None,
             responses: VecDeque::new(),
             response_sender,
             response_receiver: Box::pin(response_receiver),
@@ -71,6 +73,23 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
             cleanup_complete: false,
             result: None,
         }
+    }
+
+    /// Create a connection with unsolicited caching notifications and break timers.
+    pub fn new_with_driver(connection: Connection<B>, stream: S, driver: DefaultDriver) -> Self {
+        let mut task = Self::new(connection, stream);
+        task.connection.state.lock().caching_enabled = true;
+        task.caching = Some(
+            task.connection
+                .clone()
+                .serve_caching(
+                    driver,
+                    task.response_sender.clone(),
+                    crate::caching::BREAK_TIMEOUT,
+                )
+                .boxed(),
+        );
+        task
     }
 
     /// Take the terminal result after the worker finishes.
@@ -105,8 +124,26 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
     pub async fn shutdown(&mut self) -> Result<(), Error> {
         self.disconnect(None);
         let mut error = self.failure.take();
-        while !self.requests.is_empty() {
-            let mut request = std::pin::pin!(self.requests.next().fuse());
+        while !self.requests.is_empty() || self.caching.is_some() {
+            let mut request = std::pin::pin!(
+                async {
+                    if self.requests.is_empty() {
+                        std::future::pending().await
+                    } else {
+                        self.requests.next().await
+                    }
+                }
+                .fuse()
+            );
+            let mut caching = std::pin::pin!(
+                async {
+                    match &mut self.caching {
+                        Some(caching) => caching.await,
+                        None => std::future::pending().await,
+                    }
+                }
+                .fuse()
+            );
             let mut response =
                 std::pin::pin!(self.response_receiver.as_ref().get_ref().recv().fuse());
             futures::select! {
@@ -116,6 +153,12 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
                     }
                 }
                 _ = response => {}
+                result = caching => {
+                    if let Err(failure) = result {
+                        if error.is_none() { error = Some(failure); }
+                    }
+                    self.caching = None;
+                }
             }
         }
         while self.response_receiver.as_ref().get_ref().try_recv().is_ok() {}
@@ -248,6 +291,15 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
                 }
                 progress = true;
             }
+            if let Some(caching) = &mut self.caching {
+                if let Poll::Ready(result) = caching.as_mut().poll(cx) {
+                    self.caching = None;
+                    if let Err(error) = result {
+                        self.disconnect(Some(error));
+                    }
+                    progress = true;
+                }
+            }
             if self.failure.is_none() {
                 if let Poll::Ready(result) = self.write_step(cx) {
                     if let Err(error) = result {
@@ -264,7 +316,11 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
                     progress = true;
                 }
             }
-            if self.eof && self.requests.is_empty() && !self.cleanup_complete {
+            if self.eof
+                && self.requests.is_empty()
+                && self.caching.is_none()
+                && !self.cleanup_complete
+            {
                 let cleanup = self.cleanup.get_or_insert_with(|| {
                     let connection = self.connection.clone();
                     async move { connection.shutdown().await }.boxed()
@@ -311,6 +367,7 @@ impl<B: FileSystem, S> Inspect for ConnectionTask<B, S> {
             .field("receive_body_bytes", self.packet_len)
             .field("receive_body_length", self.packet.len())
             .field("active_requests", self.requests.len())
+            .field("caching_service", self.caching.is_some())
             .field("queued_responses", self.responses.len())
             .field(
                 "response_channel_frames",
@@ -401,7 +458,11 @@ impl<B: FileSystem> ServerWorker<B> {
                             Ok(stream) => {
                                 self.connections.insert(
                                     self.next_connection,
-                                    ConnectionTask::new(self.server.connect(), stream),
+                                    ConnectionTask::new_with_driver(
+                                        self.server.connect(),
+                                        stream,
+                                        self.driver.clone(),
+                                    ),
                                 );
                                 self.next_connection += 1;
                             }

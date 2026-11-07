@@ -3,6 +3,8 @@
 
 //! Provider-owned caching coherence, independent of SMB packet layouts.
 
+pub mod software;
+
 use super::RequestContext;
 use crate::spec::Status;
 use async_trait::async_trait;

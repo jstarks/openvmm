@@ -76,6 +76,18 @@ fn samba_create_and_sharing() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_oplock_exclusive() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096)
+            .with_oplocks()
+            .unwrap(),
+        std::future::pending(),
+        &["smb2.oplock.exclusive1", "smb2.oplock.exclusive2"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_compression() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

@@ -30,7 +30,7 @@ will not need them.
 | Change notifications | Persistent registration, filters, subtree events, buffering and cleanup | Eighteen selected Samba cases and deterministic contracts; `rec` has conflicting fixed-count expectations |
 | Security | Basic descriptors, faithful grants, atomic updates, parent checks and creation inheritance | Descriptor-read/buffer/grant cases, four selected ACL cases and direct contracts; advanced ACEs/SACLs/reinheritance unsupported, persistent-ACL flag clear |
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
-| Caching and IOCTLs | Uncached default, opt-in classic oplocks and selected provider-backed controls | Exclusive/level-II grants, cross-connection breaks/ACKs and write invalidation have direct tests plus Samba exclusive1/exclusive2; batch grants and leases remain unsupported by software caching |
+| Caching and IOCTLs | Uncached default, opt-in classic oplocks and selected provider-backed controls | Exclusive/level-II and batch grants, cross-connection breaks/ACKs and write invalidation have direct tests plus Samba exclusive1/exclusive2/batch1; leases remain unsupported |
 | Naming | Share-relative namespace and canonical paths | Dot components/aliases resolve within the virtual root; Unicode BMP simple uppercase is shared by lookup, streams and wildcard matching |
 | Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
 
@@ -205,8 +205,10 @@ call admission and registration under their own store lock and wait outside it.
 This first implementation is shared provider infrastructure, not a transparent
 wrapper around arbitrary providers.
 
-Software grants currently cover exclusive/level-II caching on default file
-streams only, not directories, batch oplocks or leases. Named-stream opens
+Software grants currently cover exclusive/level-II and batch caching on default
+file streams only, not directories or leases. Batch open breaks precede ordinary
+sharing checks; stat-only opens retain the grant. After a batch downgrade, a
+write self-invalidates level-II caching. Named-stream opens
 conservatively revoke default-stream caching and suppress new grants while
 they remain open. Those unsupported caching requests may be
 declined without failing the open. Host providers with external mutations must
@@ -236,6 +238,7 @@ cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_direc
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_sparse)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_compression)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oplock_exclusive)'
+cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_oplock_batch)'
 cargo nextest run --profile agent -p smb --run-ignored only -E 'test(samba_create_and_sharing)'
 SMBTORTURE=/path/to/corrected/smbtorture \
     cargo nextest run --profile agent -p smb --run-ignored only \
@@ -281,8 +284,11 @@ requires that bit to be ignored when FILE_DIRECTORY_FILE is set. It is not
 counted as passing; direct tests preserve the public directory rule.
 The opt-in oplock harness adds `smb2.oplock.exclusive1` and `exclusive2`: real
 grants, sharing failures without spurious breaks, and cross-connection downgrade
-notifications acknowledged by Samba. Both failed before implementation. This is
-not batch/lease or full oplock-suite coverage.
+notifications acknowledged by Samba. Both failed before implementation.
+The batch harness adds `smb2.oplock.batch1`, also failing first: a break before
+a sharing-violation result, no duplicate break on a second failure, and a
+write-triggered self-break to none. These are three selected cases, not lease
+or full oplock-suite coverage.
 The rename harness covers eleven cases: simple, modification-time preservation,
 missing DELETE access, source sharing, destination-directory sharing, and
 rejecting directory renames with open descendants, plus metadata-only parent

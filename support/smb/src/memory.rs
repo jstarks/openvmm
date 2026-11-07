@@ -2095,6 +2095,23 @@ impl MemoryFs {
                         .with_delete(supersede || options.access().delete())
                         .into_bits();
                 }
+                if let Some(caching) = &state.caching {
+                    let stat_access = AccessMask::new()
+                        .with_read_attributes(true)
+                        .with_write_attributes(true)
+                        .with_synchronize(true)
+                        .into_bits();
+                    if let Some(wait) = caching.prepare_batch_open(
+                        CachingKey {
+                            file: id,
+                            stream: default,
+                        },
+                        options.access & !stat_access != 0,
+                        replacement,
+                    )? {
+                        return Ok(OpenAttempt::Wait(wait));
+                    }
+                }
                 let mut available = AccessMask::from_bits(allowed_access(&state, link));
                 if options.access().maximum_allowed() && node.metadata.attributes().readonly() {
                     available.set_write_data(false);

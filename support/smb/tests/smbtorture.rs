@@ -88,6 +88,18 @@ fn samba_oplock_exclusive() {
 
 #[test]
 #[ignore = "requires the Samba smbtorture executable"]
+fn samba_oplock_batch() {
+    run_torture(
+        MemoryFs::new(16 * 1024 * 1024, 4096)
+            .with_oplocks()
+            .unwrap(),
+        std::future::pending(),
+        &["smb2.oplock.batch1"],
+    );
+}
+
+#[test]
+#[ignore = "requires the Samba smbtorture executable"]
 fn samba_compression() {
     run_torture(
         MemoryFs::new(16 * 1024 * 1024, 4096),

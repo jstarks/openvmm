@@ -122,6 +122,30 @@ impl SoftwareCaching {
         Ok(())
     }
 
+    /// Break batch handle caching before ordinary open access/sharing checks
+    /// (MS-FSA 2.1.5.1.2). Stat-only opens do not break classic oplocks.
+    pub fn prepare_batch_open(
+        &self,
+        key: CachingKey,
+        significant_access: bool,
+        replacement: bool,
+    ) -> Result<Option<CachingWait>, Status> {
+        self.prepare(|_, entry| {
+            if entry.key == key
+                && significant_access
+                && entry.control.state.lock().held == CachingState::ReadWriteHandle
+            {
+                Some(if replacement {
+                    CachingState::None
+                } else {
+                    CachingState::Read
+                })
+            } else {
+                None
+            }
+        })
+    }
+
     /// Admit a data open or replacement after ordinary sharing/access validation.
     /// Replacement breaks every stream of the file before destructive effects.
     pub fn prepare_open(
@@ -135,7 +159,9 @@ impl SoftwareCaching {
                 Some(CachingState::None)
             } else if data_access && entry.key == key {
                 match entry.control.state.lock().held {
-                    CachingState::ReadWrite => Some(CachingState::Read),
+                    CachingState::ReadWrite | CachingState::ReadWriteHandle => {
+                        Some(CachingState::Read)
+                    }
                     _ => None,
                 }
             } else {
@@ -158,7 +184,12 @@ impl SoftwareCaching {
                 return None;
             }
             let exclusive_owner = owns_table && id == owner.id;
-            if exclusive_owner && entry.control.state.lock().held == CachingState::ReadWrite {
+            if exclusive_owner
+                && matches!(
+                    entry.control.state.lock().held,
+                    CachingState::ReadWrite | CachingState::ReadWriteHandle
+                )
+            {
                 None
             } else {
                 Some(CachingState::None)
@@ -227,6 +258,11 @@ impl SoftwareCaching {
             } else {
                 Oplock::Exclusive
             }),
+            CachingRequest::Oplock(Oplock::Batch) if eligible => Some(if another {
+                Oplock::LevelII
+            } else {
+                Oplock::Batch
+            }),
             CachingRequest::Oplock(Oplock::LevelII) if eligible => Some(Oplock::LevelII),
             _ => None,
         };
@@ -234,6 +270,7 @@ impl SoftwareCaching {
             state: Mutex::new(ControlState {
                 held: match level {
                     Some(Oplock::Exclusive) => CachingState::ReadWrite,
+                    Some(Oplock::Batch) => CachingState::ReadWriteHandle,
                     Some(_) => CachingState::Read,
                     None => CachingState::None,
                 },

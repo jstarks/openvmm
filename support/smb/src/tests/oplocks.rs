@@ -418,3 +418,147 @@ fn named_stream_activity_revokes_and_suppresses_default_stream_caching() {
         );
     });
 }
+
+#[test]
+fn batch_breaks_precede_sharing_failure_but_stat_opens_do_not_break() {
+    DefaultPool::run_with(async |driver| {
+        let server =
+            Server::new("memory", MemoryFs::new(1024, 16).with_oplocks().unwrap()).unwrap();
+        let mut a = cached_client(&server).await;
+        let mut b = cached_client(&server).await;
+        let mut body = exclusive_body(CreateDisposition::OPEN_IF, ShareAccess::new());
+        CreateRequest::mut_from_prefix(&mut body[..])
+            .unwrap()
+            .0
+            .requested_oplock_level = OplockLevel::BATCH;
+        let first = read_body::<CreateResponse>(&a.ok(Command::CREATE, &body).await).unwrap();
+        assert_eq!(first.oplock_level, OplockLevel::BATCH);
+        a.ok(
+            Command::WRITE,
+            &Client::write_body(first.file_id, 0, b"old"),
+        )
+        .await;
+        let (sender, receiver) = async_channel::bounded(2);
+        let mut service = std::pin::pin!(a.connection.clone().serve_caching(
+            driver,
+            sender,
+            Duration::from_secs(35)
+        ));
+        let stat = AccessMask::new()
+            .with_read_attributes(true)
+            .with_write_attributes(true)
+            .with_synchronize(true);
+        let result = b
+            .open_result(
+                "file",
+                stat.into_bits(),
+                ShareAccess::ALL.into_bits(),
+                CreateDisposition::OPEN.0,
+                0,
+            )
+            .await;
+        assert_eq!(response_status(&result), Status::SUCCESS);
+        b.close(read_body::<CreateResponse>(&result).unwrap().file_id)
+            .await;
+        assert!(futures::poll!(&mut service).is_pending());
+        assert!(receiver.try_recv().is_err());
+        let delete = create_body(
+            "file",
+            AccessMask::new().with_delete(true).into_bits(),
+            ShareAccess::ALL.into_bits(),
+            CreateDisposition::OPEN.0,
+            CreateOptions::new().with_delete_on_close(true).into_bits(),
+            &[],
+        );
+        let mut denied = Box::pin(b.send(Command::CREATE, &delete));
+        assert!(futures::poll!(&mut denied).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        let change = notification(
+            &receiver.try_recv().unwrap(),
+            first.file_id,
+            a.session,
+            OplockLevel::LEVEL_II,
+        );
+        assert!(futures::poll!(&mut denied).is_pending());
+        a.ok(Command::OPLOCK_BREAK, change.as_bytes()).await;
+        assert_eq!(response_status(&denied.await), Status::SHARING_VIOLATION);
+        assert_eq!(
+            response_status(&b.send(Command::CREATE, &delete).await),
+            Status::SHARING_VIOLATION
+        );
+        assert!(futures::poll!(&mut service).is_pending());
+        assert!(receiver.try_recv().is_err());
+        let bytes = Client::write_body(first.file_id, 0, b"new");
+        let mut writing = Box::pin(a.send(Command::WRITE, &bytes));
+        assert!(futures::poll!(&mut writing).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        assert_eq!(response_status(&writing.await), Status::SUCCESS);
+        notification(
+            &receiver.try_recv().unwrap(),
+            first.file_id,
+            a.session,
+            OplockLevel::NONE,
+        );
+        let result = a.read(first.file_id, 0, 3).await;
+        let read = read_body::<ReadResponse>(&result).unwrap();
+        assert_eq!(&result[usize::from(read.data_offset)..], b"new");
+        a.connection.cancel_all();
+        service.await.unwrap();
+        a.connection.shutdown().await.unwrap();
+        b.connection.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn batch_acknowledgment_to_exclusive_relinquishes_the_provider_grant() {
+    DefaultPool::run_with(async |driver| {
+        let server =
+            Server::new("memory", MemoryFs::new(1024, 16).with_oplocks().unwrap()).unwrap();
+        let mut a = cached_client(&server).await;
+        let mut b = cached_client(&server).await;
+        let mut body = exclusive_body(CreateDisposition::OPEN_IF, ShareAccess::ALL);
+        CreateRequest::mut_from_prefix(&mut body[..])
+            .unwrap()
+            .0
+            .requested_oplock_level = OplockLevel::BATCH;
+        let first = read_body::<CreateResponse>(&a.ok(Command::CREATE, &body).await).unwrap();
+        let (sender, receiver) = async_channel::bounded(2);
+        let mut service = std::pin::pin!(a.connection.clone().serve_caching(
+            driver,
+            sender,
+            Duration::from_secs(35)
+        ));
+        let mut opening = Box::pin(b.send(Command::CREATE, &body));
+        assert!(futures::poll!(&mut opening).is_pending());
+        assert!(futures::poll!(&mut service).is_pending());
+        let mut change = notification(
+            &receiver.try_recv().unwrap(),
+            first.file_id,
+            a.session,
+            OplockLevel::LEVEL_II,
+        );
+        change.oplock_level = OplockLevel::EXCLUSIVE;
+        let response = a.ok(Command::OPLOCK_BREAK, change.as_bytes()).await;
+        assert_eq!(
+            read_body::<OplockBreakAcknowledgement>(&response)
+                .unwrap()
+                .oplock_level,
+            OplockLevel::NONE
+        );
+        let opened = opening.await;
+        assert_eq!(response_status(&opened), Status::SUCCESS);
+        b.close(read_body::<CreateResponse>(&opened).unwrap().file_id)
+            .await;
+        a.ok(
+            Command::WRITE,
+            &Client::write_body(first.file_id, 0, b"new"),
+        )
+        .await;
+        assert!(futures::poll!(&mut service).is_pending());
+        assert!(receiver.try_recv().is_err());
+        a.connection.cancel_all();
+        service.await.unwrap();
+        a.connection.shutdown().await.unwrap();
+        b.connection.shutdown().await.unwrap();
+    });
+}

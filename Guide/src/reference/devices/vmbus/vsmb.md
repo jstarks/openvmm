@@ -46,6 +46,13 @@ enumeration, deletion and clean shutdown. An aligned uncached read and device
 transfer counters verify actual external reads and writes, rather than relying
 on client-cached readback.
 
+Native Windows cases exercise notification delivery/cancellation, shared and
+exclusive byte-range locks, waiting/cancelled locks and release on handle close.
+A server-observed pending watch must survive VM pause/resume. A cached reader
+holds verified server-granted lease rights; a write through a hard-link alias
+must revoke those rights before cached and uncached reads see the updated data.
+The break must finish before the server's forced-revocation timeout.
+
 The VM-independent [`smb` engine](https://openvmm.dev/rustdoc/linux/smb/index.html)
 is also exercised by selected Samba suites over its loopback TCP test frontend.
 Those tests complement, but do not replace, VMBus guest coverage.

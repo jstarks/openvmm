@@ -2,6 +2,9 @@
 # Licensed under the MIT License.
 
 $ErrorActionPreference = 'Stop'
+foreach ($signal in @('C:\vsmb-resume', 'C:\vsmb-cache-go', 'C:\vsmb-cache-read-go')) {
+    [System.IO.File]::Delete($signal)
+}
 
 # Activate an isolated virtual redirector instance, without changing the
 # machine's ordinary SMB client signing or authentication policy.
@@ -20,6 +23,12 @@ public static class VsmbGuest {
     struct Privilege { public uint Count; public Luid Luid; public uint Attributes; }
     [StructLayout(LayoutKind.Sequential)]
     struct IoStatus { public IntPtr Status; public UIntPtr Information; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Overlapped {
+        public UIntPtr Internal, InternalHigh;
+        public uint Offset, OffsetHigh;
+        public IntPtr Event;
+    }
 
     [DllImport("advapi32.dll", SetLastError=true)]
     static extern bool OpenProcessToken(IntPtr process, uint access, out SafeFileHandle token);
@@ -39,6 +48,25 @@ public static class VsmbGuest {
     static extern bool VirtualFree(IntPtr address, UIntPtr size, uint operation);
     [DllImport("kernel32.dll", SetLastError=true)]
     static extern bool ReadFile(SafeFileHandle handle, IntPtr buffer, uint length, out uint read, IntPtr overlapped);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern SafeWaitHandle CreateEvent(IntPtr attributes, bool manualReset, bool initialState, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint WaitForSingleObject(SafeWaitHandle handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetOverlappedResult(SafeFileHandle handle, IntPtr overlapped, out uint bytes, bool wait);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool CancelIoEx(SafeFileHandle handle, IntPtr overlapped);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool LockFileEx(SafeFileHandle handle, uint flags, uint reserved, uint low, uint high, IntPtr overlapped);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool UnlockFileEx(SafeFileHandle handle, uint reserved, uint low, uint high, IntPtr overlapped);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool ReadDirectoryChangesW(SafeFileHandle handle, IntPtr buffer, uint length,
+        bool subtree, uint filter, IntPtr returned, IntPtr overlapped, IntPtr completion);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetFilePointerEx(SafeFileHandle handle, long distance, out long position, uint method);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool CreateHardLink(string name, string existing, IntPtr security);
     [DllImport("ntdll.dll")]
     static extern uint NtFsControlFile(SafeFileHandle handle, IntPtr evt, IntPtr apc,
         IntPtr context, out IoStatus status, uint code, byte[] input, uint length,
@@ -125,12 +153,242 @@ public static class VsmbGuest {
             }
         }
     }
+
+        sealed class Pending : IDisposable {
+            public readonly IntPtr Ov, Buffer;
+            readonly SafeFileHandle file;
+            readonly SafeWaitHandle evt;
+            bool active;
+
+            public Pending(SafeFileHandle file, uint offset) {
+                this.file = file;
+                evt = CreateEvent(IntPtr.Zero, true, false, null);
+                if (evt.IsInvalid) throw new Win32Exception();
+                Ov = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Overlapped)));
+                Buffer = Marshal.AllocHGlobal(4096);
+                Marshal.StructureToPtr(new Overlapped {
+                    Offset = offset, Event = evt.DangerousGetHandle()
+                }, Ov, false);
+            }
+
+            public void Lock(uint flags, bool mustPend) {
+                bool result = LockFileEx(file, flags, 0, 16, 0, Ov);
+                int error = result ? 0 : Marshal.GetLastWin32Error();
+                if (error != 0 && error != 997) throw new Win32Exception(error);
+                active = !result;
+                if (mustPend && !active) throw new Exception("Conflicting lock did not pend");
+                if (!mustPend && active) Complete(0);
+            }
+
+            public void Notify() {
+                if (!ReadDirectoryChangesW(file, Buffer, 4096, false, 1,
+                    IntPtr.Zero, Ov, IntPtr.Zero)) throw new Win32Exception();
+                active = true;
+                uint bytes;
+                if (GetOverlappedResult(file, Ov, out bytes, false))
+                    throw new Exception("Watch completed without a change");
+                int error = Marshal.GetLastWin32Error();
+                if (error != 996) throw new Win32Exception(error);
+            }
+
+            public void Cancel() {
+                if (!CancelIoEx(file, Ov)) throw new Win32Exception();
+            }
+
+            public void ClosePending() {
+                file.Dispose();
+                if (WaitForSingleObject(evt, 5000) != 0)
+                    Environment.FailFast("Closing handle did not drain its notification");
+                active = false;
+                uint status = unchecked((uint)Marshal.ReadIntPtr(Ov).ToInt64());
+                if (status != 0xc0000120 && status != 0x10b)
+                    throw new Exception("Unexpected close notification status: 0x" + status.ToString("X8"));
+            }
+
+            public uint Complete(int expectedError) {
+                if (WaitForSingleObject(evt, 5000) != 0) {
+                    CancelIoEx(file, Ov);
+                    if (WaitForSingleObject(evt, 5000) != 0)
+                        Environment.FailFast("vSMB operation failed to drain after timeout");
+                    active = false;
+                    throw new TimeoutException("vSMB pending operation timed out");
+                }
+                uint bytes;
+                bool result = GetOverlappedResult(file, Ov, out bytes, false);
+                int error = result ? 0 : Marshal.GetLastWin32Error();
+                active = false;
+                if (error != expectedError)
+                    throw new Exception("Completion error " + error + ", expected " + expectedError);
+                return bytes;
+            }
+
+            public void Unlock() {
+                if (!UnlockFileEx(file, 0, 16, 0, Ov)) throw new Win32Exception();
+            }
+
+            public void Dispose() {
+                if (active) {
+                    CancelIoEx(file, Ov);
+                    if (WaitForSingleObject(evt, 5000) != 0)
+                        Environment.FailFast("vSMB operation still owns its buffers");
+                }
+                Marshal.FreeHGlobal(Buffer);
+                Marshal.FreeHGlobal(Ov);
+                evt.Dispose();
+            }
+        }
+
+        static SafeFileHandle OpenAsync(string path, bool directory) {
+            var file = CreateFile(path, directory ? 1u : 0xc0000000u, 7,
+                IntPtr.Zero, 3, directory ? 0x42000000u : 0x40000080u, IntPtr.Zero);
+            if (file.IsInvalid) throw new Win32Exception();
+            return file;
+        }
+
+        public static void TestLocks(string path) {
+            System.IO.File.WriteAllBytes(path, new byte[4096]);
+            using (var first = OpenAsync(path, false))
+            using (var second = OpenAsync(path, false)) {
+                using (var shared1 = new Pending(first, 64))
+                using (var shared2 = new Pending(second, 64)) {
+                    shared1.Lock(0, false);
+                    shared2.Lock(0, false);
+                    shared2.Unlock();
+                    shared1.Unlock();
+                }
+                using (var owner = new Pending(first, 64)) {
+                    owner.Lock(2, false);
+                    using (var conflict = new Pending(second, 64)) {
+                        try {
+                            conflict.Lock(3, false);
+                            throw new Exception("Exclusive conflict succeeded");
+                        } catch (Win32Exception error) {
+                            if (error.NativeErrorCode != 33) throw;
+                        }
+                    }
+                    using (var cancelled = new Pending(second, 64)) {
+                        cancelled.Lock(2, true);
+                        cancelled.Cancel();
+                        cancelled.Complete(995);
+                    }
+                    using (var waiter = new Pending(second, 64)) {
+                        waiter.Lock(2, true);
+                        owner.Unlock();
+                        waiter.Complete(0);
+                        waiter.Unlock();
+                    }
+                    owner.Lock(2, false);
+                    using (var waiter = new Pending(second, 64)) {
+                        waiter.Lock(2, true);
+                        first.Dispose();
+                        waiter.Complete(0);
+                        waiter.Unlock();
+                    }
+                }
+            }
+            System.IO.File.Delete(path);
+        }
+
+        public static void TestNotifications(string directory) {
+            using (var closing = OpenAsync(directory, true))
+            using (var watch = new Pending(closing, 0)) {
+                watch.Notify();
+                watch.ClosePending();
+            }
+            using (var handle = OpenAsync(directory, true)) {
+                using (var cancelled = new Pending(handle, 0)) {
+                    cancelled.Notify();
+                    cancelled.Cancel();
+                    cancelled.Complete(995);
+                }
+                using (var watch = new Pending(handle, 0)) {
+                    watch.Notify();
+                    string path = System.IO.Path.Combine(directory, "notified.bin");
+                    System.IO.File.WriteAllBytes(path, new byte[1]);
+                    uint bytes = watch.Complete(0);
+                    int length = Marshal.ReadInt32(watch.Buffer, 8);
+                    if (bytes < 12 || Marshal.ReadInt32(watch.Buffer, 4) != 1 ||
+                        length != "notified.bin".Length * 2 ||
+                        Marshal.PtrToStringUni(IntPtr.Add(watch.Buffer, 12), length / 2) != "notified.bin")
+                        throw new Exception("Wrong directory notification");
+                    System.IO.File.Delete(path);
+                }
+            }
+
+        }
+
+            public static void TestPausedNotification(string directory) {
+                using (var handle = OpenAsync(directory, true))
+                using (var watch = new Pending(handle, 0)) {
+                    watch.Notify();
+                    var deadline = Stopwatch.StartNew();
+                    while (!System.IO.File.Exists(@"C:\vsmb-resume")) {
+                        if (deadline.ElapsedMilliseconds > 20000)
+                            throw new TimeoutException("Host did not resume notification test");
+                        System.Threading.Thread.Sleep(10);
+                    }
+                    string path = System.IO.Path.Combine(directory, "resumed.bin");
+                    System.IO.File.WriteAllBytes(path, new byte[1]);
+                    watch.Complete(0);
+                    System.IO.File.Delete(path);
+                }
+            }
+
+            public static void TestCaching(string path) {
+                System.IO.File.WriteAllBytes(path, new byte[4096]);
+                string alias = path + ".alias";
+                if (!CreateHardLink(alias, path, IntPtr.Zero)) throw new Win32Exception();
+                using (var first = CreateFile(path, 0x80000000, 7, IntPtr.Zero, 3, 0x80, IntPtr.Zero)) {
+                    if (first.IsInvalid) throw new Win32Exception();
+                    using (var buffer = new Pending(first, 0)) {
+                    uint read;
+                    if (!ReadFile(first, buffer.Buffer, 4096, out read, IntPtr.Zero))
+                        throw new Win32Exception();
+                    if (read != 4096 || Marshal.ReadByte(buffer.Buffer) != 0)
+                        throw new Exception("Wrong initial cached data");
+                    System.IO.File.WriteAllText(@"C:\vsmb-cache-ready", "ready");
+                    var deadline = Stopwatch.StartNew();
+                    while (!System.IO.File.Exists(@"C:\vsmb-cache-go")) {
+                        if (deadline.ElapsedMilliseconds > 20000)
+                            throw new TimeoutException("Host did not inspect caching grant");
+                        System.Threading.Thread.Sleep(10);
+                    }
+                    using (var stream = new System.IO.FileStream(alias,
+                        System.IO.FileMode.Open, System.IO.FileAccess.Write,
+                        System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
+                        stream.WriteByte(0x5a);
+                        stream.Flush(true);
+                    }
+                    System.IO.File.WriteAllText(@"C:\vsmb-cache-ready", "written");
+                    deadline.Restart();
+                    while (!System.IO.File.Exists(@"C:\vsmb-cache-read-go")) {
+                        if (deadline.ElapsedMilliseconds > 20000)
+                            throw new TimeoutException("Host did not inspect caching break");
+                        System.Threading.Thread.Sleep(10);
+                    }
+                    long position;
+                    if (!SetFilePointerEx(first, 0, out position, 0) ||
+                        !ReadFile(first, buffer.Buffer, 4096, out read, IntPtr.Zero))
+                        throw new Win32Exception();
+                    if (read != 4096 || Marshal.ReadByte(buffer.Buffer) != 0x5a)
+                        throw new Exception("Stale cached data after alias write");
+                    }
+                }
+                if (ReadUncached(path, 4096)[0] != 0x5a)
+                    throw new Exception("Stale data after caching break");
+                System.IO.File.Delete(alias);
+                System.IO.File.Delete(path);
+            }
 }
 '@
 
 [VsmbGuest]::Activate()
 $directory = 'V:\guest-test'
 [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+[VsmbGuest]::TestPausedNotification($directory)
+[VsmbGuest]::TestNotifications($directory)
+[VsmbGuest]::TestLocks((Join-Path $directory 'locked.bin'))
+[VsmbGuest]::TestCaching((Join-Path $directory 'cached.bin'))
 $source = Join-Path $directory 'source.bin'
 $target = Join-Path $directory 'renamed.bin'
 $bytes = New-Object byte[] 131077

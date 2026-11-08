@@ -85,10 +85,29 @@ async fn vsmb_memory_file_operations(
             timer.sleep(std::time::Duration::from_millis(25)).await;
         }
         anyhow::ensure!(lock_ready, "guest did not reach pending-lock checkpoint");
-        let requests = vm.inspect_vmm(path).await?.to_string();
+        let inspect::Node::Dir(requests) = vm.inspect_vmm(path).await? else {
+            anyhow::bail!("request table is not inspectable");
+        };
+        let lock = requests
+            .iter()
+            .find(|entry| match &entry.node {
+                inspect::Node::Dir(fields) => fields
+                    .iter()
+                    .any(|field| field.name == "command" && field.node.to_string() == "\"LOCK\""),
+                _ => false,
+            })
+            .ok_or_else(|| anyhow::anyhow!("lock wait was not observed on the server"))?;
+        let lock_path = format!("{path}/{}", lock.name);
+        let waiting = lock.node.to_string();
+        vm.backend().pause().await?;
         anyhow::ensure!(
-            requests.contains("command: \"LOCK\""),
-            "lock wait was not observed on the server: {requests}"
+            vm.inspect_vmm(&lock_path).await?.to_string() == waiting,
+            "pause discarded or changed the pending lock"
+        );
+        vm.backend().resume().await?;
+        anyhow::ensure!(
+            vm.inspect_vmm(&lock_path).await?.to_string() == waiting,
+            "resume completed or changed the lock before unlock"
         );
         agent
             .write_file("C:\\vsmb-lock-go", b"go".as_slice())

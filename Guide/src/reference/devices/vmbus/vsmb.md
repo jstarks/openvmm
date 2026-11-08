@@ -54,8 +54,8 @@ Native Windows cases exercise notification delivery/cancellation, shared and
 exclusive byte-range locks, waiting/cancelled locks and release on handle close.
 Locking opens use hard-link aliases, and a waiting LOCK must be observed in the
 server request table rather than inferred from Windows-local lock caching.
-A server-observed pending watch must survive VM pause/resume. A cached reader
-holds verified server-granted lease rights; a write through a hard-link alias
+A server-observed pending watch and waiting LOCK must survive VM pause/resume.
+A cached reader holds verified server-granted lease rights; a write through a hard-link alias
 must revoke those rights before cached and uncached reads see the updated data.
 The break must finish before the server's forced-revocation timeout.
 

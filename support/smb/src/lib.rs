@@ -5,9 +5,9 @@
 //!
 //! This initial implementation supports unsigned guest sessions for local
 //! testing, including bounded related/unrelated compound requests with retained
-//! operation ownership. It is not a network authentication service. Leases,
-//! security descriptor updates and host filesystem
-//! providers are not yet implemented.
+//! operation ownership and provider-backed caching and filesystem semantics.
+//! Transport-owned external data does not introduce VM dependencies.
+//! This is not a network authentication service; native providers are separate.
 
 #![forbid(unsafe_code)]
 
@@ -20,11 +20,13 @@ pub use compound::Request;
 pub mod memory;
 pub mod provider;
 mod quota;
+pub mod runtime;
 pub mod security;
 pub mod spec;
 pub mod tcp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod transfer;
 
 use caching::OpenCaching;
 use codec::*;
@@ -53,8 +55,8 @@ pub enum Error {
     /// Transport failures retain the underlying OS diagnostic.
     #[error("SMB transport failed")]
     Io(#[from] std::io::Error),
-    /// A Direct TCP frame is not within the supported size bounds.
-    #[error("invalid Direct TCP frame length or type")]
+    /// A length-prefixed SMB frame is not within the supported size bounds.
+    #[error("invalid SMB frame length or type")]
     InvalidFrame,
     /// Two outstanding requests used the same client message ID.
     #[error("duplicate SMB message ID {0}")]
@@ -102,6 +104,15 @@ pub struct Server<B: FileSystem> {
 }
 
 impl<B: FileSystem> Server<B> {
+    /// Connect a transport with independently owned external READ/WRITE buffers.
+    pub fn connect_with_external_data(
+        self: &Arc<Self>,
+        external_data: Arc<dyn transfer::ExternalData>,
+    ) -> Connection<B> {
+        let mut connection = self.connect();
+        connection.external_data = Some(external_data);
+        connection
+    }
     /// Configure an unsigned guest-access share.
     pub fn new(name: impl Into<String>, backend: B) -> Result<Arc<Self>, Status> {
         let name = name.into();
@@ -149,6 +160,7 @@ impl<B: FileSystem> Server<B> {
             state,
             caching_changed: self.caching_changed.clone(),
             caching_stop: RequestContext::new(self.next_request.fetch_add(1, Ordering::Relaxed)),
+            external_data: None,
         }
     }
 }
@@ -189,6 +201,7 @@ struct Activity {
 
 /// Protocol state for one connection. Dropping it closes all provider opens.
 pub struct Connection<B: FileSystem> {
+    external_data: Option<Arc<dyn transfer::ExternalData>>,
     caching_stop: RequestContext,
     server: Arc<Server<B>>,
     state: Arc<Mutex<ConnectionState<B::File>>>,
@@ -367,6 +380,7 @@ impl<F> ConnectionState<F> {
 impl<B: FileSystem> Clone for Connection<B> {
     fn clone(&self) -> Self {
         Self {
+            external_data: self.external_data.clone(),
             server: self.server.clone(),
             state: self.state.clone(),
             caching_changed: self.caching_changed.clone(),
@@ -2788,7 +2802,6 @@ impl<B: FileSystem> Connection<B> {
     ) -> Result<Vec<u8>, Status> {
         let request: ReadRequest = read_body(packet)?;
         if request.length.get() as usize > MAX_TRANSFER_SIZE
-            || Channel(request.channel.get()) != Channel::NONE
             || request.offset.get() > i64::MAX as u64 - u64::from(request.length.get())
         {
             return Err(Status::INVALID_PARAMETER);
@@ -2798,6 +2811,26 @@ impl<B: FileSystem> Connection<B> {
         if !file.access.read_data() && !file.access.execute() {
             return Err(Status::ACCESS_DENIED);
         }
+        let external = if Channel(request.channel.get()) != Channel::NONE {
+            let transfer = self
+                .external_data
+                .as_ref()
+                .ok_or(Status::INVALID_PARAMETER)?;
+            let descriptor = variable::<ReadRequest>(
+                packet,
+                request.channel_info_offset.get() as usize,
+                request.channel_info_length.get() as usize,
+            )?;
+            transfer.validate(
+                request.channel.get(),
+                descriptor,
+                request.length.get() as usize,
+                transfer::Direction::Write,
+            )?;
+            Some((transfer, descriptor))
+        } else {
+            None
+        };
         let bytes = if request.length.get() == 0 {
             Vec::new()
         } else {
@@ -2816,6 +2849,24 @@ impl<B: FileSystem> Connection<B> {
         }
         if bytes.len() < request.minimum_count.get() as usize {
             return Err(Status::END_OF_FILE);
+        }
+        if bytes.len() > request.length.get() as usize {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        if let Some((transfer, descriptor)) = external {
+            transfer
+                .write(request.channel.get(), descriptor, &bytes)
+                .await?;
+            return Ok(ReadResponse {
+                structure_size: ReadResponse::STRUCTURE_SIZE.into(),
+                data_offset: 0,
+                reserved: 0,
+                data_length: 0.into(),
+                data_remaining: (bytes.len() as u32).into(),
+                reserved2: 0.into(),
+            }
+            .as_bytes()
+            .to_vec());
         }
         let mut out = ReadResponse {
             structure_size: ReadResponse::STRUCTURE_SIZE.into(),
@@ -2838,21 +2889,49 @@ impl<B: FileSystem> Connection<B> {
         context: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
         let request: WriteRequest = read_body(packet)?;
-        if request.length.get() as usize > MAX_TRANSFER_SIZE
-            || Channel(request.channel.get()) != Channel::NONE
-            || request.offset.get() > i64::MAX as u64 - u64::from(request.length.get())
+        let external = Channel(request.channel.get()) != Channel::NONE;
+        let length = if external {
+            request.remaining_bytes.get()
+        } else {
+            request.length.get()
+        };
+        if length as usize > MAX_TRANSFER_SIZE
+            || (external && (request.length.get() != 0 || request.data_offset.get() != 0))
+            || request.offset.get() > i64::MAX as u64 - u64::from(length)
         {
             return Err(Status::INVALID_PARAMETER);
         }
-        let bytes = variable::<WriteRequest>(
-            packet,
-            request.data_offset.get() as usize,
-            request.length.get() as usize,
-        )?;
         let file = self.file(request.file_id, tree, context)?;
         if !file.access.write_data() {
             return Err(Status::ACCESS_DENIED);
         }
+        let owned;
+        let bytes = if external {
+            let transfer = self
+                .external_data
+                .as_ref()
+                .ok_or(Status::INVALID_PARAMETER)?;
+            let descriptor = variable::<WriteRequest>(
+                packet,
+                request.channel_info_offset.get() as usize,
+                request.channel_info_length.get() as usize,
+            )?;
+            transfer.validate(
+                request.channel.get(),
+                descriptor,
+                length as usize,
+                transfer::Direction::Read,
+            )?;
+            owned = transfer
+                .read(request.channel.get(), descriptor, length as usize)
+                .await?;
+            if owned.len() != length as usize {
+                return Err(Status::INTERNAL_ERROR);
+            }
+            owned.as_slice()
+        } else {
+            variable::<WriteRequest>(packet, request.data_offset.get() as usize, length as usize)?
+        };
         let written = self
             .server
             .backend

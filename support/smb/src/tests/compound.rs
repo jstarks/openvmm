@@ -2,6 +2,28 @@
 // Licensed under the MIT License.
 
 use super::*;
+
+#[test]
+fn external_write_credit_charge_uses_actual_transfer_length() {
+    let mut write = WriteRequest::new_zeroed();
+    write.structure_size = WriteRequest::STRUCTURE_SIZE.into();
+    write.channel = 2.into();
+    write.remaining_bytes = 65537.into();
+    let mut header = Header::new_zeroed();
+    header.command = Command::WRITE.0.into();
+    header.credit_charge = 1.into();
+    let packet = [header.as_bytes(), write.as_bytes()].concat();
+    assert_eq!(
+        crate::compound::charge(&packet, &header),
+        Err(Status::INVALID_PARAMETER)
+    );
+    header.credit_charge = 2.into();
+    assert_eq!(crate::compound::charge(&packet, &header), Ok(2));
+    write.remaining_bytes = 65536.into();
+    header.credit_charge = 1.into();
+    let packet = [header.as_bytes(), write.as_bytes()].concat();
+    assert_eq!(crate::compound::charge(&packet, &header), Ok(1));
+}
 use test_with_tracing::test;
 
 #[test]

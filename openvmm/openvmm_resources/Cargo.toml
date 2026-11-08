@@ -94,6 +94,7 @@ netvsp.workspace = true
 storvsp.workspace = true
 uidevices.workspace = true
 vmbfs.workspace = true
+vsmb.workspace = true
 vmbus_serial_host.workspace = true
 
 # Workers

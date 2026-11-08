@@ -1855,6 +1855,19 @@ async fn vm_config_from_command_line(
         ));
     }
 
+    if let Some(share_name) = &opt.vsmb_memory {
+        if !with_hv {
+            anyhow::bail!("--vsmb-memory requires Hyper-V enlightenments and VMBus");
+        }
+        vmbus_devices.push((
+            DeviceVtl::Vtl0,
+            vsmb_resources::VsmbMemoryDeviceHandle {
+                share_name: share_name.clone(),
+            }
+            .into_resource(),
+        ));
+    }
+
     let mut virtio_devices = Vec::new();
     let mut add_virtio_device =
         |bus, resource: Resource<VirtioDeviceHandle>, pcie_devices: &mut Vec<_>| match bus {

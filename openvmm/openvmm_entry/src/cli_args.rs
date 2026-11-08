@@ -1187,6 +1187,10 @@ flags:
     #[clap(long)]
     pub imc: Option<PathBuf>,
 
+    /// expose a volatile writable in-memory vSMB share (16 MiB, 4096 objects)
+    #[clap(long, value_name = "SHARE", conflicts_with = "no_vmbus")]
+    pub vsmb_memory: Option<String>,
+
     /// expose a battery device
     #[clap(long)]
     pub battery: bool,

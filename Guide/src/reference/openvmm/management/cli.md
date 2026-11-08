@@ -69,7 +69,12 @@ describes the source definitions.
 * `--no-vmbus`: Disables the VMBus server and all VMBus devices, even when
   `--hv` or `--uefi` is active. The guest boots using only standard PCIe
   devices and virtio transports. Incompatible with `--disk`, `--pcat`,
-  `--vtl2`, and VMBus serial options.
+  `--vtl2`, `--vsmb-memory`, and VMBus serial options.
+* `--vsmb-memory <SHARE>`: Expose one volatile writable in-memory vSMB share
+  with a 16 MiB storage quota and a 4096-object limit. Requires Hyper-V
+  enlightenments and VMBus; incompatible with `--no-vmbus`. Guest redirector
+  activation is separate from offering the device. Save/restore and host
+  filesystem exports are not supported. See [vSMB](../../devices/vmbus/vsmb.md).
 * `--hypervisor <SPEC>`: Select a specific hypervisor backend, optionally with
   backend-specific parameters. The format is `name` or `name:key=val,key,...`.
   Available backends: `whp` (Windows), `kvm` (Linux), `mshv` (Linux,

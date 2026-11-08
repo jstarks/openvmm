@@ -74,6 +74,8 @@ mod vmbus_relay;
 mod vmdk;
 /// Tests involving VMGS functionality
 mod vmgs;
+/// Windows Server 2025 operations over the synthetic vSMB share.
+mod vsmb;
 
 /// Boot through the UEFI firmware, it will shut itself down after booting.
 #[vmm_test_with(

@@ -12,7 +12,7 @@ service. The example binds only to loopback.
 ## Compatibility Checklist
 
 This is the current SMB 2.1, writable MemoryFs test profile, not a claim of
-Windows guest compatibility. "Implemented" means the listed behavior has direct
+complete Windows guest compatibility. "Implemented" means the listed behavior has direct
 tests; selected Samba cases provide additional independent evidence, not proof
 that an entire suite passes. Provider-optional features must be rejected honestly
 when unavailable. Their absence does not establish that a future vSMB guest
@@ -32,7 +32,7 @@ will not need them.
 | EAs and named streams | Retained EAs and real named-stream storage, enumeration, rename and lifetime | Both advertised; thirteen selected naming/directory/I/O/sharing/deletion/rename/attribute/permission/disposition stream cases pass |
 | Caching and IOCTLs | Uncached default, opt-in oplocks/SMB 2.1 leases and provider-backed controls | Real grants, shared lifetime, routed breaks/ACKs and lock-aware admission have direct tests plus selected Samba classic, lease request/break/no-self-break, upgrades, locks, sharing failures, mixed caching and pending-break cases; lease-v2 and directory leasing remain unsupported |
 | Naming | Share-relative namespace and canonical paths | Dot components/aliases resolve within the virtual root; Unicode BMP simple uppercase is shared by lookup, streams and wildcard matching |
-| Transport integration | Exercise the shared engine without VM dependencies | Loopback TCP only; VMBus, guest tests and host-backed providers remain deferred |
+| Transport integration | Exercise the shared engine without VM dependencies | Shared runtime serves loopback TCP and the separate `vsmb` VMBus device; Server 2025 file operations and copied external I/O tested; native providers remain deferred |
 
 Compatibility work proceeds by selecting applicable Samba cases, checking any
 mismatch against public specifications, and adding small deterministic Rust
@@ -293,6 +293,27 @@ cargo run -p smb --example smb_server -- 127.0.0.1:1445
 
 The share is named `memory`; all file data disappears when the process exits.
 It has a 16 MiB data quota and a 4096-object limit.
+
+## VMBus Integration
+
+The separate `vsmb` device exposes one volatile MemoryFs share through
+OpenVMM's `--vsmb-memory <SHARE>` option. The common `runtime::ConnectionTask`
+owns admission, pending operations, responses, caching and disconnect cleanup;
+`tcp::ConnectionTask` remains a compatibility re-export. The device owns VMBus
+negotiation, guest-memory access and VM lifecycle. `transfer::ExternalData`
+validates transport-owned descriptors and copies data into owned buffers without
+adding guest addresses or VM types to the core API.
+
+The initial target is Windows Server 2025 with vSMB transport version 1 and
+negotiated v2 page descriptors. A real guest test verifies create, ordinary
+read/write, uncached external read, rename, enumeration, deletion and clean
+teardown. The stock image needs explicit virtual-redirector activation and
+transport binding; offering the device alone does not map a drive.
+
+This is not a complete vSMB implementation. Registered-buffer/older transfer
+profiles, boot-file service, serialized save/restore, multiple-share management
+and native filesystem providers are separate work. See the
+[vSMB Guide](../../Guide/src/reference/devices/vmbus/vsmb.md) for usage and tests.
 
 ## Tests
 

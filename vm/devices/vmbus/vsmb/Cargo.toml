@@ -1,0 +1,32 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "vsmb"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vsmb_resources.workspace = true
+smb.workspace = true
+guestmem.workspace = true
+vmbus_async.workspace = true
+vmbus_channel.workspace = true
+vmbus_core.workspace = true
+vmcore.workspace = true
+vm_resource.workspace = true
+guid.workspace = true
+inspect.workspace = true
+task_control.workspace = true
+pal_async.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tracelimit.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
+vmbus_channel = { workspace = true, features = ["test_helpers"] }
+
+[lints]
+workspace = true

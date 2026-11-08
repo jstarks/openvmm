@@ -66,8 +66,6 @@ members = [
   "opentmk/opentmk_executor",
   # support crates consumed by closed-source only
   "support/debug_output_tracing",
-  # Standalone SMB core, until consumed by a device wrapper.
-  "support/smb",
   # TDISP
   # Temporary: remove once a workspace member depends on this crate.
   "vm/devices/tdisp_lstoraccel",
@@ -194,6 +192,7 @@ sev_guest_device_tio = { path = "support/sev_guest_device/sev_guest_device_tio" 
 sparse_mmap = { path = "support/sparse_mmap" }
 string_page_buf = { path = "support/string_page_buf" }
 task_control = { path = "support/task_control" }
+smb = { path = "support/smb" }
 tdx_guest_device = { path = "support/tdx_guest_device" }
 term = { path = "support/term" }
 test_with_tracing = { path = "support/test_with_tracing" }
@@ -415,6 +414,8 @@ virtio_vsock = { path = "vm/devices/virtio/virtio_vsock" }
 virtiofs = { path = "vm/devices/virtio/virtiofs" }
 vmbfs = { path = "vm/devices/vmbus/vmbfs" }
 vmbfs_resources = { path = "vm/devices/vmbus/vmbfs_resources" }
+vsmb = { path = "vm/devices/vmbus/vsmb" }
+vsmb_resources = { path = "vm/devices/vmbus/vsmb_resources" }
 vmbus_async = { path = "vm/devices/vmbus/vmbus_async" }
 vmbus_channel = { path = "vm/devices/vmbus/vmbus_channel" }
 vmbus_client = { path = "vm/devices/vmbus/vmbus_client" }

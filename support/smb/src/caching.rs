@@ -9,7 +9,7 @@ use crate::provider::{
 };
 use futures::FutureExt;
 use pal_async::{
-    DefaultDriver,
+    driver::Driver,
     timer::{Instant, PolledTimer},
 };
 use std::time::Duration;
@@ -311,9 +311,9 @@ impl<B: FileSystem> Connection<B> {
         Err(Status::INTERNAL_ERROR)
     }
 
-    pub(crate) async fn serve_caching(
+    pub(crate) async fn serve_caching<D: Driver + Clone + Send + 'static>(
         self,
-        driver: DefaultDriver,
+        driver: D,
         sender: async_channel::Sender<Vec<u8>>,
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -379,11 +379,11 @@ impl<B: FileSystem> Connection<B> {
     }
 }
 
-async fn watch<F: Send + Sync>(
+async fn watch<F: Send + Sync, D: Driver>(
     file: Arc<OpenFile<F>>,
     file_id: FileId,
     session: u64,
-    driver: DefaultDriver,
+    driver: D,
     sender: async_channel::Sender<Vec<u8>>,
     timeout: Duration,
     connection_stop: RequestContext,
@@ -507,9 +507,9 @@ impl Drop for WatchClaim {
     }
 }
 
-async fn watch_lease(
+async fn watch_lease<D: Driver>(
     caching: &Arc<OpenCaching>,
-    driver: DefaultDriver,
+    driver: D,
     sender: async_channel::Sender<Vec<u8>>,
     timeout: Duration,
     connection_stop: RequestContext,

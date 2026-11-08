@@ -55,7 +55,14 @@ pub(super) fn ranges(packet: &[u8]) -> Result<Vec<Range<usize>>, Error> {
 pub(super) fn charge(packet: &[u8], header: &Header) -> Result<u32, Status> {
     let payload = match header.command() {
         Command::READ => read_body::<ReadRequest>(packet)?.length.get(),
-        Command::WRITE => read_body::<WriteRequest>(packet)?.length.get(),
+        Command::WRITE => {
+            let request = read_body::<WriteRequest>(packet)?;
+            if Channel(request.channel.get()) == Channel::NONE {
+                request.length.get()
+            } else {
+                request.remaining_bytes.get()
+            }
+        }
         Command::QUERY_DIRECTORY => read_body::<QueryDirectoryRequest>(packet)?
             .output_buffer_length
             .get(),

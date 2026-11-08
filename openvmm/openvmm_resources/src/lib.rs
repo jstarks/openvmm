@@ -128,6 +128,7 @@ vm_resource::register_static_resolvers! {
     storvsp::resolver::StorvspIdeResolver,
     uidevices::resolver::VmbusUiResolver,
     vmbfs::resolver::VmbfsResolver,
+    vsmb::resolver::VsmbResolver,
     vmbus_serial_host::resolver::VmbusSerialDeviceResolver,
 }
 

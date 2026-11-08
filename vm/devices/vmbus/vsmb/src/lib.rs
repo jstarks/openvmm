@@ -128,8 +128,10 @@ impl SimpleVmbusDevice for VsmbDevice {
     async fn close(&mut self) {
         if let Some(channel) = &mut self.channel {
             if let Err(error) = channel.shutdown().await {
-                tracelimit::warn_ratelimited!(?error, "vSMB cleanup failed");
-                return;
+                tracelimit::warn_ratelimited!(?error, "vSMB shutdown reported an error");
+                if !channel.cleanup_succeeded() {
+                    return;
+                }
             }
         }
         self.channel = None;

@@ -25,8 +25,10 @@ tracelimit.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]
+inspect = { workspace = true, features = ["initiate"] }
 test_with_tracing.workspace = true
 vmbus_channel = { workspace = true, features = ["test_helpers"] }
+vmbus_ring.workspace = true
 
 [lints]
 workspace = true

@@ -46,6 +46,7 @@ pub struct ConnectionTask<B: FileSystem, S> {
     failure: Option<Error>,
     cleanup: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>>,
     cleanup_complete: bool,
+    cleanup_succeeded: bool,
     result: Option<Result<(), Error>>,
 }
 
@@ -69,6 +70,7 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
             failure: None,
             cleanup: None,
             cleanup_complete: false,
+            cleanup_succeeded: false,
             result: None,
         }
     }
@@ -102,6 +104,12 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
     /// The retained byte transport, available for transport-specific inspection.
     pub fn transport(&self) -> &S {
         &self.stream
+    }
+
+    /// Whether provider cleanup completed successfully, independent of an
+    /// earlier protocol or transport failure returned by shutdown.
+    pub fn cleanup_succeeded(&self) -> bool {
+        self.cleanup_succeeded
     }
 
     /// Poll retained operations and stream progress without transferring ownership.
@@ -184,6 +192,7 @@ impl<B: FileSystem, S> ConnectionTask<B, S> {
         } else {
             self.connection.shutdown().await?;
         }
+        self.cleanup_succeeded = true;
         match error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -345,6 +354,7 @@ impl<B: FileSystem, S: AsyncRead + AsyncWrite + Unpin> ConnectionTask<B, S> {
                     Poll::Ready(result) => {
                         self.cleanup = None;
                         self.cleanup_complete = true;
+                        self.cleanup_succeeded = result.is_ok();
                         if let Err(error) = result {
                             self.disconnect(Some(error));
                         }
@@ -382,6 +392,7 @@ impl<B: FileSystem, S> Inspect for ConnectionTask<B, S> {
             .field("receive_body_bytes", self.packet_len)
             .field("receive_body_length", self.packet.len())
             .field("active_requests", self.requests.len())
+            .field("cleanup_succeeded", self.cleanup_succeeded)
             .field("caching_service", self.caching.is_some())
             .field("queued_responses", self.responses.len())
             .field(

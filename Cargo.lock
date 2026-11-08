@@ -11937,6 +11937,7 @@ dependencies = [
  "vmbus_async",
  "vmbus_channel",
  "vmbus_core",
+ "vmbus_ring",
  "vmcore",
  "vsmb_resources",
  "zerocopy",

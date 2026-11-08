@@ -2547,3 +2547,35 @@ fn shutdown_closes_other_opens_and_retains_failed_close_for_retry() {
         assert_eq!(inspect_text("backend/opens", &fs).await, "0");
     });
 }
+
+#[test]
+fn runtime_shutdown_reports_incomplete_provider_cleanup_until_retry_succeeds() {
+    block_on(async {
+        let (fs, control) = controlled(false);
+        let server = Server::new("memory", fs.clone()).unwrap();
+        let mut client = Client::new(&server).await;
+        client.open("first", 2, 0).await;
+        control
+            .plan_next(
+                Operation::Close,
+                Plan {
+                    failure: Some(Status::ACCESS_DENIED),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        let mut task = crate::runtime::ConnectionTask::new(
+            client.connection.clone(),
+            futures::io::Cursor::new(Vec::<u8>::new()),
+        );
+        assert!(matches!(
+            task.shutdown().await,
+            Err(Error::Backend(Status::ACCESS_DENIED))
+        ));
+        assert!(!task.cleanup_succeeded());
+        assert_eq!(inspect_text("backend/opens", &fs).await, "1");
+        task.shutdown().await.unwrap();
+        assert!(task.cleanup_succeeded());
+        assert_eq!(inspect_text("backend/opens", &fs).await, "0");
+    });
+}

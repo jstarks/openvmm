@@ -11,6 +11,8 @@ use smb::{
 use task_control::TaskControl;
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
+mod reconnect;
+
 fn frame(command: Command, message: u64, session: u64, tree: u32, body: &[u8]) -> Vec<u8> {
     let mut header = Header::new_zeroed();
     header.protocol = SIGNATURE;
@@ -53,65 +55,9 @@ async fn connected_channel_negotiates_and_services_real_smb(driver: DefaultDrive
     let mut task = TaskControl::new(channel);
     task.insert(&driver, "vsmb-test", ());
     task.start();
-    guest
-        .write_all(&[1, 0, 0, 8, 1, 0, 0, 0, 255, 255, 255, 255])
-        .await
-        .unwrap();
-    let mut reply = [0; 12];
-    guest.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply, [1, 0, 0, 8, 1, 0, 0, 0, 1, 0, 0, 0]);
-    let mut negotiate = NegotiateRequest::new_zeroed();
-    negotiate.structure_size = NegotiateRequest::STRUCTURE_SIZE.into();
-    negotiate.dialect_count = 1.into();
-    let mut body = negotiate.as_bytes().to_vec();
-    body.extend_from_slice(&0x0210u16.to_le_bytes());
-    guest
-        .write_all(&frame(Command::NEGOTIATE, 0, 0, 0, &body))
-        .await
-        .unwrap();
-    let response = receive(&mut guest).await;
-    assert_eq!(
-        Header::read_from_prefix(&response).unwrap().0.status.get(),
-        0
-    );
-    let negotiate = NegotiateResponse::read_from_prefix(&response[64..])
-        .unwrap()
-        .0;
-    assert_eq!(negotiate.dialect.get(), 0x0210);
-    assert!(negotiate.capabilities.leasing());
-    let setup = SessionSetupRequest {
-        structure_size: SessionSetupRequest::STRUCTURE_SIZE.into(),
-        ..SessionSetupRequest::new_zeroed()
-    };
-    guest
-        .write_all(&frame(Command::SESSION_SETUP, 1, 0, 0, setup.as_bytes()))
-        .await
-        .unwrap();
-    let response = receive(&mut guest).await;
-    let header = Header::read_from_prefix(&response).unwrap().0;
-    assert_eq!(header.status.get(), 0);
-    assert_ne!(header.session_id.get(), 0);
-    let session = header.session_id.get();
-    let name: Vec<u8> = "\\\\VSMB\\memory"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    let tree = TreeConnectRequest {
-        structure_size: TreeConnectRequest::STRUCTURE_SIZE.into(),
-        path_offset: 72.into(),
-        path_length: (name.len() as u16).into(),
-        ..TreeConnectRequest::new_zeroed()
-    };
-    let body = [tree.as_bytes(), &name].concat();
-    guest
-        .write_all(&frame(Command::TREE_CONNECT, 2, session, 0, &body))
-        .await
-        .unwrap();
-    let response = receive(&mut guest).await;
-    let header = Header::read_from_prefix(&response).unwrap().0;
-    assert_eq!(header.status.get(), 0);
-    assert_ne!(header.tree_id.get(), 0);
-    let tree = header.tree_id.get();
+    let (session, tree) = reconnect::connect(&mut guest).await;
+    assert_ne!(session, 0);
+    assert_ne!(tree, 0);
     let name: Vec<u8> = "wire".encode_utf16().flat_map(u16::to_le_bytes).collect();
     let mut create = CreateRequest::new_zeroed();
     create.structure_size = CreateRequest::STRUCTURE_SIZE.into();

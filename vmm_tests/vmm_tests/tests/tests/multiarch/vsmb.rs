@@ -36,6 +36,9 @@ async fn vsmb_memory_file_operations(
     agent
         .write_file("C:\\vsmb-lock-ready", b"waiting".as_slice())
         .await?;
+    agent
+        .write_file("C:\\vsmb-idle-ready", b"waiting".as_slice())
+        .await?;
     let command =
         cmd!(shell, "powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]);
     let checkpoint = async {
@@ -140,6 +143,26 @@ async fn vsmb_memory_file_operations(
         );
         agent
             .write_file("C:\\vsmb-cache-read-go", b"go".as_slice())
+            .await?;
+        let mut idle = false;
+        for _ in 0..400 {
+            if agent.read_file("C:\\vsmb-idle-ready").await? == b"ready" {
+                idle = true;
+                break;
+            }
+            timer.sleep(std::time::Duration::from_millis(25)).await;
+        }
+        anyhow::ensure!(idle, "guest did not reach idle-share checkpoint");
+        for _ in 0..50 {
+            timer.sleep(std::time::Duration::from_millis(500)).await;
+            let eof = vm
+                .inspect_vmm("vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/channel/eof")
+                .await?
+                .to_string();
+            anyhow::ensure!(eof == "false", "idle share disconnected: {eof}");
+        }
+        agent
+            .write_file("C:\\vsmb-idle-go", b"go".as_slice())
             .await?;
         Ok::<_, anyhow::Error>(())
     };

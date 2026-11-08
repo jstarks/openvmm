@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 $ErrorActionPreference = 'Stop'
-foreach ($signal in @('C:\vsmb-resume', 'C:\vsmb-lock-go', 'C:\vsmb-cache-go', 'C:\vsmb-cache-read-go')) {
+foreach ($signal in @('C:\vsmb-resume', 'C:\vsmb-lock-go', 'C:\vsmb-cache-go', 'C:\vsmb-cache-read-go', 'C:\vsmb-idle-go')) {
     [System.IO.File]::Delete($signal)
 }
 
@@ -23,6 +23,18 @@ public static class VsmbGuest {
     struct Privilege { public uint Count; public Luid Luid; public uint Attributes; }
     [StructLayout(LayoutKind.Sequential)]
     struct IoStatus { public IntPtr Status; public UIntPtr Information; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct UnicodeString {
+        public ushort Length, MaximumLength;
+        public IntPtr Buffer;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ObjectAttributes {
+        public uint Length;
+        public IntPtr RootDirectory, ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor, SecurityQualityOfService;
+    }
     [StructLayout(LayoutKind.Sequential)]
     struct Overlapped {
         public UIntPtr Internal, InternalHigh;
@@ -71,6 +83,11 @@ public static class VsmbGuest {
     static extern uint NtFsControlFile(SafeFileHandle handle, IntPtr evt, IntPtr apc,
         IntPtr context, out IoStatus status, uint code, byte[] input, uint length,
         IntPtr output, uint outputLength);
+    [DllImport("ntdll.dll")]
+    static extern uint NtCreateFile(out SafeFileHandle handle, uint access,
+        ref ObjectAttributes attributes, out IoStatus status, IntPtr allocationSize,
+        uint fileAttributes, uint share, uint disposition, uint options,
+        IntPtr eaBuffer, uint eaLength);
 
     static void Put(byte[] buffer, int offset, uint value) {
         Array.Copy(BitConverter.GetBytes(value), 0, buffer, offset, 4);
@@ -131,8 +148,45 @@ public static class VsmbGuest {
                 IntPtr.Zero, 0);
             if (status != 0) throw new Exception("BIND_TRANSPORT: 0x" + status.ToString("X8"));
         }
-        if (!DefineDosDevice(1, "V:", @"\Device\vmsmb\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\memory"))
+        string share = @"\Device\vmsmb\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\memory";
+        MountShare(share);
+        if (!DefineDosDevice(1, "V:", share))
             throw new Win32Exception();
+    }
+
+    static void MountShare(string path) {
+        IntPtr buffer = Marshal.StringToHGlobalUni(path);
+        IntPtr name = IntPtr.Zero;
+        try {
+            var unicode = new UnicodeString {
+                Length = checked((ushort)(path.Length * 2)),
+                MaximumLength = checked((ushort)((path.Length + 1) * 2)),
+                Buffer = buffer
+            };
+            name = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+            Marshal.StructureToPtr(unicode, name, false);
+            var attributes = new ObjectAttributes {
+                Length = (uint)Marshal.SizeOf(typeof(ObjectAttributes)),
+                ObjectName = name,
+                Attributes = 0x40
+            };
+            SafeFileHandle handle;
+            IoStatus io;
+            const uint TreeConnectAttributePinned = 2;
+            const uint FileCreateTreeConnection = 0x80;
+            const uint FileSynchronousIoNonalert = 0x20;
+            // Pin the tree connection independently of application file handles.
+            uint status = NtCreateFile(out handle, 0x00100080, ref attributes,
+                out io, IntPtr.Zero, TreeConnectAttributePinned, 7, 1,
+                FileCreateTreeConnection | FileSynchronousIoNonalert, IntPtr.Zero, 0);
+            using (handle) {
+                if (status != 0)
+                    throw new Exception("MOUNT_SHARE: 0x" + status.ToString("X8"));
+            }
+        } finally {
+            if (name != IntPtr.Zero) Marshal.FreeHGlobal(name);
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     public static byte[] ReadUncached(string path, int length) {
@@ -421,4 +475,14 @@ $files = @([System.IO.Directory]::EnumerateFiles($directory))
 if ($files.Count -ne 1) { throw 'Wrong directory contents' }
 [System.IO.File]::Delete($target)
 [System.IO.Directory]::Delete($directory)
+[System.IO.File]::WriteAllBytes('V:\idle.bin', [byte[]](1, 2, 3))
+[System.IO.File]::WriteAllText('C:\vsmb-idle-ready', 'ready')
+while (![System.IO.File]::Exists('C:\vsmb-idle-go')) {
+    [System.Threading.Thread]::Sleep(25)
+}
+$idle = [System.IO.File]::ReadAllBytes('V:\idle.bin')
+if ($idle.Length -ne 3 -or $idle[0] -ne 1 -or $idle[1] -ne 2 -or $idle[2] -ne 3) {
+    throw 'Wrong file contents after idle'
+}
+[System.IO.File]::Delete('V:\idle.bin')
 Write-Output 'VSMB_FILE_OPERATIONS_PASSED'

@@ -23,6 +23,8 @@ boot-file service are not implemented.
 Offering the channel does not automatically activate the Windows virtual
 redirector or map a drive. The guest test explicitly creates an isolated
 redirector instance, binds it to the offered VMBus transport and maps the share.
+The mapping includes a persistent tree connection, not just a drive-letter
+alias, so closing application files does not tear down the idle transport.
 Its activation fixture is pinned to the Server 2025 test image; it is not a
 general guest provisioning interface.
 
@@ -45,6 +47,8 @@ The fixture verifies directory creation, patterned file read/write, rename,
 enumeration, deletion and clean shutdown. An aligned uncached read and device
 transfer counters verify actual external reads and writes, rather than relying
 on client-cached readback.
+It also checks that the mapped share remains connected during an idle interval
+and that file contents can be read afterward.
 
 Native Windows cases exercise notification delivery/cancellation, shared and
 exclusive byte-range locks, waiting/cancelled locks and release on handle close.

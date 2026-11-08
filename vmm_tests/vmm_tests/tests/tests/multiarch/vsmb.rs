@@ -194,6 +194,41 @@ async fn vsmb_memory_file_operations(
             "no actual external {operation} observed"
         );
     }
+    cmd!(shell, "powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.IO.File]::WriteAllText('V:\\reboot.txt', 'retained')",
+        ])
+        .run()
+        .await?;
+    agent.reboot().await?;
+    let agent = vm.wait_for_reset().await?;
+    for resource in [
+        "opens",
+        "watch_count",
+        "lock_count",
+        "lock_waiters",
+        "caching/opens",
+    ] {
+        let path = format!("vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/server/backend/{resource}");
+        let value = vm.inspect_vmm(&path).await?.to_string();
+        anyhow::ensure!(value == "0", "guest reboot retained {resource}: {value}");
+    }
+    let (bootstrap, _) = script
+        .split_once("\n[VsmbGuest]::Activate()")
+        .ok_or_else(|| anyhow::anyhow!("guest bootstrap boundary missing"))?;
+    let probe = format!(
+        "{bootstrap}\n[VsmbGuest]::Activate()\n\
+         if ([System.IO.File]::ReadAllText('V:\\reboot.txt') -ne 'retained') {{ throw 'Wrong file contents after reboot' }}\n\
+         [System.IO.File]::Delete('V:\\reboot.txt')"
+    );
+    let shell = agent.windows_shell();
+    cmd!(shell, "powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &probe])
+        .run()
+        .await?;
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;
     Ok(())

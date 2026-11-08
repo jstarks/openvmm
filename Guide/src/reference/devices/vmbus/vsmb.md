@@ -48,7 +48,8 @@ enumeration, deletion and clean shutdown. An aligned uncached read and device
 transfer counters verify actual external reads and writes, rather than relying
 on client-cached readback.
 It also checks that the mapped share remains connected during an idle interval
-and that file contents can be read afterward.
+and that file contents can be read afterward. An orderly guest reboot must
+release the old connection's resources and preserve data in the same device.
 
 Native Windows cases exercise notification delivery/cancellation, shared and
 exclusive byte-range locks, waiting/cancelled locks and release on handle close.

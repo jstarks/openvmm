@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 $ErrorActionPreference = 'Stop'
-foreach ($signal in @('C:\vsmb-resume', 'C:\vsmb-cache-go', 'C:\vsmb-cache-read-go')) {
+foreach ($signal in @('C:\vsmb-resume', 'C:\vsmb-lock-go', 'C:\vsmb-cache-go', 'C:\vsmb-cache-read-go')) {
     [System.IO.File]::Delete($signal)
 }
 
@@ -171,13 +171,17 @@ public static class VsmbGuest {
                 }, Ov, false);
             }
 
-            public void Lock(uint flags, bool mustPend) {
+            public void Lock(uint flags, bool mustPend, int expectedError = 0) {
                 bool result = LockFileEx(file, flags, 0, 16, 0, Ov);
                 int error = result ? 0 : Marshal.GetLastWin32Error();
-                if (error != 0 && error != 997) throw new Win32Exception(error);
                 active = !result;
+                if (error != 997) {
+                    active = false;
+                    if (error != expectedError)
+                        throw new Exception("Lock error " + error + ", expected " + expectedError);
+                }
                 if (mustPend && !active) throw new Exception("Conflicting lock did not pend");
-                if (!mustPend && active) Complete(0);
+                if (!mustPend && active) Complete(expectedError);
             }
 
             public void Notify() {
@@ -247,8 +251,11 @@ public static class VsmbGuest {
 
         public static void TestLocks(string path) {
             System.IO.File.WriteAllBytes(path, new byte[4096]);
+            string alias = path + ".alias";
+            if (!CreateHardLink(alias, path, IntPtr.Zero)) throw new Win32Exception();
             using (var first = OpenAsync(path, false))
-            using (var second = OpenAsync(path, false)) {
+            using (var second = OpenAsync(alias, false)) {
+                Console.WriteLine("VSMB_SHARED_LOCKS");
                 using (var shared1 = new Pending(first, 64))
                 using (var shared2 = new Pending(second, 64)) {
                     shared1.Lock(0, false);
@@ -257,14 +264,10 @@ public static class VsmbGuest {
                     shared1.Unlock();
                 }
                 using (var owner = new Pending(first, 64)) {
+                    Console.WriteLine("VSMB_EXCLUSIVE_LOCKS");
                     owner.Lock(2, false);
                     using (var conflict = new Pending(second, 64)) {
-                        try {
-                            conflict.Lock(3, false);
-                            throw new Exception("Exclusive conflict succeeded");
-                        } catch (Win32Exception error) {
-                            if (error.NativeErrorCode != 33) throw;
-                        }
+                        conflict.Lock(3, false, 33);
                     }
                     using (var cancelled = new Pending(second, 64)) {
                         cancelled.Lock(2, true);
@@ -272,13 +275,22 @@ public static class VsmbGuest {
                         cancelled.Complete(995);
                     }
                     using (var waiter = new Pending(second, 64)) {
+                        Console.WriteLine("VSMB_UNLOCK_WAITER");
                         waiter.Lock(2, true);
+                        System.IO.File.WriteAllText(@"C:\vsmb-lock-ready", "ready");
+                        var deadline = Stopwatch.StartNew();
+                        while (!System.IO.File.Exists(@"C:\vsmb-lock-go")) {
+                            if (deadline.ElapsedMilliseconds > 20000)
+                                throw new TimeoutException("Host did not inspect pending lock");
+                            System.Threading.Thread.Sleep(10);
+                        }
                         owner.Unlock();
                         waiter.Complete(0);
                         waiter.Unlock();
                     }
                     owner.Lock(2, false);
                     using (var waiter = new Pending(second, 64)) {
+                        Console.WriteLine("VSMB_CLOSE_WAITER");
                         waiter.Lock(2, true);
                         first.Dispose();
                         waiter.Complete(0);
@@ -286,6 +298,7 @@ public static class VsmbGuest {
                     }
                 }
             }
+            System.IO.File.Delete(alias);
             System.IO.File.Delete(path);
         }
 

@@ -33,6 +33,9 @@ async fn vsmb_memory_file_operations(
     agent
         .write_file("C:\\vsmb-cache-ready", b"waiting".as_slice())
         .await?;
+    agent
+        .write_file("C:\\vsmb-lock-ready", b"waiting".as_slice())
+        .await?;
     let command =
         cmd!(shell, "powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]);
     let checkpoint = async {
@@ -69,6 +72,23 @@ async fn vsmb_memory_file_operations(
                 "[System.IO.File]::WriteAllText('C:\\vsmb-resume', 'go')",
             ])
             .run()
+            .await?;
+        let mut lock_ready = false;
+        for _ in 0..400 {
+            if agent.read_file("C:\\vsmb-lock-ready").await? == b"ready" {
+                lock_ready = true;
+                break;
+            }
+            timer.sleep(std::time::Duration::from_millis(25)).await;
+        }
+        anyhow::ensure!(lock_ready, "guest did not reach pending-lock checkpoint");
+        let requests = vm.inspect_vmm(path).await?.to_string();
+        anyhow::ensure!(
+            requests.contains("command: \"LOCK\""),
+            "lock wait was not observed on the server: {requests}"
+        );
+        agent
+            .write_file("C:\\vsmb-lock-go", b"go".as_slice())
             .await?;
         let mut ready = false;
         for _ in 0..400 {

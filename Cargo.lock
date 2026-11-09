@@ -8548,6 +8548,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "smb_windows"
+version = "0.0.0"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "blocking",
+ "futures",
+ "inspect",
+ "pal",
+ "pal_async",
+ "parking_lot",
+ "smb",
+ "tempfile",
+ "test_with_tracing",
+ "thiserror 2.0.16",
+ "tracelimit",
+ "windows-sys 0.61.0",
+]
+
+[[package]]
 name = "smbios_defs"
 version = "0.0.0"
 dependencies = [

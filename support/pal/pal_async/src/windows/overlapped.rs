@@ -23,6 +23,8 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
+use windows_sys::Win32::Foundation::NTSTATUS;
+use windows_sys::Win32::Foundation::STATUS_PENDING;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::IO::CancelIoEx;
@@ -215,6 +217,19 @@ impl<T> Io<T> {
     }
 
     fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<BufResult<T>> {
+        self.poll_result_with(cx, |result, overlapped| {
+            result.and_then(|()| {
+                let (status, len) = overlapped.io_status().expect("IO is known to be complete");
+                chk_status(status).map(|_| len)
+            })
+        })
+    }
+
+    fn poll_result_with<R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        complete: impl FnOnce(io::Result<()>, &Overlapped) -> R,
+    ) -> Poll<(R, T)> {
         let (r, inner) = match &self.state {
             IssueState::Complete { .. } => {
                 let IssueState::Complete { result, inner } =
@@ -254,14 +269,7 @@ impl<T> Io<T> {
             IssueState::Taken => panic!("polled after completion"),
         };
 
-        let r = r.and_then(|()| {
-            let (status, len) = inner
-                .overlapped
-                .io_status()
-                .expect("IO is known to be complete");
-            chk_status(status).map(|_| len)
-        });
-
+        let r = complete(r, &inner.overlapped);
         let buffers = inner.buffers.into_inner();
         Poll::Ready((r, buffers))
     }
@@ -521,6 +529,39 @@ impl OverlappedFile {
     {
         Custom(Io::issue(self, 0, buffers, f))
     }
+
+    /// Performs native overlapped I/O without translating its completion status.
+    ///
+    /// # Safety
+    /// The requirements of [`Self::custom`] apply. `f` must issue an NT operation
+    /// using `overlapped` as both its completion context and IO_STATUS_BLOCK,
+    /// and return the NTSTATUS from that operation.
+    pub unsafe fn custom_nt<F, T>(&self, buffers: T, f: F) -> CustomNt<T>
+    where
+        F: FnOnce(RawHandle, &mut T, *mut OVERLAPPED) -> NTSTATUS,
+    {
+        CustomNt(Io::issue(
+            self,
+            0,
+            buffers,
+            |handle, buffers, overlapped| {
+                let status = f(handle, buffers, overlapped);
+                if status == STATUS_PENDING {
+                    Err(io::Error::from_raw_os_error(ERROR_IO_PENDING as i32))
+                } else {
+                    // SAFETY: An inline completion no longer aliases this status
+                    // block. On immediate failure NT need not have written it.
+                    unsafe {
+                        (*overlapped).Internal = status as usize;
+                        if status as u32 >> 30 == 3 {
+                            (*overlapped).InternalHigh = 0;
+                        }
+                    }
+                    Ok(())
+                }
+            },
+        ))
+    }
 }
 
 /// An IO result that returns the associated buffers.
@@ -557,3 +598,198 @@ io!(Read, (T), T);
 io!(Write, (T), T);
 io!(Ioctl, (T, U), (T, U));
 io!(Custom, (T), T);
+
+/// A native operation returning its untranslated status, byte count and buffers.
+#[derive(Debug)]
+#[must_use]
+pub struct CustomNt<T>(Io<T>);
+
+impl<T> CustomNt<T> {
+    /// Requests cancellation. Await this operation to observe its actual result.
+    pub fn cancel(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl<T> Future for CustomNt<T> {
+    type Output = ((NTSTATUS, usize), T);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.poll_result_with(cx, |result, overlapped| {
+            assert!(
+                result.is_ok(),
+                "native issue only returns pending or success"
+            );
+            overlapped.io_status().expect("IO is known to be complete")
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // UNSAFETY: Test operations retain their buffers through native completion.
+    #![expect(unsafe_code)]
+
+    use super::*;
+    use crate::DefaultDriver;
+    use crate::async_test;
+    use crate::windows::pipe::{ListeningPipe, NamedPipeServer};
+    use pal::windows::pipe::{Disposition, PipeMode, new_named_pipe};
+    use std::fs::OpenOptions;
+    use test_with_tracing::test;
+    use windows_sys::Wdk::Storage::FileSystem::{NtReadFile, NtWriteFile};
+    use windows_sys::Win32::Foundation::{
+        STATUS_ACCESS_DENIED, STATUS_CANCELLED, STATUS_END_OF_FILE, STATUS_SUCCESS,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
+    fn read(file: &OverlappedFile, offset: Option<i64>, length: usize) -> CustomNt<Vec<u8>> {
+        // SAFETY: The native call only aliases the operation's owned storage.
+        unsafe {
+            file.custom_nt(vec![0; length], |handle, data, overlapped| {
+                NtReadFile(
+                    handle,
+                    null_mut(),
+                    None,
+                    overlapped.cast(),
+                    overlapped.cast(),
+                    data.as_mut_ptr().cast(),
+                    data.len() as u32,
+                    offset.as_ref().map_or(null(), std::ptr::from_ref),
+                    null(),
+                )
+            })
+        }
+    }
+
+    async fn pair(driver: &DefaultDriver) -> (OverlappedFile, OverlappedFile) {
+        let mut name = [0; 16];
+        getrandom::fill(&mut name).unwrap();
+        let path = format!(r"\\.\pipe\{:x}", u128::from_ne_bytes(name));
+        let server = NamedPipeServer::create(&path).unwrap();
+        let mut accept = server.accept(driver).unwrap();
+        assert!(futures::poll!(&mut accept).is_pending());
+        let client = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .attributes(FILE_FLAG_OVERLAPPED)
+            .open(&path)
+            .unwrap();
+        let server = accept.await.unwrap();
+        // SAFETY: Each handle is exclusively owned and opened for overlapped I/O.
+        unsafe {
+            (
+                OverlappedFile::new(driver, server).unwrap(),
+                OverlappedFile::new(driver, client).unwrap(),
+            )
+        }
+    }
+
+    #[async_test]
+    async fn native_inline_errors_and_partial_read(driver: DefaultDriver) {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"data").unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .attributes(FILE_FLAG_OVERLAPPED)
+            .open(temp.path())
+            .unwrap();
+        // SAFETY: This fresh handle is exclusively owned.
+        let file = unsafe { OverlappedFile::new(&driver, file).unwrap() };
+        // SAFETY: Native arguments refer only to the owned buffer and status.
+        let write = unsafe {
+            file.custom_nt(vec![1u8], |handle, data, overlapped| {
+                NtWriteFile(
+                    handle,
+                    null_mut(),
+                    None,
+                    overlapped.cast(),
+                    overlapped.cast(),
+                    data.as_ptr().cast(),
+                    1,
+                    &0,
+                    null(),
+                )
+            })
+        };
+        let ((status, count), data) = write.await;
+        assert_eq!((status, count), (STATUS_ACCESS_DENIED, 0));
+        assert_eq!(data, [1]);
+        let ((status, count), data) = read(&file, Some(0), 8).await;
+        assert_eq!((status, count), (STATUS_SUCCESS, 4));
+        assert_eq!(&data[..count], b"data");
+        let ((status, count), _) = read(&file, Some(4), 8).await;
+        assert_eq!((status, count), (STATUS_END_OF_FILE, 0));
+    }
+
+    #[async_test]
+    async fn native_pending_cancel_and_retained_operation(driver: DefaultDriver) {
+        let (server, client) = pair(&driver).await;
+        let mut cancelled = read(&server, None, 8);
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        cancelled.cancel();
+        let ((status, count), data) = cancelled.await;
+        assert_eq!((status, count, data.len()), (STATUS_CANCELLED, 0, 8));
+
+        let mut retained = read(&server, None, 8);
+        {
+            let mut temporary = std::pin::pin!(std::future::poll_fn(|cx| {
+                Pin::new(&mut retained).poll(cx)
+            }));
+            assert!(futures::poll!(&mut temporary).is_pending());
+        }
+        client.write_at(0, b"ready".as_slice()).await.0.unwrap();
+        // Completion won the race: a late cancellation must retain the result.
+        retained.cancel();
+        let ((status, count), data) = retained.await;
+        assert_eq!((status, count), (STATUS_SUCCESS, 5));
+        assert_eq!(&data[..count], b"ready");
+    }
+
+    #[async_test]
+    async fn native_dropped_pending_operation_does_not_consume_next_read(driver: DefaultDriver) {
+        let (server, client) = pair(&driver).await;
+        let mut dropped = read(&server, None, 8);
+        assert!(futures::poll!(&mut dropped).is_pending());
+        drop(dropped);
+        let mut next = read(&server, None, 8);
+        assert!(futures::poll!(&mut next).is_pending());
+        client.write_at(0, b"next".as_slice()).await.0.unwrap();
+        let ((status, count), data) = next.await;
+        assert_eq!((status, count), (STATUS_SUCCESS, 4));
+        assert_eq!(&data[..count], b"next");
+    }
+
+    #[async_test]
+    async fn native_warning_preserves_partial_message_bytes(driver: DefaultDriver) {
+        let mut name = [0; 16];
+        getrandom::fill(&mut name).unwrap();
+        let path = format!(r"\\.\pipe\{:x}", u128::from_ne_bytes(name));
+        let pipe = new_named_pipe(
+            &path,
+            windows_sys::Win32::Foundation::GENERIC_READ
+                | windows_sys::Win32::Foundation::GENERIC_WRITE,
+            Disposition::Create,
+            PipeMode::Message,
+        )
+        .unwrap();
+        let mut accept = ListeningPipe::new(&driver, pipe).unwrap();
+        assert!(futures::poll!(&mut accept).is_pending());
+        let client = OpenOptions::new().write(true).open(&path).unwrap();
+        let server = accept.await.unwrap();
+        // SAFETY: The fresh handle has exclusive overlapped ownership.
+        let server = unsafe { OverlappedFile::new(&driver, server).unwrap() };
+        use std::io::Write;
+        (&client).write_all(b"message").unwrap();
+        let ((status, count), data) = read(&server, None, 3).await;
+        assert_eq!(
+            status,
+            windows_sys::Win32::Foundation::STATUS_BUFFER_OVERFLOW
+        );
+        assert_eq!(count, 3);
+        assert_eq!(data, b"mes");
+        let ((status, count), data) = read(&server, None, 8).await;
+        assert_eq!((status, count), (STATUS_SUCCESS, 4));
+        assert_eq!(&data[..count], b"sage");
+    }
+}

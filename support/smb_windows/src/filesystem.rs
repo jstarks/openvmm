@@ -1,0 +1,521 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+use crate::io::{Io, check};
+use crate::native::{self, Create};
+use async_trait::async_trait;
+use futures::FutureExt;
+use inspect::Inspect;
+use pal_async::driver::Driver;
+use pal_async::windows::overlapped::OverlappedFile;
+use parking_lot::Mutex;
+use smb::provider::{
+    BasicInformation, FileSystem, Metadata, OpenOptions, RequestContext, map_access,
+};
+use smb::security::SecurityDescriptor;
+use smb::spec::{AccessMask, CreateDisposition, SecurityInformation, Status};
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use windows_sys::Wdk::Storage::FileSystem as nt;
+use windows_sys::Win32::Storage::FileSystem as fs;
+
+const OPEN_LIMIT: usize = 4096;
+const IO_LIMIT: usize = 1024 * 1024;
+
+/// Failure to capture a supported, case-insensitive local NTFS export root.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot initialize Windows SMB filesystem: {0:?}")]
+pub struct OpenRootError(Status);
+
+/// A VM-independent, process-identity Windows filesystem with no caching grants.
+///
+/// Every intermediate directory is retained during resolution. An object
+/// already opened remains a capability if a host application later moves it.
+/// Host hard links are not confined by pathname containment.
+/// Traversed directories require attribute-query access to enforce the initial
+/// exclusion of case-sensitive directories.
+///
+/// EXECUTE requests also require native READ_DATA so SMB can load executable
+/// contents. That additional physical right is not a guest-visible data/list
+/// grant; the host ACL must permit it.
+pub struct WindowsFs(Arc<Inner>);
+
+struct Inner {
+    io: Io,
+    root: Arc<File>,
+    opens: AtomicUsize,
+}
+
+struct Reservation(Arc<Inner>);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.opens.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// An independent native open; closing it releases native sharing reservations.
+pub struct WindowsFile {
+    file: Mutex<Option<Open>>,
+    path: String,
+    append_only: bool,
+    hidden_read: bool,
+}
+
+struct Open {
+    file: Arc<NativeFile>,
+    _reservation: Reservation,
+}
+
+enum NativeFile {
+    Data(OverlappedFile),
+    Directory(File, Mutex<()>),
+}
+
+impl NativeFile {
+    fn get(&self) -> &File {
+        match self {
+            Self::Data(file) => file.get(),
+            Self::Directory(file, _) => file,
+        }
+    }
+
+    fn overlapped(&self) -> Result<&OverlappedFile, Status> {
+        match self {
+            Self::Data(file) => Ok(file),
+            Self::Directory(..) => Err(Status::FILE_IS_A_DIRECTORY),
+        }
+    }
+
+    fn list(&self) -> Result<Vec<String>, Status> {
+        match self {
+            Self::Data(_) => Err(Status::NOT_A_DIRECTORY),
+            Self::Directory(file, scan) => {
+                let _scan = scan.lock();
+                native::list(file)
+            }
+        }
+    }
+}
+
+impl WindowsFile {
+    fn get(&self) -> Result<Arc<NativeFile>, Status> {
+        self.file
+            .lock()
+            .as_ref()
+            .map(|open| open.file.clone())
+            .ok_or(Status::FILE_CLOSED)
+    }
+}
+
+impl Inspect for WindowsFs {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        req.respond()
+            .field("opens", self.0.opens.load(Ordering::Relaxed))
+            .field("open_limit", OPEN_LIMIT)
+            .field(
+                "workers_submitted",
+                self.0.io.submitted.load(Ordering::Relaxed),
+            );
+    }
+}
+
+impl WindowsFs {
+    /// Captures an export root. Native setup executes on a bounded worker.
+    pub async fn new(
+        root: impl AsRef<Path>,
+        driver: Arc<dyn Driver>,
+    ) -> Result<Self, OpenRootError> {
+        let io = Io::new(driver);
+        let root = root.as_ref().to_owned();
+        let root = io
+            .worker(&RequestContext::new(0), move || native::root(&root))
+            .await
+            .map_err(OpenRootError)?;
+        Ok(Self(Arc::new(Inner {
+            io,
+            root: Arc::new(root),
+            opens: AtomicUsize::new(0),
+        })))
+    }
+
+    fn reserve(&self) -> Result<Reservation, Status> {
+        self.0
+            .opens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < OPEN_LIMIT).then_some(count + 1)
+            })
+            .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
+        Ok(Reservation(self.0.clone()))
+    }
+}
+
+fn components(name: &str) -> Result<Vec<String>, Status> {
+    if name.starts_with('\\') || name.contains('/') || name.encode_utf16().count() > 32767 {
+        return Err(Status::OBJECT_NAME_INVALID);
+    }
+    let mut result = Vec::new();
+    for part in name.split('\\').filter(|part| !part.is_empty()) {
+        if part.contains(':') {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        if part
+            .chars()
+            .any(|c| c < ' ' || matches!(c, '*' | '?' | '"' | '<' | '>' | '|'))
+            || part.encode_utf16().count() > 255
+        {
+            return Err(Status::OBJECT_NAME_INVALID);
+        }
+        result.push(part.to_owned());
+    }
+    Ok(result)
+}
+
+fn create(options: &OpenOptions<'_>) -> Result<Create, Status> {
+    let supported = nt::FILE_DIRECTORY_FILE
+        | nt::FILE_NON_DIRECTORY_FILE
+        | nt::FILE_WRITE_THROUGH
+        | nt::FILE_SEQUENTIAL_ONLY
+        | nt::FILE_RANDOM_ACCESS
+        | nt::FILE_NO_EA_KNOWLEDGE;
+    if options.options & !supported != 0
+        || options.access().access_system_security()
+        || options.disposition > nt::FILE_OVERWRITE_IF
+    {
+        return Err(Status::NOT_SUPPORTED);
+    }
+    Ok(Create {
+        // SMB READ accepts EXECUTE, whereas NtReadFile requires READ_DATA.
+        // Keep this physical right private to the provider.
+        access: {
+            let access = map_access(options.access);
+            if AccessMask::from_bits(access).execute() {
+                access | fs::FILE_READ_DATA
+            } else {
+                access
+            }
+        },
+        sharing: options.share_access,
+        disposition: options.disposition,
+        options: options.options,
+        attributes: options.attributes,
+    })
+}
+
+fn walk(
+    root: Arc<File>,
+    parts: Vec<String>,
+    create: &Create,
+) -> Result<(File, String, u32), Status> {
+    let mut parents = vec![root];
+    let mut names = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            if parents.len() > 1 {
+                parents.pop();
+                names.pop();
+            }
+            continue;
+        }
+        let parent = parents.last().expect("root remains on the parent stack");
+        native::check_directory(parent)?;
+        if index + 1 == parts.len() {
+            let (file, action) = native::open(
+                Some(parent),
+                &part.encode_utf16().collect::<Vec<_>>(),
+                create,
+            )?;
+            if native::is_directory(&file)? {
+                native::check_directory(&file)?;
+            }
+            names.push(native::component(&file)?);
+            return Ok((file, format!("\\{}", names.join("\\")), action));
+        }
+        let (directory, _) = native::open(
+            Some(parent),
+            &part.encode_utf16().collect::<Vec<_>>(),
+            &Create {
+                access: fs::FILE_READ_ATTRIBUTES,
+                sharing: fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE | fs::FILE_SHARE_DELETE,
+                disposition: nt::FILE_OPEN,
+                options: nt::FILE_DIRECTORY_FILE,
+                attributes: 0,
+            },
+        )?;
+        native::check_directory(&directory)?;
+        names.push(native::component(&directory)?);
+        parents.push(Arc::new(directory));
+    }
+    if !matches!(create.disposition, nt::FILE_OPEN | nt::FILE_OPEN_IF) {
+        return Err(Status::ACCESS_DENIED);
+    }
+    let parent = parents.last().expect("root remains on the parent stack");
+    native::check_directory(parent)?;
+    let (file, action) = native::open(Some(parent), &[], create)?;
+    Ok((file, format!("\\{}", names.join("\\")), action))
+}
+
+#[async_trait]
+impl FileSystem for WindowsFs {
+    type File = WindowsFile;
+
+    async fn open(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        request: &RequestContext,
+    ) -> Result<(WindowsFile, u32), Status> {
+        check(request)?;
+        let parts = components(name)?;
+        let mut create = create(&options)?;
+        let logical_access = AccessMask::from_bits(map_access(options.access));
+        let hidden_read = logical_access.execute()
+            && !logical_access.read_data()
+            && !logical_access.maximum_allowed();
+        let unsupported_creation =
+            options.security.is_some() || options.extended_attributes.is_some();
+        if unsupported_creation {
+            create.disposition = match options.disposition() {
+                CreateDisposition::OPEN | CreateDisposition::OPEN_IF => nt::FILE_OPEN,
+                CreateDisposition::OVERWRITE | CreateDisposition::OVERWRITE_IF => {
+                    nt::FILE_OVERWRITE
+                }
+                _ => return Err(Status::NOT_SUPPORTED),
+            };
+        }
+        let reservation = self.reserve()?;
+        let root = self.0.root.clone();
+        let result = self
+            .0
+            .io
+            .worker(request, move || {
+                // Retain the open slot even if an initialization future is dropped.
+                let (file, path, action) = walk(root, parts, &create)?;
+                let directory = native::is_directory(&file)?;
+                Ok(((file, path, action, directory), reservation))
+            })
+            .await;
+        let ((file, path, action, directory), reservation) = match result {
+            Err(Status::OBJECT_NAME_NOT_FOUND) if unsupported_creation => {
+                return Err(Status::NOT_SUPPORTED);
+            }
+            result => result?,
+        };
+        let file = if directory {
+            NativeFile::Directory(file, Mutex::new(()))
+        } else {
+            NativeFile::Data(
+                native::overlapped(&*self.0.io.driver, file).map_err(|error| {
+                    tracelimit::error_ratelimited!(
+                        ?error,
+                        "cannot associate native SMB open with IOCP"
+                    );
+                    Status::INTERNAL_ERROR
+                })?,
+            )
+        };
+        Ok((
+            WindowsFile {
+                file: Mutex::new(Some(Open {
+                    file: Arc::new(file),
+                    _reservation: reservation,
+                })),
+                path,
+                append_only: options.access().append_data()
+                    && !options.access().write_data()
+                    && !options.access().generic_write()
+                    && !options.access().generic_all(),
+                hidden_read,
+            },
+            action,
+        ))
+    }
+
+    async fn close(&self, file: &WindowsFile, _request: &RequestContext) -> Result<(), Status> {
+        let native = file.file.lock().take();
+        // The engine has already drained this open's operations. Closing does
+        // not issue an implicit flush and is not prevented by cancellation.
+        self.0
+            .io
+            .worker(&RequestContext::new(0), move || {
+                drop(native);
+                Ok(())
+            })
+            .await
+    }
+
+    async fn metadata(
+        &self,
+        file: &WindowsFile,
+        request: &RequestContext,
+    ) -> Result<Metadata, Status> {
+        let native = file.get()?;
+        let path = file.path.clone();
+        let mut metadata = self
+            .0
+            .io
+            .worker(request, move || native::metadata(native.get(), path))
+            .await?;
+        if file.hidden_read {
+            metadata.granted_access &= !fs::FILE_READ_DATA;
+        }
+        Ok(metadata)
+    }
+
+    async fn query_security(
+        &self,
+        file: &WindowsFile,
+        information: SecurityInformation,
+        request: &RequestContext,
+    ) -> Result<SecurityDescriptor, Status> {
+        let file = file.get()?;
+        self.0
+            .io
+            .worker(request, move || {
+                native::query_security(file.get(), information.into_bits())
+            })
+            .await
+    }
+
+    async fn read(
+        &self,
+        file: &WindowsFile,
+        offset: u64,
+        length: usize,
+        request: &RequestContext,
+    ) -> Result<Vec<u8>, Status> {
+        check(request)?;
+        let offset = i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?;
+        let file = file.get()?;
+        let mut io = native::read(file.overlapped()?, offset, vec![0; length.min(IO_LIMIT)]);
+        let mut cancelled = std::pin::pin!(request.cancelled().fuse());
+        let ((result, count), mut data) = futures::select_biased! {
+            result = (&mut io).fuse() => result,
+            () = cancelled => {
+                io.cancel();
+                io.await
+            },
+        };
+        native::status(result)?;
+        if count > data.len() {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        data.truncate(count);
+        Ok(data)
+    }
+
+    async fn write(
+        &self,
+        file: &WindowsFile,
+        offset: u64,
+        data: &[u8],
+        request: &RequestContext,
+    ) -> Result<usize, Status> {
+        check(request)?;
+        let offset = if file.append_only {
+            -1
+        } else {
+            i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?
+        };
+        let file = file.get()?;
+        let data = data[..data.len().min(IO_LIMIT)].to_vec();
+        let mut io = native::write(file.overlapped()?, offset, data);
+        let mut cancelled = std::pin::pin!(request.cancelled().fuse());
+        let ((result, count), data) = futures::select_biased! {
+            result = (&mut io).fuse() => result,
+            () = cancelled => {
+                io.cancel();
+                io.await
+            },
+        };
+        native::status(result)?;
+        if count > data.len() {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        Ok(count)
+    }
+
+    async fn flush(&self, file: &WindowsFile, request: &RequestContext) -> Result<(), Status> {
+        let file = file.get()?;
+        self.0
+            .io
+            .worker(request, move || native::flush(file.get()))
+            .await
+    }
+
+    async fn list(
+        &self,
+        directory: &WindowsFile,
+        request: &RequestContext,
+    ) -> Result<Vec<Metadata>, Status> {
+        let file = directory.get()?;
+        if directory.hidden_read {
+            return Err(Status::ACCESS_DENIED);
+        }
+        let path = directory.path.clone();
+        self.0
+            .io
+            .worker(request, move || {
+                let names = file.list()?;
+                let mut entries = Vec::with_capacity(names.len());
+                for name in names {
+                    let (child, _) = native::open(
+                        Some(file.get()),
+                        &name.encode_utf16().collect::<Vec<_>>(),
+                        &Create {
+                            access: fs::FILE_READ_ATTRIBUTES,
+                            sharing: fs::FILE_SHARE_READ
+                                | fs::FILE_SHARE_WRITE
+                                | fs::FILE_SHARE_DELETE,
+                            disposition: nt::FILE_OPEN,
+                            options: 0,
+                            attributes: 0,
+                        },
+                    )?;
+                    let path = format!("{}\\{}", path.trim_end_matches('\\'), name);
+                    entries.push(native::metadata(&child, path)?);
+                }
+                Ok(entries)
+            })
+            .await
+    }
+
+    async fn set_len(
+        &self,
+        file: &WindowsFile,
+        length: u64,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        let file = file.get()?;
+        self.0
+            .io
+            .worker(request, move || native::set_len(file.get(), length))
+            .await
+    }
+
+    async fn set_delete_on_close(
+        &self,
+        _file: &WindowsFile,
+        _delete: bool,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+
+    async fn set_basic(
+        &self,
+        _file: &WindowsFile,
+        _info: BasicInformation,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        Err(Status::NOT_SUPPORTED)
+    }
+}
+
+#[cfg(test)]
+mod tests;

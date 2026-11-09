@@ -24,7 +24,7 @@ impl Fixture for NativeFixture {
         Status::SUCCESS
     }
 
-    fn notify_requires_reopen_after_delete(&self) -> bool {
+    fn notify_delete_state_is_per_registration(&self) -> bool {
         true
     }
 
@@ -124,6 +124,69 @@ contract_test!(notify_fifo_and_small_buffer);
 contract_test!(notify_subtree_and_filters);
 contract_test!(notify_deletion_generations);
 contract_test!(notify_nonempty_delete_mode_preserves_watch);
+
+#[async_test]
+async fn notification_delete_state_belongs_to_existing_registrations(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let directory_options = OpenOptions {
+        options: nt::FILE_DIRECTORY_FILE,
+        ..options(CreateDisposition::CREATE)
+    };
+    let (watching, _) = fs.open("state", directory_options, &request).await.unwrap();
+    let (deleting, _) = fs
+        .open(
+            "state",
+            OpenOptions {
+                disposition: nt::FILE_OPEN,
+                ..directory_options
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let filter = NotifyFilter::new().with_file_name(true);
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    assert!(matches!(
+        fs.notify(&watching, filter, false, 4096, &cancelled).await,
+        Err(Status::CANCELLED)
+    ));
+    fs.set_delete_on_close(&deleting, true, &request)
+        .await
+        .unwrap();
+    fs.set_delete_on_close(&deleting, false, &request)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fs.notify(&watching, filter, false, 4096, &request).await,
+        Err(Status::DELETE_PENDING)
+    ));
+    {
+        let native = deleting.get().unwrap();
+        let directory = native.directory().unwrap();
+        let direct = native::notify(directory.file.clone(), filter, false);
+        std::fs::write(root.path().join("state/fresh"), []).unwrap();
+        let ((status, used), buffer) = direct.await;
+        let changes = native::notify_changes(status, used, &buffer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            changes,
+            vec![smb::provider::Change {
+                action: smb::spec::NotifyAction::ADDED,
+                name: "fresh".to_owned(),
+            }]
+        );
+    }
+    assert!(matches!(
+        fs.notify(&deleting, filter, false, 4096, &cancelled).await,
+        Err(Status::CANCELLED)
+    ));
+    fs.close(&watching, &request).await.unwrap();
+    fs.close(&deleting, &request).await.unwrap();
+}
 
 #[async_test]
 async fn notifications_buffer_external_recursive_host_changes(driver: DefaultDriver) {

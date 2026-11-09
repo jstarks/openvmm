@@ -96,7 +96,6 @@ struct Directory {
     file: Arc<OverlappedFile>,
     scan: Mutex<()>,
     id: u64,
-    notify_deleted: AtomicBool,
     closing: AtomicBool,
 }
 
@@ -357,7 +356,6 @@ impl FileSystem for WindowsFs {
                 file: Arc::new(file),
                 scan: Mutex::new(()),
                 id,
-                notify_deleted: AtomicBool::new(options.options & nt::FILE_DELETE_ON_CLOSE != 0),
                 closing: AtomicBool::new(false),
             })
         } else {
@@ -584,7 +582,6 @@ impl FileSystem for WindowsFs {
                 native::set_disposition(file.get(), delete)?;
                 if delete {
                     if let NativeFile::Directory(directory) = &*file {
-                        directory.notify_deleted.store(true, Ordering::Release);
                         if let Some(watches) = watches.remove(&directory.id) {
                             for watch in watches.into_iter().filter_map(|watch| watch.upgrade()) {
                                 watch.invalidate();
@@ -619,12 +616,9 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<NotifyResult, Status> {
         let native = file.get()?;
-        let directory = native.directory()?;
+        native.directory()?;
         if file.hidden_access & fs::FILE_READ_DATA != 0 {
             return Err(Status::ACCESS_DENIED);
-        }
-        if directory.notify_deleted.load(Ordering::Acquire) {
-            return Err(Status::DELETE_PENDING);
         }
         let existing = file.watch.lock().await.clone();
         let watch = match existing {

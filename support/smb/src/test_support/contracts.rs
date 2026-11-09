@@ -113,10 +113,11 @@ pub trait Fixture {
         Status::ACCESS_DENIED
     }
 
-    /// Native Windows retains the invalidated notification context on an open
-    /// after delete disposition is cleared. A fresh directory open is required
-    /// to watch again; the literal MS-FSA model can recreate a peer's registration.
-    fn notify_requires_reopen_after_delete(&self) -> bool {
+    /// Windows retains deletion state on existing notification registrations,
+    /// not on an unregistered deleting open or deferred delete-on-close mode.
+    /// Invalidated registrations require a fresh directory open, unlike the
+    /// literal MS-FSA model's peer reactivation and deleting-open marker.
+    fn notify_delete_state_is_per_registration(&self) -> bool {
         false
     }
 
@@ -2426,11 +2427,21 @@ pub async fn notify_nonempty_delete_mode_preserves_watch<F: Fixture>(fixture: &F
                 .with_delete_on_close(true)
                 .into_bits();
             let (attempt, _) = fs.open("watch", mode, &request).await.unwrap();
-            rejected(
-                fs.notify(&attempt, file_names(), false, 4096, &request)
-                    .await,
-                Status::DELETE_PENDING,
-            );
+            if fixture.notify_delete_state_is_per_registration() {
+                let cancelled = RequestContext::new(3);
+                cancelled.cancel();
+                rejected(
+                    fs.notify(&attempt, file_names(), false, 4096, &cancelled)
+                        .await,
+                    Status::CANCELLED,
+                );
+            } else {
+                rejected(
+                    fs.notify(&attempt, file_names(), false, 4096, &request)
+                        .await,
+                    Status::DELETE_PENDING,
+                );
+            }
             fs.close(&attempt, &request).await.unwrap();
             assert!(futures::poll!(&mut work).is_pending());
             added = open(
@@ -3147,7 +3158,7 @@ pub async fn notify_deletion_generations<F: Fixture>(fixture: &F) {
             .unwrap();
         first_request.cancel();
         second_request.cancel();
-        let replacement = if fixture.notify_requires_reopen_after_delete() {
+        let replacement = if fixture.notify_delete_state_is_per_registration() {
             rejected(
                 fs.notify(
                     &watched,
@@ -3187,11 +3198,21 @@ pub async fn notify_deletion_generations<F: Fixture>(fixture: &F) {
             fs.close(replacement, &request).await.unwrap();
         }
     }
-    rejected(
-        fs.notify(&deleting, file_names(), false, 4096, &request)
-            .await,
-        Status::DELETE_PENDING,
-    );
+    if fixture.notify_delete_state_is_per_registration() {
+        let cancelled = RequestContext::new(6);
+        cancelled.cancel();
+        rejected(
+            fs.notify(&deleting, file_names(), false, 4096, &cancelled)
+                .await,
+            Status::CANCELLED,
+        );
+    } else {
+        rejected(
+            fs.notify(&deleting, file_names(), false, 4096, &request)
+                .await,
+            Status::DELETE_PENDING,
+        );
+    }
     fs.close(&child, &request).await.unwrap();
     fs.close(&watched, &request).await.unwrap();
     fs.close(&deleting, &request).await.unwrap();

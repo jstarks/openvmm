@@ -8526,6 +8526,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "smb_linux"
+version = "0.0.0"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "blocking",
+ "event-listener",
+ "futures",
+ "inspect",
+ "io-uring",
+ "libc",
+ "pal_async",
+ "parking_lot",
+ "smb",
+ "tempfile",
+ "test_with_tracing",
+ "thiserror 2.0.16",
+ "tracelimit",
+ "unicycle",
+]
+
+[[package]]
 name = "smbios_defs"
 version = "0.0.0"
 dependencies = [

@@ -74,6 +74,8 @@ open_enum! {
         #![expect(missing_docs, reason = "Status names follow the cited NTSTATUS table.")]
         SUCCESS = 0,
         UNSUCCESSFUL = 0xc0000001,
+        NOT_SAME_DEVICE = 0xc00000d4,
+        MEDIA_WRITE_PROTECTED = 0xc00000a2,
         PENDING = 0x00000103,
         NOTIFY_CLEANUP = 0x0000010b,
         NOTIFY_ENUM_DIR = 0x0000010c,

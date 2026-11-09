@@ -1129,21 +1129,8 @@ fn beneath_open(state: &State, open: &Open, ancestor: u64) -> bool {
     open.node == ancestor || beneath(state, state.links[&open.link].parent, ancestor)
 }
 
-fn share_categories(access: u32) -> u32 {
-    let access = AccessMask::from_bits(access);
-    ShareAccess::new()
-        .with_read(access.read_data() || access.execute())
-        .with_write(access.write_data() || access.append_data())
-        .with_delete(access.delete())
-        .into_bits()
-}
-
 fn sharing_conflict(access: u32, sharing: u32, other: &Open) -> bool {
-    let access = share_categories(access);
-    let other_access = share_categories(other.access);
-    access != 0
-        && other_access != 0
-        && (access & !other.sharing != 0 || other_access & !sharing != 0)
+    crate::provider::sharing_conflict(access, sharing, other.access, other.sharing)
 }
 
 fn stream_sharing_conflict(access: u32, sharing: u32, other: &Open, stream: u64) -> bool {

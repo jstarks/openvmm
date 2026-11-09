@@ -1,0 +1,31 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "smb_linux"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+async-trait.workspace = true
+blocking.workspace = true
+event-listener.workspace = true
+futures.workspace = true
+inspect.workspace = true
+io-uring.workspace = true
+libc.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+smb.workspace = true
+thiserror.workspace = true
+tracelimit.workspace = true
+
+[dev-dependencies]
+smb = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+test_with_tracing.workspace = true
+unicycle.workspace = true
+
+[lints]
+workspace = true

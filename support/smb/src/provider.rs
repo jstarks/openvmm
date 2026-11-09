@@ -63,7 +63,8 @@ impl RequestContext {
         }
     }
 
-    pub(crate) fn cancel(&self) {
+    /// Request cancellation without dropping submitted operations or their inputs.
+    pub fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
         self.0.changed.notify(usize::MAX);
     }
@@ -528,14 +529,16 @@ pub struct ByteRange {
 pub struct LockId(pub u64);
 
 impl ByteRange {
-    pub(crate) fn validate(self) -> Result<(), Status> {
+    /// Reject ranges whose last byte cannot be represented.
+    pub fn validate(self) -> Result<(), Status> {
         if self.length != 0 && self.offset.checked_add(self.length - 1).is_none() {
             return Err(Status::INVALID_LOCK_RANGE);
         }
         Ok(())
     }
 
-    pub(crate) fn overlaps(self, other: Self) -> bool {
+    /// Test inclusive MS-FSA range overlap, including its zero-length rules.
+    pub fn overlaps(self, other: Self) -> bool {
         // MS-FSA §2.1.4.10 gives {0, 0} special treatment and uses inclusive ends.
         self != (Self {
             offset: 0,
@@ -979,4 +982,21 @@ pub fn map_access(mut access: u32) -> u32 {
         }
     }
     access
+}
+
+/// Whether two default-stream opens conflict under MS-FSA share-access rules.
+pub fn sharing_conflict(access: u32, sharing: u32, other_access: u32, other_sharing: u32) -> bool {
+    let categories = |access| {
+        let access = AccessMask::from_bits(access);
+        crate::spec::ShareAccess::new()
+            .with_read(access.read_data() || access.execute())
+            .with_write(access.write_data() || access.append_data())
+            .with_delete(access.delete())
+            .into_bits()
+    };
+    let access = categories(access);
+    let other_access = categories(other_access);
+    access != 0
+        && other_access != 0
+        && (access & !other_sharing != 0 || other_access & !sharing != 0)
 }

@@ -193,15 +193,36 @@ impl Io {
         path: CString,
         request: &RequestContext,
     ) -> io::Result<Arc<File>> {
-        check(request)?;
-        let how = types::OpenHow::new()
-            .flags((libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64)
-            .resolve(RESOLVE_NO_MAGICLINKS);
-        let entry = opcode::OpenAt2::new(types::Fd(libc::AT_FDCWD), path.as_ptr(), &how).build();
-        // SAFETY: `path` and `how` remain owned until submission completes.
-        let fd = unsafe { self.submit(entry).await? };
-        // SAFETY: A successful OPENAT2 CQE transfers ownership of this descriptor.
-        Ok(Arc::new(unsafe { File::from_raw_fd(fd) }))
+        // Resource resolution may be dropped before the runtime owns any operations.
+        self.worker(request, move || {
+            #[repr(C)]
+            struct OpenHow {
+                flags: u64,
+                mode: u64,
+                resolve: u64,
+            }
+            let how = OpenHow {
+                flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                mode: 0,
+                resolve: RESOLVE_NO_MAGICLINKS,
+            };
+            // SAFETY: The worker owns both syscall buffers and receives a fresh descriptor.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    &how,
+                    size_of::<OpenHow>(),
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: This worker owns the successful OPENAT2 result.
+            Ok(Arc::new(unsafe { File::from_raw_fd(fd as i32) }))
+        })
+        .await
     }
 
     pub async fn open(

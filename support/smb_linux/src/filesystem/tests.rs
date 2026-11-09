@@ -312,6 +312,26 @@ async fn unavailable_ftruncate_uses_real_bounded_worker_path(driver: DefaultDriv
 }
 
 #[async_test]
+async fn resource_initialization_can_be_dropped_before_runtime_ownership(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let driver: Arc<dyn Driver> = Arc::new(driver);
+    let mut initialize = Box::pin(LinuxFs::new(root.path(), driver.clone()));
+    std::future::poll_fn(|cx| {
+        let _ = initialize.as_mut().poll(cx);
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(initialize);
+    let fs = LinuxFs::new(root.path(), driver).await.unwrap();
+    let request = RequestContext::new(1);
+    let (file, _) = fs
+        .open("usable", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    fs.close(&file, &request).await.unwrap();
+}
+
+#[async_test]
 async fn required_data_opcode_has_no_blocking_fallback(driver: DefaultDriver) {
     let root = tempfile::tempdir().unwrap();
     let driver = MaskedDriver {

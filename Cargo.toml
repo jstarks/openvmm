@@ -66,8 +66,6 @@ members = [
   "opentmk/opentmk_executor",
   # support crates consumed by closed-source only
   "support/debug_output_tracing",
-  # Native SMB provider (until a device consumes it).
-  "support/smb_linux",
   # TDISP
   # Temporary: remove once a workspace member depends on this crate.
   "vm/devices/tdisp_lstoraccel",
@@ -195,6 +193,7 @@ sparse_mmap = { path = "support/sparse_mmap" }
 string_page_buf = { path = "support/string_page_buf" }
 task_control = { path = "support/task_control" }
 smb = { path = "support/smb" }
+smb_linux = { path = "support/smb_linux" }
 tdx_guest_device = { path = "support/tdx_guest_device" }
 term = { path = "support/term" }
 test_with_tracing = { path = "support/test_with_tracing" }

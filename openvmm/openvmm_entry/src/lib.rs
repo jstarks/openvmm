@@ -1868,6 +1868,26 @@ async fn vm_config_from_command_line(
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    if let Some(root) = &opt.vsmb_linux {
+        if !with_hv {
+            anyhow::bail!("--vsmb-linux requires Hyper-V enlightenments and VMBus");
+        }
+        let root = std::path::absolute(root).context("resolve vSMB export path")?;
+        let root_path = root
+            .to_str()
+            .context("vSMB export path must be UTF-8")?
+            .to_owned();
+        vmbus_devices.push((
+            DeviceVtl::Vtl0,
+            vsmb_resources::VsmbLinuxDeviceHandle {
+                share_name: "linux".into(),
+                root_path,
+            }
+            .into_resource(),
+        ));
+    }
+
     let mut virtio_devices = Vec::new();
     let mut add_virtio_device =
         |bus, resource: Resource<VirtioDeviceHandle>, pcie_devices: &mut Vec<_>| match bus {

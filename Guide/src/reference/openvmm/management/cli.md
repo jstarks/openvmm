@@ -69,12 +69,18 @@ describes the source definitions.
 * `--no-vmbus`: Disables the VMBus server and all VMBus devices, even when
   `--hv` or `--uefi` is active. The guest boots using only standard PCIe
   devices and virtio transports. Incompatible with `--disk`, `--pcat`,
-  `--vtl2`, `--vsmb-memory`, and VMBus serial options.
+  `--vtl2`, `--vsmb-memory`, `--vsmb-linux`, and VMBus serial options.
 * `--vsmb-memory <SHARE>`: Expose one volatile writable in-memory vSMB share
   with a 16 MiB storage quota and a 4096-object limit. Requires Hyper-V
   enlightenments and VMBus; incompatible with `--no-vmbus`. Guest redirector
-  activation is separate from offering the device. Save/restore and host
-  filesystem exports are not supported. See [vSMB](../../devices/vmbus/vsmb.md).
+  activation is separate from offering the device. Save/restore is unsupported.
+  See [vSMB](../../devices/vmbus/vsmb.md).
+* `--vsmb-linux <ROOT>`: On Linux 6.6+, expose a host directory as the writable
+  vSMB share `linux`, using the process's host credentials. Requires Hyper-V
+  enlightenments and VMBus; incompatible with `--no-vmbus` and `--vsmb-memory`.
+  The root configuration path must be UTF-8. Guest redirector activation is
+  separate; save/restore is unsupported. See [vSMB](../../devices/vmbus/vsmb.md)
+  for the native provider's initial compatibility profile.
 * `--hypervisor <SPEC>`: Select a specific hypervisor backend, optionally with
   backend-specific parameters. The format is `name` or `name:key=val,key,...`.
   Available backends: `whp` (Windows), `kvm` (Linux), `mshv` (Linux,

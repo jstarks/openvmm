@@ -14,7 +14,7 @@ mod transport;
 use guestmem::GuestMemory;
 use guid::Guid;
 use inspect::InspectMut;
-use smb::{Server, memory::MemoryFs, runtime::ConnectionTask};
+use smb::{Server, memory::MemoryFs, provider::FileSystem, runtime::ConnectionTask};
 use std::sync::Arc;
 use task_control::{Cancelled, StopTask};
 use vmbus_async::pipe::BytePipe;
@@ -30,12 +30,12 @@ use vmcore::vm_task::VmTaskDriver;
 const INTERFACE: Guid = guid::guid!("4d12e519-17a0-4ae4-8eaa-5270fc6abdb7");
 const INSTANCE: Guid = guid::guid!("dcc079ae-60ba-4d07-847c-3493609c0870");
 
-/// A volatile, writable MemoryFs share. Serialization is not supported.
-pub struct VsmbDevice {
-    server: Arc<Server<MemoryFs>>,
+/// A share using a VM-independent filesystem provider. Serialization is unsupported.
+pub struct VsmbDevice<B: FileSystem = MemoryFs> {
+    server: Arc<Server<B>>,
     driver: VmTaskDriver,
     // Device ownership survives the simple wrapper dropping its runner on close.
-    channel: Option<ConnectionTask<MemoryFs, transport::Transport<BytePipe<GpadlRingMem>>>>,
+    channel: Option<ConnectionTask<B, transport::Transport<BytePipe<GpadlRingMem>>>>,
     guest_data: Option<Arc<transfer::GuestData>>,
 }
 
@@ -45,8 +45,19 @@ impl VsmbDevice {
         let fs = MemoryFs::new(16 * 1024 * 1024, 4096)
             .with_oplocks()?
             .with_short_name_generation();
+        Self::with_filesystem(share_name, driver, fs)
+    }
+}
+
+impl<B: FileSystem> VsmbDevice<B> {
+    /// Configure one share backed by the supplied provider.
+    pub fn with_filesystem(
+        share_name: String,
+        driver: VmTaskDriver,
+        filesystem: B,
+    ) -> Result<Self, smb::spec::Status> {
         Ok(Self {
-            server: Server::new(share_name, fs)?,
+            server: Server::new(share_name, filesystem)?,
             driver,
             channel: None,
             guest_data: None,
@@ -55,7 +66,7 @@ impl VsmbDevice {
 }
 
 #[async_trait::async_trait]
-impl SimpleVmbusDevice for VsmbDevice {
+impl<B: FileSystem> SimpleVmbusDevice for VsmbDevice<B> {
     type SavedState = vmcore::save_restore::NoSavedState;
     type Runner = ();
 
@@ -146,7 +157,7 @@ impl SimpleVmbusDevice for VsmbDevice {
     }
 }
 
-impl InspectMut for VsmbDevice {
+impl<B: FileSystem> InspectMut for VsmbDevice<B> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         SimpleVmbusDevice::inspect(self, req, None);
     }

@@ -1191,6 +1191,11 @@ flags:
     #[clap(long, value_name = "SHARE", conflicts_with = "no_vmbus")]
     pub vsmb_memory: Option<String>,
 
+    /// expose a Linux host directory as the writable vSMB share "linux" (Linux 6.6+)
+    #[cfg(target_os = "linux")]
+    #[clap(long, value_name = "ROOT", conflicts_with_all = ["no_vmbus", "vsmb_memory"])]
+    pub vsmb_linux: Option<PathBuf>,
+
     /// expose a battery device
     #[clap(long)]
     pub battery: bool,
@@ -5673,6 +5678,34 @@ mod tests {
             Options::try_parse_from(["openvmm", "--uefi", "--no-hv", "--no-vmbus", "--hv"])
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_vsmb_requires_a_root_and_excludes_other_share_modes() {
+        let opt =
+            Options::try_parse_from(["openvmm", "--uefi", "--vsmb-linux", "/tmp/export"]).unwrap();
+        assert_eq!(opt.vsmb_linux.as_deref(), Some(Path::new("/tmp/export")));
+        for args in [
+            vec!["openvmm", "--uefi", "--vsmb-linux"],
+            vec![
+                "openvmm",
+                "--uefi",
+                "--vsmb-linux",
+                "/tmp/export",
+                "--no-vmbus",
+            ],
+            vec![
+                "openvmm",
+                "--uefi",
+                "--vsmb-linux",
+                "/tmp/export",
+                "--vsmb-memory",
+                "memory",
+            ],
+        ] {
+            assert!(Options::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

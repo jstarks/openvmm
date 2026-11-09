@@ -33,3 +33,50 @@ impl ResolveResource<VmbusDeviceHandleKind, VsmbMemoryDeviceHandle> for VsmbReso
         Ok(SimpleDeviceWrapper::new(driver, device).into())
     }
 }
+
+/// Resolves directory-backed shares on Linux hosts.
+#[cfg(target_os = "linux")]
+pub struct VsmbLinuxResolver;
+
+#[cfg(target_os = "linux")]
+vm_resource::declare_static_async_resolver! {
+    VsmbLinuxResolver,
+    (VmbusDeviceHandleKind, vsmb_resources::VsmbLinuxDeviceHandle),
+}
+
+/// A directory-backed share could not be configured.
+#[cfg(target_os = "linux")]
+#[derive(Debug, thiserror::Error)]
+pub enum LinuxResolveError {
+    /// Required native I/O or root capture failed.
+    #[error("failed to initialize Linux vSMB filesystem")]
+    FileSystem(#[from] smb_linux::OpenRootError),
+    /// The share configuration is invalid.
+    #[error("invalid Linux vSMB share: {0:?}")]
+    Share(#[from] smb::spec::Status),
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl vm_resource::AsyncResolveResource<VmbusDeviceHandleKind, vsmb_resources::VsmbLinuxDeviceHandle>
+    for VsmbLinuxResolver
+{
+    type Output = ResolvedVmbusDevice;
+    type Error = LinuxResolveError;
+
+    async fn resolve(
+        &self,
+        _resolver: &vm_resource::ResourceResolver,
+        resource: vsmb_resources::VsmbLinuxDeviceHandle,
+        input: ResolveVmbusDeviceHandleParams<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        let driver = input.driver_source.simple();
+        let filesystem = smb_linux::LinuxFs::new(
+            std::path::Path::new(&resource.root_path),
+            std::sync::Arc::new(driver.clone()),
+        )
+        .await?;
+        let device = VsmbDevice::with_filesystem(resource.share_name, driver.clone(), filesystem)?;
+        Ok(SimpleDeviceWrapper::new(driver, device).into())
+    }
+}

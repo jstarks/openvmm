@@ -6,7 +6,7 @@ name = "smb_linux"
 edition.workspace = true
 rust-version.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 async-channel.workspace = true
 async-trait.workspace = true
 blocking.workspace = true

@@ -24,6 +24,10 @@ async-trait.workspace = true
 tracelimit.workspace = true
 zerocopy.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+smb_linux.workspace = true
+thiserror.workspace = true
+
 [dev-dependencies]
 inspect = { workspace = true, features = ["initiate"] }
 test_with_tracing.workspace = true

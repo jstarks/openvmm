@@ -1,6 +1,7 @@
 # vSMB
 
-The `vsmb` device exposes a volatile in-memory SMB filesystem over VMBus.
+The `vsmb` device exposes one SMB share over VMBus, backed by memory or a Linux
+host directory.
 
 ## Configuration
 
@@ -10,10 +11,33 @@ writable share with a 16 MiB storage quota and a 4096-object limit. Files surviv
 channel reconnects but disappear when the device is destroyed. The option
 cannot be combined with `--no-vmbus`.
 
+On Linux, use `--vsmb-linux <ROOT>` instead to expose the host directory as the
+share `linux`. The declared minimum kernel is Linux 6.6. File reads, writes and
+flushes use io_uring; metadata operations without usable SQEs use bounded workers.
+The root configuration path must be UTF-8. Both options require Hyper-V
+enlightenments and VMBus and are mutually exclusive.
+
 ```admonish warning
-This is an initial integration profile, not a host filesystem export or a
-complete vSMB implementation. Serialized VM save/restore is unsupported.
+Linux exports are writable with the OpenVMM process's credentials. Choose an
+export directory accordingly: guest changes affect real host files.
+This is an initial compatibility profile, not a complete vSMB implementation.
+Serialized VM save/restore is unsupported.
 ```
+
+The Linux v1 profile uses native case lookup and WSL-style character projection.
+It does not guarantee unambiguous access to every possible Linux filename.
+Existing relative symlinks are exposed for guest evaluation; absolute-target
+traversal is rejected. Nested mounts within the export are allowed. Safe target
+inspection supplies directory-link hints; dangling links are file-like.
+
+External host changes are allowed, so the provider grants no oplocks or leases.
+Notifications observe native changes; recursive membership changes can report
+overflow and require enumeration. SMB locks and sharing coordinate SMB clients,
+not uncooperative host processes. Guest security queries describe simple
+share-level policy, not POSIX ACLs; guest ACL changes are rejected.
+Windows-only metadata storage, guest EAs and named streams are not implemented.
+Ordinary writes are buffered; FLUSH and write-through are honored, while an
+ordinary CLOSE does not implicitly flush.
 
 The initial compatibility target is Windows Server 2025. The tested transport
 uses version 1 negotiation and v2 page descriptors, copying data between guest
@@ -36,7 +60,7 @@ Run connected-ring and guest-memory tests with:
 cargo nextest run --profile agent -p vsmb
 ```
 
-Run the real Windows guest fixture with:
+Run the MemoryFs Windows guest fixture with:
 
 ```bash
 cargo xflowey vmm-tests-run \
@@ -59,6 +83,18 @@ A server-observed pending watch and waiting LOCK must survive VM pause/resume.
 A cached reader holds verified server-granted lease rights; a write through a hard-link alias
 must revoke those rights before cached and uncached reads see the updated data.
 The break must finish before the server's forced-revocation timeout.
+
+On a Linux host, run the native-backed Windows guest fixture with:
+
+```bash
+cargo xflowey vmm-tests-run \
+  --filter 'test(vsmb_linux_file_operations)' --skip-vhd-prompt
+```
+
+It verifies real host bytes, host updates and notifications, filename projection,
+uncached external transfers, pending watch/lock pause-resume and reboot cleanup.
+Host-seeded hard-link aliases force server-side locking; guest hard-link creation
+is not part of this native v1 profile.
 
 The VM-independent [`smb` engine](https://openvmm.dev/rustdoc/linux/smb/index.html)
 is also exercised by selected Samba suites over its loopback TCP test frontend.

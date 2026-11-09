@@ -93,7 +93,9 @@ public static class VsmbGuest {
         Array.Copy(BitConverter.GetBytes(value), 0, buffer, offset, 4);
     }
 
-    public static void Activate() {
+    public static void Activate() { Activate("memory"); }
+
+    public static void Activate(string shareName) {
         SafeFileHandle token;
         if (!OpenProcessToken(Process.GetCurrentProcess().Handle, 0x28, out token))
             throw new Win32Exception();
@@ -148,7 +150,7 @@ public static class VsmbGuest {
                 IntPtr.Zero, 0);
             if (status != 0) throw new Exception("BIND_TRANSPORT: 0x" + status.ToString("X8"));
         }
-        string share = @"\Device\vmsmb\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\memory";
+        string share = @"\Device\vmsmb\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\" + shareName;
         MountShare(share);
         if (!DefineDosDevice(1, "V:", share))
             throw new Win32Exception();
@@ -303,10 +305,12 @@ public static class VsmbGuest {
             return file;
         }
 
-        public static void TestLocks(string path) {
+        public static void TestLocks(string path) { TestLocks(path, false); }
+
+        public static void TestLocks(string path, bool prelinked) {
             System.IO.File.WriteAllBytes(path, new byte[4096]);
             string alias = path + ".alias";
-            if (!CreateHardLink(alias, path, IntPtr.Zero)) throw new Win32Exception();
+            if (!prelinked && !CreateHardLink(alias, path, IntPtr.Zero)) throw new Win32Exception();
             using (var first = OpenAsync(path, false))
             using (var second = OpenAsync(alias, false)) {
                 Console.WriteLine("VSMB_SHARED_LOCKS");
@@ -354,6 +358,20 @@ public static class VsmbGuest {
             }
             System.IO.File.Delete(alias);
             System.IO.File.Delete(path);
+        }
+
+        public static void TestHostNotification(string directory) {
+            using (var handle = OpenAsync(directory, true))
+            using (var watch = new Pending(handle, 0)) {
+                watch.Notify();
+                System.IO.File.WriteAllText(@"C:\vsmb-native-watch-ready", "ready");
+                uint bytes = watch.Complete(0);
+                int length = Marshal.ReadInt32(watch.Buffer, 8);
+                if (bytes < 12 || Marshal.ReadInt32(watch.Buffer, 4) != 1 ||
+                    Marshal.PtrToStringUni(IntPtr.Add(watch.Buffer, 12), length / 2) != "from-host.bin")
+                    throw new Exception("Wrong host directory notification");
+                System.IO.File.Delete(System.IO.Path.Combine(directory, "from-host.bin"));
+            }
         }
 
         public static void TestNotifications(string directory) {

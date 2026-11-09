@@ -18,3 +18,16 @@ pub struct VsmbMemoryDeviceHandle {
 impl ResourceId<VmbusDeviceHandleKind> for VsmbMemoryDeviceHandle {
     const ID: &'static str = "vsmb-memory";
 }
+
+/// A writable directory-rooted share on a Linux host.
+#[derive(MeshPayload)]
+pub struct VsmbLinuxDeviceHandle {
+    /// SMB share name.
+    pub share_name: String,
+    /// Host directory captured when the device is resolved.
+    pub root_path: String,
+}
+
+impl ResourceId<VmbusDeviceHandleKind> for VsmbLinuxDeviceHandle {
+    const ID: &'static str = "vsmb-linux";
+}

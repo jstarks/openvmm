@@ -129,6 +129,8 @@ vm_resource::register_static_resolvers! {
     uidevices::resolver::VmbusUiResolver,
     vmbfs::resolver::VmbfsResolver,
     vsmb::resolver::VsmbResolver,
+    #[cfg(target_os = "linux")]
+    vsmb::resolver::VsmbLinuxResolver,
     vmbus_serial_host::resolver::VmbusSerialDeviceResolver,
 }
 

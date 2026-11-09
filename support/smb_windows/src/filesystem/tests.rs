@@ -20,6 +20,10 @@ impl Fixture for NativeFixture {
         &self.0
     }
 
+    fn readonly_maximum_delete_child_status(&self) -> Status {
+        Status::SUCCESS
+    }
+
     fn expectations(&self) -> Expectations {
         Expectations {
             filesystem_information: Feature::Supported,

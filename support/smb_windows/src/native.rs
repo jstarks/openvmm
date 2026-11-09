@@ -10,7 +10,6 @@ use pal_async::windows::overlapped::{CustomNt, OverlappedFile};
 use smb::provider::{BasicInformation, FileSystemInformation, Metadata, SectorSizeInformation};
 use smb::security::SecurityDescriptor;
 use smb::spec::Status;
-use smb::spec::{AccessMask, CreateAction};
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::mem::{offset_of, size_of};
@@ -290,31 +289,6 @@ pub(crate) fn metadata(file: &File, path: String) -> Result<Metadata, Status> {
         maximal_access: info.EffectiveAccess,
         granted_access: access.AccessFlags,
     })
-}
-
-pub(crate) fn readonly_maximum_mask(
-    file: &File,
-    requested: u32,
-    action: u32,
-) -> Result<u32, Status> {
-    let requested = AccessMask::from_bits(requested);
-    if !requested.maximum_allowed() || action != CreateAction::OPENED.0 {
-        return Ok(0);
-    }
-    let info: nt::FILE_BASIC_INFORMATION = query(file)?;
-    if info.FileAttributes & fs::FILE_ATTRIBUTE_READONLY == 0 {
-        return Ok(0);
-    }
-    // MS-FSA 2.1.5.1.2.1 narrows MAXIMUM_ALLOWED before checking remaining
-    // explicit rights. NtCreateFile can instead retain explicit DELETE_CHILD.
-    let mask = fs::FILE_WRITE_DATA | fs::FILE_APPEND_DATA | fs::FILE_DELETE_CHILD;
-    let granted: nt::FILE_ACCESS_INFORMATION = query(file)?;
-    let remaining =
-        requested.with_maximum_allowed(false).into_bits() & !(granted.AccessFlags & !mask);
-    if remaining != 0 {
-        return Err(Status::ACCESS_DENIED);
-    }
-    Ok(mask)
 }
 
 information! {

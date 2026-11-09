@@ -44,6 +44,11 @@ pub struct OpenRootError(Status);
 ///
 /// Metadata follows native names within the captured root. Name queries on
 /// objects subsequently moved outside that root fail explicitly.
+///
+/// MAXIMUM_ALLOWED uses the native open's access decision. In particular,
+/// Windows can accept explicit DELETE_CHILD together with MAXIMUM_ALLOWED on
+/// a readonly file, unlike MS-FSA 2.1.5.1.2.1. Rechecking attributes after open
+/// would race with external host changes and require extra query permissions.
 pub struct WindowsFs(Arc<Inner>);
 
 struct Inner {
@@ -304,12 +309,10 @@ impl FileSystem for WindowsFs {
                 // Retain the open slot even if an initialization future is dropped.
                 let (file, action) = walk(root, parts, &create)?;
                 let directory = native::is_directory(&file)?;
-                let readonly_mask =
-                    native::readonly_maximum_mask(&file, logical_access.into_bits(), action)?;
-                Ok(((file, action, directory, readonly_mask), reservation))
+                Ok(((file, action, directory), reservation))
             })
             .await;
-        let ((file, action, directory, readonly_mask), reservation) = match result {
+        let ((file, action, directory), reservation) = match result {
             Err(Status::OBJECT_NAME_NOT_FOUND) if unsupported_creation => {
                 return Err(Status::NOT_SUPPORTED);
             }
@@ -338,8 +341,7 @@ impl FileSystem for WindowsFs {
                     && !options.access().write_data()
                     && !options.access().generic_write()
                     && !options.access().generic_all(),
-                hidden_access: readonly_mask
-                    | if hidden_read { fs::FILE_READ_DATA } else { 0 }
+                hidden_access: if hidden_read { fs::FILE_READ_DATA } else { 0 }
                     | if action == CreateAction::CREATED.0 && !logical_access.maximum_allowed() {
                         replacement_access(options.disposition()) & !logical_access.into_bits()
                     } else {

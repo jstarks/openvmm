@@ -106,6 +106,13 @@ pub trait Fixture {
     /// Feature expectations chosen by this provider's tests.
     fn expectations(&self) -> Expectations;
 
+    /// MS-FSA rejects explicit DELETE_CHILD with MAXIMUM_ALLOWED on a readonly
+    /// file. Native Windows can accept the open instead; this declares that
+    /// status without weakening the remaining maximum-access assertions.
+    fn readonly_maximum_delete_child_status(&self) -> Status {
+        Status::ACCESS_DENIED
+    }
+
     /// Observe actual watch registration or a contended lock entering its wait.
     ///
     /// Called after the operation's first pending poll. The scenario continues
@@ -1413,8 +1420,8 @@ pub async fn maximum_allowed_access<F: Fixture>(fixture: &F) {
         );
         fs.close(&peer, &request).await.unwrap();
         let access = AccessMask::new().with_delete_child(true);
-        rejected(
-            fs.open(
+        let mixed = fs
+            .open(
                 "grants",
                 OpenOptions {
                     access: access.with_maximum_allowed(true).into_bits(),
@@ -1422,9 +1429,18 @@ pub async fn maximum_allowed_access<F: Fixture>(fixture: &F) {
                 },
                 &request,
             )
-            .await,
-            Status::ACCESS_DENIED,
-        );
+            .await;
+        let expected = fixture.readonly_maximum_delete_child_status();
+        if expected == Status::SUCCESS {
+            let (mixed, _) = mixed.unwrap();
+            let granted =
+                AccessMask::from_bits(fs.metadata(&mixed, &request).await.unwrap().granted_access);
+            assert!(granted.read_data());
+            assert!(!granted.write_data() && !granted.append_data());
+            fs.close(&mixed, &request).await.unwrap();
+        } else {
+            rejected(mixed, expected);
+        }
         let (explicit, _) = fs
             .open(
                 "grants",

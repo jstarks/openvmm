@@ -7,15 +7,19 @@
 use pal::windows::{ObjectAttributes, UnicodeStringRef};
 use pal_async::driver::Driver;
 use pal_async::windows::overlapped::{CustomNt, OverlappedFile};
-use smb::provider::{BasicInformation, FileSystemInformation, Metadata, SectorSizeInformation};
+use smb::provider::{
+    BasicInformation, Change, FileSystemInformation, Metadata, SectorSizeInformation,
+};
 use smb::security::SecurityDescriptor;
 use smb::spec::Status;
+use smb::spec::{NotifyAction, NotifyFilter};
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::mem::{offset_of, size_of};
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle};
 use std::path::Path;
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use windows_sys::Wdk::Storage::FileSystem as nt;
@@ -23,6 +27,23 @@ use windows_sys::Wdk::System::SystemServices as ss;
 use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE};
 use windows_sys::Win32::Storage::FileSystem as fs;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtNotifyChangeDirectoryFile(
+        file: windows_sys::Win32::Foundation::HANDLE,
+        event: windows_sys::Win32::Foundation::HANDLE,
+        routine: Option<
+            unsafe extern "system" fn(*mut std::ffi::c_void, *mut IO_STATUS_BLOCK, u32),
+        >,
+        context: *const std::ffi::c_void,
+        iosb: *mut IO_STATUS_BLOCK,
+        buffer: *mut std::ffi::c_void,
+        length: u32,
+        filter: u32,
+        tree: bool,
+    ) -> i32;
+}
 
 struct Completion(UnsafeCell<IO_STATUS_BLOCK>);
 
@@ -179,6 +200,12 @@ information! {
     nt::FILE_ALIGNMENT_INFORMATION => nt::FileAlignmentInformation,
     nt::FILE_EA_INFORMATION => nt::FileEaInformation,
     nt::FILE_CASE_SENSITIVE_INFORMATION => nt::FileCaseSensitiveInformation,
+    nt::FILE_INTERNAL_INFORMATION => nt::FileInternalInformation,
+}
+
+pub(crate) fn identity(file: &File) -> Result<u64, Status> {
+    let info: nt::FILE_INTERNAL_INFORMATION = query(file)?;
+    Ok(info.IndexNumber as u64)
 }
 
 fn query<T: Information>(file: &File) -> Result<T, Status> {
@@ -307,32 +334,33 @@ pub(crate) fn delete_pending(file: &File) -> Result<bool, Status> {
     Ok(standard(file)?.DeletePending)
 }
 
-pub(crate) fn list(directory: &File) -> Result<Vec<String>, Status> {
-    check_directory(directory)?;
-    let mut buffer = [0u64; 1024];
+pub(crate) fn list(directory: &OverlappedFile) -> Result<Vec<String>, Status> {
+    check_directory(directory.get())?;
     let mut names = Vec::new();
     let mut bytes = 0;
     let mut restart = true;
     loop {
-        let iosb = Completion::new();
-        // SAFETY: This unassociated directory handle has serialized enumeration.
-        // The worker retains the aligned output until completion, including pending.
-        let result = unsafe {
-            nt::NtQueryDirectoryFile(
-                directory.as_raw_handle(),
-                null_mut(),
-                None,
-                null(),
-                iosb.as_ptr(),
-                buffer.as_mut_ptr().cast(),
-                size_of_val(&buffer) as u32,
-                nt::FileNamesInformation,
-                true,
-                null(),
-                restart,
-            )
+        // SAFETY: PAL owns the aligned buffer, status and completion context.
+        // The bounded worker drains each query before releasing the scan lock.
+        let operation = unsafe {
+            directory.custom_nt(vec![0u64; 1024], |handle, buffer, overlapped| {
+                nt::NtQueryDirectoryFile(
+                    handle,
+                    null_mut(),
+                    None,
+                    overlapped.cast(),
+                    overlapped.cast(),
+                    buffer.as_mut_ptr().cast(),
+                    size_of_val(buffer.as_slice()) as u32,
+                    nt::FileNamesInformation,
+                    true,
+                    null(),
+                    restart,
+                )
+            })
         };
-        match iosb.finish(result) {
+        let ((result, used), buffer) = futures::executor::block_on(operation);
+        match status(result) {
             Err(Status::NO_MORE_FILES) => return Ok(names),
             result => result?,
         }
@@ -341,7 +369,7 @@ pub(crate) fn list(directory: &File) -> Result<Vec<String>, Status> {
         let info = unsafe { &*buffer.as_ptr().cast::<nt::FILE_NAMES_INFORMATION>() };
         let name = wide_name(
             &buffer,
-            iosb.information(),
+            used,
             offset_of!(nt::FILE_NAMES_INFORMATION, FileName),
             info.FileNameLength,
         )?;
@@ -353,6 +381,90 @@ pub(crate) fn list(directory: &File) -> Result<Vec<String>, Status> {
             return Err(Status::INSUFFICIENT_RESOURCES);
         }
         names.push(name);
+    }
+}
+
+pub(crate) struct NotifyBuffer {
+    _file: Arc<OverlappedFile>,
+    words: Vec<u64>,
+}
+
+pub(crate) fn notify(
+    file: Arc<OverlappedFile>,
+    filter: NotifyFilter,
+    tree: bool,
+) -> CustomNt<NotifyBuffer> {
+    let buffer = NotifyBuffer {
+        _file: file.clone(),
+        words: vec![0; 8192],
+    };
+    // SAFETY: The pending operation owns its handle, aligned output, status and
+    // completion context through actual completion, including after cancellation.
+    unsafe {
+        file.custom_nt(buffer, |handle, buffer, overlapped| {
+            NtNotifyChangeDirectoryFile(
+                handle,
+                null_mut(),
+                None,
+                overlapped.cast(),
+                overlapped.cast(),
+                buffer.words.as_mut_ptr().cast(),
+                size_of_val(buffer.words.as_slice()) as u32,
+                filter.into_bits(),
+                tree,
+            )
+        })
+    }
+}
+
+pub(crate) fn notify_changes(
+    result: i32,
+    used: usize,
+    buffer: &NotifyBuffer,
+) -> Result<Option<Vec<Change>>, Status> {
+    if result == windows_sys::Win32::Foundation::STATUS_NOTIFY_CLEANUP {
+        return Err(Status::NOTIFY_CLEANUP);
+    }
+    if result == windows_sys::Win32::Foundation::STATUS_BUFFER_OVERFLOW {
+        return Ok(None);
+    }
+    status(result)?;
+    if used == 0 || result == windows_sys::Win32::Foundation::STATUS_NOTIFY_ENUM_DIR {
+        return Ok(None);
+    }
+    if used > size_of_val(buffer.words.as_slice()) {
+        return Err(Status::INTERNAL_ERROR);
+    }
+    // SAFETY: Completion has released the buffer; used is within its allocation.
+    let mut bytes = unsafe { std::slice::from_raw_parts(buffer.words.as_ptr().cast::<u8>(), used) };
+    let mut changes = Vec::new();
+    loop {
+        if bytes.len() < 12 {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        let next = u32::from_le_bytes(bytes[..4].try_into().expect("checked prefix")) as usize;
+        let action = u32::from_le_bytes(bytes[4..8].try_into().expect("checked prefix"));
+        let length = u32::from_le_bytes(bytes[8..12].try_into().expect("checked prefix")) as usize;
+        let end = 12usize.checked_add(length).ok_or(Status::INTERNAL_ERROR)?;
+        let name = bytes.get(12..end).ok_or(Status::INTERNAL_ERROR)?;
+        if !length.is_multiple_of(2) {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        let name = name
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        changes.push(Change {
+            action: NotifyAction(action),
+            name: String::from_utf16(&name).map_err(|_| Status::OBJECT_NAME_INVALID)?,
+        });
+        if next == 0 {
+            return Ok(Some(changes));
+        }
+        if next < end || !next.is_multiple_of(4) {
+            return Err(Status::INTERNAL_ERROR);
+        }
+        bytes = bytes.get(next..).ok_or(Status::INTERNAL_ERROR)?;
     }
 }
 

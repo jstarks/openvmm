@@ -3,6 +3,7 @@
 
 use crate::io::{Io, check};
 use crate::native::{self, Create};
+use crate::notify::Watch;
 use async_trait::async_trait;
 use futures::FutureExt;
 use inspect::Inspect;
@@ -10,15 +11,18 @@ use pal_async::driver::Driver;
 use pal_async::windows::overlapped::OverlappedFile;
 use parking_lot::Mutex;
 use smb::provider::{
-    BasicInformation, FileSystem, FileSystemInformation, Metadata, OpenOptions, RequestContext,
-    map_access,
+    BasicInformation, FileSystem, FileSystemInformation, Metadata, NotifyResult, OpenOptions,
+    RequestContext, map_access,
 };
 use smb::security::SecurityDescriptor;
-use smb::spec::{AccessMask, CreateAction, CreateDisposition, SecurityInformation, Status};
+use smb::spec::{
+    AccessMask, CreateAction, CreateDisposition, NotifyFilter, SecurityInformation, Status,
+};
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use windows_sys::Wdk::Storage::FileSystem as nt;
 use windows_sys::Win32::Storage::FileSystem as fs;
 
@@ -49,12 +53,17 @@ pub struct OpenRootError(Status);
 /// Windows can accept explicit DELETE_CHILD together with MAXIMUM_ALLOWED on
 /// a readonly file, unlike MS-FSA 2.1.5.1.2.1. Rechecking attributes after open
 /// would race with external host changes and require extra query permissions.
+///
+/// Notifications retain the first registration's filter and scope across guest
+/// cancellations. Once deletion invalidates a registration, watching again
+/// requires a fresh directory open, even if delete disposition is cleared.
 pub struct WindowsFs(Arc<Inner>);
 
 struct Inner {
     io: Io,
     root: Arc<File>,
     opens: AtomicUsize,
+    watches: Mutex<HashMap<u64, Vec<Weak<Watch>>>>,
 }
 
 struct Reservation(Arc<Inner>);
@@ -70,6 +79,7 @@ pub struct WindowsFile {
     file: Mutex<Option<Open>>,
     append_only: bool,
     hidden_access: u32,
+    watch: Arc<futures::lock::Mutex<Option<Arc<Watch>>>>,
 }
 
 struct Open {
@@ -79,30 +89,45 @@ struct Open {
 
 enum NativeFile {
     Data(OverlappedFile),
-    Directory(File, Mutex<()>),
+    Directory(Directory),
+}
+
+struct Directory {
+    file: Arc<OverlappedFile>,
+    scan: Mutex<()>,
+    id: u64,
+    notify_deleted: AtomicBool,
+    closing: AtomicBool,
 }
 
 impl NativeFile {
     fn get(&self) -> &File {
         match self {
             Self::Data(file) => file.get(),
-            Self::Directory(file, _) => file,
+            Self::Directory(directory) => directory.file.get(),
         }
     }
 
     fn overlapped(&self) -> Result<&OverlappedFile, Status> {
         match self {
             Self::Data(file) => Ok(file),
-            Self::Directory(..) => Err(Status::FILE_IS_A_DIRECTORY),
+            Self::Directory(_) => Err(Status::FILE_IS_A_DIRECTORY),
+        }
+    }
+
+    fn directory(&self) -> Result<&Directory, Status> {
+        match self {
+            Self::Directory(directory) => Ok(directory),
+            Self::Data(_) => Err(Status::NOT_A_DIRECTORY),
         }
     }
 
     fn list(&self) -> Result<Vec<String>, Status> {
         match self {
             Self::Data(_) => Err(Status::NOT_A_DIRECTORY),
-            Self::Directory(file, scan) => {
-                let _scan = scan.lock();
-                native::list(file)
+            Self::Directory(directory) => {
+                let _scan = directory.scan.lock();
+                native::list(&directory.file)
             }
         }
     }
@@ -146,6 +171,7 @@ impl WindowsFs {
             io,
             root: Arc::new(root),
             opens: AtomicUsize::new(0),
+            watches: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -308,7 +334,11 @@ impl FileSystem for WindowsFs {
             .worker(request, move || {
                 // Retain the open slot even if an initialization future is dropped.
                 let (file, action) = walk(root, parts, &create)?;
-                let directory = native::is_directory(&file)?;
+                let directory = if native::is_directory(&file)? {
+                    Some(native::identity(&file)?)
+                } else {
+                    None
+                };
                 Ok(((file, action, directory), reservation))
             })
             .await;
@@ -318,18 +348,20 @@ impl FileSystem for WindowsFs {
             }
             result => result?,
         };
-        let file = if directory {
-            NativeFile::Directory(file, Mutex::new(()))
+        let file = native::overlapped(&*self.0.io.driver, file).map_err(|error| {
+            tracelimit::error_ratelimited!(?error, "cannot associate native SMB open with IOCP");
+            Status::INTERNAL_ERROR
+        })?;
+        let file = if let Some(id) = directory {
+            NativeFile::Directory(Directory {
+                file: Arc::new(file),
+                scan: Mutex::new(()),
+                id,
+                notify_deleted: AtomicBool::new(options.options & nt::FILE_DELETE_ON_CLOSE != 0),
+                closing: AtomicBool::new(false),
+            })
         } else {
-            NativeFile::Data(
-                native::overlapped(&*self.0.io.driver, file).map_err(|error| {
-                    tracelimit::error_ratelimited!(
-                        ?error,
-                        "cannot associate native SMB open with IOCP"
-                    );
-                    Status::INTERNAL_ERROR
-                })?,
-            )
+            NativeFile::Data(file)
         };
         Ok((
             WindowsFile {
@@ -347,6 +379,7 @@ impl FileSystem for WindowsFs {
                     } else {
                         0
                     },
+                watch: Arc::new(futures::lock::Mutex::new(None)),
             },
             action,
         ))
@@ -354,6 +387,14 @@ impl FileSystem for WindowsFs {
 
     async fn close(&self, file: &WindowsFile, _request: &RequestContext) -> Result<(), Status> {
         let native = file.file.lock().take();
+        if let Some(open) = &native {
+            if let NativeFile::Directory(directory) = &*open.file {
+                directory.closing.store(true, Ordering::Release);
+            }
+        }
+        if let Some(watch) = file.watch.lock().await.take() {
+            watch.shutdown().await;
+        }
         // The engine has already drained this open's operations. Closing does
         // not issue an implicit flush and is not prevented by cancellation.
         self.0
@@ -535,9 +576,24 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let inner = self.0.clone();
         self.0
             .io
-            .worker(request, move || native::set_disposition(file.get(), delete))
+            .worker(request, move || {
+                let mut watches = inner.watches.lock();
+                native::set_disposition(file.get(), delete)?;
+                if delete {
+                    if let NativeFile::Directory(directory) = &*file {
+                        directory.notify_deleted.store(true, Ordering::Release);
+                        if let Some(watches) = watches.remove(&directory.id) {
+                            for watch in watches.into_iter().filter_map(|watch| watch.upgrade()) {
+                                watch.invalidate();
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
             .await
     }
 
@@ -552,6 +608,68 @@ impl FileSystem for WindowsFs {
             .io
             .worker(request, move || native::set_basic(file.get(), info))
             .await
+    }
+
+    async fn notify(
+        &self,
+        file: &WindowsFile,
+        filter: NotifyFilter,
+        watch_tree: bool,
+        output_length: usize,
+        request: &RequestContext,
+    ) -> Result<NotifyResult, Status> {
+        let native = file.get()?;
+        let directory = native.directory()?;
+        if file.hidden_access & fs::FILE_READ_DATA != 0 {
+            return Err(Status::ACCESS_DENIED);
+        }
+        if directory.notify_deleted.load(Ordering::Acquire) {
+            return Err(Status::DELETE_PENDING);
+        }
+        let existing = file.watch.lock().await.clone();
+        let watch = match existing {
+            Some(watch) => watch,
+            None => {
+                let inner = self.0.clone();
+                let native = native.clone();
+                let slot = file.watch.clone();
+                self.0
+                    .io
+                    .worker(&RequestContext::new(request.id()), move || {
+                        // Store the registration before returning the worker result,
+                        // so dropping an awaiting future cannot discard accepted work.
+                        let mut slot = futures::executor::block_on(slot.lock());
+                        let directory = native.directory()?;
+                        if directory.closing.load(Ordering::Acquire) {
+                            return Err(Status::FILE_CLOSED);
+                        }
+                        if let Some(watch) = &*slot {
+                            return Ok(watch.clone());
+                        }
+                        let mut watches = inner.watches.lock();
+                        if native::delete_pending(native.get())? {
+                            return Err(Status::DELETE_PENDING);
+                        }
+                        let watch = Watch::new(directory.file.clone(), filter, watch_tree)?;
+                        watches.retain(|_, entries| {
+                            entries.retain(|entry| entry.strong_count() != 0);
+                            !entries.is_empty()
+                        });
+                        watches
+                            .entry(directory.id)
+                            .or_default()
+                            .push(Arc::downgrade(&watch));
+                        *slot = Some(watch.clone());
+                        Ok(watch)
+                    })
+                    .await?
+            }
+        };
+        let result = watch.notify(output_length, request).await;
+        if watch.invalidated() {
+            watch.shutdown().await;
+        }
+        result
     }
 
     async fn set_allocation_size(

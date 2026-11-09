@@ -113,6 +113,13 @@ pub trait Fixture {
         Status::ACCESS_DENIED
     }
 
+    /// Native Windows retains the invalidated notification context on an open
+    /// after delete disposition is cleared. A fresh directory open is required
+    /// to watch again; the literal MS-FSA model can recreate a peer's registration.
+    fn notify_requires_reopen_after_delete(&self) -> bool {
+        false
+    }
+
     /// Observe actual watch registration or a contended lock entering its wait.
     ///
     /// Called after the operation's first pending poll. The scenario continues
@@ -3109,7 +3116,8 @@ pub async fn notify_subtree_and_filters<F: Fixture>(fixture: &F) {
 }
 
 /// Deletion invalidates old watch generations even after disposition reset or
-/// late cancellation. Old waiters cannot steal a replacement registration.
+/// late cancellation. Old waiters cannot steal a replacement registration,
+/// using a fresh open when the provider declares native notification lifetime.
 /// Closing a distinct delete-on-close open also invalidates a pending watch.
 pub async fn notify_deletion_generations<F: Fixture>(fixture: &F) {
     let fs = fixture.filesystem();
@@ -3139,9 +3147,25 @@ pub async fn notify_deletion_generations<F: Fixture>(fixture: &F) {
             .unwrap();
         first_request.cancel();
         second_request.cancel();
+        let replacement = if fixture.notify_requires_reopen_after_delete() {
+            rejected(
+                fs.notify(
+                    &watched,
+                    NotifyFilter::new().with_dir_name(true),
+                    false,
+                    4096,
+                    &request,
+                )
+                .await,
+                Status::DELETE_PENDING,
+            );
+            Some(open(fs, "generation", CreateDisposition::OPEN, true, &request).await)
+        } else {
+            None
+        };
         let fresh_request = RequestContext::new(4);
         let mut fresh = std::pin::pin!(fs.notify(
-            &watched,
+            replacement.as_ref().unwrap_or(&watched),
             NotifyFilter::new().with_dir_name(true),
             false,
             4096,
@@ -3159,6 +3183,9 @@ pub async fn notify_deletion_generations<F: Fixture>(fixture: &F) {
         )
         .await;
         changes(fresh.await.unwrap(), &[(NotifyAction::ADDED, "child")]);
+        if let Some(replacement) = &replacement {
+            fs.close(replacement, &request).await.unwrap();
+        }
     }
     rejected(
         fs.notify(&deleting, file_names(), false, 4096, &request)

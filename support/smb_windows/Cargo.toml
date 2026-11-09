@@ -10,6 +10,7 @@ rust-version.workspace = true
 async-channel.workspace = true
 async-trait.workspace = true
 blocking.workspace = true
+event-listener.workspace = true
 futures.workspace = true
 inspect.workspace = true
 pal.workspace = true

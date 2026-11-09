@@ -935,6 +935,8 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     /// Cancellation removes a waiter, not the open's watch or buffered changes.
     /// Directory deletion invalidates registrations and completes pending waits with
     /// STATUS_DELETE_PENDING; later registration must not absorb the old waiters.
+    /// Reactivation after clearing delete disposition may require a new directory
+    /// open, according to the native provider's notification lifetime.
     /// Establish the watch even if the request was canceled before its first poll.
     /// Pending waits must honor cancellation unless an actual result was already obtained.
     /// Providers must bound storage and report overflow rather than silently lose events.

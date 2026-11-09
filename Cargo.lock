@@ -8554,6 +8554,7 @@ dependencies = [
  "async-channel",
  "async-trait",
  "blocking",
+ "event-listener",
  "futures",
  "inspect",
  "pal",

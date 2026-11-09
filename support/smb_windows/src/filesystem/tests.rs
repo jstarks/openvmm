@@ -24,6 +24,10 @@ impl Fixture for NativeFixture {
         Status::SUCCESS
     }
 
+    fn notify_requires_reopen_after_delete(&self) -> bool {
+        true
+    }
+
     fn expectations(&self) -> Expectations {
         Expectations {
             filesystem_information: Feature::Supported,
@@ -50,12 +54,28 @@ impl Fixture for NativeFixture {
             basic_information: Feature::Supported,
             rename: Feature::Supported,
             locks: Feature::Unsupported(Status::NOT_SUPPORTED),
-            notifications: Feature::Unsupported(Status::NOT_SUPPORTED),
+            notifications: Feature::Supported,
         }
     }
 
-    async fn wait_until_pending(&self, _operation: Operation, _request: &RequestContext) {
-        panic!("this foundation has no pending locks or watches");
+    async fn wait_until_pending(&self, operation: Operation, request: &RequestContext) {
+        assert!(matches!(operation, Operation::Notify));
+        let mut timer = pal_async::timer::PolledTimer::new(&*self.0.0.io.driver);
+        loop {
+            let pending = self
+                .0
+                .0
+                .watches
+                .lock()
+                .values()
+                .flatten()
+                .filter_map(Weak::upgrade)
+                .any(|watch| watch.pending(request.id()));
+            if pending {
+                return;
+            }
+            timer.sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 }
 
@@ -100,6 +120,248 @@ contract_test!(sparse_files);
 contract_test!(reparse_controls);
 contract_test!(lock_conflicts_and_io);
 contract_test!(notify_registration_and_cancellation);
+contract_test!(notify_fifo_and_small_buffer);
+contract_test!(notify_subtree_and_filters);
+contract_test!(notify_deletion_generations);
+contract_test!(notify_nonempty_delete_mode_preserves_watch);
+
+#[async_test]
+async fn notifications_buffer_external_recursive_host_changes(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (directory, _) = fs
+        .open(
+            "external",
+            OpenOptions {
+                options: nt::FILE_DIRECTORY_FILE,
+                ..options(CreateDisposition::CREATE)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let filter = NotifyFilter::new().with_file_name(true);
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    assert!(matches!(
+        fs.notify(&directory, filter, true, 4096, &cancelled).await,
+        Err(Status::CANCELLED)
+    ));
+    std::fs::create_dir(root.path().join("external/sub")).unwrap();
+    std::fs::write(root.path().join("external/sub/first"), b"host").unwrap();
+    for name in ["sub\\first", "sub\\second"] {
+        let result = fs
+            .notify(&directory, filter, true, 4096, &request)
+            .await
+            .unwrap();
+        let NotifyResult::Changes(changes) = result else {
+            panic!("expected external host change, got {result:?}");
+        };
+        assert_eq!(
+            changes,
+            vec![smb::provider::Change {
+                action: smb::spec::NotifyAction::ADDED,
+                name: name.to_owned(),
+            }]
+        );
+        if name == "sub\\first" {
+            std::fs::write(root.path().join("external/sub/second"), b"host").unwrap();
+        }
+    }
+    fs.close(&directory, &request).await.unwrap();
+}
+
+#[async_test]
+async fn notification_close_drains_native_io_and_releases_sharing(driver: DefaultDriver) {
+    use std::os::windows::fs::OpenOptionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (directory, _) = fs
+        .open(
+            "closing",
+            OpenOptions {
+                options: nt::FILE_DIRECTORY_FILE,
+                ..options(CreateDisposition::CREATE)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let filter = NotifyFilter::new().with_file_name(true);
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    assert!(matches!(
+        fs.notify(&directory, filter, false, 4096, &cancelled).await,
+        Err(Status::CANCELLED)
+    ));
+    {
+        let mut pending = std::pin::pin!(fs.notify(&directory, filter, false, 4096, &request));
+        assert!(futures::poll!(&mut pending).is_pending());
+        fs.close(&directory, &request).await.unwrap();
+        assert!(matches!(pending.await, Err(Status::NOTIFY_CLEANUP)));
+    }
+    let exclusive = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(fs::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root.path().join("closing"))
+        .unwrap();
+    drop(exclusive);
+}
+
+#[async_test]
+async fn accepted_notification_registration_survives_dropped_setup(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (directory, _) = fs
+        .open(
+            "",
+            OpenOptions {
+                options: nt::FILE_DIRECTORY_FILE,
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let inner = fs.0.clone();
+    let (started, starts) = async_channel::bounded(1);
+    let (release, wait) = std::sync::mpsc::channel();
+    let barrier = std::thread::spawn(move || {
+        let _registry = inner.watches.lock();
+        started.try_send(()).unwrap();
+        let _ = wait.recv();
+    });
+    starts.recv().await.unwrap();
+    let mut setup = Box::pin(fs.notify(
+        &directory,
+        NotifyFilter::new().with_file_name(true),
+        false,
+        4096,
+        &request,
+    ));
+    assert!(futures::poll!(&mut setup).is_pending());
+    let mut timer = pal_async::timer::PolledTimer::new(&*fs.0.io.driver);
+    while directory.watch.try_lock().is_some() {
+        timer.sleep(std::time::Duration::from_millis(1)).await;
+    }
+    drop(setup);
+    release.send(()).unwrap();
+    assert!(directory.watch.lock().await.is_some());
+    barrier.join().unwrap();
+    std::fs::write(root.path().join("retained"), []).unwrap();
+    let result = fs
+        .notify(
+            &directory,
+            NotifyFilter::new().with_dir_name(true),
+            true,
+            4096,
+            &request,
+        )
+        .await
+        .unwrap();
+    let NotifyResult::Changes(changes) = result else {
+        panic!("lost accepted registration: {result:?}");
+    };
+    assert_eq!(
+        changes,
+        vec![smb::provider::Change {
+            action: smb::spec::NotifyAction::ADDED,
+            name: "retained".to_owned(),
+        }]
+    );
+    fs.close(&directory, &request).await.unwrap();
+}
+
+#[async_test]
+async fn native_notification_storage_overflow_requires_reenumeration(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("overflow")).unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (directory, _) = fs
+        .open(
+            "overflow",
+            OpenOptions {
+                options: nt::FILE_DIRECTORY_FILE,
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let filter = NotifyFilter::new().with_file_name(true);
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    assert!(matches!(
+        fs.notify(&directory, filter, false, 4096, &cancelled).await,
+        Err(Status::CANCELLED)
+    ));
+    for index in 0..512 {
+        let name = format!("{index:04}-{}", "x".repeat(128));
+        std::fs::write(root.path().join("overflow").join(name), []).unwrap();
+    }
+    let mut timer = pal_async::timer::PolledTimer::new(&*fs.0.io.driver);
+    {
+        let events = async {
+            for _ in 0..4 {
+                if matches!(
+                    fs.notify(&directory, filter, false, 256 * 1024, &request)
+                        .await
+                        .unwrap(),
+                    NotifyResult::Overflow
+                ) {
+                    return;
+                }
+            }
+            panic!("native event storm did not report overflow");
+        };
+        let mut events = std::pin::pin!(events.fuse());
+        let timeout = timer.sleep(std::time::Duration::from_secs(5));
+        let mut timeout = std::pin::pin!(timeout.fuse());
+        futures::select! {
+            () = events => {},
+            _ = timeout => panic!("native event storm did not complete"),
+        }
+    }
+    fs.close(&directory, &request).await.unwrap();
+}
+
+#[async_test]
+async fn notification_names_reject_invalid_utf16(driver: DefaultDriver) {
+    use std::os::windows::ffi::OsStringExt;
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (directory, _) = fs
+        .open(
+            "",
+            OpenOptions {
+                options: nt::FILE_DIRECTORY_FILE,
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let filter = NotifyFilter::new().with_file_name(true);
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    assert!(matches!(
+        fs.notify(&directory, filter, false, 4096, &cancelled).await,
+        Err(Status::CANCELLED)
+    ));
+    let name = std::ffi::OsString::from_wide(&[0xd800]);
+    std::fs::write(root.path().join(name), []).unwrap();
+    assert!(matches!(
+        fs.notify(&directory, filter, false, 4096, &request).await,
+        Err(Status::OBJECT_NAME_INVALID)
+    ));
+    fs.close(&directory, &request).await.unwrap();
+}
 
 #[async_test]
 async fn native_mutations_change_host_bytes_names_and_attributes(driver: DefaultDriver) {

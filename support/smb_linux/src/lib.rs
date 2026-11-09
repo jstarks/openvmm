@@ -15,11 +15,16 @@
 //! SMB sharing and byte locks coordinate clients of this provider, not external
 //! host processes. Concurrent external namespace changes retain POSIX semantics.
 //! No oplocks or leases are granted. Serialization is not supported.
+//!
+//! Inotify registrations survive cancellation and deliver buffered changes FIFO.
+//! Recursive directory membership changes rebuild registrations and report
+//! overflow, requiring enumeration instead of pretending no events were missed.
 
 #![cfg(target_os = "linux")]
 
 mod io;
 mod names;
+mod notify;
 
 mod filesystem;
 pub use filesystem::{LinuxFile, LinuxFs, OpenRootError};

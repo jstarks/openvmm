@@ -51,6 +51,75 @@ pub(crate) fn check(request: &RequestContext) -> io::Result<()> {
 }
 
 impl Io {
+    pub fn readiness(
+        &self,
+        file: &File,
+    ) -> io::Result<pal_async::driver::PollImpl<dyn pal_async::fd::PollFdReady>> {
+        self.driver.new_dyn_fd_ready(file.as_raw_fd())
+    }
+
+    pub async fn watch_fd(&self, request: &RequestContext) -> io::Result<Arc<File>> {
+        self.worker(request, move || {
+            // SAFETY: inotify_init1 has no pointer arguments and returns a fresh descriptor.
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: This worker owns the newly returned descriptor.
+            Ok(Arc::new(unsafe { File::from_raw_fd(fd) }))
+        })
+        .await
+    }
+
+    pub async fn watch_events(
+        &self,
+        file: Arc<File>,
+        request: &RequestContext,
+    ) -> io::Result<Vec<u8>> {
+        // Linux 6.6 inotify exposes read(), not the read_iter required by io_uring.
+        self.worker(request, move || {
+            let mut data = vec![0; 65536];
+            // SAFETY: The owned output and nonblocking descriptor survive this bounded read.
+            let count =
+                unsafe { libc::read(file.as_raw_fd(), data.as_mut_ptr().cast(), data.len()) };
+            if count < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            data.truncate(count as usize);
+            Ok(data)
+        })
+        .await
+    }
+
+    pub async fn watch_directory(
+        &self,
+        watch: Arc<File>,
+        directory: Arc<File>,
+        request: &RequestContext,
+    ) -> io::Result<i32> {
+        self.worker(request, move || {
+            let name = CString::new(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+                .expect("descriptor path has no NUL");
+            let mask = libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_FROM
+                | libc::IN_MOVED_TO
+                | libc::IN_MODIFY
+                | libc::IN_ATTRIB
+                | libc::IN_ACCESS
+                | libc::IN_DELETE_SELF
+                | libc::IN_MOVE_SELF
+                | libc::IN_ONLYDIR;
+            // SAFETY: Both descriptors and the trusted proc path are retained by this job.
+            let wd = unsafe { libc::inotify_add_watch(watch.as_raw_fd(), name.as_ptr(), mask) };
+            if wd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(wd)
+        })
+        .await
+    }
+
     pub fn new(driver: Arc<dyn Driver>, workers: usize) -> io::Result<Self> {
         if workers == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero workers"));

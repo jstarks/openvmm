@@ -3,6 +3,7 @@
 
 use crate::io::Io;
 use crate::names;
+use crate::notify::Watch;
 use async_trait::async_trait;
 use event_listener::Event;
 use futures::FutureExt;
@@ -11,21 +12,21 @@ use pal_async::driver::Driver;
 use parking_lot::Mutex;
 use smb::provider::{
     BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
-    LockId, Metadata, OpenError, OpenOptions, ReparsePoint, RequestContext, SymbolicLink,
-    map_access, sharing_conflict,
+    LockId, Metadata, NotifyResult, OpenError, OpenOptions, ReparsePoint, RequestContext,
+    SymbolicLink, map_access, sharing_conflict,
 };
 use smb::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use smb::spec::{
     AccessMask, AceFlags, CreateAction, CreateDisposition, FileAttributes, IO_REPARSE_TAG_SYMLINK,
-    SecurityInformation, Status,
+    NotifyFilter, SecurityInformation, Status,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 const OPEN_LIMIT: usize = 4096;
 const IDENTITY_LIMIT: usize = 65536;
@@ -130,6 +131,8 @@ struct Record {
     directory: bool,
     reparse: bool,
     write_through: bool,
+    watch: Option<Weak<Watch>>,
+    notify_deleted: bool,
     closing: bool,
     delete_on_close: bool,
 }
@@ -201,6 +204,20 @@ impl Drop for Operation {
     }
 }
 
+struct Closing {
+    inner: Arc<Inner>,
+    id: u64,
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        if let Some(record) = self.inner.state.lock().opens.get_mut(&self.id) {
+            record.closing = false;
+        }
+        self.inner.changed.notify(usize::MAX);
+    }
+}
+
 struct Reservation {
     inner: Arc<Inner>,
     id: u64,
@@ -219,6 +236,7 @@ pub struct LinuxFile {
     pin: Mutex<Option<Arc<File>>>,
     key: Key,
     closed: AtomicBool,
+    watch: futures::lock::Mutex<Option<Arc<Watch>>>,
 }
 
 struct Resolved {
@@ -242,7 +260,7 @@ impl std::fmt::Debug for LinuxFile {
     }
 }
 
-fn status(error: std::io::Error) -> Status {
+pub(crate) fn status(error: std::io::Error) -> Status {
     match error.raw_os_error() {
         Some(libc::ECANCELED) => Status::CANCELLED,
         Some(libc::ENOENT) => Status::OBJECT_NAME_NOT_FOUND,
@@ -316,6 +334,21 @@ impl Inner {
 }
 
 impl LinuxFs {
+    fn invalidate_watches(&self, key: Key) {
+        let watches = self
+            .0
+            .state
+            .lock()
+            .opens
+            .values()
+            .filter(|open| open.key == key)
+            .filter_map(|open| open.watch.as_ref().and_then(Weak::upgrade))
+            .collect::<Vec<_>>();
+        for watch in watches {
+            watch.invalidate();
+        }
+    }
+
     async fn claim(
         &self,
         keys: &[ClaimKey],
@@ -475,6 +508,15 @@ impl LinuxFs {
                 name: native.clone(),
                 path,
             };
+            if self
+                .0
+                .state
+                .lock()
+                .deletes
+                .contains_key(&location.identity())
+            {
+                return Err(Status::DELETE_PENDING.into());
+            }
             let leaf = index + 1 == parts.len();
             let file = match self
                 .0
@@ -574,6 +616,8 @@ impl LinuxFs {
                 directory,
                 reparse,
                 write_through: options.options().write_through(),
+                watch: None,
+                notify_deleted: directory && options.options().delete_on_close(),
                 closing: false,
                 delete_on_close: options.options().delete_on_close(),
             },
@@ -775,6 +819,23 @@ impl Inspect for LinuxFs {
             .field("opens", state.opens.len())
             .field("lock_count", state.locks.len())
             .field("lock_waiters", state.waiters.len())
+            .field(
+                "watch_count",
+                state
+                    .opens
+                    .values()
+                    .filter(|open| open.watch.as_ref().and_then(Weak::upgrade).is_some())
+                    .count(),
+            )
+            .field(
+                "notify_waiters",
+                state
+                    .opens
+                    .values()
+                    .filter_map(|open| open.watch.as_ref().and_then(Weak::upgrade))
+                    .map(|watch| watch.waiter_count())
+                    .sum::<usize>(),
+            )
             .field("active_io", state.active.len())
             .field("identities", state.identities.len())
             .field("submitted_io", self.0.io.submitted.load(Ordering::Relaxed));
@@ -1039,6 +1100,7 @@ impl FileSystem for LinuxFs {
             pin: Mutex::new(Some(pin)),
             key,
             closed: AtomicBool::new(false),
+            watch: futures::lock::Mutex::new(None),
         };
         if truncated {
             self.set_len(&file, 0, request).await?;
@@ -1066,6 +1128,10 @@ impl FileSystem for LinuxFs {
         if file.closed.load(Ordering::Acquire) {
             return Ok(());
         }
+        let _closing = Closing {
+            inner: self.0.clone(),
+            id: file.reservation.id,
+        };
         loop {
             let listener = self.0.changed.listen();
             let ready = {
@@ -1100,9 +1166,18 @@ impl FileSystem for LinuxFs {
                 &request,
             )
             .await?;
+        let deferred_delete = record.delete_on_close
+            && (!record.directory
+                || self
+                    .0
+                    .io
+                    .list(file.pin()?, &request)
+                    .await
+                    .map_err(status)?
+                    .is_empty());
         let delete = {
             let mut state = self.0.state.lock();
-            if record.delete_on_close {
+            if deferred_delete {
                 state.deletes.insert(record.location.identity(), file.key);
             }
             state.deletes.contains_key(&record.location.identity())
@@ -1111,6 +1186,9 @@ impl FileSystem for LinuxFs {
                         && open.location.identity() == record.location.identity()
                 })
         };
+        if deferred_delete && record.directory {
+            self.invalidate_watches(file.key);
+        }
         if delete && self.same_entry(&record, &request).await? {
             match self
                 .0
@@ -1127,6 +1205,9 @@ impl FileSystem for LinuxFs {
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(error) => return Err(status(error)),
             }
+        }
+        if let Some(watch) = file.watch.lock().await.take() {
+            watch.shutdown(&self.0.io).await?;
         }
         let native = file.file.lock().take();
         let pin = file.pin.lock().take();
@@ -1334,6 +1415,15 @@ impl FileSystem for LinuxFs {
                 name,
                 path,
             };
+            if self
+                .0
+                .state
+                .lock()
+                .deletes
+                .contains_key(&location.identity())
+            {
+                continue;
+            }
             let metadata = self.describe(pin, &location, 0, false, request).await?;
             entries.push(metadata);
         }
@@ -1413,8 +1503,19 @@ impl FileSystem for LinuxFs {
                 return Err(Status::SHARING_VIOLATION);
             }
             state.deletes.insert(record.location.identity(), file.key);
+            if record.directory {
+                state
+                    .opens
+                    .get_mut(&file.reservation.id)
+                    .ok_or(Status::FILE_CLOSED)?
+                    .notify_deleted = true;
+            }
         } else {
             state.deletes.remove(&record.location.identity());
+        }
+        drop(state);
+        if delete && record.directory {
+            self.invalidate_watches(file.key);
         }
         Ok(())
     }
@@ -1664,6 +1765,60 @@ impl FileSystem for LinuxFs {
         Ok(())
     }
 
+    async fn notify(
+        &self,
+        file: &LinuxFile,
+        filter: NotifyFilter,
+        watch_tree: bool,
+        output_length: usize,
+        request: &RequestContext,
+    ) -> Result<NotifyResult, Status> {
+        let record = self.record(file)?;
+        if record.closing {
+            return Err(Status::FILE_CLOSED);
+        }
+        if !record.directory {
+            return Err(Status::NOT_A_DIRECTORY);
+        }
+        if record.notify_deleted
+            || self
+                .0
+                .state
+                .lock()
+                .deletes
+                .contains_key(&record.location.identity())
+        {
+            return Err(Status::DELETE_PENDING);
+        }
+        let watch = {
+            let mut slot = file.watch.lock().await;
+            if slot.as_ref().is_none_or(|watch| watch.invalidated()) {
+                *slot = Some(Watch::new(&self.0.io, file.pin()?, filter, watch_tree).await?);
+            }
+            slot.as_ref().expect("watch initialized").clone()
+        };
+        {
+            let mut state = self.0.state.lock();
+            let record = state
+                .opens
+                .get_mut(&file.reservation.id)
+                .ok_or(Status::FILE_CLOSED)?;
+            if record.closing {
+                return Err(Status::FILE_CLOSED);
+            }
+            record.watch = Some(Arc::downgrade(&watch));
+        }
+        self.0.changed.notify(usize::MAX);
+        let result = watch.notify(&self.0.io, output_length, request).await;
+        if let Err(error) = watch.retire_if_idle(&self.0.io).await {
+            tracelimit::warn_ratelimited!(?error, "retired Linux SMB watch close failed");
+            if result.is_ok() {
+                return Err(error);
+            }
+        }
+        result
+    }
+
     async fn file_control(
         &self,
         file: &LinuxFile,
@@ -1737,6 +1892,9 @@ impl FileSystem for LinuxFs {
             return Err(Status::OBJECT_NAME_NOT_FOUND);
         }
         self.refresh(&mut destination, request).await?;
+        if destination.location.identity() == record.location.identity() {
+            return Ok(());
+        }
         if let Some(stat) = destination.stat {
             let key = Key::of(&stat);
             if self

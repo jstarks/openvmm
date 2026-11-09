@@ -89,20 +89,29 @@ impl Fixture for NativeFixture {
             basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
             rename: Feature::Supported,
             locks: Feature::Supported,
-            notifications: Feature::Unsupported(Status::NOT_SUPPORTED),
+            notifications: Feature::Supported,
         }
     }
     async fn wait_until_pending(&self, operation: Operation, request: &RequestContext) {
-        assert_eq!(operation, Operation::Lock);
-        assert!(
-            self.0
-                .0
-                .state
-                .lock()
-                .waiters
-                .values()
-                .any(|id| *id == request.id())
-        );
+        loop {
+            let listener = self.0.0.changed.listen();
+            let pending = {
+                let state = self.0.0.state.lock();
+                match operation {
+                    Operation::Lock => state.waiters.values().any(|id| *id == request.id()),
+                    Operation::Notify => state
+                        .opens
+                        .values()
+                        .filter_map(|open| open.watch.as_ref().and_then(Weak::upgrade))
+                        .any(|watch| watch.pending(request.id())),
+                    _ => panic!("unexpected pending operation"),
+                }
+            };
+            if pending {
+                return;
+            }
+            listener.await;
+        }
     }
 }
 
@@ -130,6 +139,156 @@ contract_test!(creation_eas);
 contract_test!(extended_attributes);
 contract_test!(named_streams);
 contract_test!(stream_information);
+contract_test!(notify_registration_and_cancellation);
+contract_test!(notify_fifo_and_small_buffer);
+contract_test!(notify_subtree_and_filters);
+contract_test!(notify_deletion_generations);
+contract_test!(delete_on_close);
+contract_test!(delete_mode_is_deferred_to_close);
+contract_test!(directory_delete_mode_checks_emptiness_at_close);
+contract_test!(notify_nonempty_delete_mode_preserves_watch);
+
+#[async_test]
+async fn external_host_rename_delivers_names_and_metadata(driver: DefaultDriver) {
+    use smb::provider::NotifyResult;
+    use smb::spec::{NotifyAction, NotifyFilter};
+    let root = tempfile::tempdir().unwrap();
+    let fs = LinuxFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (names, _) = fs
+        .open("", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let (metadata, _) = fs
+        .open("", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    let name_filter = NotifyFilter::new().with_file_name(true);
+    let metadata_filter = NotifyFilter::new()
+        .with_attributes(true)
+        .with_creation(true);
+    for (file, filter) in [(&names, name_filter), (&metadata, metadata_filter)] {
+        assert_eq!(
+            fs.notify(file, filter, false, 4096, &cancelled)
+                .await
+                .unwrap_err(),
+            Status::CANCELLED
+        );
+    }
+    std::fs::write(root.path().join("before"), b"host").unwrap();
+    let NotifyResult::Changes(changes) = fs
+        .notify(&names, name_filter, false, 4096, &request)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(changes[0].action, NotifyAction::ADDED);
+    std::fs::rename(root.path().join("before"), root.path().join("after")).unwrap();
+    let NotifyResult::Changes(changes) = fs
+        .notify(&names, name_filter, false, 4096, &request)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(changes.len(), 2);
+    assert_eq!(
+        (changes[0].action, changes[0].name.as_str()),
+        (NotifyAction::RENAMED_OLD_NAME, "before")
+    );
+    assert_eq!(
+        (changes[1].action, changes[1].name.as_str()),
+        (NotifyAction::RENAMED_NEW_NAME, "after")
+    );
+    let NotifyResult::Changes(changes) = fs
+        .notify(&metadata, metadata_filter, false, 4096, &request)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(
+        changes
+            .iter()
+            .any(|change| change.action == NotifyAction::MODIFIED && change.name == "after")
+    );
+    fs.close(&names, &request).await.unwrap();
+    fs.close(&metadata, &request).await.unwrap();
+}
+
+#[async_test]
+async fn recursive_watch_rebuilds_after_directory_membership_changes(driver: DefaultDriver) {
+    use smb::provider::NotifyResult;
+    use smb::spec::{NotifyAction, NotifyFilter};
+    let root = tempfile::tempdir().unwrap();
+    let fs = LinuxFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (directory, _) = fs
+        .open("", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    let filter = NotifyFilter::new().with_file_name(true);
+    assert_eq!(
+        fs.notify(&directory, filter, true, 4096, &cancelled)
+            .await
+            .unwrap_err(),
+        Status::CANCELLED
+    );
+    std::fs::create_dir(root.path().join("child")).unwrap();
+    assert!(matches!(
+        fs.notify(&directory, filter, true, 4096, &request)
+            .await
+            .unwrap(),
+        NotifyResult::Overflow
+    ));
+    std::fs::write(root.path().join("child").join("file"), b"host").unwrap();
+    let NotifyResult::Changes(changes) = fs
+        .notify(&directory, filter, true, 4096, &request)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(
+        changes
+            .iter()
+            .any(|change| change.action == NotifyAction::ADDED && change.name == "child\\file")
+    );
+    fs.close(&directory, &request).await.unwrap();
+}
+
+#[async_test]
+async fn close_releases_pending_native_watch(driver: DefaultDriver) {
+    use smb::spec::NotifyFilter;
+    let root = tempfile::tempdir().unwrap();
+    let fs = LinuxFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (directory, _) = fs
+        .open("", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let cancelled = RequestContext::new(2);
+    cancelled.cancel();
+    let filter = NotifyFilter::new().with_file_name(true);
+    assert_eq!(
+        fs.notify(&directory, filter, false, 4096, &cancelled)
+            .await
+            .unwrap_err(),
+        Status::CANCELLED
+    );
+    let (notify, closed) = futures::join!(
+        fs.notify(&directory, filter, false, 4096, &request),
+        fs.close(&directory, &request)
+    );
+    assert_eq!(notify.unwrap_err(), Status::NOTIFY_CLEANUP);
+    closed.unwrap();
+    assert!(fs.0.state.lock().opens.is_empty());
+}
 
 #[async_test]
 async fn unavailable_ftruncate_uses_real_bounded_worker_path(driver: DefaultDriver) {

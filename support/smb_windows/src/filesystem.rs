@@ -10,10 +10,11 @@ use pal_async::driver::Driver;
 use pal_async::windows::overlapped::OverlappedFile;
 use parking_lot::Mutex;
 use smb::provider::{
-    BasicInformation, FileSystem, Metadata, OpenOptions, RequestContext, map_access,
+    BasicInformation, FileSystem, FileSystemInformation, Metadata, OpenOptions, RequestContext,
+    map_access,
 };
 use smb::security::SecurityDescriptor;
-use smb::spec::{AccessMask, CreateDisposition, SecurityInformation, Status};
+use smb::spec::{AccessMask, CreateAction, CreateDisposition, SecurityInformation, Status};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,6 +41,9 @@ pub struct OpenRootError(Status);
 /// EXECUTE requests also require native READ_DATA so SMB can load executable
 /// contents. That additional physical right is not a guest-visible data/list
 /// grant; the host ACL must permit it.
+///
+/// Metadata follows native names within the captured root. Name queries on
+/// objects subsequently moved outside that root fail explicitly.
 pub struct WindowsFs(Arc<Inner>);
 
 struct Inner {
@@ -59,9 +63,8 @@ impl Drop for Reservation {
 /// An independent native open; closing it releases native sharing reservations.
 pub struct WindowsFile {
     file: Mutex<Option<Open>>,
-    path: String,
     append_only: bool,
-    hidden_read: bool,
+    hidden_access: u32,
 }
 
 struct Open {
@@ -179,6 +182,7 @@ fn create(options: &OpenOptions<'_>) -> Result<Create, Status> {
         | nt::FILE_WRITE_THROUGH
         | nt::FILE_SEQUENTIAL_ONLY
         | nt::FILE_RANDOM_ACCESS
+        | nt::FILE_DELETE_ON_CLOSE
         | nt::FILE_NO_EA_KNOWLEDGE;
     if options.options & !supported != 0
         || options.access().access_system_security()
@@ -190,7 +194,7 @@ fn create(options: &OpenOptions<'_>) -> Result<Create, Status> {
         // SMB READ accepts EXECUTE, whereas NtReadFile requires READ_DATA.
         // Keep this physical right private to the provider.
         access: {
-            let access = map_access(options.access);
+            let access = map_access(options.access) | replacement_access(options.disposition());
             if AccessMask::from_bits(access).execute() {
                 access | fs::FILE_READ_DATA
             } else {
@@ -204,13 +208,19 @@ fn create(options: &OpenOptions<'_>) -> Result<Create, Status> {
     })
 }
 
-fn walk(
-    root: Arc<File>,
-    parts: Vec<String>,
-    create: &Create,
-) -> Result<(File, String, u32), Status> {
+fn replacement_access(disposition: CreateDisposition) -> u32 {
+    // MS-FSA 2.1.5.1.2 requires these grants for replacing existing default data.
+    match disposition {
+        CreateDisposition::SUPERSEDE => fs::DELETE | fs::FILE_WRITE_ATTRIBUTES | fs::FILE_WRITE_EA,
+        CreateDisposition::OVERWRITE | CreateDisposition::OVERWRITE_IF => {
+            fs::FILE_WRITE_DATA | fs::FILE_WRITE_ATTRIBUTES | fs::FILE_WRITE_EA
+        }
+        _ => 0,
+    }
+}
+
+fn walk(root: Arc<File>, parts: Vec<String>, create: &Create) -> Result<(File, u32), Status> {
     let mut parents = vec![root];
-    let mut names = Vec::new();
     for (index, part) in parts.iter().enumerate() {
         if part == "." {
             continue;
@@ -218,7 +228,6 @@ fn walk(
         if part == ".." {
             if parents.len() > 1 {
                 parents.pop();
-                names.pop();
             }
             continue;
         }
@@ -233,8 +242,7 @@ fn walk(
             if native::is_directory(&file)? {
                 native::check_directory(&file)?;
             }
-            names.push(native::component(&file)?);
-            return Ok((file, format!("\\{}", names.join("\\")), action));
+            return Ok((file, action));
         }
         let (directory, _) = native::open(
             Some(parent),
@@ -248,7 +256,6 @@ fn walk(
             },
         )?;
         native::check_directory(&directory)?;
-        names.push(native::component(&directory)?);
         parents.push(Arc::new(directory));
     }
     if !matches!(create.disposition, nt::FILE_OPEN | nt::FILE_OPEN_IF) {
@@ -257,7 +264,7 @@ fn walk(
     let parent = parents.last().expect("root remains on the parent stack");
     native::check_directory(parent)?;
     let (file, action) = native::open(Some(parent), &[], create)?;
-    Ok((file, format!("\\{}", names.join("\\")), action))
+    Ok((file, action))
 }
 
 #[async_trait]
@@ -295,12 +302,14 @@ impl FileSystem for WindowsFs {
             .io
             .worker(request, move || {
                 // Retain the open slot even if an initialization future is dropped.
-                let (file, path, action) = walk(root, parts, &create)?;
+                let (file, action) = walk(root, parts, &create)?;
                 let directory = native::is_directory(&file)?;
-                Ok(((file, path, action, directory), reservation))
+                let readonly_mask =
+                    native::readonly_maximum_mask(&file, logical_access.into_bits(), action)?;
+                Ok(((file, action, directory, readonly_mask), reservation))
             })
             .await;
-        let ((file, path, action, directory), reservation) = match result {
+        let ((file, action, directory, readonly_mask), reservation) = match result {
             Err(Status::OBJECT_NAME_NOT_FOUND) if unsupported_creation => {
                 return Err(Status::NOT_SUPPORTED);
             }
@@ -325,12 +334,17 @@ impl FileSystem for WindowsFs {
                     file: Arc::new(file),
                     _reservation: reservation,
                 })),
-                path,
                 append_only: options.access().append_data()
                     && !options.access().write_data()
                     && !options.access().generic_write()
                     && !options.access().generic_all(),
-                hidden_read,
+                hidden_access: readonly_mask
+                    | if hidden_read { fs::FILE_READ_DATA } else { 0 }
+                    | if action == CreateAction::CREATED.0 && !logical_access.maximum_allowed() {
+                        replacement_access(options.disposition()) & !logical_access.into_bits()
+                    } else {
+                        0
+                    },
             },
             action,
         ))
@@ -355,15 +369,16 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<Metadata, Status> {
         let native = file.get()?;
-        let path = file.path.clone();
+        let root = self.0.root.clone();
         let mut metadata = self
             .0
             .io
-            .worker(request, move || native::metadata(native.get(), path))
+            .worker(request, move || {
+                let path = native::relative_path(&root, native.get())?;
+                native::metadata(native.get(), path)
+            })
             .await?;
-        if file.hidden_read {
-            metadata.granted_access &= !fs::FILE_READ_DATA;
-        }
+        metadata.granted_access &= !file.hidden_access;
         Ok(metadata)
     }
 
@@ -379,6 +394,18 @@ impl FileSystem for WindowsFs {
             .worker(request, move || {
                 native::query_security(file.get(), information.into_bits())
             })
+            .await
+    }
+
+    async fn filesystem_information(
+        &self,
+        file: &WindowsFile,
+        request: &RequestContext,
+    ) -> Result<FileSystemInformation, Status> {
+        let file = file.get()?;
+        self.0
+            .io
+            .worker(request, move || native::filesystem_information(file.get()))
             .await
     }
 
@@ -454,14 +481,15 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<Vec<Metadata>, Status> {
         let file = directory.get()?;
-        if directory.hidden_read {
+        if directory.hidden_access & fs::FILE_READ_DATA != 0 {
             return Err(Status::ACCESS_DENIED);
         }
-        let path = directory.path.clone();
+        let root = self.0.root.clone();
         self.0
             .io
             .worker(request, move || {
                 let names = file.list()?;
+                let path = native::relative_path(&root, file.get())?;
                 let mut entries = Vec::with_capacity(names.len());
                 for name in names {
                     let (child, _) = native::open(
@@ -500,20 +528,91 @@ impl FileSystem for WindowsFs {
 
     async fn set_delete_on_close(
         &self,
-        _file: &WindowsFile,
-        _delete: bool,
-        _request: &RequestContext,
+        file: &WindowsFile,
+        delete: bool,
+        request: &RequestContext,
     ) -> Result<(), Status> {
-        Err(Status::NOT_SUPPORTED)
+        let file = file.get()?;
+        self.0
+            .io
+            .worker(request, move || native::set_disposition(file.get(), delete))
+            .await
     }
 
     async fn set_basic(
         &self,
-        _file: &WindowsFile,
-        _info: BasicInformation,
-        _request: &RequestContext,
+        file: &WindowsFile,
+        info: BasicInformation,
+        request: &RequestContext,
     ) -> Result<(), Status> {
-        Err(Status::NOT_SUPPORTED)
+        let file = file.get()?;
+        self.0
+            .io
+            .worker(request, move || native::set_basic(file.get(), info))
+            .await
+    }
+
+    async fn set_allocation_size(
+        &self,
+        file: &WindowsFile,
+        length: u64,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        let file = file.get()?;
+        self.0
+            .io
+            .worker(request, move || native::set_allocation(file.get(), length))
+            .await
+    }
+
+    async fn rename(
+        &self,
+        file: &WindowsFile,
+        name: &str,
+        replace: bool,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        let file = file.get()?;
+        let root = self.0.root.clone();
+        let mut parts = components(name)?;
+        let leaf = parts.pop().ok_or(Status::OBJECT_NAME_INVALID)?;
+        if leaf == "." || leaf == ".." {
+            return Err(Status::OBJECT_NAME_INVALID);
+        }
+        self.0
+            .io
+            .worker(request, move || {
+                let source = native::relative_path(&root, file.get())?;
+                if source == "\\" || native::delete_pending(file.get())? {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                let (parent, _) = walk(
+                    root.clone(),
+                    parts,
+                    &Create {
+                        access: fs::FILE_READ_ATTRIBUTES,
+                        sharing: fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE | fs::FILE_SHARE_DELETE,
+                        disposition: nt::FILE_OPEN,
+                        options: nt::FILE_DIRECTORY_FILE,
+                        attributes: 0,
+                    },
+                )
+                .map_err(|status| {
+                    if status == Status::OBJECT_NAME_NOT_FOUND {
+                        Status::OBJECT_PATH_NOT_FOUND
+                    } else {
+                        status
+                    }
+                })?;
+                let destination = native::relative_path(&root, &parent)?;
+                if native::is_directory(file.get())?
+                    && (destination == source || destination.starts_with(&format!("{source}\\")))
+                {
+                    return Err(Status::ACCESS_DENIED);
+                }
+                native::rename(file.get(), &parent, &leaf, replace)
+            })
+            .await
     }
 }
 

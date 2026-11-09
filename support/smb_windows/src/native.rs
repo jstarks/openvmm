@@ -7,9 +7,10 @@
 use pal::windows::{ObjectAttributes, UnicodeStringRef};
 use pal_async::driver::Driver;
 use pal_async::windows::overlapped::{CustomNt, OverlappedFile};
-use smb::provider::Metadata;
+use smb::provider::{BasicInformation, FileSystemInformation, Metadata, SectorSizeInformation};
 use smb::security::SecurityDescriptor;
 use smb::spec::Status;
+use smb::spec::{AccessMask, CreateAction};
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::mem::{offset_of, size_of};
@@ -227,7 +228,7 @@ fn wide_name(buffer: &[u64], used: usize, offset: usize, bytes: u32) -> Result<S
     String::from_utf16(name).map_err(|_| Status::OBJECT_NAME_INVALID)
 }
 
-pub(crate) fn component(file: &File) -> Result<String, Status> {
+fn filename(file: &File) -> Result<String, Status> {
     let mut buffer = vec![0u64; 8192];
     let iosb = Completion::new();
     // SAFETY: The aligned output holds a maximum-length NT filename.
@@ -246,8 +247,19 @@ pub(crate) fn component(file: &File) -> Result<String, Status> {
             offset_of!(nt::FILE_NAME_INFORMATION, FileName),
             info.FileNameLength,
         )?;
-        Ok(name.rsplit('\\').next().unwrap_or("").to_owned())
+        Ok(name)
     }
+}
+
+pub(crate) fn relative_path(root: &File, file: &File) -> Result<String, Status> {
+    let root = filename(root)?;
+    let name = filename(file)?;
+    if name == root {
+        return Ok("\\".to_owned());
+    }
+    let prefix = format!("{}\\", root.trim_end_matches('\\'));
+    let relative = name.strip_prefix(&prefix).ok_or(Status::NOT_SUPPORTED)?;
+    Ok(format!("\\{relative}"))
 }
 
 pub(crate) fn metadata(file: &File, path: String) -> Result<Metadata, Status> {
@@ -280,6 +292,31 @@ pub(crate) fn metadata(file: &File, path: String) -> Result<Metadata, Status> {
     })
 }
 
+pub(crate) fn readonly_maximum_mask(
+    file: &File,
+    requested: u32,
+    action: u32,
+) -> Result<u32, Status> {
+    let requested = AccessMask::from_bits(requested);
+    if !requested.maximum_allowed() || action != CreateAction::OPENED.0 {
+        return Ok(0);
+    }
+    let info: nt::FILE_BASIC_INFORMATION = query(file)?;
+    if info.FileAttributes & fs::FILE_ATTRIBUTE_READONLY == 0 {
+        return Ok(0);
+    }
+    // MS-FSA 2.1.5.1.2.1 narrows MAXIMUM_ALLOWED before checking remaining
+    // explicit rights. NtCreateFile can instead retain explicit DELETE_CHILD.
+    let mask = fs::FILE_WRITE_DATA | fs::FILE_APPEND_DATA | fs::FILE_DELETE_CHILD;
+    let granted: nt::FILE_ACCESS_INFORMATION = query(file)?;
+    let remaining =
+        requested.with_maximum_allowed(false).into_bits() & !(granted.AccessFlags & !mask);
+    if remaining != 0 {
+        return Err(Status::ACCESS_DENIED);
+    }
+    Ok(mask)
+}
+
 information! {
     nt::FILE_STANDARD_INFORMATION => nt::FileStandardInformation,
 }
@@ -290,6 +327,10 @@ fn standard(file: &File) -> Result<nt::FILE_STANDARD_INFORMATION, Status> {
 
 pub(crate) fn is_directory(file: &File) -> Result<bool, Status> {
     Ok(standard(file)?.Directory)
+}
+
+pub(crate) fn delete_pending(file: &File) -> Result<bool, Status> {
+    Ok(standard(file)?.DeletePending)
 }
 
 pub(crate) fn list(directory: &File) -> Result<Vec<String>, Status> {
@@ -355,6 +396,196 @@ pub(crate) fn set_len(file: &File, length: u64) -> Result<(), Status> {
             size_of_val(&info) as u32,
             nt::FileEndOfFileInformation,
         ))
+    }
+}
+
+pub(crate) fn set_allocation(file: &File, length: u64) -> Result<(), Status> {
+    let info = nt::FILE_ALLOCATION_INFORMATION {
+        AllocationSize: length.try_into().map_err(|_| Status::INVALID_PARAMETER)?,
+    };
+    set(file, &info)
+}
+
+pub(crate) fn set_basic(file: &File, info: BasicInformation) -> Result<(), Status> {
+    set(
+        file,
+        &nt::FILE_BASIC_INFORMATION {
+            CreationTime: info.created,
+            LastAccessTime: info.accessed,
+            LastWriteTime: info.written,
+            ChangeTime: info.changed,
+            FileAttributes: info.attributes,
+        },
+    )
+}
+
+pub(crate) fn set_disposition(file: &File, delete: bool) -> Result<(), Status> {
+    set(
+        file,
+        &nt::FILE_DISPOSITION_INFORMATION { DeleteFile: delete },
+    )
+}
+
+information! {
+    nt::FILE_ALLOCATION_INFORMATION => nt::FileAllocationInformation,
+    nt::FILE_BASIC_INFORMATION => nt::FileBasicInformation,
+    nt::FILE_DISPOSITION_INFORMATION => nt::FileDispositionInformation,
+}
+
+fn set<T: Information>(file: &File, info: &T) -> Result<(), Status> {
+    let iosb = Completion::new();
+    // SAFETY: Information pairs this fixed layout with its native class.
+    unsafe {
+        iosb.finish(nt::NtSetInformationFile(
+            file.as_raw_handle(),
+            iosb.as_ptr(),
+            std::ptr::from_ref(info).cast(),
+            size_of::<T>() as u32,
+            T::CLASS,
+        ))
+    }
+}
+
+pub(crate) fn rename(file: &File, parent: &File, name: &str, replace: bool) -> Result<(), Status> {
+    let name: Vec<u16> = name.encode_utf16().collect();
+    let offset = offset_of!(nt::FILE_RENAME_INFORMATION, FileName);
+    let length =
+        (offset + size_of_val(name.as_slice())).max(size_of::<nt::FILE_RENAME_INFORMATION>());
+    let mut buffer = vec![0u64; length.div_ceil(size_of::<u64>())];
+    let iosb = Completion::new();
+    // SAFETY: The aligned allocation holds the fixed header and complete name.
+    // The destination is one validated component beneath a retained parent.
+    unsafe {
+        let info = buffer.as_mut_ptr().cast::<nt::FILE_RENAME_INFORMATION>();
+        (*info).Anonymous.ReplaceIfExists = replace;
+        (*info).RootDirectory = parent.as_raw_handle();
+        (*info).FileNameLength = size_of_val(name.as_slice()) as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        iosb.finish(nt::NtSetInformationFile(
+            file.as_raw_handle(),
+            iosb.as_ptr(),
+            info.cast(),
+            length as u32,
+            nt::FileRenameInformation,
+        ))
+    }
+}
+
+trait VolumeInformation: Default {
+    const CLASS: nt::FS_INFORMATION_CLASS;
+}
+
+impl VolumeInformation for ss::FILE_FS_FULL_SIZE_INFORMATION {
+    const CLASS: nt::FS_INFORMATION_CLASS = nt::FileFsFullSizeInformation;
+}
+impl VolumeInformation for ss::FILE_FS_DEVICE_INFORMATION {
+    const CLASS: nt::FS_INFORMATION_CLASS = nt::FileFsDeviceInformation;
+}
+impl VolumeInformation for nt::FILE_FS_SECTOR_SIZE_INFORMATION {
+    const CLASS: nt::FS_INFORMATION_CLASS = nt::FileFsSectorSizeInformation;
+}
+
+fn volume<T: VolumeInformation>(file: &File) -> Result<T, Status> {
+    let mut info = T::default();
+    let iosb = Completion::new();
+    // SAFETY: VolumeInformation pairs each fixed layout with its native class.
+    unsafe {
+        iosb.finish(nt::NtQueryVolumeInformationFile(
+            file.as_raw_handle(),
+            iosb.as_ptr(),
+            std::ptr::from_mut(&mut info).cast(),
+            size_of::<T>() as u32,
+            T::CLASS,
+        ))?;
+    }
+    Ok(info)
+}
+
+pub(crate) fn filesystem_information(file: &File) -> Result<FileSystemInformation, Status> {
+    use windows_sys::Win32::System::SystemServices as win;
+    let size: ss::FILE_FS_FULL_SIZE_INFORMATION = volume(file)?;
+    let device: ss::FILE_FS_DEVICE_INFORMATION = volume(file)?;
+    let sector: nt::FILE_FS_SECTOR_SIZE_INFORMATION = volume(file)?;
+    if size.TotalAllocationUnits < 0
+        || size.CallerAvailableAllocationUnits < 0
+        || size.ActualAvailableAllocationUnits < 0
+        || size.SectorsPerAllocationUnit == 0
+        || size.BytesPerSector == 0
+    {
+        return Err(Status::INTERNAL_ERROR);
+    }
+    let mut buffer = [0u64; 1024];
+    let iosb = Completion::new();
+    // SAFETY: The aligned allocation holds each variable-sized volume record.
+    unsafe {
+        iosb.finish(nt::NtQueryVolumeInformationFile(
+            file.as_raw_handle(),
+            iosb.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            size_of_val(&buffer) as u32,
+            nt::FileFsVolumeInformation,
+        ))?;
+        let info = &*buffer.as_ptr().cast::<ss::FILE_FS_VOLUME_INFORMATION>();
+        let created = info.VolumeCreationTime as u64;
+        let serial = info.VolumeSerialNumber;
+        let supports_objects = info.SupportsObjects;
+        let label = wide_name(
+            &buffer,
+            iosb.information(),
+            offset_of!(ss::FILE_FS_VOLUME_INFORMATION, VolumeLabel),
+            info.VolumeLabelLength,
+        )?;
+        let iosb = Completion::new();
+        iosb.finish(nt::NtQueryVolumeInformationFile(
+            file.as_raw_handle(),
+            iosb.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            size_of_val(&buffer) as u32,
+            nt::FileFsAttributeInformation,
+        ))?;
+        let info = &*buffer.as_ptr().cast::<nt::FILE_FS_ATTRIBUTE_INFORMATION>();
+        let name = wide_name(
+            &buffer,
+            iosb.information(),
+            offset_of!(nt::FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName),
+            info.FileSystemNameLength,
+        )?;
+        // Native capabilities are not automatically provider capabilities.
+        let attributes = info.FileSystemAttributes
+            & (win::FILE_CASE_PRESERVED_NAMES
+                | win::FILE_UNICODE_ON_DISK
+                | win::FILE_READ_ONLY_VOLUME
+                | win::FILE_VOLUME_IS_COMPRESSED);
+        Ok(FileSystemInformation {
+            created,
+            serial,
+            label,
+            supports_objects,
+            name,
+            attributes,
+            maximum_component_name_length: info
+                .MaximumComponentNameLength
+                .try_into()
+                .map_err(|_| Status::INTERNAL_ERROR)?,
+            device_type: device.DeviceType,
+            device_characteristics: device.Characteristics,
+            total_allocation_units: size.TotalAllocationUnits,
+            caller_available_allocation_units: size.CallerAvailableAllocationUnits,
+            actual_available_allocation_units: size.ActualAvailableAllocationUnits,
+            sectors_per_allocation_unit: size.SectorsPerAllocationUnit,
+            bytes_per_sector: size.BytesPerSector,
+            sector_size: Some(SectorSizeInformation {
+                logical_bytes: sector.LogicalBytesPerSector,
+                physical_atomic_bytes: sector.PhysicalBytesPerSectorForAtomicity,
+                physical_performance_bytes: sector.PhysicalBytesPerSectorForPerformance,
+                effective_atomic_bytes: sector
+                    .FileSystemEffectivePhysicalBytesPerSectorForAtomicity,
+                flags: sector.Flags,
+                sector_alignment: sector.ByteOffsetForSectorAlignment,
+                partition_alignment: sector.ByteOffsetForPartitionAlignment,
+            }),
+            object_information: None,
+        })
     }
 }
 

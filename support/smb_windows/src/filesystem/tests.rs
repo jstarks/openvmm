@@ -22,8 +22,8 @@ impl Fixture for NativeFixture {
 
     fn expectations(&self) -> Expectations {
         Expectations {
-            filesystem_information: Feature::Unsupported(Status::NOT_SUPPORTED),
-            allocation: Feature::Unsupported(Status::NOT_SUPPORTED),
+            filesystem_information: Feature::Supported,
+            allocation: Feature::Supported,
             creation_allocation: false,
             file_mode: Feature::Unsupported(Status::NOT_SUPPORTED),
             security_queries: Feature::Supported,
@@ -43,8 +43,8 @@ impl Fixture for NativeFixture {
             reparse_controls: Feature::Unsupported(Status::INVALID_DEVICE_REQUEST),
             sparse_files: Feature::Unsupported(Status::INVALID_DEVICE_REQUEST),
             compression: Feature::Unsupported(Status::INVALID_DEVICE_REQUEST),
-            basic_information: Feature::Unsupported(Status::NOT_SUPPORTED),
-            rename: Feature::Unsupported(Status::NOT_SUPPORTED),
+            basic_information: Feature::Supported,
+            rename: Feature::Supported,
             locks: Feature::Unsupported(Status::NOT_SUPPORTED),
             notifications: Feature::Unsupported(Status::NOT_SUPPORTED),
         }
@@ -74,6 +74,10 @@ contract_test!(allocation_reservations);
 contract_test!(file_mode_updates);
 contract_test!(basic_information);
 contract_test!(rename_identity);
+contract_test!(rename_namespace_and_replacement);
+contract_test!(delete_on_close);
+contract_test!(delete_mode_is_deferred_to_close);
+contract_test!(directory_delete_mode_checks_emptiness_at_close);
 contract_test!(security_queries);
 contract_test!(file_acl_updates);
 contract_test!(directory_acl_updates);
@@ -92,6 +96,187 @@ contract_test!(sparse_files);
 contract_test!(reparse_controls);
 contract_test!(lock_conflicts_and_io);
 contract_test!(notify_registration_and_cancellation);
+
+#[async_test]
+async fn native_mutations_change_host_bytes_names_and_attributes(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (source, _) = fs
+        .open("before", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    fs.write(&source, 0, b"contents", &request).await.unwrap();
+    let volume = fs.filesystem_information(&source, &request).await.unwrap();
+    let capabilities = smb::spec::FileSystemAttributes::from_bits(volume.attributes);
+    assert!(!capabilities.persistent_acls() && !capabilities.named_streams());
+    assert!(!capabilities.extended_attributes() && !capabilities.supports_hard_links());
+    assert!(!capabilities.supports_reparse_points() && !capabilities.supports_sparse_files());
+    assert!(!capabilities.file_compression() && !capabilities.supports_object_ids());
+    fs.set_allocation_size(&source, 8192, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(root.path().join("before")).unwrap().len(),
+        8
+    );
+    assert!(
+        fs.metadata(&source, &request)
+            .await
+            .unwrap()
+            .allocation_size
+            >= 8192
+    );
+    let basic = BasicInformation {
+        created: 0,
+        accessed: 0,
+        written: 0,
+        changed: 0,
+        attributes: fs::FILE_ATTRIBUTE_READONLY,
+    };
+    fs.set_basic(&source, basic, &request).await.unwrap();
+    assert!(
+        std::fs::metadata(root.path().join("before"))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+    fs.set_basic(
+        &source,
+        BasicInformation {
+            attributes: fs::FILE_ATTRIBUTE_NORMAL,
+            ..basic
+        },
+        &request,
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir(root.path().join("destination")).unwrap();
+    fs.rename(&source, "destination\\moved", false, &request)
+        .await
+        .unwrap();
+    assert!(!root.path().join("before").exists());
+    assert_eq!(
+        std::fs::read(root.path().join("destination/moved")).unwrap(),
+        b"contents"
+    );
+    let (peer, _) = fs
+        .open(
+            "destination\\moved",
+            options(CreateDisposition::OPEN),
+            &request,
+        )
+        .await
+        .unwrap();
+    fs.set_delete_on_close(&source, true, &request)
+        .await
+        .unwrap();
+    fs.close(&source, &request).await.unwrap();
+    assert_eq!(fs.read(&peer, 0, 8, &request).await.unwrap(), b"contents");
+    fs.set_delete_on_close(&peer, false, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("destination/moved")).unwrap(),
+        b"contents"
+    );
+    fs.set_delete_on_close(&peer, true, &request).await.unwrap();
+    fs.close(&peer, &request).await.unwrap();
+    assert!(!root.path().join("destination/moved").exists());
+}
+
+#[async_test]
+async fn overwrite_checks_implicit_access_before_truncating_native_data(driver: DefaultDriver) {
+    use pal::windows::security::{LocalSecurityDescriptor, create_file_with_security};
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let descriptor: LocalSecurityDescriptor = "D:P(D;;0x10;;;WD)(A;;FA;;;WD)".parse().unwrap();
+    let mut host = create_file_with_security(&root.path().join("protected"), &descriptor).unwrap();
+    host.write_all(b"preserve").unwrap();
+    drop(host);
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    assert_eq!(
+        fs.open(
+            "protected",
+            OpenOptions {
+                access: AccessMask::new().with_read_attributes(true).into_bits(),
+                ..options(CreateDisposition::OVERWRITE)
+            },
+            &request
+        )
+        .await
+        .err(),
+        Some(Status::ACCESS_DENIED)
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("protected")).unwrap(),
+        b"preserve"
+    );
+}
+
+#[async_test]
+async fn native_timestamps_and_per_open_write_time_controls(driver: DefaultDriver) {
+    use std::os::windows::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (file, _) = fs
+        .open("times", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    let info = BasicInformation {
+        created: 132_000_000_000_000_000,
+        accessed: 132_000_000_000_000_010,
+        written: 132_000_000_000_000_020,
+        changed: 132_000_000_000_000_030,
+        attributes: 0,
+    };
+    fs.set_basic(&file, info, &request).await.unwrap();
+    let metadata = std::fs::metadata(root.path().join("times")).unwrap();
+    assert_eq!(metadata.creation_time(), info.created as u64);
+    assert_eq!(metadata.last_access_time(), info.accessed as u64);
+    assert_eq!(metadata.last_write_time(), info.written as u64);
+    let control = BasicInformation {
+        created: 0,
+        accessed: 0,
+        written: -1,
+        changed: 0,
+        attributes: 0,
+    };
+    fs.set_basic(&file, control, &request).await.unwrap();
+    fs.write(&file, 0, b"suppressed", &request).await.unwrap();
+    fs.close(&file, &request).await.unwrap();
+    assert_eq!(
+        std::fs::metadata(root.path().join("times"))
+            .unwrap()
+            .last_write_time(),
+        info.written as u64
+    );
+    let (file, _) = fs
+        .open("times", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    fs.set_basic(&file, control, &request).await.unwrap();
+    fs.set_basic(
+        &file,
+        BasicInformation {
+            written: -2,
+            ..control
+        },
+        &request,
+    )
+    .await
+    .unwrap();
+    fs.write(&file, 0, b"restored", &request).await.unwrap();
+    fs.close(&file, &request).await.unwrap();
+    assert_ne!(
+        std::fs::metadata(root.path().join("times"))
+            .unwrap()
+            .last_write_time(),
+        info.written as u64
+    );
+}
 
 fn options(disposition: CreateDisposition) -> OpenOptions<'static> {
     OpenOptions {
@@ -231,7 +416,6 @@ async fn rejected_options_and_cancellation_have_no_effects(driver: DefaultDriver
     let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
     let request = RequestContext::new(1);
     for (name, bits) in [
-        ("delete", nt::FILE_DELETE_ON_CLOSE),
         ("backup", nt::FILE_OPEN_FOR_BACKUP_INTENT),
         ("unbuffered", nt::FILE_NO_INTERMEDIATE_BUFFERING),
     ] {
@@ -345,6 +529,60 @@ async fn native_opens_do_not_add_metadata_or_synchronize_access(driver: DefaultD
         .err(),
         Some(Status::ACCESS_DENIED)
     );
+}
+
+#[async_test]
+async fn rename_does_not_require_source_metadata_or_synchronize_access(driver: DefaultDriver) {
+    use pal::windows::security::{LocalSecurityDescriptor, create_file_with_security};
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let descriptor: LocalSecurityDescriptor =
+        "D:P(D;;0x00100088;;;WD)(A;;FA;;;WD)".parse().unwrap();
+    let mut host = create_file_with_security(&root.path().join("before"), &descriptor).unwrap();
+    host.write_all(b"retained").unwrap();
+    drop(host);
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let access = AccessMask::new().with_delete(true).into_bits();
+    let (file, _) = fs
+        .open(
+            "before",
+            OpenOptions {
+                access,
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    fs.rename(&file, "after", false, &request).await.unwrap();
+    fs.close(&file, &request).await.unwrap();
+    assert_eq!(
+        fs.open(
+            "before",
+            OpenOptions {
+                access,
+                ..options(CreateDisposition::OPEN)
+            },
+            &request
+        )
+        .await
+        .err(),
+        Some(Status::OBJECT_NAME_NOT_FOUND)
+    );
+    let (file, _) = fs
+        .open(
+            "after",
+            OpenOptions {
+                access: AccessMask::new().with_read_data(true).into_bits(),
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs.read(&file, 0, 8, &request).await.unwrap(), b"retained");
+    fs.close(&file, &request).await.unwrap();
 }
 
 #[async_test]

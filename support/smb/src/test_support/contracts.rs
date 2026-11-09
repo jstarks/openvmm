@@ -2475,6 +2475,11 @@ pub async fn basic_information<F: Fixture>(fixture: &F) {
             .await
             .unwrap();
         let mode = OpenOptions {
+            // Isolate delete-mode denial from the earlier readonly write-access check.
+            access: AccessMask::new()
+                .with_delete(true)
+                .with_read_attributes(true)
+                .into_bits(),
             options: CreateOptions::new().with_delete_on_close(true).into_bits(),
             ..options(CreateDisposition::OPEN, false)
         };

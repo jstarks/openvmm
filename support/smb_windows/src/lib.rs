@@ -4,9 +4,10 @@
 //! Windows-native SMB provider foundation.
 //!
 //! This increment supports confined ordinary NTFS files, native sharing,
-//! metadata, enumeration and data I/O. It grants no SMB caching. Reparse
+//! volume/security queries, metadata updates, enumeration, rename/deletion,
+//! allocation and data I/O. It grants no SMB caching. Reparse
 //! traversal, case-sensitive directories, security mutation, streams, EAs,
-//! delete mode, rename, locking and notifications are explicitly unsupported.
+//! locking and notifications are explicitly unsupported.
 //! It is not yet wired to the vSMB device.
 
 #![cfg(windows)]

@@ -9,6 +9,11 @@ raw NTLM token exchange accommodates test clients without authenticating or
 verifying credentials. This must not be used as a network authentication
 service. The example binds only to loopback.
 
+Known specification discrepancies, native observations and evidence limits are
+tracked in the [specification errata candidates](spec-errata.md).
+The [Windows host-backed lock design](../smb_windows/locking.md) describes the
+proposed request-scoped adapter; it is not yet implemented.
+
 ## Compatibility Checklist
 
 This is the current SMB 2.1, writable MemoryFs test profile, not a claim of

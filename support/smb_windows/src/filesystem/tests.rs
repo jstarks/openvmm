@@ -126,6 +126,120 @@ contract_test!(notify_deletion_generations);
 contract_test!(notify_nonempty_delete_mode_preserves_watch);
 
 #[async_test]
+async fn native_lock_boundaries_follow_unsigned_range_rules(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open("boundaries", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    let (other, _) = fs
+        .open("boundaries", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let owned = owner.get().unwrap();
+    let peer = other.get().unwrap();
+    for (held, attempted, conflict) in [
+        (
+            smb::provider::ByteRange {
+                offset: 0,
+                length: 0,
+            },
+            smb::provider::ByteRange {
+                offset: 2,
+                length: 4,
+            },
+            false,
+        ),
+        (
+            smb::provider::ByteRange {
+                offset: 3,
+                length: 0,
+            },
+            smb::provider::ByteRange {
+                offset: 2,
+                length: 4,
+            },
+            true,
+        ),
+        (
+            smb::provider::ByteRange {
+                offset: u64::MAX,
+                length: 1,
+            },
+            smb::provider::ByteRange {
+                offset: u64::MAX,
+                length: 1,
+            },
+            true,
+        ),
+    ] {
+        let ((status, _), ()) =
+            native::lock(owned.overlapped().unwrap(), held, 0, true, true).await;
+        native::status(status).unwrap();
+        let ((status, _), ()) =
+            native::lock(peer.overlapped().unwrap(), attempted, 0, true, true).await;
+        if conflict {
+            assert_eq!(Status(status as u32), Status::LOCK_NOT_GRANTED);
+        } else {
+            native::status(status).unwrap();
+            native::unlock(peer.get(), attempted, 0).unwrap();
+        }
+        native::unlock(owned.get(), held, 0).unwrap();
+    }
+    drop(owned);
+    drop(peer);
+    fs.close(&owner, &request).await.unwrap();
+    fs.close(&other, &request).await.unwrap();
+}
+
+#[async_test]
+async fn native_shared_backing_is_required_for_append_after_external_eof_change(
+    driver: DefaultDriver,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open("eof", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    let (other, _) = fs
+        .open("eof", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    fs.write(&owner, 0, b"abcdefghij", &request).await.unwrap();
+    let owned = owner.get().unwrap();
+    let peer = other.get().unwrap();
+    let range = smb::provider::ByteRange {
+        offset: 2,
+        length: 4,
+    };
+    let ((status, _), ()) = native::lock(owned.overlapped().unwrap(), range, 0, true, true).await;
+    native::status(status).unwrap();
+    assert_eq!(fs.metadata(&owner, &request).await.unwrap().size, 10);
+    native::set_len(peer.get(), 3).unwrap();
+    let ((status, count), _) = native::write(owned.overlapped().unwrap(), -1, vec![b'x']).await;
+    native::status(status).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(fs.read(&owner, 0, 10, &request).await.unwrap(), b"abcx");
+    let ((status, _), ()) = native::lock(owned.overlapped().unwrap(), range, 0, false, true).await;
+    native::status(status).unwrap();
+    native::set_len(peer.get(), 3).unwrap();
+    let ((status, count), _) = native::write(owned.overlapped().unwrap(), -1, vec![b'y']).await;
+    assert_eq!(Status(status as u32), Status::FILE_LOCK_CONFLICT);
+    assert_eq!(count, 0);
+    assert_eq!(fs.read(&owner, 0, 10, &request).await.unwrap(), b"abc");
+    native::unlock(owned.get(), range, 0).unwrap();
+    native::unlock(owned.get(), range, 0).unwrap();
+    drop(owned);
+    drop(peer);
+    fs.close(&owner, &request).await.unwrap();
+    fs.close(&other, &request).await.unwrap();
+}
+
+#[async_test]
 async fn native_lock_keys_and_overlapping_acquisitions(driver: DefaultDriver) {
     let root = tempfile::tempdir().unwrap();
     let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();

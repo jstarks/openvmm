@@ -1,0 +1,420 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+use crate::native_memory::NativeRam;
+use guestmem::GuestMemory;
+use memory_range::MemoryRange;
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use test_with_tracing::test;
+use x86_system::memory_core::shared::{Exchange, PhysicalRam};
+use x86_system::mmu_core::shared::{Request, RunError};
+use x86_system::shared::{Batch, BatchStop, SharedEventMachine};
+use x86_system::{
+    EventDiagnostic, EventMachine, EventOutcome, Injection, Machine, Mmu, State, Tables,
+};
+
+const CODE: u64 = 0x10000;
+const HANDLER: u64 = 0x11000;
+const IRQ: u64 = 0x12000;
+const DATA: u64 = 0x1a000;
+const INITIAL: u64 = 0x1234_5678_89ab_cdef;
+const RF: u64 = 1 << 16;
+const IF: u64 = 1 << 9;
+
+fn put(ram: &mut [u8], address: u64, value: u64) {
+    ram[address as usize..address as usize + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn pte(page: u64) -> u64 {
+    0x4000 + page / 4096 * 8
+}
+
+fn gate(ram: &mut [u8], vector: u8, target: u64, attr: u8) {
+    put(
+        ram,
+        0xa000 + vector as u64 * 16,
+        (target & 0xffff) | (8 << 16) | ((attr as u64) << 40) | ((target >> 16) << 48),
+    );
+    put(ram, 0xa008 + vector as u64 * 16, target >> 32);
+}
+
+pub(super) fn fixture() -> (Vec<u8>, EventMachine) {
+    let mut ram = vec![0; 0x20000];
+    for (table, next) in [(0x1000, 0x2000), (0x2000, 0x3000), (0x3000, 0x4000)] {
+        put(&mut ram, table, next | 7);
+    }
+    for page in 0..512 {
+        put(&mut ram, 0x4000 + page * 8, (page * 4096) | 7);
+    }
+    put(&mut ram, pte(DATA), DATA);
+    put(&mut ram, DATA, INITIAL);
+    put(&mut ram, 0x9008, 0x00af9b000000ffff);
+    put(&mut ram, 0x9010, 0x00cf93000000ffff);
+    gate(&mut ram, 13, HANDLER, 0x8e);
+    gate(&mut ram, 14, HANDLER, 0x8e);
+    gate(&mut ram, 64, IRQ, 0x8e);
+    ram[CODE as usize..CODE as usize + 5].copy_from_slice(&[0x48, 0x8b, 0x07, 0xf4, 0xf4]);
+    ram[HANDLER as usize..HANDLER as usize + 11].copy_from_slice(&[
+        0x48, 0x89, 0x0e, 0x0f, 0x01, 0x3f, 0x4c, 0x01, 0xc4, 0x48, 0xcf,
+    ]);
+    ram[IRQ as usize..IRQ as usize + 5].copy_from_slice(&[0x4d, 0x01, 0xda, 0x48, 0xcf]);
+    let mut gpr = [0; 16];
+    gpr[1] = DATA | 7;
+    gpr[4] = 0x1800b;
+    gpr[6] = pte(DATA);
+    gpr[7] = DATA;
+    gpr[8] = 8;
+    gpr[11] = 1;
+    let owned = EventMachine {
+        core: Machine {
+            cpu: State {
+                gpr,
+                flags: 0x20_0603,
+                rip: CODE,
+            },
+            mmu: Mmu::new(super::shared_mmu_tests::config(), 0xdead_beef),
+        },
+        tables: Tables {
+            idt_base: 0xa000,
+            idt_limit: 4095,
+            gdt_base: 0x9000,
+            gdt_limit: 23,
+        },
+        stopped: None,
+        handler_pending: false,
+        pending: None,
+        shadow: false,
+        halted: false,
+    };
+    (ram, owned)
+}
+
+pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, NativeRam) {
+    let memory = GuestMemory::allocate(bytes.len());
+    memory.write_at(0, bytes).unwrap();
+    let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..bytes.len() as u64)).unwrap();
+    (memory, ram)
+}
+
+fn shared(owned: &EventMachine) -> SharedEventMachine {
+    SharedEventMachine::new(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.core.mmu.cr2(),
+        owned.tables,
+    )
+}
+
+fn one<R: PhysicalRam>(cpu: &mut SharedEventMachine, ram: &R) -> Batch
+where
+    R::Error: std::fmt::Debug,
+{
+    let before = cpu.cpu();
+    for _ in 0..1024 {
+        let batch = cpu.run(ram, 1, 1).unwrap();
+        if batch.stop != BatchStop::Yield {
+            return batch;
+        }
+        assert_eq!((batch.retired, batch.delivered), (0, 0));
+        assert_eq!(
+            cpu.cpu(),
+            before,
+            "yield must expose the unretired CPU image"
+        );
+    }
+    panic!("shared event exceeded finite test schedule");
+}
+
+fn compare_one(
+    bytes: &mut Vec<u8>,
+    owned: &mut EventMachine,
+    cpu: &mut SharedEventMachine,
+    memory: &GuestMemory,
+    ram: &NativeRam,
+) -> Batch {
+    let expected = owned.run(bytes, 0, 1);
+    let actual = one(cpu, ram);
+    assert_eq!(
+        (actual.retired, actual.delivered),
+        (expected.retired, expected.delivered)
+    );
+    assert_eq!(
+        actual.stop,
+        match expected.outcome {
+            EventOutcome::Budget => BatchStop::Budget,
+            EventOutcome::Waiting => BatchStop::Waiting,
+            EventOutcome::Stopped(reason) => BatchStop::Stopped(reason),
+            other => panic!("unexpected one-step oracle outcome: {other:?}"),
+        }
+    );
+    assert_eq!(cpu.cpu(), owned.core.cpu);
+    assert_eq!(cpu.cr2(), owned.core.mmu.cr2());
+    assert_eq!(cpu.pending(), owned.pending);
+    assert_eq!(cpu.shadow(), owned.shadow);
+    assert_eq!(cpu.halted(), owned.halted);
+    assert_eq!(cpu.handler_pending(), owned.handler_pending);
+    let mut actual_bytes = vec![0; bytes.len()];
+    memory.read_at(0, &mut actual_bytes).unwrap();
+    assert_eq!(actual_bytes, *bytes, "complete RAM oracle");
+    actual
+}
+
+#[test]
+fn shared_guest_repairs_fault_retries_and_wakes_from_hlt() {
+    let (mut bytes, mut owned) = fixture();
+    let initial = owned.core.cpu;
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    let (mut retired, mut delivered) = (0, 0);
+    for _ in 0..6 {
+        let batch = compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+        retired += batch.retired;
+        delivered += batch.delivered;
+    }
+    assert_eq!((retired, delivered), (5, 1));
+    assert_eq!(cpu.cpu().gpr[0], INITIAL);
+    assert_eq!(cpu.cpu().gpr[4], initial.gpr[4]);
+    assert_eq!((cpu.cpu().rip, cpu.cpu().flags & RF), (CODE + 3, 0));
+    retired += compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram).retired;
+    assert_eq!(
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram).stop,
+        BatchStop::Waiting
+    );
+    assert_eq!(owned.inject(64), Injection::Queued);
+    assert_eq!(cpu.inject(64), Injection::Queued);
+    for _ in 0..4 {
+        let batch = compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+        retired += batch.retired;
+        delivered += batch.delivered;
+    }
+    assert_eq!((retired, delivered), (9, 2));
+    assert_eq!(cpu.cpu().gpr[10], 1);
+    assert_eq!(cpu.cpu().rip, CODE + 5);
+    assert!(cpu.halted());
+}
+
+#[test]
+fn shared_event_entry_matches_owned_full_ram_matrix() {
+    for attr in [0x8e, 0x8f] {
+        for residue in [0, 1, 7, 15] {
+            for rf in [0, RF] {
+                for kind in 0..4 {
+                    let (mut bytes, mut owned) = fixture();
+                    owned.core.cpu.gpr[4] = 0x18000 + residue;
+                    owned.core.cpu.flags |= rf;
+                    for (vector, target) in [(13, HANDLER), (14, HANDLER), (64, IRQ)] {
+                        gate(&mut bytes, vector, target, attr);
+                    }
+                    match kind {
+                        0 => assert_eq!(owned.inject(64), Injection::Queued),
+                        1 => {}
+                        2 => owned.core.cpu.gpr[7] = 0x8000_0000_0000,
+                        _ => put(&mut bytes, pte(CODE), CODE | 7 | (1 << 63)),
+                    }
+                    let (memory, ram) = backing(&bytes);
+                    let mut cpu = shared(&owned);
+                    if kind == 0 {
+                        assert_eq!(cpu.inject(64), Injection::Queued);
+                    }
+                    assert_eq!(
+                        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram).delivered,
+                        1
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_event_partial_frames_preserve_cpu_pending_and_prefix() {
+    for rsp in [0x18008, 0x18018, 0x18028] {
+        let (mut bytes, mut owned) = fixture();
+        owned.core.cpu.gpr[4] = rsp;
+        put(&mut bytes, pte(0x17000), 0x17000);
+        assert_eq!(owned.inject(64), Injection::Queued);
+        let initial = owned.core.cpu;
+        let (memory, ram) = backing(&bytes);
+        let mut cpu = shared(&owned);
+        assert_eq!(cpu.inject(64), Injection::Queued);
+        let batch = compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+        assert!(matches!(
+            batch.stop,
+            BatchStop::Stopped(EventDiagnostic::Memory { .. })
+        ));
+        assert_eq!(cpu.cpu(), initial);
+        assert_eq!(cpu.pending(), Some(64));
+        assert_eq!(cpu.inject(65), Injection::Stopped(owned.stopped.unwrap()));
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+    }
+}
+
+struct FailOnce {
+    ram: NativeRam,
+    address: u64,
+    fail: AtomicBool,
+}
+
+impl PhysicalRam for FailOnce {
+    type Error = io::Error;
+    fn read_word(&self, address: u64) -> io::Result<u64> {
+        self.ram.read_word(address).map_err(io::Error::other)
+    }
+    fn write_word(&self, address: u64, value: u64) -> io::Result<()> {
+        if address == self.address && self.fail.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("scheduled frame transport error"));
+        }
+        self.ram
+            .write_word(address, value)
+            .map_err(io::Error::other)
+    }
+    fn compare_exchange_word(&self, address: u64, old: u64, new: u64) -> io::Result<Exchange> {
+        self.ram
+            .compare_exchange_word(address, old, new)
+            .map_err(io::Error::other)
+    }
+    fn barrier(&self) {
+        self.ram.barrier();
+    }
+}
+
+#[test]
+fn shared_frame_host_error_and_dma_never_replay_committed_prefix() {
+    let (bytes, owned) = fixture();
+    let initial = owned.core.cpu;
+    let (memory, ram) = backing(&bytes);
+    let ram = FailOnce {
+        ram,
+        address: 0x17ff0,
+        fail: AtomicBool::new(true),
+    };
+    let mut cpu = shared(&owned);
+    assert_eq!(cpu.inject(64), Injection::Queued);
+    let error = cpu.run(&ram, 256, 1).unwrap_err();
+    assert!(matches!(
+        error,
+        RunError::Memory {
+            request: Request::WriteWord {
+                address: 0x17ff0,
+                ..
+            },
+            ..
+        }
+    ));
+    let request = cpu.request();
+    assert_eq!(cpu.cpu(), initial);
+    assert_eq!(cpu.pending(), Some(64));
+    assert_eq!(memory.read_plain::<u64>(0x17ff8).unwrap(), 16);
+    memory.write_plain(0x17ff8, &0xfaceu64).unwrap();
+    let yielded = cpu.run(&ram, 0, 1).unwrap();
+    assert_eq!(
+        (yielded.retired, yielded.delivered, yielded.stop),
+        (0, 0, BatchStop::Yield)
+    );
+    assert_eq!(cpu.request(), request);
+    let result = one(&mut cpu, &ram);
+    assert_eq!((result.retired, result.delivered), (0, 1));
+    assert_eq!(memory.read_plain::<u64>(0x17ff8).unwrap(), 0xface);
+    assert_eq!(cpu.pending(), None);
+    assert_eq!(cpu.cpu().rip, IRQ);
+}
+
+#[test]
+fn shared_iret_rejects_bad_images_without_early_cpu_commit() {
+    for kind in 0..9 {
+        let (mut bytes, mut owned) = fixture();
+        bytes[CODE as usize..CODE as usize + 2].copy_from_slice(&[0x48, 0xcf]);
+        let stack = owned.core.cpu.gpr[4];
+        for (index, word) in [CODE + 3, 8, 0x20_0603 | RF, 0x1b007, 16]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut bytes, stack + index as u64 * 8, word);
+        }
+        match kind {
+            0 => {}
+            1 => put(&mut bytes, stack + 8, 16),
+            2 => put(&mut bytes, stack + 32, 8),
+            3 => put(&mut bytes, stack + 16, 0),
+            4 => put(&mut bytes, stack, 0x8000_0000_0000),
+            5 => put(&mut bytes, stack + 24, 0x8000_0000_0000),
+            6 => put(&mut bytes, 0x9008, 0),
+            7 => put(&mut bytes, 0x9010, 0),
+            _ => put(&mut bytes, pte(0x18000), 0x18000),
+        }
+        let initial = owned.core.cpu;
+        let (memory, ram) = backing(&bytes);
+        let mut cpu = shared(&owned);
+        let batch = compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+        if kind == 0 {
+            assert_eq!(batch.retired, 1);
+            assert_eq!(cpu.cpu().gpr[4], 0x1b007);
+        } else {
+            assert!(matches!(batch.stop, BatchStop::Stopped(_)));
+            assert_eq!(cpu.cpu(), initial);
+        }
+    }
+}
+
+#[test]
+fn shared_sti_shadow_rf_and_first_handler_boundaries_match_oracle() {
+    let (mut bytes, mut owned) = fixture();
+    owned.core.cpu.flags &= !IF;
+    bytes[CODE as usize..CODE as usize + 5].copy_from_slice(&[0xfb, 0xfb, 0xfa, 0xf4, 0xf4]);
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    assert_eq!(cpu.inject(31), Injection::InvalidVector);
+    assert_eq!(owned.inject(64), Injection::Queued);
+    assert_eq!(cpu.inject(64), Injection::Queued);
+    assert_eq!(cpu.inject(65), Injection::Busy);
+    for _ in 0..7 {
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+    }
+    assert!(cpu.halted());
+    assert_eq!(owned.inject(65), Injection::Queued);
+    assert_eq!(cpu.inject(65), Injection::Queued);
+    assert_eq!(
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram).stop,
+        BatchStop::Waiting
+    );
+
+    let (mut bytes, mut owned) = fixture();
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    for _ in 0..5 {
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+    }
+    assert_ne!(cpu.cpu().flags & RF, 0);
+    assert_eq!(owned.inject(64), Injection::Queued);
+    assert_eq!(cpu.inject(64), Injection::Queued);
+    compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+    assert_ne!(
+        memory.read_plain::<u64>(cpu.cpu().gpr[4] + 16).unwrap() & RF,
+        0
+    );
+    for _ in 0..3 {
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+    }
+    assert_eq!(cpu.cpu().gpr[0], INITIAL);
+    assert_eq!(cpu.cpu().flags & RF, 0);
+
+    let (mut bytes, mut owned) = fixture();
+    owned.core.cpu.flags &= !IF;
+    bytes[CODE as usize..CODE as usize + 4].copy_from_slice(&[0xfb, 0x48, 0x8b, 0x07]);
+    gate(&mut bytes, 14, HANDLER, 0x8f);
+    assert_eq!(owned.inject(64), Injection::Queued);
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    assert_eq!(cpu.inject(64), Injection::Queued);
+    for _ in 0..2 {
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
+    }
+    assert_eq!(
+        compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram).stop,
+        BatchStop::Stopped(EventDiagnostic::HandlerFault {
+            vector: 64,
+            code: 0
+        }),
+    );
+}

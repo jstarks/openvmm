@@ -970,6 +970,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a1ec0cfec728a79a5109075543131387f911cb4d07716436d7ae20533657a96"
 
 [[package]]
+name = "convert_case"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
+
+[[package]]
 name = "cordyceps"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7450,9 +7456,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.101"
+version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
@@ -8854,6 +8860,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "synstructure"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
+
+[[package]]
 name = "sysinfo"
 version = "0.39.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10155,6 +10172,55 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "verus_builtin"
+version = "0.0.0-2026-11-01-0251"
+source = "git+https://github.com/verus-lang/verus?rev=8bf68ee741df833ea5d0fe6a2255126fdea87e47#8bf68ee741df833ea5d0fe6a2255126fdea87e47"
+
+[[package]]
+name = "verus_builtin_macros"
+version = "0.0.0-2026-11-01-0251"
+source = "git+https://github.com/verus-lang/verus?rev=8bf68ee741df833ea5d0fe6a2255126fdea87e47#8bf68ee741df833ea5d0fe6a2255126fdea87e47"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+ "synstructure",
+ "verus_prettyplease",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_prettyplease"
+version = "0.0.0-2026-11-01-0251"
+source = "git+https://github.com/verus-lang/verus?rev=8bf68ee741df833ea5d0fe6a2255126fdea87e47#8bf68ee741df833ea5d0fe6a2255126fdea87e47"
+dependencies = [
+ "proc-macro2",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_state_machines_macros"
+version = "0.0.0-2026-11-01-0251"
+source = "git+https://github.com/verus-lang/verus?rev=8bf68ee741df833ea5d0fe6a2255126fdea87e47#8bf68ee741df833ea5d0fe6a2255126fdea87e47"
+dependencies = [
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_syn"
+version = "0.0.0-2026-11-01-0251"
+source = "git+https://github.com/verus-lang/verus?rev=8bf68ee741df833ea5d0fe6a2255126fdea87e47#8bf68ee741df833ea5d0fe6a2255126fdea87e47"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "vfio-bindings"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10373,6 +10439,27 @@ dependencies = [
  "vmcore",
  "x86defs",
  "zerocopy",
+]
+
+[[package]]
+name = "virt_emu"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "build_rs_guest_arch",
+ "futures",
+ "guestmem",
+ "hvdef",
+ "inspect",
+ "memory_range",
+ "pal_async",
+ "parking_lot",
+ "test_with_tracing",
+ "thiserror 2.0.16",
+ "virt",
+ "vm_topology",
+ "vmcore",
+ "x86_system",
 ]
 
 [[package]]
@@ -11908,6 +11995,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vstd"
+version = "0.0.0-2026-11-01-0251"
+source = "git+https://github.com/verus-lang/verus?rev=8bf68ee741df833ea5d0fe6a2255126fdea87e47#8bf68ee741df833ea5d0fe6a2255126fdea87e47"
+dependencies = [
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
+]
+
+[[package]]
 name = "vswhom"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12781,6 +12878,13 @@ dependencies = [
  "bitflags 2.13.2",
  "rustversion",
  "volatile",
+]
+
+[[package]]
+name = "x86_system"
+version = "0.0.0"
+dependencies = [
+ "vstd",
 ]
 
 [[package]]

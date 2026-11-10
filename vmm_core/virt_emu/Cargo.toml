@@ -1,0 +1,31 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "virt_emu"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+guestmem.workspace = true
+memory_range.workspace = true
+virt.workspace = true
+x86_system.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+hvdef.workspace = true
+inspect.workspace = true
+vmcore.workspace = true
+vm_topology.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true
+
+[lints]
+workspace = true

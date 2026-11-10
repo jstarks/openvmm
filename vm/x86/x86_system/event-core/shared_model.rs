@@ -18,12 +18,15 @@ use super::{
     WordResult, event_model as e, mmu_model, model,
 };
 use vstd::prelude::*;
+#[path = "shared_decode_model.rs"]
+pub mod decode;
 
 verus! {
 
 pub struct State {
     pub core: c::State, pub tables: Tables, pub phase: Phase,
     pub pending: Option<u8>, pub shadow: bool, pub halted: bool, pub handler_pending: bool,
+    pub external_decode: bool, pub decode_sequence: u64,
 }
 pub open spec fn visible_cpu(s: State) -> model::State {
     match s.phase { Phase::Ordinary { flags } => model::State { flags, ..s.core.cpu },
@@ -108,6 +111,8 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
                 (State { core: c::boundary_commit(s.core, next, true).0, phase: Phase::Ready,
                     shadow: value == 0xfb && cpu.flags & 0x200u64 == 0,
                     halted: value == 0xf4, handler_pending: false, ..s }, Tick::Retired(false))
+            } else if s.external_decode && value != 0x48 && value != 0x0f {
+                decode::offer(s, value, 0, 0, 1)
             } else if value != 0x0f && (value < 0x48 || value > 0x4f) {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported))
             } else if cpu.rip == u64::MAX {
@@ -118,6 +123,9 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
         },
         Phase::Second { first } => {
             if first == 0x48 && value == 0xcf { iret(s) }
+            else if s.external_decode && (first != 0x0f || value != 1) {
+                decode::offer(s, first, value, 0, 2)
+            }
             else if first != 0x0f {
                 (State { core: c::boundary_commit(s.core,
                     model::State { flags: cpu.flags & !0x10000u64, ..cpu }, true).0,
@@ -129,7 +137,9 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
             } else { (fetch(s, (cpu.rip + 2) as u64, Phase::Third), Tick::Pending) }
         },
         Phase::Third => {
-            if value != 0x3f || !mmu_model::canonical(cpu.gpr[7]) {
+            if s.external_decode && value != 0x3f {
+                decode::offer(s, 0x0f, 1, value, 3)
+            } else if value != 0x3f || !mmu_model::canonical(cpu.gpr[7]) {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported))
             } else {
                 let invalidated = c::State { mmu: m::State {
@@ -239,6 +249,18 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
 }
 pub open spec fn advance(s: State) -> (State, Tick) {
     match s.phase {
+        Phase::Decode { input } => (s, Tick::Decode(input)),
+        Phase::Admitted { .. } => decode::admitted(s),
+        Phase::DecodeFetch { input } => match m::request(s.core.mmu) {
+            Request::Complete(report) => match report.result {
+                MmuResult::Success(value) => decode::append(s, value),
+                MmuResult::PageFault(code) => entry(s, Event::PageFault(code)),
+                MmuResult::GeneralProtection => entry(s, Event::GeneralProtection),
+                other => stop(s, EventDiagnostic::Fetch {
+                    address: (input.rip + input.length) as u64, byte_result: other }),
+            },
+            _ => (s, Tick::Waiting),
+        },
         Phase::Stopped { reason } => (s, Tick::Stopped(reason)),
         Phase::Ready => {
             if !e::flags_supported(s.core.cpu.flags) { stop(s, EventDiagnostic::Profile) }

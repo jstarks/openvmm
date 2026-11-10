@@ -20,7 +20,7 @@ verus! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PagedDiagnostic {
     InvalidConfig, Backing, HugePage, Ambiguous, DataCrossPage, DataWrap, FetchWrap,
-    Unsupported, DebugRequired,
+    Unsupported, DebugRequired, DecodeLimit, DecodeRejected, DecodeExhausted,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepOutcome {

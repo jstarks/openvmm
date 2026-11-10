@@ -8,6 +8,7 @@ use vstd::prelude::*;
 pub mod arithmetic;
 pub mod decoder;
 pub mod model;
+pub mod operand;
 
 pub use arithmetic::{adc64, add_two_words, add64, merge_flags};
 

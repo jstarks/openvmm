@@ -10459,6 +10459,7 @@ dependencies = [
  "virt",
  "vm_topology",
  "vmcore",
+ "x86_decode",
  "x86_system",
 ]
 
@@ -12878,6 +12879,14 @@ dependencies = [
  "bitflags 2.13.2",
  "rustversion",
  "volatile",
+]
+
+[[package]]
+name = "x86_decode"
+version = "0.0.0"
+dependencies = [
+ "iced-x86",
+ "x86_system",
 ]
 
 [[package]]

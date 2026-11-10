@@ -106,6 +106,184 @@ fn shared(owned: &EventMachine) -> SharedEventMachine {
     )
 }
 
+fn decoded_one(cpu: &mut SharedEventMachine, ram: &NativeRam) -> Batch {
+    let before = cpu.cpu();
+    for _ in 0..4096 {
+        let batch = cpu.run(ram, 1, 1).unwrap();
+        match batch.stop {
+            BatchStop::Decode(input) => {
+                assert_eq!(cpu.cpu(), before, "decode must expose the unretired CPU");
+                assert!(cpu.complete_decode(input.sequence, x86_decode::admit(input)));
+            }
+            BatchStop::Yield => assert_eq!(cpu.cpu(), before),
+            _ => return batch,
+        }
+    }
+    panic!("decoded instruction exceeded finite schedule");
+}
+
+#[test]
+fn decoded_page_edge_retires_without_touching_the_missing_next_page() {
+    let (mut bytes, mut owned) = fixture();
+    let start = 0x10ffdusize;
+    bytes[start..start + 3].copy_from_slice(&[0x49, 0x89, 0xf7]);
+    put(&mut bytes, pte(0x11000), 0x11000);
+    owned.core.cpu.rip = start as u64;
+    owned.core.cpu.flags |= RF;
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    assert!(cpu.enable_decode());
+    let batch = decoded_one(&mut cpu, &ram);
+    assert_eq!(
+        (batch.retired, batch.delivered, batch.stop),
+        (1, 0, BatchStop::Budget)
+    );
+    let mut expected = owned.core.cpu;
+    expected.gpr[15] = expected.gpr[6];
+    expected.rip += 3;
+    expected.flags &= !RF;
+    assert_eq!(cpu.cpu(), expected);
+    assert_eq!(cpu.cr2(), owned.core.mmu.cr2());
+    assert_eq!(memory.read_plain::<u64>(pte(0x11000)).unwrap(), 0x11000);
+}
+
+#[test]
+fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code() {
+    for (code, expected, length) in [
+        (&[0xb8, 0x78, 0x56, 0x34, 0x12][..], 0x12345678, 5),
+        (&[0x48, 0x8b, 0x07][..], 0xabcdef0123456789, 3),
+    ] {
+        let (mut bytes, mut owned) = fixture();
+        bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(code);
+        owned.core.cpu.gpr[7] = 0x8000;
+        put(&mut bytes, 0x8000, 0xabcdef0123456789);
+        let (memory, ram) = backing(&bytes);
+        let mut cpu = shared(&owned);
+        assert!(cpu.enable_decode());
+        loop {
+            let batch = cpu.run(&ram, 1024, 1).unwrap();
+            let BatchStop::Decode(input) = batch.stop else {
+                panic!("{batch:?}")
+            };
+            let decision = x86_decode::admit(input);
+            assert!(cpu.complete_decode(input.sequence, decision));
+            if !matches!(decision, x86_system::shared::decode::DecodeDecision::More) {
+                break;
+            }
+        }
+        memory.write_at(CODE, &[0xff; 8]).unwrap();
+        let done = decoded_one(&mut cpu, &ram);
+        assert_eq!(
+            (done.retired, done.delivered, done.stop),
+            (1, 0, BatchStop::Budget)
+        );
+        assert_eq!(cpu.cpu().gpr[0], expected);
+        assert_eq!(cpu.cpu().rip, CODE + length);
+    }
+}
+
+#[test]
+fn decoded_fetch_fault_discards_prefix_and_rejects_reply_after_guest_repair() {
+    use x86_system::shared::decode::DecodeDecision;
+    let (mut bytes, mut owned) = fixture();
+    let start = 0x15ffeusize;
+    bytes[start..start + 5].copy_from_slice(&[0xb8, 0x11, 0x22, 0x33, 0x44]);
+    put(&mut bytes, pte(0x16000), 0x16000);
+    owned.core.cpu.rip = start as u64;
+    owned.core.cpu.flags |= RF;
+    owned.core.cpu.gpr[0] = 0xfeedface;
+    owned.core.cpu.gpr[1] = 0x16007;
+    owned.core.cpu.gpr[6] = pte(0x16000);
+    owned.core.cpu.gpr[7] = 0x16000;
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    assert!(cpu.enable_decode());
+    let stale = loop {
+        let batch = cpu.run(&ram, 1024, 1).unwrap();
+        let BatchStop::Decode(input) = batch.stop else {
+            panic!("{batch:?}")
+        };
+        assert!(cpu.complete_decode(input.sequence, x86_decode::admit(input)));
+        if input.length == 2 {
+            break input;
+        }
+    };
+    let fault = cpu.run(&ram, 1024, 1).unwrap();
+    assert_eq!(
+        (fault.retired, fault.delivered, fault.stop),
+        (0, 1, BatchStop::Budget)
+    );
+    assert_eq!(cpu.cr2(), 0x16000);
+    assert!(!cpu.complete_decode(stale.sequence, DecodeDecision::Rejected));
+    memory
+        .write_at(start as u64, &[0xb9, 0x78, 0x56, 0x34, 0x12])
+        .unwrap();
+    for _ in 0..4 {
+        assert_eq!(decoded_one(&mut cpu, &ram).retired, 1);
+    }
+    assert_eq!(cpu.cpu().rip, start as u64);
+    assert_ne!(cpu.cpu().flags & RF, 0);
+    let batch = cpu.run(&ram, 1024, 1).unwrap();
+    let BatchStop::Decode(current) = batch.stop else {
+        panic!("{batch:?}")
+    };
+    assert!(current.sequence > stale.sequence);
+    assert_eq!(
+        current.bytes[0], 0xb9,
+        "restart must refetch the changed opcode"
+    );
+    assert!(!cpu.complete_decode(stale.sequence, DecodeDecision::Legacy));
+    assert!(cpu.complete_decode(current.sequence, x86_decode::admit(current)));
+    let done = decoded_one(&mut cpu, &ram);
+    assert_eq!(
+        (done.retired, done.delivered, done.stop),
+        (1, 0, BatchStop::Budget)
+    );
+    assert_eq!(cpu.cpu().gpr[0], 0xfeedface);
+    assert_eq!(cpu.cpu().gpr[1], 0x12345678);
+    assert_eq!(cpu.cpu().rip, start as u64 + 5);
+    assert_eq!(cpu.cpu().flags & RF, 0);
+}
+
+#[test]
+fn decoded_instruction_keeps_sti_shadow_until_retirement_then_delivers_irq() {
+    let (mut bytes, mut owned) = fixture();
+    bytes[CODE as usize..CODE as usize + 7]
+        .copy_from_slice(&[0xfb, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xf4]);
+    owned.core.cpu.flags &= !IF;
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    assert!(cpu.enable_decode());
+    assert_eq!(decoded_one(&mut cpu, &ram).retired, 1);
+    assert!(cpu.shadow());
+    assert_eq!(cpu.inject(64), Injection::Queued);
+    loop {
+        let batch = cpu.run(&ram, 1, 1).unwrap();
+        match batch.stop {
+            BatchStop::Decode(input) => {
+                assert!(cpu.shadow());
+                assert_eq!(cpu.pending(), Some(64));
+                assert_eq!((batch.retired, batch.delivered), (0, 0));
+                assert!(cpu.complete_decode(input.sequence, x86_decode::admit(input)));
+            }
+            BatchStop::Yield => {}
+            BatchStop::Budget => {
+                assert_eq!((batch.retired, batch.delivered), (1, 0));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(!cpu.shadow());
+    assert_eq!(cpu.cpu().rip, CODE + 6);
+    assert_eq!(cpu.cpu().gpr[0], 0x12345678);
+    let entered = decoded_one(&mut cpu, &ram);
+    assert_eq!((entered.retired, entered.delivered), (0, 1));
+    let stack = owned.core.cpu.gpr[4] / 16 * 16;
+    assert_eq!(memory.read_plain::<u64>(stack - 40).unwrap(), CODE + 6);
+    assert_eq!(cpu.pending(), None);
+}
+
 fn one<R: PhysicalRam>(cpu: &mut SharedEventMachine, ram: &R) -> Batch
 where
     R::Error: std::fmt::Debug,

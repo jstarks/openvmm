@@ -469,6 +469,7 @@ virt = { path = "vmm_core/virt" }
 virt_hvf = { path = "vmm_core/virt_hvf" }
 virt_kvm = { path = "vmm_core/virt_kvm" }
 x86_system = { path = "vm/x86/x86_system" }
+x86_decode = { path = "vm/x86/x86_decode" }
 virt_mshv = { path = "vmm_core/virt_mshv" }
 virt_support_aarch64emu = { path = "vmm_core/virt_support_aarch64emu" }
 virt_support_apic = { path = "vmm_core/virt_support_apic" }
@@ -666,13 +667,8 @@ elfcore = "2.0.1"
 object = { version = "0.37.3", default-features = false }
 
 # --- Virtualization / hypervisor / firmware ---
-# iced has negative features, which aren't how features are supposed to work, but disable them here along with default features.
-iced-x86 = { version = "1.17", default-features = false, features = [
-  "no_vex",
-  "no_evex",
-  "no_xop",
-  "no_d3now",
-] }
+# Keep encoding recognition separate from each consumer's execution profile.
+iced-x86 = { version = "=1.21.0", default-features = false }
 igvm = { git = "https://github.com/microsoft/igvm", rev = "b7e717d40653f8c2382342eb7097dcd3ec0568de" }
 igvm_defs = { git = "https://github.com/microsoft/igvm", rev = "b7e717d40653f8c2382342eb7097dcd3ec0568de", default-features = false }
 kvm-bindings = "0.14.0"

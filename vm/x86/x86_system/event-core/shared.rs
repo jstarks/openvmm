@@ -10,6 +10,9 @@ use mmu_core::shared::{self as memory, Reply, Request, RunError};
 #[cfg(verus_keep_ghost)]
 use paged_core::shared::CpuPhase;
 use paged_core::shared::{SharedMachine, Tick as CpuTick};
+#[path = "shared_decode.rs"]
+pub mod decode;
+use decode::{DecodeDecision, DecodeInput};
 
 verus! {
 
@@ -19,6 +22,9 @@ pub struct ReturnWords { pub ip: u64, pub cs: u64, pub flags: u64, pub rsp: u64,
 pub enum Phase {
     Ready, First, Second { first: u8 }, Third,
     Ordinary { flags: u64 },
+    Decode { input: DecodeInput },
+    DecodeFetch { input: DecodeInput },
+    Admitted { input: DecodeInput, decision: DecodeDecision },
     GateLow { event: Event, address: u64 },
     GateHigh { event: Event, low: u64 },
     Code { event: Event, low: u64, target: u64 },
@@ -28,23 +34,35 @@ pub enum Phase {
     Stopped { reason: EventDiagnostic },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tick { Pending, Waiting, Retired(bool), Delivered(u8), Halted, Stopped(EventDiagnostic) }
+pub enum Tick { Pending, Waiting, Retired(bool), Delivered(u8), Halted, Stopped(EventDiagnostic),
+    Decode(DecodeInput) }
 
 pub struct SharedEventMachine {
     core: SharedMachine, tables: Tables, phase: Phase,
     pending: Option<u8>, shadow: bool, halted: bool, handler_pending: bool,
+    external_decode: bool, decode_sequence: u64,
 }
 impl View for SharedEventMachine {
     type V = spec::State;
     closed spec fn view(&self) -> spec::State {
         spec::State { core: self.core@, tables: self.tables, phase: self.phase,
             pending: self.pending, shadow: self.shadow, halted: self.halted,
-            handler_pending: self.handler_pending }
+            handler_pending: self.handler_pending, external_decode: self.external_decode,
+            decode_sequence: self.decode_sequence }
     }
 }
 impl SharedEventMachine {
     pub closed spec fn invariant(&self) -> bool {
         self.core.invariant()
+        && match self.phase {
+            Phase::Decode { input } | Phase::Admitted { input, .. } =>
+                spec::decode::valid_input(self@, input)
+                && !mmu_core::shared_model::active(self.core@.mmu.phase),
+            Phase::DecodeFetch { input } => spec::decode::valid_input(self@, input)
+                && input.length < 15 && input.rip as int + input.length as int <= u64::MAX
+                && self.core@.mmu.va == input.rip + input.length,
+            _ => true,
+        }
         && match self.phase {
             Phase::Ready => self.core@.phase == CpuPhase::Ready
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
@@ -82,7 +100,8 @@ impl SharedEventMachine {
         let core = SharedMachine::new(cpu, config, cr2, false);
         proof { core.boundary_facts(); }
         Self { core, tables, phase: Phase::Ready,
-            pending: None, shadow: false, halted: false, handler_pending: false }
+            pending: None, shadow: false, halted: false, handler_pending: false,
+            external_decode: false, decode_sequence: 0 }
     }
 
     pub fn cpu(&self) -> (v: State) ensures v@ == spec::visible_cpu(self@) {
@@ -204,6 +223,18 @@ impl SharedEventMachine {
         ensures final(self).invariant(), (final(self)@, tick) == spec::advance(old(self)@),
     {
         match self.phase {
+            Phase::Decode { input } => Tick::Decode(input),
+            Phase::Admitted { .. } => self.advance_admitted(),
+            Phase::DecodeFetch { input } => match self.core.request() {
+                Request::Complete(report) => match report.result {
+                    MmuResult::Success(value) => self.append_decode(value),
+                    MmuResult::PageFault(code) => self.start_entry(Event::PageFault(code)),
+                    MmuResult::GeneralProtection => self.start_entry(Event::GeneralProtection),
+                    other => self.stop(EventDiagnostic::Fetch {
+                        address: input.rip + input.length as u64, byte_result: other }),
+                },
+                _ => Tick::Waiting,
+            },
             Phase::Stopped { reason } => Tick::Stopped(reason),
             Phase::Ready => {
                 let cpu = self.core.cpu();
@@ -294,6 +325,9 @@ impl SharedEventMachine {
                     self.halted = value == 0xf4; self.handler_pending = false;
                     return Tick::Retired(false);
                 }
+                if self.external_decode && value != 0x48 && value != 0x0f {
+                    return self.offer_decode(value, 0, 0, 1);
+                }
                 if value != 0x0f && (value < 0x48 || value > 0x4f) {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
@@ -303,6 +337,9 @@ impl SharedEventMachine {
             },
             Phase::Second { first } => {
                 if first == 0x48 && value == 0xcf { return self.start_iret(); }
+                if self.external_decode && (first != 0x0f || value != 1) {
+                    return self.offer_decode(first, value, 0, 2);
+                }
                 if first != 0x0f {
                     let flags = cpu.flags; cpu.flags &= !0x10000u64;
                     let _accepted = self.core.boundary_commit(cpu, true); assert(_accepted);
@@ -314,6 +351,9 @@ impl SharedEventMachine {
                 self.phase = Phase::Third; Tick::Pending
             },
             Phase::Third => {
+                if self.external_decode && value != 0x3f {
+                    return self.offer_decode(0x0f, 1, value, 3);
+                }
                 if value != 0x3f || !canonical(cpu.gpr[7]) {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
@@ -330,7 +370,8 @@ impl SharedEventMachine {
     fn word_location(&self) -> (out: (Stage, u64))
         requires self.invariant(),
             !matches!(self.phase, Phase::Ready | Phase::First | Phase::Second { .. }
-                | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }),
+                | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
+                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }),
         ensures out == spec::word_location(self@),
     {
         let cpu = self.core.cpu();
@@ -350,7 +391,8 @@ impl SharedEventMachine {
     fn word_value(&mut self, value: u64) -> (tick: Tick)
         requires old(self).invariant(),
             !matches!(old(self).phase, Phase::Ready | Phase::First | Phase::Second { .. }
-                | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }),
+                | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
+                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }),
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::word_value(old(self)@, value),
     {
@@ -443,6 +485,7 @@ pub enum BatchStop {
     Waiting,
     Stopped(EventDiagnostic),
     Io(IoRequest),
+    Decode(DecodeInput),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Batch {
@@ -478,6 +521,13 @@ impl SharedEventMachine {
                 });
             }
             match self.advance() {
+                Tick::Decode(input) => {
+                    return Ok(Batch {
+                        retired,
+                        delivered,
+                        stop: BatchStop::Decode(input),
+                    });
+                }
                 Tick::Pending => {}
                 Tick::Retired(serializing) => {
                     if serializing {

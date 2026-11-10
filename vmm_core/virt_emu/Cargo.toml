@@ -11,6 +11,7 @@ guestmem.workspace = true
 memory_range.workspace = true
 virt.workspace = true
 x86_system.workspace = true
+x86_decode.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 futures.workspace = true

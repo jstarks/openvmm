@@ -62,6 +62,9 @@ pub enum Error {
     /// Completion identity or kind did not match.
     #[error("device completion did not match the outstanding request")]
     Completion,
+    /// Decoder input was stale or no longer outstanding.
+    #[error("decoder completion did not match the outstanding request")]
+    DecodeCompletion,
     /// Dropping an in-flight run future prevents safe continuation.
     #[error("run future was cancelled during a device operation; replay is unsafe")]
     CancelledIo,
@@ -413,6 +416,7 @@ impl Processor for EmuProcessor<'_> {
         if self.state.io_active {
             return Err(dev.fatal_error(Box::new(Error::CancelledIo)));
         }
+        let mut decode_work = 0u8;
         loop {
             stop.check()?;
             if let Some(error) = self.state.fault.take() {
@@ -435,6 +439,16 @@ impl Processor for EmuProcessor<'_> {
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Memory(error)))),
             };
             match batch.stop {
+                BatchStop::Decode(input) => {
+                    if !core.complete_decode(input.sequence, x86_decode::admit(input)) {
+                        return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));
+                    }
+                    decode_work += 1;
+                    if decode_work == 64 {
+                        self.control.yield_requested.request_yield();
+                        decode_work = 0;
+                    }
+                }
                 BatchStop::Io(request) => {
                     self.state.io_active = true;
                     self.ram.barrier();
@@ -613,7 +627,11 @@ impl AccessVpState for EmuStateAccess<'_> {
         {
             return Err(Error::Profile("initial long-mode register image"));
         }
-        self.state.core = Some(SharedEventMachine::new(cpu, config, regs.cr2, tables));
+        let mut core = SharedEventMachine::new(cpu, config, regs.cr2, tables);
+        if !core.enable_decode() {
+            return Err(Error::Profile("initial decoder state"));
+        }
+        self.state.core = Some(core);
         Ok(())
     }
     fn activity(&mut self) -> Result<vp::Activity, Error> {

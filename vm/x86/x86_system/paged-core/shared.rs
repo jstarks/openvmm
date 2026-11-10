@@ -123,6 +123,45 @@ impl SharedMachine {
         true
     }
 
+    pub(crate) fn boundary_decoded(&mut self, rex: u8, opcode: u8, modrm: u8) -> (tick: Tick)
+        requires old(self).invariant(), old(self)@.phase is Boundary,
+            !mmu_core::shared_model::active(old(self)@.mmu.phase),
+            old(self)@.cpu.flags & 0x10100u64 == 0,
+        ensures final(self).invariant(),
+            (final(self)@, tick) == spec::decoded(old(self)@, rex, opcode, modrm),
+    {
+        self.decoded(rex, opcode, modrm)
+    }
+
+    fn decoded(&mut self, rex: u8, opcode: u8, modrm: u8) -> (tick: Tick)
+        requires old(self).mmu.invariant(),
+            !mmu_core::shared_model::active(old(self).mmu@.phase),
+            old(self).cpu.flags & 0x10100u64 == 0,
+        ensures final(self).invariant(),
+            (final(self)@, tick) == spec::decoded(old(self)@, rex, opcode, modrm),
+    {
+        let op = memory_core::decode(rex, opcode, modrm);
+        match op {
+            memory_core::Op::Alu(alu) => {
+                let _result = execute(&mut self.cpu, alu);
+                assert(_result == Diagnostic::Advanced);
+                self.phase = CpuPhase::Ready;
+                Tick::Retired
+            },
+            memory_core::Op::Unsupported =>
+                self.stop(StepOutcome::Diagnostic(PagedDiagnostic::Unsupported)),
+            memory_core::Op::Load { base, .. } | memory_core::Op::Store { base, .. } => {
+                let address = self.cpu.gpr[base as usize];
+                let request = match op { memory_core::Op::Store { reg, .. } =>
+                    WordAccess::Write(self.cpu.gpr[reg as usize]), _ => WordAccess::Read };
+                let _accepted = self.mmu.begin_word(address, request, self.user);
+                assert(_accepted);
+                self.phase = CpuPhase::Data { op };
+                Tick::Pending
+            },
+        }
+    }
+
     fn stop(&mut self, outcome: StepOutcome) -> (tick: Tick)
         requires old(self).mmu.invariant(), !mmu_core::shared_model::active(old(self).mmu@.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::stopped(old(self)@, outcome),
@@ -255,26 +294,7 @@ impl SharedMachine {
                 Tick::Pending
             },
             CpuPhase::Third { rex, opcode } => {
-                let op = memory_core::decode(rex, opcode, value);
-                match op {
-                    memory_core::Op::Alu(alu) => {
-                        let _result = execute(&mut self.cpu, alu);
-                        assert(_result == Diagnostic::Advanced);
-                        self.phase = CpuPhase::Ready;
-                        Tick::Retired
-                    },
-                    memory_core::Op::Unsupported =>
-                        self.stop(StepOutcome::Diagnostic(PagedDiagnostic::Unsupported)),
-                    memory_core::Op::Load { base, .. } | memory_core::Op::Store { base, .. } => {
-                        let address = self.cpu.gpr[base as usize];
-                        let request = match op { memory_core::Op::Store { reg, .. } =>
-                            WordAccess::Write(self.cpu.gpr[reg as usize]), _ => WordAccess::Read };
-                        let _accepted = self.mmu.begin_word(address, request, self.user);
-                        assert(_accepted);
-                        self.phase = CpuPhase::Data { op };
-                        Tick::Pending
-                    },
-                }
+                self.decoded(rex, opcode, value)
             },
             _ => { assert(false); Tick::Waiting },
         }

@@ -64,6 +64,25 @@ pub open spec fn fetch(s: State, offset: u64, phase: CpuPhase) -> (State, Tick) 
     (State { mmu: mm::begin(s.mmu, (s.cpu.rip + offset) as u64, Access::Fetch, s.user, None),
         phase, ..s }, Tick::Pending)
 }
+pub open spec fn decoded(s: State, rex: u8, opcode: u8, value: u8) -> (State, Tick) {
+    let op = memory_model::decode(rex, opcode, value);
+    match op {
+        memory_model::Op::Alu(a) => (State { cpu: model::execute(s.cpu, a).0,
+            phase: CpuPhase::Ready, ..s }, Tick::Retired),
+        memory_model::Op::Unsupported =>
+            stopped(s, StepOutcome::Diagnostic(PagedDiagnostic::Unsupported)),
+        memory_model::Op::Load(reg, base) | memory_model::Op::Store(reg, base) => {
+            let request = match op { memory_model::Op::Store(r, _) =>
+                WordAccess::Write(s.cpu.gpr[r] as u64), _ => WordAccess::Read };
+            let executable = match op { memory_model::Op::Load(_, _) =>
+                memory_core::Op::Load { reg: reg as u8, base: base as u8 },
+                _ => memory_core::Op::Store { reg: reg as u8, base: base as u8 } };
+            (State { mmu: mm::begin(s.mmu, s.cpu.gpr[base] as u64,
+                word_model::request(request), s.user, Some(request)),
+                phase: CpuPhase::Data { op: executable }, ..s }, Tick::Pending)
+        },
+    }
+}
 pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
     match s.phase {
         CpuPhase::First => {
@@ -81,23 +100,7 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
             } else { fetch(s, 2, CpuPhase::Third { rex, opcode: value }) }
         },
         CpuPhase::Third { rex, opcode } => {
-            let op = memory_model::decode(rex, opcode, value);
-            match op {
-                memory_model::Op::Alu(a) => (State { cpu: model::execute(s.cpu, a).0,
-                    phase: CpuPhase::Ready, ..s }, Tick::Retired),
-                memory_model::Op::Unsupported =>
-                    stopped(s, StepOutcome::Diagnostic(PagedDiagnostic::Unsupported)),
-                memory_model::Op::Load(reg, base) | memory_model::Op::Store(reg, base) => {
-                    let request = match op { memory_model::Op::Store(r, _) =>
-                        WordAccess::Write(s.cpu.gpr[r] as u64), _ => WordAccess::Read };
-                    let executable = match op { memory_model::Op::Load(_, _) =>
-                        memory_core::Op::Load { reg: reg as u8, base: base as u8 },
-                        _ => memory_core::Op::Store { reg: reg as u8, base: base as u8 } };
-                    (State { mmu: mm::begin(s.mmu, s.cpu.gpr[base] as u64,
-                        word_model::request(request), s.user, Some(request)),
-                        phase: CpuPhase::Data { op: executable }, ..s }, Tick::Pending)
-                },
-            }
+            decoded(s, rex, opcode, value)
         },
         _ => (s, Tick::Waiting),
     }

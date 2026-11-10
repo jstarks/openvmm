@@ -412,6 +412,59 @@ fn pending_lock_cancel_uses_async_identity_and_does_not_obstruct_unlock_or_flush
 }
 
 #[test]
+fn rollback_failure_is_reported_without_hiding_retained_locks() {
+    block_on(async {
+        let (fs, control) = ControlledFs::new(MemoryFs::new(1024, 16));
+        let server = Server::new("memory", fs).unwrap();
+        let mut client = Client::new(&server).await;
+        let owner = client.open("cleanup-error", 2, 0).await;
+        let peer = client.open("cleanup-error", 1, 0).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(owner, 0, &[b'a'; 16]))
+            .await;
+        lock(&mut client, owner, &[(2, 4, EXCLUSIVE)], Status::SUCCESS).await;
+        lock(&mut client, peer, &[(10, 1, EXCLUSIVE)], Status::SUCCESS).await;
+        control
+            .set_plan(
+                Operation::RollbackLock,
+                Plan {
+                    failure: Some(Status::ACCESS_DENIED),
+                    ..Plan::default()
+                },
+            )
+            .unwrap();
+        lock(
+            &mut client,
+            owner,
+            &[(2, 4, SHARED), (10, 1, EXCLUSIVE)],
+            Status::ACCESS_DENIED,
+        )
+        .await;
+        assert_eq!(
+            response_status(&client.read(peer, 2, 1).await),
+            Status::FILE_LOCK_CONFLICT
+        );
+        assert_eq!(
+            response_status(
+                &client
+                    .send(Command::WRITE, &Client::write_body(owner, 2, b"x"))
+                    .await
+            ),
+            Status::FILE_LOCK_CONFLICT
+        );
+        lock(&mut client, owner, &[(2, 4, UNLOCK)], Status::SUCCESS).await;
+        assert_eq!(
+            response_status(&client.read(peer, 2, 1).await),
+            Status::SUCCESS
+        );
+        lock(&mut client, owner, &[(2, 4, UNLOCK)], Status::SUCCESS).await;
+        client
+            .ok(Command::WRITE, &Client::write_body(peer, 2, b"x"))
+            .await;
+    });
+}
+
+#[test]
 fn close_cancels_own_waiters_and_releases_locks_for_other_connections() {
     block_on(async {
         let memory = MemoryFs::new(1024, 16);

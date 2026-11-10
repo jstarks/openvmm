@@ -7,7 +7,6 @@
 use pal::windows::{ObjectAttributes, UnicodeStringRef};
 use pal_async::driver::Driver;
 use pal_async::windows::overlapped::{CustomNt, OverlappedFile};
-#[cfg(test)]
 use smb::provider::ByteRange;
 use smb::provider::{
     BasicInformation, Change, FileSystemInformation, Metadata, SectorSizeInformation,
@@ -717,20 +716,42 @@ pub(crate) fn query_security(file: &File, information: u32) -> Result<SecurityDe
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read(file: &OverlappedFile, offset: i64, data: Vec<u8>) -> CustomNt<Vec<u8>> {
     read_with_key(file, offset, data, 0)
 }
 
+#[cfg(test)]
 pub(crate) fn read_with_key(
     file: &OverlappedFile,
     offset: i64,
     data: Vec<u8>,
     key: u32,
 ) -> CustomNt<Vec<u8>> {
+    read_buffer(file, offset, data, |data| data, key)
+}
+
+pub(crate) fn read_admitted<G: Send + 'static>(
+    file: &OverlappedFile,
+    offset: i64,
+    data: Vec<u8>,
+    guard: G,
+) -> CustomNt<(Vec<u8>, G)> {
+    read_buffer(file, offset, (data, guard), |data| &mut data.0, 0)
+}
+
+fn read_buffer<T: Send + 'static>(
+    file: &OverlappedFile,
+    offset: i64,
+    data: T,
+    buffer: impl FnOnce(&mut T) -> &mut Vec<u8>,
+    key: u32,
+) -> CustomNt<T> {
     // SAFETY: The kernel references only PAL-owned status and data allocations.
     // NtReadFile captures the offset before returning.
     unsafe {
         file.custom_nt(data, |handle, data, overlapped| {
+            let data = buffer(data);
             nt::NtReadFile(
                 handle,
                 null_mut(),
@@ -746,20 +767,42 @@ pub(crate) fn read_with_key(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn write(file: &OverlappedFile, offset: i64, data: Vec<u8>) -> CustomNt<Vec<u8>> {
     write_with_key(file, offset, data, 0)
 }
 
+#[cfg(test)]
 pub(crate) fn write_with_key(
     file: &OverlappedFile,
     offset: i64,
     data: Vec<u8>,
     key: u32,
 ) -> CustomNt<Vec<u8>> {
+    write_buffer(file, offset, data, |data| data, key)
+}
+
+pub(crate) fn write_admitted<G: Send + 'static>(
+    file: &OverlappedFile,
+    offset: i64,
+    data: Vec<u8>,
+    guard: G,
+) -> CustomNt<(Vec<u8>, G)> {
+    write_buffer(file, offset, (data, guard), |data| &mut data.0, 0)
+}
+
+fn write_buffer<T: Send + 'static>(
+    file: &OverlappedFile,
+    offset: i64,
+    data: T,
+    buffer: impl FnOnce(&mut T) -> &mut Vec<u8>,
+    key: u32,
+) -> CustomNt<T> {
     // SAFETY: The kernel references only PAL-owned status and data allocations.
     // NtWriteFile captures the offset before returning.
     unsafe {
         file.custom_nt(data, |handle, data, overlapped| {
+            let data = buffer(data);
             nt::NtWriteFile(
                 handle,
                 null_mut(),
@@ -775,7 +818,6 @@ pub(crate) fn write_with_key(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn lock(
     file: &OverlappedFile,
     range: ByteRange,
@@ -805,7 +847,6 @@ pub(crate) fn lock(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn unlock(file: &File, range: ByteRange, key: u32) -> Result<(), Status> {
     let offset = range.offset as i64;
     let length = range.length as i64;

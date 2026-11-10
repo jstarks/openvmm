@@ -4,6 +4,9 @@
 //! Filesystem semantics independent of host files and VM resources.
 
 pub mod caching;
+mod locking;
+
+pub use locking::{LockScope, LockSettlement};
 
 pub use caching::{
     Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingSnapshot,
@@ -899,6 +902,8 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     /// Waiting requests must honor cancellation unless the lock was already acquired.
     /// Explicit close and fallback handle drop release all of the open's locks.
     /// Providers implementing this operation must also implement unlock and rollback_lock.
+    /// New callers should use `lock_request`; native providers may support only
+    /// that scoped interface rather than arbitrary committed-token rollback.
     async fn lock(
         &self,
         _file: &Self::File,
@@ -929,6 +934,16 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
         _request: &RequestContext,
     ) -> Result<(), Status> {
         Err(Status::NOT_SUPPORTED)
+    }
+    /// Begin one ordered lock request. The caller explicitly settles its prefix:
+    /// immediate conflicts roll back acquisitions, while later validation errors
+    /// and successful requests preserve them. Unlock prefixes are never rolled back.
+    ///
+    /// The default adapts acquisition IDs without changing software providers.
+    /// Wrappers must delegate this entry point, not reconstruct a scope around
+    /// legacy hooks that the underlying provider may not implement.
+    fn lock_request<'a>(&'a self, file: &'a Self::File) -> Box<dyn LockScope + 'a> {
+        Box::new(locking::IdScope::new(self, file))
     }
     /// Watch directory changes. The first call fixes filter/scope for its registration;
     /// buffer changes between calls and complete overlapping requests FIFO.

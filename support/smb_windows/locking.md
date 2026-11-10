@@ -1,6 +1,8 @@
 # Windows Host-Backed Lock Design
 
-Status: proposed design; provider lock support is not implemented or enabled.
+Status: implemented library adapter; Windows device/CLI wiring and VM validation
+remain pending. The legacy acquisition-token API is unsupported by this provider;
+use `FileSystem::lock_request` and explicit `LockScope::settle`.
 Native assumptions below were checked on ARM64 Windows `ge_release`,
 build 26300.9818, on 2026-11-09.
 
@@ -49,7 +51,7 @@ or infer append safety from an earlier EOF query.
 
 ## Request Scope, Rather Than Unbounded Rollback Tokens
 
-The proposed canonical provider operation owns a complete lock request scope.
+The canonical provider operation owns a complete lock request scope.
 It supports acquisition, ordinary unlock, preserving the processed prefix,
 and rolling back only that scope's acquisitions.
 
@@ -68,7 +70,7 @@ This boundary tells the backend when rollback of tentative acquisitions ends.
 It is not a claim that the existing API cannot express correct behavior.
 Rather, it supplies the lifecycle information required by this staging design.
 
-Software providers can initially use a default scope adapter around their
+Software providers use a default scope adapter around their
 existing acquisition IDs. Their ownership, I/O and rollback behavior must not
 change. Native support overrides the scoped operation; do not pretend its
 legacy per-acquisition rollback hook works for arbitrary committed locks.
@@ -139,11 +141,18 @@ and retain admission guards through actual native completion, not merely until
 an awaiting future is dropped. Keep synchronous state locks short; never await
 while holding them.
 
+The implementation briefly takes the ledger gate to admit I/O and then retains
+a completion-owned active-operation guard. Ordinary reads/writes may overlap.
+A lock scope retains the gate and drains active operations before changing
+locks. Native data buffers retain both that active guard and the native open.
+Native lock/unlock attempts and ledger updates run together on bounded workers,
+which retain the ledger gate even if an awaiting future is dropped.
+
 Do not hold such an exclusion gate across a contended native lock wait. That
 could prevent a concurrent same-open unlock from releasing the lock needed for
 progress.
 
-The initial design instead implements a logical waiting request using bounded,
+The adapter implements a logical waiting request using bounded,
 fail-immediately native attempts:
 
 1. Enter admission, validate current state and issue one nonblocking attempt.
@@ -189,27 +198,37 @@ Host-backed protection has the scope of native Windows byte-range locks. It
 does not claim to prohibit external EOF changes or memory-mapped mutation
 that the native filesystem itself permits.
 
-## Implementation and Validation Gate
+## Implementation and Validation
 
-This is not yet a completed adapter. Before enabling it:
+The library adapter and default software adapter are implemented. Direct
+contracts and focused native regressions cover:
 
-- Introduce the scoped provider operation and default software adapter;
-  explicitly delegate it through instrumentation wrappers.
-- Migrate direct provider contracts to test request outcomes, including failed
-  arrays preserving an older exclusive lock.
-- Implement the native ledger, realization and I/O admission together.
-- Test repeated shared acquisitions, mixed exact groups, zero-length ranges,
-  aliases, unsigned boundaries and exclusive-preferred ordinary unlock.
-- Test rollback after every acquisition point, invalid later elements,
-  resource/cleanup failures and commit-prefix outcomes.
-- Test owner/foreign reads and writes, append with external EOF changes,
-  and realization failure without data or unlock effects.
-- Test same-open unlock and unrelated requests progressing while another lock
-  waits; cancellation before admission, during an attempt and after grant.
-- Test close/drop, waiter limits, transient stop retention and destructive
-  cancel-and-drain. A batching API alone does not establish these properties.
+- Instrumentation delegation without falling back to unsupported legacy hooks.
+- Shared/exclusive ownership and exact exclusive-preferred unlock.
+- Mixed rollback at every acquisition prefix, preserving older exclusive locks.
+- Repeated shared locks, hard-link aliases, empty and unsigned boundary ranges.
+- Shared backing realization before owner append and last-exclusive unlock.
+- Owner/foreign reads and writes, including externally changed EOF.
+- Same-open unlock and flush progress while a lock waits, and retries after a
+  host unlock that does not signal the provider.
+- Cancellation before admission and after grant, retained unpolled attempts,
+  and completion-owned ledger updates after an awaiter is dropped.
+- Acquisition-capacity failure preserving its prefix, close recovering capacity,
+  foreign-provider handle rejection, and injected scope-settlement failure.
 
-Only after those checks pass should the shared synthetic coordinator be
-extracted for Linux and Windows. That layer should reuse the admission and
-identity concepts, while preserving the explicit distinction between native
-host enforcement and the guest-exclusive mutation-ownership promise.
+The shared engine's wire tests separately cover invalid-element prefix
+preservation, immediate-conflict rollback, partial unlocks, cancellation and
+CLOSE draining. They are not native SMB/vSMB wire certification.
+
+Remaining limits: actual NT backing-installation/unlock failures have not been
+fault-injected (the settlement failure is at the provider wrapper). Error paths
+retain existing ledger/backing before reporting the dependent write/unlock
+failure; partial realization remains committed. Waiter-cap exhaustion and
+filter-induced pending NT calls are not forced by these tests. Windows
+production line coverage is unavailable. Actual VM pause/disconnect validation
+still requires the Windows device integration; a retained library future does
+not establish VM lifecycle behavior.
+
+Shared synthetic coordination should reuse the admission and identity concepts,
+while preserving the explicit distinction between native host enforcement and
+the guest-exclusive mutation-ownership promise.

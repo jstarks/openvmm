@@ -35,8 +35,8 @@ use inspect::Inspect;
 use parking_lot::Mutex;
 use provider::{
     BasicInformation, ByteRange, CachingGrant, CachingRequest, FileControl, FileControlResult,
-    FileSystem, FileSystemInformation, Metadata, NotifyResult, OpenError, OpenOptions, Opened,
-    RequestContext, StreamInformation, SymbolicLink, map_access,
+    FileSystem, FileSystemInformation, LockSettlement, Metadata, NotifyResult, OpenError,
+    OpenOptions, Opened, RequestContext, StreamInformation, SymbolicLink, map_access,
 };
 use spec::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2317,61 +2317,58 @@ impl<B: FileSystem> Connection<B> {
         if !unlocking && count > 1 && locks.iter().any(|lock| !lock.flags.fail_immediately()) {
             return Err(Status::INVALID_PARAMETER);
         }
-        let mut acquired = Vec::new();
-        for lock in locks {
-            let range = ByteRange {
-                offset: lock.offset.get(),
-                length: lock.length.get(),
-            };
-            let flags = lock.flags;
-            if unlocking {
-                if flags.shared_lock() || flags.exclusive_lock() || flags.fail_immediately() {
-                    return Err(Status::INVALID_PARAMETER);
-                }
-                self.server
-                    .backend
-                    .unlock(&file.file, range, context)
-                    .await?;
-            } else {
-                let expected = LockFlags::new()
-                    .with_shared_lock(flags.shared_lock())
-                    .with_exclusive_lock(flags.exclusive_lock())
-                    .with_fail_immediately(flags.fail_immediately());
-                if flags.shared_lock() == flags.exclusive_lock()
-                    || flags.into_bits() != expected.into_bits()
-                {
-                    return Err(Status::INVALID_PARAMETER);
-                }
-                let result = self
-                    .server
-                    .backend
-                    .lock(
-                        &file.file,
-                        range,
-                        flags.exclusive_lock(),
-                        flags.fail_immediately(),
-                        context,
-                    )
-                    .await;
-                if result == Err(Status::LOCK_NOT_GRANTED) && flags.fail_immediately() {
-                    let rollback = RequestContext::new(
-                        self.server.next_request.fetch_add(1, Ordering::Relaxed),
-                    );
-                    for &acquired in acquired.iter().rev() {
-                        if let Err(status) = self
-                            .server
-                            .backend
-                            .rollback_lock(&file.file, acquired, &rollback)
-                            .await
-                        {
-                            tracelimit::error_ratelimited!(?status, "SMB lock rollback failed");
-                            return Err(status);
-                        }
+        let mut scope = self.server.backend.lock_request(&file.file);
+        let mut rollback = false;
+        let result = async {
+            for lock in locks {
+                let range = ByteRange {
+                    offset: lock.offset.get(),
+                    length: lock.length.get(),
+                };
+                let flags = lock.flags;
+                if unlocking {
+                    if flags.shared_lock() || flags.exclusive_lock() || flags.fail_immediately() {
+                        return Err(Status::INVALID_PARAMETER);
                     }
+                    scope.unlock(range, context).await?;
+                } else {
+                    let expected = LockFlags::new()
+                        .with_shared_lock(flags.shared_lock())
+                        .with_exclusive_lock(flags.exclusive_lock())
+                        .with_fail_immediately(flags.fail_immediately());
+                    if flags.shared_lock() == flags.exclusive_lock()
+                        || flags.into_bits() != expected.into_bits()
+                    {
+                        return Err(Status::INVALID_PARAMETER);
+                    }
+                    let result = scope
+                        .lock(
+                            range,
+                            flags.exclusive_lock(),
+                            flags.fail_immediately(),
+                            context,
+                        )
+                        .await;
+                    if result == Err(Status::LOCK_NOT_GRANTED) && flags.fail_immediately() {
+                        rollback = true;
+                    }
+                    result?;
                 }
-                acquired.push(result?);
             }
+            Ok::<(), Status>(())
         }
+        .await;
+        let settlement = if rollback {
+            LockSettlement::Rollback
+        } else {
+            LockSettlement::Preserve
+        };
+        let cleanup = RequestContext::new(self.server.next_request.fetch_add(1, Ordering::Relaxed));
+        if let Err(status) = scope.settle(settlement, &cleanup).await {
+            tracelimit::error_ratelimited!(?status, ?settlement, "SMB lock settlement failed");
+            return Err(status);
+        }
+        result?;
         Ok(SimpleBody {
             structure_size: SimpleBody::STRUCTURE_SIZE.into(),
             reserved: 0.into(),

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::io::{Io, check};
+use crate::locking::{ActiveIo, Coordination, DataFile, Scope};
 use crate::native::{self, Create};
 use crate::notify::Watch;
 use async_trait::async_trait;
@@ -11,8 +12,8 @@ use pal_async::driver::Driver;
 use pal_async::windows::overlapped::OverlappedFile;
 use parking_lot::Mutex;
 use smb::provider::{
-    BasicInformation, FileSystem, FileSystemInformation, Metadata, NotifyResult, OpenOptions,
-    RequestContext, map_access,
+    BasicInformation, FileSystem, FileSystemInformation, LockScope, Metadata, NotifyResult,
+    OpenOptions, RequestContext, map_access,
 };
 use smb::security::SecurityDescriptor;
 use smb::spec::{
@@ -64,6 +65,7 @@ struct Inner {
     root: Arc<File>,
     opens: AtomicUsize,
     watches: Mutex<HashMap<u64, Vec<Weak<Watch>>>>,
+    locks: Arc<Coordination>,
 }
 
 struct Reservation(Arc<Inner>);
@@ -87,12 +89,12 @@ struct Open {
     _reservation: Reservation,
 }
 
-enum NativeFile {
-    Data(OverlappedFile),
+pub(crate) enum NativeFile {
+    Data(DataFile),
     Directory(Directory),
 }
 
-struct Directory {
+pub(crate) struct Directory {
     file: Arc<OverlappedFile>,
     scan: Mutex<()>,
     id: u64,
@@ -100,17 +102,34 @@ struct Directory {
 }
 
 impl NativeFile {
-    fn get(&self) -> &File {
+    pub(crate) fn get(&self) -> &File {
         match self {
-            Self::Data(file) => file.get(),
+            Self::Data(data) => data.file.get(),
             Self::Directory(directory) => directory.file.get(),
         }
     }
 
     fn overlapped(&self) -> Result<&OverlappedFile, Status> {
         match self {
-            Self::Data(file) => Ok(file),
+            Self::Data(data) => Ok(&data.file),
             Self::Directory(_) => Err(Status::FILE_IS_A_DIRECTORY),
+        }
+    }
+
+    pub(crate) fn data(&self) -> Result<&DataFile, Status> {
+        match self {
+            Self::Data(data) => Ok(data),
+            Self::Directory(_) => Err(Status::INVALID_PARAMETER),
+        }
+    }
+
+    async fn active(&self, request: &RequestContext) -> Result<Option<ActiveIo>, Status> {
+        match self {
+            Self::Data(data) => {
+                let _gate = data.admit(request).await?;
+                Ok(Some(data.active()?))
+            }
+            Self::Directory(_) => Ok(None),
         }
     }
 
@@ -147,6 +166,8 @@ impl Inspect for WindowsFs {
         req.respond()
             .field("opens", self.0.opens.load(Ordering::Relaxed))
             .field("open_limit", OPEN_LIMIT)
+            .field("range_locks", self.0.locks.lock_count())
+            .field("lock_waiters", self.0.locks.waiter_count())
             .field(
                 "workers_submitted",
                 self.0.io.submitted.load(Ordering::Relaxed),
@@ -171,6 +192,7 @@ impl WindowsFs {
             root: Arc::new(root),
             opens: AtomicUsize::new(0),
             watches: Mutex::new(HashMap::new()),
+            locks: Arc::new(Coordination::default()),
         })))
     }
 
@@ -301,6 +323,10 @@ fn walk(root: Arc<File>, parts: Vec<String>, create: &Create) -> Result<(File, u
 impl FileSystem for WindowsFs {
     type File = WindowsFile;
 
+    fn lock_request<'a>(&'a self, file: &'a WindowsFile) -> Box<dyn LockScope + 'a> {
+        Box::new(Scope::new(file.get(), &self.0.io, &self.0.locks))
+    }
+
     async fn open(
         &self,
         name: &str,
@@ -359,7 +385,7 @@ impl FileSystem for WindowsFs {
                 closing: AtomicBool::new(false),
             })
         } else {
-            NativeFile::Data(file)
+            NativeFile::Data(DataFile::new(file, self.0.locks.clone()))
         };
         Ok((
             WindowsFile {
@@ -386,8 +412,14 @@ impl FileSystem for WindowsFs {
     async fn close(&self, file: &WindowsFile, _request: &RequestContext) -> Result<(), Status> {
         let native = file.file.lock().take();
         if let Some(open) = &native {
-            if let NativeFile::Directory(directory) = &*open.file {
-                directory.closing.store(true, Ordering::Release);
+            match &*open.file {
+                NativeFile::Directory(directory) => {
+                    directory.closing.store(true, Ordering::Release)
+                }
+                NativeFile::Data(data) => {
+                    data.closing.store(true, Ordering::Release);
+                    data.coordination.changed();
+                }
             }
         }
         if let Some(watch) = file.watch.lock().await.take() {
@@ -395,9 +427,23 @@ impl FileSystem for WindowsFs {
         }
         // The engine has already drained this open's operations. Closing does
         // not issue an implicit flush and is not prevented by cancellation.
+        let mut locks = match &native {
+            Some(open) => match &*open.file {
+                NativeFile::Data(data) => {
+                    let guard = data.gate.clone().lock_owned().await;
+                    data.drain(&RequestContext::new(0)).await?;
+                    Some(guard)
+                }
+                NativeFile::Directory(_) => None,
+            },
+            None => None,
+        };
         self.0
             .io
             .worker(&RequestContext::new(0), move || {
+                if let (Some(open), Some(ledger)) = (&native, &mut locks) {
+                    open.file.data()?.close(ledger)?;
+                }
                 drop(native);
                 Ok(())
             })
@@ -460,9 +506,16 @@ impl FileSystem for WindowsFs {
         check(request)?;
         let offset = i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?;
         let file = file.get()?;
-        let mut io = native::read(file.overlapped()?, offset, vec![0; length.min(IO_LIMIT)]);
+        file.overlapped()?;
+        let admission = file.active(request).await?;
+        let mut io = native::read_admitted(
+            file.overlapped()?,
+            offset,
+            vec![0; length.min(IO_LIMIT)],
+            (file.clone(), admission),
+        );
         let mut cancelled = std::pin::pin!(request.cancelled().fuse());
-        let ((result, count), mut data) = futures::select_biased! {
+        let ((result, count), (mut data, _admission)) = futures::select_biased! {
             result = (&mut io).fuse() => result,
             () = cancelled => {
                 io.cancel();
@@ -491,10 +544,26 @@ impl FileSystem for WindowsFs {
             i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?
         };
         let file = file.get()?;
+        file.overlapped()?;
+        let mut guard = file.data()?.admit(request).await?;
+        if file.data()?.needs_realization(&guard) {
+            let backing = file.clone();
+            guard = self
+                .0
+                .io
+                .worker(request, move || {
+                    backing.data()?.realize(&mut guard)?;
+                    Ok(guard)
+                })
+                .await?;
+        }
+        let admission = (file.clone(), file.data()?.active()?);
+        drop(guard);
+        check(request)?;
         let data = data[..data.len().min(IO_LIMIT)].to_vec();
-        let mut io = native::write(file.overlapped()?, offset, data);
+        let mut io = native::write_admitted(file.overlapped()?, offset, data, admission);
         let mut cancelled = std::pin::pin!(request.cancelled().fuse());
-        let ((result, count), data) = futures::select_biased! {
+        let ((result, count), (data, _admission)) = futures::select_biased! {
             result = (&mut io).fuse() => result,
             () = cancelled => {
                 io.cancel();
@@ -561,9 +630,13 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let admission = file.active(request).await?;
         self.0
             .io
-            .worker(request, move || native::set_len(file.get(), length))
+            .worker(request, move || {
+                let _admission = admission;
+                native::set_len(file.get(), length)
+            })
             .await
     }
 
@@ -574,10 +647,12 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let admission = file.active(request).await?;
         let inner = self.0.clone();
         self.0
             .io
             .worker(request, move || {
+                let _admission = admission;
                 let mut watches = inner.watches.lock();
                 native::set_disposition(file.get(), delete)?;
                 if delete {
@@ -601,9 +676,13 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let admission = file.active(request).await?;
         self.0
             .io
-            .worker(request, move || native::set_basic(file.get(), info))
+            .worker(request, move || {
+                let _admission = admission;
+                native::set_basic(file.get(), info)
+            })
             .await
     }
 
@@ -673,9 +752,13 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let admission = file.active(request).await?;
         self.0
             .io
-            .worker(request, move || native::set_allocation(file.get(), length))
+            .worker(request, move || {
+                let _admission = admission;
+                native::set_allocation(file.get(), length)
+            })
             .await
     }
 
@@ -687,6 +770,7 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let admission = file.active(request).await?;
         let root = self.0.root.clone();
         let mut parts = components(name)?;
         let leaf = parts.pop().ok_or(Status::OBJECT_NAME_INVALID)?;
@@ -696,6 +780,7 @@ impl FileSystem for WindowsFs {
         self.0
             .io
             .worker(request, move || {
+                let _admission = admission;
                 let source = native::relative_path(&root, file.get())?;
                 if source == "\\" || native::delete_pending(file.get())? {
                     return Err(Status::ACCESS_DENIED);

@@ -3,7 +3,7 @@
 
 use super::*;
 use pal_async::{DefaultDriver, async_test};
-use smb::provider::{FileSystem, OpenOptions, RequestContext};
+use smb::provider::{ByteRange, FileSystem, LockSettlement, OpenOptions, RequestContext};
 use smb::spec::{AccessMask, CreateAction, CreateDisposition, ShareAccess};
 use smb::test_support::{
     Operation,
@@ -53,24 +53,27 @@ impl Fixture for NativeFixture {
             compression: Feature::Unsupported(Status::INVALID_DEVICE_REQUEST),
             basic_information: Feature::Supported,
             rename: Feature::Supported,
-            locks: Feature::Unsupported(Status::NOT_SUPPORTED),
+            locks: Feature::Supported,
             notifications: Feature::Supported,
         }
     }
 
     async fn wait_until_pending(&self, operation: Operation, request: &RequestContext) {
-        assert!(matches!(operation, Operation::Notify));
+        assert!(matches!(operation, Operation::Notify | Operation::Lock));
         let mut timer = pal_async::timer::PolledTimer::new(&*self.0.0.io.driver);
         loop {
-            let pending = self
-                .0
-                .0
-                .watches
-                .lock()
-                .values()
-                .flatten()
-                .filter_map(Weak::upgrade)
-                .any(|watch| watch.pending(request.id()));
+            let pending = if operation == Operation::Lock {
+                self.0.0.locks.pending(request.id())
+            } else {
+                self.0
+                    .0
+                    .watches
+                    .lock()
+                    .values()
+                    .flatten()
+                    .filter_map(Weak::upgrade)
+                    .any(|watch| watch.pending(request.id()))
+            };
             if pending {
                 return;
             }
@@ -119,11 +122,603 @@ contract_test!(compression);
 contract_test!(sparse_files);
 contract_test!(reparse_controls);
 contract_test!(lock_conflicts_and_io);
+contract_test!(lock_waiters_and_cancellation);
+contract_test!(lock_rollback_and_drop);
 contract_test!(notify_registration_and_cancellation);
 contract_test!(notify_fifo_and_small_buffer);
 contract_test!(notify_subtree_and_filters);
 contract_test!(notify_deletion_generations);
 contract_test!(notify_nonempty_delete_mode_preserves_watch);
+
+async fn acquire<B: FileSystem>(
+    fs: &B,
+    file: &B::File,
+    range: ByteRange,
+    exclusive: bool,
+    request: &RequestContext,
+) -> Result<(), Status> {
+    let mut scope = fs.lock_request(file);
+    let result = scope.lock(range, exclusive, true, request).await;
+    scope
+        .settle(LockSettlement::Preserve, &RequestContext::new(request.id()))
+        .await?;
+    result
+}
+
+async fn release<B: FileSystem>(
+    fs: &B,
+    file: &B::File,
+    range: ByteRange,
+    request: &RequestContext,
+) -> Result<(), Status> {
+    let mut scope = fs.lock_request(file);
+    let result = scope.unlock(range, request).await;
+    scope
+        .settle(LockSettlement::Preserve, &RequestContext::new(request.id()))
+        .await?;
+    result
+}
+
+#[async_test]
+async fn native_scope_rollback_preserves_old_locks_at_each_prefix(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "rollback-array",
+            options(CreateDisposition::CREATE),
+            &request,
+        )
+        .await
+        .unwrap();
+    fs.write(&owner, 0, &[b'a'; 32], &request).await.unwrap();
+    std::fs::hard_link(
+        root.path().join("rollback-array"),
+        root.path().join("alias"),
+    )
+    .unwrap();
+    let (peer, _) = fs
+        .open("alias", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let old = ByteRange {
+        offset: 2,
+        length: 4,
+    };
+    let blocked = ByteRange {
+        offset: 20,
+        length: 1,
+    };
+    acquire(&fs, &owner, old, true, &request).await.unwrap();
+    acquire(&fs, &peer, blocked, true, &request).await.unwrap();
+    let additions = [
+        (old, false),
+        (old, false),
+        (
+            ByteRange {
+                offset: 8,
+                length: 1,
+            },
+            false,
+        ),
+        (
+            ByteRange {
+                offset: 10,
+                length: 1,
+            },
+            true,
+        ),
+        (
+            ByteRange {
+                offset: 10,
+                length: 1,
+            },
+            false,
+        ),
+        (
+            ByteRange {
+                offset: 0,
+                length: 0,
+            },
+            true,
+        ),
+        (
+            ByteRange {
+                offset: 0,
+                length: 0,
+            },
+            true,
+        ),
+    ];
+    for prefix in 0..=additions.len() {
+        let mut scope = fs.lock_request(&owner);
+        for &(range, exclusive) in &additions[..prefix] {
+            scope.lock(range, exclusive, true, &request).await.unwrap();
+        }
+        assert_eq!(
+            scope.lock(blocked, true, true, &request).await,
+            Err(Status::LOCK_NOT_GRANTED)
+        );
+        scope
+            .settle(LockSettlement::Rollback, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.read(&peer, 2, 1, &request).await,
+            Err(Status::FILE_LOCK_CONFLICT)
+        );
+        assert_eq!(fs.write(&owner, 2, b"a", &request).await, Ok(1));
+        assert_eq!(fs.write(&peer, 8, b"a", &request).await, Ok(1));
+        assert_eq!(fs.read(&peer, 10, 1, &request).await.unwrap(), b"a");
+    }
+    release(&fs, &owner, old, &request).await.unwrap();
+    assert_eq!(
+        release(&fs, &owner, old, &request).await,
+        Err(Status::RANGE_NOT_LOCKED)
+    );
+    acquire(&fs, &peer, old, true, &request).await.unwrap();
+    fs.close(&owner, &request).await.unwrap();
+    fs.close(&peer, &request).await.unwrap();
+}
+
+#[async_test]
+async fn committed_shared_backing_protects_append_and_survives_exclusive_unlock(
+    driver: DefaultDriver,
+) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("append-locked"), b"abcdefghij").unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "append-locked",
+            OpenOptions {
+                access: AccessMask::new()
+                    .with_read_data(true)
+                    .with_append_data(true)
+                    .with_read_attributes(true)
+                    .into_bits(),
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let (peer, _) = fs
+        .open("append-locked", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let range = ByteRange {
+        offset: 2,
+        length: 4,
+    };
+    acquire(&fs, &owner, range, true, &request).await.unwrap();
+    let mut scope = fs.lock_request(&owner);
+    scope.lock(range, false, true, &request).await.unwrap();
+    scope.lock(range, false, true, &request).await.unwrap();
+    scope
+        .settle(LockSettlement::Preserve, &request)
+        .await
+        .unwrap();
+    let host = peer.get().unwrap();
+    native::set_len(host.get(), 3).unwrap();
+    assert_eq!(
+        fs.write(&owner, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    release(&fs, &owner, range, &request).await.unwrap();
+    assert_eq!(fs.read(&peer, 0, 3, &request).await.unwrap(), b"abc");
+    assert_eq!(
+        fs.write(&peer, 2, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    release(&fs, &owner, range, &request).await.unwrap();
+    assert_eq!(
+        fs.write(&owner, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    release(&fs, &owner, range, &request).await.unwrap();
+    assert_eq!(fs.write(&owner, 0, b"x", &request).await, Ok(1));
+    assert_eq!(fs.read(&peer, 0, 4, &request).await.unwrap(), b"abcx");
+    fs.close(&owner, &request).await.unwrap();
+    fs.close(&peer, &request).await.unwrap();
+}
+
+#[async_test]
+async fn native_unlock_realizes_shared_backing_without_an_owner_write(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "unlock-realize",
+            options(CreateDisposition::CREATE),
+            &request,
+        )
+        .await
+        .unwrap();
+    let (peer, _) = fs
+        .open("unlock-realize", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    fs.write(&owner, 0, b"abcd", &request).await.unwrap();
+    let range = ByteRange {
+        offset: 0,
+        length: 4,
+    };
+    acquire(&fs, &owner, range, true, &request).await.unwrap();
+    acquire(&fs, &owner, range, false, &request).await.unwrap();
+    release(&fs, &owner, range, &request).await.unwrap();
+    assert_eq!(fs.read(&peer, 0, 4, &request).await.unwrap(), b"abcd");
+    assert_eq!(
+        fs.write(&peer, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    assert_eq!(
+        fs.write(&owner, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    fs.close(&owner, &request).await.unwrap();
+    assert_eq!(fs.write(&peer, 0, b"x", &request).await, Ok(1));
+    fs.close(&peer, &request).await.unwrap();
+}
+
+#[async_test]
+async fn contended_native_waits_allow_same_open_unlock_and_detect_host_unlock(
+    driver: DefaultDriver,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let fixture = NativeFixture(fs);
+    let fs = &fixture.0;
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "waiting-native",
+            options(CreateDisposition::CREATE),
+            &request,
+        )
+        .await
+        .unwrap();
+    let (host, _) = fs
+        .open("waiting-native", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let host = host.get().unwrap();
+    let range = ByteRange {
+        offset: 0,
+        length: 4,
+    };
+    for external in [false, true] {
+        if external {
+            let ((status, _), ()) =
+                native::lock(host.overlapped().unwrap(), range, 0, true, true).await;
+            native::status(status).unwrap();
+        } else {
+            acquire(fs, &owner, range, true, &request).await.unwrap();
+        }
+        let mut scope = fs.lock_request(&owner);
+        let waiting = RequestContext::new(2);
+        let (result, ()) = futures::join!(scope.lock(range, true, false, &waiting), async {
+            fixture.wait_until_pending(Operation::Lock, &waiting).await;
+            fs.flush(&owner, &request).await.unwrap();
+            if external {
+                native::unlock(host.get(), range, 0).unwrap();
+            } else {
+                release(fs, &owner, range, &request).await.unwrap();
+            }
+        },);
+        result.unwrap();
+        scope
+            .settle(LockSettlement::Preserve, &request)
+            .await
+            .unwrap();
+        release(fs, &owner, range, &request).await.unwrap();
+    }
+    fs.close(&owner, &request).await.unwrap();
+}
+
+#[async_test]
+async fn scoped_locks_drain_concurrent_io_admission_and_cancel_without_grant(
+    driver: DefaultDriver,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open("drain-native", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    let native = owner.get().unwrap();
+    let first = native.active(&request).await.unwrap();
+    let second = native.active(&request).await.unwrap();
+    let range = ByteRange {
+        offset: 0,
+        length: 1,
+    };
+    let cancelled = RequestContext::new(2);
+    let mut scope = fs.lock_request(&owner);
+    {
+        let mut lock = std::pin::pin!(scope.lock(range, true, true, &cancelled));
+        assert!(futures::poll!(&mut lock).is_pending());
+        drop(first);
+        assert!(futures::poll!(&mut lock).is_pending());
+        cancelled.cancel();
+        assert_eq!(lock.await, Err(Status::CANCELLED));
+    }
+    scope
+        .settle(LockSettlement::Preserve, &request)
+        .await
+        .unwrap();
+    drop(second);
+    acquire(&fs, &owner, range, true, &request).await.unwrap();
+    fs.close(&owner, &request).await.unwrap();
+}
+
+#[async_test]
+async fn native_lock_capacity_failure_preserves_prefix_and_close_recovers_capacity(
+    driver: DefaultDriver,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "lock-capacity",
+            options(CreateDisposition::CREATE),
+            &request,
+        )
+        .await
+        .unwrap();
+    let (peer, _) = fs
+        .open("lock-capacity", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let range = ByteRange {
+        offset: 0,
+        length: 1,
+    };
+    let mut scope = fs.lock_request(&owner);
+    for _ in 0..4096 {
+        scope.lock(range, false, true, &request).await.unwrap();
+    }
+    assert_eq!(
+        scope.lock(range, false, true, &request).await,
+        Err(Status::INSUFFICIENT_RESOURCES)
+    );
+    scope
+        .settle(LockSettlement::Preserve, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.write(&owner, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    fs.close(&owner, &request).await.unwrap();
+    acquire(&fs, &peer, range, true, &request).await.unwrap();
+    fs.close(&peer, &request).await.unwrap();
+}
+
+#[async_test]
+async fn controlled_native_scopes_keep_grants_after_late_cancel(driver: DefaultDriver) {
+    use smb::test_support::{ControlledFs, Gate, Phase, Plan};
+    let root = tempfile::tempdir().unwrap();
+    let driver: Arc<dyn Driver> = Arc::new(driver);
+    let native = WindowsFs::new(root.path(), driver.clone()).await.unwrap();
+    let (fs, control) = ControlledFs::new(native);
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open("late-native", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    let (peer, _) = fs
+        .open("late-native", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let range = ByteRange {
+        offset: 0,
+        length: 1,
+    };
+    control
+        .set_plan(
+            Operation::Lock,
+            Plan {
+                hold_after: true,
+                ..Plan::default()
+            },
+        )
+        .unwrap();
+    let cancelled = RequestContext::new(2);
+    let mut scope = fs.lock_request(&owner);
+    let (result, ()) = futures::join!(scope.lock(range, true, true, &cancelled), async {
+        let call = control.next_call().await;
+        let mut timer = pal_async::timer::PolledTimer::new(&*driver);
+        while control.snapshot(call.id).unwrap().phase != Phase::After {
+            timer.sleep(std::time::Duration::from_millis(1)).await;
+        }
+        cancelled.cancel();
+        control.release(call.id, Gate::After).unwrap();
+    },);
+    result.unwrap();
+    scope
+        .settle(LockSettlement::Preserve, &request)
+        .await
+        .unwrap();
+    assert_eq!(fs.write(&owner, 0, b"x", &request).await, Ok(1));
+    assert_eq!(
+        fs.write(&peer, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    fs.close(&owner, &request).await.unwrap();
+    assert_eq!(fs.write(&peer, 0, b"x", &request).await, Ok(1));
+    fs.close(&peer, &request).await.unwrap();
+}
+
+#[async_test]
+async fn failed_native_scope_cleanup_reports_error_and_retains_accurate_protection(
+    driver: DefaultDriver,
+) {
+    use smb::test_support::{ControlledFs, Plan};
+    let root = tempfile::tempdir().unwrap();
+    let native = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let (fs, control) = ControlledFs::new(native);
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "cleanup-native",
+            options(CreateDisposition::CREATE),
+            &request,
+        )
+        .await
+        .unwrap();
+    let (peer, _) = fs
+        .open("cleanup-native", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let range = ByteRange {
+        offset: 0,
+        length: 1,
+    };
+    acquire(&fs, &owner, range, true, &request).await.unwrap();
+    let mut scope = fs.lock_request(&owner);
+    scope.lock(range, false, true, &request).await.unwrap();
+    control
+        .set_plan(
+            Operation::RollbackLock,
+            Plan {
+                failure: Some(Status::ACCESS_DENIED),
+                ..Plan::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        scope.settle(LockSettlement::Rollback, &request).await,
+        Err(Status::ACCESS_DENIED)
+    );
+    assert_eq!(
+        fs.write(&owner, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    assert_eq!(
+        fs.write(&peer, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    release(&fs, &owner, range, &request).await.unwrap();
+    assert_eq!(
+        fs.write(&peer, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    release(&fs, &owner, range, &request).await.unwrap();
+    assert_eq!(fs.write(&peer, 0, b"x", &request).await, Ok(1));
+    fs.close(&owner, &request).await.unwrap();
+    fs.close(&peer, &request).await.unwrap();
+}
+
+#[async_test]
+async fn native_scope_rejects_foreign_provider_handles(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let driver: Arc<dyn Driver> = Arc::new(driver);
+    let fs = WindowsFs::new(root.path(), driver.clone()).await.unwrap();
+    let foreign = WindowsFs::new(root.path(), driver).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "foreign-native",
+            options(CreateDisposition::CREATE),
+            &request,
+        )
+        .await
+        .unwrap();
+    let range = ByteRange {
+        offset: 0,
+        length: 1,
+    };
+    acquire(&fs, &owner, range, true, &request).await.unwrap();
+    assert_eq!(
+        acquire(&foreign, &owner, range, false, &request).await,
+        Err(Status::FILE_CLOSED)
+    );
+    fs.close(&owner, &request).await.unwrap();
+}
+
+#[async_test]
+async fn native_unsigned_and_empty_range_conflicts_match_inclusive_rules(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "unsigned-native",
+            options(CreateDisposition::CREATE),
+            &request,
+        )
+        .await
+        .unwrap();
+    let (peer, _) = fs
+        .open(
+            "unsigned-native",
+            options(CreateDisposition::OPEN),
+            &request,
+        )
+        .await
+        .unwrap();
+    let owner = owner.get().unwrap();
+    let peer = peer.get().unwrap();
+    let ranges = [
+        ByteRange {
+            offset: 0,
+            length: 0,
+        },
+        ByteRange {
+            offset: 3,
+            length: 0,
+        },
+        ByteRange {
+            offset: u64::MAX,
+            length: 0,
+        },
+        ByteRange {
+            offset: 0,
+            length: 1,
+        },
+        ByteRange {
+            offset: 3,
+            length: 1,
+        },
+        ByteRange {
+            offset: u64::MAX,
+            length: 1,
+        },
+        ByteRange {
+            offset: 0,
+            length: u64::MAX,
+        },
+        ByteRange {
+            offset: 1,
+            length: u64::MAX,
+        },
+    ];
+    for held in ranges {
+        let ((status, _), ()) =
+            native::lock(owner.overlapped().unwrap(), held, 0, true, true).await;
+        native::status(status).unwrap();
+        for attempted in ranges {
+            let ((status, _), ()) =
+                native::lock(peer.overlapped().unwrap(), attempted, 0, true, true).await;
+            let expected = if held.overlaps(attempted) {
+                Status::LOCK_NOT_GRANTED
+            } else {
+                Status::SUCCESS
+            };
+            assert_eq!(Status(status as u32), expected, "{held:?}, {attempted:?}");
+            if expected == Status::SUCCESS {
+                native::unlock(peer.get(), attempted, 0).unwrap();
+            }
+        }
+        native::unlock(owner.get(), held, 0).unwrap();
+    }
+}
 
 #[async_test]
 async fn native_lock_boundaries_follow_unsigned_range_rules(driver: DefaultDriver) {
@@ -142,33 +737,33 @@ async fn native_lock_boundaries_follow_unsigned_range_rules(driver: DefaultDrive
     let peer = other.get().unwrap();
     for (held, attempted, conflict) in [
         (
-            smb::provider::ByteRange {
+            ByteRange {
                 offset: 0,
                 length: 0,
             },
-            smb::provider::ByteRange {
+            ByteRange {
                 offset: 2,
                 length: 4,
             },
             false,
         ),
         (
-            smb::provider::ByteRange {
+            ByteRange {
                 offset: 3,
                 length: 0,
             },
-            smb::provider::ByteRange {
+            ByteRange {
                 offset: 2,
                 length: 4,
             },
             true,
         ),
         (
-            smb::provider::ByteRange {
+            ByteRange {
                 offset: u64::MAX,
                 length: 1,
             },
-            smb::provider::ByteRange {
+            ByteRange {
                 offset: u64::MAX,
                 length: 1,
             },
@@ -212,7 +807,7 @@ async fn native_shared_backing_is_required_for_append_after_external_eof_change(
     fs.write(&owner, 0, b"abcdefghij", &request).await.unwrap();
     let owned = owner.get().unwrap();
     let peer = other.get().unwrap();
-    let range = smb::provider::ByteRange {
+    let range = ByteRange {
         offset: 2,
         length: 4,
     };
@@ -256,7 +851,7 @@ async fn native_lock_keys_and_overlapping_acquisitions(driver: DefaultDriver) {
     let owner_native = owner.get().unwrap();
     let other_native = other.get().unwrap();
     let file = owner_native.overlapped().unwrap();
-    let range = smb::provider::ByteRange {
+    let range = ByteRange {
         offset: 2,
         length: 4,
     };

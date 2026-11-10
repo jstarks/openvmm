@@ -12,8 +12,8 @@ pub mod contracts;
 use crate::provider::{
     BasicInformation, ByteRange, Caching, CachingBreak, CachingBreakId, CachingGrant,
     CachingRequest, CachingSnapshot, CachingState, ExtendedAttribute, FileControl,
-    FileControlResult, FileSystem, FileSystemInformation, LockId, Metadata, NotifyResult,
-    OpenError, OpenOptions, Opened, RequestContext, StreamInformation,
+    FileControlResult, FileSystem, FileSystemInformation, LockId, LockScope, LockSettlement,
+    Metadata, NotifyResult, OpenError, OpenOptions, Opened, RequestContext, StreamInformation,
 };
 use crate::security::SecurityDescriptor;
 use crate::spec::SecurityInformation;
@@ -104,6 +104,8 @@ pub enum Operation {
     Unlock,
     /// Exact acquisition rollback.
     RollbackLock,
+    /// Preserve a processed lock-request prefix.
+    CommitLocks,
 }
 
 /// A manually releasable scheduling point.
@@ -693,9 +695,80 @@ impl Caching for ControlledCaching {
     }
 }
 
+struct ControlledLockScope<'a> {
+    inner: Box<dyn LockScope + 'a>,
+    controller: Controller,
+    handle: u64,
+}
+
+#[async_trait]
+impl LockScope for ControlledLockScope<'_> {
+    async fn lock(
+        &mut self,
+        range: ByteRange,
+        exclusive: bool,
+        fail_immediately: bool,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        let mut call = self.controller.begin(
+            Operation::Lock,
+            Some(self.handle),
+            None,
+            Some(range.offset),
+            Some(range.length),
+            request,
+        )?;
+        let context = call.prepare().await?;
+        let result = self
+            .inner
+            .lock(range, exclusive, fail_immediately, &context)
+            .await;
+        call.complete(result, None).await
+    }
+
+    async fn unlock(&mut self, range: ByteRange, request: &RequestContext) -> Result<(), Status> {
+        let mut call = self.controller.begin(
+            Operation::Unlock,
+            Some(self.handle),
+            None,
+            Some(range.offset),
+            Some(range.length),
+            request,
+        )?;
+        let context = call.prepare().await?;
+        let result = self.inner.unlock(range, &context).await;
+        call.complete(result, None).await
+    }
+
+    async fn settle(
+        self: Box<Self>,
+        settlement: LockSettlement,
+        request: &RequestContext,
+    ) -> Result<(), Status> {
+        let operation = match settlement {
+            LockSettlement::Preserve => Operation::CommitLocks,
+            LockSettlement::Rollback => Operation::RollbackLock,
+        };
+        let mut call =
+            self.controller
+                .begin(operation, Some(self.handle), None, None, None, request)?;
+        let context = call.prepare().await?;
+        let result = self.inner.settle(settlement, &context).await;
+        call.complete(result, None).await
+    }
+}
+
 #[async_trait]
 impl<B: FileSystem> FileSystem for ControlledFs<B> {
     type File = ControlledFile<B::File>;
+
+    fn lock_request<'a>(&'a self, file: &'a Self::File) -> Box<dyn LockScope + 'a> {
+        Box::new(ControlledLockScope {
+            inner: self.backend.lock_request(&file.inner),
+            controller: self.controller.clone(),
+            handle: file.id,
+        })
+    }
 
     fn supports_leases(&self) -> bool {
         self.backend.supports_leases()

@@ -16,7 +16,8 @@
 use super::Operation;
 use crate::provider::{
     BasicInformation, ByteRange, Change, ExtendedAttribute, FileControl, FileControlResult,
-    FileSystem, NotifyResult, OpenError, OpenOptions, RequestContext, StreamInformation,
+    FileSystem, LockSettlement, NotifyResult, OpenError, OpenOptions, RequestContext,
+    StreamInformation,
 };
 use crate::spec::{
     AccessMask, CreateAction, CreateDisposition, CreateOptions, FileAttributes, NotifyAction,
@@ -1566,7 +1567,40 @@ async fn rejected_lock<B: FileSystem>(
     status: Status,
     request: &RequestContext,
 ) {
-    rejected(fs.lock(file, RANGE, true, true, request).await, status);
+    rejected(
+        acquire_lock(fs, file, RANGE, true, true, request).await,
+        status,
+    );
+}
+
+async fn acquire_lock<B: FileSystem>(
+    fs: &B,
+    file: &B::File,
+    range: ByteRange,
+    exclusive: bool,
+    immediate: bool,
+    request: &RequestContext,
+) -> Result<(), Status> {
+    let mut scope = fs.lock_request(file);
+    let result = scope.lock(range, exclusive, immediate, request).await;
+    scope
+        .settle(LockSettlement::Preserve, &RequestContext::new(request.id()))
+        .await?;
+    result
+}
+
+async fn release_lock<B: FileSystem>(
+    fs: &B,
+    file: &B::File,
+    range: ByteRange,
+    request: &RequestContext,
+) -> Result<(), Status> {
+    let mut scope = fs.lock_request(file);
+    let result = scope.unlock(range, request).await;
+    scope
+        .settle(LockSettlement::Preserve, &RequestContext::new(request.id()))
+        .await?;
+    result
 }
 
 /// Create/open actions, shared data and identity, truncation, zero extension,
@@ -1680,7 +1714,9 @@ pub async fn rename_identity<F: Fixture>(fixture: &F) {
     } else {
         let locked = matches!(fixture.expectations().locks, Feature::Supported);
         if locked {
-            fs.lock(&file, RANGE, true, true, &request).await.unwrap();
+            acquire_lock(fs, &file, RANGE, true, true, &request)
+                .await
+                .unwrap();
         }
         fs.rename(&file, "after", false, &request).await.unwrap();
         let after = fs.metadata(&peer, &request).await.unwrap();
@@ -1692,7 +1728,7 @@ pub async fn rename_identity<F: Fixture>(fixture: &F) {
                 fs.read(&peer, 0, 7, &request).await,
                 Status::FILE_LOCK_CONFLICT,
             );
-            fs.unlock(&file, RANGE, &request).await.unwrap();
+            release_lock(fs, &file, RANGE, &request).await.unwrap();
         }
         assert_eq!(read_bytes(fs, &peer, 0, 7, &request).await, b"payload");
         rejected(
@@ -2715,16 +2751,16 @@ pub async fn lock_conflicts_and_io<F: Fixture>(fixture: &F) {
     let other = open(fs, "locks", CreateDisposition::OPEN, false, &request).await;
     write_all(fs, &owner, 0, b"abcdefghij", &request).await;
     for exclusive in [false, true] {
-        fs.lock(&owner, RANGE, exclusive, true, &request)
+        acquire_lock(fs, &owner, RANGE, exclusive, true, &request)
             .await
             .unwrap();
         assert_eq!(read_bytes(fs, &owner, 2, 4, &request).await, b"cdef");
         rejected(
-            fs.lock(&other, RANGE, true, true, &request).await,
+            acquire_lock(fs, &other, RANGE, true, true, &request).await,
             Status::LOCK_NOT_GRANTED,
         );
         rejected(
-            fs.lock(&owner, RANGE, true, true, &request).await,
+            acquire_lock(fs, &owner, RANGE, true, true, &request).await,
             Status::LOCK_NOT_GRANTED,
         );
         rejected(
@@ -2733,7 +2769,7 @@ pub async fn lock_conflicts_and_io<F: Fixture>(fixture: &F) {
         );
         if exclusive {
             rejected(
-                fs.lock(&other, RANGE, false, true, &request).await,
+                acquire_lock(fs, &other, RANGE, false, true, &request).await,
                 Status::LOCK_NOT_GRANTED,
             );
             rejected(
@@ -2742,20 +2778,23 @@ pub async fn lock_conflicts_and_io<F: Fixture>(fixture: &F) {
             );
             write_all(fs, &owner, 2, b"cdef", &request).await;
         } else {
-            fs.lock(&other, RANGE, false, true, &request).await.unwrap();
+            acquire_lock(fs, &other, RANGE, false, true, &request)
+                .await
+                .unwrap();
             assert_eq!(read_bytes(fs, &other, 2, 4, &request).await, b"cdef");
             rejected(
                 fs.write(&owner, 2, b"x", &request).await,
                 Status::FILE_LOCK_CONFLICT,
             );
-            fs.unlock(&other, RANGE, &request).await.unwrap();
+            release_lock(fs, &other, RANGE, &request).await.unwrap();
         }
         rejected(
-            fs.unlock(&other, RANGE, &request).await,
+            release_lock(fs, &other, RANGE, &request).await,
             Status::RANGE_NOT_LOCKED,
         );
         rejected(
-            fs.unlock(
+            release_lock(
+                fs,
                 &owner,
                 ByteRange {
                     offset: 2,
@@ -2766,9 +2805,9 @@ pub async fn lock_conflicts_and_io<F: Fixture>(fixture: &F) {
             .await,
             Status::RANGE_NOT_LOCKED,
         );
-        fs.unlock(&owner, RANGE, &request).await.unwrap();
+        release_lock(fs, &owner, RANGE, &request).await.unwrap();
         rejected(
-            fs.unlock(&owner, RANGE, &request).await,
+            release_lock(fs, &owner, RANGE, &request).await,
             Status::RANGE_NOT_LOCKED,
         );
     }
@@ -2801,15 +2840,17 @@ pub async fn lock_conflicts_and_io<F: Fixture>(fixture: &F) {
             true,
         ),
     ] {
-        fs.lock(&owner, held, true, true, &request).await.unwrap();
-        let result = fs.lock(&other, attempted, true, true, &request).await;
+        acquire_lock(fs, &owner, held, true, true, &request)
+            .await
+            .unwrap();
+        let result = acquire_lock(fs, &other, attempted, true, true, &request).await;
         if conflict {
             rejected(result, Status::LOCK_NOT_GRANTED);
         } else {
             result.unwrap();
-            fs.unlock(&other, attempted, &request).await.unwrap();
+            release_lock(fs, &other, attempted, &request).await.unwrap();
         }
-        fs.unlock(&owner, held, &request).await.unwrap();
+        release_lock(fs, &owner, held, &request).await.unwrap();
     }
     fs.close(&other, &request).await.unwrap();
     fs.close(&owner, &request).await.unwrap();
@@ -2827,32 +2868,36 @@ pub async fn lock_waiters_and_cancellation<F: Fixture>(fixture: &F) {
         return;
     }
     let other = open(fs, "waiting", CreateDisposition::OPEN, false, &request).await;
-    fs.lock(&owner, RANGE, true, true, &request).await.unwrap();
+    acquire_lock(fs, &owner, RANGE, true, true, &request)
+        .await
+        .unwrap();
     {
         let cancelled = RequestContext::new(2);
-        let mut work = std::pin::pin!(fs.lock(&other, RANGE, true, false, &cancelled));
+        let mut work = std::pin::pin!(acquire_lock(fs, &other, RANGE, true, false, &cancelled));
         pending(fixture, Operation::Lock, &cancelled, work.as_mut()).await;
         cancelled.cancel();
         rejected(work.await, Status::CANCELLED);
     }
     {
         let waiting = RequestContext::new(3);
-        let mut work = std::pin::pin!(fs.lock(&other, RANGE, true, false, &waiting));
+        let mut work = std::pin::pin!(acquire_lock(fs, &other, RANGE, true, false, &waiting));
         pending(fixture, Operation::Lock, &waiting, work.as_mut()).await;
-        fs.unlock(&owner, RANGE, &request).await.unwrap();
+        release_lock(fs, &owner, RANGE, &request).await.unwrap();
         work.await.unwrap();
         waiting.cancel();
         rejected(
-            fs.lock(&owner, RANGE, true, true, &request).await,
+            acquire_lock(fs, &owner, RANGE, true, true, &request).await,
             Status::LOCK_NOT_GRANTED,
         );
     }
     fs.close(&other, &request).await.unwrap();
-    fs.lock(&owner, RANGE, true, true, &request).await.unwrap();
+    acquire_lock(fs, &owner, RANGE, true, true, &request)
+        .await
+        .unwrap();
     fs.close(&owner, &request).await.unwrap();
 }
 
-/// Rollback targets an acquisition, not an older exact-range lock; ordinary
+/// Rollback targets this request, not an older exact-range lock; ordinary
 /// unlock prefers exclusive matches, and fallback drop releases remaining locks.
 pub async fn lock_rollback_and_drop<F: Fixture>(fixture: &F) {
     let fs = fixture.filesystem();
@@ -2864,28 +2909,33 @@ pub async fn lock_rollback_and_drop<F: Fixture>(fixture: &F) {
         return;
     }
     let other = open(fs, "rollback", CreateDisposition::OPEN, false, &request).await;
-    fs.lock(&owner, RANGE, true, true, &request).await.unwrap();
-    let acquired = RequestContext::new(2);
-    let added = fs
-        .lock(&owner, RANGE, false, true, &acquired)
+    acquire_lock(fs, &owner, RANGE, true, true, &request)
         .await
         .unwrap();
+    let acquired = RequestContext::new(2);
+    let mut scope = fs.lock_request(&owner);
+    scope.lock(RANGE, false, true, &acquired).await.unwrap();
     acquired.cancel();
-    fs.rollback_lock(&owner, added, &request).await.unwrap();
-    fs.rollback_lock(&owner, added, &request).await.unwrap();
+    scope
+        .settle(LockSettlement::Rollback, &request)
+        .await
+        .unwrap();
     rejected(
-        fs.lock(&other, RANGE, false, true, &request).await,
+        acquire_lock(fs, &other, RANGE, false, true, &request).await,
         Status::LOCK_NOT_GRANTED,
     );
-    let shared = fs.lock(&owner, RANGE, false, true, &request).await.unwrap();
-    fs.unlock(&owner, RANGE, &request).await.unwrap();
-    fs.lock(&other, RANGE, false, true, &request).await.unwrap();
-    fs.unlock(&owner, RANGE, &request).await.unwrap();
-    fs.rollback_lock(&owner, shared, &request).await.unwrap();
+    acquire_lock(fs, &owner, RANGE, false, true, &request)
+        .await
+        .unwrap();
+    release_lock(fs, &owner, RANGE, &request).await.unwrap();
+    acquire_lock(fs, &other, RANGE, false, true, &request)
+        .await
+        .unwrap();
+    release_lock(fs, &owner, RANGE, &request).await.unwrap();
     fs.close(&owner, &request).await.unwrap();
     drop(other);
     let reopened = open(fs, "rollback", CreateDisposition::OPEN, false, &request).await;
-    fs.lock(&reopened, RANGE, true, true, &request)
+    acquire_lock(fs, &reopened, RANGE, true, true, &request)
         .await
         .unwrap();
     fs.close(&reopened, &request).await.unwrap();

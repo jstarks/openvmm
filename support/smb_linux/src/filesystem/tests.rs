@@ -93,12 +93,15 @@ impl Fixture for NativeFixture {
         }
     }
     async fn wait_until_pending(&self, operation: Operation, request: &RequestContext) {
+        if operation == Operation::Lock {
+            self.0.0.locks.wait_until_pending(request.id()).await;
+            return;
+        }
         loop {
             let listener = self.0.0.changed.listen();
             let pending = {
                 let state = self.0.0.state.lock();
                 match operation {
-                    Operation::Lock => state.waiters.values().any(|id| *id == request.id()),
                     Operation::Notify => state
                         .opens
                         .values()
@@ -420,7 +423,7 @@ async fn disjoint_writes_on_one_open_can_be_in_flight_together(driver: DefaultDr
         std::task::Poll::Ready(())
     })
     .await;
-    assert_eq!(fs.0.state.lock().active.len(), 2);
+    assert_eq!(fs.0.locks.active_count(), 2);
     let (a, b) = futures::join!(a, b);
     assert_eq!((a.unwrap(), b.unwrap()), (3, 3));
     assert_eq!(
@@ -638,7 +641,7 @@ async fn native_creation_truncation_and_close_delete(driver: DefaultDriver) {
     fs.close(&file, &request).await.unwrap();
     assert!(!root.path().join("file").exists());
     assert_eq!(fs.0.state.lock().opens.len(), 0);
-    assert_eq!(fs.0.state.lock().locks.len(), 0);
+    assert_eq!(fs.0.locks.lock_count(), 0);
 }
 
 #[async_test]
@@ -834,7 +837,7 @@ async fn submitted_write_survives_cancel_and_unpolled_interval(driver: DefaultDr
         std::task::Poll::Ready(())
     })
     .await;
-    assert_eq!(fs.0.state.lock().active.len(), 1);
+    assert_eq!(fs.0.locks.active_count(), 1);
     request.cancel();
     let unrelated = RequestContext::new(2);
     let (other, _) = fs
@@ -854,7 +857,7 @@ async fn submitted_write_survives_cancel_and_unpolled_interval(driver: DefaultDr
     assert_eq!(write.await.unwrap(), 8);
     close.await.unwrap();
     fs.close(&other, &unrelated).await.unwrap();
-    assert_eq!(fs.0.state.lock().active.len(), 0);
+    assert_eq!(fs.0.locks.active_count(), 0);
     assert_eq!(fs.0.state.lock().opens.len(), 0);
 }
 

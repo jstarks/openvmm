@@ -286,8 +286,10 @@ impl Io {
         file: Arc<File>,
         offset: u64,
         length: u32,
+        guard: impl Send + 'static,
         request: &RequestContext,
     ) -> io::Result<Vec<u8>> {
+        let _guard = guard;
         check(request)?;
         let mut data = vec![0; length as usize];
         let entry = opcode::Read::new(types::Fd(file.as_raw_fd()), data.as_mut_ptr(), length)
@@ -304,8 +306,10 @@ impl Io {
         file: Arc<File>,
         offset: u64,
         data: Vec<u8>,
+        guard: impl Send + 'static,
         request: &RequestContext,
     ) -> io::Result<usize> {
+        let _guard = guard;
         check(request)?;
         let length = u32::try_from(data.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "write too large"))?;
@@ -343,16 +347,22 @@ impl Io {
         &self,
         file: Arc<File>,
         length: u64,
+        guard: impl Send + 'static,
         request: &RequestContext,
     ) -> io::Result<()> {
         if self.driver.io_uring_probe(opcode::Ftruncate::CODE) {
+            let _guard = guard;
             check(request)?;
             let entry = opcode::Ftruncate::new(types::Fd(file.as_raw_fd()), length).build();
             // SAFETY: The operation owns the descriptor through completion.
             unsafe { self.submit(entry).await? };
             Ok(())
         } else {
-            self.worker(request, move || file.set_len(length)).await
+            self.worker(request, move || {
+                let _guard = guard;
+                file.set_len(length)
+            })
+            .await
         }
     }
 

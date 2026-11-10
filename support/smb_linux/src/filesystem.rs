@@ -10,6 +10,7 @@ use futures::FutureExt;
 use inspect::Inspect;
 use pal_async::driver::Driver;
 use parking_lot::Mutex;
+use smb::provider::locking::software::{SoftwareIo, SoftwareLockOwner, SoftwareLocks};
 use smb::provider::{
     BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
     LockId, Metadata, NotifyResult, OpenError, OpenOptions, ReparsePoint, RequestContext,
@@ -30,7 +31,6 @@ use std::sync::{Arc, Weak};
 
 const OPEN_LIMIT: usize = 4096;
 const IDENTITY_LIMIT: usize = 65536;
-const LOCK_LIMIT: usize = 16384;
 const NT_EPOCH: i64 = 11_644_473_600;
 
 #[cfg(test)]
@@ -53,6 +53,7 @@ struct Inner {
     root: Arc<File>,
     state: Mutex<State>,
     changed: Event,
+    locks: SoftwareLocks<Key>,
     security: SecurityDescriptor,
 }
 
@@ -91,11 +92,8 @@ struct State {
     identities: HashMap<Key, u64>,
     opens: HashMap<u64, Record>,
     deletes: HashMap<(Key, CString), Key>,
-    locks: Vec<RangeLock>,
-    active: Vec<ActiveIo>,
     claims: HashMap<ClaimKey, u64>,
     pending_opens: usize,
-    waiters: HashMap<u64, u64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -135,78 +133,13 @@ struct Record {
     notify_deleted: bool,
     closing: bool,
     delete_on_close: bool,
-}
-
-struct RangeLock {
-    id: LockId,
-    key: Key,
-    owner: u64,
-    range: ByteRange,
-    exclusive: bool,
-}
-
-struct ActiveIo {
-    id: u64,
-    key: Key,
-    owner: u64,
-    range: ByteRange,
-    write: bool,
-    eof: bool,
-}
-
-struct LockWaiter {
-    inner: Arc<Inner>,
-    id: u64,
-}
-
-impl Drop for LockWaiter {
-    fn drop(&mut self) {
-        self.inner.state.lock().waiters.remove(&self.id);
-        self.inner.changed.notify(usize::MAX);
-    }
-}
-
-struct Operation {
-    inner: Arc<Inner>,
-    id: u64,
-}
-
-impl Operation {
-    fn set_range(&self, range: ByteRange) -> Result<(), Status> {
-        let mut state = self.inner.state.lock();
-        let io = state
-            .active
-            .iter()
-            .find(|io| io.id == self.id)
-            .ok_or(Status::FILE_CLOSED)?;
-        let (key, owner) = (io.key, io.owner);
-        if state.locks.iter().any(|lock| {
-            lock.key == key
-                && lock.range.overlaps(range)
-                && (!lock.exclusive || lock.owner != owner)
-        }) {
-            return Err(Status::FILE_LOCK_CONFLICT);
-        }
-        state
-            .active
-            .iter_mut()
-            .find(|io| io.id == self.id)
-            .expect("operation remains registered")
-            .range = range;
-        Ok(())
-    }
-}
-
-impl Drop for Operation {
-    fn drop(&mut self) {
-        self.inner.state.lock().active.retain(|io| io.id != self.id);
-        self.inner.changed.notify(usize::MAX);
-    }
+    locks: SoftwareLockOwner<Key>,
 }
 
 struct Closing {
     inner: Arc<Inner>,
     id: u64,
+    locks: SoftwareLockOwner<Key>,
 }
 
 impl Drop for Closing {
@@ -214,6 +147,7 @@ impl Drop for Closing {
         if let Some(record) = self.inner.state.lock().opens.get_mut(&self.id) {
             record.closing = false;
         }
+        self.locks.resume();
         self.inner.changed.notify(usize::MAX);
     }
 }
@@ -321,7 +255,6 @@ impl Inner {
     fn release(&self, id: u64) {
         let mut state = self.state.lock();
         state.opens.remove(&id);
-        state.locks.retain(|lock| lock.owner != id);
         let State { deletes, opens, .. } = &mut *state;
         deletes.retain(|location, _| {
             opens
@@ -460,6 +393,7 @@ impl LinuxFs {
                 ..State::default()
             }),
             changed: Event::new(),
+            locks: SoftwareLocks::default(),
             security: share_security(),
         })))
     }
@@ -620,6 +554,7 @@ impl LinuxFs {
                 notify_deleted: directory && options.options().delete_on_close(),
                 closing: false,
                 delete_on_close: options.options().delete_on_close(),
+                locks: self.0.locks.open(key)?,
             },
         );
         Ok(Reservation {
@@ -652,78 +587,27 @@ impl LinuxFs {
         write: bool,
         eof: bool,
         request: &RequestContext,
-    ) -> Result<Operation, Status> {
-        if !Arc::ptr_eq(&self.0, &file.reservation.inner) {
+    ) -> Result<SoftwareIo<Key>, Status> {
+        let open = self.record(file)?;
+        crate::io::check(request).map_err(status)?;
+        if open.closing {
             return Err(Status::FILE_CLOSED);
         }
-        loop {
-            let listener = self.0.changed.listen();
-            crate::io::check(request).map_err(status)?;
-            {
-                let mut state = self.0.state.lock();
-                let open = state
-                    .opens
-                    .get(&file.reservation.id)
-                    .ok_or(Status::FILE_CLOSED)?;
-                if open.closing || file.closed.load(Ordering::Acquire) {
-                    return Err(Status::FILE_CLOSED);
-                }
-                if open.directory {
-                    return Err(Status::FILE_IS_A_DIRECTORY);
-                }
-                if open.reparse {
-                    return Err(Status::INVALID_DEVICE_REQUEST);
-                }
-                let access = AccessMask::from_bits(open.access);
-                if if write {
-                    !(access.write_data() || access.append_data())
-                } else {
-                    !(access.read_data() || access.execute())
-                } {
-                    return Err(Status::ACCESS_DENIED);
-                }
-                let busy = state
-                    .active
-                    .iter()
-                    .any(|io| io.key == file.key && ((write && io.eof) || (eof && io.write)));
-                if !busy {
-                    if !eof
-                        && range.length != 0
-                        && state.locks.iter().any(|lock| {
-                            lock.key == file.key
-                                && lock.range.overlaps(range)
-                                && if write {
-                                    !lock.exclusive || lock.owner != file.reservation.id
-                                } else {
-                                    lock.exclusive && lock.owner != file.reservation.id
-                                }
-                        })
-                    {
-                        return Err(Status::FILE_LOCK_CONFLICT);
-                    }
-                    let id = state.next;
-                    state.next = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
-                    state.active.push(ActiveIo {
-                        id,
-                        key: file.key,
-                        owner: file.reservation.id,
-                        range,
-                        write,
-                        eof,
-                    });
-                    return Ok(Operation {
-                        inner: self.0.clone(),
-                        id,
-                    });
-                }
-            }
-            let mut listener = std::pin::pin!(listener.fuse());
-            let mut cancelled = std::pin::pin!(request.cancelled().fuse());
-            futures::select! {
-                () = listener => {},
-                () = cancelled => return Err(Status::CANCELLED),
-            }
+        if open.directory {
+            return Err(Status::FILE_IS_A_DIRECTORY);
         }
+        if open.reparse {
+            return Err(Status::INVALID_DEVICE_REQUEST);
+        }
+        let access = AccessMask::from_bits(open.access);
+        if if write {
+            !(access.write_data() || access.append_data())
+        } else {
+            !(access.read_data() || access.execute())
+        } {
+            return Err(Status::ACCESS_DENIED);
+        }
+        open.locks.operation(range, write, eof, request).await
     }
 
     async fn describe(
@@ -817,8 +701,8 @@ impl Inspect for LinuxFs {
         let state = self.0.state.lock();
         req.respond()
             .field("opens", state.opens.len())
-            .field("lock_count", state.locks.len())
-            .field("lock_waiters", state.waiters.len())
+            .field("lock_count", self.0.locks.lock_count())
+            .field("lock_waiters", self.0.locks.waiter_count())
             .field(
                 "watch_count",
                 state
@@ -836,7 +720,7 @@ impl Inspect for LinuxFs {
                     .map(|watch| watch.waiter_count())
                     .sum::<usize>(),
             )
-            .field("active_io", state.active.len())
+            .field("active_io", self.0.locks.active_count())
             .field("identities", state.identities.len())
             .field("submitted_io", self.0.io.submitted.load(Ordering::Relaxed));
     }
@@ -1131,26 +1015,18 @@ impl FileSystem for LinuxFs {
         let _closing = Closing {
             inner: self.0.clone(),
             id: file.reservation.id,
+            locks: self.record(file)?.locks,
         };
-        loop {
-            let listener = self.0.changed.listen();
-            let ready = {
-                let mut state = self.0.state.lock();
-                let open = state
-                    .opens
-                    .get_mut(&file.reservation.id)
-                    .ok_or(Status::FILE_CLOSED)?;
-                open.closing = true;
-                !state
-                    .active
-                    .iter()
-                    .any(|io| io.owner == file.reservation.id)
-            };
-            if ready {
-                break;
-            }
-            listener.await;
+        {
+            let mut state = self.0.state.lock();
+            state
+                .opens
+                .get_mut(&file.reservation.id)
+                .ok_or(Status::FILE_CLOSED)?
+                .closing = true;
+            _closing.locks.start_close()?;
         }
+        _closing.locks.drain().await;
         let request = RequestContext::new(0);
         let _node = self
             .claim(&[ClaimKey::Node(file.key)], false, &request)
@@ -1220,6 +1096,7 @@ impl FileSystem for LinuxFs {
             None => Ok(()),
         };
         file.closed.store(true, Ordering::Release);
+        _closing.locks.close();
         self.0.release(file.reservation.id);
         if let Err(error) = data_result {
             tracelimit::warn_ratelimited!(?error, "Linux SMB data descriptor close failed");
@@ -1267,7 +1144,7 @@ impl FileSystem for LinuxFs {
         {
             return Err(Status::INVALID_PARAMETER);
         }
-        let _operation = self
+        let operation = self
             .operation(
                 file,
                 ByteRange {
@@ -1281,7 +1158,7 @@ impl FileSystem for LinuxFs {
             .await?;
         self.0
             .io
-            .read(Self::data(file)?, offset, length as u32, request)
+            .read(Self::data(file)?, offset, length as u32, operation, request)
             .await
             .map_err(status)
     }
@@ -1339,7 +1216,7 @@ impl FileSystem for LinuxFs {
         }
         self.0
             .io
-            .write(Self::data(file)?, offset, data.to_vec(), request)
+            .write(Self::data(file)?, offset, data.to_vec(), operation, request)
             .await
             .map_err(status)
     }
@@ -1458,9 +1335,10 @@ impl FileSystem for LinuxFs {
             offset: 0,
             length: i64::MAX as u64,
         })?;
+        let operation = Arc::new(operation);
         self.0
             .io
-            .truncate(Self::data(file)?, length, request)
+            .truncate(Self::data(file)?, length, operation.clone(), request)
             .await
             .map_err(status)?;
         if self.record(file)?.write_through {
@@ -1653,75 +1531,17 @@ impl FileSystem for LinuxFs {
         request: &RequestContext,
     ) -> Result<LockId, Status> {
         range.validate()?;
-        let mut waiter = None;
-        loop {
-            let listener = self.0.changed.listen();
-            self.record(file)?;
-            crate::io::check(request).map_err(status)?;
-            {
-                let mut state = self.0.state.lock();
-                let open = state
-                    .opens
-                    .get(&file.reservation.id)
-                    .ok_or(Status::FILE_CLOSED)?;
-                if open.closing {
-                    return Err(Status::FILE_CLOSED);
-                }
-                if open.directory {
-                    return Err(Status::INVALID_PARAMETER);
-                }
-                let conflict = state.locks.iter().any(|lock| {
-                    lock.key == file.key
-                        && lock.range.overlaps(range)
-                        && if lock.exclusive {
-                            lock.owner != file.reservation.id || exclusive
-                        } else {
-                            exclusive
-                        }
-                }) || state.active.iter().any(|io| {
-                    io.key == file.key
-                        && io.owner != file.reservation.id
-                        && io.range.overlaps(range)
-                        && (exclusive || io.write)
-                });
-                if !conflict {
-                    if state.locks.len() == LOCK_LIMIT {
-                        return Err(Status::INSUFFICIENT_RESOURCES);
-                    }
-                    let id = LockId(state.next);
-                    state.next = id.0.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
-                    state.locks.push(RangeLock {
-                        id,
-                        key: file.key,
-                        owner: file.reservation.id,
-                        range,
-                        exclusive,
-                    });
-                    return Ok(id);
-                }
-                if fail_immediately {
-                    return Err(Status::LOCK_NOT_GRANTED);
-                }
-                if waiter.is_none() {
-                    if state.waiters.len() == OPEN_LIMIT {
-                        return Err(Status::INSUFFICIENT_RESOURCES);
-                    }
-                    let id = state.next;
-                    state.next = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
-                    state.waiters.insert(id, request.id());
-                    waiter = Some(LockWaiter {
-                        inner: self.0.clone(),
-                        id,
-                    });
-                }
-            }
-            let mut listener = std::pin::pin!(listener.fuse());
-            let mut cancelled = std::pin::pin!(request.cancelled().fuse());
-            futures::select! {
-                () = listener => {},
-                () = cancelled => return Err(Status::CANCELLED),
-            }
+        let open = self.record(file)?;
+        crate::io::check(request).map_err(status)?;
+        if open.closing {
+            return Err(Status::FILE_CLOSED);
         }
+        if open.directory {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        open.locks
+            .lock(range, exclusive, fail_immediately, request)
+            .await
     }
 
     async fn unlock(
@@ -1731,20 +1551,7 @@ impl FileSystem for LinuxFs {
         _request: &RequestContext,
     ) -> Result<(), Status> {
         range.validate()?;
-        self.record(file)?;
-        let mut state = self.0.state.lock();
-        let index = state
-            .locks
-            .iter()
-            .enumerate()
-            .filter(|(_, lock)| lock.owner == file.reservation.id && lock.range == range)
-            .max_by_key(|(_, lock)| lock.exclusive)
-            .map(|(index, _)| index)
-            .ok_or(Status::RANGE_NOT_LOCKED)?;
-        state.locks.remove(index);
-        drop(state);
-        self.0.changed.notify(usize::MAX);
-        Ok(())
+        self.record(file)?.locks.unlock(range)
     }
 
     async fn rollback_lock(
@@ -1756,12 +1563,9 @@ impl FileSystem for LinuxFs {
         if !Arc::ptr_eq(&self.0, &file.reservation.inner) {
             return Err(Status::FILE_CLOSED);
         }
-        self.0
-            .state
-            .lock()
-            .locks
-            .retain(|entry| entry.owner != file.reservation.id || entry.id != lock);
-        self.0.changed.notify(usize::MAX);
+        if let Some(record) = self.0.state.lock().opens.get(&file.reservation.id) {
+            record.locks.rollback(lock);
+        }
         Ok(())
     }
 

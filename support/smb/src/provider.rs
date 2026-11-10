@@ -4,7 +4,7 @@
 //! Filesystem semantics independent of host files and VM resources.
 
 pub mod caching;
-mod locking;
+pub mod locking;
 
 pub use locking::{LockScope, LockSettlement};
 

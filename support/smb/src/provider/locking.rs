@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Request-scoped provider locks and shared synthetic enforcement.
+
+pub mod software;
+
 use super::{ByteRange, FileSystem, LockId, RequestContext};
 use crate::spec::Status;
 use async_trait::async_trait;

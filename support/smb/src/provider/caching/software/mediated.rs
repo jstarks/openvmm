@@ -627,6 +627,64 @@ mod tests {
     }
 
     #[async_test]
+    async fn cancelled_namespace_wait_preserves_break_and_allows_flush_and_retry() {
+        let cache = MediatedCaching::default();
+        let (source, _) = open(&cache, 1, CachingRequest::None).await;
+        let (foreign, grant) = open(&cache, 2, lease(2, CachingState::ReadWriteHandle)).await;
+        let control = control(grant);
+        let cancelled = RequestContext::new(3);
+        let mut operation = Box::pin(cache.namespace_request(&source, &cancelled));
+        assert!(futures::poll!(&mut operation).is_pending());
+        let context = RequestContext::new(4);
+        let change = control.wait_for_break(&context).await.unwrap();
+        cancelled.cancel();
+        assert_eq!(operation.await.err(), Some(Status::CANCELLED));
+        assert!(control.snapshot().breaking);
+        assert_eq!(control.snapshot().state, CachingState::ReadWriteHandle);
+        drop(cache.namespace(&context).await.unwrap());
+        let mut retry = Box::pin(cache.namespace_request(&source, &context));
+        assert!(futures::poll!(&mut retry).is_pending());
+        drop(foreign.request(Change::Data, &context).await.unwrap());
+        control
+            .acknowledge(change.id, change.state, &context)
+            .await
+            .unwrap();
+        drop(retry.await.unwrap());
+        source.close();
+        foreign.close();
+        let activity = cache.0.activity.lock();
+        assert_eq!(activity.namespaces, 0);
+        assert!(activity.files.is_empty());
+        assert!(cache.0.caching.0.lock().opens.is_empty());
+    }
+
+    #[async_test]
+    async fn pending_break_survives_one_close_and_finishes_after_last_lease_close() {
+        let cache = MediatedCaching::default();
+        let (source, _) = open(&cache, 1, CachingRequest::None).await;
+        let (first, grant) = open(&cache, 2, lease(2, CachingState::ReadWriteHandle)).await;
+        let control = control(grant);
+        let (second, _) = open(&cache, 2, lease(2, CachingState::ReadWriteHandle)).await;
+        let context = RequestContext::new(3);
+        let mut operation = Box::pin(cache.namespace_request(&source, &context));
+        assert!(futures::poll!(&mut operation).is_pending());
+        control.wait_for_break(&context).await.unwrap();
+        first.close();
+        assert!(control.snapshot().breaking);
+        assert!(futures::poll!(&mut operation).is_pending());
+        second.close();
+        drop(operation.await.unwrap());
+        assert_eq!(control.snapshot().state, CachingState::None);
+        assert_eq!(
+            control.wait_for_break(&context).await,
+            Err(Status::FILE_CLOSED)
+        );
+        source.close();
+        assert!(cache.0.activity.lock().files.is_empty());
+        assert!(cache.0.caching.0.lock().opens.is_empty());
+    }
+
+    #[async_test]
     async fn classic_namespace_break_uses_level_two_not_read_write() {
         let cache = MediatedCaching::default();
         let (source, _) = open(&cache, 1, CachingRequest::None).await;
@@ -738,6 +796,89 @@ mod tests {
             control(grant).snapshot().state,
             CachingState::ReadWriteHandle
         );
+    }
+
+    #[async_test]
+    async fn failed_settlement_keeps_lock_protection_without_leaking_active_admission() {
+        use crate::provider::locking::software::{self, SoftwareLocks};
+
+        struct FailedSettlement(Box<dyn LockScope>);
+
+        #[async_trait]
+        impl LockScope for FailedSettlement {
+            async fn lock(
+                &mut self,
+                range: ByteRange,
+                exclusive: bool,
+                fail_immediately: bool,
+                request: &RequestContext,
+            ) -> Result<(), Status> {
+                self.0
+                    .lock(range, exclusive, fail_immediately, request)
+                    .await
+            }
+
+            async fn unlock(
+                &mut self,
+                range: ByteRange,
+                request: &RequestContext,
+            ) -> Result<(), Status> {
+                self.0.unlock(range, request).await
+            }
+
+            async fn settle(
+                self: Box<Self>,
+                _settlement: LockSettlement,
+                _request: &RequestContext,
+            ) -> Result<(), Status> {
+                Err(Status::ACCESS_DENIED)
+            }
+        }
+
+        for settlement in [LockSettlement::Preserve, LockSettlement::Rollback] {
+            let cache = MediatedCaching::default();
+            let locks = SoftwareLocks::default();
+            let backing = locks.open(1u64).unwrap();
+            let foreign = locks.open(1u64).unwrap();
+            let (owner, _) = open(&cache, 1, CachingRequest::None).await;
+            let context = RequestContext::new(1);
+            let range = ByteRange {
+                offset: 0,
+                length: 16,
+            };
+            let inner = Box::new(FailedSettlement(software::scope(Ok(backing.clone()))));
+            let mut scope = owner.lock_scope(inner);
+            scope.lock(range, true, true, &context).await.unwrap();
+            assert_eq!(
+                scope.settle(settlement, &context).await,
+                Err(Status::ACCESS_DENIED)
+            );
+            assert_eq!(cache.0.activity.lock().files[&1].active, 0);
+            assert_eq!(
+                foreign.operation(range, true, false, &context).await.err(),
+                Some(Status::FILE_LOCK_CONFLICT)
+            );
+            let (reader, grant) = open(&cache, 1, lease(2, CachingState::Read)).await;
+            let control = control(grant);
+            assert_eq!(control.snapshot().state, CachingState::None);
+            let mut cleanup = owner.lock_scope(software::scope(Ok(backing.clone())));
+            cleanup.unlock(range, &context).await.unwrap();
+            cleanup
+                .settle(LockSettlement::Preserve, &context)
+                .await
+                .unwrap();
+            let (upgraded, _) = open(&cache, 1, lease(2, CachingState::Read)).await;
+            assert_eq!(control.snapshot().state, CachingState::Read);
+            backing.close();
+            foreign.close();
+            owner.close();
+            reader.close();
+            upgraded.close();
+            let activity = cache.0.activity.lock();
+            assert!(activity.files.is_empty());
+            assert_eq!(activity.locks, 0);
+            assert!(cache.0.caching.0.lock().opens.is_empty());
+        }
     }
 
     #[async_test]

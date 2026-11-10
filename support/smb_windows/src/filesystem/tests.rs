@@ -37,57 +37,194 @@ mod software_caching {
     }
 
     #[async_test]
-    async fn alias_replacement_waits_for_dirty_lease_flush(driver: DefaultDriver) {
+    async fn alias_replacement_preserves_dirty_break_after_dropped_and_cancelled_waits(
+        driver: DefaultDriver,
+    ) {
         for mode in [LockMode::Native, LockMode::Synthetic] {
-            let root = tempfile::tempdir().unwrap();
-            std::fs::write(root.path().join("data"), b"original").unwrap();
-            std::fs::hard_link(root.path().join("data"), root.path().join("alias")).unwrap();
-            let fs =
-                WindowsFs::new_with_software_caching(root.path(), Arc::new(driver.clone()), mode)
-                    .await
-                    .unwrap();
-            let context = RequestContext::new(1);
-            let opened = fs
-                .open_with_caching(
-                    "data",
-                    options(CreateDisposition::OPEN),
-                    lease(1, CachingState::ReadWriteHandle),
-                    &context,
+            for cancel in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::write(root.path().join("data"), b"original").unwrap();
+                std::fs::hard_link(root.path().join("data"), root.path().join("alias")).unwrap();
+                let fs = WindowsFs::new_with_software_caching(
+                    root.path(),
+                    Arc::new(driver.clone()),
+                    mode,
                 )
                 .await
                 .unwrap();
-            let owner = opened.file;
-            let control = control(opened.caching);
-            assert_eq!(control.snapshot().state, CachingState::ReadWriteHandle);
-            let replace_context = RequestContext::new(2);
-            let replace = fs.open_with_caching(
-                "alias",
-                options(CreateDisposition::OVERWRITE),
-                CachingRequest::None,
-                &replace_context,
-            );
-            let flush = async {
-                let change = control.wait_for_break(&context).await.unwrap();
+                let context = RequestContext::new(1);
+                let opened = fs
+                    .open_with_caching(
+                        "data",
+                        options(CreateDisposition::OPEN),
+                        lease(1, CachingState::ReadWriteHandle),
+                        &context,
+                    )
+                    .await
+                    .unwrap();
+                let owner = opened.file;
+                let control = control(opened.caching);
+                assert_eq!(control.snapshot().state, CachingState::ReadWriteHandle);
+                let abandoned_context = RequestContext::new(2);
+                let abandoned = Box::pin(fs.open_with_caching(
+                    "alias",
+                    options(CreateDisposition::OVERWRITE),
+                    CachingRequest::None,
+                    &abandoned_context,
+                ));
+                let (change, abandoned) = match futures::future::select(
+                    abandoned,
+                    Box::pin(control.wait_for_break(&context)),
+                )
+                .await
+                {
+                    futures::future::Either::Right((change, pending)) => (change.unwrap(), pending),
+                    futures::future::Either::Left(_) => {
+                        panic!("replacement completed before its caching break")
+                    }
+                };
                 assert_eq!(change.state, CachingState::None);
+                if cancel {
+                    abandoned_context.cancel();
+                    assert_eq!(abandoned.await.err().unwrap().status(), Status::CANCELLED);
+                } else {
+                    drop(abandoned);
+                }
+                assert!(control.snapshot().breaking);
+                assert_eq!(control.snapshot().state, CachingState::ReadWriteHandle);
                 assert_eq!(
                     std::fs::read(root.path().join("data")).unwrap(),
                     b"original"
                 );
-                fs.write(&owner, 0, b"dirty!!!", &context).await.unwrap();
-                assert_eq!(
-                    std::fs::read(root.path().join("data")).unwrap(),
-                    b"dirty!!!"
+                let replace_context = RequestContext::new(4);
+                let replace = fs.open_with_caching(
+                    "alias",
+                    options(CreateDisposition::OVERWRITE),
+                    CachingRequest::None,
+                    &replace_context,
                 );
-                control
-                    .acknowledge(change.id, change.state, &context)
+                let flush = async {
+                    assert_eq!(
+                        std::fs::read(root.path().join("data")).unwrap(),
+                        b"original"
+                    );
+                    fs.write(&owner, 0, b"dirty!!!", &context).await.unwrap();
+                    assert_eq!(
+                        std::fs::read(root.path().join("data")).unwrap(),
+                        b"dirty!!!"
+                    );
+                    control
+                        .acknowledge(change.id, change.state, &context)
+                        .await
+                        .unwrap();
+                };
+                let (replaced, ()) = futures::join!(replace, flush);
+                let replaced = replaced.unwrap();
+                assert!(std::fs::read(root.path().join("data")).unwrap().is_empty());
+                fs.close(&replaced.file, &context).await.unwrap();
+                fs.close(&owner, &context).await.unwrap();
+            }
+        }
+    }
+
+    #[async_test]
+    async fn rename_and_delete_wait_for_dirty_alias_flush_and_handle_break(driver: DefaultDriver) {
+        for mode in [LockMode::Native, LockMode::Synthetic] {
+            for delete in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::write(root.path().join("data"), b"original").unwrap();
+                std::fs::hard_link(root.path().join("data"), root.path().join("alias")).unwrap();
+                let fs = WindowsFs::new_with_software_caching(
+                    root.path(),
+                    Arc::new(driver.clone()),
+                    mode,
+                )
+                .await
+                .unwrap();
+                let context = RequestContext::new(1);
+                let opened = fs
+                    .open_with_caching(
+                        "alias",
+                        options(CreateDisposition::OPEN),
+                        lease(1, CachingState::ReadWriteHandle),
+                        &context,
+                    )
                     .await
                     .unwrap();
-            };
-            let (replaced, ()) = futures::join!(replace, flush);
-            let replaced = replaced.unwrap();
-            assert!(std::fs::read(root.path().join("data")).unwrap().is_empty());
-            fs.close(&replaced.file, &context).await.unwrap();
-            fs.close(&owner, &context).await.unwrap();
+                let cached = opened.file;
+                let control = control(opened.caching);
+                assert_eq!(control.snapshot().state, CachingState::ReadWriteHandle);
+                let namespace_context = RequestContext::new(2);
+                let opening = fs.open("data", options(CreateDisposition::OPEN), &namespace_context);
+                let flush = async {
+                    let change = control.wait_for_break(&context).await.unwrap();
+                    assert_eq!(change.state, CachingState::ReadHandle);
+                    assert_eq!(
+                        std::fs::read(root.path().join("data")).unwrap(),
+                        b"original"
+                    );
+                    fs.write(&cached, 0, b"dirty!!!", &context).await.unwrap();
+                    fs.flush(&cached, &context).await.unwrap();
+                    control
+                        .acknowledge(change.id, change.state, &context)
+                        .await
+                        .unwrap();
+                };
+                let (opened, ()) = futures::join!(opening, flush);
+                let (namespace, _) = opened.unwrap();
+                let operation = async {
+                    if delete {
+                        fs.set_delete_on_close(&namespace, true, &namespace_context)
+                            .await
+                    } else {
+                        fs.rename(&namespace, "renamed", false, &namespace_context)
+                            .await
+                    }
+                };
+                let acknowledge = async {
+                    let change = control.wait_for_break(&context).await.unwrap();
+                    assert_eq!(change.state, CachingState::Read);
+                    assert_eq!(
+                        std::fs::read(root.path().join("data")).unwrap(),
+                        b"dirty!!!"
+                    );
+                    assert!(!root.path().join("renamed").exists());
+                    assert!(
+                        !fs.metadata(&namespace, &context)
+                            .await
+                            .unwrap()
+                            .delete_pending
+                    );
+                    control
+                        .acknowledge(change.id, change.state, &context)
+                        .await
+                        .unwrap();
+                };
+                let (result, ()) = futures::join!(operation, acknowledge);
+                result.unwrap();
+                if delete {
+                    assert!(
+                        fs.metadata(&namespace, &context)
+                            .await
+                            .unwrap()
+                            .delete_pending
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read(root.path().join("renamed")).unwrap(),
+                        b"dirty!!!"
+                    );
+                }
+                assert_eq!(fs.read(&cached, 0, 8, &context).await.unwrap(), b"dirty!!!");
+                fs.close(&namespace, &context).await.unwrap();
+                fs.close(&cached, &context).await.unwrap();
+                assert!(!root.path().join("data").exists());
+                assert_eq!(
+                    std::fs::read(root.path().join("alias")).unwrap(),
+                    b"dirty!!!"
+                );
+                assert_eq!(fs.0.opens.load(Ordering::Relaxed), 0);
+            }
         }
     }
 

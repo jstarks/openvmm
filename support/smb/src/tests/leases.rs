@@ -565,7 +565,7 @@ fn a_shared_lease_migrates_to_a_live_connection_after_disconnect() {
             Server::new("memory", MemoryFs::new(1024, 16).with_oplocks().unwrap()).unwrap();
         let mut a = client(&server, 4).await;
         let mut b = client(&server, 4).await;
-        let first = created(&a.ok(Command::CREATE, &body("file", 1, 7)).await, 1, 7);
+        created(&a.ok(Command::CREATE, &body("file", 1, 7)).await, 1, 7);
         let second = created(&b.ok(Command::CREATE, &body("file", 1, 7)).await, 1, 7);
         let (send_a, recv_a) = async_channel::bounded(4);
         let (send_b, recv_b) = async_channel::bounded(4);
@@ -594,7 +594,6 @@ fn a_shared_lease_migrates_to_a_live_connection_after_disconnect() {
         assert!(futures::poll!(&mut service_a).is_pending());
         change(&recv_a.try_recv().unwrap(), 1, 7, 3, 1);
         assert!(recv_b.try_recv().is_err());
-        a.close(first).await;
         a.connection.shutdown().await.unwrap();
         service_a.await.unwrap();
         assert!(futures::poll!(&mut service_b).is_pending());

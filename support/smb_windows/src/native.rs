@@ -331,6 +331,10 @@ pub(crate) fn is_directory(file: &File) -> Result<bool, Status> {
     Ok(standard(file)?.Directory)
 }
 
+pub(crate) fn size(file: &File) -> Result<u64, Status> {
+    u64::try_from(standard(file)?.EndOfFile).map_err(|_| Status::INTERNAL_ERROR)
+}
+
 pub(crate) fn delete_pending(file: &File) -> Result<bool, Status> {
     Ok(standard(file)?.DeletePending)
 }

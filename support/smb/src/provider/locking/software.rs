@@ -32,10 +32,11 @@ struct Table<K> {
     locks: Vec<RangeLock<K>>,
     active: Vec<ActiveIo<K>>,
     waiters: HashMap<u64, u64>,
+    mutation: Option<u64>,
 }
 
 struct Open<K> {
-    key: K,
+    key: Option<K>,
     closing: bool,
 }
 
@@ -65,6 +66,7 @@ impl<K> Default for SoftwareLocks<K> {
                 locks: Vec::new(),
                 active: Vec::new(),
                 waiters: HashMap::new(),
+                mutation: None,
             }),
             changed: Event::new(),
         }))
@@ -72,6 +74,40 @@ impl<K> Default for SoftwareLocks<K> {
 }
 
 impl<K> SoftwareLocks<K> {
+    /// Fence unknown-identity EOF effects, such as a native destructive open.
+    /// Drain admitted writes and block new writes until the returned guard is
+    /// dropped by actual completion. Complete caching breaks before entering.
+    pub async fn mutation(&self, request: &RequestContext) -> Result<SoftwareMutation<K>, Status> {
+        let mut guard = None;
+        loop {
+            let listener = self.0.changed.listen();
+            if request.is_cancelled() {
+                return Err(Status::CANCELLED);
+            }
+            {
+                let mut table = self.0.state.lock();
+                if guard.is_none() && table.mutation.is_none() {
+                    let id = table.next;
+                    table.next = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
+                    table.mutation = Some(id);
+                    guard = Some(SoftwareMutation {
+                        inner: self.0.clone(),
+                        id,
+                    });
+                }
+                if guard.is_some() && !table.active.iter().any(|io| io.write) {
+                    return Ok(guard.take().expect("mutation fence acquired"));
+                }
+            }
+            let mut changed = std::pin::pin!(listener.fuse());
+            let mut cancelled = std::pin::pin!(request.cancelled().fuse());
+            futures::select! {
+                () = changed => {},
+                () = cancelled => return Err(Status::CANCELLED),
+            }
+        }
+    }
+
     /// Number of live logical acquisitions.
     pub fn lock_count(&self) -> usize {
         self.0.state.lock().locks.len()
@@ -110,6 +146,13 @@ impl<K> SoftwareLocks<K> {
 impl<K: Clone + Eq> SoftwareLocks<K> {
     /// Register an independent open; aliases share a key but never an owner.
     pub fn open(&self, key: K) -> Result<SoftwareLockOwner<K>, Status> {
+        let owner = self.reserve()?;
+        owner.bind(key)?;
+        Ok(owner)
+    }
+
+    /// Reserve bounded open capacity before native effects reveal its identity.
+    pub fn reserve(&self) -> Result<SoftwareLockOwner<K>, Status> {
         let mut table = self.0.state.lock();
         if table.owners.len() == OPEN_LIMIT {
             return Err(Status::INSUFFICIENT_RESOURCES);
@@ -119,7 +162,7 @@ impl<K: Clone + Eq> SoftwareLocks<K> {
         table.owners.insert(
             id,
             Open {
-                key,
+                key: None,
                 closing: false,
             },
         );
@@ -156,6 +199,20 @@ impl<K> Drop for Owner<K> {
 pub struct SoftwareLockOwner<K>(Arc<Owner<K>>);
 
 impl<K> SoftwareLockOwner<K> {
+    /// Bind a reserved open exactly once, before publishing it or admitting I/O.
+    pub fn bind(&self, key: K) -> Result<(), Status> {
+        let mut table = self.0.inner.state.lock();
+        let open = table
+            .owners
+            .get_mut(&self.0.id)
+            .ok_or(Status::FILE_CLOSED)?;
+        if open.key.is_some() || open.closing {
+            return Err(Status::INVALID_DEVICE_STATE);
+        }
+        open.key = Some(key);
+        Ok(())
+    }
+
     /// Release all locks after the provider has drained this open's I/O.
     pub fn close(&self) {
         self.0.close();
@@ -236,7 +293,7 @@ impl<K: Clone + Eq> SoftwareLockOwner<K> {
                 if open.closing {
                     return Err(Status::FILE_CLOSED);
                 }
-                let key = open.key.clone();
+                let key = open.key.clone().ok_or(Status::INVALID_DEVICE_STATE)?;
                 let conflict = table.locks.iter().any(|lock| {
                     lock.key == key
                         && lock.range.overlaps(range)
@@ -331,11 +388,12 @@ impl<K: Clone + Eq> SoftwareLockOwner<K> {
                 if open.closing {
                     return Err(Status::FILE_CLOSED);
                 }
-                let key = open.key.clone();
-                let busy = table
-                    .active
-                    .iter()
-                    .any(|io| io.key == key && (write && io.eof || eof && io.write));
+                let key = open.key.clone().ok_or(Status::INVALID_DEVICE_STATE)?;
+                let busy = write && table.mutation.is_some()
+                    || table
+                        .active
+                        .iter()
+                        .any(|io| io.key == key && (write && io.eof || eof && io.write));
                 if !busy {
                     if !eof
                         && range.length != 0
@@ -427,6 +485,22 @@ impl<K> Drop for SoftwareIo<K> {
     }
 }
 
+/// Completion-owned admission for native effects whose target was not yet known.
+pub struct SoftwareMutation<K> {
+    inner: Arc<Inner<K>>,
+    id: u64,
+}
+
+impl<K> Drop for SoftwareMutation<K> {
+    fn drop(&mut self) {
+        let mut table = self.inner.state.lock();
+        assert_eq!(table.mutation, Some(self.id));
+        table.mutation = None;
+        drop(table);
+        self.inner.changed.notify(usize::MAX);
+    }
+}
+
 struct Waiter<K> {
     inner: Arc<Inner<K>>,
     id: u64,
@@ -449,6 +523,58 @@ mod tests {
         offset: 2,
         length: 4,
     };
+
+    #[test]
+    fn reserved_capacity_is_bound_once_before_effects_can_be_admitted() {
+        block_on(async {
+            let locks = SoftwareLocks::default();
+            let request = RequestContext::new(1);
+            let mut owners = Vec::new();
+            for _ in 0..OPEN_LIMIT {
+                owners.push(locks.reserve().unwrap());
+            }
+            assert_eq!(locks.reserve().err(), Some(Status::INSUFFICIENT_RESOURCES));
+            let owner = owners.pop().unwrap();
+            assert_eq!(
+                owner.lock(RANGE, true, true, &request).await,
+                Err(Status::INVALID_DEVICE_STATE)
+            );
+            owner.bind(7).unwrap();
+            assert_eq!(owner.bind(8), Err(Status::INVALID_DEVICE_STATE));
+            owner.lock(RANGE, true, true, &request).await.unwrap();
+            drop(owner);
+            locks
+                .open(7)
+                .unwrap()
+                .lock(RANGE, true, true, &request)
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn unknown_identity_mutation_drains_writes_and_releases_a_cancelled_fence() {
+        block_on(async {
+            let locks = SoftwareLocks::default();
+            let owner = locks.open(7).unwrap();
+            let request = RequestContext::new(1);
+            let write = owner.operation(RANGE, true, false, &request).await.unwrap();
+            let cancelled = RequestContext::new(2);
+            let mut mutation = Box::pin(locks.mutation(&cancelled));
+            assert!(futures::poll!(&mut mutation).is_pending());
+            let mut blocked = Box::pin(owner.operation(RANGE, true, false, &request));
+            assert!(futures::poll!(&mut blocked).is_pending());
+            cancelled.cancel();
+            assert_eq!(mutation.await.err(), Some(Status::CANCELLED));
+            blocked.await.unwrap();
+            drop(write);
+            let mutation = locks.mutation(&request).await.unwrap();
+            let mut blocked = Box::pin(owner.operation(RANGE, true, false, &request));
+            assert!(futures::poll!(&mut blocked).is_pending());
+            drop(mutation);
+            blocked.await.unwrap();
+        });
+    }
 
     #[test]
     fn active_io_rejects_foreign_locks_and_retains_its_dropped_owner() {

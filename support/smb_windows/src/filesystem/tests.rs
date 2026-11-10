@@ -59,6 +59,10 @@ impl Fixture for NativeFixture {
     }
 
     async fn wait_until_pending(&self, operation: Operation, request: &RequestContext) {
+        if operation == Operation::Lock && self.0.0.lock_mode == LockMode::Synthetic {
+            self.0.0.synthetic.wait_until_pending(request.id()).await;
+            return;
+        }
         assert!(matches!(operation, Operation::Notify | Operation::Lock));
         let mut timer = pal_async::timer::PolledTimer::new(&*self.0.0.io.driver);
         loop {
@@ -84,10 +88,15 @@ impl Fixture for NativeFixture {
 
 macro_rules! contract_test {
     ($name:ident) => {
+        contract_test!($name, LockMode::Native);
+    };
+    ($name:ident, $mode:expr) => {
         #[async_test]
         async fn $name(driver: DefaultDriver) {
             let root = tempfile::tempdir().unwrap();
-            let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+            let fs = WindowsFs::new_with_lock_mode(root.path(), Arc::new(driver), $mode)
+                .await
+                .unwrap();
             contracts::$name(&NativeFixture(fs)).await;
         }
     };
@@ -129,6 +138,228 @@ contract_test!(notify_fifo_and_small_buffer);
 contract_test!(notify_subtree_and_filters);
 contract_test!(notify_deletion_generations);
 contract_test!(notify_nonempty_delete_mode_preserves_watch);
+
+mod synthetic {
+    use super::*;
+    use test_with_tracing::test;
+    contract_test!(data_and_identity, LockMode::Synthetic);
+    contract_test!(lock_conflicts_and_io, LockMode::Synthetic);
+    contract_test!(lock_waiters_and_cancellation, LockMode::Synthetic);
+    contract_test!(lock_rollback_and_drop, LockMode::Synthetic);
+    contract_test!(rename_identity, LockMode::Synthetic);
+    contract_test!(delete_on_close, LockMode::Synthetic);
+}
+
+#[async_test]
+async fn selected_lock_mode_controls_host_enforcement_but_not_guest_alias_conflicts(
+    driver: DefaultDriver,
+) {
+    use std::os::windows::fs::FileExt;
+    let driver: Arc<dyn Driver> = Arc::new(driver);
+    for mode in [LockMode::Native, LockMode::Synthetic] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mode");
+        std::fs::write(&path, b"abcd").unwrap();
+        std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+        let host = File::open(path).unwrap();
+        let fs = WindowsFs::new_with_lock_mode(root.path(), driver.clone(), mode)
+            .await
+            .unwrap();
+        let request = RequestContext::new(1);
+        let (owner, _) = fs
+            .open("mode", options(CreateDisposition::OPEN), &request)
+            .await
+            .unwrap();
+        let (peer, _) = fs
+            .open("alias", options(CreateDisposition::OPEN), &request)
+            .await
+            .unwrap();
+        let range = ByteRange {
+            offset: 0,
+            length: 4,
+        };
+        acquire(&fs, &owner, range, true, &request).await.unwrap();
+        assert_eq!(
+            fs.read(&peer, 0, 1, &request).await,
+            Err(Status::FILE_LOCK_CONFLICT)
+        );
+        assert_eq!(
+            fs.write(&peer, 0, b"x", &request).await,
+            Err(Status::FILE_LOCK_CONFLICT)
+        );
+        let mut data = [0; 1];
+        let read = host.seek_read(&mut data, 0);
+        match mode {
+            LockMode::Native => assert_eq!(
+                read.unwrap_err().raw_os_error(),
+                Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+            ),
+            LockMode::Synthetic => {
+                assert_eq!(read.unwrap(), 1);
+                assert_eq!(&data, b"a");
+            }
+        }
+        fs.close(&owner, &request).await.unwrap();
+        assert_eq!(fs.read(&peer, 0, 1, &request).await.unwrap(), b"a");
+        fs.close(&peer, &request).await.unwrap();
+    }
+}
+
+#[async_test]
+async fn synthetic_append_checks_actual_eof_without_adding_query_rights(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("synthetic-append");
+    std::fs::write(&path, b"head").unwrap();
+    let fs = WindowsFs::new_with_lock_mode(root.path(), Arc::new(driver), LockMode::Synthetic)
+        .await
+        .unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "synthetic-append",
+            options(CreateDisposition::OPEN),
+            &request,
+        )
+        .await
+        .unwrap();
+    let (append, _) = fs
+        .open(
+            "synthetic-append",
+            OpenOptions {
+                access: AccessMask::new().with_append_data(true).into_bits(),
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    acquire(
+        &fs,
+        &owner,
+        ByteRange {
+            offset: 0,
+            length: 4,
+        },
+        false,
+        &request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs.write(&append, 0, b"tail", &request).await, Ok(4));
+    acquire(
+        &fs,
+        &owner,
+        ByteRange {
+            offset: 8,
+            length: 1,
+        },
+        false,
+        &request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs.write(&append, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"headtail");
+    fs.set_len(&owner, 0, &request).await.unwrap();
+    assert_eq!(
+        fs.write(&append, 0, b"x", &request).await,
+        Err(Status::FILE_LOCK_CONFLICT)
+    );
+    fs.close(&append, &request).await.unwrap();
+    fs.close(&owner, &request).await.unwrap();
+}
+
+#[async_test]
+async fn synthetic_destructive_open_drains_writes_and_fences_new_writes(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("overwrite");
+    std::fs::write(&path, b"original").unwrap();
+    let fs = WindowsFs::new_with_lock_mode(root.path(), Arc::new(driver), LockMode::Synthetic)
+        .await
+        .unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open("overwrite", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let native = owner.get().unwrap();
+    let admitted = native
+        .software_operation(
+            ByteRange {
+                offset: 0,
+                length: u64::MAX,
+            },
+            true,
+            true,
+            &request,
+        )
+        .await
+        .unwrap();
+    let mut overwrite =
+        Box::pin(fs.open("overwrite", options(CreateDisposition::OVERWRITE), &request));
+    assert!(futures::poll!(&mut overwrite).is_pending());
+    assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    let mut write = Box::pin(fs.write(&owner, 4, b"x", &request));
+    assert!(futures::poll!(&mut write).is_pending());
+    drop(admitted);
+    let (opened, count) = futures::join!(overwrite, write);
+    let (opened, action) = opened.unwrap();
+    assert_eq!(action, CreateAction::OVERWRITTEN.0);
+    assert_eq!(count.unwrap(), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), b"\0\0\0\0x");
+    fs.close(&opened, &request).await.unwrap();
+    fs.close(&owner, &request).await.unwrap();
+}
+
+#[async_test]
+async fn cancelling_synthetic_destructive_admission_leaves_data_and_future_writes_intact(
+    driver: DefaultDriver,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cancel-overwrite");
+    std::fs::write(&path, b"original").unwrap();
+    let fs = WindowsFs::new_with_lock_mode(root.path(), Arc::new(driver), LockMode::Synthetic)
+        .await
+        .unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open(
+            "cancel-overwrite",
+            options(CreateDisposition::OPEN),
+            &request,
+        )
+        .await
+        .unwrap();
+    let native = owner.get().unwrap();
+    let admitted = native
+        .software_operation(
+            ByteRange {
+                offset: 0,
+                length: u64::MAX,
+            },
+            true,
+            true,
+            &request,
+        )
+        .await
+        .unwrap();
+    let cancelled = RequestContext::new(2);
+    let mut overwrite = Box::pin(fs.open(
+        "cancel-overwrite",
+        options(CreateDisposition::OVERWRITE),
+        &cancelled,
+    ));
+    assert!(futures::poll!(&mut overwrite).is_pending());
+    cancelled.cancel();
+    assert_eq!(overwrite.await.err(), Some(Status::CANCELLED));
+    drop(admitted);
+    assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    assert_eq!(fs.write(&owner, 0, b"X", &request).await, Ok(1));
+    fs.close(&owner, &request).await.unwrap();
+}
 
 async fn acquire<B: FileSystem>(
     fs: &B,

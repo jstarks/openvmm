@@ -46,6 +46,14 @@ pub trait LockScope: Send {
     ) -> Result<(), Status>;
 }
 
+/// Adapt acquisition-ID hooks when a provider selects its software configuration.
+pub fn with_ids<'a, B: FileSystem + ?Sized>(
+    backend: &'a B,
+    file: &'a B::File,
+) -> Box<dyn LockScope + 'a> {
+    Box::new(IdScope::new(backend, file))
+}
+
 pub(super) struct IdScope<'a, B: FileSystem + ?Sized> {
     backend: &'a B,
     file: &'a B::File,

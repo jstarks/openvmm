@@ -10,6 +10,9 @@
 //! traversal, case-sensitive directories, security mutation, streams and EAs
 //! are explicitly unsupported.
 //! It is not yet wired to the vSMB device.
+//!
+//! Native range locks are the default. Explicit synthetic locking requires the
+//! host to promise no mutation outside this provider; it does not enable caching.
 
 #![cfg(windows)]
 
@@ -19,4 +22,4 @@ mod locking;
 mod native;
 mod notify;
 
-pub use filesystem::{OpenRootError, WindowsFile, WindowsFs};
+pub use filesystem::{LockMode, OpenRootError, WindowsFile, WindowsFs};

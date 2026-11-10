@@ -6,6 +6,33 @@ use `FileSystem::lock_request` and explicit `LockScope::settle`.
 Native assumptions below were checked on ARM64 Windows `ge_release`,
 build 26300.9818, on 2026-11-09.
 
+## Enforcement Modes
+
+`WindowsFs::new` uses `LockMode::Native`. `new_with_lock_mode` can explicitly
+select `LockMode::Synthetic`; errors never switch modes automatically.
+Synthetic locking uses the
+[shared coordinator](../smb/src/provider/locking/software.rs), also used by
+Linux, rather than installing kernel locks. All guest access must share one
+provider instance, and the host promises not to mutate the backing files
+outside the SMB server. Independent providers and host readers bypass its
+logical byte locks. Native sharing, access decisions and notifications remain
+native. Neither mode grants guest caching.
+
+Synthetic I/O retains its software admission guard in the actual native
+operation's owned buffer/worker state. Append samples EOF only under cooperating
+write/EOF exclusion. EOF/allocation changes join that exclusion without adding
+byte-lock denials that their MS-FSA algorithms do not require:
+[FileEndOfFileInformation](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/5555bcb6-bc29-4f8a-900c-e469b792faab)
+and [FileAllocationInformation](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/3820daf2-e512-4730-8cce-2d0435ae6ad2).
+
+A destructive native open can change EOF before its identity is returned.
+Reserve bounded software-owner capacity first, then fence and drain admitted
+writes across the store while the original `NtCreateFile` executes. Bind the
+returned identity before publishing the open. This briefly defers writes to
+other files during destructive opens, but ordinary writes remain concurrent.
+It preserves native atomic access/sharing decisions without a speculative
+pathname lookup or emulating supersede with extra write permissions.
+
 ## Required Semantics
 
 Follow the specified lock and I/O conflict rules, including shared locks over
@@ -229,6 +256,8 @@ production line coverage is unavailable. Actual VM pause/disconnect validation
 still requires the Windows device integration; a retained library future does
 not establish VM lifecycle behavior.
 
-Shared synthetic coordination should reuse the admission and identity concepts,
-while preserving the explicit distinction between native host enforcement and
-the guest-exclusive mutation-ownership promise.
+Shared synthetic coordination preserves the explicit distinction between native
+host enforcement and the guest-exclusive mutation-ownership promise. Tests
+exercise both Windows modes, hard-link aliases, append-only grants without
+extra query rights, destructive-open admission and cancellation, and the
+different enforcement visible to an independent host reader.

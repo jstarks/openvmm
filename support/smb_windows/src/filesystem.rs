@@ -11,9 +11,13 @@ use inspect::Inspect;
 use pal_async::driver::Driver;
 use pal_async::windows::overlapped::OverlappedFile;
 use parking_lot::Mutex;
+use smb::provider::locking::{
+    self,
+    software::{SoftwareIo, SoftwareLockOwner, SoftwareLocks},
+};
 use smb::provider::{
-    BasicInformation, FileSystem, FileSystemInformation, LockScope, Metadata, NotifyResult,
-    OpenOptions, RequestContext, map_access,
+    BasicInformation, ByteRange, FileSystem, FileSystemInformation, LockId, LockScope, Metadata,
+    NotifyResult, OpenOptions, RequestContext, map_access,
 };
 use smb::security::SecurityDescriptor;
 use smb::spec::{
@@ -34,6 +38,17 @@ const IO_LIMIT: usize = 1024 * 1024;
 #[derive(Debug, thiserror::Error)]
 #[error("cannot initialize Windows SMB filesystem: {0:?}")]
 pub struct OpenRootError(Status);
+
+/// Byte-range enforcement selected once for every open of a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// Coordinate with independent host opens using native Windows locks.
+    Native,
+    /// Software enforcement: the host promises not to mutate backing files
+    /// outside this SMB provider. Independently constructed providers do not
+    /// share this coordination. This does not enable guest write caching.
+    Synthetic,
+}
 
 /// A VM-independent, process-identity Windows filesystem with no caching grants.
 ///
@@ -66,6 +81,8 @@ struct Inner {
     opens: AtomicUsize,
     watches: Mutex<HashMap<u64, Vec<Weak<Watch>>>>,
     locks: Arc<Coordination>,
+    lock_mode: LockMode,
+    synthetic: SoftwareLocks<u64>,
 }
 
 struct Reservation(Arc<Inner>);
@@ -133,6 +150,22 @@ impl NativeFile {
         }
     }
 
+    async fn software_operation(
+        &self,
+        range: ByteRange,
+        write: bool,
+        eof: bool,
+        request: &RequestContext,
+    ) -> Result<Option<SoftwareIo<u64>>, Status> {
+        match self {
+            Self::Data(data) => match &data.synthetic {
+                Some(owner) => owner.operation(range, write, eof, request).await.map(Some),
+                None => Ok(None),
+            },
+            Self::Directory(_) => Ok(None),
+        }
+    }
+
     fn directory(&self) -> Result<&Directory, Status> {
         match self {
             Self::Directory(directory) => Ok(directory),
@@ -163,11 +196,24 @@ impl WindowsFile {
 
 impl Inspect for WindowsFs {
     fn inspect(&self, req: inspect::Request<'_>) {
+        let (mode, locks, waiters) = match self.0.lock_mode {
+            LockMode::Native => (
+                "native",
+                self.0.locks.lock_count(),
+                self.0.locks.waiter_count(),
+            ),
+            LockMode::Synthetic => (
+                "synthetic",
+                self.0.synthetic.lock_count(),
+                self.0.synthetic.waiter_count(),
+            ),
+        };
         req.respond()
             .field("opens", self.0.opens.load(Ordering::Relaxed))
             .field("open_limit", OPEN_LIMIT)
-            .field("range_locks", self.0.locks.lock_count())
-            .field("lock_waiters", self.0.locks.waiter_count())
+            .field("lock_mode", mode)
+            .field("range_locks", locks)
+            .field("lock_waiters", waiters)
             .field(
                 "workers_submitted",
                 self.0.io.submitted.load(Ordering::Relaxed),
@@ -181,6 +227,15 @@ impl WindowsFs {
         root: impl AsRef<Path>,
         driver: Arc<dyn Driver>,
     ) -> Result<Self, OpenRootError> {
+        Self::new_with_lock_mode(root, driver, LockMode::Native).await
+    }
+
+    /// Capture an export with explicit, immutable host-coordination policy.
+    pub async fn new_with_lock_mode(
+        root: impl AsRef<Path>,
+        driver: Arc<dyn Driver>,
+        lock_mode: LockMode,
+    ) -> Result<Self, OpenRootError> {
         let io = Io::new(driver);
         let root = root.as_ref().to_owned();
         let root = io
@@ -193,6 +248,8 @@ impl WindowsFs {
             opens: AtomicUsize::new(0),
             watches: Mutex::new(HashMap::new()),
             locks: Arc::new(Coordination::default()),
+            lock_mode,
+            synthetic: SoftwareLocks::default(),
         })))
     }
 
@@ -204,6 +261,15 @@ impl WindowsFs {
             })
             .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
         Ok(Reservation(self.0.clone()))
+    }
+
+    fn synthetic_owner(&self, file: &WindowsFile) -> Result<SoftwareLockOwner<u64>, Status> {
+        let native = file.get()?;
+        let data = native.data()?;
+        if !Arc::ptr_eq(&data.coordination, &self.0.locks) {
+            return Err(Status::FILE_CLOSED);
+        }
+        data.synthetic.clone().ok_or(Status::NOT_SUPPORTED)
     }
 }
 
@@ -324,7 +390,42 @@ impl FileSystem for WindowsFs {
     type File = WindowsFile;
 
     fn lock_request<'a>(&'a self, file: &'a WindowsFile) -> Box<dyn LockScope + 'a> {
-        Box::new(Scope::new(file.get(), &self.0.io, &self.0.locks))
+        match self.0.lock_mode {
+            LockMode::Native => Box::new(Scope::new(file.get(), &self.0.io, &self.0.locks)),
+            LockMode::Synthetic => locking::with_ids(self, file),
+        }
+    }
+
+    async fn lock(
+        &self,
+        file: &WindowsFile,
+        range: ByteRange,
+        exclusive: bool,
+        fail_immediately: bool,
+        request: &RequestContext,
+    ) -> Result<LockId, Status> {
+        self.synthetic_owner(file)?
+            .lock(range, exclusive, fail_immediately, request)
+            .await
+    }
+
+    async fn unlock(
+        &self,
+        file: &WindowsFile,
+        range: ByteRange,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        self.synthetic_owner(file)?.unlock(range)
+    }
+
+    async fn rollback_lock(
+        &self,
+        file: &WindowsFile,
+        lock: LockId,
+        _request: &RequestContext,
+    ) -> Result<(), Status> {
+        self.synthetic_owner(file)?.rollback(lock);
+        Ok(())
     }
 
     async fn open(
@@ -352,11 +453,22 @@ impl FileSystem for WindowsFs {
             };
         }
         let reservation = self.reserve()?;
+        let owner = if self.0.lock_mode == LockMode::Synthetic {
+            Some(self.0.synthetic.reserve()?)
+        } else {
+            None
+        };
+        let mutation = if owner.is_some() && replacement_access(options.disposition()) != 0 {
+            Some(self.0.synthetic.mutation(request).await?)
+        } else {
+            None
+        };
         let root = self.0.root.clone();
         let result = self
             .0
             .io
             .worker(request, move || {
+                let _mutation = mutation;
                 // Retain the open slot even if an initialization future is dropped.
                 let (file, action) = walk(root, parts, &create)?;
                 let directory = if native::is_directory(&file)? {
@@ -364,10 +476,18 @@ impl FileSystem for WindowsFs {
                 } else {
                     None
                 };
-                Ok(((file, action, directory), reservation))
+                let owner = if directory.is_none() {
+                    if let Some(owner) = &owner {
+                        owner.bind(native::identity(&file)?)?;
+                    }
+                    owner
+                } else {
+                    None
+                };
+                Ok(((file, action, directory, owner), reservation))
             })
             .await;
-        let ((file, action, directory), reservation) = match result {
+        let ((file, action, directory, owner), reservation) = match result {
             Err(Status::OBJECT_NAME_NOT_FOUND) if unsupported_creation => {
                 return Err(Status::NOT_SUPPORTED);
             }
@@ -385,7 +505,9 @@ impl FileSystem for WindowsFs {
                 closing: AtomicBool::new(false),
             })
         } else {
-            NativeFile::Data(DataFile::new(file, self.0.locks.clone()))
+            let mut data = DataFile::new(file, self.0.locks.clone());
+            data.synthetic = owner;
+            NativeFile::Data(data)
         };
         Ok((
             WindowsFile {
@@ -418,6 +540,9 @@ impl FileSystem for WindowsFs {
                 }
                 NativeFile::Data(data) => {
                     data.closing.store(true, Ordering::Release);
+                    if let Some(owner) = &data.synthetic {
+                        owner.start_close()?;
+                    }
                     data.coordination.changed();
                 }
             }
@@ -430,6 +555,9 @@ impl FileSystem for WindowsFs {
         let mut locks = match &native {
             Some(open) => match &*open.file {
                 NativeFile::Data(data) => {
+                    if let Some(owner) = &data.synthetic {
+                        owner.drain().await;
+                    }
                     let guard = data.gate.clone().lock_owned().await;
                     data.drain(&RequestContext::new(0)).await?;
                     Some(guard)
@@ -507,12 +635,23 @@ impl FileSystem for WindowsFs {
         let offset = i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?;
         let file = file.get()?;
         file.overlapped()?;
+        let software = file
+            .software_operation(
+                ByteRange {
+                    offset: offset as u64,
+                    length: length.min(IO_LIMIT) as u64,
+                },
+                false,
+                false,
+                request,
+            )
+            .await?;
         let admission = file.active(request).await?;
         let mut io = native::read_admitted(
             file.overlapped()?,
             offset,
             vec![0; length.min(IO_LIMIT)],
-            (file.clone(), admission),
+            (file.clone(), admission, software),
         );
         let mut cancelled = std::pin::pin!(request.cancelled().fuse());
         let ((result, count), (mut data, _admission)) = futures::select_biased! {
@@ -538,6 +677,8 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<usize, Status> {
         check(request)?;
+        let requested_offset = offset;
+        let append = file.append_only && !data.is_empty();
         let offset = if file.append_only {
             -1
         } else {
@@ -545,6 +686,43 @@ impl FileSystem for WindowsFs {
         };
         let file = file.get()?;
         file.overlapped()?;
+        let length = data.len().min(IO_LIMIT) as u64;
+        let software = file
+            .software_operation(
+                if append {
+                    ByteRange {
+                        offset: 0,
+                        length: u64::MAX,
+                    }
+                } else {
+                    ByteRange {
+                        offset: requested_offset,
+                        length,
+                    }
+                },
+                true,
+                append,
+                request,
+            )
+            .await?;
+        if let Some(software) = software.as_ref().filter(|_| append) {
+            let backing = file.clone();
+            let size = self
+                .0
+                .io
+                .worker(request, move || native::size(backing.get()))
+                .await?;
+            if size
+                .checked_add(length)
+                .is_none_or(|end| end > i64::MAX as u64)
+            {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            software.set_range(ByteRange {
+                offset: size,
+                length,
+            })?;
+        }
         let mut guard = file.data()?.admit(request).await?;
         if file.data()?.needs_realization(&guard) {
             let backing = file.clone();
@@ -557,7 +735,7 @@ impl FileSystem for WindowsFs {
                 })
                 .await?;
         }
-        let admission = (file.clone(), file.data()?.active()?);
+        let admission = (file.clone(), file.data()?.active()?, software);
         drop(guard);
         check(request)?;
         let data = data[..data.len().min(IO_LIMIT)].to_vec();
@@ -630,11 +808,23 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let software = file
+            .software_operation(
+                ByteRange {
+                    offset: 0,
+                    length: u64::MAX,
+                },
+                true,
+                true,
+                request,
+            )
+            .await?;
         let admission = file.active(request).await?;
         self.0
             .io
             .worker(request, move || {
                 let _admission = admission;
+                let _software = software;
                 native::set_len(file.get(), length)
             })
             .await
@@ -752,11 +942,23 @@ impl FileSystem for WindowsFs {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let file = file.get()?;
+        let software = file
+            .software_operation(
+                ByteRange {
+                    offset: 0,
+                    length: u64::MAX,
+                },
+                true,
+                true,
+                request,
+            )
+            .await?;
         let admission = file.active(request).await?;
         self.0
             .io
             .worker(request, move || {
                 let _admission = admission;
+                let _software = software;
                 native::set_allocation(file.get(), length)
             })
             .await

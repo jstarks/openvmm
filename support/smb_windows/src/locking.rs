@@ -11,6 +11,7 @@ use futures::lock::{Mutex, OwnedMutexGuard};
 use pal_async::timer::PolledTimer;
 use pal_async::windows::overlapped::OverlappedFile;
 use parking_lot::Mutex as SyncMutex;
+use smb::provider::locking::software::SoftwareLockOwner;
 use smb::provider::{ByteRange, LockScope, LockSettlement, RequestContext};
 use smb::spec::Status;
 use std::collections::HashMap;
@@ -134,6 +135,7 @@ pub(crate) struct DataFile {
     pub closing: AtomicBool,
     pub coordination: Arc<Coordination>,
     active: Arc<Active>,
+    pub synthetic: Option<SoftwareLockOwner<u64>>,
 }
 
 impl DataFile {
@@ -144,6 +146,7 @@ impl DataFile {
             closing: AtomicBool::new(false),
             coordination,
             active: Arc::new(Active::default()),
+            synthetic: None,
         }
     }
 
@@ -210,6 +213,9 @@ impl DataFile {
         }
         ledger.groups.clear();
         ledger.acquired.clear();
+        if let Some(owner) = &self.synthetic {
+            owner.close();
+        }
         self.coordination.changed();
         Ok(())
     }

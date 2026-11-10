@@ -943,7 +943,7 @@ pub trait FileSystem: Inspect + Send + Sync + 'static {
     /// Wrappers must delegate this entry point, not reconstruct a scope around
     /// legacy hooks that the underlying provider may not implement.
     fn lock_request<'a>(&'a self, file: &'a Self::File) -> Box<dyn LockScope + 'a> {
-        Box::new(locking::IdScope::new(self, file))
+        locking::with_ids(self, file)
     }
     /// Watch directory changes. The first call fixes filter/scope for its registration;
     /// buffer changes between calls and complete overlapping requests FIFO.

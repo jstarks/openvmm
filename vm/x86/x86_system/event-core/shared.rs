@@ -78,8 +78,8 @@ impl SharedEventMachine {
             Phase::GateHigh { event, .. } =>
                 self.tables.idt_base as int + event_model::vector(event) as int * 16 + 15 <= u64::MAX,
             Phase::Push { event, stack, index, .. } => index < 6
-                && index >= (if event is External { 1u8 } else { 0u8 })
-                && stack >= 8 * (if event is External { 5u64 } else { 6u64 }),
+                && index >= (if event_model::has_error_code(event) { 0u8 } else { 1u8 })
+                && stack >= 8 * (if event_model::has_error_code(event) { 6u64 } else { 5u64 }),
             Phase::Pop { index, .. } => index < 5 && self.core@.cpu.gpr[4] <= u64::MAX - 40,
             _ => true,
         }
@@ -180,7 +180,7 @@ impl SharedEventMachine {
     {
         if self.handler_pending {
             let (vector, code) = match event { Event::PageFault(c) => (14, c),
-                Event::GeneralProtection => (13, 0), Event::External(v) => (v, 0) };
+                Event::GeneralProtection => (13, 0), Event::InvalidOpcode => (6, 0), Event::External(v) => (v, 0) };
             return self.stop(EventDiagnostic::HandlerFault { vector, code });
         }
         let cpu = self.core.cpu();
@@ -188,13 +188,14 @@ impl SharedEventMachine {
         if external && match event { Event::External(v) => v < 32, _ => false } {
             return self.stop(EventDiagnostic::InterruptWindow);
         }
-        let count = if external { 5u64 } else { 6u64 };
+        let count = if has_error_code(event) { 6u64 } else { 5u64 };
         let stack = cpu.gpr[4] / 16 * 16;
         if !flags_supported(cpu.flags) || !tables_supported(self.tables)
             || !canonical(cpu.rip) || !canonical(cpu.gpr[4]) || stack < count * 8 {
             return self.stop(EventDiagnostic::Profile);
         }
-        let vector: u8 = match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13, Event::External(v) => v };
+        let vector: u8 = match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13,
+            Event::InvalidOpcode => 6, Event::External(v) => v };
         let offset = vector as u64 * 16;
         if offset + 15 > self.tables.idt_limit as u64 || self.tables.idt_base > u64::MAX - offset - 15 {
             return self.stop(EventDiagnostic::Descriptor(Stage::Idt));
@@ -378,11 +379,12 @@ impl SharedEventMachine {
         match self.phase {
             Phase::GateLow { address, .. } => (Stage::Idt, address),
             Phase::GateHigh { event, .. } => (Stage::Idt, self.tables.idt_base
-                + (match event { Event::PageFault(_) => 14u64, Event::GeneralProtection => 13, Event::External(v) => v as u64 }) * 16 + 8),
+                + (match event { Event::PageFault(_) => 14u64, Event::GeneralProtection => 13,
+                    Event::InvalidOpcode => 6, Event::External(v) => v as u64 }) * 16 + 8),
             Phase::Code { .. } | Phase::ReturnCode { .. } => (Stage::Code, self.tables.gdt_base + 8),
             Phase::ReturnStack { .. } => (Stage::Stack, self.tables.gdt_base + 16),
             Phase::Push { event, stack, index, .. } =>
-                (Stage::Push, stack - 8 * (index as u64 - if matches!(event, Event::External(_)) { 1 } else { 0 } + 1)),
+                (Stage::Push, stack - 8 * (index as u64 - if has_error_code(event) { 0 } else { 1 } + 1)),
             Phase::Pop { index, .. } => (Stage::Pop, cpu.gpr[4] + index as u64 * 8),
             _ => { assert(false); (Stage::Idt, 0) },
         }
@@ -409,14 +411,14 @@ impl SharedEventMachine {
             },
             Phase::Code { event, low, target } => {
                 if value != 0x00af9b000000ffffu64 { return self.stop(EventDiagnostic::Descriptor(Stage::Code)); }
-                let index = if matches!(event, Event::External(_)) { 1u8 } else { 0u8 };
+                let index = if has_error_code(event) { 0u8 } else { 1u8 };
                 let stack = cpu.gpr[4] / 16 * 16;
                 let word = frame_word(cpu, event, index);
                 self.begin_word(stack - 8, WordAccess::Write(word), Phase::Push { event, low, target, stack, index });
             },
             Phase::Push { event, low, target, stack, index } => {
                 if index == 5 {
-                    let count = if matches!(event, Event::External(_)) { 5u64 } else { 6u64 };
+                    let count = if has_error_code(event) { 6u64 } else { 5u64 };
                     let ghost before = cpu@;
                     cpu.gpr[4] = stack - count * 8;
                     assert(cpu@.gpr =~= before.gpr.update(4, stack as int - count as int * 8));
@@ -425,10 +427,10 @@ impl SharedEventMachine {
                     self.phase = Phase::Ready; self.handler_pending = true; self.shadow = false; self.halted = false;
                     if matches!(event, Event::External(_)) { self.pending = None; }
                     return Tick::Delivered(match event { Event::PageFault(_) => 14,
-                        Event::GeneralProtection => 13, Event::External(v) => v });
+                        Event::GeneralProtection => 13, Event::InvalidOpcode => 6, Event::External(v) => v });
                 }
                 let next = index + 1;
-                let start = if matches!(event, Event::External(_)) { 1u64 } else { 0u64 };
+                let start = if has_error_code(event) { 0u64 } else { 1u64 };
                 let address = stack - 8 * (next as u64 - start + 1);
                 self.begin_word(address, WordAccess::Write(frame_word(cpu, event, next)),
                     Phase::Push { event, low, target, stack, index: next });
@@ -471,6 +473,8 @@ fn frame_word(cpu: State, event: Event, index: u8) -> (value: u64)
 {
     if matches!(event, Event::External(_)) {
         match index { 0 => 0, 1 => 16, 2 => cpu.gpr[4], 3 => cpu.flags, 4 => 8, _ => cpu.rip }
+    } else if matches!(event, Event::InvalidOpcode) {
+        match index { 0 => 0, 1 => 16, 2 => cpu.gpr[4], 3 => cpu.flags | 0x10000u64, 4 => 8, _ => cpu.rip }
     } else {
         match index { 0 => 16, 1 => cpu.gpr[4], 2 => cpu.flags | 0x10000u64, 3 => 8, 4 => cpu.rip,
             _ => match event { Event::PageFault(code) => code as u64, _ => 0 } }

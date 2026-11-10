@@ -148,6 +148,100 @@ fn decoded_page_edge_retires_without_touching_the_missing_next_page() {
 }
 
 #[test]
+fn decoded_faults_frame_ud_and_gp_without_fetching_past_the_page() {
+    for (code, vector, count) in [
+        (&[0x0f, 0x0b][..], 6u8, 5u64),
+        (&[0x66; 15][..], 13u8, 6u64),
+    ] {
+        let (mut bytes, mut owned) = fixture();
+        let start = 0x11000 - code.len();
+        bytes[start..0x11000].copy_from_slice(code);
+        put(&mut bytes, pte(0x11000), 0x11000);
+        gate(&mut bytes, vector, IRQ, 0x8e);
+        owned.core.cpu.rip = start as u64;
+        let initial = owned.core.cpu;
+        let (memory, ram) = backing(&bytes);
+        let mut cpu = shared(&owned);
+        assert!(cpu.enable_decode());
+        let stack = initial.gpr[4] & !15;
+        let mut stores = Vec::new();
+        let mut completed = None;
+        for _ in 0..4096 {
+            if let Request::WriteWord {
+                address,
+                word_value,
+            } = cpu.request()
+            {
+                stores.push((address, word_value));
+            }
+            let batch = cpu.run(&ram, 1, 1).unwrap();
+            match batch.stop {
+                BatchStop::Decode(input) => {
+                    assert!(cpu.complete_decode(input.sequence, x86_decode::admit(input)));
+                }
+                BatchStop::Yield => assert_eq!(cpu.cpu(), initial),
+                _ => {
+                    completed = Some(batch);
+                    break;
+                }
+            }
+        }
+        let batch = completed.expect("fault delivery exceeded finite schedule");
+        let mut words = vec![16, initial.gpr[4], initial.flags | RF, 8, initial.rip];
+        if vector == 13 {
+            words.push(0);
+        }
+        let expected: Vec<_> = words
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (stack - 8 * (index as u64 + 1), value))
+            .collect();
+        assert_eq!(
+            stores, expected,
+            "frame prefix writes must be ordered and never replayed"
+        );
+        assert_eq!(
+            (batch.retired, batch.delivered, batch.stop),
+            (0, 1, BatchStop::Budget)
+        );
+        assert_eq!(cpu.cr2(), owned.core.mmu.cr2());
+        assert_eq!(memory.read_plain::<u64>(pte(0x11000)).unwrap(), 0x11000);
+        let bottom = stack - count * 8;
+        assert_eq!(cpu.cpu().rip, IRQ);
+        assert_eq!(cpu.cpu().gpr[4], bottom);
+        let ip = bottom + if vector == 13 { 8 } else { 0 };
+        assert_eq!(memory.read_plain::<u64>(ip).unwrap(), initial.rip);
+        assert_eq!(
+            memory.read_plain::<u64>(stack - 24).unwrap(),
+            initial.flags | RF
+        );
+        if vector == 13 {
+            assert_eq!(memory.read_plain::<u64>(bottom).unwrap(), 0);
+        }
+    }
+}
+
+#[test]
+fn truncated_decode_fetch_fault_wins_before_opcode_classification() {
+    let (mut bytes, mut owned) = fixture();
+    bytes[0x10fff] = 0x0f;
+    put(&mut bytes, pte(0x11000), 0x11000);
+    gate(&mut bytes, 14, IRQ, 0x8e);
+    owned.core.cpu.rip = 0x10fff;
+    let initial = owned.core.cpu;
+    let (memory, ram) = backing(&bytes);
+    let mut cpu = shared(&owned);
+    assert!(cpu.enable_decode());
+    let batch = decoded_one(&mut cpu, &ram);
+    assert_eq!((batch.retired, batch.delivered), (0, 1));
+    assert_eq!(cpu.cr2(), 0x11000);
+    let stack = (initial.gpr[4] & !15) - 48;
+    assert_eq!(memory.read_plain::<u64>(stack).unwrap(), 16);
+    assert_eq!(memory.read_plain::<u64>(stack + 8).unwrap(), initial.rip);
+    assert_eq!(cpu.cpu().rip, IRQ);
+}
+
+#[test]
 fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code() {
     for (code, expected, length) in [
         (&[0xb8, 0x78, 0x56, 0x34, 0x12][..], 0x12345678, 5),

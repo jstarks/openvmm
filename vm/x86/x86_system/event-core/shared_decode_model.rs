@@ -78,7 +78,7 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
         _ => arbitrary() };
     match decision {
         DecodeDecision::More => {
-            if input.length == 15 { stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DecodeLimit)) }
+            if input.length == 15 { entry(s, Event::GeneralProtection) }
             else if input.rip as int + input.length as int > u64::MAX {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap))
             } else {
@@ -86,6 +86,8 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
             }
         },
         DecodeDecision::Rejected => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DecodeRejected)),
+        DecodeDecision::InvalidOpcode => entry(s, Event::InvalidOpcode),
+        DecodeDecision::Overlong => entry(s, Event::GeneralProtection),
         DecodeDecision::Unsupported => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
         DecodeDecision::Scalar { dst, source } => {
             let result = scalar::model::commit(s.core.cpu.gpr.map(|i: int, value: int| value as u64),

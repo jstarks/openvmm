@@ -314,7 +314,7 @@ fn invalid_valid_unsupported_and_prefix_length_limit_are_distinct_from_truncatio
     ));
     assert!(matches!(
         outcome(&[0xf0, 0x01, 0xc8], 0),
-        Outcome::Rejected(_)
+        Outcome::InvalidOpcode(_)
     ));
     for bytes in [
         &[0x0f, 0x30][..],
@@ -329,13 +329,59 @@ fn invalid_valid_unsupported_and_prefix_length_limit_are_distinct_from_truncatio
         assert!(decoder.outcome().is_none());
     }
     decoder.complete(decoder.request().unwrap(), 0x66).unwrap();
-    assert!(matches!(decoder.outcome(), Some(Outcome::Rejected(_))));
+    assert!(matches!(decoder.outcome(), Some(Outcome::Overlong(_))));
     assert!(decoder.request().is_none());
     let mut maximum = vec![0x66; 13];
     maximum.extend_from_slice(&[0x89, 0xc0]);
     assert_eq!(
         decode(&maximum, 0).operands[0],
         Operand::Register(reg(0, Width::Word, false))
+    );
+}
+
+#[test]
+fn architectural_decode_faults_keep_ambiguous_full_length_failures_diagnostic() {
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    for (code, expected) in [
+        (&[0x0f, 0x0b][..], DecodeDecision::InvalidOpcode),
+        (&[0xf0, 0x01, 0xc8][..], DecodeDecision::InvalidOpcode),
+        (&[0x66; 15][..], DecodeDecision::Overlong),
+        (&[0x4f; 15][..], DecodeDecision::Overlong),
+        (&[0xc5, 0xf8, 0x77][..], DecodeDecision::Unsupported),
+    ] {
+        let mut bytes = [0; 15];
+        bytes[..code.len()].copy_from_slice(code);
+        assert_eq!(
+            admit(DecodeInput {
+                sequence: 1,
+                rip: 0xfff,
+                length: code.len() as u8,
+                bytes
+            }),
+            expected
+        );
+    }
+    let mut bytes = [0x66; 15];
+    bytes[8..10].copy_from_slice(&[0x48, 0xb8]);
+    bytes[10..].fill(0);
+    assert_eq!(
+        admit(DecodeInput {
+            sequence: 1,
+            rip: 0,
+            length: 15,
+            bytes
+        }),
+        DecodeDecision::Rejected
+    );
+    bytes[..3].copy_from_slice(&[0x0f, 0x0b, 0x90]);
+    assert_eq!(
+        admit(DecodeInput {
+            sequence: 1,
+            rip: 0,
+            length: 3,
+            bytes
+        }),
+        DecodeDecision::Rejected
     );
 }
 

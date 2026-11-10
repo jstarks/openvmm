@@ -71,7 +71,7 @@ pub open spec fn fetch(s: State, address: u64, phase: Phase) -> State {
 pub open spec fn entry_profile(cpu: model::State, t: Tables, event: Event) -> bool {
     e::flags_supported(cpu.flags) && e::tables_supported(t)
         && mmu_model::canonical(cpu.rip) && mmu_model::canonical(cpu.gpr[4])
-        && cpu.gpr[4] / 16 * 16 >= if event is External { 40int } else { 48int }
+        && cpu.gpr[4] / 16 * 16 >= if e::has_error_code(event) { 48int } else { 40int }
 }
 pub open spec fn entry(s: State, event: Event) -> (State, Tick) {
     if s.handler_pending {
@@ -157,6 +157,8 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
 pub open spec fn frame_word(cpu: model::State, event: Event, index: u8) -> u64 {
     if event is External {
         match index { 0 => 0, 1 => 16, 2 => cpu.gpr[4] as u64, 3 => cpu.flags, 4 => 8, _ => cpu.rip as u64 }
+    } else if event is InvalidOpcode {
+        match index { 0 => 0, 1 => 16, 2 => cpu.gpr[4] as u64, 3 => cpu.flags | 0x10000u64, 4 => 8, _ => cpu.rip as u64 }
     } else {
         match index { 0 => 16, 1 => cpu.gpr[4] as u64, 2 => cpu.flags | 0x10000u64,
             3 => 8, 4 => cpu.rip as u64, _ => e::error(event) }
@@ -169,7 +171,7 @@ pub open spec fn word_location(s: State) -> (Stage, u64) {
         Phase::Code { .. } | Phase::ReturnCode { .. } => (Stage::Code, (s.tables.gdt_base as int + 8) as u64),
         Phase::ReturnStack { .. } => (Stage::Stack, (s.tables.gdt_base as int + 16) as u64),
         Phase::Push { event, stack, index, .. } => (Stage::Push,
-            (stack as int - 8 * (index as int - if event is External { 1int } else { 0int } + 1)) as u64),
+            (stack as int - 8 * (index as int - if e::has_error_code(event) { 0int } else { 1int } + 1)) as u64),
         Phase::Pop { index, .. } => (Stage::Pop, (s.core.cpu.gpr[4] + index as int * 8) as u64),
         _ => (Stage::Idt, 0),
     }
@@ -197,7 +199,7 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
         Phase::Code { event, low, target } => {
             if value != 0x00af9b000000ffffu64 { stop(s, EventDiagnostic::Descriptor(Stage::Code)) }
             else {
-                let index = if event is External { 1u8 } else { 0u8 };
+                let index = if e::has_error_code(event) { 0u8 } else { 1u8 };
                 let stack = (cpu.gpr[4] / 16 * 16) as u64;
                 (word(s, (stack - 8) as u64, WordAccess::Write(frame_word(cpu, event, index)),
                     Phase::Push { event, low, target, stack, index }), Tick::Pending)
@@ -205,7 +207,7 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
         },
         Phase::Push { event, low, target, stack, index } => {
             if index == 5 {
-                let count = if event is External { 5int } else { 6int };
+                let count = if e::has_error_code(event) { 6int } else { 5int };
                 let next = model::State { gpr: cpu.gpr.update(4, stack as int - count * 8),
                     flags: e::live_flags(cpu.flags, low), rip: target as int };
                 (State { core: c::boundary_commit(s.core, next, true).0, phase: Phase::Ready,
@@ -213,7 +215,7 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
                     pending: if event is External { None } else { s.pending }, ..s }, Tick::Delivered(e::vector(event)))
             } else {
                 let next = (index + 1) as u8;
-                let start = if event is External { 1int } else { 0int };
+                let start = if e::has_error_code(event) { 0int } else { 1int };
                 (word(s, (stack as int - 8 * (next as int - start + 1)) as u64,
                     WordAccess::Write(frame_word(cpu, event, next)),
                     Phase::Push { event, low, target, stack, index: next }), Tick::Pending)

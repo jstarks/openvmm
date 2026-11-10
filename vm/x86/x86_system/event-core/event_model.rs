@@ -42,7 +42,11 @@ pub open spec fn live_flags(flags: u64, low: u64) -> u64 {
         & (if low / 1099511627776u64 % 2 == 0 { !0x200u64 } else { u64::MAX })
 }
 pub open spec fn vector(event: Event) -> u8 {
-    match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13, Event::External(v) => v }
+    match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13,
+        Event::InvalidOpcode => 6, Event::External(v) => v }
+}
+pub open spec fn has_error_code(event: Event) -> bool {
+    event is PageFault || event is GeneralProtection
 }
 pub open spec fn error(event: Event) -> u64 {
     match event { Event::PageFault(code) => code as u64, _ => 0 }
@@ -115,7 +119,7 @@ pub open spec fn enter(s: State, b: Seq<u8>, base: int, event: Event)
     } else if !flags_supported(s.core.cpu.flags) || !tables_supported(s.tables)
         || !mmu_model::canonical(s.core.cpu.rip)
         || !mmu_model::canonical(s.core.cpu.gpr[4])
-        || s.core.cpu.gpr[4] / 16 * 16 < (if event is External { 40int } else { 48int }) {
+        || s.core.cpu.gpr[4] / 16 * 16 < (if has_error_code(event) { 48int } else { 40int }) {
         stopped(s, b, EventDiagnostic::Profile, 0)
     } else {
         let offset = vector(event) as int * 16;
@@ -145,13 +149,16 @@ pub open spec fn enter(s: State, b: Seq<u8>, base: int, event: Event)
                     let words = if event is External {
                         seq![0u64, 16u64, s.core.cpu.gpr[4] as u64, s.core.cpu.flags, 8u64, s.core.cpu.rip as u64]
                     } else { words };
+                    let words = if event is InvalidOpcode {
+                        seq![0u64, 16u64, s.core.cpu.gpr[4] as u64, s.core.cpu.flags | 0x10000u64, 8u64, s.core.cpu.rip as u64]
+                    } else { words };
                     let pushed = push_words(next.core.mmu, code.1, base, stack,
-                        if event is External { 1nat } else { 0nat }, words);
+                        if has_error_code(event) { 0nat } else { 1nat }, words);
                     let next = State { core: paged_model::State { mmu: pushed.0, ..next.core }, ..next };
                     if let Some(reason) = pushed.2 { stopped(next, pushed.1, reason, reads + pushed.3) }
                     else {
                         let cpu = model::State {
-                            gpr: s.core.cpu.gpr.update(4, stack - (if event is External { 40int } else { 48int })),
+                            gpr: s.core.cpu.gpr.update(4, stack - (if has_error_code(event) { 48int } else { 40int })),
                             flags: live_flags(s.core.cpu.flags, gate.2[0]),
                             rip: gate_target(gate.2[0], gate.2[1]),
                         };

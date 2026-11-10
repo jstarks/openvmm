@@ -149,7 +149,9 @@ pub enum Outcome {
         encoding: Encoding,
         code: u32,
     },
-    /// Includes overlong encodings. This diagnostic is not an architectural #UD.
+    InvalidOpcode(Encoding),
+    Overlong(Encoding),
+    /// Malformed packets or ambiguous full-length failures, not a guest fault.
     Rejected(Encoding),
 }
 
@@ -213,6 +215,13 @@ impl FetchDecoder {
 }
 
 fn inspect(encoding: Encoding) -> Option<Outcome> {
+    if encoding.length == MAX_INSTRUCTION_BYTES as u8
+        && encoding.bytes().iter().all(|byte| {
+            matches!(byte, 0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3 | 0x40..=0x4f)
+        })
+    {
+        return Some(Outcome::Overlong(encoding));
+    }
     let mut decoder = Decoder::with_ip(64, encoding.bytes(), encoding.rip, DecoderOptions::AMD);
     let instruction = decoder.decode();
     if decoder.last_error() == DecoderError::NoMoreBytes
@@ -220,21 +229,29 @@ fn inspect(encoding: Encoding) -> Option<Outcome> {
     {
         return None;
     }
-    Some(
-        if decoder.last_error() != DecoderError::None
-            || instruction.len() != encoding.length as usize
-        {
+    Some(if instruction.len() != encoding.length as usize {
+        Outcome::Rejected(encoding)
+    } else if decoder.last_error() != DecoderError::None {
+        // Iced merges length exhaustion with invalid opcodes at byte 15.
+        if encoding.length == MAX_INSTRUCTION_BYTES as u8 {
             Outcome::Rejected(encoding)
         } else {
-            match normalize(&instruction, encoding) {
-                Some(decoded) => Outcome::Normalized(decoded),
-                None => Outcome::Unsupported {
-                    encoding,
-                    code: instruction.code() as u32,
-                },
-            }
-        },
-    )
+            Outcome::InvalidOpcode(encoding)
+        }
+    } else if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Ud0 | Mnemonic::Ud1 | Mnemonic::Ud2
+    ) {
+        Outcome::InvalidOpcode(encoding)
+    } else {
+        match normalize(&instruction, encoding) {
+            Some(decoded) => Outcome::Normalized(decoded),
+            None => Outcome::Unsupported {
+                encoding,
+                code: instruction.code() as u32,
+            },
+        }
+    })
 }
 
 /// Pure admission for one token-bound prefix already fetched by the core.
@@ -250,6 +267,8 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
     match inspect(encoding) {
         None => DecodeDecision::More,
         Some(Outcome::Rejected(_)) => DecodeDecision::Rejected,
+        Some(Outcome::InvalidOpcode(_)) => DecodeDecision::InvalidOpcode,
+        Some(Outcome::Overlong(_)) => DecodeDecision::Overlong,
         Some(Outcome::Unsupported { .. }) => DecodeDecision::Unsupported,
         Some(Outcome::Normalized(decoded)) => {
             if decoded.prefixes.lock

@@ -23,6 +23,8 @@ pub enum DecodeDecision {
     Legacy,
     Unsupported,
     Rejected,
+    InvalidOpcode,
+    Overlong,
 }
 
 impl SharedEventMachine {
@@ -115,7 +117,7 @@ impl SharedEventMachine {
         match decision {
             DecodeDecision::More => {
                 if input.length == 15 {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DecodeLimit));
+                    return self.start_entry(Event::GeneralProtection);
                 }
                 if input.rip > u64::MAX - input.length as u64 {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap));
@@ -127,6 +129,8 @@ impl SharedEventMachine {
             },
             DecodeDecision::Rejected =>
                 self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DecodeRejected)),
+            DecodeDecision::InvalidOpcode => self.start_entry(Event::InvalidOpcode),
+            DecodeDecision::Overlong => self.start_entry(Event::GeneralProtection),
             DecodeDecision::Unsupported =>
                 self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
             DecodeDecision::Scalar { dst, source } => {

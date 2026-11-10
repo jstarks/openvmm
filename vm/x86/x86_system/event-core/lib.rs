@@ -20,7 +20,7 @@ pub struct Tables {
     pub idt_base: u64, pub idt_limit: u16, pub gdt_base: u64, pub gdt_limit: u16,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Event { PageFault(u8), GeneralProtection, External(u8) }
+pub enum Event { PageFault(u8), GeneralProtection, InvalidOpcode, External(u8) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Injection { Queued, Busy, InvalidVector, Stopped(EventDiagnostic) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +82,9 @@ impl EventMachine {
 fn flags_supported(flags: u64) -> (v: bool)
     ensures v == event_model::flags_supported(flags),
 { flags & !0x0021_0ed7u64 == 0 && flags & 2 != 0 }
+fn has_error_code(event: Event) -> (v: bool)
+    ensures v == event_model::has_error_code(event),
+{ matches!(event, Event::PageFault(_) | Event::GeneralProtection) }
 fn tables_supported(t: Tables) -> (v: bool)
     ensures v == event_model::tables_supported(t),
 {
@@ -184,6 +187,7 @@ impl EventMachine {
         if self.handler_pending {
             let (vector, code) = match event {
                 Event::PageFault(code) => (14, code), Event::GeneralProtection => (13, 0),
+                Event::InvalidOpcode => (6, 0),
                 Event::External(v) => (v, 0),
             };
             return EventReport { outcome: self.stop(EventDiagnostic::HandlerFault { vector, code }), table_reads: 0 };
@@ -194,13 +198,14 @@ impl EventMachine {
         if external && match event { Event::External(v) => v < 32, _ => false } {
             return EventReport { outcome: self.stop(EventDiagnostic::InterruptWindow), table_reads: 0 };
         }
-        let count = if external { 5u64 } else { 6u64 };
+        let count = if has_error_code(event) { 6u64 } else { 5u64 };
         if !flags_supported(self.core.cpu.flags) || !tables_supported(self.tables)
             || !canonical(self.core.cpu.rip) || !canonical(old_rsp) || stack < 8 * count {
             return EventReport { outcome: self.stop(EventDiagnostic::Profile), table_reads: 0 };
         }
         let (vector, error): (u8, u64) = match event {
             Event::PageFault(code) => (14, code as u64), Event::GeneralProtection => (13, 0),
+            Event::InvalidOpcode => (6, 0),
             Event::External(v) => (v, 0),
         };
         let offset = vector as u64 * 16;
@@ -240,7 +245,12 @@ impl EventMachine {
         if external {
             assert(words@ =~= seq![0u64, 16u64, old_rsp, self.core.cpu.flags, 8u64, self.core.cpu.rip]);
         }
-        let start = if external { 1u8 } else { 0u8 };
+        let words = if matches!(event, Event::InvalidOpcode) {
+            let v = [0u64, 16u64, old_rsp, self.core.cpu.flags | 0x10000u64, 8u64, self.core.cpu.rip];
+            assert(v@ =~= seq![0u64, 16u64, old_rsp, self.core.cpu.flags | 0x10000u64, 8u64, self.core.cpu.rip]);
+            v
+        } else { words };
+        let start = if has_error_code(event) { 0u8 } else { 1u8 };
         let pushed = push_words(&mut self.core.mmu, ram, base, stack, start, words);
         let reads = reads + pushed.1;
         if let Some(reason) = pushed.0 {

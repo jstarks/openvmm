@@ -87,7 +87,8 @@ pub open spec fn entry(s: State, event: Event) -> (State, Tick) {
         stop(s, EventDiagnostic::HandlerFault { vector: e::vector(event), code: e::error(event) as u8 })
     } else if event is External && e::vector(event) < 32 {
         stop(s, EventDiagnostic::InterruptWindow)
-    } else if !entry_profile(s.core.cpu, s.tables, event) {
+    } else if !entry_profile(s.core.cpu, s.tables, event)
+        || match s.system { Some(system) => system.ss.selector != 16, None => false } {
         stop(s, EventDiagnostic::Profile)
     } else {
         let offset = e::vector(event) as int * 16;
@@ -101,7 +102,8 @@ pub open spec fn entry(s: State, event: Event) -> (State, Tick) {
 }
 pub open spec fn iret(s: State) -> (State, Tick) {
     if !e::flags_supported(s.core.cpu.flags) || !e::tables_supported(s.tables)
-        || s.core.cpu.gpr[4] > u64::MAX - 40 {
+        || s.core.cpu.gpr[4] > u64::MAX - 40
+        || match s.system { Some(system) => system.ss.selector != 16, None => false } {
         stop(s, EventDiagnostic::Profile)
     } else {
         (word(s, s.core.cpu.gpr[4] as u64, WordAccess::Read,

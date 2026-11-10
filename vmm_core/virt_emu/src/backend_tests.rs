@@ -228,6 +228,40 @@ async fn descriptor_entry_updates_real_vp_state_and_preserves_store_neighbors(
 }
 
 #[async_test]
+async fn loaded_nonlegacy_ss_rejects_iret_without_fabricating_segment_state(driver: DefaultDriver) {
+    let (mut bytes, mut owned) = fixture();
+    let program = [0xb8, 0x18, 0, 0, 0, 0x8e, 0xd0, 0x48, 0xcf];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    bytes[0x9018..0x9020].copy_from_slice(&0x00cf93000000ffffu64.to_le_bytes());
+    owned.tables.gdt_limit = 31;
+    let (_, mut binder, _memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let mut expected = initial;
+    expected.rax = 0x18;
+    expected.ss.selector = 0x18;
+    expected.rip = CODE + 7;
+    expected.rflags &= !0x10000;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    let progress = vp.completed_batch_progress();
+    assert_eq!((progress.retired, progress.delivered), (2, 0));
+    assert_eq!(devices.faults.lock().len(), 1);
+    assert!(devices.faults.lock()[0].contains("Profile"));
+}
+
+#[async_test]
 async fn entry_forms_retire_through_real_vp_and_preserve_the_call_push(driver: DefaultDriver) {
     let (mut bytes, owned) = fixture();
     bytes[CODE as usize..CODE as usize + 11]

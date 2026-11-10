@@ -222,7 +222,8 @@ impl SharedEventMachine {
         let count = if has_error_code(event) { 6u64 } else { 5u64 };
         let stack = cpu.gpr[4] / 16 * 16;
         if !flags_supported(cpu.flags) || !tables_supported(self.tables)
-            || !canonical(cpu.rip) || !canonical(cpu.gpr[4]) || stack < count * 8 {
+            || !canonical(cpu.rip) || !canonical(cpu.gpr[4]) || stack < count * 8
+            || match self.system { Some(system) => system.ss.selector != 16, None => false } {
             return self.stop(EventDiagnostic::Profile);
         }
         let vector: u8 = match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13,
@@ -243,7 +244,8 @@ impl SharedEventMachine {
         ensures final(self).invariant(), (final(self)@, tick) == spec::iret(old(self)@),
     {
         let cpu = self.core.cpu();
-        if !flags_supported(cpu.flags) || !tables_supported(self.tables) || cpu.gpr[4] > u64::MAX - 40 {
+        if !flags_supported(cpu.flags) || !tables_supported(self.tables) || cpu.gpr[4] > u64::MAX - 40
+            || match self.system { Some(system) => system.ss.selector != 16, None => false } {
             return self.stop(EventDiagnostic::Profile);
         }
         self.begin_word(cpu.gpr[4], WordAccess::Read, Phase::Pop { index: 0,

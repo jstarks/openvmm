@@ -211,6 +211,240 @@ async fn vsmb_linux_file_operations(
     Ok(())
 }
 
+#[cfg(windows)]
+#[openvmm_test(uefi_aarch64(vhd(windows_11_enterprise_aarch64)))]
+async fn vsmb_windows_native_file_operations(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _extra_deps: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    windows_file_operations(config, driver, vsmb_resources::VsmbWindowsLockMode::Native).await
+}
+
+#[cfg(windows)]
+#[openvmm_test(uefi_aarch64(vhd(windows_11_enterprise_aarch64)))]
+async fn vsmb_windows_synthetic_file_operations(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _extra_deps: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    windows_file_operations(
+        config,
+        driver,
+        vsmb_resources::VsmbWindowsLockMode::Synthetic,
+    )
+    .await
+}
+
+#[cfg(windows)]
+async fn windows_file_operations(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    driver: DefaultDriver,
+    lock_mode: vsmb_resources::VsmbWindowsLockMode,
+) -> anyhow::Result<()> {
+    let host_changes = matches!(&lock_mode, vsmb_resources::VsmbWindowsLockMode::Native);
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("locked.bin"), [0; 4096])?;
+    std::fs::hard_link(
+        root.path().join("locked.bin"),
+        root.path().join("locked.bin.alias"),
+    )?;
+    std::fs::write(root.path().join("host-update.bin"), [0x11; 4096])?;
+    let root_path = root
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 test root"))?
+        .to_owned();
+    let (mut vm, agent) = config
+        .modify_backend(|b| {
+            b.without_save_restore().with_custom_config(|c| {
+                c.vmbus_devices.push((
+                    DeviceVtl::Vtl0,
+                    vsmb_resources::VsmbWindowsDeviceHandle {
+                        share_name: "windows".into(),
+                        root_path,
+                        lock_mode,
+                    }
+                    .into_resource(),
+                ));
+            })
+        })
+        .run()
+        .await?;
+    let common = include_str!("../../../test_data/vsmb_file_operations.ps1");
+    let (bootstrap, _) = common
+        .split_once("\n[VsmbGuest]::Activate()")
+        .ok_or_else(|| anyhow::anyhow!("guest bootstrap boundary missing"))?;
+    let script = format!(
+        "{bootstrap}\n$VsmbHostChanges = ${host_changes}\n{}",
+        include_str!("../../../test_data/vsmb_windows_file_operations.ps1")
+    );
+    for signal in [
+        "vsmb-lock-ready",
+        "vsmb-native-ready",
+        "vsmb-native-watch-ready",
+    ] {
+        agent
+            .write_file(format!("C:\\{signal}"), b"waiting".as_slice())
+            .await?;
+    }
+    let shell = agent.windows_shell();
+    let command =
+        cmd!(shell, "powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let checkpoint = async {
+        let requests = "vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/channel/connection/requests";
+        let backend = "vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/server/backend";
+        let mut timer = PolledTimer::new(&driver);
+        let mut registered = false;
+        for _ in 0..400 {
+            if vm
+                .inspect_vmm(&format!("{backend}/notify_waiters"))
+                .await?
+                .to_string()
+                .parse::<usize>()?
+                > 0
+            {
+                registered = true;
+                break;
+            }
+            timer.sleep(std::time::Duration::from_millis(25)).await;
+        }
+        anyhow::ensure!(registered, "Windows-backed notification was not registered");
+        vm.backend().pause().await?;
+        anyhow::ensure!(
+            vm.inspect_vmm(requests)
+                .await?
+                .to_string()
+                .contains("CHANGE_NOTIFY"),
+            "pause lost the Windows-backed notification"
+        );
+        vm.backend().resume().await?;
+        agent
+            .write_file("C:\\vsmb-resume", b"go".as_slice())
+            .await?;
+        let mut ready = false;
+        for _ in 0..400 {
+            if agent.read_file("C:\\vsmb-lock-ready").await? == b"ready" {
+                ready = true;
+                break;
+            }
+            timer.sleep(std::time::Duration::from_millis(25)).await;
+        }
+        anyhow::ensure!(ready, "Windows-backed lock checkpoint was not reached");
+        let inspect::Node::Dir(entries) = vm.inspect_vmm(requests).await? else {
+            anyhow::bail!("request table is not inspectable");
+        };
+        let waiting = entries
+            .iter()
+            .find(|entry| match &entry.node {
+                inspect::Node::Dir(fields) => fields
+                    .iter()
+                    .any(|field| field.name == "command" && field.node.to_string() == "\"LOCK\""),
+                _ => false,
+            })
+            .ok_or_else(|| anyhow::anyhow!("no actual Windows-backed pending LOCK"))?;
+        let waiting_path = format!("{requests}/{}", waiting.name);
+        let waiting = waiting.node.to_string();
+        vm.backend().pause().await?;
+        anyhow::ensure!(
+            vm.inspect_vmm(&waiting_path).await?.to_string() == waiting,
+            "pause changed the Windows-backed LOCK"
+        );
+        vm.backend().resume().await?;
+        anyhow::ensure!(
+            vm.inspect_vmm(&waiting_path).await?.to_string() == waiting,
+            "resume changed the Windows-backed LOCK"
+        );
+        agent
+            .write_file("C:\\vsmb-lock-go", b"go".as_slice())
+            .await?;
+        let mut ready = false;
+        for _ in 0..400 {
+            if agent.read_file("C:\\vsmb-native-ready").await? == b"ready" {
+                ready = true;
+                break;
+            }
+            timer.sleep(std::time::Duration::from_millis(25)).await;
+        }
+        anyhow::ensure!(ready, "Windows backing checkpoint was not reached");
+        let actual = std::fs::read(root.path().join("guest-test").join("renamed.bin"))?;
+        anyhow::ensure!(
+            actual.len() == 131077
+                && actual
+                    .iter()
+                    .enumerate()
+                    .all(|(i, byte)| *byte == (i % 251) as u8),
+            "guest data did not reach NTFS"
+        );
+        if host_changes {
+            std::fs::write(root.path().join("host-update.bin"), [0x5a; 4096])?;
+        }
+        agent
+            .write_file("C:\\vsmb-native-go", b"go".as_slice())
+            .await?;
+        if host_changes {
+            let mut ready = false;
+            for _ in 0..400 {
+                if agent.read_file("C:\\vsmb-native-watch-ready").await? == b"ready" {
+                    ready = true;
+                    break;
+                }
+                timer.sleep(std::time::Duration::from_millis(25)).await;
+            }
+            anyhow::ensure!(
+                ready,
+                "guest did not register the Windows host-change watch"
+            );
+            std::fs::write(
+                root.path().join("guest-test").join("from-host.bin"),
+                b"host",
+            )?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    futures::try_join!(command.run(), checkpoint)?;
+    for operation in ["reads", "writes"] {
+        let path = format!("vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/external_data/{operation}");
+        anyhow::ensure!(
+            vm.inspect_vmm(&path).await?.to_string().parse::<u64>()? > 0,
+            "no Windows-backed external {operation}"
+        );
+    }
+    anyhow::ensure!(
+        std::fs::read(root.path().join("retained.txt"))? == b"retained",
+        "missing retained NTFS data"
+    );
+    anyhow::ensure!(
+        !root.path().join("guest-test").exists(),
+        "guest directory deletion did not reach NTFS"
+    );
+    agent.reboot().await?;
+    let agent = vm.wait_for_reset().await?;
+    for resource in [
+        "opens",
+        "watch_count",
+        "notify_waiters",
+        "lock_count",
+        "lock_waiters",
+        "active_io",
+    ] {
+        let path = format!("vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/server/backend/{resource}");
+        let value = vm.inspect_vmm(&path).await?.to_string();
+        anyhow::ensure!(value == "0", "Windows reboot retained {resource}: {value}");
+    }
+    let probe = format!(
+        "{bootstrap}\n[VsmbGuest]::Activate('windows')\nif ([System.IO.File]::ReadAllText('V:\\retained.txt') -ne 'retained') {{ throw 'Wrong retained Windows data' }}"
+    );
+    let shell = agent.windows_shell();
+    cmd!(shell, "powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &probe])
+        .run()
+        .await?;
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
 #[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2025_x64)))]
 async fn vsmb_memory_file_operations(
     config: PetriVmBuilder<OpenVmmPetriBackend>,

@@ -68,6 +68,17 @@ pub(crate) fn parse_options() -> Options {
 
 const DEFAULT_MEMORY_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Byte-range enforcement for a Windows vSMB export.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum VsmbWindowsLockMode {
+    /// coordinate locks with independent host opens
+    #[default]
+    Native,
+    /// software locks; the host promises no mutation outside the SMB server
+    Synthetic,
+}
+
 /// Guest memory configuration parsed from `--memory` (and, flattened, from
 /// `--numa`).
 ///
@@ -1195,6 +1206,16 @@ flags:
     #[cfg(target_os = "linux")]
     #[clap(long, value_name = "ROOT", conflicts_with_all = ["no_vmbus", "vsmb_memory"])]
     pub vsmb_linux: Option<PathBuf>,
+
+    /// expose a Windows NTFS directory as the writable vSMB share "windows"
+    #[cfg(windows)]
+    #[clap(long, value_name = "ROOT", conflicts_with_all = ["no_vmbus", "vsmb_memory"])]
+    pub vsmb_windows: Option<PathBuf>,
+
+    /// Windows byte-range enforcement (default: native); synthetic requires no host mutation
+    #[cfg(windows)]
+    #[clap(long, value_enum, value_name = "MODE", requires = "vsmb_windows")]
+    pub vsmb_windows_locks: Option<VsmbWindowsLockMode>,
 
     /// expose a battery device
     #[clap(long)]
@@ -5706,6 +5727,54 @@ mod tests {
         ] {
             assert!(Options::try_parse_from(args).is_err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vsmb_requires_a_root_and_excludes_other_share_modes() {
+        let opt =
+            Options::try_parse_from(["openvmm", "--uefi", "--vsmb-windows", r"C:\export"]).unwrap();
+        assert_eq!(opt.vsmb_windows.as_deref(), Some(Path::new(r"C:\export")));
+        assert_eq!(opt.vsmb_windows_locks, None);
+        for args in [
+            vec!["openvmm", "--uefi", "--vsmb-windows"],
+            vec![
+                "openvmm",
+                "--uefi",
+                "--vsmb-windows",
+                r"C:\export",
+                "--no-vmbus",
+            ],
+            vec![
+                "openvmm",
+                "--uefi",
+                "--vsmb-windows",
+                r"C:\export",
+                "--vsmb-memory",
+                "memory",
+            ],
+            vec!["openvmm", "--uefi", "--vsmb-windows-locks", "synthetic"],
+            vec![
+                "openvmm",
+                "--uefi",
+                "--vsmb-windows",
+                r"C:\export",
+                "--vsmb-windows-locks",
+                "automatic",
+            ],
+        ] {
+            assert!(Options::try_parse_from(args).is_err());
+        }
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--uefi",
+            "--vsmb-windows",
+            r"C:\export",
+            "--vsmb-windows-locks",
+            "synthetic",
+        ])
+        .unwrap();
+        assert_eq!(opt.vsmb_windows_locks, Some(VsmbWindowsLockMode::Synthetic));
     }
 
     #[test]

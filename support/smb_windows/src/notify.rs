@@ -62,6 +62,10 @@ impl Drop for Waiter<'_> {
 }
 
 impl Watch {
+    pub fn waiter_count(&self) -> usize {
+        self.state.lock().waiters.len()
+    }
+
     pub fn new(
         file: Arc<OverlappedFile>,
         filter: NotifyFilter,

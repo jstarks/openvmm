@@ -98,6 +98,7 @@ pub struct WindowsFile {
     file: Mutex<Option<Open>>,
     append_only: bool,
     hidden_access: u32,
+    io_alignment: usize,
     watch: Arc<futures::lock::Mutex<Option<Arc<Watch>>>>,
 }
 
@@ -196,6 +197,14 @@ impl WindowsFile {
 
 impl Inspect for WindowsFs {
     fn inspect(&self, req: inspect::Request<'_>) {
+        let watches = self
+            .0
+            .watches
+            .lock()
+            .values()
+            .flatten()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
         let (mode, locks, waiters) = match self.0.lock_mode {
             LockMode::Native => (
                 "native",
@@ -212,8 +221,17 @@ impl Inspect for WindowsFs {
             .field("opens", self.0.opens.load(Ordering::Relaxed))
             .field("open_limit", OPEN_LIMIT)
             .field("lock_mode", mode)
-            .field("range_locks", locks)
+            .field("lock_count", locks)
             .field("lock_waiters", waiters)
+            .field("watch_count", watches.len())
+            .field(
+                "notify_waiters",
+                watches
+                    .iter()
+                    .map(|watch| watch.waiter_count())
+                    .sum::<usize>(),
+            )
+            .field("active_io", self.0.locks.active_count())
             .field(
                 "workers_submitted",
                 self.0.io.submitted.load(Ordering::Relaxed),
@@ -301,11 +319,21 @@ fn create(options: &OpenOptions<'_>) -> Result<Create, Status> {
         | nt::FILE_SEQUENTIAL_ONLY
         | nt::FILE_RANDOM_ACCESS
         | nt::FILE_DELETE_ON_CLOSE
-        | nt::FILE_NO_EA_KNOWLEDGE;
+        | nt::FILE_NO_EA_KNOWLEDGE
+        | nt::FILE_OPEN_FOR_BACKUP_INTENT
+        | nt::FILE_OPEN_NO_RECALL
+        | nt::FILE_NO_INTERMEDIATE_BUFFERING
+        | nt::FILE_OPEN_REPARSE_POINT;
     if options.options & !supported != 0
         || options.access().access_system_security()
         || options.disposition > nt::FILE_OVERWRITE_IF
     {
+        tracelimit::warn_ratelimited!(
+            options = options.options,
+            access = options.access,
+            disposition = options.disposition,
+            "unsupported Windows SMB create flags"
+        );
         return Err(Status::NOT_SUPPORTED);
     }
     Ok(Create {
@@ -321,7 +349,9 @@ fn create(options: &OpenOptions<'_>) -> Result<Create, Status> {
         },
         sharing: options.share_access,
         disposition: options.disposition,
-        options: options.options,
+        // Ordinary Windows creates also set this flag. Reparse objects remain
+        // unsupported: let OBJ_DONT_REPARSE reject them, not open the link itself.
+        options: options.options & !nt::FILE_OPEN_REPARSE_POINT,
         attributes: options.attributes,
     })
 }
@@ -443,6 +473,7 @@ impl FileSystem for WindowsFs {
             && !logical_access.maximum_allowed();
         let unsupported_creation =
             options.security.is_some() || options.extended_attributes.is_some();
+        let unbuffered = options.options & nt::FILE_NO_INTERMEDIATE_BUFFERING != 0;
         if unsupported_creation {
             create.disposition = match options.disposition() {
                 CreateDisposition::OPEN | CreateDisposition::OPEN_IF => nt::FILE_OPEN,
@@ -484,10 +515,15 @@ impl FileSystem for WindowsFs {
                 } else {
                     None
                 };
-                Ok(((file, action, directory, owner), reservation))
+                let io_alignment = if unbuffered {
+                    native::io_alignment(&file)?
+                } else {
+                    1
+                };
+                Ok(((file, action, directory, owner, io_alignment), reservation))
             })
             .await;
-        let ((file, action, directory, owner), reservation) = match result {
+        let ((file, action, directory, owner, io_alignment), reservation) = match result {
             Err(Status::OBJECT_NAME_NOT_FOUND) if unsupported_creation => {
                 return Err(Status::NOT_SUPPORTED);
             }
@@ -525,6 +561,7 @@ impl FileSystem for WindowsFs {
                     } else {
                         0
                     },
+                io_alignment,
                 watch: Arc::new(futures::lock::Mutex::new(None)),
             },
             action,
@@ -633,6 +670,7 @@ impl FileSystem for WindowsFs {
     ) -> Result<Vec<u8>, Status> {
         check(request)?;
         let offset = i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?;
+        let buffer = crate::io::Buffer::new(length.min(IO_LIMIT), file.io_alignment)?;
         let file = file.get()?;
         file.overlapped()?;
         let software = file
@@ -650,11 +688,11 @@ impl FileSystem for WindowsFs {
         let mut io = native::read_admitted(
             file.overlapped()?,
             offset,
-            vec![0; length.min(IO_LIMIT)],
+            buffer,
             (file.clone(), admission, software),
         );
         let mut cancelled = std::pin::pin!(request.cancelled().fuse());
-        let ((result, count), (mut data, _admission)) = futures::select_biased! {
+        let ((result, count), (data, _admission)) = futures::select_biased! {
             result = (&mut io).fuse() => result,
             () = cancelled => {
                 io.cancel();
@@ -662,11 +700,10 @@ impl FileSystem for WindowsFs {
             },
         };
         native::status(result)?;
-        if count > data.len() {
+        if count > data.as_ref().len() {
             return Err(Status::INTERNAL_ERROR);
         }
-        data.truncate(count);
-        Ok(data)
+        Ok(data.into_vec(count))
     }
 
     async fn write(
@@ -684,6 +721,10 @@ impl FileSystem for WindowsFs {
         } else {
             i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?
         };
+        let mut buffer = crate::io::Buffer::new(data.len().min(IO_LIMIT), file.io_alignment)?;
+        buffer
+            .as_mut()
+            .copy_from_slice(&data[..data.len().min(IO_LIMIT)]);
         let file = file.get()?;
         file.overlapped()?;
         let length = data.len().min(IO_LIMIT) as u64;
@@ -738,8 +779,7 @@ impl FileSystem for WindowsFs {
         let admission = (file.clone(), file.data()?.active()?, software);
         drop(guard);
         check(request)?;
-        let data = data[..data.len().min(IO_LIMIT)].to_vec();
-        let mut io = native::write_admitted(file.overlapped()?, offset, data, admission);
+        let mut io = native::write_admitted(file.overlapped()?, offset, buffer, admission);
         let mut cancelled = std::pin::pin!(request.cancelled().fuse());
         let ((result, count), (data, _admission)) = futures::select_biased! {
             result = (&mut io).fuse() => result,
@@ -749,7 +789,7 @@ impl FileSystem for WindowsFs {
             },
         };
         native::status(result)?;
-        if count > data.len() {
+        if count > data.as_ref().len() {
             return Err(Status::INTERNAL_ERROR);
         }
         Ok(count)

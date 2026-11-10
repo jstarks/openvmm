@@ -1888,6 +1888,33 @@ async fn vm_config_from_command_line(
         ));
     }
 
+    #[cfg(windows)]
+    if let Some(root) = &opt.vsmb_windows {
+        if !with_hv {
+            anyhow::bail!("--vsmb-windows requires Hyper-V enlightenments and VMBus");
+        }
+        let root = std::path::absolute(root).context("resolve vSMB export path")?;
+        let root_path = root
+            .to_str()
+            .context("vSMB export path must be UTF-8")?
+            .to_owned();
+        let lock_mode = match opt.vsmb_windows_locks.unwrap_or_default() {
+            cli_args::VsmbWindowsLockMode::Native => vsmb_resources::VsmbWindowsLockMode::Native,
+            cli_args::VsmbWindowsLockMode::Synthetic => {
+                vsmb_resources::VsmbWindowsLockMode::Synthetic
+            }
+        };
+        vmbus_devices.push((
+            DeviceVtl::Vtl0,
+            vsmb_resources::VsmbWindowsDeviceHandle {
+                share_name: "windows".into(),
+                root_path,
+                lock_mode,
+            }
+            .into_resource(),
+        ));
+    }
+
     let mut virtio_devices = Vec::new();
     let mut add_virtio_device =
         |bus, resource: Resource<VirtioDeviceHandle>, pcie_devices: &mut Vec<_>| match bus {

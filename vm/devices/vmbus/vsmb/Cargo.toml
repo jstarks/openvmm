@@ -26,6 +26,11 @@ zerocopy.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 smb_linux.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+smb_windows.workspace = true
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 thiserror.workspace = true
 
 [dev-dependencies]

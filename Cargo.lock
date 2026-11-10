@@ -11974,6 +11974,7 @@ dependencies = [
  "pal_async",
  "smb",
  "smb_linux",
+ "smb_windows",
  "task_control",
  "test_with_tracing",
  "thiserror 2.0.16",

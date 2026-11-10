@@ -80,3 +80,58 @@ impl vm_resource::AsyncResolveResource<VmbusDeviceHandleKind, vsmb_resources::Vs
         Ok(SimpleDeviceWrapper::new(driver, device).into())
     }
 }
+
+/// Resolves directory-backed shares on Windows hosts.
+#[cfg(windows)]
+pub struct VsmbWindowsResolver;
+
+#[cfg(windows)]
+vm_resource::declare_static_async_resolver! {
+    VsmbWindowsResolver,
+    (VmbusDeviceHandleKind, vsmb_resources::VsmbWindowsDeviceHandle),
+}
+
+/// A Windows directory-backed share could not be configured.
+#[cfg(windows)]
+#[derive(Debug, thiserror::Error)]
+pub enum WindowsResolveError {
+    /// Native root capture failed.
+    #[error("failed to initialize Windows vSMB filesystem")]
+    FileSystem(#[from] smb_windows::OpenRootError),
+    /// The share configuration is invalid.
+    #[error("invalid Windows vSMB share: {0:?}")]
+    Share(#[from] smb::spec::Status),
+}
+
+#[cfg(windows)]
+#[async_trait::async_trait]
+impl
+    vm_resource::AsyncResolveResource<
+        VmbusDeviceHandleKind,
+        vsmb_resources::VsmbWindowsDeviceHandle,
+    > for VsmbWindowsResolver
+{
+    type Output = ResolvedVmbusDevice;
+    type Error = WindowsResolveError;
+
+    async fn resolve(
+        &self,
+        _resolver: &vm_resource::ResourceResolver,
+        resource: vsmb_resources::VsmbWindowsDeviceHandle,
+        input: ResolveVmbusDeviceHandleParams<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        let driver = input.driver_source.simple();
+        let mode = match resource.lock_mode {
+            vsmb_resources::VsmbWindowsLockMode::Native => smb_windows::LockMode::Native,
+            vsmb_resources::VsmbWindowsLockMode::Synthetic => smb_windows::LockMode::Synthetic,
+        };
+        let filesystem = smb_windows::WindowsFs::new_with_lock_mode(
+            std::path::Path::new(&resource.root_path),
+            std::sync::Arc::new(driver.clone()),
+            mode,
+        )
+        .await?;
+        let device = VsmbDevice::with_filesystem(resource.share_name, driver.clone(), filesystem)?;
+        Ok(SimpleDeviceWrapper::new(driver, device).into())
+    }
+}

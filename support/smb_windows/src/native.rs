@@ -319,6 +319,13 @@ pub(crate) fn metadata(file: &File, path: String) -> Result<Metadata, Status> {
     })
 }
 
+pub(crate) fn io_alignment(file: &File) -> Result<usize, Status> {
+    let info: nt::FILE_ALIGNMENT_INFORMATION = query(file)?;
+    (info.AlignmentRequirement as usize)
+        .checked_add(1)
+        .ok_or(Status::NOT_SUPPORTED)
+}
+
 information! {
     nt::FILE_STANDARD_INFORMATION => nt::FileStandardInformation,
 }
@@ -735,20 +742,20 @@ pub(crate) fn read_with_key(
     read_buffer(file, offset, data, |data| data, key)
 }
 
-pub(crate) fn read_admitted<G: Send + 'static>(
+pub(crate) fn read_admitted<B: AsMut<[u8]> + Send + 'static, G: Send + 'static>(
     file: &OverlappedFile,
     offset: i64,
-    data: Vec<u8>,
+    data: B,
     guard: G,
-) -> CustomNt<(Vec<u8>, G)> {
-    read_buffer(file, offset, (data, guard), |data| &mut data.0, 0)
+) -> CustomNt<(B, G)> {
+    read_buffer(file, offset, (data, guard), |data| data.0.as_mut(), 0)
 }
 
 fn read_buffer<T: Send + 'static>(
     file: &OverlappedFile,
     offset: i64,
     data: T,
-    buffer: impl FnOnce(&mut T) -> &mut Vec<u8>,
+    buffer: impl FnOnce(&mut T) -> &mut [u8],
     key: u32,
 ) -> CustomNt<T> {
     // SAFETY: The kernel references only PAL-owned status and data allocations.
@@ -786,20 +793,20 @@ pub(crate) fn write_with_key(
     write_buffer(file, offset, data, |data| data, key)
 }
 
-pub(crate) fn write_admitted<G: Send + 'static>(
+pub(crate) fn write_admitted<B: AsMut<[u8]> + Send + 'static, G: Send + 'static>(
     file: &OverlappedFile,
     offset: i64,
-    data: Vec<u8>,
+    data: B,
     guard: G,
-) -> CustomNt<(Vec<u8>, G)> {
-    write_buffer(file, offset, (data, guard), |data| &mut data.0, 0)
+) -> CustomNt<(B, G)> {
+    write_buffer(file, offset, (data, guard), |data| data.0.as_mut(), 0)
 }
 
 fn write_buffer<T: Send + 'static>(
     file: &OverlappedFile,
     offset: i64,
     data: T,
-    buffer: impl FnOnce(&mut T) -> &mut Vec<u8>,
+    buffer: impl FnOnce(&mut T) -> &mut [u8],
     key: u32,
 ) -> CustomNt<T> {
     // SAFETY: The kernel references only PAL-owned status and data allocations.

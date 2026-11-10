@@ -131,6 +131,8 @@ vm_resource::register_static_resolvers! {
     vsmb::resolver::VsmbResolver,
     #[cfg(target_os = "linux")]
     vsmb::resolver::VsmbLinuxResolver,
+    #[cfg(windows)]
+    vsmb::resolver::VsmbWindowsResolver,
     vmbus_serial_host::resolver::VmbusSerialDeviceResolver,
 }
 

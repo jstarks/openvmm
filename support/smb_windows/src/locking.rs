@@ -29,10 +29,11 @@ struct Active {
     changed: Event,
 }
 
-pub(crate) struct ActiveIo(Arc<Active>);
+pub(crate) struct ActiveIo(Arc<Active>, Arc<Coordination>);
 
 impl Drop for ActiveIo {
     fn drop(&mut self) {
+        self.1.active.fetch_sub(1, Ordering::Relaxed);
         self.0.count.fetch_sub(1, Ordering::Release);
         self.0.changed.notify(usize::MAX);
     }
@@ -44,6 +45,7 @@ pub(crate) struct Coordination {
     next: AtomicU64,
     locks: AtomicUsize,
     waiters: SyncMutex<HashMap<u64, usize>>,
+    active: AtomicUsize,
 }
 
 impl Coordination {
@@ -53,6 +55,10 @@ impl Coordination {
 
     pub fn waiter_count(&self) -> usize {
         self.waiters.lock().values().sum()
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
     }
 
     pub fn changed(&self) {
@@ -172,7 +178,8 @@ impl DataFile {
                 (count < ACTIVE_LIMIT).then_some(count + 1)
             })
             .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
-        Ok(ActiveIo(self.active.clone()))
+        self.coordination.active.fetch_add(1, Ordering::Relaxed);
+        Ok(ActiveIo(self.active.clone(), self.coordination.clone()))
     }
 
     pub async fn drain(&self, request: &RequestContext) -> Result<(), Status> {

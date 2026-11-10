@@ -9,7 +9,7 @@
 //! and data I/O. It grants no SMB caching. Reparse
 //! traversal, case-sensitive directories, security mutation, streams and EAs
 //! are explicitly unsupported.
-//! It is not yet wired to the vSMB device.
+//! The vSMB Windows resource resolver exposes this provider to OpenVMM.
 //!
 //! Native range locks are the default. Explicit synthetic locking requires the
 //! host to promise no mutation outside this provider; it does not enable caching.

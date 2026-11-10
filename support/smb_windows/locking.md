@@ -1,7 +1,9 @@
 # Windows Host-Backed Lock Design
 
-Status: implemented library adapter; Windows device/CLI wiring and VM validation
-remain pending. The legacy acquisition-token API is unsupported by this provider;
+Status: implemented library adapter and Windows device/CLI wiring; both modes
+pass Windows 11 Enterprise ARM64 guest lifecycle validation on an ARM64 Windows
+host. This is not Server 2025 guest coverage. The native mode's legacy
+acquisition-token API is unsupported;
 use `FileSystem::lock_request` and explicit `LockScope::settle`.
 Native assumptions below were checked on ARM64 Windows `ge_release`,
 build 26300.9818, on 2026-11-09.

@@ -31,3 +31,27 @@ pub struct VsmbLinuxDeviceHandle {
 impl ResourceId<VmbusDeviceHandleKind> for VsmbLinuxDeviceHandle {
     const ID: &'static str = "vsmb-linux";
 }
+
+/// Windows host coordination policy; neither choice enables guest caching.
+#[derive(MeshPayload)]
+pub enum VsmbWindowsLockMode {
+    /// Coordinate byte-range locks with independent native host opens.
+    Native,
+    /// The host promises not to mutate files outside the SMB server.
+    Synthetic,
+}
+
+/// A writable ordinary-NTFS directory share on a Windows host.
+#[derive(MeshPayload)]
+pub struct VsmbWindowsDeviceHandle {
+    /// SMB share name.
+    pub share_name: String,
+    /// Host directory captured when the device is resolved.
+    pub root_path: String,
+    /// Explicit coordination policy for every open of this provider instance.
+    pub lock_mode: VsmbWindowsLockMode,
+}
+
+impl ResourceId<VmbusDeviceHandleKind> for VsmbWindowsDeviceHandle {
+    const ID: &'static str = "vsmb-windows";
+}

@@ -1732,13 +1732,109 @@ async fn native_sharing_across_host_opens_and_hard_link_aliases(driver: DefaultD
 }
 
 #[async_test]
+async fn windows_directory_api_options_accept_ordinary_files_and_directories(
+    driver: DefaultDriver,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    for (name, flags) in [
+        (
+            "directory",
+            nt::FILE_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+        ),
+        ("data", nt::FILE_OPEN_REPARSE_POINT),
+        (
+            "backup-directory",
+            nt::FILE_DIRECTORY_FILE | nt::FILE_OPEN_FOR_BACKUP_INTENT,
+        ),
+        (
+            "backup-data",
+            nt::FILE_OPEN_FOR_BACKUP_INTENT | nt::FILE_OPEN_REPARSE_POINT,
+        ),
+        (
+            "unrecalled-data",
+            nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_NO_RECALL,
+        ),
+    ] {
+        let (file, action) = fs
+            .open(
+                name,
+                OpenOptions {
+                    options: flags,
+                    ..options(CreateDisposition::CREATE)
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(action, CreateAction::CREATED.0);
+        assert_eq!(
+            fs.metadata(&file, &request).await.unwrap().is_directory(),
+            flags & nt::FILE_DIRECTORY_FILE != 0
+        );
+        if flags & nt::FILE_DIRECTORY_FILE == 0 {
+            fs.write(&file, 0, b"ordinary", &request).await.unwrap();
+            assert_eq!(fs.read(&file, 0, 8, &request).await.unwrap(), b"ordinary");
+        }
+        fs.close(&file, &request).await.unwrap();
+    }
+}
+
+#[async_test]
+async fn unbuffered_io_preserves_data_and_rejects_unaligned_requests(driver: DefaultDriver) {
+    for mode in [LockMode::Native, LockMode::Synthetic] {
+        let root = tempfile::tempdir().unwrap();
+        let fs = WindowsFs::new_with_lock_mode(root.path(), Arc::new(driver.clone()), mode)
+            .await
+            .unwrap();
+        let request = RequestContext::new(1);
+        let (file, _) = fs
+            .open(
+                "data",
+                OpenOptions {
+                    access: (AccessMask::FILE_GENERIC_READ.into_bits()
+                        | AccessMask::FILE_GENERIC_WRITE.into_bits())
+                        & !fs::FILE_APPEND_DATA,
+                    options: nt::FILE_NON_DIRECTORY_FILE | nt::FILE_NO_INTERMEDIATE_BUFFERING,
+                    ..options(CreateDisposition::CREATE)
+                },
+                &request,
+            )
+            .await
+            .unwrap();
+        let data = (0..4096).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        assert_eq!(
+            fs.write(&file, 0, &data, &request).await.unwrap(),
+            data.len()
+        );
+        assert_eq!(fs.read(&file, 0, data.len(), &request).await.unwrap(), data);
+        assert_eq!(
+            fs.read(&file, 1, data.len(), &request).await,
+            Err(Status::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            fs.write(&file, 1, &data, &request).await,
+            Err(Status::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            fs.write(&file, 0, &[0], &request).await,
+            Err(Status::INVALID_PARAMETER)
+        );
+        assert_eq!(fs.read(&file, 0, data.len(), &request).await.unwrap(), data);
+        fs.close(&file, &request).await.unwrap();
+        assert_eq!(std::fs::read(root.path().join("data")).unwrap(), data);
+    }
+}
+
+#[async_test]
 async fn rejected_options_and_cancellation_have_no_effects(driver: DefaultDriver) {
     let root = tempfile::tempdir().unwrap();
     let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
     let request = RequestContext::new(1);
     for (name, bits) in [
-        ("backup", nt::FILE_OPEN_FOR_BACKUP_INTENT),
-        ("unbuffered", nt::FILE_NO_INTERMEDIATE_BUFFERING),
+        ("by-id", nt::FILE_OPEN_BY_FILE_ID),
+        ("opfilter", nt::FILE_RESERVE_OPFILTER),
     ] {
         assert_eq!(
             fs.open(
@@ -2121,16 +2217,28 @@ async fn junction_traversal_is_rejected_without_host_effects(driver: DefaultDriv
     drop(junction);
     let request = RequestContext::new(1);
     for (name, disposition) in [
+        ("junction", CreateDisposition::OPEN),
         ("junction\\data", CreateDisposition::OVERWRITE),
         ("junction\\new", CreateDisposition::CREATE),
         ("junction\\..\\data", CreateDisposition::OPEN),
     ] {
-        assert_eq!(
-            fs.open(name, options(disposition), &request).await.err(),
-            Some(Status(
-                windows_sys::Win32::Foundation::STATUS_REPARSE_POINT_ENCOUNTERED as u32
-            ))
-        );
+        for flags in [0, nt::FILE_OPEN_REPARSE_POINT] {
+            assert_eq!(
+                fs.open(
+                    name,
+                    OpenOptions {
+                        options: flags,
+                        ..options(disposition)
+                    },
+                    &request
+                )
+                .await
+                .err(),
+                Some(Status(
+                    windows_sys::Win32::Foundation::STATUS_REPARSE_POINT_ENCOUNTERED as u32
+                ))
+            );
+        }
     }
     assert_eq!(
         std::fs::read(outside.path().join("data")).unwrap(),
@@ -2151,14 +2259,23 @@ async fn intermediate_and_leaf_symlinks_cannot_escape_or_truncate(driver: Defaul
     let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
     let request = RequestContext::new(1);
     for name in ["redirect\\data", "redirect\\..\\data", "leaf"] {
-        assert_eq!(
-            fs.open(name, options(CreateDisposition::OVERWRITE), &request)
+        for flags in [0, nt::FILE_OPEN_REPARSE_POINT] {
+            assert_eq!(
+                fs.open(
+                    name,
+                    OpenOptions {
+                        options: flags,
+                        ..options(CreateDisposition::OVERWRITE)
+                    },
+                    &request
+                )
                 .await
                 .err(),
-            Some(Status(
-                windows_sys::Win32::Foundation::STATUS_REPARSE_POINT_ENCOUNTERED as u32
-            ))
-        );
+                Some(Status(
+                    windows_sys::Win32::Foundation::STATUS_REPARSE_POINT_ENCOUNTERED as u32
+                ))
+            );
+        }
     }
     assert_eq!(
         std::fs::read(outside.path().join("data")).unwrap(),

@@ -9,6 +9,54 @@ use smb::spec::Status;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) struct Buffer {
+    bytes: Vec<u8>,
+    start: usize,
+    length: usize,
+}
+
+impl Buffer {
+    pub fn new(length: usize, alignment: usize) -> Result<Self, Status> {
+        if !alignment.is_power_of_two() {
+            return Err(Status::NOT_SUPPORTED);
+        }
+        let allocation = length
+            .checked_add(alignment - 1)
+            .ok_or(Status::INSUFFICIENT_RESOURCES)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(allocation)
+            .map_err(|_| Status::INSUFFICIENT_RESOURCES)?;
+        bytes.resize(allocation, 0);
+        let start = bytes.as_ptr().align_offset(alignment);
+        Ok(Self {
+            bytes,
+            start,
+            length,
+        })
+    }
+
+    pub fn into_vec(mut self, count: usize) -> Vec<u8> {
+        if self.start != 0 {
+            self.bytes.copy_within(self.start..self.start + count, 0);
+        }
+        self.bytes.truncate(count);
+        self.bytes
+    }
+}
+
+impl AsRef<[u8]> for Buffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[self.start..self.start + self.length]
+    }
+}
+
+impl AsMut<[u8]> for Buffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.start..self.start + self.length]
+    }
+}
+
 pub(crate) struct Io {
     pub driver: Arc<dyn Driver>,
     workers: Arc<Workers>,

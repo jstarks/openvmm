@@ -7,6 +7,8 @@
 use pal::windows::{ObjectAttributes, UnicodeStringRef};
 use pal_async::driver::Driver;
 use pal_async::windows::overlapped::{CustomNt, OverlappedFile};
+#[cfg(test)]
+use smb::provider::ByteRange;
 use smb::provider::{
     BasicInformation, Change, FileSystemInformation, Metadata, SectorSizeInformation,
 };
@@ -716,6 +718,15 @@ pub(crate) fn query_security(file: &File, information: u32) -> Result<SecurityDe
 }
 
 pub(crate) fn read(file: &OverlappedFile, offset: i64, data: Vec<u8>) -> CustomNt<Vec<u8>> {
+    read_with_key(file, offset, data, 0)
+}
+
+pub(crate) fn read_with_key(
+    file: &OverlappedFile,
+    offset: i64,
+    data: Vec<u8>,
+    key: u32,
+) -> CustomNt<Vec<u8>> {
     // SAFETY: The kernel references only PAL-owned status and data allocations.
     // NtReadFile captures the offset before returning.
     unsafe {
@@ -729,13 +740,22 @@ pub(crate) fn read(file: &OverlappedFile, offset: i64, data: Vec<u8>) -> CustomN
                 data.as_mut_ptr().cast(),
                 data.len() as u32,
                 &offset,
-                null(),
+                &key,
             )
         })
     }
 }
 
 pub(crate) fn write(file: &OverlappedFile, offset: i64, data: Vec<u8>) -> CustomNt<Vec<u8>> {
+    write_with_key(file, offset, data, 0)
+}
+
+pub(crate) fn write_with_key(
+    file: &OverlappedFile,
+    offset: i64,
+    data: Vec<u8>,
+    key: u32,
+) -> CustomNt<Vec<u8>> {
     // SAFETY: The kernel references only PAL-owned status and data allocations.
     // NtWriteFile captures the offset before returning.
     unsafe {
@@ -749,9 +769,56 @@ pub(crate) fn write(file: &OverlappedFile, offset: i64, data: Vec<u8>) -> Custom
                 data.as_ptr().cast(),
                 data.len() as u32,
                 &offset,
-                null(),
+                &key,
             )
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock(
+    file: &OverlappedFile,
+    range: ByteRange,
+    key: u32,
+    exclusive: bool,
+    fail_immediately: bool,
+) -> CustomNt<()> {
+    let offset = range.offset as i64;
+    let length = range.length as i64;
+    // SAFETY: NT captures the range before returning; PAL retains the status
+    // and completion context through actual completion.
+    unsafe {
+        file.custom_nt((), |handle, (), overlapped| {
+            nt::NtLockFile(
+                handle,
+                null_mut(),
+                None,
+                overlapped.cast(),
+                overlapped.cast(),
+                &offset,
+                &length,
+                key,
+                fail_immediately,
+                exclusive,
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn unlock(file: &File, range: ByteRange, key: u32) -> Result<(), Status> {
+    let offset = range.offset as i64;
+    let length = range.length as i64;
+    let iosb = Completion::new();
+    // SAFETY: The synchronous unlock retains its captured range and status.
+    unsafe {
+        iosb.finish(nt::NtUnlockFile(
+            file.as_raw_handle(),
+            iosb.as_ptr(),
+            &offset,
+            &length,
+            key,
+        ))
     }
 }
 

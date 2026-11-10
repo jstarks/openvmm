@@ -126,6 +126,58 @@ contract_test!(notify_deletion_generations);
 contract_test!(notify_nonempty_delete_mode_preserves_watch);
 
 #[async_test]
+async fn native_lock_keys_and_overlapping_acquisitions(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (owner, _) = fs
+        .open("keys", options(CreateDisposition::CREATE), &request)
+        .await
+        .unwrap();
+    fs.write(&owner, 0, b"abcdefghij", &request).await.unwrap();
+    let (other, _) = fs
+        .open("keys", options(CreateDisposition::OPEN), &request)
+        .await
+        .unwrap();
+    let owner_native = owner.get().unwrap();
+    let other_native = other.get().unwrap();
+    let file = owner_native.overlapped().unwrap();
+    let range = smb::provider::ByteRange {
+        offset: 2,
+        length: 4,
+    };
+    let ((result, _), ()) = native::lock(file, range, 1, true, true).await;
+    native::status(result).unwrap();
+    for key in [0, 1, 2] {
+        let ((read, _), _) = native::read_with_key(file, 2, vec![0; 1], key).await;
+        let ((write, _), _) = native::write_with_key(file, 2, vec![b'c'], key).await;
+        let expected = if key == 1 {
+            Status::SUCCESS
+        } else {
+            Status::FILE_LOCK_CONFLICT
+        };
+        assert_eq!(Status(read as u32), expected);
+        assert_eq!(Status(write as u32), expected);
+    }
+    let ((different, _), ()) = native::lock(file, range, 2, false, true).await;
+    assert_eq!(Status(different as u32), Status::LOCK_NOT_GRANTED);
+    let ((same, _), ()) = native::lock(file, range, 1, false, true).await;
+    native::status(same).unwrap();
+    native::unlock(file.get(), range, 1).unwrap();
+    let ((after, _), _) = native::write_with_key(file, 2, vec![b'c'], 1).await;
+    assert_eq!(Status(after as u32), Status::FILE_LOCK_CONFLICT);
+    let ((peer_read, count), data) =
+        native::read(other_native.overlapped().unwrap(), 2, vec![0; 1]).await;
+    native::status(peer_read).unwrap();
+    assert_eq!(&data[..count], b"c");
+    native::unlock(file.get(), range, 1).unwrap();
+    drop(owner_native);
+    drop(other_native);
+    fs.close(&owner, &request).await.unwrap();
+    fs.close(&other, &request).await.unwrap();
+}
+
+#[async_test]
 async fn notification_delete_state_belongs_to_existing_registrations(driver: DefaultDriver) {
     let root = tempfile::tempdir().unwrap();
     let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();

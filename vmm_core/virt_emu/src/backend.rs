@@ -26,6 +26,7 @@ use virt::{
     PartitionConfig, PlatformInfo, Processor, ProtoPartition, ProtoPartitionConfig,
     ProtoPartitionIsolation, StopVp, VpHaltReason, VpIndex,
 };
+use x86_system::memory_core::cpu_core::system::{self, SegmentState, SystemState};
 use x86_system::memory_core::shared::{Exchange, PhysicalRam};
 use x86_system::mmu_core::shared::RunError;
 use x86_system::mmu_core::shared::io::IoReply;
@@ -190,6 +191,8 @@ pub struct EmuPartition {
 
 struct VpState {
     core: Option<SharedEventMachine>,
+    initial_system: Option<SystemState>,
+    started: bool,
     io_active: bool,
     fault: Option<Error>,
 }
@@ -294,6 +297,8 @@ impl ProtoPartition for EmuProtoPartition {
         let binder = EmuProcessorBinder {
             state: VpState {
                 core: None,
+                initial_system: Some(SystemState::empty()),
+                started: false,
                 io_active: false,
                 fault: None,
             },
@@ -416,6 +421,7 @@ impl Processor for EmuProcessor<'_> {
         if self.state.io_active {
             return Err(dev.fatal_error(Box::new(Error::CancelledIo)));
         }
+        self.state.started = true;
         let mut decode_work = 0u8;
         loop {
             stop.check()?;
@@ -534,6 +540,66 @@ impl EmuStateAccess<'_> {
         }
         self.state.core.as_ref().ok_or(Error::Uninitialized)
     }
+
+    fn system(&self) -> Result<SystemState, Error> {
+        if self.vtl != Vtl::Vtl0 {
+            return Err(Error::Profile("VTL"));
+        }
+        if let Some(core) = &self.state.core {
+            core.system()
+                .ok_or(Error::Profile("missing core system state"))
+        } else {
+            self.state.initial_system.ok_or(Error::Uninitialized)
+        }
+    }
+
+    fn set_system(&mut self, system: SystemState) -> Result<(), Error> {
+        if self.vtl != Vtl::Vtl0 {
+            return Err(Error::Profile("VTL"));
+        }
+        if self.state.started {
+            return Err(Error::AlreadyInitialized);
+        }
+        if let Some(core) = &mut self.state.core {
+            if !core.configure_system(system) {
+                return Err(Error::Profile("initial system state"));
+            }
+        } else {
+            self.state.initial_system = Some(system);
+        }
+        Ok(())
+    }
+}
+
+fn segment_state(segment: SegmentRegister) -> SegmentState {
+    SegmentState {
+        base: segment.base,
+        limit: segment.limit,
+        selector: segment.selector,
+        attributes: segment.attributes,
+    }
+}
+
+fn segment_register(segment: SegmentState) -> SegmentRegister {
+    SegmentRegister {
+        base: segment.base,
+        limit: segment.limit,
+        selector: segment.selector,
+        attributes: segment.attributes,
+    }
+}
+
+fn with_system(mut regs: vp::Registers, system: SystemState) -> vp::Registers {
+    regs.cs = segment_register(system.cs);
+    regs.ss = segment_register(system.ss);
+    regs.ds = segment_register(system.ds);
+    regs.es = segment_register(system.es);
+    regs.fs = segment_register(system.fs);
+    regs.gs = segment_register(system.gs);
+    regs.tr = segment_register(system.tr);
+    regs.ldtr = segment_register(system.ldtr);
+    regs.efer |= u64::from(system.efer_sce);
+    regs
 }
 
 /// Constructs the one fixed flat-segment profile accepted by initial import.
@@ -590,18 +656,16 @@ impl AccessVpState for EmuStateAccess<'_> {
     }
     fn registers(&mut self) -> Result<vp::Registers, Error> {
         let core = self.core()?;
-        Ok(long_mode_registers(
-            core.cpu(),
-            core.config(),
-            core.tables(),
-            core.cr2(),
+        Ok(with_system(
+            long_mode_registers(core.cpu(), core.config(), core.tables(), core.cr2()),
+            self.system()?,
         ))
     }
     fn set_registers(&mut self, regs: &vp::Registers) -> Result<(), Error> {
         if self.vtl != Vtl::Vtl0 {
             return Err(Error::Profile("VTL"));
         }
-        if self.state.core.is_some() {
+        if self.state.core.is_some() || self.state.started {
             return Err(Error::AlreadyInitialized);
         }
         let config = Config {
@@ -616,7 +680,22 @@ impl AccessVpState for EmuStateAccess<'_> {
             idt_limit: regs.idtr.limit,
         };
         let cpu = state_from_registers(regs);
-        if regs != &long_mode_registers(cpu, config, tables, regs.cr2)
+        let system = SystemState {
+            cs: segment_state(regs.cs),
+            ss: segment_state(regs.ss),
+            ds: segment_state(regs.ds),
+            es: segment_state(regs.es),
+            fs: segment_state(regs.fs),
+            gs: segment_state(regs.gs),
+            tr: segment_state(regs.tr),
+            ldtr: segment_state(regs.ldtr),
+            efer_sce: regs.efer & 1 != 0,
+            ..self.system()?
+        };
+        let mut normalized = *regs;
+        normalized.cr0 |= 0x10;
+        if !system.is_supported()
+            || normalized != with_system(long_mode_registers(cpu, config, tables, regs.cr2), system)
             || config.root >= 1u64 << 48
             || !config.root.is_multiple_of(4096)
             || cpu.flags & !0x0021_0ed7 != 0
@@ -628,11 +707,43 @@ impl AccessVpState for EmuStateAccess<'_> {
             return Err(Error::Profile("initial long-mode register image"));
         }
         let mut core = SharedEventMachine::new(cpu, config, regs.cr2, tables);
-        if !core.enable_decode() {
-            return Err(Error::Profile("initial decoder state"));
+        if !core.configure_system(system) || !core.enable_decode() {
+            return Err(Error::Profile("initial system/decoder state"));
         }
         self.state.core = Some(core);
+        self.state.initial_system = None;
         Ok(())
+    }
+    fn pat(&mut self) -> Result<vp::Pat, Error> {
+        Ok(vp::Pat {
+            value: self.system()?.pat,
+        })
+    }
+    fn set_pat(&mut self, value: &vp::Pat) -> Result<(), Error> {
+        if value.value != system::DEFAULT_PAT {
+            return Err(Error::Profile("initial PAT image"));
+        }
+        let mut system = self.system()?;
+        system.pat = value.value;
+        self.set_system(system)
+    }
+    fn mtrrs(&mut self) -> Result<vp::Mtrrs, Error> {
+        let system = self.system()?;
+        Ok(vp::Mtrrs {
+            msr_mtrr_def_type: system.mtrr_def,
+            fixed: system.mtrr_fixed,
+            variable: system.mtrr_variable,
+        })
+    }
+    fn set_mtrrs(&mut self, value: &vp::Mtrrs) -> Result<(), Error> {
+        if !system::mtrrs_supported(value.msr_mtrr_def_type, &value.fixed, &value.variable) {
+            return Err(Error::Profile("initial MTRR image"));
+        }
+        let mut system = self.system()?;
+        system.mtrr_def = value.msr_mtrr_def_type;
+        system.mtrr_fixed = value.fixed;
+        system.mtrr_variable = value.variable;
+        self.set_system(system)
     }
     fn activity(&mut self) -> Result<vp::Activity, Error> {
         let core = self.core()?;
@@ -658,7 +769,6 @@ impl AccessVpState for EmuStateAccess<'_> {
     unsupported_state! {
         (xsave, set_xsave, vp::Xsave), (apic, set_apic, vp::Apic),
         (xcr, set_xcr, vp::Xcr0), (xss, set_xss, vp::Xss),
-        (mtrrs, set_mtrrs, vp::Mtrrs), (pat, set_pat, vp::Pat),
         (virtual_msrs, set_virtual_msrs, vp::VirtualMsrs),
         (debug_regs, set_debug_regs, vp::DebugRegisters),
         (tsc, set_tsc, vp::Tsc), (cet, set_cet, vp::Cet),

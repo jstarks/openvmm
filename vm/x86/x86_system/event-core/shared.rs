@@ -4,6 +4,9 @@
 //! Resumable same-CPL event delivery over the shared CPU/MMU protocol.
 use super::shared_model as spec;
 use super::*;
+#[cfg(verus_keep_ghost)]
+use memory_core::cpu_core::system;
+use memory_core::cpu_core::system::SystemState;
 use memory_core::shared::PhysicalRam;
 use mmu_core::shared::io::{IoReply, IoRequest, IoRoute, Operand};
 use mmu_core::shared::{self as memory, Reply, Request, RunError};
@@ -41,6 +44,7 @@ pub struct SharedEventMachine {
     core: SharedMachine, tables: Tables, phase: Phase,
     pending: Option<u8>, shadow: bool, halted: bool, handler_pending: bool,
     external_decode: bool, decode_sequence: u64,
+    system: Option<SystemState>,
 }
 impl View for SharedEventMachine {
     type V = spec::State;
@@ -48,12 +52,17 @@ impl View for SharedEventMachine {
         spec::State { core: self.core@, tables: self.tables, phase: self.phase,
             pending: self.pending, shadow: self.shadow, halted: self.halted,
             handler_pending: self.handler_pending, external_decode: self.external_decode,
-            decode_sequence: self.decode_sequence }
+            decode_sequence: self.decode_sequence, system: self.system }
     }
 }
 impl SharedEventMachine {
+    pub closed spec fn system_supported(&self) -> bool {
+        match self.system { Some(s) => system::model::supported(s), None => true }
+    }
+
     pub closed spec fn invariant(&self) -> bool {
         self.core.invariant()
+        && self.system_supported()
         && match self.phase {
             Phase::Decode { input } | Phase::Admitted { input, .. } =>
                 spec::decode::valid_input(self@, input)
@@ -96,12 +105,28 @@ impl SharedEventMachine {
     pub fn new(cpu: State, config: Config, cr2: u64, tables: Tables) -> (s: Self)
         ensures s.invariant(), s@.core.cpu == cpu@, s@.phase == Phase::Ready,
             s@.tables == tables, s@.pending is None, !s@.shadow, !s@.halted, !s@.handler_pending,
+            s@.system is None,
     {
         let core = SharedMachine::new(cpu, config, cr2, false);
         proof { core.boundary_facts(); }
         Self { core, tables, phase: Phase::Ready,
             pending: None, shadow: false, halted: false, handler_pending: false,
-            external_decode: false, decode_sequence: 0 }
+            external_decode: false, decode_sequence: 0, system: None }
+    }
+
+    pub fn system(&self) -> (out: Option<SystemState>)
+        ensures out == self@.system,
+    { self.system }
+
+    pub fn configure_system(&mut self, system: SystemState) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@, accepted) == spec::configure_system(old(self)@, system),
+            final(self)@.core == old(self)@.core,
+    {
+        if !matches!(self.phase, Phase::Ready) || !system.is_supported() { return false; }
+        self.system = Some(system);
+        true
     }
 
     pub fn cpu(&self) -> (v: State) ensures v@ == spec::visible_cpu(self@) {
@@ -159,7 +184,8 @@ impl SharedEventMachine {
     { self.core.respond(reply) }
 
     fn stop(&mut self, reason: EventDiagnostic) -> (tick: Tick)
-        requires old(self).core.invariant(), !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        requires old(self).core.invariant(), old(self).system_supported(),
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::stop(old(self)@, reason),
     { self.phase = Phase::Stopped { reason }; Tick::Stopped(reason) }
 
@@ -174,7 +200,8 @@ impl SharedEventMachine {
     }
 
     fn start_entry(&mut self, event: Event) -> (tick: Tick)
-        requires old(self).core.invariant(), old(self).core@.phase == CpuPhase::Boundary,
+        requires old(self).core.invariant(), old(self).system_supported(),
+            old(self).core@.phase == CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::entry(old(self)@, event),
     {
@@ -206,7 +233,8 @@ impl SharedEventMachine {
     }
 
     fn start_iret(&mut self) -> (tick: Tick)
-        requires old(self).core.invariant(), old(self).core@.phase == CpuPhase::Boundary,
+        requires old(self).core.invariant(), old(self).system_supported(),
+            old(self).core@.phase == CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::iret(old(self)@),
     {

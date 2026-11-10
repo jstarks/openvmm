@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use super::Tables;
+use super::memory_core::cpu_core::system::SystemState;
 #[cfg(verus_keep_ghost)]
 use super::mmu_core::shared::Request;
 #[cfg(verus_keep_ghost)]
@@ -27,6 +28,12 @@ pub struct State {
     pub core: c::State, pub tables: Tables, pub phase: Phase,
     pub pending: Option<u8>, pub shadow: bool, pub halted: bool, pub handler_pending: bool,
     pub external_decode: bool, pub decode_sequence: u64,
+    pub system: Option<SystemState>,
+}
+pub open spec fn configure_system(s: State, system: SystemState) -> (State, bool) {
+    if s.phase is Ready && super::memory_core::cpu_core::system::model::supported(system) {
+        (State { system: Some(system), ..s }, true)
+    } else { (s, false) }
 }
 pub open spec fn visible_cpu(s: State) -> model::State {
     match s.phase { Phase::Ordinary { flags } => model::State { flags, ..s.core.cpu },

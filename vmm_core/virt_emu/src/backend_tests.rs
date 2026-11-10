@@ -178,6 +178,128 @@ async fn build(
 }
 
 #[async_test]
+async fn loader_system_import_orders_roundtrip_and_lock_after_run(driver: DefaultDriver) {
+    use virt::vp::{Mtrrs, Pat};
+    use x86_system::memory_core::cpu_core::system::{DEFAULT_PAT, FIXED_WB};
+
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let (mut bytes, owned) = fixture();
+        bytes[CODE as usize] = 0xf4;
+        let (_, mut binder, _memory, _keeper) = build(&driver, &bytes).await;
+        let mut vp = binder.bind().unwrap();
+        let mut regs = long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        );
+        regs.fs = regs.ds;
+        regs.gs = regs.ds;
+        regs.fs.base = 0xffff_8000_0000_1234;
+        regs.gs.base = 0x1234;
+        regs.tr = virt::x86::SegmentRegister {
+            base: 0,
+            limit: 0xffff,
+            selector: 0,
+            attributes: 0x8b,
+        };
+        regs.ldtr = virt::x86::SegmentRegister {
+            attributes: 0x82,
+            ..regs.tr
+        };
+        regs.efer |= 1;
+        regs.cr0 &= !0x10;
+        let pat = Pat { value: DEFAULT_PAT };
+        let mut mtrrs = Mtrrs {
+            msr_mtrr_def_type: 0xc00,
+            ..Default::default()
+        };
+        mtrrs.fixed[..2].fill(FIXED_WB);
+        for operation in order {
+            let mut access = vp.access_state(Vtl::Vtl0);
+            match operation {
+                0 => access.set_registers(&regs).unwrap(),
+                1 => access.set_pat(&pat).unwrap(),
+                2 => access.set_mtrrs(&mtrrs).unwrap(),
+                _ => unreachable!(),
+            }
+        }
+        let mut expected = regs;
+        expected.cr0 |= 0x10;
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert_eq!(vp.access_state(Vtl::Vtl0).pat().unwrap(), pat);
+        assert_eq!(vp.access_state(Vtl::Vtl0).mtrrs().unwrap(), mtrrs);
+        assert!(vp.access_state(Vtl::Vtl2).set_mtrrs(&mtrrs).is_err());
+        assert!(vp.access_state(Vtl::Vtl2).pat().is_err());
+        assert!(
+            vp.access_state(Vtl::Vtl0)
+                .set_pat(&Pat { value: 0 })
+                .is_err()
+        );
+        let mut bad_mtrrs = Mtrrs::default();
+        bad_mtrrs.variable[15] = 1;
+        assert!(vp.access_state(Vtl::Vtl0).set_mtrrs(&bad_mtrrs).is_err());
+        assert_eq!(vp.access_state(Vtl::Vtl0).mtrrs().unwrap(), mtrrs);
+
+        let devices = Devices::new();
+        let stop = StopVpSource::new();
+        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        park(run.as_mut());
+        stop.stop();
+        assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+        drop(run);
+        expected.rip += 1;
+        expected.rflags &= !0x10000;
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert_eq!(vp.access_state(Vtl::Vtl0).mtrrs().unwrap(), mtrrs);
+        assert_eq!(vp.access_state(Vtl::Vtl0).pat().unwrap(), pat);
+        assert!(vp.access_state(Vtl::Vtl0).set_pat(&pat).is_err());
+        assert!(vp.access_state(Vtl::Vtl0).set_mtrrs(&mtrrs).is_err());
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert!(devices.faults.lock().is_empty());
+    }
+}
+
+#[async_test]
+async fn rejected_initial_system_import_keeps_staging_and_allows_corrected_image(
+    driver: DefaultDriver,
+) {
+    use virt::vp::Mtrrs;
+    use x86_system::memory_core::cpu_core::system::FIXED_WB;
+
+    let (bytes, owned) = fixture();
+    let (_, mut binder, _memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let mut mtrrs = Mtrrs {
+        msr_mtrr_def_type: 0xc00,
+        ..Default::default()
+    };
+    mtrrs.fixed[..2].fill(FIXED_WB);
+    vp.access_state(Vtl::Vtl0).set_mtrrs(&mtrrs).unwrap();
+    let mut regs = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    regs.gs.base = 0x8000_0000_0000;
+    assert!(vp.access_state(Vtl::Vtl0).set_registers(&regs).is_err());
+    assert!(vp.access_state(Vtl::Vtl0).registers().is_err());
+    assert_eq!(vp.access_state(Vtl::Vtl0).mtrrs().unwrap(), mtrrs);
+    regs.gs.base = 0xffff_8000_0000_0000;
+    vp.access_state(Vtl::Vtl0).set_registers(&regs).unwrap();
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), regs);
+    assert_eq!(vp.access_state(Vtl::Vtl0).mtrrs().unwrap(), mtrrs);
+}
+
+#[async_test]
 async fn real_backend_guest_recovery_delayed_mmio_hlt_and_irq(driver: DefaultDriver) {
     let (mut bytes, mut oracle) = fixture();
     bytes[CODE as usize..CODE as usize + 11].copy_from_slice(&[

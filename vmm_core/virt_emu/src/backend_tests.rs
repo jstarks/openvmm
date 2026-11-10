@@ -445,4 +445,48 @@ async fn backend_state_profile_and_requested_yield_preserve_cpu(driver: DefaultD
     drop(run);
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), regs);
     assert!(devices.faults.lock().is_empty());
+
+    let (mut bytes, owned) = fixture();
+    let code = [0xba, 0x01, 0x01, 0, 0xc0].repeat(128);
+    bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+    bytes[CODE as usize + code.len()] = 0xf4;
+    let (_, mut binder, _memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    vp.access_state(Vtl::Vtl0)
+        .set_registers(&long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        ))
+        .unwrap();
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    assert!(
+        run.as_mut()
+            .poll(&mut Context::from_waker(&wake))
+            .is_pending()
+    );
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
+    let partial = vp.access_state(Vtl::Vtl0).registers().unwrap();
+    assert_eq!(
+        partial.rip,
+        CODE + 12 * 5,
+        "decode work must yield before HLT"
+    );
+    assert_eq!(partial.rdx, 0xc0000101);
+
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    park(run.as_mut());
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
+    assert_eq!(
+        vp.access_state(Vtl::Vtl0).registers().unwrap().rip,
+        CODE + code.len() as u64 + 1
+    );
+    assert!(devices.faults.lock().is_empty());
 }

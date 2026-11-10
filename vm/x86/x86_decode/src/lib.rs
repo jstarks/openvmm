@@ -9,6 +9,7 @@ pub use x86_system::memory_core::cpu_core::operand::*;
 
 use iced_x86::Register as IcedRegister;
 use iced_x86::{Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind};
+use x86_system::memory_core::cpu_core::control::Condition;
 use x86_system::memory_core::cpu_core::integer;
 use x86_system::shared::decode::{DecodeDecision, DecodeInput};
 use x86_system::shared::entry::Instruction as EntryInstruction;
@@ -339,6 +340,13 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     }
     let size = address_size(encoding.bytes());
     let get = |index| operand(&instruction, index, Operation::Mov, size);
+    match encoding.bytes() {
+        [0x0f, 0xa2] => return Some(EntryInstruction::Cpuid),
+        [0x48, 0xcb] => return Some(EntryInstruction::FarReturn),
+        [0x9c] => return Some(EntryInstruction::PushFlags),
+        [0x9d] => return Some(EntryInstruction::PopFlags),
+        _ => {}
+    }
     match instruction.mnemonic() {
         Mnemonic::Add
         | Mnemonic::Sub
@@ -346,7 +354,9 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         | Mnemonic::Or
         | Mnemonic::Test
         | Mnemonic::Shl
-        | Mnemonic::Shr => {
+        | Mnemonic::Shr
+        | Mnemonic::Cmp
+        | Mnemonic::Xor => {
             let Operand::Register(dst) = get(0)? else {
                 return None;
             };
@@ -365,6 +375,8 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                 Mnemonic::Or => integer::Operation::Or,
                 Mnemonic::Test => integer::Operation::Test,
                 Mnemonic::Shl => integer::Operation::Shl,
+                Mnemonic::Cmp => integer::Operation::Cmp,
+                Mnemonic::Xor => integer::Operation::Xor,
                 _ => integer::Operation::Shr,
             };
             Some(EntryInstruction::Integer {
@@ -433,6 +445,12 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             }
             Some(EntryInstruction::Push { source })
         }
+        Mnemonic::Pop => {
+            let Operand::Register(dst) = get(0)? else {
+                return None;
+            };
+            (dst.width() == Width::Qword).then_some(EntryInstruction::Pop { dst })
+        }
         Mnemonic::Ret if encoding.bytes() == [0xc3] => Some(EntryInstruction::Return),
         Mnemonic::Leave if encoding.bytes() == [0xc9] => Some(EntryInstruction::Leave),
         Mnemonic::Jmp | Mnemonic::Je | Mnemonic::Jne
@@ -445,6 +463,43 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                     Mnemonic::Jne => Some(false),
                     _ => None,
                 },
+            })
+        }
+        Mnemonic::Jo
+        | Mnemonic::Jno
+        | Mnemonic::Jb
+        | Mnemonic::Jae
+        | Mnemonic::Jbe
+        | Mnemonic::Ja
+        | Mnemonic::Js
+        | Mnemonic::Jns
+        | Mnemonic::Jp
+        | Mnemonic::Jnp
+        | Mnemonic::Jl
+        | Mnemonic::Jge
+        | Mnemonic::Jle
+        | Mnemonic::Jg
+            if instruction.op0_kind() == OpKind::NearBranch64 =>
+        {
+            let condition = match instruction.mnemonic() {
+                Mnemonic::Jo => Condition::Overflow,
+                Mnemonic::Jno => Condition::NotOverflow,
+                Mnemonic::Jb => Condition::Below,
+                Mnemonic::Jae => Condition::AboveEqual,
+                Mnemonic::Jbe => Condition::BelowEqual,
+                Mnemonic::Ja => Condition::Above,
+                Mnemonic::Js => Condition::Sign,
+                Mnemonic::Jns => Condition::NotSign,
+                Mnemonic::Jp => Condition::Parity,
+                Mnemonic::Jnp => Condition::NotParity,
+                Mnemonic::Jl => Condition::Less,
+                Mnemonic::Jge => Condition::GreaterEqual,
+                Mnemonic::Jle => Condition::LessEqual,
+                _ => Condition::Greater,
+            };
+            Some(EntryInstruction::Branch {
+                target: instruction.near_branch64(),
+                condition,
             })
         }
         _ => None,

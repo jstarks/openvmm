@@ -43,6 +43,10 @@ pub mod model {
     pub open spec fn canonical(base: u64) -> bool {
         base < 0x8000_0000_0000u64 || base >= 0xffff_8000_0000_0000u64
     }
+    pub open spec fn supported_code(s: SegmentState) -> bool {
+        s.base == 0 && s.limit == u32::MAX && s.attributes == 0xa09b
+        && s.selector != 0 && s.selector & 7u16 == 0
+    }
     pub open spec fn supported_data(s: SegmentState) -> bool {
         s.base == 0 && s.limit == u32::MAX && s.attributes == 0xc093
         && s.selector != 0 && s.selector & 7u16 == 0
@@ -64,7 +68,7 @@ pub mod model {
         && (forall|i: int| 0 <= i < 16 ==> #[trigger] variable[i] == 0)
     }
     pub open spec fn supported(s: SystemState) -> bool {
-        s.cs == CODE_SEGMENT && supported_data(s.ss) && supported_data(s.ds)
+        supported_code(s.cs) && supported_data(s.ss) && supported_data(s.ds)
         && supported_data(s.es) && data_or_null(s.fs) && data_or_null(s.gs)
         && canonical(s.fs.base) && canonical(s.gs.base)
         && unused(s.tr, 0x8b) && unused(s.ldtr, 0x82)
@@ -85,6 +89,12 @@ pub proof fn lemma_replace_data(s: SystemState, ss: SegmentState, ds: SegmentSta
     requires model::supported(s), model::supported_data(ss),
         model::supported_data(ds), model::supported_data(es),
     ensures model::supported(SystemState { ss, ds, es, ..s }),
+{
+}
+
+pub proof fn lemma_replace_code(s: SystemState, cs: SegmentState)
+    requires model::supported(s), model::supported_code(cs),
+    ensures model::supported(SystemState { cs, ..s }),
 {
 }
 
@@ -113,6 +123,13 @@ pub fn mtrrs_supported(def: u64, fixed: &[u64; 11], variable: &[u64; 16]) -> (ou
         i += 1;
     }
     true
+}
+
+fn supported_code(s: SegmentState) -> (out: bool)
+    ensures out == model::supported_code(s),
+{
+    s.base == 0 && s.limit == u32::MAX && s.attributes == 0xa09b
+        && s.selector != 0 && s.selector & 7 == 0
 }
 
 fn supported_data(s: SegmentState) -> (out: bool)
@@ -157,7 +174,7 @@ impl SystemState {
     pub fn is_supported(self) -> (out: bool)
         ensures out == model::supported(self),
     {
-        self.cs == CODE_SEGMENT && supported_data(self.ss) && supported_data(self.ds)
+        supported_code(self.cs) && supported_data(self.ss) && supported_data(self.ds)
             && supported_data(self.es) && data_or_null(self.fs) && data_or_null(self.gs)
             && (self.fs.base < 0x8000_0000_0000 || self.fs.base >= 0xffff_8000_0000_0000)
             && (self.gs.base < 0x8000_0000_0000 || self.gs.base >= 0xffff_8000_0000_0000)

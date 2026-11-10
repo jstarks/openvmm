@@ -39,6 +39,49 @@ pub mod model {
     pub open spec fn load_data(word: u64, selector: u16) -> Option<SegmentState> {
         if admitted(word, selector) { Some(image(word, selector)) } else { None }
     }
+    pub open spec fn admitted_code(word: u64, selector: u16) -> bool {
+        selector != 0 && selector & 7u16 == 0
+        && base(word) == 0 && limit(word) == u32::MAX
+        && attributes(word) == 0xa09b
+    }
+    pub open spec fn load_code(word: u64, selector: u16) -> Option<SegmentState> {
+        if admitted_code(word, selector) { Some(image(word, selector)) } else { None }
+    }
+}
+
+/// Bounded CPL0 nonconforming readable/accessed long code, L=G=1,
+/// D/B=AVL=0. Ignored long-mode base/limit fields are still retained
+/// (APM Volume 2 §§4.7.2, 4.8.1).
+pub proof fn lemma_flat_code_correspondence(word: u64, selector: u16)
+    ensures
+        model::admitted_code(word, selector) <==>
+            (word == 0x00af_9b00_0000_ffffu64 && selector != 0 && selector & 7u16 == 0),
+        model::admitted_code(word, selector) ==>
+            system::model::supported_code(model::image(word, selector)),
+{
+    assert((model::base(word) == 0 && model::limit(word) == u32::MAX
+        && model::attributes(word) == 0xa09b)
+        <==> word == 0x00af_9b00_0000_ffffu64) by(bit_vector);
+}
+
+/// Unsupported images return None, not an architectural exception. Requiring
+/// A=1 avoids descriptor writes; R=1 and the flat hidden fields are profile
+/// restrictions, not requirements on every architectural long-mode code segment.
+pub fn load_code(word: u64, selector: u16) -> (out: Option<SegmentState>)
+    ensures
+        out == model::load_code(word, selector),
+        out.is_some() == model::admitted_code(word, selector),
+        match out {
+            Some(segment) => segment == model::image(word, selector)
+                && system::model::supported_code(segment),
+            None => true,
+        },
+{
+    proof { lemma_flat_code_correspondence(word, selector); }
+    if selector == 0 || selector & 7 != 0 || word != 0x00af_9b00_0000_ffff {
+        return None;
+    }
+    Some(SegmentState { base: 0, limit: u32::MAX, selector, attributes: 0xa09b })
 }
 
 /// This profile requires a present DPL0 expand-up writable accessed data

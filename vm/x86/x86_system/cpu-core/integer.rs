@@ -19,7 +19,7 @@ pub mod model {
 verus! {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
-pub enum Operation { Add, Sub, And, Or, Test, Shl, Shr }
+pub enum Operation { Add, Sub, Cmp, And, Or, Xor, Test, Shl, Shr }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Outcome {
@@ -66,13 +66,14 @@ pub open spec fn core(operation: Operation, a: u64, b: u64, width: Width)
     let mask = super::operand::model::mask(width);
     let c = count(b, width);
     match operation {
-        Operation::Add | Operation::Sub => {
-            let t = arithmetic_model(operation == Operation::Sub,
+        Operation::Add | Operation::Sub | Operation::Cmp => {
+            let t = arithmetic_model(operation != Operation::Add,
                 a as int, b as int, modulus(width));
             (t.0 as u64, t.1, t.2, t.3)
         },
         Operation::And | Operation::Test => (a & b, false, false, false),
         Operation::Or => (a | b, false, false, false),
+        Operation::Xor => (a ^ b, false, false, false),
         Operation::Shl => {
             let value = if c >= n { 0u64 } else { (a << c) & mask };
             let cf = c > 0 && c <= n && ((a >> (n - c)) & 1u64) != 0;
@@ -112,7 +113,7 @@ pub open spec fn transition(operation: Operation, left: u64, right: u64,
     } else {
         let t = core(operation, a, b, width);
         (t.0, packed(flags, t.0, (modulus(width) / 2) as u64, t.1, t.2, t.3),
-            operation != Operation::Test)
+            operation != Operation::Test && operation != Operation::Cmp)
     }
 }
 
@@ -159,9 +160,52 @@ fn arithmetic_value(sub: bool, a: u64, b: u64, m: u128)
     (value, cf, af, of)
 }
 
-/// AMD APM Volume 3 ADD/SUB, AND/OR/TEST, SAL/SHL and SHR, with the
+pub proof fn cmp_matches_sub(left: u64, right: u64, width: Width, flags: u64)
+    ensures
+        model::evaluate(Operation::Cmp, left, right, width, flags).value
+            == model::evaluate(Operation::Sub, left, right, width, flags).value,
+        model::evaluate(Operation::Cmp, left, right, width, flags).flags
+            == model::evaluate(Operation::Sub, left, right, width, flags).flags,
+        !model::evaluate(Operation::Cmp, left, right, width, flags).write,
+{
+}
+
+pub proof fn logical_family(operation: Operation, left: u64, right: u64,
+    width: Width, flags: u64)
+    requires
+        operation == Operation::And || operation == Operation::Or
+            || operation == Operation::Xor || operation == Operation::Test,
+    ensures
+        model::evaluate(operation, left, right, width, flags).value
+            & !super::operand::model::mask(width) == 0,
+        model::evaluate(operation, left, right, width, flags).flags & 0x811u64 == 0,
+        model::evaluate(operation, left, right, width, flags).write
+            == (operation != Operation::Test),
+{
+    let mask = super::operand::model::mask(width);
+    let a = left & mask;
+    let b = right & mask;
+    let is_or = operation == Operation::Or;
+    let is_xor = operation == Operation::Xor;
+    let value = model::evaluate(operation, left, right, width, flags).value;
+    assert(value & !mask == 0) by(bit_vector)
+        requires value == (if is_or { a | b } else if is_xor { a ^ b } else { a & b }),
+            a == left & mask, b == right & mask;
+    let even = arithmetic::model::population((value % 256) as int) % 2 == 0;
+    let zf = value == 0;
+    let sf = value >= (modulus(width) / 2) as u64;
+    let next_flags = model::evaluate(operation, left, right, width, flags).flags;
+    assert(next_flags & 0x811u64 == 0) by(bit_vector)
+        requires next_flags == (flags & !0x8d5u64)
+            | (0u64 | (if even { 4u64 } else { 0u64 }) | 0u64
+                | (if zf { 64u64 } else { 0u64 })
+                | (if sf { 128u64 } else { 0u64 }) | 0u64);
+}
+
+/// AMD APM Volume 3 ADD/SUB/CMP, AND/OR/XOR/TEST, SAL/SHL and SHR, with the
 /// arithmetic flag meanings from Volume 1 section 3.1.4.
 ///
+/// CMP shares SUB's result and flags but does not write the destination.
 /// Undefined AF is chosen zero for logical operations and nonzero shifts.
 /// Shift OF is chosen zero beyond count one. At count == width we retain
 /// the last shifted-out bit; beyond width CF is chosen zero. Counts are
@@ -173,7 +217,7 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
     ensures
         out == model::evaluate(operation, left, right, width, flags),
         out.flags & !0x8d5u64 == flags & !0x8d5u64,
-        out.write == (operation != Operation::Test),
+        out.write == (operation != Operation::Test && operation != Operation::Cmp),
 {
     let mask = width.mask();
     let n = width.bits();
@@ -199,7 +243,7 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
         return Outcome { value: a, flags, write: true };
     }
     let (value, cf, af, of) = match operation {
-        Operation::Add | Operation::Sub => {
+        Operation::Add | Operation::Sub | Operation::Cmp => {
             proof {
                 match width {
                     Width::Byte => { assert(a < 256 && b < 256) by(bit_vector)
@@ -211,10 +255,11 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
                     Width::Qword => {},
                 }
             }
-            arithmetic_value(operation == Operation::Sub, a, b, m)
+            arithmetic_value(operation != Operation::Add, a, b, m)
         },
         Operation::And | Operation::Test => (a & b, false, false, false),
         Operation::Or => (a | b, false, false, false),
+        Operation::Xor => (a ^ b, false, false, false),
         Operation::Shl => {
             let value = if c >= n { 0u64 } else { (a << c) & mask };
             let cf = c <= n && ((a >> (n - c)) & 1u64) != 0;
@@ -251,7 +296,8 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
     assert(next_flags == packed(flags, value, (modulus(width) / 2) as u64, cf, af, of));
     assert(next_flags & !0x8d5u64 == flags & !0x8d5u64) by(bit_vector)
         requires next_flags == (flags & !0x8d5u64) | bits, bits & !0x8d5u64 == 0u64;
-    Outcome { value, flags: next_flags, write: operation != Operation::Test }
+    Outcome { value, flags: next_flags,
+        write: operation != Operation::Test && operation != Operation::Cmp }
 }
 
 }

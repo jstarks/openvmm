@@ -37,9 +37,9 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
     const ENTRY: u64 = 0x2d98100;
-    const FRONTIER: u64 = 0x2d98124;
-    const STACK: u64 = 0x2603f38;
-    const RETURN: u64 = 0x2d9811a;
+    const FRONTIER: u64 = 0x2d9813a;
+    const STACK: u64 = 0x2603f48;
+    const RETURN: u64 = 0x2d98133;
     const CMDLINE: &str =
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
     type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -255,29 +255,33 @@ mod native {
         );
         let mut changes = BTreeMap::new();
         expected_walk(&memory, initial.registers.cr3, ENTRY, false, &mut changes)?;
-        for address in [0x2d8af5a, 0x1201f8b, 0x1edc370, FRONTIER, 0x30ae018] {
+        for address in [0x2d8af5a, 0x1201f8b, 0x1edc370, FRONTIER, 0x30ae018, 0x2000] {
             expected_walk(&memory, initial.registers.cr3, address, false, &mut changes)?;
         }
         for address in [0x2603ef0, 0x26041d0] {
             expected_walk(&memory, initial.registers.cr3, address, true, &mut changes)?;
         }
-        // Independent expected bytes of both ten-byte table operands and the #VC gate.
-        // Later pushes overwrite the original GDTR base and first CALL return slot.
+        ensure!(
+            memory.read_plain::<u32>(0x213c)? == 0 && memory.read_plain::<u64>(0x2250)? == 0,
+            "unexpected confidential-computing/setup-data boot parameters"
+        );
+        // Final stack words follow the original detection/check call paths, including
+        // the saved flag image overwritten after the first far return.
         for (address, value) in [
-            (0x2603f40, 0x10u64),
-            (0x2603f38, 0x2d98126),
-            (0x2603f28, 0x2d8af8d),
-            (0x2603f20, initial.registers.rbp),
+            (0x2603f40, RETURN),
+            (0x2603f38, 0x93),
+            (0x2603f30, 0),
+            (0x2603f28, 0x2d8ba13),
+            (0x2603f20, initial.registers.r13),
             (0x2603f00, 0x2604000),
-            (0x2603f08, 0x100000001d),
-            (0x2603f10, 0x8e00),
-            (0x2603f18, 0x2d982ca),
+            (0x2603f08, initial.registers.rbx),
+            (0x2603f10, 0x2000),
+            (0x2603f18, initial.registers.r12),
             (0x26041d0, 0x02d98e00001082ca),
             (0x26041d8, 0),
         ] {
             expected_store(&memory, &mut changes, address, &value.to_le_bytes())?;
         }
-        expected_store(&memory, &mut changes, 0x2603f36, &0x7fu16.to_le_bytes())?;
         expected_store(&memory, &mut changes, 0x2603efe, &0x1ffu16.to_le_bytes())?;
         let before = memory_digest(&memory, &BTreeMap::new())?;
         let mut binder = binders.pop().context("missing VP binder")?;
@@ -323,20 +327,22 @@ mod native {
         );
         let progress = vp.completed_batch_progress();
         ensure!(
-            progress.retired == 54 && progress.delivered == 0,
+            progress.retired == 134 && progress.delivered == 0,
             "wrong progress: {progress:?}"
         );
         let mut expected = initial.registers;
         expected.cr0 |= 0x10;
-        expected.rax = 0x2d98126;
-        expected.rdx = 0x2604000;
-        expected.rcx = 0x02d9000000000000;
-        expected.rsi = 0x00008e0000000000;
-        expected.rdi = 0;
+        expected.rax = 0;
+        expected.rbx = 0x10000;
+        expected.rdx = 0x6000000;
+        expected.rcx = 0;
+        expected.rsi = 0;
+        expected.rdi = 0x12f3c6f;
+        expected.r8 = 0;
         expected.r15 = initial.registers.rsi;
         expected.rsp = STACK;
         expected.rip = FRONTIER;
-        expected.rflags &= !0x108d5;
+        expected.rflags = (expected.rflags & !0x108d5) | 0x44;
         expected.gs.base = 0;
         expected.gdtr.base = 0x30ae000;
         expected.gdtr.limit = 0x7f;
@@ -345,6 +351,7 @@ mod native {
         expected.ds.selector = 0x18;
         expected.ss.selector = 0x18;
         expected.es.selector = 0x18;
+        expected.cs.selector = 0x10;
         let mut state = vp.access_state(Vtl::Vtl0);
         let actual = state.registers()?;
         ensure!(
@@ -365,9 +372,12 @@ mod native {
             memory_digest(&memory, &changes)? == before,
             "RAM changed outside the declared A/D, stack and #VC gate effects"
         );
-        let mut bytes = [0; 2];
+        let mut bytes = [0; 7];
         memory.read_at(FRONTIER, &mut bytes)?;
-        ensure!(bytes == [0x48, 0xcb], "wrong frontier bytes");
+        ensure!(
+            bytes == [0x48, 0x2b, 0x3d, 0x9b, 0xf3, 0x1b, 0],
+            "wrong frontier bytes"
+        );
         let functions = [0, 1, 0x8000_0000, 0x8000_0001, 0x8000_0008];
         let cpuid: Vec<_> = functions
             .into_iter()
@@ -382,12 +392,13 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
-                "entry": ENTRY, "frontier": actual.rip, "frontier_hex": "48cb",
+                "entry": ENTRY, "frontier": actual.rip, "frontier_hex": "482b3d9bf31b00",
                 "r15": actual.r15, "rsp": actual.rsp, "return_address": RETURN,
                 "rflags": actual.rflags, "seconds": seconds,
                 "complete_register_image_checked": true, "whole_ram_checked": true,
                 "descriptor_setup_returned": true,
-                "cpuid_target": cpuid, "cpuid_instruction_implemented": false,
+                "verify_cpu_returned_success": actual.rax == 0,
+                "cpuid_target": cpuid, "cpuid_instruction_implemented": true,
                 "linux_boot": false, "snp": false,
             })
         );

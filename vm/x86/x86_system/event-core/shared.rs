@@ -223,7 +223,7 @@ impl SharedEventMachine {
         let stack = cpu.gpr[4] / 16 * 16;
         if !flags_supported(cpu.flags) || !tables_supported(self.tables)
             || !canonical(cpu.rip) || !canonical(cpu.gpr[4]) || stack < count * 8
-            || match self.system { Some(system) => system.ss.selector != 16, None => false } {
+            || match self.system { Some(system) => system.ss.selector != 16 || system.cs.selector != 8, None => false } {
             return self.stop(EventDiagnostic::Profile);
         }
         let vector: u8 = match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13,
@@ -245,7 +245,7 @@ impl SharedEventMachine {
     {
         let cpu = self.core.cpu();
         if !flags_supported(cpu.flags) || !tables_supported(self.tables) || cpu.gpr[4] > u64::MAX - 40
-            || match self.system { Some(system) => system.ss.selector != 16, None => false } {
+            || match self.system { Some(system) => system.ss.selector != 16 || system.cs.selector != 8, None => false } {
             return self.stop(EventDiagnostic::Profile);
         }
         self.begin_word(cpu.gpr[4], WordAccess::Read, Phase::Pop { index: 0,
@@ -331,7 +331,13 @@ impl SharedEventMachine {
                     WordResult::Success(value) => self.word_value(value),
                     result => {
                         if let WordResult::PageFault(code) = result {
-                            if matches!(self.phase, Phase::NearCall { .. } | Phase::EntryMemory { .. }) {
+                            let far_return = match self.phase {
+                                Phase::EntryMemory { task, .. } => matches!(task,
+                                    entry::MemoryTask::FarTarget { .. } | entry::MemoryTask::FarSelector { .. }
+                                    | entry::MemoryTask::FarCode { .. }),
+                                _ => false,
+                            };
+                            if !far_return && matches!(self.phase, Phase::NearCall { .. } | Phase::EntryMemory { .. }) {
                                 return self.start_entry(Event::PageFault(code));
                             }
                         }

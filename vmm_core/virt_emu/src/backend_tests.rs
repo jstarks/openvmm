@@ -262,6 +262,70 @@ async fn loaded_nonlegacy_ss_rejects_iret_without_fabricating_segment_state(driv
 }
 
 #[async_test]
+async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: DefaultDriver) {
+    for iret in [false, true] {
+        let (mut bytes, owned) = fixture();
+        let mut program = vec![
+            0x6a, 0x10, 0x48, 0x8d, 0x05, 3, 0, 0, 0, 0x50, 0x48, 0xcb, 0x9c, 0x6a, 0, 0x9d, 0xb8,
+            1, 0, 0, 0, 0x0f, 0xa2, 0x9d,
+        ];
+        if iret {
+            program.extend([0x48, 0xcf]);
+        } else {
+            program.push(0xf4);
+        }
+        bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+        bytes[0x9010..0x9018].copy_from_slice(&0x00af9b000000ffffu64.to_le_bytes());
+        let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+        let mut vp = binder.bind().unwrap();
+        let mut initial = long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        );
+        initial.rsp = 0x18018;
+        vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+        let devices = Devices::new();
+        let stop = StopVpSource::new();
+        if iret {
+            assert!(matches!(
+                vp.run_vp(stop.checker(), &devices).await,
+                Err(VpHaltReason::PowerOff)
+            ));
+            assert_eq!(devices.faults.lock().len(), 1);
+            assert!(devices.faults.lock()[0].contains("Profile"));
+        } else {
+            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            park(run.as_mut());
+            stop.stop();
+            assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+            drop(run);
+            assert!(devices.faults.lock().is_empty());
+        }
+        let mut expected = initial;
+        expected.rax = 0x00a00f11;
+        expected.rbx = 0x10000;
+        expected.rcx = 0;
+        expected.rdx = 0x0780a179;
+        expected.cs.selector = 16;
+        expected.rip = CODE + if iret { 24 } else { 25 };
+        expected.rflags &= !0x10000;
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert_eq!(
+            memory.read_plain::<u64>(0x18010).unwrap(),
+            initial.rflags & !0x30000
+        );
+        assert_eq!(memory.read_plain::<u64>(0x18008).unwrap(), 0);
+        let progress = vp.completed_batch_progress();
+        assert_eq!(
+            (progress.retired, progress.delivered),
+            (if iret { 10 } else { 11 }, 0)
+        );
+    }
+}
+
+#[async_test]
 async fn entry_forms_retire_through_real_vp_and_preserve_the_call_push(driver: DefaultDriver) {
     let (mut bytes, owned) = fixture();
     bytes[CODE as usize..CODE as usize + 11]

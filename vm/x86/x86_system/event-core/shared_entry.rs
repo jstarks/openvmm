@@ -5,7 +5,7 @@ use super::*;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::operand;
 use memory_core::cpu_core::operand::{Address, Operand, Register, Segment, SegmentBases, Width};
-use memory_core::cpu_core::{descriptor, integer};
+use memory_core::cpu_core::{control, descriptor, integer, profile};
 
 verus! {
 
@@ -18,6 +18,12 @@ pub enum Instruction {
     Table { address: Address, idt: bool },
     Segment { segment: Segment, src: Register },
     Push { source: Operand },
+    Pop { dst: Register },
+    PushFlags,
+    PopFlags,
+    FarReturn,
+    Cpuid,
+    Branch { target: u64, condition: control::Condition },
     Return,
     Leave,
     Jump { target: u64, zero: Option<bool> },
@@ -33,6 +39,11 @@ pub enum MemoryTask {
     Push { stack: u64 },
     Return { stack: u64 },
     Leave { stack: u64 },
+    Pop { stack: u64, dst: Register },
+    Flags { stack: u64 },
+    FarTarget { stack: u64 },
+    FarSelector { stack: u64, target: u64 },
+    FarCode { stack: u64, target: u64, selector: u16 },
 }
 
 fn scalar(cpu: State, source: Operand) -> (out: Option<u64>)
@@ -97,6 +108,56 @@ impl SharedEventMachine {
         }
         let next = cpu.rip.wrapping_add(length as u64);
         match instruction {
+            Instruction::Cpuid => {
+                let function = (cpu.gpr[0] & 0xffff_ffff) as u32;
+                let subleaf = (cpu.gpr[1] & 0xffff_ffff) as u32;
+                let values = profile::cpuid(function, subleaf);
+                let ghost before = cpu@;
+                cpu.gpr[0] = values[0] as u64; cpu.gpr[3] = values[1] as u64;
+                cpu.gpr[1] = values[2] as u64; cpu.gpr[2] = values[3] as u64;
+                assert(cpu@.gpr =~= before.gpr.update(0, values[0] as int)
+                    .update(3, values[1] as int).update(1, values[2] as int).update(2, values[3] as int));
+                self.retire_entry(cpu, length, false, true)
+            },
+            Instruction::Branch { target, condition } => {
+                if control::condition(condition, cpu.flags) {
+                    if !canonical(target) {
+                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                    }
+                    cpu.rip = target;
+                    self.retire_entry(cpu, 0, false, false)
+                } else { self.retire_entry(cpu, length, false, false) }
+            },
+            Instruction::PushFlags => {
+                if cpu.gpr[4] < 8 || cpu.gpr[4] % 8 != 0 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let stack = cpu.gpr[4] - 8;
+                self.entry_memory(stack, Width::Qword, WordAccess::Write(control::flags_image(cpu.flags)),
+                    length, MemoryTask::Push { stack })
+            },
+            Instruction::Pop { dst } => {
+                if !dst.is_valid() || dst.width() != Width::Qword || cpu.gpr[4] > u64::MAX - 8
+                    || cpu.gpr[4] % 8 != 0 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                self.entry_memory(cpu.gpr[4], Width::Qword, WordAccess::Read, length,
+                    MemoryTask::Pop { stack: cpu.gpr[4], dst })
+            },
+            Instruction::PopFlags => {
+                if cpu.gpr[4] > u64::MAX - 8 || cpu.gpr[4] % 8 != 0 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                self.entry_memory(cpu.gpr[4], Width::Qword, WordAccess::Read, length,
+                    MemoryTask::Flags { stack: cpu.gpr[4] })
+            },
+            Instruction::FarReturn => {
+                if self.system.is_none() || cpu.gpr[4] > u64::MAX - 16 || cpu.gpr[4] % 8 != 0 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                self.entry_memory(cpu.gpr[4], Width::Qword, WordAccess::Read, length,
+                    MemoryTask::FarTarget { stack: cpu.gpr[4] })
+            },
             Instruction::ZeroExtend { dst, src } => {
                 if !dst.is_valid() || !src.is_valid() || dst.width().bits() <= src.width().bits()
                     || !matches!(src.width(), Width::Byte | Width::Word) {
@@ -220,6 +281,61 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::Pop { stack, dst } => {
+                if !dst.is_valid() || dst.width() != Width::Qword || stack > u64::MAX - 8 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                cpu.gpr[4] = stack + 8;
+                assert(cpu@.gpr =~= before.gpr.update(4, stack as int + 8));
+                let ghost registers = cpu.gpr@;
+                assert(registers =~= before.gpr.update(4, stack as int + 8)
+                    .map(|i:int,v:int|v as u64));
+                dst.write(&mut cpu.gpr, value);
+                assert(cpu@.gpr =~= operand::model::write(registers, dst, value)
+                    .map(|i: int, v: u64| v as int));
+            },
+            MemoryTask::Flags { stack } => {
+                let Some(flags) = control::restore_flags(value) else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                if stack > u64::MAX - 8 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                cpu.gpr[4] = stack + 8; cpu.flags = flags;
+                assert(cpu@.gpr =~= before.gpr.update(4, stack as int + 8));
+            },
+            MemoryTask::FarTarget { stack } => {
+                if stack > u64::MAX - 16 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                return self.entry_memory(stack + 8, Width::Qword, WordAccess::Read, length,
+                    MemoryTask::FarSelector { stack, target: value });
+            },
+            MemoryTask::FarSelector { stack, target } => {
+                if value == 0 || value > 0xffff || value % 8 != 0
+                    || value + 7 > self.tables.gdt_limit as u64
+                    || self.tables.gdt_base > u64::MAX - value || !canonical(target) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                return self.entry_memory(self.tables.gdt_base + value, Width::Qword,
+                    WordAccess::Read, length, MemoryTask::FarCode { stack, target, selector: value as u16 });
+            },
+            MemoryTask::FarCode { stack, target, selector } => {
+                let Some(code) = descriptor::load_code(value, selector) else {
+                    return self.stop(EventDiagnostic::Descriptor(Stage::Code));
+                };
+                let Some(mut system) = self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                if stack > u64::MAX - 16 || !canonical(target) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                system.cs = code;
+                self.system = Some(system);
+                cpu.gpr[4] = stack + 16; cpu.rip = target;
+                assert(cpu@.gpr =~= before.gpr.update(4, stack as int + 16));
+                return self.retire_entry(cpu, 0, false, false);
+            },
             MemoryTask::Load { dst } => {
                 if !dst.is_valid() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));

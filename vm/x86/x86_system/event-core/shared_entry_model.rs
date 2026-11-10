@@ -6,7 +6,7 @@ use super::super::memory_core::cpu_core::operand::{
     Address, Operand, Segment, SegmentBases, Width,
 };
 #[cfg(verus_keep_ghost)]
-use super::super::memory_core::cpu_core::{descriptor, integer, operand};
+use super::super::memory_core::cpu_core::{control, descriptor, integer, operand, profile};
 #[cfg(verus_keep_ghost)]
 use super::super::shared::entry::{Instruction, MemoryTask};
 use super::*;
@@ -59,6 +59,41 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
+        Instruction::Cpuid => {
+            let values = profile::target(((cpu.gpr[0] as u64) & 0xffff_ffffu64) as u32,
+                ((cpu.gpr[1] as u64) & 0xffff_ffffu64) as u32);
+            retire(s, model::State { gpr: cpu.gpr.update(0,values[0] as int)
+                .update(3,values[1] as int).update(1,values[2] as int).update(2,values[3] as int),
+                ..cpu },length,false,true)
+        },
+        Instruction::Branch { target, condition } => {
+            if control::model::condition(condition,cpu.flags) {
+                if !mmu_model::canonical(target as int) { unsupported(s) }
+                else { retire(s,model::State {rip:target as int,..cpu},0,false,false) }
+            } else { retire(s,cpu,length,false,false) }
+        },
+        Instruction::PushFlags => {
+            if cpu.gpr[4] < 8 || cpu.gpr[4] % 8 != 0 { unsupported(s) }
+            else { memory(s,(cpu.gpr[4]-8) as u64,Width::Qword,
+                WordAccess::Write(control::model::flags_image(cpu.flags)),length,
+                MemoryTask::Push {stack:(cpu.gpr[4]-8) as u64}) }
+        },
+        Instruction::Pop { dst } => {
+            if !dst.valid() || dst@.width != Width::Qword || cpu.gpr[4] + 8 > u64::MAX
+                || cpu.gpr[4] % 8 != 0 { unsupported(s) }
+            else { memory(s,cpu.gpr[4] as u64,Width::Qword,WordAccess::Read,length,
+                MemoryTask::Pop {stack:cpu.gpr[4] as u64,dst}) }
+        },
+        Instruction::PopFlags => {
+            if cpu.gpr[4] + 8 > u64::MAX || cpu.gpr[4] % 8 != 0 { unsupported(s) }
+            else { memory(s,cpu.gpr[4] as u64,Width::Qword,WordAccess::Read,length,
+                MemoryTask::Flags {stack:cpu.gpr[4] as u64}) }
+        },
+        Instruction::FarReturn => {
+            if s.system is None || cpu.gpr[4] + 16 > u64::MAX || cpu.gpr[4] % 8 != 0 { unsupported(s) }
+            else { memory(s,cpu.gpr[4] as u64,Width::Qword,WordAccess::Read,length,
+                MemoryTask::FarTarget {stack:cpu.gpr[4] as u64}) }
+        },
         Instruction::ZeroExtend { dst, src } => {
             if !dst.valid() || !src.valid() || operand::model::bits(dst@.width) <= operand::model::bits(src@.width)
                 || !(src@.width is Byte || src@.width is Word) { unsupported(s) }
@@ -130,6 +165,49 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::Pop {stack,dst} => {
+            if !dst.valid() || dst@.width != Width::Qword || stack as int + 8 > u64::MAX { unsupported(s) }
+            else {
+                let gpr = operand::model::write(
+                    cpu.gpr.update(4,stack as int+8).map(|i:int,v:int|v as u64),dst,value);
+                retire(s,model::State {gpr:gpr.map(|i:int,v:u64|v as int),..cpu},length,false,false)
+            }
+        },
+        MemoryTask::Flags {stack} => match control::model::restore_flags(value) {
+            None => unsupported(s),
+            Some(flags) => {
+                if stack as int + 8 > u64::MAX {unsupported(s)}
+                else {retire(s,model::State {gpr:cpu.gpr.update(4,stack as int+8),
+                    flags,..cpu},length,false,false)}
+            },
+        },
+        MemoryTask::FarTarget {stack} => {
+            if stack as int + 16 > u64::MAX {unsupported(s)}
+            else {memory(s,(stack+8) as u64,Width::Qword,WordAccess::Read,length,
+                MemoryTask::FarSelector {stack,target:value})}
+        },
+        MemoryTask::FarSelector {stack,target} => {
+            if value == 0 || value > 0xffff || value % 8 != 0
+                || value as int + 7 > s.tables.gdt_limit as int
+                || s.tables.gdt_base as int + value as int > u64::MAX || !mmu_model::canonical(target as int) {
+                unsupported(s)
+            } else {memory(s,(s.tables.gdt_base as int + value as int) as u64,Width::Qword,
+                WordAccess::Read,length,MemoryTask::FarCode {stack,target,selector:value as u16})}
+        },
+        MemoryTask::FarCode {stack,target,selector} => match descriptor::model::load_code(value,selector) {
+            None => stop(s,EventDiagnostic::Descriptor(Stage::Code)),
+            Some(code) => match s.system {
+                None => unsupported(s),
+                Some(system) => {
+                    if stack as int + 16 > u64::MAX || !mmu_model::canonical(target as int) {unsupported(s)}
+                    else {
+                        let system = super::super::memory_core::cpu_core::system::SystemState {cs:code,..system};
+                        retire(State {system:Some(system),..s},model::State {
+                            gpr:cpu.gpr.update(4,stack as int+16),rip:target as int,..cpu},0,false,false)
+                    }
+                },
+            },
+        },
         MemoryTask::Load { dst } => {
             if !dst.valid() { unsupported(s) }
             else { retire(s, model::State { gpr: operand::model::write(registers(cpu), dst, value)

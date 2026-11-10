@@ -88,7 +88,7 @@ pub open spec fn entry(s: State, event: Event) -> (State, Tick) {
     } else if event is External && e::vector(event) < 32 {
         stop(s, EventDiagnostic::InterruptWindow)
     } else if !entry_profile(s.core.cpu, s.tables, event)
-        || match s.system { Some(system) => system.ss.selector != 16, None => false } {
+        || match s.system { Some(system) => system.ss.selector != 16 || system.cs.selector != 8, None => false } {
         stop(s, EventDiagnostic::Profile)
     } else {
         let offset = e::vector(event) as int * 16;
@@ -103,7 +103,7 @@ pub open spec fn entry(s: State, event: Event) -> (State, Tick) {
 pub open spec fn iret(s: State) -> (State, Tick) {
     if !e::flags_supported(s.core.cpu.flags) || !e::tables_supported(s.tables)
         || s.core.cpu.gpr[4] > u64::MAX - 40
-        || match s.system { Some(system) => system.ss.selector != 16, None => false } {
+        || match s.system { Some(system) => system.ss.selector != 16 || system.cs.selector != 8, None => false } {
         stop(s, EventDiagnostic::Profile)
     } else {
         (word(s, s.core.cpu.gpr[4] as u64, WordAccess::Read,
@@ -328,7 +328,14 @@ pub open spec fn advance(s: State) -> (State, Tick) {
         _ => match m::request(s.core.mmu) {
             Request::CompleteWord { report } => match report.result {
                 WordResult::Success(v) => word_value(s, v),
-                result => if result is PageFault && (s.phase is NearCall || s.phase is EntryMemory) {
+                result => if result is PageFault && (s.phase is NearCall || s.phase is EntryMemory)
+                    && !(match s.phase {
+                        Phase::EntryMemory { task, .. } => matches!(task,
+                            super::shared::entry::MemoryTask::FarTarget { .. }
+                            | super::shared::entry::MemoryTask::FarSelector { .. }
+                            | super::shared::entry::MemoryTask::FarCode { .. }),
+                        _ => false,
+                    }) {
                     entry(s, Event::PageFault(match result { WordResult::PageFault(code) => code, _ => 0u8 }))
                 } else {
                     stop(s, EventDiagnostic::Memory { stage: word_location(s).0, address: word_location(s).1, result })

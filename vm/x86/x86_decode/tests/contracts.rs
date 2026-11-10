@@ -572,9 +572,6 @@ fn entry_xor_and_exact_validated_system_forms_have_bounded_cpu_admission() {
         }
     );
     for bytes in [
-        &[0x48, 0x31, 0xc0][..],
-        &[0x66, 0x31, 0xc0][..],
-        &[0x30, 0xc0][..],
         &[0x31, 0x00][..],
         &[0x66, 0x0f, 0x30][..],
         &[0x48, 0xe8, 0, 0, 0, 0][..],
@@ -674,7 +671,7 @@ fn descriptor_entry_admission_does_not_expand_unrelated_forms_or_skip_truncation
         assert_eq!(admit(packet(bytes)), DecodeDecision::More);
     }
     for bytes in [
-        &[0x48, 0xcb][..],
+        &[0xcb][..],
         &[0x66, 0xc3][..],
         &[0x66, 0x55][..],
         &[0x8e, 0xe0][..],
@@ -687,6 +684,116 @@ fn descriptor_entry_admission_does_not_expand_unrelated_forms_or_skip_truncation
             DecodeDecision::Unsupported,
             "{bytes:02x?}"
         );
+    }
+}
+
+#[test]
+fn cpu_check_forms_keep_exact_widths_flags_stack_and_branch_conditions() {
+    use x86_system::memory_core::cpu_core::{control::Condition, integer};
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    use x86_system::shared::entry::Instruction;
+    let packet = |bytes: &[u8]| {
+        let mut input = DecodeInput {
+            sequence: 1,
+            rip: 0x1000,
+            length: bytes.len() as u8,
+            bytes: [0; 15],
+        };
+        input.bytes[..bytes.len()].copy_from_slice(bytes);
+        input
+    };
+    for (bytes, expected) in [
+        (&[0x0f, 0xa2][..], Instruction::Cpuid),
+        (&[0x48, 0xcb][..], Instruction::FarReturn),
+        (&[0x9c][..], Instruction::PushFlags),
+        (&[0x9d][..], Instruction::PopFlags),
+        (
+            &[0x5b][..],
+            Instruction::Pop {
+                dst: reg(3, Width::Qword, false),
+            },
+        ),
+        (
+            &[0x41, 0x5d][..],
+            Instruction::Pop {
+                dst: reg(13, Width::Qword, false),
+            },
+        ),
+        (
+            &[0x76, 0x10][..],
+            Instruction::Branch {
+                target: 0x1012,
+                condition: Condition::BelowEqual,
+            },
+        ),
+        (
+            &[0x72, 0x10][..],
+            Instruction::Branch {
+                target: 0x1012,
+                condition: Condition::Below,
+            },
+        ),
+    ] {
+        assert_eq!(admit(packet(bytes)), DecodeDecision::Entry(expected));
+    }
+    for (bytes, operation, dst, width, value) in [
+        (
+            &[0x83, 0xf8, 1][..],
+            integer::Operation::Cmp,
+            0,
+            Width::Dword,
+            1,
+        ),
+        (
+            &[0x81, 0xf2, 0x69, 0xa1, 0, 7][..],
+            integer::Operation::Xor,
+            2,
+            Width::Dword,
+            0x700a169,
+        ),
+    ] {
+        assert!(
+            matches!(admit(packet(bytes)),DecodeDecision::Entry(Instruction::Integer {
+            operation:actual,dst:register,source:Operand::Immediate(Immediate{value:immediate,..})})
+            if actual==operation && register==reg(dst,width,false) && immediate==value)
+        );
+    }
+    for bytes in [
+        &[0x66, 0x31, 0xff][..],
+        &[0x48, 0x31, 0xc0][..],
+        &[0x30, 0xc0][..],
+    ] {
+        assert!(matches!(
+            admit(packet(bytes)),
+            DecodeDecision::Entry(Instruction::Integer {
+                operation: integer::Operation::Xor,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn cpu_check_admission_still_rejects_unimplemented_privilege_and_prefix_forms() {
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    for bytes in [
+        &[0x66, 0x9c][..],
+        &[0x66, 0x9d][..],
+        &[0xcb][..],
+        &[0x66, 0xcb][..],
+        &[0xca, 0, 0][..],
+        &[0x0f, 0x32][..],
+        &[0x66, 0x5b][..],
+        &[0xf3, 0x0f, 0xa2][..],
+    ] {
+        let mut packet = DecodeInput {
+            sequence: 1,
+            rip: 0,
+            length: bytes.len() as u8,
+            bytes: [0; 15],
+        };
+        packet.bytes[..bytes.len()].copy_from_slice(bytes);
+        assert_eq!(admit(packet), DecodeDecision::Unsupported, "{bytes:02x?}");
     }
 }
 

@@ -309,7 +309,7 @@ fn invalid_valid_unsupported_and_prefix_length_limit_are_distinct_from_truncatio
         bytes,
     };
     assert!(matches!(
-        x86_decode::admit(malformed),
+        admit(malformed),
         x86_system::shared::decode::DecodeDecision::Rejected
     ));
     assert!(matches!(

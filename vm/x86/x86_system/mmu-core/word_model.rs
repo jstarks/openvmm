@@ -78,14 +78,14 @@ pub open spec fn access(s: mmu_model::State, b: Seq<u8>, base: int, va: int,
                 Permissions { rw: true, user: true, nx: false }, s.config, req, user);
             match walked.1 {
                 mmu_model::Walk::Failed(r) => fault(s, walked.0, lift(r), va, walked.2),
-                mmu_model::Walk::Mapped { frame, leaf, permissions } => {
+                mmu_model::Walk::Mapped { frame, leaf, permissions, large } => {
                     let pa = frame + va % 4096;
                     if !memory_model::span(base, walked.0.len() as int, pa, 8) {
                         fault(s, walked.0, WordResult::Backing, va, walked.2)
                     } else {
                         match a {
                             WordAccess::Read => (mmu_model::State { cache: Some(mmu_model::Mapping {
-                                page: va / 4096, root: s.config.root as int, frame, permissions,
+                                page: va / 4096, root: s.config.root as int, frame, permissions, large,
                             }), ..s }, walked.0,
                                 WordResult::Success(memory_model::word(walked.0, pa - base) as u64), walked.2),
                             WordAccess::Write(value) => {

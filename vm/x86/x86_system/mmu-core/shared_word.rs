@@ -45,6 +45,10 @@ impl SharedMmu {
         ensures final(self).invariant(), final(self)@ ==
             spec::word_loaded(old(self)@, frame, permissions, leaf, first, tail, reads),
     {
+        let large = match self.phase {
+            Phase::Data { large, .. } | Phase::WordTail { large, .. } => large,
+            _ => { assert(false); return; },
+        };
         let address = frame + self.va % 4096;
         match self.word {
             Some(WordAccess::Read) => {
@@ -54,7 +58,7 @@ impl SharedMmu {
                     (first >> shift) | (tail << (64 - shift))
                 };
                 self.inner.cache = Some(Mapping { page: self.va / 4096,
-                    root: self.inner.config.root, frame, permissions });
+                    root: self.inner.config.root, frame, permissions, large });
                 self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(value),
                     table_reads: reads, virtual_address: self.va } };
             },
@@ -74,11 +78,11 @@ impl SharedMmu {
         ensures final(self).invariant(), final(self)@ == spec::word_data(old(self)@, word),
     {
         match self.phase {
-            Phase::Data { frame, permissions, leaf, reads } => {
+            Phase::Data { frame, permissions, leaf, reads, large } => {
                 if self.va % 8 == 0 {
                     self.word_loaded(frame, permissions, leaf, word, 0, reads);
                 } else {
-                    self.phase = Phase::WordTail { frame, permissions, leaf, first: word, reads };
+                    self.phase = Phase::WordTail { frame, permissions, leaf, first: word, reads, large };
                 }
             },
             _ => { proof { assert(false); } },
@@ -90,7 +94,7 @@ impl SharedMmu {
         ensures final(self).invariant(), final(self)@ == spec::word_tail(old(self)@, word),
     {
         match self.phase {
-            Phase::WordTail { frame, permissions, leaf, first, reads } =>
+            Phase::WordTail { frame, permissions, leaf, first, reads, .. } =>
                 self.word_loaded(frame, permissions, leaf, first, word, reads),
             _ => { proof { assert(false); } },
         }

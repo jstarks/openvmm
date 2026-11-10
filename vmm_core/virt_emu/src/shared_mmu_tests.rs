@@ -67,6 +67,69 @@ fn compare(mut data: Vec<u8>, c: Config, va: u64, access: Access, user: bool) {
 }
 
 #[test]
+fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
+    let mut data = vec![0; 0x400000];
+    for (address, value) in [(0x1000, 0x2007u64), (0x2000, 0x3007), (0x3008, 0x201087)] {
+        data[address..address + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    data[0x200000] = 0x71;
+    data[0x20f123] = 0x72;
+    data[0x3fffff] = 0x73;
+    let memory = GuestMemory::allocate(data.len());
+    memory.write_at(0, &data).unwrap();
+    let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..data.len() as u64)).unwrap();
+    let mut owned = Mmu::new(config(), 77);
+    let mut shared = SharedMmu::new(config(), 77);
+    for va in [0x200000, 0x20f123, 0x3fffff] {
+        let expected = owned.access(&mut data, 0, va, Access::Read, false);
+        assert!(shared.begin(va, Access::Read, false));
+        assert_eq!(finish(&mut shared, &ram), expected);
+    }
+    let expected = owned.access_word(&mut data, 0, 0x20f121, x86_system::WordAccess::Read, false);
+    assert!(shared.begin_word(0x20f121, x86_system::WordAccess::Read, false));
+    let Progress::CompleteWord(report) = shared.run(&ram, 64).unwrap() else {
+        panic!("qword did not complete")
+    };
+    assert_eq!(report, expected);
+    assert_eq!(report.result, x86_system::WordResult::Success(0x720000));
+    assert!(shared.invalidate(0x3ff000));
+    owned.invalidate(0x3ff000);
+    assert_eq!((shared.cache_count(), owned.cache_count()), (0, 0));
+    let mut actual = vec![0; data.len()];
+    memory.read_at(0, &mut actual).unwrap();
+    assert_eq!(actual, data);
+    for mask in [32, 64] {
+        memory.write_plain(0x3008, &(0x201087u64)).unwrap();
+        let mut shared = SharedMmu::new(config(), 77);
+        assert!(shared.begin(0x20f123, Access::Write(0x93), false));
+        let mut raced = false;
+        let mut result = None;
+        for _ in 0..128 {
+            if let Request::Compare {
+                address: 0x3008,
+                expected,
+                replacement,
+            } = shared.request()
+            {
+                if !raced && expected & mask == 0 && replacement & mask != 0 {
+                    memory.write_plain(0x3008, &(expected & !2)).unwrap();
+                    raced = true;
+                }
+            }
+            if let Progress::Complete(report) = shared.run(&ram, 1).unwrap() {
+                result = Some(report.result);
+                break;
+            }
+        }
+        assert!(raced);
+        assert_eq!(result, Some(MmuResult::PageFault(3)));
+        assert_eq!(shared.cr2(), 0x20f123);
+        assert_eq!(memory.read_plain::<u8>(0x20f123).unwrap(), 0x72);
+        assert_eq!(memory.read_plain::<u64>(0x3008).unwrap() & 64, 0);
+    }
+}
+
+#[test]
 fn shared_mmu_matches_owned_full_ram_permission_matrix() {
     for pattern in 0..4096u64 {
         let mut data = bytes();

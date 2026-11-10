@@ -13,6 +13,7 @@ pub struct Mapping {
     pub root: int,
     pub frame: int,
     pub permissions: Permissions,
+    pub large: bool,
 }
 
 pub struct State {
@@ -32,7 +33,7 @@ pub struct Entry {
 }
 
 pub enum Walk {
-    Mapped { frame: int, leaf: int, permissions: Permissions },
+    Mapped { frame: int, leaf: int, permissions: Permissions, large: bool },
     Failed(MmuResult),
 }
 
@@ -50,13 +51,16 @@ pub open spec fn index(va: int, level: nat) -> int {
 }
 pub open spec fn entry(word: int, level: nat, nxe: bool) -> Entry {
     Entry {
-        base: (word / 4096 % 68719476736int) * 4096,
+        base: if level == 2 && bit(word, 128) {
+            (word / 2097152 % 134217728int) * 2097152
+        } else { (word / 4096 % 68719476736int) * 4096 },
         present: bit(word, 1),
         rw: bit(word, 2),
         user: bit(word, 4),
         nx: bit(word, 9223372036854775808int),
         reserved: word / 281474976710656int % 16 != 0
             || (!nxe && bit(word, 9223372036854775808int))
+            || (level == 2 && bit(word, 128) && word / 8192 % 256 != 0)
             || (level == 0 && (bit(word, 128) || bit(word, 256))),
         huge: (level == 1 || level == 2) && bit(word, 128),
     }
@@ -82,6 +86,9 @@ pub open spec fn accessed(word: int) -> int {
 pub open spec fn dirty(word: int) -> int {
     word + if bit(word, 64) { 0int } else { 64int }
 }
+pub open spec fn leaf_frame(base: int, va: int, level: nat) -> int {
+    base + if level == 2 { (va / 4096 % 512) * 4096 } else { 0int }
+}
 
 // Only structural/permission intersections without a sourced ordering are stopped.
 #[verifier::opaque]
@@ -104,15 +111,16 @@ pub open spec fn walk(b: Seq<u8>, base: int, table: int, va: int,
         } else if e.reserved {
             (b, Walk::Failed(if !allowed(next, c, a, user) { MmuResult::Ambiguous }
                 else { MmuResult::PageFault(pfec(c, a, user, true, true)) }), 1)
-        } else if e.huge {
+        } else if e.huge && level == 1 {
             (b, Walk::Failed(MmuResult::HugePage), 1)
         } else {
             let updated = memory_model::put(b, i, accessed(w));
-            if level >= 3 {
+            if level >= 3 || e.huge {
                 if !allowed(next, c, a, user) {
                     (updated, Walk::Failed(MmuResult::PageFault(pfec(c, a, user, true, false))), 1)
                 } else {
-                    (updated, Walk::Mapped { frame: e.base, leaf: i, permissions: next }, 1)
+                    (updated, Walk::Mapped { frame: leaf_frame(e.base, va, level),
+                        leaf: i, permissions: next, large: level == 2 }, 1)
                 }
             } else {
                 let rest = walk(updated, base, e.base, va, level + 1, next, c, a, user);
@@ -124,7 +132,9 @@ pub open spec fn walk(b: Seq<u8>, base: int, table: int, va: int,
 
 pub open spec fn invalidate(s: State, va: int) -> State {
     State { cache: match s.cache {
-        Some(m) => if m.page == va / 4096 { None } else { Some(m) },
+        Some(m) => if m.page == va / 4096 || (m.large && m.page / 512 == va / 2097152) {
+            None
+        } else { Some(m) },
         None => None,
     }, ..s }
 }
@@ -164,7 +174,7 @@ pub open spec fn access(s: State, b: Seq<u8>, base: int, va: int, a: Access, use
                 Permissions { rw: true, user: true, nx: false }, s.config, a, user);
             match walked.1 {
                 Walk::Failed(r) => fault(s, walked.0, r, va, walked.2),
-                Walk::Mapped { frame, leaf, permissions } => {
+                Walk::Mapped { frame, leaf, permissions, large } => {
                     let pa = frame + va % 4096;
                     if !memory_model::span(base, walked.0.len() as int, pa, 1) {
                         fault(s, walked.0, MmuResult::Backing, va, walked.2)
@@ -177,7 +187,7 @@ pub open spec fn access(s: State, b: Seq<u8>, base: int, va: int, a: Access, use
                                     d.update(pa - base, value), MmuResult::Success(value), walked.2)
                             },
                             _ => finish(State { cache: Some(Mapping {
-                                page: va / 4096, root: s.config.root as int, frame, permissions,
+                                page: va / 4096, root: s.config.root as int, frame, permissions, large,
                             }), ..s }, walked.0, MmuResult::Success(walked.0[pa - base]), walked.2),
                         }
                     }

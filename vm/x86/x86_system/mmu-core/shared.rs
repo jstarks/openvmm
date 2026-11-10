@@ -24,11 +24,11 @@ pub enum Phase {
     Idle,
     Walk { table: u64, level: u8, permissions: Permissions },
     Mark { address: u64, word: u64, level: u8, frame: u64, permissions: Permissions },
-    Data { frame: u64, permissions: Permissions, leaf: Option<Leaf>, reads: u8 },
+    Data { frame: u64, permissions: Permissions, leaf: Option<Leaf>, reads: u8, large: bool },
     Dirty { pte: Leaf, address: u64, word: u64, reads: u8 },
     Store { address: u64, word: u64, reads: u8 },
     Done(Report),
-    WordTail { frame: u64, permissions: Permissions, leaf: Option<Leaf>, first: u64, reads: u8 },
+    WordTail { frame: u64, permissions: Permissions, leaf: Option<Leaf>, first: u64, reads: u8, large: bool },
     WordDirty { pte: Leaf, data: WordData, reads: u8 },
     WordStore { data: WordData, reads: u8 },
     WordHead { data: WordData, reads: u8 },
@@ -183,7 +183,7 @@ impl SharedMmu {
                 if m.page == va / 4096 && m.root == self.inner.config.root
                     && !matches!(access, Access::Write(_)) && allowed(m.permissions, self.inner.config, access, user) {
                     self.phase = Phase::Data { frame: m.frame, permissions: m.permissions,
-                        leaf: None, reads: 0 };
+                        leaf: None, reads: 0, large: m.large };
                     return true;
                 }
             }
@@ -318,15 +318,16 @@ impl SharedMmu {
                         MmuResult::Ambiguous
                     } else { MmuResult::PageFault(pfec(self.inner.config, self.access, self.user, true, true)) };
                     self.fail(result, level + 1);
-                } else if e.huge {
+                } else if e.huge && level == 1 {
                     self.fail(MmuResult::HugePage, level + 1);
                 } else {
                     self.phase = Phase::Mark { address: table + index(self.va, level) * 8,
-                        word, level, frame: e.base, permissions: next };
+                        word, level, frame: if e.huge { leaf_frame(e.base, self.va, level) } else { e.base },
+                        permissions: next };
                 }
                 true
             },
-            Phase::Data { frame, permissions, leaf, reads } => {
+            Phase::Data { frame, permissions, leaf, reads, large } => {
                 if self.word.is_some() {
                     self.word_data_read(word);
                     return true;
@@ -341,7 +342,7 @@ impl SharedMmu {
                     },
                     _ => {
                         self.inner.cache = Some(Mapping { page: self.va / 4096,
-                            root: self.inner.config.root, frame, permissions });
+                            root: self.inner.config.root, frame, permissions, large });
                         self.phase = Phase::Done(Report { result: MmuResult::Success(
                             ((word >> ((self.va % 8 * 8) as u32)) & 255) as u8),
                             table_reads: reads, virtual_address: self.va });
@@ -362,12 +363,12 @@ impl SharedMmu {
     {
         match self.phase {
             Phase::Mark { address, word, level, frame, permissions } => {
-                if level < 3 {
+                if level < 3 && !(level == 2 && word / 128 % 2 == 1) {
                     self.phase = Phase::Walk { table: frame, level: level + 1, permissions };
                 } else if !allowed(permissions, self.inner.config, self.access, self.user) {
-                    self.fail(MmuResult::PageFault(pfec(self.inner.config, self.access, self.user, true, false)), 4);
+                    self.fail(MmuResult::PageFault(pfec(self.inner.config, self.access, self.user, true, false)), level + 1);
                 } else {
-                    self.phase = Phase::Data { frame, permissions, reads: 4,
+                    self.phase = Phase::Data { frame, permissions, reads: level + 1, large: level == 2,
                         leaf: Some(Leaf { address, word: accessed(word) }) };
                 }
                 true

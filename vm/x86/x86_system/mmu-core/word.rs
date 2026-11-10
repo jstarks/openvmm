@@ -93,7 +93,7 @@ impl Mmu {
                 self.word_fault(result, va);
                 WordReport { result, table_reads: walked.1, virtual_address: va }
             },
-            Walk::Mapped { frame, leaf, permissions } => {
+            Walk::Mapped { frame, leaf, permissions, large } => {
                 let pa = frame + va % 4096;
                 let i = match memory_core::span(base, ram.len(), pa, 8) {
                     Some(i) => i, None => {
@@ -104,7 +104,7 @@ impl Mmu {
                 let value = match a {
                     WordAccess::Read => {
                         self.cache = Some(Mapping { page: va / 4096, root: self.config.root,
-                            frame, permissions });
+                            frame, permissions, large });
                         memory_core::load(ram, i)
                     },
                     WordAccess::Write(value) => {

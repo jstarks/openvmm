@@ -32,12 +32,12 @@ pub enum MmuResult {
 pub struct Report { pub result: MmuResult, pub table_reads: u8, pub virtual_address: u64 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Mapping { page: u64, root: u64, frame: u64, permissions: Permissions }
+struct Mapping { page: u64, root: u64, frame: u64, permissions: Permissions, large: bool }
 impl View for Mapping {
     type V = mmu_model::Mapping;
     closed spec fn view(&self) -> mmu_model::Mapping {
         mmu_model::Mapping { page: self.page as int, root: self.root as int,
-            frame: self.frame as int, permissions: self.permissions }
+            frame: self.frame as int, permissions: self.permissions, large: self.large }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +71,7 @@ impl Mmu {
         ensures final(self)@ == mmu_model::invalidate(old(self)@, va as int), final(self).invariant(),
     {
         if let Some(m) = self.cache {
-            if m.page == va / 4096 { self.cache = None; }
+            if m.page == va / 4096 || (m.large && m.page / 512 == va / 2097152) { self.cache = None; }
         }
     }
 }
@@ -102,12 +102,16 @@ fn entry(word: u64, level: u8, nxe: bool) -> (e: Entry)
     requires level < 4,
     ensures e@ == mmu_model::entry(word as int, level as nat, nxe),
         e.base < 0x1_0000_0000_0000u64, e.base % 4096 == 0,
+        level == 2 && e.huge ==> e.base % 2097152 == 0,
 {
-    let base = (word / 4096 % 68719476736) * 4096;
+    let base = if level == 2 && word / 128 % 2 == 1 {
+        (word / 2097152 % 134217728) * 2097152
+    } else { (word / 4096 % 68719476736) * 4096 };
     Entry { base, present: word % 2 == 1, rw: word / 2 % 2 == 1,
         user: word / 4 % 2 == 1, nx: word / 9223372036854775808 % 2 == 1,
         reserved: word / 281474976710656 % 16 != 0
             || (!nxe && word / 9223372036854775808 % 2 == 1)
+            || (level == 2 && word / 128 % 2 == 1 && word / 8192 % 256 != 0)
             || (level == 0 && (word / 128 % 2 == 1 || word / 256 % 2 == 1)),
         huge: (level == 1 || level == 2) && word / 128 % 2 == 1 }
 }
@@ -142,13 +146,22 @@ fn dirty(w: u64) -> (v: u64) ensures v as int == mmu_model::dirty(w as int)
     w | 64
 }
 
-enum Walk { Mapped { frame: u64, leaf: usize, permissions: Permissions }, Failed(MmuResult) }
+fn leaf_frame(base: u64, va: u64, level: u8) -> (frame: u64)
+    requires base < 0x1_0000_0000_0000u64, base % 4096 == 0,
+        level == 2 ==> base % 2097152 == 0,
+    ensures frame as int == mmu_model::leaf_frame(base as int, va as int, level as nat),
+        frame < 0x1_0000_0000_0000u64, frame % 4096 == 0,
+{
+    base + if level == 2 { (va / 4096 % 512) * 4096 } else { 0 }
+}
+
+enum Walk { Mapped { frame: u64, leaf: usize, permissions: Permissions, large: bool }, Failed(MmuResult) }
 impl View for Walk {
     type V = mmu_model::Walk;
     closed spec fn view(&self) -> mmu_model::Walk {
         match *self {
-            Walk::Mapped { frame, leaf, permissions } => mmu_model::Walk::Mapped {
-                frame: frame as int, leaf: leaf as int, permissions },
+            Walk::Mapped { frame, leaf, permissions, large } => mmu_model::Walk::Mapped {
+                frame: frame as int, leaf: leaf as int, permissions, large },
             Walk::Failed(r) => mmu_model::Walk::Failed(r),
         }
     }
@@ -181,6 +194,7 @@ fn descend(ram: &mut Vec<u8>, base: u64, table: u64, va: u64,
     rest
 }
 
+#[verifier::spinoff_prover]
 fn walk(ram: &mut Vec<u8>, base: u64, table: u64, va: u64,
     level: u8, p: Permissions, c: Config, a: Access, user: bool) -> (r: (Walk, u8))
     requires level < 4, table < 0x1_0000_0000_0000u64, table % 4096 == 0,
@@ -219,19 +233,20 @@ fn walk(ram: &mut Vec<u8>, base: u64, table: u64, va: u64,
         proof { reveal(mmu_model::walk); }
         return (Walk::Failed(fault), 1);
     }
-    if e.huge {
+    if e.huge && level == 1 {
         proof { reveal(mmu_model::walk); }
         return (Walk::Failed(MmuResult::HugePage), 1);
     }
     let aw = accessed(w);
     assert(aw as int == mmu_model::accessed(w as int));
-    if level == 3 {
+    if level == 3 || e.huge {
         memory_core::store(ram, i, aw);
         proof { reveal(mmu_model::walk); }
         if !allowed(next, c, a, user) {
             return (Walk::Failed(MmuResult::PageFault(pfec(c, a, user, true, false))), 1);
         }
-        (Walk::Mapped { frame: e.base, leaf: i, permissions: next }, 1)
+        (Walk::Mapped { frame: leaf_frame(e.base, va, level), leaf: i,
+            permissions: next, large: level == 2 }, 1)
     } else {
         let rest = descend(ram, base, e.base, va, level + 1, next, c, a, user, i, aw);
         proof { reveal(mmu_model::walk); }
@@ -295,7 +310,7 @@ impl Mmu {
                 self.fault(result, va);
                 Report { result, table_reads: walked.1, virtual_address: va }
             },
-            Walk::Mapped { frame, leaf, permissions } => {
+            Walk::Mapped { frame, leaf, permissions, large } => {
                 let pa = frame + va % 4096;
                 let i = match memory_core::span(base, ram.len(), pa, 1) {
                     Some(i) => i, None => {
@@ -317,7 +332,7 @@ impl Mmu {
                     },
                     _ => {
                         self.cache = Some(Mapping { page: va / 4096, root: self.config.root,
-                            frame, permissions });
+                            frame, permissions, large });
                         ram[i]
                     },
                 };

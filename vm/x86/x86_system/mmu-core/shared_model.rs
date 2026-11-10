@@ -78,7 +78,7 @@ pub open spec fn begin(s: State, va: u64, access: Access, user: bool, word: Opti
             Some(c) => if c.page == va as int / 4096 && c.root == s.inner.config.root as int
                 && !(access is Write) && m::allowed(c.permissions, s.inner.config, access, user) {
                 State { phase: Phase::Data { frame: c.frame as u64,
-                    permissions: c.permissions, leaf: None, reads: 0 }, ..t }
+                    permissions: c.permissions, leaf: None, reads: 0, large: c.large }, ..t }
             } else { restart(t) },
             None => restart(t),
         }
@@ -133,15 +133,16 @@ pub open spec fn read(s: State, word: u64) -> State {
                     MmuResult::Ambiguous
                 } else { MmuResult::PageFault(m::pfec(s.inner.config, s.access, s.user, true, true)) },
                 (level + 1) as u8)
-            } else if e.huge {
+            } else if e.huge && level == 1 {
                 fault(s, MmuResult::HugePage, (level + 1) as u8)
             } else {
                 State { phase: Phase::Mark {
                     address: (table as int + m::index(s.va as int, level as nat) * 8) as u64,
-                    word, level, frame: e.base as u64, permissions: next }, ..s }
+                    word, level, frame: if e.huge { m::leaf_frame(e.base, s.va as int, level as nat) as u64 } else { e.base as u64 },
+                    permissions: next }, ..s }
             }
         },
-        Phase::Data { frame, permissions, leaf, reads } => {
+        Phase::Data { frame, permissions, leaf, reads, large } => {
             if s.word is Some { word_data(s, word) } else {
             let address = (frame as int + s.va % 4096) as u64;
             match s.access {
@@ -151,7 +152,7 @@ pub open spec fn read(s: State, word: u64) -> State {
                 },
                 _ => State { inner: m::State { cache: Some(m::Mapping {
                         page: s.va as int / 4096, root: s.inner.config.root as int,
-                        frame: frame as int, permissions }), ..s.inner },
+                        frame: frame as int, permissions, large }), ..s.inner },
                     phase: Phase::Done(Report { result: MmuResult::Success(
                         ((word >> ((s.va % 8 * 8) as u32)) & 255) as u8),
                         table_reads: reads, virtual_address: s.va }), ..s },
@@ -165,13 +166,13 @@ pub open spec fn read(s: State, word: u64) -> State {
 pub open spec fn exchanged(s: State) -> State {
     match s.phase {
         Phase::Mark { address, word, level, frame, permissions } => {
-            if level < 3 {
+            if level < 3 && !(level == 2 && m::bit(word as int, 128)) {
                 State { phase: Phase::Walk { table: frame, level: (level + 1) as u8, permissions }, ..s }
             } else if !m::allowed(permissions, s.inner.config, s.access, s.user) {
                 fault(s, MmuResult::PageFault(m::pfec(
-                    s.inner.config, s.access, s.user, true, false)), 4)
+                    s.inner.config, s.access, s.user, true, false)), (level + 1) as u8)
             } else {
-                State { phase: Phase::Data { frame, permissions, reads: 4,
+                State { phase: Phase::Data { frame, permissions, reads: (level + 1) as u8, large: level == 2,
                     leaf: Some(Leaf { address, word: m::accessed(word as int) as u64 }) }, ..s }
             }
         },
@@ -226,11 +227,14 @@ pub open spec fn last_request(data: WordData) -> Request {
 }
 pub open spec fn word_loaded(s: State, frame: u64, permissions: Permissions,
     leaf: Option<Leaf>, first: u64, tail: u64, reads: u8) -> State {
+    let large = match s.phase {
+        Phase::Data { large, .. } | Phase::WordTail { large, .. } => large, _ => false,
+    };
     let address = (frame as int + s.va % 4096) as u64;
     match s.word {
         Some(WordAccess::Read) => State { inner: m::State { cache: Some(m::Mapping {
             page: s.va as int / 4096, root: s.inner.config.root as int,
-            frame: frame as int, permissions }), ..s.inner },
+            frame: frame as int, permissions, large }), ..s.inner },
             phase: Phase::WordDone { report: WordReport { result: WordResult::Success(
                 joined(first, tail, s.va % 8)), table_reads: reads, virtual_address: s.va } }, ..s },
         Some(WordAccess::Write(value)) => match leaf {
@@ -243,16 +247,16 @@ pub open spec fn word_loaded(s: State, frame: u64, permissions: Permissions,
 }
 pub open spec fn word_data(s: State, word: u64) -> State {
     match s.phase {
-        Phase::Data { frame, permissions, leaf, reads } => {
+        Phase::Data { frame, permissions, leaf, reads, large } => {
             if s.va % 8 == 0 { word_loaded(s, frame, permissions, leaf, word, 0, reads) }
-            else { State { phase: Phase::WordTail { frame, permissions, leaf, first: word, reads }, ..s } }
+            else { State { phase: Phase::WordTail { frame, permissions, leaf, first: word, reads, large }, ..s } }
         },
         _ => s,
     }
 }
 pub open spec fn word_tail(s: State, word: u64) -> State {
     match s.phase {
-        Phase::WordTail { frame, permissions, leaf, first, reads } =>
+        Phase::WordTail { frame, permissions, leaf, first, reads, .. } =>
             word_loaded(s, frame, permissions, leaf, first, word, reads),
         _ => s,
     }

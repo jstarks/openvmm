@@ -92,6 +92,11 @@ describes the source definitions.
   to promise no mutation outside the SMB server and all cooperating access to
   share one provider instance. Neither mode enables guest caching or silently
   falls back to the other.
+* `--vsmb-software-caching`: Requires `--vsmb-linux` or `--vsmb-windows`.
+  Opt into software-managed oplocks and SMB 2.1 leases only when the host
+  promises no mutation outside this SMB service. All cooperating SMB access
+  must share the same provider instance. Off by default; independent of the
+  Windows byte-range lock mode. This does not acquire host-kernel oplocks.
 * `--hypervisor <SPEC>`: Select a specific hypervisor backend, optionally with
   backend-specific parameters. The format is `name` or `name:key=val,key,...`.
   Available backends: `whp` (Windows), `kvm` (Linux), `mshv` (Linux,

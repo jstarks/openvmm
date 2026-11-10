@@ -1204,13 +1204,18 @@ flags:
 
     /// expose a Linux host directory as the writable vSMB share "linux" (Linux 6.6+)
     #[cfg(target_os = "linux")]
-    #[clap(long, value_name = "ROOT", conflicts_with_all = ["no_vmbus", "vsmb_memory"])]
+    #[clap(long, value_name = "ROOT", group = "vsmb_host", conflicts_with_all = ["no_vmbus", "vsmb_memory"])]
     pub vsmb_linux: Option<PathBuf>,
 
     /// expose a Windows NTFS directory as the writable vSMB share "windows"
     #[cfg(windows)]
-    #[clap(long, value_name = "ROOT", conflicts_with_all = ["no_vmbus", "vsmb_memory"])]
+    #[clap(long, value_name = "ROOT", group = "vsmb_host", conflicts_with_all = ["no_vmbus", "vsmb_memory"])]
     pub vsmb_windows: Option<PathBuf>,
+
+    /// software SMB caching; the host promises no mutation outside this SMB server
+    #[cfg(any(windows, target_os = "linux"))]
+    #[clap(long, requires = "vsmb_host")]
+    pub vsmb_software_caching: bool,
 
     /// Windows byte-range enforcement (default: native); synthetic requires no host mutation
     #[cfg(windows)]
@@ -5775,6 +5780,39 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(opt.vsmb_windows_locks, Some(VsmbWindowsLockMode::Synthetic));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn software_caching_requires_an_explicit_native_export() {
+        for args in [
+            vec!["openvmm", "--uefi", "--vsmb-software-caching"],
+            vec![
+                "openvmm",
+                "--uefi",
+                "--vsmb-memory",
+                "memory",
+                "--vsmb-software-caching",
+            ],
+        ] {
+            assert!(Options::try_parse_from(args).is_err());
+        }
+        let host_arg = if cfg!(windows) {
+            "--vsmb-windows"
+        } else {
+            "--vsmb-linux"
+        };
+        let opt = Options::try_parse_from(["openvmm", "--uefi", host_arg, "export"]).unwrap();
+        assert!(!opt.vsmb_software_caching);
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--uefi",
+            host_arg,
+            "export",
+            "--vsmb-software-caching",
+        ])
+        .unwrap();
+        assert!(opt.vsmb_software_caching);
     }
 
     #[test]

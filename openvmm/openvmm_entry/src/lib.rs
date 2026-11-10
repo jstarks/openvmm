@@ -1883,6 +1883,7 @@ async fn vm_config_from_command_line(
             vsmb_resources::VsmbLinuxDeviceHandle {
                 share_name: "linux".into(),
                 root_path,
+                software_caching: opt.vsmb_software_caching,
             }
             .into_resource(),
         ));
@@ -1910,6 +1911,7 @@ async fn vm_config_from_command_line(
                 share_name: "windows".into(),
                 root_path,
                 lock_mode,
+                software_caching: opt.vsmb_software_caching,
             }
             .into_resource(),
         ));

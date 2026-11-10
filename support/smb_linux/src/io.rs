@@ -180,9 +180,11 @@ impl Io {
         }
         let permit = Permit(self.workers.clone());
         check(request)?;
+        let keepalive = request.clone();
         // The job, not its awaiting future, owns the slot and native inputs.
         blocking::unblock(move || {
             let _permit = permit;
+            let _keepalive = keepalive;
             work()
         })
         .await

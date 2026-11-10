@@ -36,6 +36,7 @@ async fn vsmb_linux_file_operations(
                     vsmb_resources::VsmbLinuxDeviceHandle {
                         share_name: "linux".into(),
                         root_path,
+                        software_caching: false,
                     }
                     .into_resource(),
                 ));
@@ -218,7 +219,13 @@ async fn vsmb_windows_native_file_operations(
     _extra_deps: (),
     driver: DefaultDriver,
 ) -> anyhow::Result<()> {
-    windows_file_operations(config, driver, vsmb_resources::VsmbWindowsLockMode::Native).await
+    windows_file_operations(
+        config,
+        driver,
+        vsmb_resources::VsmbWindowsLockMode::Native,
+        false,
+    )
+    .await
 }
 
 #[cfg(windows)]
@@ -232,6 +239,39 @@ async fn vsmb_windows_synthetic_file_operations(
         config,
         driver,
         vsmb_resources::VsmbWindowsLockMode::Synthetic,
+        false,
+    )
+    .await
+}
+
+#[cfg(windows)]
+#[openvmm_test(uefi_aarch64(vhd(windows_11_enterprise_aarch64)))]
+async fn vsmb_windows_native_software_caching(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _extra_deps: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    windows_file_operations(
+        config,
+        driver,
+        vsmb_resources::VsmbWindowsLockMode::Native,
+        true,
+    )
+    .await
+}
+
+#[cfg(windows)]
+#[openvmm_test(uefi_aarch64(vhd(windows_11_enterprise_aarch64)))]
+async fn vsmb_windows_synthetic_software_caching(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _extra_deps: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    windows_file_operations(
+        config,
+        driver,
+        vsmb_resources::VsmbWindowsLockMode::Synthetic,
+        true,
     )
     .await
 }
@@ -241,8 +281,10 @@ async fn windows_file_operations(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     driver: DefaultDriver,
     lock_mode: vsmb_resources::VsmbWindowsLockMode,
+    software_caching: bool,
 ) -> anyhow::Result<()> {
-    let host_changes = matches!(&lock_mode, vsmb_resources::VsmbWindowsLockMode::Native);
+    let host_changes =
+        !software_caching && matches!(&lock_mode, vsmb_resources::VsmbWindowsLockMode::Native);
     let root = tempfile::tempdir()?;
     std::fs::write(root.path().join("locked.bin"), [0; 4096])?;
     std::fs::hard_link(
@@ -250,20 +292,28 @@ async fn windows_file_operations(
         root.path().join("locked.bin.alias"),
     )?;
     std::fs::write(root.path().join("host-update.bin"), [0x11; 4096])?;
+    if software_caching {
+        std::fs::write(root.path().join("cached.bin"), [0; 4096])?;
+        std::fs::hard_link(
+            root.path().join("cached.bin"),
+            root.path().join("cached.bin.alias"),
+        )?;
+    }
     let root_path = root
         .path()
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 test root"))?
         .to_owned();
     let (mut vm, agent) = config
-        .modify_backend(|b| {
-            b.without_save_restore().with_custom_config(|c| {
+        .modify_backend(move |b| {
+            b.without_save_restore().with_custom_config(move |c| {
                 c.vmbus_devices.push((
                     DeviceVtl::Vtl0,
                     vsmb_resources::VsmbWindowsDeviceHandle {
                         share_name: "windows".into(),
                         root_path,
                         lock_mode,
+                        software_caching,
                     }
                     .into_resource(),
                 ));
@@ -276,13 +326,14 @@ async fn windows_file_operations(
         .split_once("\n[VsmbGuest]::Activate()")
         .ok_or_else(|| anyhow::anyhow!("guest bootstrap boundary missing"))?;
     let script = format!(
-        "{bootstrap}\n$VsmbHostChanges = ${host_changes}\n{}",
+        "{bootstrap}\n$VsmbHostChanges = ${host_changes}\n$VsmbSoftwareCaching = ${software_caching}\n{}",
         include_str!("../../../test_data/vsmb_windows_file_operations.ps1")
     );
     for signal in [
         "vsmb-lock-ready",
         "vsmb-native-ready",
         "vsmb-native-watch-ready",
+        "vsmb-cache-ready",
     ] {
         agent
             .write_file(format!("C:\\{signal}"), b"waiting".as_slice())
@@ -358,6 +409,72 @@ async fn windows_file_operations(
         agent
             .write_file("C:\\vsmb-lock-go", b"go".as_slice())
             .await?;
+        if software_caching {
+            let mut ready = false;
+            for _ in 0..400 {
+                if agent.read_file("C:\\vsmb-cache-ready").await? == b"ready" {
+                    ready = true;
+                    break;
+                }
+                timer.sleep(std::time::Duration::from_millis(25)).await;
+            }
+            anyhow::ensure!(ready, "guest did not reach Windows cached-read checkpoint");
+            let opens_path = "vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/channel/connection/opens";
+            let inspect::Node::Dir(opens) = vm.inspect_vmm(opens_path).await? else {
+                anyhow::bail!("open table is not inspectable");
+            };
+            let mut held_path = None;
+            for open in &opens {
+                let inspect::Node::Dir(fields) = &open.node else {
+                    continue;
+                };
+                if !fields.iter().any(|field| field.name == "caching") {
+                    continue;
+                }
+                let path = format!("{opens_path}/{}/caching/provider/held", open.name);
+                let held = vm.inspect_vmm(&path).await?.to_string();
+                if held.contains("Read") {
+                    held_path = Some(path);
+                    break;
+                }
+            }
+            let held_path = held_path
+                .ok_or_else(|| anyhow::anyhow!("no server-granted Windows read caching"))?;
+            let held = vm.inspect_vmm(&held_path).await?.to_string();
+            vm.backend().pause().await?;
+            anyhow::ensure!(
+                vm.inspect_vmm(&held_path).await?.to_string() == held,
+                "pause changed Windows caching rights"
+            );
+            vm.backend().resume().await?;
+            let break_started = std::time::Instant::now();
+            agent
+                .write_file("C:\\vsmb-cache-go", b"go".as_slice())
+                .await?;
+            let mut written = false;
+            for _ in 0..400 {
+                if agent.read_file("C:\\vsmb-cache-ready").await? == b"written" {
+                    written = true;
+                    break;
+                }
+                timer.sleep(std::time::Duration::from_millis(25)).await;
+            }
+            anyhow::ensure!(
+                written,
+                "Windows alias writer did not complete after caching break"
+            );
+            anyhow::ensure!(
+                break_started.elapsed() < std::time::Duration::from_secs(10),
+                "Windows caching break used forced timeout"
+            );
+            anyhow::ensure!(
+                vm.inspect_vmm(&held_path).await?.to_string() == "\"None\"",
+                "Windows alias write retained stale cache rights"
+            );
+            agent
+                .write_file("C:\\vsmb-cache-read-go", b"go".as_slice())
+                .await?;
+        }
         let mut ready = false;
         for _ in 0..400 {
             if agent.read_file("C:\\vsmb-native-ready").await? == b"ready" {
@@ -431,6 +548,22 @@ async fn windows_file_operations(
         let path = format!("vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/server/backend/{resource}");
         let value = vm.inspect_vmm(&path).await?.to_string();
         anyhow::ensure!(value == "0", "Windows reboot retained {resource}: {value}");
+    }
+    if software_caching {
+        for resource in [
+            "reservations/opens",
+            "files",
+            "namespace_admissions",
+            "active_effects",
+        ] {
+            let value = vm.inspect_vmm(&format!(
+                "vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/server/backend/software_caching/{resource}"
+            )).await?.to_string();
+            anyhow::ensure!(
+                value == "0",
+                "Windows reboot retained caching {resource}: {value}"
+            );
+        }
     }
     let probe = format!(
         "{bootstrap}\n[VsmbGuest]::Activate('windows')\nif ([System.IO.File]::ReadAllText('V:\\retained.txt') -ne 'retained') {{ throw 'Wrong retained Windows data' }}"

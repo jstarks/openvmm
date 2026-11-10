@@ -8,6 +8,8 @@
 //! This ordering makes admission atomic with effects without awaiting under a
 //! synchronous lock. All opens, including uncached opens, need a reservation.
 
+pub mod mediated;
+
 use super::{
     Caching, CachingBreak, CachingBreakId, CachingGrant, CachingRequest, CachingSnapshot,
     CachingState, LeaseIdentity, Oplock,

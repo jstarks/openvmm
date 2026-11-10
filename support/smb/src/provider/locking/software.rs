@@ -198,6 +198,41 @@ impl<K> Drop for Owner<K> {
 #[derive(Clone)]
 pub struct SoftwareLockOwner<K>(Arc<Owner<K>>);
 
+/// Use the canonical acquisition-ID adapter without reentering a provider's hooks.
+pub fn scope<K: Clone + Eq + Send + 'static>(
+    owner: Result<SoftwareLockOwner<K>, Status>,
+) -> Box<dyn super::LockScope> {
+    Box::new(super::IdScope::new(SoftwareTarget(owner)))
+}
+
+struct SoftwareTarget<K>(Result<SoftwareLockOwner<K>, Status>);
+
+#[async_trait::async_trait]
+impl<K: Clone + Eq + Send + 'static> super::IdTarget for SoftwareTarget<K> {
+    async fn lock(
+        &self,
+        range: ByteRange,
+        exclusive: bool,
+        fail_immediately: bool,
+        request: &RequestContext,
+    ) -> Result<LockId, Status> {
+        self.0
+            .as_ref()
+            .map_err(|status| *status)?
+            .lock(range, exclusive, fail_immediately, request)
+            .await
+    }
+
+    async fn unlock(&self, range: ByteRange, _request: &RequestContext) -> Result<(), Status> {
+        self.0.as_ref().map_err(|status| *status)?.unlock(range)
+    }
+
+    async fn rollback(&self, id: LockId, _request: &RequestContext) -> Result<(), Status> {
+        self.0.as_ref().map_err(|status| *status)?.rollback(id);
+        Ok(())
+    }
+}
+
 impl<K> SoftwareLockOwner<K> {
     /// Bind a reserved open exactly once, before publishing it or admitting I/O.
     pub fn bind(&self, key: K) -> Result<(), Status> {

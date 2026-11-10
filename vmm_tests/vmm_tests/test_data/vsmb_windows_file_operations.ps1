@@ -7,6 +7,9 @@ $directory = 'V:\guest-test'
 [VsmbGuest]::TestPausedNotification($directory)
 [VsmbGuest]::TestNotifications($directory)
 [VsmbGuest]::TestLocks('V:\locked.bin', $true)
+if ($VsmbSoftwareCaching) {
+    [VsmbGuest]::TestCaching('V:\cached.bin', $true)
+}
 
 $source = Join-Path $directory 'source.bin'
 $target = Join-Path $directory 'renamed.bin'
@@ -39,4 +42,8 @@ if ($VsmbHostChanges) {
 [System.IO.File]::Delete($target)
 [System.IO.Directory]::Delete($directory)
 [System.IO.File]::WriteAllText('V:\retained.txt', 'retained')
+if ($VsmbSoftwareCaching) {
+    $retained = [System.IO.File]::Open('V:\retained.txt', [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+    try { $retained.Flush($true) } finally { $retained.Dispose() }
+}
 Write-Output 'VSMB_WINDOWS_FILE_OPERATIONS_PASSED'

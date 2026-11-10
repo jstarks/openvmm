@@ -71,11 +71,19 @@ impl vm_resource::AsyncResolveResource<VmbusDeviceHandleKind, vsmb_resources::Vs
         input: ResolveVmbusDeviceHandleParams<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let driver = input.driver_source.simple();
-        let filesystem = smb_linux::LinuxFs::new(
-            std::path::Path::new(&resource.root_path),
-            std::sync::Arc::new(driver.clone()),
-        )
-        .await?;
+        let filesystem = if resource.software_caching {
+            smb_linux::LinuxFs::new_with_software_caching(
+                std::path::Path::new(&resource.root_path),
+                std::sync::Arc::new(driver.clone()),
+            )
+            .await?
+        } else {
+            smb_linux::LinuxFs::new(
+                std::path::Path::new(&resource.root_path),
+                std::sync::Arc::new(driver.clone()),
+            )
+            .await?
+        };
         let device = VsmbDevice::with_filesystem(resource.share_name, driver.clone(), filesystem)?;
         Ok(SimpleDeviceWrapper::new(driver, device).into())
     }
@@ -125,12 +133,21 @@ impl
             vsmb_resources::VsmbWindowsLockMode::Native => smb_windows::LockMode::Native,
             vsmb_resources::VsmbWindowsLockMode::Synthetic => smb_windows::LockMode::Synthetic,
         };
-        let filesystem = smb_windows::WindowsFs::new_with_lock_mode(
-            std::path::Path::new(&resource.root_path),
-            std::sync::Arc::new(driver.clone()),
-            mode,
-        )
-        .await?;
+        let filesystem = if resource.software_caching {
+            smb_windows::WindowsFs::new_with_software_caching(
+                std::path::Path::new(&resource.root_path),
+                std::sync::Arc::new(driver.clone()),
+                mode,
+            )
+            .await?
+        } else {
+            smb_windows::WindowsFs::new_with_lock_mode(
+                std::path::Path::new(&resource.root_path),
+                std::sync::Arc::new(driver.clone()),
+                mode,
+            )
+            .await?
+        };
         let device = VsmbDevice::with_filesystem(resource.share_name, driver.clone(), filesystem)?;
         Ok(SimpleDeviceWrapper::new(driver, device).into())
     }

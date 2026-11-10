@@ -115,9 +115,11 @@ impl Io {
         }
         let permit = Permit(self.workers.clone());
         check(request)?;
+        let keepalive = request.clone();
         self.submitted.fetch_add(1, Ordering::Relaxed);
         blocking::unblock(move || {
             let _permit = permit;
+            let _keepalive = keepalive;
             work()
         })
         .await
@@ -130,6 +132,35 @@ mod tests {
     use pal_async::{DefaultDriver, async_test};
     use std::sync::atomic::AtomicBool;
     use test_with_tracing::test;
+
+    #[async_test]
+    async fn worker_retains_admission_context_after_awaiter_is_dropped(driver: DefaultDriver) {
+        struct Admission(Sender<()>);
+        impl Drop for Admission {
+            fn drop(&mut self) {
+                self.0.try_send(()).unwrap();
+            }
+        }
+        let io = Arc::new(Io::new(Arc::new(driver)));
+        let (released, releases) = async_channel::bounded(1);
+        let request = RequestContext::new(1).with_keepalive(Admission(released));
+        let (started, starts) = async_channel::bounded(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut operation = Box::pin(async move {
+            io.worker(&request, move || {
+                started.try_send(()).unwrap();
+                wait.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        assert!(futures::poll!(&mut operation).is_pending());
+        starts.recv().await.unwrap();
+        drop(operation);
+        assert!(releases.try_recv().is_err());
+        release.send(()).unwrap();
+        releases.recv().await.unwrap();
+    }
 
     #[async_test]
     async fn worker_capacity_survives_dropped_waiters_and_cancels_admission(driver: DefaultDriver) {

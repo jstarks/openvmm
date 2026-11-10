@@ -28,8 +28,21 @@ host opens. Select `--vsmb-windows-locks synthetic` only when the host promises
 not to mutate the backing files outside the SMB server. All cooperating SMB
 access must use the same provider instance; independently constructed providers
 do not share synthetic coordination. Errors never switch modes automatically.
-Native sharing and access checks apply in either mode, and neither mode grants
-oplocks or leases.
+Native sharing and access checks apply in either mode. Selecting a byte-range
+lock mode does not itself grant oplocks or leases.
+
+On either Linux or Windows, add `--vsmb-software-caching` only when the host
+promises not to mutate the backing files outside this SMB service. This opts
+into software-managed oplocks and SMB 2.1 leases using the shared caching layer;
+it does not acquire host-kernel oplocks. All cooperating SMB paths must share
+one provider instance. Caching is disabled by default for host-directory exports
+and is independent of the Windows byte-range lock mode. Do not expect host
+readers to see dirty data still cached by the guest.
+
+The shared layer orders cache breaks and acknowledgments before conflicting
+effects, including destructive opens through hard-link aliases. Namespace
+replacements conservatively revoke foreign handle caching store-wide when the
+destination identity is unknown. Ordinary data I/O can still overlap.
 
 ```admonish warning
 Host-directory exports are writable with the OpenVMM process's credentials. Choose an
@@ -44,7 +57,7 @@ Existing relative symlinks are exposed for guest evaluation; absolute-target
 traversal is rejected. Nested mounts within the export are allowed. Safe target
 inspection supplies directory-link hints; dangling links are file-like.
 
-External host changes are allowed, so the provider grants no oplocks or leases.
+By default, external host changes are allowed and no caching rights are granted.
 Notifications observe native changes; recursive membership changes can report
 overflow and require enumeration. SMB locks and sharing coordinate SMB clients,
 not uncooperative host processes. Guest security queries describe simple
@@ -63,8 +76,8 @@ alignment requirements.
 Guest ACL changes, creation security descriptors, EAs and named streams are
 rejected. Native byte locks have NTFS's enforcement scope: they do not prevent
 every host metadata or memory-mapped change. Synthetic locking instead relies
-on the exclusive-mutation ownership promise above. Guest caching remains a
-separate, unsupported policy for this provider.
+on the exclusive-mutation ownership promise above. Software caching is a
+separate opt-in under that same promise, not a consequence of synthetic locks.
 
 The initial compatibility target is Windows Server 2025. The tested transport
 uses version 1 negotiation and v2 page descriptors, copying data between guest
@@ -123,7 +136,7 @@ uncached external transfers, pending watch/lock pause-resume and reboot cleanup.
 Host-seeded hard-link aliases force server-side locking; guest hard-link creation
 is not part of this native v1 profile.
 
-On an ARM64 Windows host, run both Windows-backed fixtures. From WSL, first
+On an ARM64 Windows host, run the Windows-backed fixtures. From WSL, first
 configure [Windows cross-compilation](../../../dev_guide/getting_started/cross_compile.md)
 and put the output on a Windows filesystem:
 
@@ -133,12 +146,15 @@ cargo xflowey vmm-tests-run --target windows-aarch64 \
   --filter 'test(vsmb_windows_)' --skip-vhd-prompt
 ```
 
-Both modes have passed Windows 11 Enterprise ARM64 guest lifecycle tests on an
-ARM64 Windows host. The fixtures verify real NTFS bytes, hard-link lock ownership,
-uncached external transfers, pending watch/lock pause-resume and reboot cleanup.
-Only native mode tests external host mutations; synthetic mode preserves its
-exclusive-mutation promise. This is not Windows Server 2025 guest compatibility
-evidence for the Windows provider.
+Both lock modes, with and without software caching, have passed Windows 11
+Enterprise ARM64 guest lifecycle tests on an ARM64 Windows host. The fixtures
+verify real NTFS bytes, hard-link lock ownership, uncached external transfers,
+pending watch/lock pause-resume and reboot cleanup. Cached cases additionally
+verify actual server grants, retained rights across pause, acknowledged alias
+breaks and released caching reservations after reboot. Only uncached native mode
+tests external host mutations; the other cases preserve their exclusive-mutation
+promise. This is not Windows Server 2025 guest compatibility evidence for the
+Windows provider.
 
 The VM-independent [`smb` engine](https://openvmm.dev/rustdoc/linux/smb/index.html)
 is also exercised by selected Samba suites over its loopback TCP test frontend.

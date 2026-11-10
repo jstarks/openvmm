@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Identity and cooperative cancellation shared by calls of one server operation.
 #[derive(Clone)]
-pub struct RequestContext(Arc<RequestState>);
+pub struct RequestContext(Arc<RequestState>, Option<Arc<dyn Send + Sync>>);
 
 struct RequestState {
     id: u64,
@@ -37,11 +37,22 @@ struct RequestState {
 impl RequestContext {
     /// Create an independent operation context.
     pub fn new(id: u64) -> Self {
-        Self(Arc::new(RequestState {
-            id,
-            cancelled: AtomicBool::new(false),
-            changed: Event::new(),
-        }))
+        Self(
+            Arc::new(RequestState {
+                id,
+                cancelled: AtomicBool::new(false),
+                changed: Event::new(),
+            }),
+            None,
+        )
+    }
+
+    /// Retain admission state through this operation and any owned native work.
+    ///
+    /// Cancellation and identity remain shared with the original context.
+    /// Backends must clone the context into work that can outlive its awaiter.
+    pub fn with_keepalive<T: Send + Sync + 'static>(&self, state: T) -> Self {
+        Self(self.0.clone(), Some(Arc::new((self.1.clone(), state))))
     }
 
     /// Server-assigned identity, distinct from the client's message ID.

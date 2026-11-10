@@ -18,7 +18,8 @@ Linux, rather than installing kernel locks. All guest access must share one
 provider instance, and the host promises not to mutate the backing files
 outside the SMB server. Independent providers and host readers bypass its
 logical byte locks. Native sharing, access decisions and notifications remain
-native. Neither mode grants guest caching.
+native. Neither mode itself enables guest caching. Software caching is a separate
+opt-in under the exclusive-mutation ownership promise.
 
 Synthetic I/O retains its software admission guard in the actual native
 operation's owned buffer/worker state. Append samples EOF only under cooperating
@@ -203,9 +204,12 @@ Pause retains the accepted logical future and any in-flight native attempt.
 It must not cancel/replay work merely because the VM stopped. Destructive
 shutdown cancels and drains; fallback file drop releases native locks.
 
-If software caching is added later, complete required breaks before entering
-an exclusion interval that could block a client's flush, then revalidate.
-Byte-range admission must not deadlock cache-break acknowledgments.
+With software caching enabled, the shared admission layer completes required
+breaks before entering backend lock exclusion, then revalidates. It retains
+admission through accepted native work and tracks locks to constrain new grants.
+Cached-mode callers must use canonical `lock_request` scopes; legacy token hooks
+are unsupported so that they cannot bypass this coordination. Byte-range
+admission must not deadlock cache-break acknowledgments.
 
 ## Safety Arguments
 

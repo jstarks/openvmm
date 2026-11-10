@@ -13,6 +13,220 @@ use test_with_tracing::test;
 
 struct NativeFixture(WindowsFs);
 
+mod software_caching {
+    use super::*;
+    use smb::provider::{Caching, CachingState, LeaseIdentity};
+    use test_with_tracing::test;
+
+    fn lease(id: u8, state: CachingState) -> CachingRequest {
+        CachingRequest::Lease {
+            identity: LeaseIdentity {
+                authority: [1; 16],
+                client_guid: [2; 16],
+                key: [id; 16],
+            },
+            state,
+        }
+    }
+
+    fn control(grant: CachingGrant) -> Arc<dyn Caching> {
+        match grant {
+            CachingGrant::Lease { control, .. } | CachingGrant::Oplock { control, .. } => control,
+            CachingGrant::None => panic!("missing caching grant"),
+        }
+    }
+
+    #[async_test]
+    async fn alias_replacement_waits_for_dirty_lease_flush(driver: DefaultDriver) {
+        for mode in [LockMode::Native, LockMode::Synthetic] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("data"), b"original").unwrap();
+            std::fs::hard_link(root.path().join("data"), root.path().join("alias")).unwrap();
+            let fs =
+                WindowsFs::new_with_software_caching(root.path(), Arc::new(driver.clone()), mode)
+                    .await
+                    .unwrap();
+            let context = RequestContext::new(1);
+            let opened = fs
+                .open_with_caching(
+                    "data",
+                    options(CreateDisposition::OPEN),
+                    lease(1, CachingState::ReadWriteHandle),
+                    &context,
+                )
+                .await
+                .unwrap();
+            let owner = opened.file;
+            let control = control(opened.caching);
+            assert_eq!(control.snapshot().state, CachingState::ReadWriteHandle);
+            let replace_context = RequestContext::new(2);
+            let replace = fs.open_with_caching(
+                "alias",
+                options(CreateDisposition::OVERWRITE),
+                CachingRequest::None,
+                &replace_context,
+            );
+            let flush = async {
+                let change = control.wait_for_break(&context).await.unwrap();
+                assert_eq!(change.state, CachingState::None);
+                assert_eq!(
+                    std::fs::read(root.path().join("data")).unwrap(),
+                    b"original"
+                );
+                fs.write(&owner, 0, b"dirty!!!", &context).await.unwrap();
+                assert_eq!(
+                    std::fs::read(root.path().join("data")).unwrap(),
+                    b"dirty!!!"
+                );
+                control
+                    .acknowledge(change.id, change.state, &context)
+                    .await
+                    .unwrap();
+            };
+            let (replaced, ()) = futures::join!(replace, flush);
+            let replaced = replaced.unwrap();
+            assert!(std::fs::read(root.path().join("data")).unwrap().is_empty());
+            fs.close(&replaced.file, &context).await.unwrap();
+            fs.close(&owner, &context).await.unwrap();
+        }
+    }
+
+    #[async_test]
+    async fn aliases_share_lease_control_until_last_close(driver: DefaultDriver) {
+        for mode in [LockMode::Native, LockMode::Synthetic] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("data"), b"retained").unwrap();
+            std::fs::hard_link(root.path().join("data"), root.path().join("alias")).unwrap();
+            let fs =
+                WindowsFs::new_with_software_caching(root.path(), Arc::new(driver.clone()), mode)
+                    .await
+                    .unwrap();
+            let context = RequestContext::new(1);
+            let first = fs
+                .open_with_caching(
+                    "data",
+                    options(CreateDisposition::OPEN),
+                    lease(1, CachingState::Read),
+                    &context,
+                )
+                .await
+                .unwrap();
+            let control = control(first.caching);
+            let second = fs
+                .open_with_caching(
+                    "alias",
+                    options(CreateDisposition::OPEN),
+                    lease(1, CachingState::ReadWriteHandle),
+                    &context,
+                )
+                .await
+                .unwrap();
+            let other = self::control(second.caching);
+            assert_eq!(control.snapshot().instance, other.snapshot().instance);
+            assert_eq!(control.snapshot().state, CachingState::ReadWriteHandle);
+            fs.close(&first.file, &context).await.unwrap();
+            assert_eq!(other.snapshot().state, CachingState::ReadWriteHandle);
+            assert_eq!(
+                fs.read(&second.file, 0, 8, &context).await.unwrap(),
+                b"retained"
+            );
+            fs.close(&second.file, &context).await.unwrap();
+            assert_eq!(
+                other.wait_for_break(&context).await.unwrap_err(),
+                Status::FILE_CLOSED
+            );
+        }
+    }
+
+    #[async_test]
+    async fn reused_lease_key_is_rejected_before_truncation_or_creation(driver: DefaultDriver) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("data"), b"first").unwrap();
+        std::fs::write(root.path().join("other"), b"preserve").unwrap();
+        let fs =
+            WindowsFs::new_with_software_caching(root.path(), Arc::new(driver), LockMode::Native)
+                .await
+                .unwrap();
+        let context = RequestContext::new(1);
+        let opened = fs
+            .open_with_caching(
+                "data",
+                options(CreateDisposition::OPEN),
+                lease(1, CachingState::ReadWrite),
+                &context,
+            )
+            .await
+            .unwrap();
+        for (name, disposition) in [
+            ("other", CreateDisposition::OVERWRITE),
+            ("new", CreateDisposition::CREATE),
+        ] {
+            assert_eq!(
+                fs.open_with_caching(
+                    name,
+                    options(disposition),
+                    lease(1, CachingState::ReadWrite),
+                    &context,
+                )
+                .await
+                .err()
+                .unwrap()
+                .status(),
+                Status::INVALID_PARAMETER
+            );
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("other")).unwrap(),
+            b"preserve"
+        );
+        assert!(!root.path().join("new").exists());
+        fs.close(&opened.file, &context).await.unwrap();
+    }
+
+    #[async_test]
+    async fn handle_cache_break_retires_conflicting_native_share(driver: DefaultDriver) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("data"), b"retained").unwrap();
+        let fs =
+            WindowsFs::new_with_software_caching(root.path(), Arc::new(driver), LockMode::Native)
+                .await
+                .unwrap();
+        let context = RequestContext::new(1);
+        let first = fs
+            .open_with_caching(
+                "data",
+                OpenOptions {
+                    share_access: 0,
+                    ..options(CreateDisposition::OPEN)
+                },
+                lease(1, CachingState::ReadHandle),
+                &context,
+            )
+            .await
+            .unwrap();
+        let control = control(first.caching);
+        let incoming_context = RequestContext::new(2);
+        let incoming = fs.open_with_caching(
+            "data",
+            options(CreateDisposition::OPEN),
+            CachingRequest::None,
+            &incoming_context,
+        );
+        let retire = async {
+            let change = control.wait_for_break(&context).await.unwrap();
+            assert_eq!(change.state, CachingState::Read);
+            fs.close(&first.file, &context).await.unwrap();
+        };
+        let (incoming, ()) = futures::join!(incoming, retire);
+        let incoming = incoming.unwrap();
+        assert_eq!(
+            fs.read(&incoming.file, 0, 8, &context).await.unwrap(),
+            b"retained"
+        );
+        fs.close(&incoming.file, &context).await.unwrap();
+    }
+}
+
 impl Fixture for NativeFixture {
     type Backend = WindowsFs;
 
@@ -1729,6 +1943,52 @@ async fn native_sharing_across_host_opens_and_hard_link_aliases(driver: DefaultD
             .open(root.path().join("alias"))
             .is_ok()
     );
+}
+
+#[async_test]
+async fn identity_probe_preserves_sharing_and_supersede_identity(driver: DefaultDriver) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("data"), b"preserve").unwrap();
+    std::fs::hard_link(root.path().join("data"), root.path().join("alias")).unwrap();
+    let fs = WindowsFs::new(root.path(), Arc::new(driver)).await.unwrap();
+    let request = RequestContext::new(1);
+    let (file, _) = fs
+        .open(
+            "data",
+            OpenOptions {
+                share_access: 0,
+                ..options(CreateDisposition::OPEN)
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let identity = native::identity(file.get().unwrap().get()).unwrap();
+    for access in [fs::FILE_READ_ATTRIBUTES, fs::SYNCHRONIZE] {
+        let (probe, _) = native::open(
+            Some(&fs.0.root),
+            &"alias".encode_utf16().collect::<Vec<_>>(),
+            &Create {
+                access,
+                sharing: fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE | fs::FILE_SHARE_DELETE,
+                disposition: nt::FILE_OPEN,
+                options: 0,
+                attributes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(native::identity(&probe).unwrap(), identity);
+    }
+    assert_eq!(identity, fs.metadata(&file, &request).await.unwrap().id);
+    assert_eq!(fs.read(&file, 0, 8, &request).await.unwrap(), b"preserve");
+    fs.close(&file, &request).await.unwrap();
+    let (replaced, _) = fs
+        .open("alias", options(CreateDisposition::SUPERSEDE), &request)
+        .await
+        .unwrap();
+    assert_eq!(fs.metadata(&replaced, &request).await.unwrap().id, identity);
+    assert!(std::fs::read(root.path().join("data")).unwrap().is_empty());
+    fs.close(&replaced, &request).await.unwrap();
 }
 
 #[async_test]

@@ -26,6 +26,8 @@ pub struct VsmbLinuxDeviceHandle {
     pub share_name: String,
     /// Host directory captured when the device is resolved.
     pub root_path: String,
+    /// Software caching; the host promises no mutation outside this SMB service.
+    pub software_caching: bool,
 }
 
 impl ResourceId<VmbusDeviceHandleKind> for VsmbLinuxDeviceHandle {
@@ -50,6 +52,8 @@ pub struct VsmbWindowsDeviceHandle {
     pub root_path: String,
     /// Explicit coordination policy for every open of this provider instance.
     pub lock_mode: VsmbWindowsLockMode,
+    /// Software caching; the host promises no mutation outside this SMB service.
+    pub software_caching: bool,
 }
 
 impl ResourceId<VmbusDeviceHandleKind> for VsmbWindowsDeviceHandle {

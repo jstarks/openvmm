@@ -51,27 +51,66 @@ pub fn with_ids<'a, B: FileSystem + ?Sized>(
     backend: &'a B,
     file: &'a B::File,
 ) -> Box<dyn LockScope + 'a> {
-    Box::new(IdScope::new(backend, file))
+    Box::new(IdScope::new(FileTarget { backend, file }))
 }
 
-pub(super) struct IdScope<'a, B: FileSystem + ?Sized> {
+struct FileTarget<'a, B: FileSystem + ?Sized> {
     backend: &'a B,
     file: &'a B::File,
+}
+
+#[async_trait]
+trait IdTarget: Send + Sync {
+    async fn lock(
+        &self,
+        range: ByteRange,
+        exclusive: bool,
+        fail_immediately: bool,
+        request: &RequestContext,
+    ) -> Result<LockId, Status>;
+    async fn unlock(&self, range: ByteRange, request: &RequestContext) -> Result<(), Status>;
+    async fn rollback(&self, id: LockId, request: &RequestContext) -> Result<(), Status>;
+}
+
+#[async_trait]
+impl<B: FileSystem + ?Sized> IdTarget for FileTarget<'_, B> {
+    async fn lock(
+        &self,
+        range: ByteRange,
+        exclusive: bool,
+        fail_immediately: bool,
+        request: &RequestContext,
+    ) -> Result<LockId, Status> {
+        self.backend
+            .lock(self.file, range, exclusive, fail_immediately, request)
+            .await
+    }
+
+    async fn unlock(&self, range: ByteRange, request: &RequestContext) -> Result<(), Status> {
+        self.backend.unlock(self.file, range, request).await
+    }
+
+    async fn rollback(&self, id: LockId, request: &RequestContext) -> Result<(), Status> {
+        self.backend.rollback_lock(self.file, id, request).await
+    }
+}
+
+pub(super) struct IdScope<T> {
+    target: T,
     acquired: Vec<LockId>,
 }
 
-impl<'a, B: FileSystem + ?Sized> IdScope<'a, B> {
-    pub fn new(backend: &'a B, file: &'a B::File) -> Self {
+impl<T> IdScope<T> {
+    fn new(target: T) -> Self {
         Self {
-            backend,
-            file,
+            target,
             acquired: Vec::new(),
         }
     }
 }
 
 #[async_trait]
-impl<B: FileSystem + ?Sized> LockScope for IdScope<'_, B> {
+impl<T: IdTarget> LockScope for IdScope<T> {
     async fn lock(
         &mut self,
         range: ByteRange,
@@ -80,15 +119,15 @@ impl<B: FileSystem + ?Sized> LockScope for IdScope<'_, B> {
         request: &RequestContext,
     ) -> Result<(), Status> {
         let id = self
-            .backend
-            .lock(self.file, range, exclusive, fail_immediately, request)
+            .target
+            .lock(range, exclusive, fail_immediately, request)
             .await?;
         self.acquired.push(id);
         Ok(())
     }
 
     async fn unlock(&mut self, range: ByteRange, request: &RequestContext) -> Result<(), Status> {
-        self.backend.unlock(self.file, range, request).await
+        self.target.unlock(range, request).await
     }
 
     async fn settle(
@@ -98,7 +137,7 @@ impl<B: FileSystem + ?Sized> LockScope for IdScope<'_, B> {
     ) -> Result<(), Status> {
         if settlement == LockSettlement::Rollback {
             for &id in self.acquired.iter().rev() {
-                self.backend.rollback_lock(self.file, id, request).await?;
+                self.target.rollback(id, request).await?;
             }
         }
         Ok(())

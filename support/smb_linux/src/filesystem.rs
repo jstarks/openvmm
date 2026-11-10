@@ -10,11 +10,15 @@ use futures::FutureExt;
 use inspect::Inspect;
 use pal_async::driver::Driver;
 use parking_lot::Mutex;
+use smb::provider::caching::software::CachingKey;
+use smb::provider::caching::software::mediated::{
+    Change as CacheChange, MediatedCaching, MediatedOpen, NamespaceAdmission,
+};
 use smb::provider::locking::software::{SoftwareIo, SoftwareLockOwner, SoftwareLocks};
 use smb::provider::{
-    BasicInformation, ByteRange, FileControl, FileControlResult, FileSystem, FileSystemInformation,
-    LockId, Metadata, NotifyResult, OpenError, OpenOptions, ReparsePoint, RequestContext,
-    SymbolicLink, map_access, sharing_conflict,
+    BasicInformation, ByteRange, CachingGrant, CachingRequest, FileControl, FileControlResult,
+    FileSystem, FileSystemInformation, LockId, LockScope, Metadata, NotifyResult, OpenError,
+    OpenOptions, Opened, ReparsePoint, RequestContext, SymbolicLink, map_access, sharing_conflict,
 };
 use smb::security::{AccessAce, Acl, AclState, SecurityDescriptor, Sid};
 use smb::spec::{
@@ -55,6 +59,7 @@ struct Inner {
     changed: Event,
     locks: SoftwareLocks<Key>,
     security: SecurityDescriptor,
+    caching: Option<MediatedCaching>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -171,6 +176,7 @@ pub struct LinuxFile {
     key: Key,
     closed: AtomicBool,
     watch: futures::lock::Mutex<Option<Arc<Watch>>>,
+    caching: Option<Arc<MediatedOpen>>,
 }
 
 struct Resolved {
@@ -180,6 +186,24 @@ struct Resolved {
 }
 
 impl LinuxFile {
+    fn retain_caching(&self, request: &RequestContext) -> RequestContext {
+        match &self.caching {
+            Some(owner) => request.with_keepalive(owner.clone()),
+            None => request.clone(),
+        }
+    }
+
+    async fn caching_request(
+        &self,
+        change: CacheChange,
+        request: &RequestContext,
+    ) -> Result<RequestContext, Status> {
+        match &self.caching {
+            Some(owner) => owner.request(change, request).await,
+            None => Ok(request.clone()),
+        }
+    }
+
     fn pin(&self) -> Result<Arc<File>, Status> {
         self.pin.lock().clone().ok_or(Status::FILE_CLOSED)
     }
@@ -379,6 +403,23 @@ impl LinuxFs {
 
     /// Capture a configured host directory. Guest paths never become absolute host paths.
     pub async fn new(root: &Path, driver: Arc<dyn Driver>) -> Result<Self, OpenRootError> {
+        Self::new_inner(root, driver, None).await
+    }
+
+    /// Software caching requires all mutations and SMB paths to use this instance.
+    /// The host must not modify the backing files outside this SMB service.
+    pub async fn new_with_software_caching(
+        root: &Path,
+        driver: Arc<dyn Driver>,
+    ) -> Result<Self, OpenRootError> {
+        Self::new_inner(root, driver, Some(MediatedCaching::default())).await
+    }
+
+    async fn new_inner(
+        root: &Path,
+        driver: Arc<dyn Driver>,
+        caching: Option<MediatedCaching>,
+    ) -> Result<Self, OpenRootError> {
         let io = Io::new(driver, 4)?;
         let name = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in export path")
@@ -395,7 +436,99 @@ impl LinuxFs {
             changed: Event::new(),
             locks: SoftwareLocks::default(),
             security: share_security(),
+            caching,
         })))
+    }
+
+    fn stable_identity(&self, key: Key) -> Result<u64, Status> {
+        let mut state = self.0.state.lock();
+        if let Some(id) = state.identities.get(&key) {
+            return Ok(*id);
+        }
+        if state.identities.len() == IDENTITY_LIMIT {
+            return Err(Status::INSUFFICIENT_RESOURCES);
+        }
+        let id = state.next;
+        state.next = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
+        state.identities.insert(key, id);
+        Ok(id)
+    }
+
+    async fn caching_open_admission(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        requested: CachingRequest,
+        request: &RequestContext,
+    ) -> Result<Option<NamespaceAdmission>, OpenError> {
+        let Some(cache) = &self.0.caching else {
+            return Ok(None);
+        };
+        loop {
+            let admission = cache.namespace(request).await?;
+            let admitted = admission.request(request);
+            let resolved = self
+                .resolve(name, options.options().open_reparse_point(), &admitted)
+                .await?;
+            let key = resolved
+                .stat
+                .as_ref()
+                .map(|stat| {
+                    self.stable_identity(Key::of(stat))
+                        .map(|file| CachingKey { file, stream: 0 })
+                })
+                .transpose()?;
+            if let (Some(key), Some(stat)) = (key, resolved.stat.as_ref()) {
+                let access = if options.access().maximum_allowed() {
+                    AccessMask::FILE_ALL_ACCESS.into_bits()
+                } else {
+                    map_access(options.access)
+                };
+                let sharing = self.0.state.lock().opens.values().any(|open| {
+                    open.key == Key::of(stat)
+                        && sharing_conflict(access, options.share_access, open.access, open.sharing)
+                });
+                if sharing {
+                    if let Some(wait) = admission.prepare_sharing(key, requested)? {
+                        drop(admitted);
+                        drop(admission);
+                        wait.wait(request).await?;
+                        continue;
+                    }
+                }
+            }
+            let replacement = matches!(
+                options.disposition(),
+                CreateDisposition::SUPERSEDE
+                    | CreateDisposition::OVERWRITE
+                    | CreateDisposition::OVERWRITE_IF
+            );
+            if let Some(wait) = admission.prepare_open(
+                key,
+                map_access(options.access),
+                replacement,
+                options.options().delete_on_close(),
+                requested,
+            )? {
+                drop(admitted);
+                drop(admission);
+                wait.wait(request).await?;
+                continue;
+            }
+            return Ok(Some(admission));
+        }
+    }
+
+    async fn namespace_request(
+        &self,
+        file: &LinuxFile,
+        request: &RequestContext,
+    ) -> Result<RequestContext, Status> {
+        match (&self.0.caching, &file.caching) {
+            (Some(store), Some(owner)) => store.namespace_request(owner, request).await,
+            (None, Some(_)) => Err(Status::FILE_CLOSED),
+            _ => Ok(request.clone()),
+        }
     }
 
     async fn resolve(
@@ -620,20 +753,7 @@ impl LinuxFs {
     ) -> Result<Metadata, Status> {
         let stat = self.0.io.stat(file, request).await.map_err(status)?;
         let key = Key::of(&stat);
-        let id = {
-            let mut state = self.0.state.lock();
-            if let Some(id) = state.identities.get(&key) {
-                *id
-            } else {
-                if state.identities.len() == IDENTITY_LIMIT {
-                    return Err(Status::INSUFFICIENT_RESOURCES);
-                }
-                let id = state.next;
-                state.next = id.checked_add(1).ok_or(Status::INSUFFICIENT_RESOURCES)?;
-                state.identities.insert(key, id);
-                id
-            }
-        };
+        let id = self.stable_identity(key)?;
         let symlink = kind(&stat) == libc::S_IFLNK;
         let directory = kind(&stat) == libc::S_IFDIR
             || (symlink && !location.path.is_empty() && {
@@ -701,6 +821,7 @@ impl Inspect for LinuxFs {
         let state = self.0.state.lock();
         req.respond()
             .field("opens", state.opens.len())
+            .field("software_caching", &self.0.caching)
             .field("lock_count", self.0.locks.lock_count())
             .field("lock_waiters", self.0.locks.waiter_count())
             .field(
@@ -730,6 +851,30 @@ impl Inspect for LinuxFs {
 impl FileSystem for LinuxFs {
     type File = LinuxFile;
 
+    fn supports_leases(&self) -> bool {
+        self.0.caching.is_some()
+    }
+
+    fn lock_request<'a>(&'a self, file: &'a LinuxFile) -> Box<dyn LockScope + 'a> {
+        if self.0.caching.is_none() {
+            return smb::provider::locking::with_ids(self, file);
+        }
+        let owner = self.record(file).and_then(|record| {
+            if record.closing {
+                Err(Status::FILE_CLOSED)
+            } else if record.directory {
+                Err(Status::INVALID_PARAMETER)
+            } else {
+                Ok(record.locks)
+            }
+        });
+        let scope = smb::provider::locking::software::scope(owner);
+        match &file.caching {
+            Some(owner) => owner.lock_scope(scope),
+            None => scope,
+        }
+    }
+
     async fn open(
         &self,
         name: &str,
@@ -747,6 +892,27 @@ impl FileSystem for LinuxFs {
         options: OpenOptions<'_>,
         request: &RequestContext,
     ) -> Result<(LinuxFile, u32), OpenError> {
+        let opened = self
+            .open_with_caching(name, options, CachingRequest::None, request)
+            .await?;
+        Ok((opened.file, opened.action))
+    }
+
+    async fn open_with_caching(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        requested: CachingRequest,
+        request: &RequestContext,
+    ) -> Result<Opened<LinuxFile>, OpenError> {
+        let admission = self
+            .caching_open_admission(name, options, requested, request)
+            .await?;
+        let admitted = match &admission {
+            Some(admission) => admission.request(request),
+            None => request.clone(),
+        };
+        let request = &admitted;
         let disposition = options.disposition();
         if disposition.0 > CreateDisposition::OVERWRITE_IF.0 {
             return Err(Status::INVALID_PARAMETER.into());
@@ -907,7 +1073,7 @@ impl FileSystem for LinuxFs {
         {
             flags |= libc::O_APPEND;
         }
-        let committed = RequestContext::new(request.id());
+        let committed = RequestContext::new(request.id()).with_keepalive(request.clone());
         let continuation = if exists { request } else { &committed };
         let location = resolved.location;
         if options.options().delete_on_close() && location.path.is_empty() {
@@ -978,40 +1144,94 @@ impl FileSystem for LinuxFs {
                     .await
                     .map_err(status)?
             };
-        let file = LinuxFile {
+        let mut file = LinuxFile {
             reservation,
             file: Mutex::new(Some(native)),
             pin: Mutex::new(Some(pin)),
             key,
             closed: AtomicBool::new(false),
             watch: futures::lock::Mutex::new(None),
+            caching: None,
         };
         if truncated {
             self.set_len(&file, 0, request).await?;
         }
-        Ok((
-            file,
-            if !exists {
-                CreateAction::CREATED.0
-            } else if truncated {
-                if disposition == CreateDisposition::SUPERSEDE {
-                    CreateAction::SUPERSEDED.0
-                } else {
-                    CreateAction::OVERWRITTEN.0
-                }
+        let action = if !exists {
+            CreateAction::CREATED.0
+        } else if truncated {
+            if disposition == CreateDisposition::SUPERSEDE {
+                CreateAction::SUPERSEDED.0
             } else {
-                CreateAction::OPENED.0
-            },
-        ))
+                CreateAction::OVERWRITTEN.0
+            }
+        } else {
+            CreateAction::OPENED.0
+        };
+        let caching = if let Some(admission) = admission {
+            let metadata = match self.metadata(&file, request).await {
+                Ok(metadata) => metadata,
+                Err(status) => {
+                    self.close(
+                        &file,
+                        &RequestContext::new(request.id()).with_keepalive(request.clone()),
+                    )
+                    .await?;
+                    return Err(status.into());
+                }
+            };
+            let registered = admission.register(
+                CachingKey {
+                    file: metadata.id,
+                    stream: 0,
+                },
+                metadata.granted_access,
+                !metadata.is_directory() && !metadata.attributes().reparse_point(),
+                options.options().delete_on_close(),
+                requested,
+            );
+            let (owner, grant) = match registered {
+                Ok(result) => result,
+                Err(status) => {
+                    self.close(
+                        &file,
+                        &RequestContext::new(request.id()).with_keepalive(request.clone()),
+                    )
+                    .await?;
+                    return Err(status.into());
+                }
+            };
+            file.caching = Some(owner);
+            grant
+        } else {
+            CachingGrant::None
+        };
+        Ok(Opened {
+            file,
+            action,
+            caching,
+        })
     }
 
-    async fn close(&self, file: &LinuxFile, _request: &RequestContext) -> Result<(), Status> {
+    async fn close(&self, file: &LinuxFile, original: &RequestContext) -> Result<(), Status> {
         if !Arc::ptr_eq(&self.0, &file.reservation.inner) {
             return Err(Status::FILE_CLOSED);
         }
         if file.closed.load(Ordering::Acquire) {
+            if let Some(owner) = &file.caching {
+                owner.close();
+            }
             return Ok(());
         }
+        let cleanup = RequestContext::new(original.id()).with_keepalive(original.clone());
+        let request = if file
+            .caching
+            .as_ref()
+            .is_some_and(|owner| owner.is_deleting())
+        {
+            self.namespace_request(file, &cleanup).await?
+        } else {
+            file.retain_caching(&cleanup)
+        };
         let _closing = Closing {
             inner: self.0.clone(),
             id: file.reservation.id,
@@ -1027,7 +1247,6 @@ impl FileSystem for LinuxFs {
             _closing.locks.start_close()?;
         }
         _closing.locks.drain().await;
-        let request = RequestContext::new(0);
         let _node = self
             .claim(&[ClaimKey::Node(file.key)], false, &request)
             .await?;
@@ -1098,6 +1317,9 @@ impl FileSystem for LinuxFs {
         file.closed.store(true, Ordering::Release);
         _closing.locks.close();
         self.0.release(file.reservation.id);
+        if let Some(owner) = &file.caching {
+            owner.close();
+        }
         if let Err(error) = data_result {
             tracelimit::warn_ratelimited!(?error, "Linux SMB data descriptor close failed");
         }
@@ -1112,6 +1334,8 @@ impl FileSystem for LinuxFs {
         file: &LinuxFile,
         request: &RequestContext,
     ) -> Result<Metadata, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         let record = self.record(file)?;
         let deleted = self
             .0
@@ -1136,6 +1360,8 @@ impl FileSystem for LinuxFs {
         length: usize,
         request: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         if offset > i64::MAX as u64
             || length > smb::MAX_TRANSFER_SIZE
             || offset
@@ -1170,6 +1396,8 @@ impl FileSystem for LinuxFs {
         data: &[u8],
         request: &RequestContext,
     ) -> Result<usize, Status> {
+        let admitted = file.caching_request(CacheChange::Data, request).await?;
+        let request = &admitted;
         if offset > i64::MAX as u64
             || data.len() > smb::MAX_TRANSFER_SIZE
             || offset
@@ -1222,6 +1450,8 @@ impl FileSystem for LinuxFs {
     }
 
     async fn flush(&self, file: &LinuxFile, request: &RequestContext) -> Result<(), Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         let record = self.record(file)?;
         if record.reparse {
             return Err(Status::INVALID_DEVICE_REQUEST);
@@ -1236,7 +1466,7 @@ impl FileSystem for LinuxFs {
             return Err(Status::NOT_SUPPORTED);
         }
         // A WRITE may share this context after its bytes have already committed.
-        let committed = RequestContext::new(request.id());
+        let committed = RequestContext::new(request.id()).with_keepalive(request.clone());
         self.0
             .io
             .flush(Self::data(file)?, &committed)
@@ -1249,6 +1479,8 @@ impl FileSystem for LinuxFs {
         file: &LinuxFile,
         request: &RequestContext,
     ) -> Result<Vec<Metadata>, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         let record = self.record(file)?;
         if !record.directory {
             return Err(Status::NOT_A_DIRECTORY);
@@ -1313,6 +1545,8 @@ impl FileSystem for LinuxFs {
         length: u64,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = file.caching_request(CacheChange::Data, request).await?;
+        let request = &admitted;
         if length > i64::MAX as u64 {
             return Err(Status::INVALID_PARAMETER);
         }
@@ -1353,6 +1587,8 @@ impl FileSystem for LinuxFs {
         delete: bool,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = self.namespace_request(file, request).await?;
+        let request = &admitted;
         crate::io::check(request).map_err(status)?;
         let record = self.record(file)?;
         if !AccessMask::from_bits(record.access).delete() {
@@ -1392,6 +1628,9 @@ impl FileSystem for LinuxFs {
             state.deletes.remove(&record.location.identity());
         }
         drop(state);
+        if let Some(owner) = &file.caching {
+            owner.set_deleting(delete)?;
+        }
         if delete && record.directory {
             self.invalidate_watches(file.key);
         }
@@ -1404,6 +1643,8 @@ impl FileSystem for LinuxFs {
         info: BasicInformation,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = file.caching_request(CacheChange::Metadata, request).await?;
+        let request = &admitted;
         let record = self.record(file)?;
         if !AccessMask::from_bits(record.access).write_attributes() {
             return Err(Status::ACCESS_DENIED);
@@ -1481,6 +1722,8 @@ impl FileSystem for LinuxFs {
         file: &LinuxFile,
         request: &RequestContext,
     ) -> Result<FileSystemInformation, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         self.record(file)?;
         let stat = self
             .0
@@ -1530,6 +1773,9 @@ impl FileSystem for LinuxFs {
         fail_immediately: bool,
         request: &RequestContext,
     ) -> Result<LockId, Status> {
+        if self.0.caching.is_some() {
+            return Err(Status::NOT_SUPPORTED);
+        }
         range.validate()?;
         let open = self.record(file)?;
         crate::io::check(request).map_err(status)?;
@@ -1550,6 +1796,9 @@ impl FileSystem for LinuxFs {
         range: ByteRange,
         _request: &RequestContext,
     ) -> Result<(), Status> {
+        if self.0.caching.is_some() {
+            return Err(Status::NOT_SUPPORTED);
+        }
         range.validate()?;
         self.record(file)?.locks.unlock(range)
     }
@@ -1560,6 +1809,9 @@ impl FileSystem for LinuxFs {
         lock: LockId,
         _request: &RequestContext,
     ) -> Result<(), Status> {
+        if self.0.caching.is_some() {
+            return Err(Status::NOT_SUPPORTED);
+        }
         if !Arc::ptr_eq(&self.0, &file.reservation.inner) {
             return Err(Status::FILE_CLOSED);
         }
@@ -1665,6 +1917,8 @@ impl FileSystem for LinuxFs {
         replace: bool,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = self.namespace_request(file, request).await?;
+        let request = &admitted;
         let _node = self
             .claim(&[ClaimKey::Node(file.key)], false, request)
             .await?;

@@ -11,13 +11,15 @@ use inspect::Inspect;
 use pal_async::driver::Driver;
 use pal_async::windows::overlapped::OverlappedFile;
 use parking_lot::Mutex;
-use smb::provider::locking::{
-    self,
-    software::{SoftwareIo, SoftwareLockOwner, SoftwareLocks},
+use smb::provider::caching::software::CachingKey;
+use smb::provider::caching::software::mediated::{
+    Change as CacheChange, MediatedCaching, MediatedOpen,
 };
+use smb::provider::locking::software::{SoftwareIo, SoftwareLockOwner, SoftwareLocks};
 use smb::provider::{
-    BasicInformation, ByteRange, FileSystem, FileSystemInformation, LockId, LockScope, Metadata,
-    NotifyResult, OpenOptions, RequestContext, map_access,
+    BasicInformation, ByteRange, CachingGrant, CachingRequest, FileSystem, FileSystemInformation,
+    LockId, LockScope, Metadata, NotifyResult, OpenError, OpenOptions, Opened, RequestContext,
+    map_access,
 };
 use smb::security::SecurityDescriptor;
 use smb::spec::{
@@ -83,6 +85,7 @@ struct Inner {
     locks: Arc<Coordination>,
     lock_mode: LockMode,
     synthetic: SoftwareLocks<u64>,
+    caching: Option<MediatedCaching>,
 }
 
 struct Reservation(Arc<Inner>);
@@ -100,6 +103,7 @@ pub struct WindowsFile {
     hidden_access: u32,
     io_alignment: usize,
     watch: Arc<futures::lock::Mutex<Option<Arc<Watch>>>>,
+    caching: Option<Arc<MediatedOpen>>,
 }
 
 struct Open {
@@ -186,6 +190,24 @@ impl NativeFile {
 }
 
 impl WindowsFile {
+    fn retain_caching(&self, request: &RequestContext) -> RequestContext {
+        match &self.caching {
+            Some(owner) => request.with_keepalive(owner.clone()),
+            None => request.clone(),
+        }
+    }
+
+    async fn caching_request(
+        &self,
+        change: CacheChange,
+        request: &RequestContext,
+    ) -> Result<RequestContext, Status> {
+        match &self.caching {
+            Some(owner) => owner.request(change, request).await,
+            None => Ok(request.clone()),
+        }
+    }
+
     fn get(&self) -> Result<Arc<NativeFile>, Status> {
         self.file
             .lock()
@@ -221,6 +243,7 @@ impl Inspect for WindowsFs {
             .field("opens", self.0.opens.load(Ordering::Relaxed))
             .field("open_limit", OPEN_LIMIT)
             .field("lock_mode", mode)
+            .field("software_caching", &self.0.caching)
             .field("lock_count", locks)
             .field("lock_waiters", waiters)
             .field("watch_count", watches.len())
@@ -240,6 +263,116 @@ impl Inspect for WindowsFs {
 }
 
 impl WindowsFs {
+    async fn open_native(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        request: &RequestContext,
+    ) -> Result<(WindowsFile, u32), Status> {
+        check(request)?;
+        let parts = components(name)?;
+        let mut create = create(&options)?;
+        let logical_access = AccessMask::from_bits(map_access(options.access));
+        let hidden_read = logical_access.execute()
+            && !logical_access.read_data()
+            && !logical_access.maximum_allowed();
+        let unsupported_creation =
+            options.security.is_some() || options.extended_attributes.is_some();
+        let unbuffered = options.options & nt::FILE_NO_INTERMEDIATE_BUFFERING != 0;
+        if unsupported_creation {
+            create.disposition = match options.disposition() {
+                CreateDisposition::OPEN | CreateDisposition::OPEN_IF => nt::FILE_OPEN,
+                CreateDisposition::OVERWRITE | CreateDisposition::OVERWRITE_IF => {
+                    nt::FILE_OVERWRITE
+                }
+                _ => return Err(Status::NOT_SUPPORTED),
+            };
+        }
+        let reservation = self.reserve()?;
+        let owner = if self.0.lock_mode == LockMode::Synthetic {
+            Some(self.0.synthetic.reserve()?)
+        } else {
+            None
+        };
+        let mutation = if owner.is_some() && replacement_access(options.disposition()) != 0 {
+            Some(self.0.synthetic.mutation(request).await?)
+        } else {
+            None
+        };
+        let root = self.0.root.clone();
+        let result = self
+            .0
+            .io
+            .worker(request, move || {
+                let _mutation = mutation;
+                let (file, action) = walk(root, parts, &create)?;
+                let directory = if native::is_directory(&file)? {
+                    Some(native::identity(&file)?)
+                } else {
+                    None
+                };
+                let owner = if directory.is_none() {
+                    if let Some(owner) = &owner {
+                        owner.bind(native::identity(&file)?)?;
+                    }
+                    owner
+                } else {
+                    None
+                };
+                let io_alignment = if unbuffered {
+                    native::io_alignment(&file)?
+                } else {
+                    1
+                };
+                Ok(((file, action, directory, owner, io_alignment), reservation))
+            })
+            .await;
+        let ((file, action, directory, owner, io_alignment), reservation) = match result {
+            Err(Status::OBJECT_NAME_NOT_FOUND) if unsupported_creation => {
+                return Err(Status::NOT_SUPPORTED);
+            }
+            result => result?,
+        };
+        let file = native::overlapped(&*self.0.io.driver, file).map_err(|error| {
+            tracelimit::error_ratelimited!(?error, "cannot associate native SMB open with IOCP");
+            Status::INTERNAL_ERROR
+        })?;
+        let file = if let Some(id) = directory {
+            NativeFile::Directory(Directory {
+                file: Arc::new(file),
+                scan: Mutex::new(()),
+                id,
+                closing: AtomicBool::new(false),
+            })
+        } else {
+            let mut data = DataFile::new(file, self.0.locks.clone());
+            data.synthetic = owner;
+            NativeFile::Data(data)
+        };
+        Ok((
+            WindowsFile {
+                file: Mutex::new(Some(Open {
+                    file: Arc::new(file),
+                    _reservation: reservation,
+                })),
+                append_only: options.access().append_data()
+                    && !options.access().write_data()
+                    && !options.access().generic_write()
+                    && !options.access().generic_all(),
+                hidden_access: if hidden_read { fs::FILE_READ_DATA } else { 0 }
+                    | if action == CreateAction::CREATED.0 && !logical_access.maximum_allowed() {
+                        replacement_access(options.disposition()) & !logical_access.into_bits()
+                    } else {
+                        0
+                    },
+                io_alignment,
+                watch: Arc::new(futures::lock::Mutex::new(None)),
+                caching: None,
+            },
+            action,
+        ))
+    }
+
     /// Captures an export root. Native setup executes on a bounded worker.
     pub async fn new(
         root: impl AsRef<Path>,
@@ -254,8 +387,33 @@ impl WindowsFs {
         driver: Arc<dyn Driver>,
         lock_mode: LockMode,
     ) -> Result<Self, OpenRootError> {
+        Self::new_inner(root.as_ref(), driver, lock_mode, None).await
+    }
+
+    /// Software caching requires all mutations and SMB paths to use this instance.
+    /// The host must not modify the backing files outside this SMB service.
+    pub async fn new_with_software_caching(
+        root: impl AsRef<Path>,
+        driver: Arc<dyn Driver>,
+        lock_mode: LockMode,
+    ) -> Result<Self, OpenRootError> {
+        Self::new_inner(
+            root.as_ref(),
+            driver,
+            lock_mode,
+            Some(MediatedCaching::default()),
+        )
+        .await
+    }
+
+    async fn new_inner(
+        root: &Path,
+        driver: Arc<dyn Driver>,
+        lock_mode: LockMode,
+        caching: Option<MediatedCaching>,
+    ) -> Result<Self, OpenRootError> {
         let io = Io::new(driver);
-        let root = root.as_ref().to_owned();
+        let root = root.to_owned();
         let root = io
             .worker(&RequestContext::new(0), move || native::root(&root))
             .await
@@ -268,6 +426,7 @@ impl WindowsFs {
             locks: Arc::new(Coordination::default()),
             lock_mode,
             synthetic: SoftwareLocks::default(),
+            caching,
         })))
     }
 
@@ -289,6 +448,55 @@ impl WindowsFs {
         }
         data.synthetic.clone().ok_or(Status::NOT_SUPPORTED)
     }
+
+    async fn identity_probe(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        request: &RequestContext,
+    ) -> Result<Option<CachingKey>, Status> {
+        let parts = components(name)?;
+        let mut create = create(&options)?;
+        create.access = probe_access(create.access);
+        create.sharing = fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE | fs::FILE_SHARE_DELETE;
+        create.disposition = nt::FILE_OPEN;
+        create.options &= !nt::FILE_DELETE_ON_CLOSE;
+        let root = self.0.root.clone();
+        self.0
+            .io
+            .worker(request, move || match walk(root, parts, &create) {
+                Ok((file, _)) => Ok(Some(CachingKey {
+                    file: native::identity(&file)?,
+                    stream: 0,
+                })),
+                Err(Status::OBJECT_NAME_NOT_FOUND) => Ok(None),
+                Err(status) => Err(status),
+            })
+            .await
+    }
+
+    async fn namespace_request(
+        &self,
+        file: &WindowsFile,
+        request: &RequestContext,
+    ) -> Result<RequestContext, Status> {
+        match (&self.0.caching, &file.caching) {
+            (Some(store), Some(owner)) => store.namespace_request(owner, request).await,
+            (None, Some(_)) => Err(Status::FILE_CLOSED),
+            _ => Ok(request.clone()),
+        }
+    }
+}
+
+fn probe_access(access: u32) -> u32 {
+    let stat = access
+        & (fs::FILE_READ_ATTRIBUTES
+            | fs::FILE_WRITE_ATTRIBUTES
+            | fs::READ_CONTROL
+            | fs::SYNCHRONIZE
+            | fs::WRITE_DAC
+            | fs::WRITE_OWNER);
+    if stat == 0 { access } else { stat }
 }
 
 fn components(name: &str) -> Result<Vec<String>, Status> {
@@ -420,9 +628,15 @@ impl FileSystem for WindowsFs {
     type File = WindowsFile;
 
     fn lock_request<'a>(&'a self, file: &'a WindowsFile) -> Box<dyn LockScope + 'a> {
-        match self.0.lock_mode {
+        let scope = match self.0.lock_mode {
             LockMode::Native => Box::new(Scope::new(file.get(), &self.0.io, &self.0.locks)),
-            LockMode::Synthetic => locking::with_ids(self, file),
+            LockMode::Synthetic => {
+                smb::provider::locking::software::scope(self.synthetic_owner(file))
+            }
+        };
+        match &file.caching {
+            Some(owner) => owner.lock_scope(scope),
+            None => scope,
         }
     }
 
@@ -434,6 +648,9 @@ impl FileSystem for WindowsFs {
         fail_immediately: bool,
         request: &RequestContext,
     ) -> Result<LockId, Status> {
+        if self.0.caching.is_some() {
+            return Err(Status::NOT_SUPPORTED);
+        }
         self.synthetic_owner(file)?
             .lock(range, exclusive, fail_immediately, request)
             .await
@@ -445,6 +662,9 @@ impl FileSystem for WindowsFs {
         range: ByteRange,
         _request: &RequestContext,
     ) -> Result<(), Status> {
+        if self.0.caching.is_some() {
+            return Err(Status::NOT_SUPPORTED);
+        }
         self.synthetic_owner(file)?.unlock(range)
     }
 
@@ -454,6 +674,9 @@ impl FileSystem for WindowsFs {
         lock: LockId,
         _request: &RequestContext,
     ) -> Result<(), Status> {
+        if self.0.caching.is_some() {
+            return Err(Status::NOT_SUPPORTED);
+        }
         self.synthetic_owner(file)?.rollback(lock);
         Ok(())
     }
@@ -464,111 +687,137 @@ impl FileSystem for WindowsFs {
         options: OpenOptions<'_>,
         request: &RequestContext,
     ) -> Result<(WindowsFile, u32), Status> {
-        check(request)?;
-        let parts = components(name)?;
-        let mut create = create(&options)?;
-        let logical_access = AccessMask::from_bits(map_access(options.access));
-        let hidden_read = logical_access.execute()
-            && !logical_access.read_data()
-            && !logical_access.maximum_allowed();
-        let unsupported_creation =
-            options.security.is_some() || options.extended_attributes.is_some();
-        let unbuffered = options.options & nt::FILE_NO_INTERMEDIATE_BUFFERING != 0;
-        if unsupported_creation {
-            create.disposition = match options.disposition() {
-                CreateDisposition::OPEN | CreateDisposition::OPEN_IF => nt::FILE_OPEN,
-                CreateDisposition::OVERWRITE | CreateDisposition::OVERWRITE_IF => {
-                    nt::FILE_OVERWRITE
-                }
-                _ => return Err(Status::NOT_SUPPORTED),
-            };
+        if self.0.caching.is_none() {
+            return self.open_native(name, options, request).await;
         }
-        let reservation = self.reserve()?;
-        let owner = if self.0.lock_mode == LockMode::Synthetic {
-            Some(self.0.synthetic.reserve()?)
-        } else {
-            None
-        };
-        let mutation = if owner.is_some() && replacement_access(options.disposition()) != 0 {
-            Some(self.0.synthetic.mutation(request).await?)
-        } else {
-            None
-        };
-        let root = self.0.root.clone();
-        let result = self
-            .0
-            .io
-            .worker(request, move || {
-                let _mutation = mutation;
-                // Retain the open slot even if an initialization future is dropped.
-                let (file, action) = walk(root, parts, &create)?;
-                let directory = if native::is_directory(&file)? {
-                    Some(native::identity(&file)?)
-                } else {
-                    None
-                };
-                let owner = if directory.is_none() {
-                    if let Some(owner) = &owner {
-                        owner.bind(native::identity(&file)?)?;
-                    }
-                    owner
-                } else {
-                    None
-                };
-                let io_alignment = if unbuffered {
-                    native::io_alignment(&file)?
-                } else {
-                    1
-                };
-                Ok(((file, action, directory, owner, io_alignment), reservation))
-            })
-            .await;
-        let ((file, action, directory, owner, io_alignment), reservation) = match result {
-            Err(Status::OBJECT_NAME_NOT_FOUND) if unsupported_creation => {
-                return Err(Status::NOT_SUPPORTED);
-            }
-            result => result?,
-        };
-        let file = native::overlapped(&*self.0.io.driver, file).map_err(|error| {
-            tracelimit::error_ratelimited!(?error, "cannot associate native SMB open with IOCP");
-            Status::INTERNAL_ERROR
-        })?;
-        let file = if let Some(id) = directory {
-            NativeFile::Directory(Directory {
-                file: Arc::new(file),
-                scan: Mutex::new(()),
-                id,
-                closing: AtomicBool::new(false),
-            })
-        } else {
-            let mut data = DataFile::new(file, self.0.locks.clone());
-            data.synthetic = owner;
-            NativeFile::Data(data)
-        };
-        Ok((
-            WindowsFile {
-                file: Mutex::new(Some(Open {
-                    file: Arc::new(file),
-                    _reservation: reservation,
-                })),
-                append_only: options.access().append_data()
-                    && !options.access().write_data()
-                    && !options.access().generic_write()
-                    && !options.access().generic_all(),
-                hidden_access: if hidden_read { fs::FILE_READ_DATA } else { 0 }
-                    | if action == CreateAction::CREATED.0 && !logical_access.maximum_allowed() {
-                        replacement_access(options.disposition()) & !logical_access.into_bits()
-                    } else {
-                        0
-                    },
-                io_alignment,
-                watch: Arc::new(futures::lock::Mutex::new(None)),
-            },
-            action,
-        ))
+        let opened = self
+            .open_with_caching(name, options, CachingRequest::None, request)
+            .await
+            .map_err(|error| error.status())?;
+        Ok((opened.file, opened.action))
     }
 
-    async fn close(&self, file: &WindowsFile, _request: &RequestContext) -> Result<(), Status> {
+    fn supports_leases(&self) -> bool {
+        self.0.caching.is_some()
+    }
+
+    async fn open_with_caching(
+        &self,
+        name: &str,
+        options: OpenOptions<'_>,
+        requested: CachingRequest,
+        request: &RequestContext,
+    ) -> Result<Opened<WindowsFile>, OpenError> {
+        let Some(cache) = &self.0.caching else {
+            let (file, action) = self.open_native(name, options, request).await?;
+            return Ok(Opened {
+                file,
+                action,
+                caching: CachingGrant::None,
+            });
+        };
+        let physical = create(&options)?;
+        loop {
+            let admission = cache.namespace(request).await?;
+            if probe_access(physical.access) == physical.access
+                && (physical.access
+                    & (fs::FILE_READ_DATA
+                        | fs::FILE_WRITE_DATA
+                        | fs::FILE_APPEND_DATA
+                        | fs::DELETE)
+                    != 0
+                    || AccessMask::from_bits(physical.access).maximum_allowed())
+            {
+                if let Some(wait) = admission.prepare_identity_probe()? {
+                    drop(admission);
+                    wait.wait(request).await?;
+                    continue;
+                }
+            }
+            let admitted = admission.request(request);
+            let key = if options.disposition() == CreateDisposition::CREATE {
+                None
+            } else {
+                self.identity_probe(name, options, &admitted).await?
+            };
+            if let Some(wait) = admission.prepare_open(
+                key,
+                map_access(options.access),
+                replacement_access(options.disposition()) != 0,
+                options.options().delete_on_close(),
+                requested,
+            )? {
+                drop(admitted);
+                drop(admission);
+                wait.wait(request).await?;
+                continue;
+            }
+            let (mut file, action) = match self.open_native(name, options, &admitted).await {
+                Err(Status::SHARING_VIOLATION) if key.is_some() => {
+                    if let Some(wait) =
+                        admission.prepare_sharing(key.expect("resolved identity"), requested)?
+                    {
+                        drop(admitted);
+                        drop(admission);
+                        wait.wait(request).await?;
+                        continue;
+                    }
+                    return Err(Status::SHARING_VIOLATION.into());
+                }
+                result => result?,
+            };
+            let metadata = match self.metadata(&file, &admitted).await {
+                Ok(metadata) => metadata,
+                Err(status) => {
+                    self.close(
+                        &file,
+                        &RequestContext::new(request.id()).with_keepalive(admitted.clone()),
+                    )
+                    .await?;
+                    return Err(status.into());
+                }
+            };
+            let registered = admission.register(
+                CachingKey {
+                    file: metadata.id,
+                    stream: 0,
+                },
+                metadata.granted_access,
+                !metadata.is_directory(),
+                options.options().delete_on_close(),
+                requested,
+            );
+            let (owner, caching) = match registered {
+                Ok(result) => result,
+                Err(status) => {
+                    self.close(
+                        &file,
+                        &RequestContext::new(request.id()).with_keepalive(admitted.clone()),
+                    )
+                    .await?;
+                    return Err(status.into());
+                }
+            };
+            file.caching = Some(owner);
+            return Ok(Opened {
+                file,
+                action,
+                caching,
+            });
+        }
+    }
+
+    async fn close(&self, file: &WindowsFile, request: &RequestContext) -> Result<(), Status> {
+        let cleanup = RequestContext::new(request.id()).with_keepalive(request.clone());
+        let cleanup = if file
+            .caching
+            .as_ref()
+            .is_some_and(|owner| owner.is_deleting())
+        {
+            self.namespace_request(file, &cleanup).await?
+        } else {
+            file.retain_caching(&cleanup)
+        };
         let native = file.file.lock().take();
         if let Some(open) = &native {
             match &*open.file {
@@ -596,23 +845,30 @@ impl FileSystem for WindowsFs {
                         owner.drain().await;
                     }
                     let guard = data.gate.clone().lock_owned().await;
-                    data.drain(&RequestContext::new(0)).await?;
+                    data.drain(&cleanup).await?;
                     Some(guard)
                 }
                 NativeFile::Directory(_) => None,
             },
             None => None,
         };
-        self.0
+        let result = self
+            .0
             .io
-            .worker(&RequestContext::new(0), move || {
+            .worker(&cleanup, move || {
                 if let (Some(open), Some(ledger)) = (&native, &mut locks) {
                     open.file.data()?.close(ledger)?;
                 }
                 drop(native);
                 Ok(())
             })
-            .await
+            .await;
+        if result.is_ok() {
+            if let Some(owner) = &file.caching {
+                owner.close();
+            }
+        }
+        result
     }
 
     async fn metadata(
@@ -620,6 +876,8 @@ impl FileSystem for WindowsFs {
         file: &WindowsFile,
         request: &RequestContext,
     ) -> Result<Metadata, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         let native = file.get()?;
         let root = self.0.root.clone();
         let mut metadata = self
@@ -640,6 +898,8 @@ impl FileSystem for WindowsFs {
         information: SecurityInformation,
         request: &RequestContext,
     ) -> Result<SecurityDescriptor, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         let file = file.get()?;
         self.0
             .io
@@ -654,6 +914,8 @@ impl FileSystem for WindowsFs {
         file: &WindowsFile,
         request: &RequestContext,
     ) -> Result<FileSystemInformation, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         let file = file.get()?;
         self.0
             .io
@@ -668,6 +930,8 @@ impl FileSystem for WindowsFs {
         length: usize,
         request: &RequestContext,
     ) -> Result<Vec<u8>, Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         check(request)?;
         let offset = i64::try_from(offset).map_err(|_| Status::INVALID_PARAMETER)?;
         let buffer = crate::io::Buffer::new(length.min(IO_LIMIT), file.io_alignment)?;
@@ -689,7 +953,7 @@ impl FileSystem for WindowsFs {
             file.overlapped()?,
             offset,
             buffer,
-            (file.clone(), admission, software),
+            (file.clone(), admission, software, request.clone()),
         );
         let mut cancelled = std::pin::pin!(request.cancelled().fuse());
         let ((result, count), (data, _admission)) = futures::select_biased! {
@@ -713,6 +977,8 @@ impl FileSystem for WindowsFs {
         data: &[u8],
         request: &RequestContext,
     ) -> Result<usize, Status> {
+        let admitted = file.caching_request(CacheChange::Data, request).await?;
+        let request = &admitted;
         check(request)?;
         let requested_offset = offset;
         let append = file.append_only && !data.is_empty();
@@ -776,7 +1042,12 @@ impl FileSystem for WindowsFs {
                 })
                 .await?;
         }
-        let admission = (file.clone(), file.data()?.active()?, software);
+        let admission = (
+            file.clone(),
+            file.data()?.active()?,
+            software,
+            request.clone(),
+        );
         drop(guard);
         check(request)?;
         let mut io = native::write_admitted(file.overlapped()?, offset, buffer, admission);
@@ -796,6 +1067,8 @@ impl FileSystem for WindowsFs {
     }
 
     async fn flush(&self, file: &WindowsFile, request: &RequestContext) -> Result<(), Status> {
+        let admitted = file.retain_caching(request);
+        let request = &admitted;
         let file = file.get()?;
         self.0
             .io
@@ -808,6 +1081,8 @@ impl FileSystem for WindowsFs {
         directory: &WindowsFile,
         request: &RequestContext,
     ) -> Result<Vec<Metadata>, Status> {
+        let admitted = directory.retain_caching(request);
+        let request = &admitted;
         let file = directory.get()?;
         if directory.hidden_access & fs::FILE_READ_DATA != 0 {
             return Err(Status::ACCESS_DENIED);
@@ -847,6 +1122,8 @@ impl FileSystem for WindowsFs {
         length: u64,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = file.caching_request(CacheChange::Data, request).await?;
+        let request = &admitted;
         let file = file.get()?;
         let software = file
             .software_operation(
@@ -876,6 +1153,9 @@ impl FileSystem for WindowsFs {
         delete: bool,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = self.namespace_request(file, request).await?;
+        let request = &admitted;
+        let caching = file.caching.clone();
         let file = file.get()?;
         let admission = file.active(request).await?;
         let inner = self.0.clone();
@@ -885,6 +1165,9 @@ impl FileSystem for WindowsFs {
                 let _admission = admission;
                 let mut watches = inner.watches.lock();
                 native::set_disposition(file.get(), delete)?;
+                if let Some(owner) = caching {
+                    owner.set_deleting(delete)?;
+                }
                 if delete {
                     if let NativeFile::Directory(directory) = &*file {
                         if let Some(watches) = watches.remove(&directory.id) {
@@ -905,6 +1188,8 @@ impl FileSystem for WindowsFs {
         info: BasicInformation,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = file.caching_request(CacheChange::Metadata, request).await?;
+        let request = &admitted;
         let file = file.get()?;
         let admission = file.active(request).await?;
         self.0
@@ -981,6 +1266,8 @@ impl FileSystem for WindowsFs {
         length: u64,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = file.caching_request(CacheChange::Data, request).await?;
+        let request = &admitted;
         let file = file.get()?;
         let software = file
             .software_operation(
@@ -1011,6 +1298,8 @@ impl FileSystem for WindowsFs {
         replace: bool,
         request: &RequestContext,
     ) -> Result<(), Status> {
+        let admitted = self.namespace_request(file, request).await?;
+        let request = &admitted;
         let file = file.get()?;
         let admission = file.active(request).await?;
         let root = self.0.root.clone();

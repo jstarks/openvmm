@@ -419,10 +419,12 @@ public static class VsmbGuest {
                 }
             }
 
-            public static void TestCaching(string path) {
+            public static void TestCaching(string path) { TestCaching(path, false); }
+
+            public static void TestCaching(string path, bool prelinked) {
                 System.IO.File.WriteAllBytes(path, new byte[4096]);
                 string alias = path + ".alias";
-                if (!CreateHardLink(alias, path, IntPtr.Zero)) throw new Win32Exception();
+                if (!prelinked && !CreateHardLink(alias, path, IntPtr.Zero)) throw new Win32Exception();
                 using (var first = CreateFile(path, 0x80000000, 7, IntPtr.Zero, 3, 0x80, IntPtr.Zero)) {
                     if (first.IsInvalid) throw new Win32Exception();
                     using (var buffer = new Pending(first, 0)) {

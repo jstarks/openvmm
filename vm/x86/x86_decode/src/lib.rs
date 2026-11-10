@@ -220,17 +220,21 @@ fn inspect(encoding: Encoding) -> Option<Outcome> {
     {
         return None;
     }
-    Some(if decoder.last_error() != DecoderError::None {
-        Outcome::Rejected(encoding)
-    } else {
-        match normalize(&instruction, encoding) {
-            Some(decoded) => Outcome::Normalized(decoded),
-            None => Outcome::Unsupported {
-                encoding,
-                code: instruction.code() as u32,
-            },
-        }
-    })
+    Some(
+        if decoder.last_error() != DecoderError::None
+            || instruction.len() != encoding.length as usize
+        {
+            Outcome::Rejected(encoding)
+        } else {
+            match normalize(&instruction, encoding) {
+                Some(decoded) => Outcome::Normalized(decoded),
+                None => Outcome::Unsupported {
+                    encoding,
+                    code: instruction.code() as u32,
+                },
+            }
+        },
+    )
 }
 
 /// Pure admission for one token-bound prefix already fetched by the core.

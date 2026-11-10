@@ -300,6 +300,18 @@ fn fetch_fault_retry_retains_progress_and_rejects_stale_completions() {
 
 #[test]
 fn invalid_valid_unsupported_and_prefix_length_limit_are_distinct_from_truncation() {
+    let mut bytes = [0; 15];
+    bytes[..3].copy_from_slice(&[0x89, 0xc8, 0x90]);
+    let malformed = x86_system::shared::decode::DecodeInput {
+        sequence: 1,
+        rip: 0x1000,
+        length: 3,
+        bytes,
+    };
+    assert!(matches!(
+        x86_decode::admit(malformed),
+        x86_system::shared::decode::DecodeDecision::Rejected
+    ));
     assert!(matches!(
         outcome(&[0xf0, 0x01, 0xc8], 0),
         Outcome::Rejected(_)

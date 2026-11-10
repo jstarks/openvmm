@@ -180,6 +180,7 @@ pub open spec fn word_location(s: State) -> (Stage, u64) {
         Phase::Push { event, stack, index, .. } => (Stage::Push,
             (stack as int - 8 * (index as int - if e::has_error_code(event) { 0int } else { 1int } + 1)) as u64),
         Phase::Pop { index, .. } => (Stage::Pop, (s.core.cpu.gpr[4] + index as int * 8) as u64),
+        Phase::NearCall { stack, .. } => (Stage::Push, stack),
         _ => (Stage::Idt, 0),
     }
 }
@@ -193,6 +194,11 @@ pub open spec fn filled(w: ReturnWords, index: u8, value: u64) -> ReturnWords {
 pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
     let cpu = s.core.cpu;
     match s.phase {
+        Phase::NearCall { target, stack } => {
+            let next = model::State { gpr: cpu.gpr.update(4, stack as int),
+                rip: target as int, flags: cpu.flags & !0x10000u64 };
+            decode::retired(s, c::boundary_commit(s.core, next, true).0)
+        },
         Phase::GateLow { event, address } =>
             (word(s, (address + 8) as u64, WordAccess::Read, Phase::GateHigh { event, low: value }), Tick::Pending),
         Phase::GateHigh { event, low } => {
@@ -316,7 +322,11 @@ pub open spec fn advance(s: State) -> (State, Tick) {
         _ => match m::request(s.core.mmu) {
             Request::CompleteWord { report } => match report.result {
                 WordResult::Success(v) => word_value(s, v),
-                result => stop(s, EventDiagnostic::Memory { stage: word_location(s).0, address: word_location(s).1, result }),
+                result => if result is PageFault && s.phase is NearCall {
+                    entry(s, Event::PageFault(match result { WordResult::PageFault(code) => code, _ => 0u8 }))
+                } else {
+                    stop(s, EventDiagnostic::Memory { stage: word_location(s).0, address: word_location(s).1, result })
+                },
             },
             _ => (s, Tick::Waiting),
         },

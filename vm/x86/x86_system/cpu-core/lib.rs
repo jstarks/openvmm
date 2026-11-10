@@ -7,9 +7,13 @@ use vstd::prelude::*;
 #[path = "../x86-add-experiment/lib.rs"]
 pub mod arithmetic;
 pub mod decoder;
+pub mod gsbase;
 pub mod model;
+pub mod near_call;
 pub mod operand;
+pub mod profile;
 pub mod system;
+pub mod xor32;
 
 pub use arithmetic::{adc64, add_two_words, add64, merge_flags};
 

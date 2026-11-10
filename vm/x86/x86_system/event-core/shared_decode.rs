@@ -5,6 +5,7 @@ use super::*;
 use memory_core::cpu_core::operand::{
     Operand as ScalarOperand, Register, ScalarStatus, commit_scalar,
 };
+use memory_core::cpu_core::{gsbase, near_call, xor32};
 
 verus! {
 
@@ -20,6 +21,9 @@ pub struct DecodeInput {
 pub enum DecodeDecision {
     More,
     Scalar { dst: Register, source: ScalarOperand },
+    Xor32 { dst: Register, src: Register },
+    Wrmsr,
+    NearCall { displacement: i32 },
     Legacy,
     Unsupported,
     Rejected,
@@ -133,6 +137,65 @@ impl SharedEventMachine {
             DecodeDecision::Overlong => self.start_entry(Event::GeneralProtection),
             DecodeDecision::Unsupported =>
                 self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+            DecodeDecision::Xor32 { dst, src } => {
+                let mut cpu = self.core.cpu();
+                let ghost before = cpu@;
+                assert(cpu.gpr@ =~= before.gpr.map(|i: int, value: int| value as u64));
+                cpu.flags &= !0x10000u64;
+                let status = xor32::commit(&mut cpu.gpr, &mut cpu.rip, &mut cpu.flags, dst, src, input.length);
+                proof {
+                    let result = xor32::transition(before.gpr.map(|i: int, value: int| value as u64),
+                        before.rip as u64, before.flags & !0x10000u64, dst, src, input.length);
+                    assert(cpu.gpr@ == result.0);
+                    assert(cpu@.gpr =~= result.0.map(|i: int, value: u64| value as int));
+                }
+                match status {
+                    ScalarStatus::Advanced => {
+                        let _accepted = self.core.boundary_commit(cpu, true);
+                        assert(_accepted);
+                        self.phase = Phase::Ready; self.shadow = false; self.handler_pending = false;
+                        Tick::Retired(false)
+                    },
+                    ScalarStatus::DebugRequired =>
+                        self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired)),
+                    _ => self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
+            DecodeDecision::Wrmsr => {
+                let Some(mut system) = self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                let mut cpu = self.core.cpu();
+                cpu.flags &= !0x10000u64;
+                let status = gsbase::commit(&mut system, &mut cpu.rip, cpu.flags,
+                    cpu.gpr[0], cpu.gpr[1], cpu.gpr[2], input.length);
+                match status {
+                    gsbase::Status::Advanced => {
+                        let _accepted = self.core.boundary_commit(cpu, true);
+                        assert(_accepted);
+                        self.system = Some(system);
+                        self.phase = Phase::Ready; self.shadow = false; self.handler_pending = false;
+                        Tick::Retired(true)
+                    },
+                    gsbase::Status::GeneralProtection => self.start_entry(Event::GeneralProtection),
+                    gsbase::Status::DebugRequired =>
+                        self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired)),
+                    _ => self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
+            DecodeDecision::NearCall { displacement } => {
+                let cpu = self.core.cpu();
+                match near_call::prepare(cpu.rip, cpu.gpr[4], cpu.flags & !0x10000u64,
+                    displacement, input.length) {
+                    near_call::Plan::Ready { target, stack, return_address } => {
+                        self.begin_word(stack, WordAccess::Write(return_address), Phase::NearCall { target, stack });
+                        Tick::Pending
+                    },
+                    near_call::Plan::DebugRequired =>
+                        self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired)),
+                    _ => self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
             DecodeDecision::Scalar { dst, source } => {
                 let mut cpu = self.core.cpu();
                 let ghost before = cpu@;

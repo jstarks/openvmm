@@ -66,6 +66,9 @@ pub enum Error {
     /// Decoder input was stale or no longer outstanding.
     #[error("decoder completion did not match the outstanding request")]
     DecodeCompletion,
+    /// Completed-batch telemetry cannot wrap.
+    #[error("completed-batch progress counter exhausted")]
+    ProgressExhausted,
     /// Dropping an in-flight run future prevents safe continuation.
     #[error("run future was cancelled during a device operation; replay is unsafe")]
     CancelledIo,
@@ -193,6 +196,7 @@ struct VpState {
     core: Option<SharedEventMachine>,
     initial_system: Option<SystemState>,
     started: bool,
+    progress: CompletedBatchProgress,
     io_active: bool,
     fault: Option<Error>,
 }
@@ -211,6 +215,22 @@ pub struct EmuProcessor<'a> {
     ram: Arc<Ram>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
+}
+
+/// Progress from successfully returned core batches, not transport-error totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompletedBatchProgress {
+    /// Instructions retired in completed batches.
+    pub retired: u64,
+    /// Events delivered in completed batches.
+    pub delivered: u64,
+}
+
+impl EmuProcessor<'_> {
+    /// Transport failures can leave additional, unreported partial progress.
+    pub fn completed_batch_progress(&self) -> CompletedBatchProgress {
+        self.state.progress
+    }
 }
 
 impl Hypervisor for EmuHypervisor {
@@ -235,20 +255,10 @@ impl Hypervisor for EmuHypervisor {
                 "one VP, no isolation/HV1/nested virtualization",
             ));
         }
-        let caps =
-            PartitionCapabilities::from_cpuid(config.processor_topology, &mut |function, _| {
-                match function {
-                    0 => [
-                        0,
-                        u32::from_le_bytes(*b"Auth"),
-                        u32::from_le_bytes(*b"cAMD"),
-                        u32::from_le_bytes(*b"enti"),
-                    ],
-                    0x8000_0000 => [0x8000_0008, 0, 0, 0],
-                    0x8000_0008 => [48, 0, 0, 0],
-                    _ => [0; 4],
-                }
-            })?;
+        let caps = PartitionCapabilities::from_cpuid(
+            config.processor_topology,
+            &mut x86_system::memory_core::cpu_core::profile::cpuid,
+        )?;
         Ok(EmuProtoPartition {
             caps: Arc::new(caps),
         })
@@ -299,6 +309,7 @@ impl ProtoPartition for EmuProtoPartition {
                 core: None,
                 initial_system: Some(SystemState::empty()),
                 started: false,
+                progress: CompletedBatchProgress::default(),
                 io_active: false,
                 fault: None,
             },
@@ -444,6 +455,13 @@ impl Processor for EmuProcessor<'_> {
                 Ok(batch) => batch,
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Memory(error)))),
             };
+            let Some(retired) = self.state.progress.retired.checked_add(batch.retired) else {
+                return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+            };
+            let Some(delivered) = self.state.progress.delivered.checked_add(batch.delivered) else {
+                return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+            };
+            self.state.progress = CompletedBatchProgress { retired, delivered };
             match batch.stop {
                 BatchStop::Decode(input) => {
                     if !core.complete_decode(input.sequence, x86_decode::admit(input)) {
@@ -602,7 +620,7 @@ fn with_system(mut regs: vp::Registers, system: SystemState) -> vp::Registers {
     regs
 }
 
-/// Constructs the one fixed flat-segment profile accepted by initial import.
+/// Constructs the component fixture's flat-segment initial profile.
 pub fn long_mode_registers(cpu: State, config: Config, tables: Tables, cr2: u64) -> vp::Registers {
     let data = SegmentRegister {
         base: 0,

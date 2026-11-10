@@ -528,10 +528,70 @@ fn actual_kernel_entry_moves_boot_pointer_sets_stack_and_clears_ecx_upper_half()
     expected[1] = 0xc0000101;
     assert_eq!(registers, expected);
     assert_eq!(rip, entry + 15);
-    assert!(matches!(
-        outcome(&[0x31, 0xc0], rip),
-        Outcome::Unsupported { .. }
-    ));
+    let xor = decode(&[0x31, 0xc0], rip);
+    assert_eq!(xor.operation, Operation::Xor);
+    assert_eq!(
+        commit_decoded(xor, &mut registers, &mut rip, 2),
+        Err(ScalarError::UnsupportedForm)
+    );
+    assert_eq!(registers, expected);
+    assert_eq!(rip, entry + 15);
+}
+
+#[test]
+fn entry_xor_and_exact_validated_system_forms_have_bounded_cpu_admission() {
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    let input = |bytes: &[u8]| {
+        let mut packet = DecodeInput {
+            sequence: 1,
+            rip: 0x2d98100,
+            length: bytes.len() as u8,
+            bytes: [0; 15],
+        };
+        packet.bytes[..bytes.len()].copy_from_slice(bytes);
+        packet
+    };
+    for (bytes, dst, src) in [
+        (&[0x31, 0xc0][..], 0, 0),
+        (&[0x41, 0x31, 0xc1][..], 9, 0),
+        (&[0x44, 0x33, 0xc9][..], 9, 1),
+    ] {
+        assert_eq!(
+            admit(input(bytes)),
+            DecodeDecision::Xor32 {
+                dst: reg(dst, Width::Dword, false),
+                src: reg(src, Width::Dword, false)
+            }
+        );
+    }
+    assert_eq!(admit(input(&[0x0f, 0x30])), DecodeDecision::Wrmsr);
+    assert_eq!(
+        admit(input(&[0xe8, 0x40, 0x2e, 0xff, 0xff])),
+        DecodeDecision::NearCall {
+            displacement: -0xd1c0
+        }
+    );
+    for bytes in [
+        &[0x48, 0x31, 0xc0][..],
+        &[0x66, 0x31, 0xc0][..],
+        &[0x30, 0xc0][..],
+        &[0x31, 0x00][..],
+        &[0x66, 0x0f, 0x30][..],
+        &[0x48, 0xe8, 0, 0, 0, 0][..],
+    ] {
+        assert_eq!(
+            admit(input(bytes)),
+            DecodeDecision::Unsupported,
+            "{bytes:02x?}"
+        );
+    }
+    assert_eq!(
+        admit(input(&[0xe8, 0, 0, 0, 0, 0x90])),
+        DecodeDecision::Rejected
+    );
+    for bytes in [&[0xe8][..], &[0xe8, 0, 0, 0][..], &[0x0f][..], &[0x31][..]] {
+        assert_eq!(admit(input(bytes)), DecodeDecision::More);
+    }
 }
 
 #[test]

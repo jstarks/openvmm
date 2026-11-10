@@ -4,6 +4,8 @@
 #[cfg(verus_keep_ghost)]
 use super::super::memory_core::cpu_core::operand::{self as scalar, ScalarStatus};
 #[cfg(verus_keep_ghost)]
+use super::super::memory_core::cpu_core::{gsbase, near_call, xor32};
+#[cfg(verus_keep_ghost)]
 use super::super::shared::decode::{DecodeDecision, DecodeInput};
 use super::*;
 
@@ -89,6 +91,47 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
         DecodeDecision::InvalidOpcode => entry(s, Event::InvalidOpcode),
         DecodeDecision::Overlong => entry(s, Event::GeneralProtection),
         DecodeDecision::Unsupported => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+        DecodeDecision::Xor32 { dst, src } => {
+            let result = xor32::transition(s.core.cpu.gpr.map(|i: int, value: int| value as u64),
+                s.core.cpu.rip as u64, s.core.cpu.flags & !0x10000u64, dst, src, input.length);
+            match result.3 {
+                ScalarStatus::Advanced => {
+                    let cpu = model::State { gpr: result.0.map(|i: int, value: u64| value as int),
+                        rip: result.1 as int, flags: result.2 };
+                    retired(s, c::boundary_commit(s.core, cpu, true).0)
+                },
+                ScalarStatus::DebugRequired => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired)),
+                _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+            }
+        },
+        DecodeDecision::Wrmsr => match s.system {
+            None => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+            Some(system) => {
+                let result = gsbase::transition(system, s.core.cpu.rip as u64,
+                    s.core.cpu.flags & !0x10000u64, s.core.cpu.gpr[0] as u64,
+                    s.core.cpu.gpr[1] as u64, s.core.cpu.gpr[2] as u64, input.length);
+                match result.2 {
+                    gsbase::Status::Advanced => {
+                        let cpu = model::State { rip: result.1 as int,
+                            flags: s.core.cpu.flags & !0x10000u64, ..s.core.cpu };
+                        let next = retired(s, c::boundary_commit(s.core, cpu, true).0).0;
+                        (State { system: Some(result.0), ..next }, Tick::Retired(true))
+                    },
+                    gsbase::Status::GeneralProtection => entry(s, Event::GeneralProtection),
+                    gsbase::Status::DebugRequired => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired)),
+                    _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
+        },
+        DecodeDecision::NearCall { displacement } => {
+            match near_call::plan(s.core.cpu.rip as u64, s.core.cpu.gpr[4] as u64,
+                s.core.cpu.flags & !0x10000u64, displacement, input.length) {
+                near_call::Plan::Ready { target, stack, return_address } =>
+                    (word(s, stack, WordAccess::Write(return_address), Phase::NearCall { target, stack }), Tick::Pending),
+                near_call::Plan::DebugRequired => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired)),
+                _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+            }
+        },
         DecodeDecision::Scalar { dst, source } => {
             let result = scalar::model::commit(s.core.cpu.gpr.map(|i: int, value: int| value as u64),
                 s.core.cpu.rip as u64, s.core.cpu.flags & !0x10000u64, dst, source, input.length);

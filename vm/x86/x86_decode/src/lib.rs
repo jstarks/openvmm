@@ -19,6 +19,7 @@ pub enum Operation {
     Lea,
     Add,
     Adc,
+    Xor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,10 +35,12 @@ impl Operation {
             read: if matches!(self, Self::Adc) { 1 } else { 0 },
             written: if matches!(self, Self::Add | Self::Adc) {
                 0x8d5
+            } else if matches!(self, Self::Xor) {
+                0x8c5
             } else {
                 0
             },
-            undefined: 0,
+            undefined: if matches!(self, Self::Xor) { 0x10 } else { 0 },
         }
     }
 }
@@ -269,7 +272,16 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
         Some(Outcome::Rejected(_)) => DecodeDecision::Rejected,
         Some(Outcome::InvalidOpcode(_)) => DecodeDecision::InvalidOpcode,
         Some(Outcome::Overlong(_)) => DecodeDecision::Overlong,
-        Some(Outcome::Unsupported { .. }) => DecodeDecision::Unsupported,
+        Some(Outcome::Unsupported { encoding, .. }) => {
+            // Iced validated the full packet; these exact forms have no scalar operand packet.
+            match encoding.bytes() {
+                [0x0f, 0x30] => DecodeDecision::Wrmsr,
+                [0xe8, a, b, c, d] => DecodeDecision::NearCall {
+                    displacement: i32::from_le_bytes([*a, *b, *c, *d]),
+                },
+                _ => DecodeDecision::Unsupported,
+            }
+        }
         Some(Outcome::Normalized(decoded)) => {
             if decoded.prefixes.lock
                 || decoded.prefixes.repeat != Repeat::None
@@ -286,6 +298,11 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
                 return DecodeDecision::Legacy;
             }
             match (decoded.operation, decoded.operands) {
+                (Operation::Xor, [Operand::Register(dst), Operand::Register(src)])
+                    if dst.width() == Width::Dword && src.width() == Width::Dword =>
+                {
+                    DecodeDecision::Xor32 { dst, src }
+                }
                 (
                     Operation::Mov,
                     [
@@ -308,6 +325,7 @@ fn normalize(instruction: &Instruction, encoding: Encoding) -> Option<Decoded> {
         Mnemonic::Lea => Operation::Lea,
         Mnemonic::Add => Operation::Add,
         Mnemonic::Adc => Operation::Adc,
+        Mnemonic::Xor => Operation::Xor,
         _ => return None,
     };
     if instruction.op_count() != 2 {

@@ -178,6 +178,45 @@ async fn build(
 }
 
 #[async_test]
+async fn entry_forms_retire_through_real_vp_and_preserve_the_call_push(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    bytes[CODE as usize..CODE as usize + 11]
+        .copy_from_slice(&[0x31, 0xc0, 0x31, 0xd2, 0x0f, 0x30, 0xe8, 5, 0, 0, 0]);
+    bytes[CODE as usize + 16] = 0xf4;
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.rcx = 0xc0000101;
+    initial.rsp = 0x18008;
+    initial.gs.base = 0x1234;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    park(run.as_mut());
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
+    let mut expected = initial;
+    expected.rax = 0;
+    expected.rdx = 0;
+    expected.rsp = 0x18000;
+    expected.rip = CODE + 17;
+    expected.rflags = (initial.rflags & !0x108d5) | 0x44;
+    expected.gs.base = 0;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(memory.read_plain::<u64>(0x18000).unwrap(), CODE + 11);
+    let progress = vp.completed_batch_progress();
+    assert_eq!((progress.retired, progress.delivered), (5, 0));
+    assert!(devices.faults.lock().is_empty());
+}
+
+#[async_test]
 async fn loader_system_import_orders_roundtrip_and_lock_after_run(driver: DefaultDriver) {
     use virt::vp::{Mtrrs, Pat};
     use x86_system::memory_core::cpu_core::system::{DEFAULT_PAT, FIXED_WB};

@@ -28,6 +28,7 @@ pub enum Phase {
     Decode { input: DecodeInput },
     DecodeFetch { input: DecodeInput },
     Admitted { input: DecodeInput, decision: DecodeDecision },
+    NearCall { target: u64, stack: u64 },
     GateLow { event: Event, address: u64 },
     GateHigh { event: Event, low: u64 },
     Code { event: Event, low: u64, target: u64 },
@@ -324,6 +325,11 @@ impl SharedEventMachine {
                 Request::CompleteWord { report } => match report.result {
                     WordResult::Success(value) => self.word_value(value),
                     result => {
+                        if let WordResult::PageFault(code) = result {
+                            if matches!(self.phase, Phase::NearCall { .. }) {
+                                return self.start_entry(Event::PageFault(code));
+                            }
+                        }
                         let (stage, address) = self.word_location();
                         self.stop(EventDiagnostic::Memory { stage, address, result })
                     },
@@ -414,6 +420,7 @@ impl SharedEventMachine {
             Phase::Push { event, stack, index, .. } =>
                 (Stage::Push, stack - 8 * (index as u64 - if has_error_code(event) { 0 } else { 1 } + 1)),
             Phase::Pop { index, .. } => (Stage::Pop, cpu.gpr[4] + index as u64 * 8),
+            Phase::NearCall { stack, .. } => (Stage::Push, stack),
             _ => { assert(false); (Stage::Idt, 0) },
         }
     }
@@ -428,6 +435,17 @@ impl SharedEventMachine {
     {
         let mut cpu = self.core.cpu();
         match self.phase {
+            Phase::NearCall { target, stack } => {
+                let ghost before = cpu@;
+                cpu.gpr[4] = stack;
+                assert(cpu@.gpr =~= before.gpr.update(4, stack as int));
+                cpu.rip = target;
+                cpu.flags &= !0x10000u64;
+                let _accepted = self.core.boundary_commit(cpu, true);
+                assert(_accepted);
+                self.phase = Phase::Ready; self.shadow = false; self.handler_pending = false;
+                return Tick::Retired(false);
+            },
             Phase::GateLow { event, address } => {
                 self.begin_word(address + 8, WordAccess::Read, Phase::GateHigh { event, low: value });
             },

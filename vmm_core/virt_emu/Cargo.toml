@@ -21,6 +21,11 @@ vmcore.workspace = true
 vm_topology.workspace = true
 
 [dev-dependencies]
+loader.workspace = true
+vm_loader.workspace = true
+vmm_core.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+sha2.workspace = true
 test_with_tracing.workspace = true
 pal_async.workspace = true
 parking_lot.workspace = true

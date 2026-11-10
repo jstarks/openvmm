@@ -133,6 +133,16 @@ impl SharedMachine {
         self.decoded(rex, opcode, modrm)
     }
 
+    pub(crate) fn boundary_sized(&mut self, address: u64, word: WordAccess, size: u8) -> (accepted: bool)
+        requires old(self).invariant(), size == 1 || size == 2 || size == 4,
+            address % 8 + size as u64 <= 8,
+        ensures final(self).invariant(), (final(self)@, accepted) ==
+            spec::boundary_sized(old(self)@, address, word, size),
+    {
+        if !matches!(self.phase, CpuPhase::Boundary) { return false; }
+        self.mmu.begin_sized(address, word, size)
+    }
+
     fn decoded(&mut self, rex: u8, opcode: u8, modrm: u8) -> (tick: Tick)
         requires old(self).mmu.invariant(),
             !mmu_core::shared_model::active(old(self).mmu@.phase),

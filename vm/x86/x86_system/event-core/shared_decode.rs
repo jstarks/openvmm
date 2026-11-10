@@ -24,6 +24,7 @@ pub enum DecodeDecision {
     Xor32 { dst: Register, src: Register },
     Wrmsr,
     NearCall { displacement: i32 },
+    Entry(entry::Instruction),
     Legacy,
     Unsupported,
     Rejected,
@@ -119,6 +120,7 @@ impl SharedEventMachine {
             _ => { assert(false); return Tick::Waiting; },
         };
         match decision {
+            DecodeDecision::Entry(instruction) => self.execute_entry(instruction, input.length),
             DecodeDecision::More => {
                 if input.length == 15 {
                     return self.start_entry(Event::GeneralProtection);

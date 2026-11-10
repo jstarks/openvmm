@@ -7,7 +7,9 @@ use vstd::prelude::*;
 #[path = "../x86-add-experiment/lib.rs"]
 pub mod arithmetic;
 pub mod decoder;
+pub mod descriptor;
 pub mod gsbase;
+pub mod integer;
 pub mod model;
 pub mod near_call;
 pub mod operand;

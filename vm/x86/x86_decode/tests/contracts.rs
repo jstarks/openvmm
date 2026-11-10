@@ -595,6 +595,102 @@ fn entry_xor_and_exact_validated_system_forms_have_bounded_cpu_admission() {
 }
 
 #[test]
+fn descriptor_entry_family_preserves_owned_operands_and_extension() {
+    use x86_system::memory_core::cpu_core::integer;
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    use x86_system::shared::entry::Instruction;
+    let packet = |bytes: &[u8]| {
+        let mut input = DecodeInput {
+            sequence: 19,
+            rip: 0x1000,
+            length: bytes.len() as u8,
+            bytes: [0; 15],
+        };
+        input.bytes[..bytes.len()].copy_from_slice(bytes);
+        input
+    };
+    assert!(matches!(admit(packet(&[0x48,0x83,0xec,0x10])),
+        DecodeDecision::Entry(Instruction::Integer { operation: integer::Operation::Sub, dst,
+            source: Operand::Immediate(Immediate { value: 16, width: Width::Qword, .. }) })
+        if dst == reg(4,Width::Qword,false)));
+    assert!(matches!(
+        admit(packet(&[0x48, 0x83, 0xe4, 0xf0])),
+        DecodeDecision::Entry(Instruction::Integer {
+            operation: integer::Operation::And,
+            source: Operand::Immediate(Immediate {
+                value: 0xffff_ffff_ffff_fff0,
+                ..
+            }),
+            ..
+        })
+    ));
+    assert!(matches!(admit(packet(&[0x66,0xc7,0x44,0x24,6,0x7f,0])),
+        DecodeDecision::Entry(Instruction::Store { address, width:Width::Word,
+            source:Operand::Immediate(Immediate{value:0x7f,..}) })
+        if address.base == Base::Register(Gpr::new(4).unwrap()) && address.displacement == 6));
+    assert!(matches!(admit(packet(&[0x8e,0xd0])),
+        DecodeDecision::Entry(Instruction::Segment { segment:Segment::Ss, src })
+        if src == reg(0,Width::Word,false)));
+    assert!(matches!(admit(packet(&[0x0f,0x01,0x54,0x24,6])),
+        DecodeDecision::Entry(Instruction::Table { idt:false,address }) if address.displacement == 6));
+    assert!(matches!(admit(packet(&[0x0f,0xb7,0xc7])),
+        DecodeDecision::Entry(Instruction::ZeroExtend { dst,src })
+        if dst == reg(0,Width::Dword,false) && src == reg(7,Width::Word,false)));
+    assert_eq!(
+        admit(packet(&[0xc3])),
+        DecodeDecision::Entry(Instruction::Return)
+    );
+    assert_eq!(
+        admit(packet(&[0xc9])),
+        DecodeDecision::Entry(Instruction::Leave)
+    );
+    assert!(matches!(
+        admit(packet(&[0x74, 0x57])),
+        DecodeDecision::Entry(Instruction::Jump {
+            target: 0x1059,
+            zero: Some(true)
+        })
+    ));
+}
+
+#[test]
+fn descriptor_entry_admission_does_not_expand_unrelated_forms_or_skip_truncation() {
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    let packet = |bytes: &[u8]| {
+        let mut input = DecodeInput {
+            sequence: 1,
+            rip: 0,
+            length: bytes.len() as u8,
+            bytes: [0; 15],
+        };
+        input.bytes[..bytes.len()].copy_from_slice(bytes);
+        input
+    };
+    for bytes in [
+        &[0x48, 0x83, 0xec][..],
+        &[0x0f, 0x01, 0x54, 0x24][..],
+        &[0x66, 0xc7, 0x44, 0x24, 6, 0x7f][..],
+    ] {
+        assert_eq!(admit(packet(bytes)), DecodeDecision::More);
+    }
+    for bytes in [
+        &[0x48, 0xcb][..],
+        &[0x66, 0xc3][..],
+        &[0x66, 0x55][..],
+        &[0x8e, 0xe0][..],
+        &[0x48, 0xd3, 0xe8][..],
+        &[0xf3, 0xc3][..],
+        &[0x48, 0x01, 0x08][..],
+    ] {
+        assert_eq!(
+            admit(packet(bytes)),
+            DecodeDecision::Unsupported,
+            "{bytes:02x?}"
+        );
+    }
+}
+
+#[test]
 fn scalar_admission_rejects_unimplemented_effects_without_changing_state() {
     for bytes in [
         &[0x48, 0x8b, 0x00][..],

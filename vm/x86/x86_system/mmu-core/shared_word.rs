@@ -7,6 +7,32 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
+    /// Small RAM operands fit in one atomic physical beat; crossing forms are not admitted.
+    pub(crate) fn begin_sized(&mut self, va: u64, request: WordAccess, size: u8) -> (accepted: bool)
+        requires old(self).invariant(), size == 1 || size == 2 || size == 4,
+            va % 8 + size as u64 <= 8,
+        ensures final(self).invariant(), accepted == !spec::active(old(self)@.phase),
+            final(self)@ == if accepted { spec::sized(old(self)@, va, request, size) } else { old(self)@ },
+    {
+        let access = match request { WordAccess::Read => Access::Read, WordAccess::Write(_) => Access::Write(0) };
+        self.begin_access(va, access, false, Some(request), size)
+    }
+
+    fn size_mask(&self) -> (mask: u64)
+        ensures mask == spec::size_mask(self.size),
+    {
+        match self.size { 1 => 0xff, 2 => 0xffff, 4 => 0xffff_ffff, _ => u64::MAX }
+    }
+
+    pub(super) fn sized_store_request(&self, data: WordData) -> (out: Request)
+        requires spec::valid_span(data, self.size),
+        ensures out == spec::sized_request(data, self.size),
+    {
+        let shift = (data.address % 8 * 8) as u32;
+        let mask = self.size_mask() << shift;
+        Request::DataCompare { address: data.address / 8 * 8, expected: data.first,
+            replacement: (data.first & !mask) | ((data.value << shift) & mask) }
+    }
     pub fn begin_word(&mut self, va: u64, request: WordAccess, user: bool) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), accepted == !spec::active(old(self)@.phase),
@@ -14,7 +40,7 @@ impl SharedMmu {
                 word_model::request(request), user, Some(request)) } else { old(self)@ },
     {
         let access = match request { WordAccess::Read => Access::Read, WordAccess::Write(_) => Access::Write(0) };
-        self.begin_access(va, access, user, Some(request))
+        self.begin_access(va, access, user, Some(request), 8)
     }
 
     pub(super) fn set_failure(&mut self, result: MmuResult, reads: u8)
@@ -28,7 +54,7 @@ impl SharedMmu {
     }
 
     pub(super) fn precheck_failure(&mut self, result: MmuResult)
-        requires old(self).inner.invariant(), !(result is Success),
+        requires old(self).inner.invariant(), old(self).valid_size(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(),
             final(self)@ == (spec::State { phase: spec::terminal(old(self)@, result, 0), ..old(self)@ }),
@@ -39,7 +65,8 @@ impl SharedMmu {
         requires old(self).invariant(), old(self).word is Some,
             old(self).phase is Data || old(self).phase is WordTail,
             frame < 0x1_0000_0000_0000u64, frame % 4096 == 0,
-            old(self).va <= u64::MAX - 7, old(self).va % 4096 <= 4088,
+            old(self).va as int + old(self).size as int - 1 <= u64::MAX,
+            old(self).va % 4096 + old(self).size as int <= 4096,
             old(self).access is Write ==> leaf is Some,
             match leaf { Some(l) => spec::valid_leaf(l), None => true },
         ensures final(self).invariant(), final(self)@ ==
@@ -53,7 +80,9 @@ impl SharedMmu {
         match self.word {
             Some(WordAccess::Read) => {
                 let offset = self.va % 8;
-                let value = if offset == 0 { first } else {
+                let value = if self.size < 8 {
+                    (first >> ((offset * 8) as u32)) & self.size_mask()
+                } else if offset == 0 { first } else {
                     let shift = (offset * 8) as u32;
                     (first >> shift) | (tail << (64 - shift))
                 };
@@ -79,7 +108,7 @@ impl SharedMmu {
     {
         match self.phase {
             Phase::Data { frame, permissions, leaf, reads, large } => {
-                if self.va % 8 == 0 {
+                if self.va % 8 == 0 || self.size < 8 {
                     self.word_loaded(frame, permissions, leaf, word, 0, reads);
                 } else {
                     self.phase = Phase::WordTail { frame, permissions, leaf, first: word, reads, large };
@@ -101,7 +130,7 @@ impl SharedMmu {
     }
 
     pub(super) fn word_store_done(&mut self, value: u64, reads: u8)
-        requires old(self).inner.invariant(), old(self).word is Some,
+        requires old(self).inner.invariant(), old(self).valid_size(), old(self).word is Some,
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(), final(self)@ == spec::word_store_done(old(self)@, value, reads),
     {

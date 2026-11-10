@@ -1,0 +1,94 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#[cfg(verus_keep_ghost)]
+use super::system;
+use super::system::SegmentState;
+use vstd::prelude::*;
+
+verus! {
+
+pub mod model {
+    #[cfg(verus_keep_ghost)]
+    use super::*;
+
+    // APM Volume 2 §§4.7.1, 4.7.3, 4.8.2: retain the descriptor's hidden
+    // fields even where 64-bit address generation ignores them.
+    pub open spec fn base(word: u64) -> u64 {
+        ((word >> 16) & 0xffffu64)
+        | (((word >> 32) & 0xffu64) << 16)
+        | (((word >> 56) & 0xffu64) << 24)
+    }
+    pub open spec fn limit(word: u64) -> u32 {
+        let raw = (word & 0xffffu64) | (((word >> 48) & 0xfu64) << 16);
+        if word & (1u64 << 55) != 0 { ((raw << 12) | 0xfffu64) as u32 }
+        else { raw as u32 }
+    }
+    pub open spec fn attributes(word: u64) -> u16 {
+        (((word >> 40) & 0xffu64) | (((word >> 52) & 0xfu64) << 12)) as u16
+    }
+    pub open spec fn admitted(word: u64, selector: u16) -> bool {
+        selector != 0 && selector & 7u16 == 0
+        && base(word) == 0 && limit(word) == u32::MAX
+        && attributes(word) == 0xc093
+    }
+    pub open spec fn image(word: u64, selector: u16) -> SegmentState {
+        SegmentState { base: base(word), limit: limit(word), selector,
+            attributes: attributes(word) }
+    }
+    pub open spec fn load_data(word: u64, selector: u16) -> Option<SegmentState> {
+        if admitted(word, selector) { Some(image(word, selector)) } else { None }
+    }
+}
+
+/// This profile requires a present DPL0 expand-up writable accessed data
+/// descriptor, G=D/B=1 and AVL=L=0, with base zero and a full 32-bit limit.
+pub proof fn lemma_flat_correspondence(word: u64, selector: u16)
+    ensures
+        model::admitted(word, selector) <==>
+            (word == 0x00cf_9300_0000_ffffu64 && selector != 0 && selector & 7u16 == 0),
+        model::admitted(word, selector) ==>
+            system::model::supported_data(model::image(word, selector)),
+{
+    assert((model::base(word) == 0 && model::limit(word) == u32::MAX
+        && model::attributes(word) == 0xc093)
+        <==> word == 0x00cf_9300_0000_ffffu64) by(bit_vector);
+}
+
+/// Unsupported images return None, not an architectural exception. In
+/// particular A must already be set: this helper cannot perform the required
+/// descriptor write for an unaccessed image (APM Volume 2 §4.7.3).
+pub fn load_data(word: u64, selector: u16) -> (out: Option<SegmentState>)
+    ensures
+        out == model::load_data(word, selector),
+        out.is_some() == model::admitted(word, selector),
+        match out {
+            Some(segment) => segment == model::image(word, selector)
+                && system::model::supported_data(segment),
+            None => true,
+        },
+{
+    let base = ((word >> 16) & 0x00ff_ffff) | ((word >> 32) & 0xff00_0000);
+    let raw_limit = (word & 0xffff) | ((word >> 32) & 0x000f_0000);
+    proof {
+        assert((((word >> 40) & 0xffu64) | ((word >> 40) & 0xf000u64))
+            <= 0xffffu64) by(bit_vector);
+    }
+    let attributes = (((word >> 40) & 0xff) | ((word >> 40) & 0xf000)) as u16;
+    proof {
+        assert((((word >> 16) & 0x00ff_ffffu64) | ((word >> 32) & 0xff00_0000u64))
+            == model::base(word)) by(bit_vector);
+        assert(((((word >> 40) & 0xffu64) | ((word >> 40) & 0xf000u64)) as u16)
+            == model::attributes(word)) by(bit_vector);
+        assert((((word & 0xffffu64) | ((word >> 32) & 0x000f_0000u64)) == 0xfffff
+            && model::attributes(word) == 0xc093)
+            <==> (model::limit(word) == u32::MAX
+                && model::attributes(word) == 0xc093)) by(bit_vector);
+    }
+    if selector == 0 || selector & 7 != 0 || base != 0
+        || raw_limit != 0xfffff || attributes != 0xc093 {
+        return None;
+    }
+    Some(SegmentState { base, limit: u32::MAX, selector, attributes })
+}
+}

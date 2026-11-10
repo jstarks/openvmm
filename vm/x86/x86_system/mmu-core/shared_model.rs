@@ -26,6 +26,7 @@ pub struct State {
     pub user: bool,
     pub word: Option<WordAccess>,
     pub sequence: u64,
+    pub size: u8,
 }
 
 pub open spec fn active(p: Phase) -> bool {
@@ -34,7 +35,7 @@ pub open spec fn active(p: Phase) -> bool {
 
 pub open spec fn can_commit(p: Phase) -> bool {
     p is Mark || p is Dirty || p is Store || p is WordDirty
-        || p is WordStore || p is WordHead || p is WordLast || p is IoDirty
+        || p is WordStore || p is WordHead || p is WordLast || p is SizedStore || p is IoDirty
 }
 pub open spec fn can_change(p: Phase) -> bool { can_commit(p) && !(p is WordStore) }
 pub open spec fn respond(s: State, reply: Reply) -> (State, bool) {
@@ -50,6 +51,10 @@ pub open spec fn valid_leaf(l: Leaf) -> bool {
 pub open spec fn valid_data(d: WordData) -> bool {
     d.address < 0x1_0000_0000_0000u64 && d.address % 4096 <= 4088
 }
+pub open spec fn valid_span(d: WordData, size: u8) -> bool {
+    if size == 8 { valid_data(d) }
+    else { d.address < 0x1_0000_0000_0000u64 && d.address % 8 + size as int <= 8 }
+}
 pub open spec fn terminal(s: State, result: MmuResult, reads: u8) -> Phase {
     if s.word is Some {
         Phase::WordDone { report: WordReport { result: word_model::lift(result),
@@ -62,11 +67,14 @@ pub open spec fn restart(s: State) -> State {
 }
 
 pub open spec fn begin(s: State, va: u64, access: Access, user: bool, word: Option<WordAccess>) -> State {
-    let t = State { va, access, user, word, ..s };
-    if word is Some && va > u64::MAX - 7 {
+    span_begin(s, va, access, user, word, 8)
+}
+pub open spec fn span_begin(s: State, va: u64, access: Access, user: bool, word: Option<WordAccess>, size: u8) -> State {
+    let t = State { va, access, user, word, size, ..s };
+    if word is Some && va as int + size as int - 1 > u64::MAX {
         State { phase: Phase::WordDone { report: WordReport { result: WordResult::Wrap,
             table_reads: 0, virtual_address: va } }, ..t }
-    } else if word is Some && va % 4096 > 4088 {
+    } else if word is Some && va % 4096 + size as int > 4096 {
         State { phase: Phase::WordDone { report: WordReport { result: WordResult::CrossPage,
             table_reads: 0, virtual_address: va } }, ..t }
     } else if !m::valid_config(s.inner.config) {
@@ -83,6 +91,19 @@ pub open spec fn begin(s: State, va: u64, access: Access, user: bool, word: Opti
             None => restart(t),
         }
     }
+}
+
+pub open spec fn sized(s: State, va: u64, word: WordAccess, size: u8) -> State {
+    span_begin(s, va, word_model::request(word), false, Some(word), size)
+}
+pub open spec fn size_mask(size: u8) -> u64 {
+    match size { 1 => 0xffu64, 2 => 0xffffu64, 4 => 0xffff_ffffu64, _ => u64::MAX }
+}
+pub open spec fn sized_request(data: WordData, size: u8) -> Request {
+    let shift = (data.address % 8 * 8) as u32;
+    let mask = size_mask(size) << shift;
+    Request::DataCompare { address: (data.address / 8 * 8) as u64, expected: data.first,
+        replacement: (data.first & !mask) | ((data.value << shift) & mask) }
 }
 
 pub open spec fn fault(s: State, result: MmuResult, reads: u8) -> State {
@@ -113,6 +134,7 @@ pub open spec fn request(s: State) -> Request {
         Phase::WordStore { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
         Phase::WordHead { data, .. } => head_request(data),
         Phase::WordLast { data, .. } => last_request(data),
+        Phase::SizedStore { data, .. } => sized_request(data, s.size),
         Phase::IoReady { address, access, .. } =>
             Request::Io(IoRequest { sequence: s.sequence, address, access }),
     }
@@ -182,13 +204,15 @@ pub open spec fn exchanged(s: State) -> State {
             phase: Phase::Done(Report { result: MmuResult::Success(
                 match s.access { Access::Write(v) => v, _ => 0 }),
                 table_reads: reads, virtual_address: s.va }), ..s },
-        Phase::WordDirty { data, reads, .. } => State { phase: if data.address % 8 == 0 {
+        Phase::WordDirty { data, reads, .. } => State { phase: if s.size < 8 {
+            Phase::SizedStore { data, reads }
+        } else if data.address % 8 == 0 {
             Phase::WordStore { data, reads }
         } else { Phase::WordHead { data, reads } }, ..s },
         Phase::WordHead { data, reads } => State { phase: Phase::WordLast { data, reads }, ..s },
         Phase::IoDirty { address, value, reads, .. } => State {
             phase: Phase::IoReady { address, access: WordAccess::Write(value), reads }, ..s },
-        Phase::WordStore { data, reads } | Phase::WordLast { data, reads } =>
+        Phase::WordStore { data, reads } | Phase::WordLast { data, reads } | Phase::SizedStore { data, reads } =>
             word_store_done(s, data.value, reads),
         _ => s,
     }
@@ -204,6 +228,8 @@ pub open spec fn changed(s: State, current: u64) -> State {
             State { phase: Phase::WordHead { data: WordData { first: current, ..data }, reads }, ..s },
         Phase::WordLast { data, reads } =>
             State { phase: Phase::WordLast { data: WordData { tail: current, ..data }, reads }, ..s },
+        Phase::SizedStore { data, reads } =>
+            State { phase: Phase::SizedStore { data: WordData { first: current, ..data }, reads }, ..s },
         _ => s,
     }
 }
@@ -236,7 +262,9 @@ pub open spec fn word_loaded(s: State, frame: u64, permissions: Permissions,
             page: s.va as int / 4096, root: s.inner.config.root as int,
             frame: frame as int, permissions, large }), ..s.inner },
             phase: Phase::WordDone { report: WordReport { result: WordResult::Success(
-                joined(first, tail, s.va % 8)), table_reads: reads, virtual_address: s.va } }, ..s },
+                if s.size == 8 { joined(first, tail, s.va % 8) }
+                else { (first >> ((s.va % 8 * 8) as u32)) & size_mask(s.size) }),
+                table_reads: reads, virtual_address: s.va } }, ..s },
         Some(WordAccess::Write(value)) => match leaf {
             Some(pte) => State { phase: Phase::WordDirty { pte,
                 data: WordData { address, first, tail, value }, reads }, ..s },
@@ -248,7 +276,7 @@ pub open spec fn word_loaded(s: State, frame: u64, permissions: Permissions,
 pub open spec fn word_data(s: State, word: u64) -> State {
     match s.phase {
         Phase::Data { frame, permissions, leaf, reads, large } => {
-            if s.va % 8 == 0 { word_loaded(s, frame, permissions, leaf, word, 0, reads) }
+            if s.va % 8 == 0 || s.size < 8 { word_loaded(s, frame, permissions, leaf, word, 0, reads) }
             else { State { phase: Phase::WordTail { frame, permissions, leaf, first: word, reads, large }, ..s } }
         },
         _ => s,

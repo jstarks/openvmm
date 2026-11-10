@@ -15,6 +15,8 @@ use paged_core::shared::CpuPhase;
 use paged_core::shared::{SharedMachine, Tick as CpuTick};
 #[path = "shared_decode.rs"]
 pub mod decode;
+#[path = "shared_entry.rs"]
+pub mod entry;
 use decode::{DecodeDecision, DecodeInput};
 
 verus! {
@@ -29,6 +31,7 @@ pub enum Phase {
     DecodeFetch { input: DecodeInput },
     Admitted { input: DecodeInput, decision: DecodeDecision },
     NearCall { target: u64, stack: u64 },
+    EntryMemory { address: u64, length: u8, task: entry::MemoryTask },
     GateLow { event: Event, address: u64 },
     GateHigh { event: Event, low: u64 },
     Code { event: Event, low: u64, target: u64 },
@@ -326,7 +329,7 @@ impl SharedEventMachine {
                     WordResult::Success(value) => self.word_value(value),
                     result => {
                         if let WordResult::PageFault(code) = result {
-                            if matches!(self.phase, Phase::NearCall { .. }) {
+                            if matches!(self.phase, Phase::NearCall { .. } | Phase::EntryMemory { .. }) {
                                 return self.start_entry(Event::PageFault(code));
                             }
                         }
@@ -421,6 +424,7 @@ impl SharedEventMachine {
                 (Stage::Push, stack - 8 * (index as u64 - if has_error_code(event) { 0 } else { 1 } + 1)),
             Phase::Pop { index, .. } => (Stage::Pop, cpu.gpr[4] + index as u64 * 8),
             Phase::NearCall { stack, .. } => (Stage::Push, stack),
+            Phase::EntryMemory { address, .. } => (Stage::Stack, address),
             _ => { assert(false); (Stage::Idt, 0) },
         }
     }
@@ -435,6 +439,7 @@ impl SharedEventMachine {
     {
         let mut cpu = self.core.cpu();
         match self.phase {
+            Phase::EntryMemory { .. } => return self.entry_value(value),
             Phase::NearCall { target, stack } => {
                 let ghost before = cpu@;
                 cpu.gpr[4] = stack;

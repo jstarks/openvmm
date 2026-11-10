@@ -79,6 +79,7 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
     let (input, decision) = match s.phase { Phase::Admitted { input, decision } => (input, decision),
         _ => arbitrary() };
     match decision {
+        DecodeDecision::Entry(instruction) => super::entry::execute(s, instruction, input.length),
         DecodeDecision::More => {
             if input.length == 15 { entry(s, Event::GeneralProtection) }
             else if input.rip as int + input.length as int > u64::MAX {

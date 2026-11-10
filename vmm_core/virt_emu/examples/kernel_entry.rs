@@ -37,8 +37,8 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
     const ENTRY: u64 = 0x2d98100;
-    const FRONTIER: u64 = 0x2d8af5a;
-    const STACK: u64 = 0x2603f40;
+    const FRONTIER: u64 = 0x2d98124;
+    const STACK: u64 = 0x2603f38;
     const RETURN: u64 = 0x2d9811a;
     const CMDLINE: &str =
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
@@ -147,9 +147,27 @@ mod native {
                 let offset = usize::try_from(word - address)?;
                 bytes[offset..offset + 8].copy_from_slice(&before.to_le_bytes());
             }
+
             hash.update(&bytes);
         }
         Ok(hash.finalize().to_vec())
+    }
+
+    fn expected_store(
+        memory: &GuestMemory,
+        changes: &mut BTreeMap<u64, (u64, u64)>,
+        address: u64,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        for (offset, &byte) in bytes.iter().enumerate() {
+            let address = address + u64::try_from(offset)?;
+            let aligned = address & !7;
+            let before = memory.read_plain::<u64>(aligned)?;
+            let pair = changes.entry(aligned).or_insert((before, before));
+            let shift = (address & 7) * 8;
+            pair.1 = (pair.1 & !(0xff << shift)) | (u64::from(byte) << shift);
+        }
+        Ok(())
     }
 
     async fn witness(driver: DefaultDriver) -> anyhow::Result<()> {
@@ -237,20 +255,30 @@ mod native {
         );
         let mut changes = BTreeMap::new();
         expected_walk(&memory, initial.registers.cr3, ENTRY, false, &mut changes)?;
-        expected_walk(
-            &memory,
-            initial.registers.cr3,
-            FRONTIER,
-            false,
-            &mut changes,
-        )?;
-        expected_walk(&memory, initial.registers.cr3, STACK, true, &mut changes)?;
-        ensure!(
-            changes
-                .insert(STACK, (memory.read_plain::<u64>(STACK)?, RETURN))
-                .is_none(),
-            "stack overlaps a page-table word"
-        );
+        for address in [0x2d8af5a, 0x1201f8b, 0x1edc370, FRONTIER, 0x30ae018] {
+            expected_walk(&memory, initial.registers.cr3, address, false, &mut changes)?;
+        }
+        for address in [0x2603ef0, 0x26041d0] {
+            expected_walk(&memory, initial.registers.cr3, address, true, &mut changes)?;
+        }
+        // Independent expected bytes of both ten-byte table operands and the #VC gate.
+        // Later pushes overwrite the original GDTR base and first CALL return slot.
+        for (address, value) in [
+            (0x2603f40, 0x10u64),
+            (0x2603f38, 0x2d98126),
+            (0x2603f28, 0x2d8af8d),
+            (0x2603f20, initial.registers.rbp),
+            (0x2603f00, 0x2604000),
+            (0x2603f08, 0x100000001d),
+            (0x2603f10, 0x8e00),
+            (0x2603f18, 0x2d982ca),
+            (0x26041d0, 0x02d98e00001082ca),
+            (0x26041d8, 0),
+        ] {
+            expected_store(&memory, &mut changes, address, &value.to_le_bytes())?;
+        }
+        expected_store(&memory, &mut changes, 0x2603f36, &0x7fu16.to_le_bytes())?;
+        expected_store(&memory, &mut changes, 0x2603efe, &0x1ffu16.to_le_bytes())?;
         let before = memory_digest(&memory, &BTreeMap::new())?;
         let mut binder = binders.pop().context("missing VP binder")?;
         ensure!(binders.is_empty(), "unexpected additional VP");
@@ -295,19 +323,28 @@ mod native {
         );
         let progress = vp.completed_batch_progress();
         ensure!(
-            progress.retired == 7 && progress.delivered == 0,
+            progress.retired == 54 && progress.delivered == 0,
             "wrong progress: {progress:?}"
         );
         let mut expected = initial.registers;
         expected.cr0 |= 0x10;
-        expected.rax = 0;
-        expected.rdx = 0;
-        expected.rcx = 0xc0000101;
-        expected.r15 = expected.rsi;
+        expected.rax = 0x2d98126;
+        expected.rdx = 0x2604000;
+        expected.rcx = 0x02d9000000000000;
+        expected.rsi = 0x00008e0000000000;
+        expected.rdi = 0;
+        expected.r15 = initial.registers.rsi;
         expected.rsp = STACK;
         expected.rip = FRONTIER;
-        expected.rflags = (expected.rflags & !0x108d5) | 0x44;
+        expected.rflags &= !0x108d5;
         expected.gs.base = 0;
+        expected.gdtr.base = 0x30ae000;
+        expected.gdtr.limit = 0x7f;
+        expected.idtr.base = 0x2604000;
+        expected.idtr.limit = 0x1ff;
+        expected.ds.selector = 0x18;
+        expected.ss.selector = 0x18;
+        expected.es.selector = 0x18;
         let mut state = vp.access_state(Vtl::Vtl0);
         let actual = state.registers()?;
         ensure!(
@@ -326,11 +363,11 @@ mod native {
         }
         ensure!(
             memory_digest(&memory, &changes)? == before,
-            "RAM changed outside the declared A/D words and CALL push"
+            "RAM changed outside the declared A/D, stack and #VC gate effects"
         );
-        let mut bytes = [0; 4];
+        let mut bytes = [0; 2];
         memory.read_at(FRONTIER, &mut bytes)?;
-        ensure!(bytes == [0x48, 0x83, 0xec, 0x10], "wrong frontier bytes");
+        ensure!(bytes == [0x48, 0xcb], "wrong frontier bytes");
         let functions = [0, 1, 0x8000_0000, 0x8000_0001, 0x8000_0008];
         let cpuid: Vec<_> = functions
             .into_iter()
@@ -345,10 +382,11 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
-                "entry": ENTRY, "frontier": actual.rip, "frontier_hex": "4883ec10",
+                "entry": ENTRY, "frontier": actual.rip, "frontier_hex": "48cb",
                 "r15": actual.r15, "rsp": actual.rsp, "return_address": RETURN,
                 "rflags": actual.rflags, "seconds": seconds,
                 "complete_register_image_checked": true, "whole_ram_checked": true,
+                "descriptor_setup_returned": true,
                 "cpuid_target": cpuid, "cpuid_instruction_implemented": false,
                 "linux_boot": false, "snp": false,
             })

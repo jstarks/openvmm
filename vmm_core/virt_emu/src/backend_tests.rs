@@ -178,6 +178,56 @@ async fn build(
 }
 
 #[async_test]
+async fn descriptor_entry_updates_real_vp_state_and_preserves_store_neighbors(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    let program = [
+        0x48, 0x83, 0xec, 0x10, 0x66, 0xc7, 0x44, 0x24, 6, 0x1f, 0, 0x48, 0x89, 0x44, 0x24, 8,
+        0x0f, 0x01, 0x54, 0x24, 6, 0xb8, 0x18, 0, 0, 0, 0x8e, 0xd8, 0x8e, 0xd0, 0x8e, 0xc0, 0x48,
+        0x83, 0xc4, 0x10, 0xf4,
+    ];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    bytes[0x9018..0x9020].copy_from_slice(&0x00cf93000000ffffu64.to_le_bytes());
+    bytes[0x18008..0x18010].copy_from_slice(&0x1122334455667788u64.to_le_bytes());
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.rax = 0x9000;
+    initial.rsp = 0x18018;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    park(run.as_mut());
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
+    let mut expected = initial;
+    expected.rax = 0x18;
+    expected.gdtr.limit = 0x1f;
+    expected.ds.selector = 0x18;
+    expected.ss.selector = 0x18;
+    expected.es.selector = 0x18;
+    expected.rip = CODE + program.len() as u64;
+    expected.rflags = (initial.rflags & !0x108d5) | 4;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(
+        memory.read_plain::<u64>(0x18008).unwrap(),
+        0x001f334455667788
+    );
+    assert_eq!(memory.read_plain::<u64>(0x18010).unwrap(), 0x9000);
+    let progress = vp.completed_batch_progress();
+    assert_eq!((progress.retired, progress.delivered), (10, 0));
+    assert!(devices.faults.lock().is_empty());
+}
+
+#[async_test]
 async fn entry_forms_retire_through_real_vp_and_preserve_the_call_push(driver: DefaultDriver) {
     let (mut bytes, owned) = fixture();
     bytes[CODE as usize..CODE as usize + 11]

@@ -50,6 +50,11 @@ pub open spec fn boundary_commit(s: State, cpu: model::State, release: bool) -> 
         (State { cpu, phase: if release { CpuPhase::Ready } else { CpuPhase::Boundary }, ..s }, true)
     } else { (s, false) }
 }
+pub open spec fn boundary_sized(s: State, address: u64, word: WordAccess, size: u8) -> (State, bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) {
+        (State { mmu: mm::sized(s.mmu, address, word, size), ..s }, true)
+    } else { (s, false) }
+}
 pub open spec fn invalidate(s: State, va: u64) -> (State, bool) {
     if (s.phase is Ready || s.phase is Stopped || s.phase is Boundary) && !mm::active(s.mmu.phase) {
         (State { mmu: mm::State { inner: super::mmu_model::invalidate(s.mmu.inner, va as int),

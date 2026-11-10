@@ -9,7 +9,9 @@ pub use x86_system::memory_core::cpu_core::operand::*;
 
 use iced_x86::Register as IcedRegister;
 use iced_x86::{Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind};
+use x86_system::memory_core::cpu_core::integer;
 use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+use x86_system::shared::entry::Instruction as EntryInstruction;
 
 pub const MAX_INSTRUCTION_BYTES: usize = 15;
 
@@ -279,7 +281,9 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
                 [0xe8, a, b, c, d] => DecodeDecision::NearCall {
                     displacement: i32::from_le_bytes([*a, *b, *c, *d]),
                 },
-                _ => DecodeDecision::Unsupported,
+                _ => {
+                    admit_entry(encoding).map_or(DecodeDecision::Unsupported, DecodeDecision::Entry)
+                }
             }
         }
         Some(Outcome::Normalized(decoded)) => {
@@ -313,9 +317,137 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
                 | (Operation::Lea, [Operand::Register(dst), source @ Operand::Address(_)]) => {
                     DecodeDecision::Scalar { dst, source }
                 }
-                _ => DecodeDecision::Unsupported,
+                _ => admit_entry(decoded.encoding)
+                    .map_or(DecodeDecision::Unsupported, DecodeDecision::Entry),
             }
         }
+    }
+}
+
+fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
+    let mut decoder = Decoder::with_ip(64, encoding.bytes(), encoding.rip, DecoderOptions::AMD);
+    let instruction = decoder.decode();
+    if decoder.last_error() != DecoderError::None
+        || instruction.len() != encoding.length as usize
+        || instruction.has_lock_prefix()
+        || instruction.has_rep_prefix()
+        || instruction.has_repne_prefix()
+        || instruction.has_xacquire_prefix()
+        || instruction.has_xrelease_prefix()
+    {
+        return None;
+    }
+    let size = address_size(encoding.bytes());
+    let get = |index| operand(&instruction, index, Operation::Mov, size);
+    match instruction.mnemonic() {
+        Mnemonic::Add
+        | Mnemonic::Sub
+        | Mnemonic::And
+        | Mnemonic::Or
+        | Mnemonic::Test
+        | Mnemonic::Shl
+        | Mnemonic::Shr => {
+            let Operand::Register(dst) = get(0)? else {
+                return None;
+            };
+            let source = get(1)?;
+            let shift = matches!(instruction.mnemonic(), Mnemonic::Shl | Mnemonic::Shr);
+            match source {
+                Operand::Register(src) if src.width() == dst.width() && !shift => {}
+                Operand::Immediate(imm)
+                    if imm.width == dst.width() || (shift && imm.width == Width::Byte) => {}
+                _ => return None,
+            }
+            let operation = match instruction.mnemonic() {
+                Mnemonic::Add => integer::Operation::Add,
+                Mnemonic::Sub => integer::Operation::Sub,
+                Mnemonic::And => integer::Operation::And,
+                Mnemonic::Or => integer::Operation::Or,
+                Mnemonic::Test => integer::Operation::Test,
+                Mnemonic::Shl => integer::Operation::Shl,
+                _ => integer::Operation::Shr,
+            };
+            Some(EntryInstruction::Integer {
+                operation,
+                dst,
+                source,
+            })
+        }
+        Mnemonic::Mov | Mnemonic::Movzx => {
+            if instruction.mnemonic() == Mnemonic::Mov {
+                if let Some(dst @ (Segment::Ds | Segment::Ss | Segment::Es)) =
+                    segment(instruction.op0_register())
+                {
+                    let source = register(instruction.op1_register())?;
+                    return Some(EntryInstruction::Segment {
+                        segment: dst,
+                        src: Register::new(source.gpr(), Width::Word, false)?,
+                    });
+                }
+            }
+            match (get(0)?, get(1)?) {
+                (Operand::Register(dst), Operand::Memory { address, width })
+                    if dst.width() == width || instruction.mnemonic() == Mnemonic::Movzx =>
+                {
+                    Some(EntryInstruction::Load {
+                        dst,
+                        address,
+                        width,
+                    })
+                }
+                (Operand::Register(dst), Operand::Register(src))
+                    if instruction.mnemonic() == Mnemonic::Movzx =>
+                {
+                    Some(EntryInstruction::ZeroExtend { dst, src })
+                }
+                (
+                    Operand::Memory { address, width },
+                    source @ (Operand::Register(_) | Operand::Immediate(_)),
+                ) if instruction.mnemonic() == Mnemonic::Mov => {
+                    match source {
+                        Operand::Register(src) if src.width() == width => {}
+                        Operand::Immediate(imm) if imm.width == width => {}
+                        _ => return None,
+                    }
+                    Some(EntryInstruction::Store {
+                        address,
+                        width,
+                        source,
+                    })
+                }
+                _ => None,
+            }
+        }
+        Mnemonic::Lgdt | Mnemonic::Lidt if instruction.op0_kind() == OpKind::Memory => {
+            Some(EntryInstruction::Table {
+                address: address(&instruction, size)?,
+                idt: instruction.mnemonic() == Mnemonic::Lidt,
+            })
+        }
+        Mnemonic::Push => {
+            let source = get(0)?;
+            match source {
+                Operand::Register(reg) if reg.width() == Width::Qword => {}
+                Operand::Immediate(imm) if imm.width == Width::Qword => {}
+                _ => return None,
+            }
+            Some(EntryInstruction::Push { source })
+        }
+        Mnemonic::Ret if encoding.bytes() == [0xc3] => Some(EntryInstruction::Return),
+        Mnemonic::Leave if encoding.bytes() == [0xc9] => Some(EntryInstruction::Leave),
+        Mnemonic::Jmp | Mnemonic::Je | Mnemonic::Jne
+            if instruction.op0_kind() == OpKind::NearBranch64 =>
+        {
+            Some(EntryInstruction::Jump {
+                target: instruction.near_branch64(),
+                zero: match instruction.mnemonic() {
+                    Mnemonic::Je => Some(true),
+                    Mnemonic::Jne => Some(false),
+                    _ => None,
+                },
+            })
+        }
+        _ => None,
     }
 }
 

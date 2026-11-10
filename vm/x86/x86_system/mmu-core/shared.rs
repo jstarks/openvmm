@@ -33,6 +33,7 @@ pub enum Phase {
     WordStore { data: WordData, reads: u8 },
     WordHead { data: WordData, reads: u8 },
     WordLast { data: WordData, reads: u8 },
+    SizedStore { data: WordData, reads: u8 },
     WordDone { report: WordReport },
     IoDirty { pte: Leaf, address: u64, value: u64, reads: u8 },
     IoReady { address: u64, access: WordAccess, reads: u8 },
@@ -62,6 +63,7 @@ pub struct SharedMmu {
     user: bool,
     word: Option<WordAccess>,
     sequence: u64,
+    size: u8,
 }
 
 impl View for SharedMmu {
@@ -69,16 +71,23 @@ impl View for SharedMmu {
     closed spec fn view(&self) -> spec::State {
         spec::State { inner: self.inner@, phase: self.phase,
             va: self.va, access: self.access, user: self.user, word: self.word,
-            sequence: self.sequence }
+            sequence: self.sequence, size: self.size }
     }
 }
 
 impl SharedMmu {
+    pub closed spec fn valid_size(&self) -> bool {
+        (self.size == 1 || self.size == 2 || self.size == 4 || self.size == 8)
+        && (self.size < 8 ==> self.va % 8 + self.size as int <= 8)
+    }
+
     pub closed spec fn invariant(&self) -> bool {
         self.inner.invariant()
+        && self.valid_size()
         && (spec::active(self.phase) ==> mmu_model::valid_config(self.inner.config))
         && (spec::active(self.phase) && self.word is Some ==>
-            self.va <= u64::MAX - 7 && self.va % 4096 <= 4088)
+            self.va as int + self.size as int - 1 <= u64::MAX
+                && self.va % 4096 + self.size as int <= 4096)
         && (self.word is Some ==> self.access == word_model::request(self.word.unwrap()))
         && match self.phase {
             Phase::Done(_) | Phase::Dirty { .. } | Phase::Store { .. } => self.word is None,
@@ -103,16 +112,18 @@ impl SharedMmu {
                 && pte.word % 2 == 1 && address < 0x1_0000_0000_0000u64,
             Phase::Store { address, .. } => self.access is Write && address < 0x1_0000_0000_0000u64,
             Phase::WordTail { frame, leaf, .. } => self.word is Some
-                && self.va % 8 != 0
+                && self.va % 8 != 0 && self.size == 8
                 && frame < 0x1_0000_0000_0000u64 && frame % 4096 == 0
                 && (self.access is Write ==> leaf is Some)
                 && match leaf { Some(l) => spec::valid_leaf(l), None => true },
             Phase::WordDirty { pte, data, .. } => self.word is Some
-                && self.access is Write && spec::valid_leaf(pte) && spec::valid_data(data),
+                && self.access is Write && spec::valid_leaf(pte) && spec::valid_span(data, self.size),
             Phase::WordStore { data, .. } => self.word is Some
                 && self.access is Write && spec::valid_data(data) && data.address % 8 == 0,
             Phase::WordHead { data, .. } | Phase::WordLast { data, .. } => self.word is Some
                 && self.access is Write && spec::valid_data(data) && data.address % 8 != 0,
+            Phase::SizedStore { data, .. } => self.word is Some
+                && self.access is Write && spec::valid_span(data, self.size) && self.size < 8,
             Phase::IoDirty { pte, address, value, .. } => spec::valid_leaf(pte)
                 && address < 0x1_0000_0000_0000u64 && address % 8 == 0
                 && self.word == Some(WordAccess::Write(value)),
@@ -129,7 +140,7 @@ impl SharedMmu {
             s@.phase == Phase::Idle, s@.sequence == 0,
     {
         Self { inner: Mmu::new(config, cr2), phase: Phase::Idle,
-            va: 0, access: Access::Read, user: false, word: None, sequence: 0 }
+            va: 0, access: Access::Read, user: false, word: None,             sequence: 0, size: 8 }
     }
 
     pub fn cr2(&self) -> (v: u64)
@@ -150,25 +161,28 @@ impl SharedMmu {
         ensures final(self).invariant(),
             accepted == !spec::active(old(self)@.phase),
             final(self)@ == if accepted { spec::begin(old(self)@, va, access, user, None) } else { old(self)@ },
-    { self.begin_access(va, access, user, None) }
+    { self.begin_access(va, access, user, None, 8) }
 
-    fn begin_access(&mut self, va: u64, access: Access, user: bool, word: Option<WordAccess>) -> (accepted: bool)
+    fn begin_access(&mut self, va: u64, access: Access, user: bool, word: Option<WordAccess>, size: u8) -> (accepted: bool)
         requires old(self).invariant(),
+            size == 1 || size == 2 || size == 4 || size == 8,
+            size < 8 ==> va % 8 + size as int <= 8,
             word is Some ==> access == word_model::request(word.unwrap()),
         ensures final(self).invariant(),
             accepted == !spec::active(old(self)@.phase),
-            final(self)@ == if accepted { spec::begin(old(self)@, va, access, user, word) } else { old(self)@ },
+            final(self)@ == if accepted { spec::span_begin(old(self)@, va, access, user, word, size) } else { old(self)@ },
     {
         if self.active() { return false; }
         self.va = va; self.access = access; self.user = user;
         self.word = word;
+        self.size = size;
         if word.is_some() {
-            if va > u64::MAX - 7 {
+            if va > u64::MAX - (size as u64 - 1) {
                 self.phase = Phase::WordDone { report: WordReport { result: WordResult::Wrap,
                     table_reads: 0, virtual_address: va } };
                 return true;
             }
-            if va % 4096 > 4088 {
+            if va % 4096 + size as u64 > 4096 {
                 self.phase = Phase::WordDone { report: WordReport { result: WordResult::CrossPage,
                     table_reads: 0, virtual_address: va } };
                 return true;
@@ -225,8 +239,9 @@ impl SharedMmu {
     }
 
     fn restart(&mut self)
-        requires old(self).inner.invariant(), mmu_model::valid_config(old(self).inner.config),
-            old(self).word is Some ==> old(self).va <= u64::MAX - 7 && old(self).va % 4096 <= 4088,
+        requires old(self).inner.invariant(), old(self).valid_size(), mmu_model::valid_config(old(self).inner.config),
+            old(self).word is Some ==> old(self).va as int + old(self).size as int - 1 <= u64::MAX
+                && old(self).va % 4096 + old(self).size as int <= 4096,
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self)@ == spec::restart(old(self)@), final(self).invariant(),
     {
@@ -235,7 +250,7 @@ impl SharedMmu {
     }
 
     fn fail(&mut self, result: MmuResult, reads: u8)
-        requires old(self).inner.invariant(), !(result is Success),
+        requires old(self).inner.invariant(), old(self).valid_size(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self)@ == spec::fault(old(self)@, result, reads), final(self).invariant(),
     {
@@ -292,6 +307,7 @@ impl SharedMmu {
             Phase::WordStore { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
             Phase::WordHead { data, .. } => self.word_head_request(data),
             Phase::WordLast { data, .. } => self.word_last_request(data),
+            Phase::SizedStore { data, .. } => self.sized_store_request(data),
             Phase::IoReady { address, access, .. } =>
                 Request::Io(IoRequest { sequence: self.sequence, address, access }),
         }
@@ -385,7 +401,8 @@ impl SharedMmu {
                 true
             },
             Phase::WordDirty { data, reads, .. } => {
-                self.phase = if data.address % 8 == 0 { Phase::WordStore { data, reads } }
+                self.phase = if self.size < 8 { Phase::SizedStore { data, reads } }
+                    else if data.address % 8 == 0 { Phase::WordStore { data, reads } }
                     else { Phase::WordHead { data, reads } };
                 true
             },
@@ -397,7 +414,7 @@ impl SharedMmu {
                 self.phase = Phase::IoReady { address, access: WordAccess::Write(value), reads };
                 true
             },
-            Phase::WordStore { data, reads } | Phase::WordLast { data, reads } => {
+            Phase::WordStore { data, reads } | Phase::WordLast { data, reads } | Phase::SizedStore { data, reads } => {
                 self.word_store_done(data.value, reads);
                 true
             },
@@ -423,6 +440,9 @@ impl SharedMmu {
             },
             Phase::WordLast { data, reads } => {
                 self.phase = Phase::WordLast { data: WordData { tail: current, ..data }, reads }; true
+            },
+            Phase::SizedStore { data, reads } => {
+                self.phase = Phase::SizedStore { data: WordData { first: current, ..data }, reads }; true
             },
             _ => false,
         }

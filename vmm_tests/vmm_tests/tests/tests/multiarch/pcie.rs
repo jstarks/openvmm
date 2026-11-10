@@ -10,6 +10,7 @@ use pal_async::DefaultDriver;
 use pal_async::timer::PolledTimer;
 use petri::PetriVmBuilder;
 use petri::openvmm::OpenVmmPetriBackend;
+#[cfg(any(windows, target_os = "linux"))]
 use petri_artifacts_vmm_test::artifacts::virtio_win::VIRTIO_WINDOWS_DRIVERS;
 use pipette_client::PipetteClient;
 use std::fmt;
@@ -1298,54 +1299,89 @@ async fn boot_no_vmbus_windows(config: PetriVmBuilder<OpenVmmPetriBackend>) -> a
 }
 
 /// Boot Windows with a virtio-net NIC on PCIe, install the NetKVM driver
-/// online via pipette, and verify the NIC gets a DHCP address from consomme.
+/// from a vSMB share, and verify the NIC gets a DHCP address from consomme.
 ///
 /// This validates that our virtio-net emulation works with the upstream
 /// virtio-win NetKVM driver on Windows.
+#[cfg(any(windows, target_os = "linux"))]
 #[openvmm_test(uefi_x64(vhd(windows_datacenter_core_2022_x64))[VIRTIO_WINDOWS_DRIVERS])]
 async fn virtio_net_windows(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     (virtio_win,): (petri::ResolvedArtifact<VIRTIO_WINDOWS_DRIVERS>,),
     driver: DefaultDriver,
 ) -> anyhow::Result<()> {
+    use openvmm_defs::config::DeviceVtl;
+    use vm_resource::IntoResource;
+
     let driver_dir = virtio_win.get().join("NetKVM/2k22/amd64");
-
-    let (vm, agent) = config
-        .modify_backend(|b| {
-            b.with_pcie_root_topology(1, 1, 1)
-                .with_virtio_nic("s0rc0rp0", PCIE_NIC_MAC_ADDRESSES[0])
-        })
-        .run()
-        .await?;
-
-    let sh = agent.windows_shell();
-
-    // Create the driver directory in the guest
-    cmd!(sh, "cmd.exe /c mkdir C:\\drivers").run().await?;
-
-    // Push driver files into the guest
-    let driver_files = [
+    let share = tempfile::tempdir()?;
+    for filename in [
         "netkvm.cat",
         "netkvm.inf",
         "netkvm.sys",
         "netkvmco.exe",
         "netkvmp.exe",
-    ];
-    for filename in &driver_files {
-        let local_path = driver_dir.join(filename);
-        let file = fs_err::File::open(&local_path)?;
-        let guest_path = format!("C:/drivers/{filename}");
-        agent
-            .write_file(&guest_path, futures::io::AllowStdIo::new(file))
-            .await
-            .with_context(|| format!("failed to write {guest_path}"))?;
+    ] {
+        fs_err::copy(driver_dir.join(filename), share.path().join(filename))?;
     }
+    let root_path = share
+        .path()
+        .to_str()
+        .context("non-UTF-8 driver share path")?
+        .to_owned();
+
+    let (vm, agent) = config
+        .modify_backend(move |b| {
+            b.without_save_restore()
+                .with_pcie_root_topology(1, 1, 1)
+                .with_virtio_nic("s0rc0rp0", PCIE_NIC_MAC_ADDRESSES[0])
+                .with_custom_config(move |c| {
+                    #[cfg(target_os = "linux")]
+                    let resource = vsmb_resources::VsmbLinuxDeviceHandle {
+                        share_name: "drivers".into(),
+                        root_path,
+                        software_caching: false,
+                    }
+                    .into_resource();
+                    #[cfg(windows)]
+                    let resource = vsmb_resources::VsmbWindowsDeviceHandle {
+                        share_name: "drivers".into(),
+                        root_path,
+                        lock_mode: vsmb_resources::VsmbWindowsLockMode::Native,
+                        software_caching: false,
+                    }
+                    .into_resource();
+                    c.vmbus_devices.push((DeviceVtl::Vtl0, resource));
+                })
+        })
+        .run()
+        .await?;
+
+    let sh = agent.windows_shell();
+    let (bootstrap, _) = include_str!("../../../test_data/vsmb_file_operations.ps1")
+        .split_once("\n[VsmbGuest]::Activate()")
+        .context("guest vSMB bootstrap boundary missing")?;
+    let activate = format!("{bootstrap}\n[VsmbGuest]::Activate('drivers')");
+    cmd!(sh, "powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &activate])
+        .run()
+        .await?;
 
     // Install the driver
-    let output = cmd!(sh, "pnputil.exe /add-driver C:/drivers/netkvm.inf /install")
+    let output = cmd!(sh, "pnputil.exe /add-driver V:/netkvm.inf /install")
         .read()
         .await?;
     tracing::info!(%output, "pnputil output");
+    // File reads write response data into external guest buffers.
+    let transfers = vm
+        .inspect_vmm("vsmb:dcc079ae-60ba-4d07-847c-3493609c0870/external_data/writes")
+        .await?
+        .to_string()
+        .parse::<u64>()?;
+    anyhow::ensure!(
+        transfers > 0,
+        "NetKVM installation did not read the vSMB share"
+    );
 
     // Wait for the NIC to get a DHCP address from consomme.
     // Consomme assigns 10.0.0.2 to the client.

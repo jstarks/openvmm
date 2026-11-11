@@ -453,6 +453,59 @@ async fn locked_integer_modify_preserves_neighbor_bits_and_carry_through_the_rea
 }
 
 #[async_test]
+async fn locked_bit_strings_use_signed_word_addresses_through_the_real_vp(driver: DefaultDriver) {
+    for (opcode, operation) in [(0xab, 0), (0xb3, 1), (0xbb, 2)] {
+        for index in [-65i64, -1, 0, 63, 64, 127] {
+            let (mut bytes, owned) = fixture();
+            let program = [0xf0, 0x48, 0x0f, opcode, 0x0b, 0xf4];
+            bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+            let original = 0xa5a5_a5a5_a5a5_a5a5u64;
+            bytes[0x16020..0x16060].fill(0xa5);
+            let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+            let mut vp = binder.bind().unwrap();
+            let mut initial = long_mode_registers(
+                owned.core.cpu,
+                super::shared_mmu_tests::config(),
+                owned.tables,
+                77,
+            );
+            initial.rbx = 0x16040;
+            initial.rcx = index as u64;
+            vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+            vp.set_execution_checkpoint(Some(CODE + 5)).unwrap();
+            let devices = Devices::new();
+            let stop = StopVpSource::new();
+            assert!(matches!(
+                vp.run_vp(stop.checker(), &devices).await,
+                Err(VpHaltReason::PowerOff)
+            ));
+            assert_eq!(devices.faults.lock().len(), 1);
+            assert!(devices.faults.lock()[0].contains("checkpoint"));
+            let target = (0x16040i64 + index.div_euclid(64) * 8) as u64;
+            let bit = 1u64 << index.rem_euclid(64);
+            let mut expected = initial;
+            expected.rip = CODE + 5;
+            expected.rflags = (initial.rflags & !0x10001) | u64::from(original & bit != 0);
+            assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+            for address in (0x16020..0x16060).step_by(8) {
+                let expected = if address != target {
+                    original
+                } else {
+                    match operation {
+                        0 => original | bit,
+                        1 => original & !bit,
+                        _ => original ^ bit,
+                    }
+                };
+                assert_eq!(memory.read_plain::<u64>(address).unwrap(), expected);
+            }
+            let progress = vp.completed_batch_progress();
+            assert_eq!((progress.retired, progress.delivered), (1, 0));
+        }
+    }
+}
+
+#[async_test]
 async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: DefaultDriver) {
     for iret in [false, true] {
         let (mut bytes, owned) = fixture();

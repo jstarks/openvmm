@@ -357,6 +357,12 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         if has_repeat_prefix(encoding) {
             return None;
         }
+        if matches!(
+            instruction.mnemonic(),
+            Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc
+        ) {
+            return admit_memory_bit(&instruction, size, true);
+        }
         let EntryInstruction::Alu {
             operation,
             destination,
@@ -563,24 +569,8 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         }
         Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
             let destination = get(0)?;
-            if let Operand::Memory { width, .. } = destination {
-                let Operand::Immediate(mut immediate) = get(1)? else {
-                    return None;
-                };
-                if !matches!(width, Width::Word | Width::Dword | Width::Qword)
-                    || immediate.encoded_width != Width::Byte
-                    || immediate.value >= width.bits() as u64
-                {
-                    return None;
-                }
-                immediate.width = width;
-                let operation = match instruction.mnemonic() {
-                    Mnemonic::Bt => integer::Operation::BitTest,
-                    Mnemonic::Bts => integer::Operation::BitSet,
-                    Mnemonic::Btr => integer::Operation::BitReset,
-                    _ => integer::Operation::BitComplement,
-                };
-                return alu_entry(operation, destination, Operand::Immediate(immediate));
+            if matches!(destination, Operand::Memory { .. }) {
+                return admit_memory_bit(&instruction, size, false);
             }
             let Operand::Register(dst) = destination else {
                 return None;
@@ -747,6 +737,49 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         }
         _ => None,
     }
+}
+
+fn admit_memory_bit(
+    instruction: &Instruction,
+    size: AddressSize,
+    locked: bool,
+) -> Option<EntryInstruction> {
+    let destination = operand(instruction, 0, Operation::Mov, size)?;
+    let Operand::Memory { width, .. } = destination else {
+        return None;
+    };
+    if !matches!(width, Width::Word | Width::Dword | Width::Qword) {
+        return None;
+    }
+    let source = match operand(instruction, 1, Operation::Mov, size)? {
+        Operand::Register(index) if index.width() == width => Operand::Register(index),
+        Operand::Immediate(mut index) if index.encoded_width == Width::Byte => {
+            index.width = width;
+            index.value &= width.bits() as u64 - 1;
+            Operand::Immediate(index)
+        }
+        _ => return None,
+    };
+    let operation = match instruction.mnemonic() {
+        Mnemonic::Bt if !locked => integer::Operation::BitTest,
+        Mnemonic::Bts => integer::Operation::BitSet,
+        Mnemonic::Btr => integer::Operation::BitReset,
+        Mnemonic::Btc => integer::Operation::BitComplement,
+        _ => return None,
+    };
+    Some(if locked {
+        EntryInstruction::LockedAlu {
+            operation,
+            destination,
+            source,
+        }
+    } else {
+        EntryInstruction::Alu {
+            operation,
+            destination,
+            source,
+        }
+    })
 }
 
 fn condition(mnemonic: Mnemonic) -> Option<Condition> {

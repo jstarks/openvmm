@@ -1121,9 +1121,9 @@ fn sign_extension_and_division_preserve_source_width_and_memory_address() {
 }
 
 #[test]
-fn register_bits_mask_immediate_indices_but_reject_memory_bit_strings() {
+fn register_bits_mask_immediate_indices_and_memory_forms_keep_indices() {
     use x86_system::memory_core::cpu_core::scalar::BitOperation;
-    use x86_system::shared::decode::DecodeDecision;
+
     use x86_system::shared::entry::Instruction;
     for (prefix, width) in [
         (&[0x66][..], Width::Word),
@@ -1159,9 +1159,21 @@ fn register_bits_mask_immediate_indices_but_reject_memory_bit_strings() {
                 }
             );
             let bytes = [prefix, &[0x0f, opcode, 0x08]].concat();
-            assert_eq!(admission(&bytes), DecodeDecision::Unsupported);
+            assert!(matches!(
+                entry(&bytes),
+                Instruction::Alu {
+                    source: Operand::Register(_),
+                    ..
+                }
+            ));
             let bytes = [prefix, &[0x0f, 0xba, extension << 3, 0xff]].concat();
-            assert_eq!(admission(&bytes), DecodeDecision::Unsupported);
+            assert!(matches!(
+                entry(&bytes),
+                Instruction::Alu {
+                    source: Operand::Immediate(_),
+                    ..
+                }
+            ));
         }
     }
 }
@@ -1515,7 +1527,7 @@ fn startup_control_msr_and_segment_packets_remain_cpu_independent() {
 }
 
 #[test]
-fn memory_bit_immediates_are_bounded_without_masking_or_register_bit_strings() {
+fn memory_bit_immediates_mask_while_register_indices_remain_signed_inputs() {
     use x86_system::memory_core::cpu_core::integer::Operation as Integer;
     use x86_system::shared::decode::DecodeDecision;
     for (prefix, width) in [
@@ -1556,10 +1568,18 @@ fn memory_bit_immediates_are_bounded_without_masking_or_register_bit_strings() {
             }
             for index in [width.bits() as u8, 0xff] {
                 let bytes = [prefix, &[0x0f, 0xba, extension << 3, index]].concat();
-                assert_eq!(admission(&bytes), DecodeDecision::Unsupported);
+                let (_, _, source) = alu(&bytes);
+                assert_eq!(
+                    source,
+                    Operand::Immediate(Immediate {
+                        encoded_width: Width::Byte,
+                        width,
+                        value: index as u64 & (width.bits() as u64 - 1),
+                    })
+                );
             }
             let bytes = [prefix, &[0x0f, opcode, 0x08]].concat();
-            assert_eq!(admission(&bytes), DecodeDecision::Unsupported);
+            assert_eq!(alu(&bytes).2, Operand::Register(reg(1, width, false)));
         }
     }
     let (operation, destination, source) =
@@ -1582,10 +1602,10 @@ fn memory_bit_immediates_are_bounded_without_masking_or_register_bit_strings() {
     assert_eq!(address.index, Gpr::new(1));
     assert_eq!(address.scale, Scale::Four);
     assert_eq!(address.displacement, 0xffff_fff8);
-    assert_eq!(
+    assert!(matches!(
         admission(&[0xf0, 0x48, 0x0f, 0xba, 0x28, 63]),
-        DecodeDecision::Unsupported
-    );
+        DecodeDecision::Entry(x86_system::shared::entry::Instruction::LockedAlu { .. })
+    ));
 }
 
 #[test]
@@ -2109,6 +2129,10 @@ fn locked_alu_packets_reject_other_families_prefixes_and_inexact_lengths() {
         &[0xf0, 0x48, 0x01, 0x08][..],
         &[0xf0, 0x48, 0x83, 0x28, 1][..],
         &[0xf0, 0x83, 0x00, 0xf2][..],
+        &[0xf0, 0x48, 0x0f, 0xab, 0x05, 0x7d, 0xf5, 0xaf, 0xff][..],
+        &[0x66, 0xf0, 0x0f, 0xb3, 0x08][..],
+        &[0x64, 0x67, 0xf0, 0x48, 0x0f, 0xbb, 0x08][..],
+        &[0xf0, 0x48, 0x0f, 0xba, 0x28, 0xff][..],
         &[0x64, 0x67, 0xf0, 0x4b, 0xf7, 0x5c, 0x8c, 0xf8][..],
     ] {
         assert!(
@@ -2137,10 +2161,6 @@ fn locked_alu_packets_reject_other_families_prefixes_and_inexact_lengths() {
     }
     for bytes in [
         &[0xf0, 0x0f, 0xc1, 0x08][..],
-        &[0xf0, 0x0f, 0xab, 0x08][..],
-        &[0xf0, 0x0f, 0xb3, 0x08][..],
-        &[0xf0, 0x0f, 0xbb, 0x08][..],
-        &[0xf0, 0x0f, 0xba, 0x28, 1][..],
         &[0xf0, 0xf2, 0xff, 0x43, 0x58][..],
         &[0xf0, 0xf3, 0xff, 0x43, 0x58][..],
     ] {

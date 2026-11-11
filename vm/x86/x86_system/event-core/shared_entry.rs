@@ -470,7 +470,7 @@ impl SharedEventMachine {
                     if !address.is_valid() || width!=source.width() {
                         return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                     }
-                    let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+                                let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
                     let accepted=self.core.boundary_compare_exchange(linear,cpu.gpr[0],source.read(&cpu.gpr),width);
                     if !accepted {
                         return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -506,6 +506,7 @@ impl SharedEventMachine {
         let Some(value)=scalar(cpu,source) else {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
+        let address=alu::memory_address(operation,address,source,value,width);
         let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
         let accepted=self.core.boundary_locked_modify(linear,operation,value,cpu.flags,width);
         if !accepted {

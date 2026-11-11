@@ -139,6 +139,8 @@ pub open spec fn locked_admitted(va: u64, operation: integer::Operation, width: 
         | integer::Operation::Sbb | integer::Operation::And | integer::Operation::Or
         | integer::Operation::Xor | integer::Operation::Inc | integer::Operation::Dec
         | integer::Operation::Neg | integer::Operation::Not => true,
+        integer::Operation::BitSet | integer::Operation::BitReset
+        | integer::Operation::BitComplement => width!=Width::Byte,
         _ => false,
     }
 }

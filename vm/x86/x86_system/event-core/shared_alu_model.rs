@@ -16,6 +16,18 @@ pub open spec fn read_only(operation:integer::Operation)->bool {
 pub open spec fn shift(operation:integer::Operation)->bool {
     operation is Shl || operation is Shr || operation is Sar
 }
+#[verifier::opaque]
+pub open spec fn memory_address(operation:integer::Operation,address:operand::Address,
+    source:Operand,index:u64,width:Width)->operand::Address {
+    if (operation is BitTest || operation is BitSet || operation is BitReset
+        || operation is BitComplement) && source is Register {
+        let shifted=integer::model::evaluate(integer::Operation::Sar,
+            scalar::model::extend(index,width),3,Width::Qword,0).value;
+        let delta=shifted & !((operand::model::bits(width) as u64 / 8 - 1) as u64);
+        operand::Address {displacement:((address.displacement as int+delta as int)
+            % 0x1_0000_0000_0000_0000int) as u64,..address}
+    } else {address}
+}
 pub open spec fn finish(s:State,operation:integer::Operation,destination:Option<Register>,
     left:u64,right:u64,width:Width,length:u8)->(State,Tick) {
     if match destination {Some(dst)=>!dst.valid() || dst@.width!=width,None=>false} {entry::unsupported(s)}
@@ -55,7 +67,8 @@ pub open spec fn execute(s:State,operation:integer::Operation,destination:Operan
             else {match entry::scalar(cpu,source) {
                 None=>entry::unsupported(s),
                 Some(right)=>{
-                    let linear=entry::linear(s,address,length);
+                    let adjusted=memory_address(operation,address,source,right,width);
+                    let linear=entry::linear(s,adjusted,length);
                     let task=MemoryTask::AluMemory {operation,source:right,width};
                     if read_only(operation) {entry::memory(s,linear,width,WordAccess::Read,length,task)}
                     else if !entry::supported_access(linear,width) {entry::unsupported(s)}

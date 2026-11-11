@@ -108,8 +108,9 @@ pub open spec fn locked_alu(s:State,operation:integer::Operation,destination:Ope
         Operand::Memory {address,width}=>{
             if !address.valid() || scalar(cpu,source) is None {unsupported(s)}
             else {
-                let va=linear(s,address,length);
                 let value=scalar(cpu,source).unwrap();
+                let adjusted=alu::memory_address(operation,address,source,value,width);
+                let va=linear(s,adjusted,length);
                 let start=c::boundary_locked_modify(s.core,va,operation,value,cpu.flags,width);
                 if !start.1 {unsupported(s)} else {
                     (State {core:start.0,phase:Phase::EntryMemory {address:va,length,

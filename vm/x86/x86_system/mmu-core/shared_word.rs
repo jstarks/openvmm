@@ -48,7 +48,11 @@ impl SharedMmu {
         if !matches!(operation, integer::Operation::Add | integer::Operation::Adc
             | integer::Operation::Sub | integer::Operation::Sbb | integer::Operation::And
             | integer::Operation::Or | integer::Operation::Xor | integer::Operation::Inc
-            | integer::Operation::Dec | integer::Operation::Neg | integer::Operation::Not) {
+            | integer::Operation::Dec | integer::Operation::Neg | integer::Operation::Not
+            | integer::Operation::BitSet | integer::Operation::BitReset
+            | integer::Operation::BitComplement)
+            || (matches!(operation,integer::Operation::BitSet | integer::Operation::BitReset
+                | integer::Operation::BitComplement) && width==Width::Byte) {
             return false;
         }
         let size = match width { Width::Byte => 1u8, Width::Word => 2,

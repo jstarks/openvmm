@@ -5,7 +5,7 @@ use super::entry::{Instruction, MemoryTask};
 use super::*;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::operand;
-use memory_core::cpu_core::operand::{Operand, Register, Width};
+use memory_core::cpu_core::operand::{Address, Operand, Register, Width};
 use memory_core::cpu_core::{integer, scalar};
 
 verus! {
@@ -16,6 +16,22 @@ fn read_only(operation: integer::Operation) -> (out: bool)
 fn shift(operation: integer::Operation) -> (out: bool)
     ensures out == spec::alu::shift(operation),
 { matches!(operation, integer::Operation::Shl | integer::Operation::Shr | integer::Operation::Sar) }
+
+pub(super) fn memory_address(operation:integer::Operation,address:Address,
+    source:Operand,index:u64,width:Width)->(out:Address)
+    ensures out==spec::alu::memory_address(operation,address,source,index,width),
+        out.valid()==address.valid(),
+{
+    reveal(spec::alu::memory_address);
+    if matches!(operation,integer::Operation::BitTest | integer::Operation::BitSet
+        | integer::Operation::BitReset | integer::Operation::BitComplement)
+        && matches!(source,Operand::Register(_)) {
+        let extended=scalar::extend(index,width);
+        let shifted=integer::evaluate(integer::Operation::Sar,extended,3,Width::Qword,0).value;
+        let delta=shifted & !(width.bits() as u64 / 8 - 1);
+        Address {displacement:address.displacement.wrapping_add(delta),..address}
+    } else {address}
+}
 
 impl SharedEventMachine {
     pub(super) fn execute_integer(&mut self,instruction:Instruction,length:u8)->(tick:Tick)
@@ -245,6 +261,7 @@ impl SharedEventMachine {
                 let Some(right)=entry::scalar(cpu,source) else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
+                let address=memory_address(operation,address,source,right,width);
                 let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
                 let task=MemoryTask::AluMemory {operation,source:right,width};
                 if read_only(operation) {

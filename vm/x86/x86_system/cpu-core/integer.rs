@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::{arithmetic, operand::Width};
+use super::{arithmetic, operand::Width, scalar};
 use vstd::prelude::*;
 
 pub mod model {
@@ -21,6 +21,7 @@ verus! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
 pub enum Operation {
     Add, Sub, Cmp, And, Or, Xor, Test, Shl, Shr, Adc, Sbb, Inc, Dec, Neg, Not, Sar,
+    Imul, BitTest, BitSet, BitReset, BitComplement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +42,26 @@ pub open spec fn modulus(width: Width) -> int {
 
 pub open spec fn signed(value: int, modulus: int) -> int {
     if value < modulus / 2 { value } else { value - modulus }
+}
+
+#[verifier::opaque]
+pub open spec fn product(left: u64, right: u64, width: Width) -> int {
+    let mask = super::operand::model::mask(width);
+    signed((left & mask) as int, modulus(width))
+        * signed((right & mask) as int, modulus(width))
+}
+
+pub open spec fn product_overflow(exact: int, width: Width) -> bool {
+    exact < -(modulus(width) / 2) || exact >= modulus(width) / 2
+}
+
+pub open spec fn bit_operation(operation: Operation) -> scalar::BitOperation {
+    match operation {
+        Operation::BitSet => scalar::BitOperation::Set,
+        Operation::BitReset => scalar::BitOperation::Reset,
+        Operation::BitComplement => scalar::BitOperation::Complement,
+        _ => scalar::BitOperation::Test,
+    }
 }
 
 /// Mathematical unsigned carry/borrow and signed-range overflow, not a
@@ -98,6 +119,16 @@ pub open spec fn core_with_carry(operation: Operation, a: u64, b: u64,
         Operation::And | Operation::Test => (a & b, false, false, false),
         Operation::Or => (a | b, false, false, false),
         Operation::Xor => (a ^ b, false, false, false),
+        Operation::Imul => {
+            let exact = product(a, b, width);
+            let overflow = product_overflow(exact, width);
+            ((exact % modulus(width)) as u64, overflow, false, overflow)
+        },
+        Operation::BitTest | Operation::BitSet | Operation::BitReset
+            | Operation::BitComplement => {
+            let out = scalar::model::bit(bit_operation(operation), a, b, width, 0);
+            (out.value, out.flags & 1u64 != 0, false, false)
+        },
         Operation::Shl => {
             let value = if c >= n { 0u64 } else { (a << c) & mask };
             let cf = c > 0 && c <= n && ((a >> (n - c)) & 1u64) != 0;
@@ -138,7 +169,16 @@ pub open spec fn transition(operation: Operation, left: u64, right: u64,
     let mask = super::operand::model::mask(width);
     let a = left & mask;
     let b = right & mask;
-    if operation == Operation::Not {
+    if operation == Operation::BitTest || operation == Operation::BitSet
+        || operation == Operation::BitReset || operation == Operation::BitComplement {
+        let out = scalar::model::bit(bit_operation(operation), left, right, width, flags);
+        (out.value, out.flags, out.write)
+    } else if operation == Operation::Imul {
+        let exact = product(left, right, width);
+        let overflow = product_overflow(exact, width);
+        ((exact % modulus(width)) as u64,
+            (flags & !0x801u64) | (if overflow { 0x801u64 } else { 0u64 }), true)
+    } else if operation == Operation::Not {
         ((!a) & mask, flags, true)
     } else if (operation == Operation::Shl || operation == Operation::Shr
         || operation == Operation::Sar)
@@ -153,6 +193,100 @@ pub open spec fn transition(operation: Operation, left: u64, right: u64,
         (t.0, packed(flags, t.0, (modulus(width) / 2) as u64, cf, t.2, t.3),
             operation != Operation::Test && operation != Operation::Cmp)
     }
+}
+
+/// A signed width-limited product fits i128 even for two Qword minima.
+pub proof fn product_bounds(a: int, b: int)
+    requires
+        -9223372036854775808 <= a <= 9223372036854775807,
+        -9223372036854775808 <= b <= 9223372036854775807,
+    ensures
+        -85070591730234615865843651857942052864 <= a * b
+            <= 85070591730234615865843651857942052864,
+{
+    assert(-85070591730234615865843651857942052864 <= a * b
+        <= 85070591730234615865843651857942052864) by(nonlinear_arith)
+        requires
+            -9223372036854775808 <= a <= 9223372036854775807,
+            -9223372036854775808 <= b <= 9223372036854775807;
+}
+
+fn multiply(a: u64, b: u64, _width: Width, m: u128) -> (out: (u64, bool))
+    requires
+        m as int == modulus(_width), a < m, b < m,
+    ensures
+        out.0 as int == (signed(a as int, m as int)
+            * signed(b as int, m as int)) % (m as int),
+        out.1 == product_overflow(signed(a as int, m as int)
+            * signed(b as int, m as int), _width),
+{
+    let half = (m / 2) as i128;
+    let x = if (a as u128) < m / 2 { a as i128 } else { (a as i128) - m as i128 };
+    let y = if (b as u128) < m / 2 { b as i128 } else { (b as i128) - m as i128 };
+    proof { product_bounds(x as int, y as int); }
+    let exact = x * y;
+    // Adding a multiple of every scalar modulus avoids a negative remainder
+    // without overflowing i128, including the minimum-times-minimum case.
+    let offset = 85070591730234615865843651857942052864i128;
+    let positive = if exact < 0 { exact + offset } else { exact };
+    let value = ((positive as u128) % m) as u64;
+    proof {
+        assert(offset as int % (m as int) == 0);
+        vstd::arithmetic::div_mod::lemma_mod_equivalence(
+            positive as int, exact as int, m as int);
+        vstd::arithmetic::div_mod::lemma_mod_bound(positive as int, m as int);
+    }
+    (value, exact < -half || exact >= half)
+}
+
+pub proof fn imul_family(left: u64, right: u64, width: Width, flags: u64)
+    ensures
+        model::evaluate(Operation::Imul, left, right, width, flags).value as int
+            == product(left, right, width) % modulus(width),
+        model::evaluate(Operation::Imul, left, right, width, flags).write,
+        model::evaluate(Operation::Imul, left, right, width, flags).flags & !0x801u64
+            == flags & !0x801u64,
+        (model::evaluate(Operation::Imul, left, right, width, flags).flags & 0x801u64
+            == 0x801u64) == product_overflow(product(left, right, width), width),
+        !product_overflow(product(left, right, width), width) ==>
+            signed(model::evaluate(Operation::Imul, left, right, width, flags).value as int,
+                modulus(width)) == product(left, right, width),
+{
+    let exact = product(left, right, width);
+    let m = modulus(width);
+    vstd::arithmetic::div_mod::lemma_mod_bound(exact, m);
+    if !product_overflow(exact, width) {
+        if exact < 0 {
+            vstd::arithmetic::div_mod::lemma_fundamental_div_mod_converse_mod(
+                exact, m, -1, exact + m);
+        } else {
+            vstd::arithmetic::div_mod::lemma_fundamental_div_mod_converse_mod(
+                exact, m, 0, exact);
+        }
+    }
+    let overflow = product_overflow(exact, width);
+    let next = model::evaluate(Operation::Imul, left, right, width, flags).flags;
+    assert(next & !0x801u64 == flags & !0x801u64
+        && (next & 0x801u64 == 0x801u64) == overflow) by(bit_vector)
+        requires next == (flags & !0x801u64) | (if overflow { 0x801u64 } else { 0u64 });
+}
+
+pub proof fn bit_family(operation: Operation, left: u64, right: u64,
+    width: Width, flags: u64)
+    requires operation == Operation::BitTest || operation == Operation::BitSet
+        || operation == Operation::BitReset || operation == Operation::BitComplement,
+    ensures model::evaluate(operation, left, right, width, flags)
+        == scalar::model::bit(bit_operation(operation), left, right, width, flags),
+        model::evaluate(operation, left, right, width, flags).write
+            == (operation != Operation::BitTest),
+        model::evaluate(operation, left, right, width, flags).flags & !1u64 == flags & !1u64,
+{
+    let out = scalar::model::bit(bit_operation(operation), left, right, width, flags);
+    let selected = 1u64 << (right % super::operand::model::bits(width) as u64);
+    let old_bit = (left & super::operand::model::mask(width)) & selected != 0;
+    let next_flags = out.flags;
+    assert(next_flags & !1u64 == flags & !1u64) by(bit_vector)
+        requires next_flags == (flags & !1u64) | (if old_bit { 1u64 } else { 0u64 });
 }
 
 fn arithmetic_value(sub: bool, a: u64, b: u64, carry: bool, m: u128)
@@ -291,7 +425,8 @@ pub proof fn logical_family(operation: Operation, left: u64, right: u64,
 }
 
 /// AMD APM Volume 3 ADC/ADD/SBB/SUB/CMP, INC/DEC/NEG/NOT, AND/OR/XOR/TEST
-/// and SAL/SHL/SHR/SAR, with flag meanings from Volume 1 section 3.1.4.
+/// SAL/SHL/SHR/SAR, IMUL and BT/BTS/BTR/BTC, with flag meanings from
+/// Volume 1 section 3.1.4.
 ///
 /// CMP shares SUB's result and flags but does not write the destination.
 /// Undefined AF is chosen zero for logical operations and nonzero shifts.
@@ -301,14 +436,19 @@ pub proof fn logical_family(operation: Operation, left: u64, right: u64,
 /// SAR retains the sign bit at/beyond width, including CF, and chooses
 /// undefined OF zero beyond count one. INC/DEC preserve CF; NOT preserves
 /// every flag. Unary operations ignore right.
+/// IMUL returns the low signed product, sets CF/OF on signed overflow and
+/// preserves all undefined flags. Bit operations reuse scalar semantics;
+/// indexes wrap within width, only CF changes, and BT does not write.
 /// Inputs are already semantically extended by the decoder; this function
 /// neither extends immediates nor commits register aliases or memory.
+#[verifier::rlimit(30)]
 pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags: u64)
     -> (out: Outcome)
     ensures
         out == model::evaluate(operation, left, right, width, flags),
         out.flags & !0x8d5u64 == flags & !0x8d5u64,
-        out.write == (operation != Operation::Test && operation != Operation::Cmp),
+        out.write == (operation != Operation::Test && operation != Operation::Cmp
+            && operation != Operation::BitTest),
 {
     let mask = width.mask();
     let n = width.bits();
@@ -320,6 +460,38 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
         Width::Dword => 4294967296u128,
         Width::Qword => 18446744073709551616u128,
     };
+    if operation == Operation::BitTest || operation == Operation::BitSet
+        || operation == Operation::BitReset || operation == Operation::BitComplement {
+        let selected = match operation {
+            Operation::BitSet => scalar::BitOperation::Set,
+            Operation::BitReset => scalar::BitOperation::Reset,
+            Operation::BitComplement => scalar::BitOperation::Complement,
+            _ => scalar::BitOperation::Test,
+        };
+        let out = scalar::bit(selected, left, right, width, flags);
+        proof {
+            bit_family(operation, left, right, width, flags);
+            let next_flags = out.flags;
+            assert(next_flags & !0x8d5u64 == flags & !0x8d5u64) by(bit_vector)
+                requires next_flags & !1u64 == flags & !1u64;
+        }
+        return out;
+    }
+    if operation == Operation::Imul {
+        proof {
+            reveal(product);
+            assert(a <= mask && b <= mask) by(bit_vector)
+                requires a == left & mask, b == right & mask;
+        }
+        let (value, overflow) = multiply(a, b, width, m);
+        let next_flags = (flags & !0x801u64) | (if overflow { 0x801u64 } else { 0u64 });
+        proof {
+            assert(next_flags & !0x8d5u64 == flags & !0x8d5u64) by(bit_vector)
+                requires next_flags == (flags & !0x801u64)
+                    | (if overflow { 0x801u64 } else { 0u64 });
+        }
+        return Outcome { value, flags: next_flags, write: true };
+    }
     let c = (right % (if width == Width::Qword { 64u64 } else { 32u64 })) as u32;
     assert(right % 64u64 == right & 63u64) by(bit_vector);
     assert(right % 32u64 == right & 31u64) by(bit_vector);
@@ -362,6 +534,11 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
             arithmetic_value(sub, x, y, carry, m)
         },
         Operation::Not => { return Outcome { value: (!a) & mask, flags, write: true }; },
+        Operation::Imul | Operation::BitTest | Operation::BitSet
+            | Operation::BitReset | Operation::BitComplement => {
+            assert(false);
+            panic!("operation returned before the arithmetic dispatch");
+        },
         Operation::And | Operation::Test => (a & b, false, false, false),
         Operation::Or => (a | b, false, false, false),
         Operation::Xor => (a ^ b, false, false, false),

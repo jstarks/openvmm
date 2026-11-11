@@ -11,7 +11,7 @@ use memory_core::cpu_core::{integer, scalar};
 verus! {
 fn read_only(operation: integer::Operation) -> (out: bool)
     ensures out == spec::alu::read_only(operation),
-{ matches!(operation, integer::Operation::Cmp | integer::Operation::Test) }
+{ matches!(operation, integer::Operation::Cmp | integer::Operation::Test | integer::Operation::BitTest) }
 
 fn shift(operation: integer::Operation) -> (out: bool)
     ensures out == spec::alu::shift(operation),
@@ -22,7 +22,7 @@ impl SharedEventMachine {
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
-            instruction is Integer || instruction is Alu,
+            instruction is Integer || instruction is Alu || instruction is Multiply,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
     {
@@ -31,6 +31,7 @@ impl SharedEventMachine {
             Instruction::Integer {operation,dst,source}=>
                 self.execute_alu(operation,Operand::Register(dst),source,length),
             Instruction::Alu {operation,destination,source}=>self.execute_alu(operation,destination,source,length),
+            Instruction::Multiply {dst,source,immediate}=>self.execute_multiply(dst,source,immediate,length),
             _=>{assert(false);Tick::Waiting},
         }
     }
@@ -41,8 +42,7 @@ impl SharedEventMachine {
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
             instruction is SignExtend || instruction is SignHigh || instruction is Divide
-                || instruction is Bit || instruction is ReadControl || instruction is WriteControl
-                || instruction is IndirectJump,
+                || instruction is Bit || instruction is IndirectJump || instruction is IndirectCall,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
     {
@@ -110,46 +110,80 @@ impl SharedEventMachine {
                 cpu.flags=result.flags;
                 self.retire_entry(cpu,length,false,false)
             },
-            Instruction::ReadControl {number,dst}=>{
-                if !dst.is_valid() || dst.width()!=Width::Qword {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                }
-                let value=match number {
-                    0=>0x8000_0011u64 | if self.core.config().wp {0x10000}else{0},
-                    3=>self.core.config().root,4=>0x20,
-                    _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
-                };
-                let ghost registers=cpu.gpr@;
-                dst.write(&mut cpu.gpr,value);
-                assert(cpu@.gpr =~= operand::model::write(registers,dst,value).map(|i:int,v:u64|v as int));
-                self.retire_entry(cpu,length,false,false)
-            },
-            Instruction::WriteControl {number,source}=>{
-                let Some(root)=entry::scalar(cpu,source) else {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                };
-                if number!=3 || root>=0x1_0000_0000_0000 || root%4096!=0 {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                }
-                let config=Config {root,..self.core.config()};
-                let _accepted=self.core.boundary_reload(config);assert(_accepted);
-                self.retire_entry(cpu,length,false,true)
-            },
-            Instruction::IndirectJump {source}=>{
+            Instruction::IndirectJump {source} | Instruction::IndirectCall {source}=>{
+                let call=matches!(instruction,Instruction::IndirectCall {..});
                 if let Operand::Memory {address,width}=source {
                     if !address.is_valid() || width!=Width::Qword {
                         return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                     }
                     return self.entry_memory(address.linear(&cpu.gpr,next,self.entry_bases()),
-                        width,WordAccess::Read,length,MemoryTask::JumpTarget);
+                        width,WordAccess::Read,length,if call {MemoryTask::CallTarget}else{MemoryTask::JumpTarget});
                 }
                 let Some(target)=entry::scalar(cpu,source) else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
-                self.finish_jump(target)
+                if call {self.begin_indirect_call(target,length)} else {self.finish_jump(target)}
             },
             _=>{assert(false);Tick::Waiting},
         }
+    }
+
+    pub(super) fn begin_indirect_call(&mut self,target:u64,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::alu::call(old(self)@,target,length),
+    {
+        let cpu=self.core.cpu();
+        if length==0 || length>15 || cpu.rip>u64::MAX-length as u64
+            || cpu.gpr[4]<8 || cpu.gpr[4]%8!=0 || !canonical(target) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let stack=cpu.gpr[4]-8;
+        self.begin_word(stack,WordAccess::Write(cpu.rip+length as u64),Phase::NearCall {target,stack});
+        Tick::Pending
+    }
+
+    pub(super) fn execute_multiply(&mut self,dst:Register,source:Operand,immediate:Option<u64>,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::alu::multiply(old(self)@,dst,source,immediate,length),
+    {
+        if !dst.is_valid() || dst.width()==Width::Byte {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let cpu=self.core.cpu();
+        if let Operand::Memory {address,width}=source {
+            if !address.is_valid() || width!=dst.width() {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            return self.entry_memory(address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),
+                self.entry_bases()),width,WordAccess::Read,length,MemoryTask::Multiply {dst,immediate});
+        }
+        let Some(value)=entry::scalar(cpu,source) else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        self.finish_multiply(dst,value,immediate,length)
+    }
+
+    pub(super) fn finish_multiply(&mut self,dst:Register,value:u64,immediate:Option<u64>,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::alu::multiply_value(old(self)@,dst,value,immediate,length),
+    {
+        if !dst.is_valid() || dst.width()==Width::Byte {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let cpu=self.core.cpu();
+        let (left,right)=match immediate {
+            Some(right)=>(value,right),None=>(dst.read(&cpu.gpr),value),
+        };
+        self.finish_alu(integer::Operation::Imul,Some(dst),left,right,dst.width(),length)
     }
 
     pub(super) fn finish_alu(&mut self, operation: integer::Operation,

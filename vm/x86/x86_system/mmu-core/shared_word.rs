@@ -24,7 +24,7 @@ impl SharedMmu {
     {
         let size = match width { Width::Byte => 1u8, Width::Word => 2,
             Width::Dword => 4, Width::Qword => 8 };
-        if matches!(operation, integer::Operation::Cmp | integer::Operation::Test)
+        if matches!(operation, integer::Operation::Cmp | integer::Operation::Test | integer::Operation::BitTest)
             || (size < 8 && va % 8 + size as u64 > 8) {
             return false;
         }

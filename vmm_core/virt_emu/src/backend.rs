@@ -69,6 +69,12 @@ pub enum Error {
     /// Completed-batch telemetry cannot wrap.
     #[error("completed-batch progress counter exhausted")]
     ProgressExhausted,
+    /// An explicitly configured host checkpoint was reached before its fetch.
+    #[error("host execution checkpoint at {rip:#x}")]
+    Checkpoint {
+        /// The unexecuted instruction at the stopped architectural boundary.
+        rip: u64,
+    },
     /// Dropping an in-flight run future prevents safe continuation.
     #[error("run future was cancelled during a device operation; replay is unsafe")]
     CancelledIo,
@@ -197,6 +203,7 @@ struct VpState {
     initial_system: Option<SystemState>,
     started: bool,
     progress: CompletedBatchProgress,
+    checkpoint: Option<u64>,
     io_active: bool,
     fault: Option<Error>,
 }
@@ -227,6 +234,17 @@ pub struct CompletedBatchProgress {
 }
 
 impl EmuProcessor<'_> {
+    /// Configure an out-of-band instruction-boundary stop without changing guest state.
+    pub fn set_execution_checkpoint(&mut self, address: Option<u64>) -> Result<(), Error> {
+        if address
+            .is_some_and(|address| (0x8000_0000_0000..0xffff_8000_0000_0000).contains(&address))
+        {
+            return Err(Error::Profile("noncanonical execution checkpoint"));
+        }
+        self.state.checkpoint = address;
+        Ok(())
+    }
+
     /// Transport failures can leave additional, unreported partial progress.
     pub fn completed_batch_progress(&self) -> CompletedBatchProgress {
         self.state.progress
@@ -310,6 +328,7 @@ impl ProtoPartition for EmuProtoPartition {
                 initial_system: Some(SystemState::empty()),
                 started: false,
                 progress: CompletedBatchProgress::default(),
+                checkpoint: None,
                 io_active: false,
                 fault: None,
             },
@@ -436,6 +455,7 @@ impl Processor for EmuProcessor<'_> {
         let mut decode_work = 0u8;
         loop {
             stop.check()?;
+            let checkpoint = self.state.checkpoint;
             if let Some(error) = self.state.fault.take() {
                 return Err(dev.fatal_error(Box::new(error)));
             }
@@ -447,7 +467,13 @@ impl Processor for EmuProcessor<'_> {
             }
             self.control.yield_requested.maybe_yield().await;
             stop.check()?;
-            let batch = match core.run_with_mmio(&*self.ram, 64, 64, |address, width| {
+            if core.at_instruction_boundary() && checkpoint == Some(core.cpu().rip) {
+                return Err(dev.fatal_error(Box::new(Error::Checkpoint {
+                    rip: core.cpu().rip,
+                })));
+            }
+            let retirements = if checkpoint.is_some() { 1 } else { 64 };
+            let batch = match core.run_with_mmio(&*self.ram, 64, retirements, |address, width| {
                 (0..u64::from(width)).all(|offset| {
                     !self.ram.is_ram(address + offset) && dev.is_mmio(address + offset)
                 })
@@ -617,6 +643,8 @@ fn with_system(mut regs: vp::Registers, system: SystemState) -> vp::Registers {
     regs.tr = segment_register(system.tr);
     regs.ldtr = segment_register(system.ldtr);
     regs.efer |= u64::from(system.efer_sce);
+    regs.cr0 |= system.cr0_extra;
+    regs.cr4 |= system.cr4_extra;
     regs
 }
 
@@ -708,6 +736,8 @@ impl AccessVpState for EmuStateAccess<'_> {
             tr: segment_state(regs.tr),
             ldtr: segment_state(regs.ldtr),
             efer_sce: regs.efer & 1 != 0,
+            cr0_extra: regs.cr0 & 0x40022,
+            cr4_extra: regs.cr4 & 0x90,
             ..self.system()?
         };
         let mut normalized = *regs;

@@ -16,7 +16,7 @@ mod native {
     use pal_async::{DefaultDriver, DefaultPool};
     use parking_lot::Mutex;
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
     use std::fs::File;
     use std::task::Poll;
@@ -33,15 +33,14 @@ mod native {
     use vm_topology::processor::x86::X2ApicState;
     use vmcore::vmtime::{VmTime, VmTimeKeeper};
     use vmm_core::acpi_builder::{AcpiArchConfig, AcpiTablesBuilder};
-    use x86_system::{EventDiagnostic, PagedDiagnostic};
 
     const RAM: u64 = 512 * 1024 * 1024;
     const ENTRY: u64 = 0x2d98100;
-    const FRONTIER: u64 = 0xffff_ffff_812f_3c80;
-    const TARGET: u64 = 0xffff_ffff_812f_3c6f;
+    const CHECKPOINT: u64 = 0xffff_ffff_82d9_8940;
+    const TARGET: u64 = 0xffff_ffff_82d9_8890;
     const ROOT: u64 = 0x2e32000;
-    const STACK: u64 = 0x2603f48;
-    const RETURN: u64 = 0x2d9815b;
+    const STACK: u64 = 0xffff_ffff_8260_3f30;
+    const RETURN: u64 = 0xffff_ffff_812f_3dad;
     const CMDLINE: &str =
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
     type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -177,14 +176,87 @@ mod native {
         Ok(())
     }
 
+    fn apply_projection(
+        memory: &GuestMemory,
+        changes: &mut BTreeMap<u64, (u64, u64)>,
+        projection: &serde_json::Value,
+    ) -> anyhow::Result<usize> {
+        let words = projection["words"]
+            .as_array()
+            .context("missing projected words")?;
+        ensure!(!words.is_empty(), "empty page-table projection");
+        let mut seen = BTreeSet::new();
+        for word in words {
+            let address = word["address"]
+                .as_u64()
+                .context("missing projected address")?;
+            let before = word["before"]
+                .as_u64()
+                .context("missing projected preimage")?;
+            let after = word["after"]
+                .as_u64()
+                .context("missing projected postimage")?;
+            ensure!(
+                address % 8 == 0 && address < RAM,
+                "invalid projected address"
+            );
+            ensure!(
+                memory.read_plain::<u64>(address)? == before,
+                "loader differs from the independent ELF preimage at {address:#x}"
+            );
+            ensure!(seen.insert(address), "duplicate projected address");
+            changes.insert(address, (before, after));
+        }
+        Ok(words.len())
+    }
+
+    fn check_zero_ranges(
+        memory: &GuestMemory,
+        projection: &serde_json::Value,
+    ) -> anyhow::Result<u64> {
+        let ranges = projection["zero_ranges"]
+            .as_array()
+            .context("missing exact zero ranges")?;
+        ensure!(ranges.len() == 2, "expected BSS and brk ranges");
+        let mut total = 0;
+        let mut buffer = vec![0; 65536];
+        for range in ranges {
+            let start = range["start"]
+                .as_u64()
+                .context("missing zero-range start")?;
+            let end = range["end"].as_u64().context("missing zero-range end")?;
+            ensure!(
+                start < end && end <= RAM && range["loader_preimage_zero"].as_bool() == Some(true),
+                "invalid zero-range profile"
+            );
+            let mut address = start;
+            while address < end {
+                let count = usize::try_from((end - address).min(buffer.len() as u64))?;
+                memory.read_at(address, &mut buffer[..count])?;
+                if let Some(offset) = buffer[..count].iter().position(|&byte| byte != 0) {
+                    bail!(
+                        "nonzero byte in exact clearing range at {:#x}",
+                        address + offset as u64
+                    );
+                }
+                address += count as u64;
+            }
+            total += end - start;
+        }
+        Ok(total)
+    }
+
     async fn witness(driver: DefaultDriver) -> anyhow::Result<()> {
         let mut args = std::env::args_os().skip(1);
         let kernel_path = args.next().context("missing vmlinux")?;
         let initrd_path = args.next().context("missing initrd")?;
         let oracle_path = args.next().context("missing mapping projection")?;
+        let initial_mapping_path = args
+            .next()
+            .context("missing pre-reset mapping projection")?;
         ensure!(
             args.next().is_none(),
-            "expected vmlinux, initrd and mapping projection"
+            "expected vmlinux, initrd and both mapping projections"
         );
         let topology = TopologyBuilder::new_x86()
             .x2apic(X2ApicState::Unsupported)
@@ -269,36 +341,17 @@ mod native {
         ensure!(
             projection["root"].as_u64() == Some(ROOT)
                 && projection["target"].as_u64() == Some(TARGET)
-                && projection["frontier"].as_u64() == Some(FRONTIER),
+                && projection["checkpoint"].as_u64() == Some(CHECKPOINT),
             "wrong mapping projection profile"
         );
-        let words = projection["words"]
-            .as_array()
-            .context("missing projected words")?;
-        ensure!(!words.is_empty(), "empty page-table projection");
-        for word in words {
-            let address = word["address"]
-                .as_u64()
-                .context("missing projected address")?;
-            let before = word["before"]
-                .as_u64()
-                .context("missing projected preimage")?;
-            let after = word["after"]
-                .as_u64()
-                .context("missing projected postimage")?;
-            ensure!(
-                address % 8 == 0 && address < RAM,
-                "invalid projected address"
-            );
-            ensure!(
-                memory.read_plain::<u64>(address)? == before,
-                "loader differs from the independent ELF preimage at {address:#x}"
-            );
-            ensure!(
-                changes.insert(address, (before, after)).is_none(),
-                "duplicate projected address"
-            );
-        }
+        let initial_mapping: serde_json::Value =
+            serde_json::from_reader(File::open(initial_mapping_path)?)?;
+        ensure!(
+            initial_mapping["root"].as_u64() == Some(ROOT)
+                && initial_mapping["target"].as_u64() == Some(0xffff_ffff_812f_3c6f),
+            "wrong pre-reset mapping profile"
+        );
+        apply_projection(&memory, &mut changes, &initial_mapping)?;
         expected_walk(
             &memory,
             initial.registers.cr3,
@@ -332,33 +385,65 @@ mod native {
         for (address, physical) in [
             (0x2d9815e, 0x2d9815e),
             (0x2f574dc, 0x2f574dc),
-            (TARGET, 0x12f3c6f),
-            (FRONTIER, 0x12f3c80),
+            (0xffff_ffff_812f_3c6f, 0x12f3c6f),
+            (0xffff_ffff_812f_3c80, 0x12f3c80),
         ] {
             expected_walk(&memory, ROOT, address, physical, false, &mut changes)?;
         }
+        let projected_words = apply_projection(&memory, &mut changes, &projection)?;
+        for physical in [
+            0x12f3c6f, 0x1201f8b, 0x1ec83f0, 0x1ed0260, 0x2d98890, 0x2d98940, 0x2500000, 0x30ae000,
+        ] {
+            expected_walk(
+                &memory,
+                ROOT,
+                0xffff_ffff_8000_0000u64 + physical,
+                physical,
+                false,
+                &mut changes,
+            )?;
+        }
+        for physical in [0x2603f00, 0x26041d0, ROOT, 0x264e018, 0x30d0a58] {
+            expected_walk(
+                &memory,
+                ROOT,
+                0xffff_ffff_8000_0000u64 + physical,
+                physical,
+                true,
+                &mut changes,
+            )?;
+        }
+        for physical in (0x3000000..0x3630000).step_by(0x200000) {
+            expected_walk(
+                &memory,
+                ROOT,
+                0xffff_ffff_8000_0000u64 + physical,
+                physical,
+                true,
+                &mut changes,
+            )?;
+        }
+        let zero_bytes = check_zero_ranges(&memory, &projection)?;
         ensure!(
             memory.read_plain::<u32>(0x213c)? == 0 && memory.read_plain::<u64>(0x2250)? == 0,
             "unexpected confidential-computing/setup-data boot parameters"
         );
-        // The original startup and disabled-SME paths save six registers each.
+        // Include surviving physical-stack history and the later high-VA aliases.
         for (address, value) in [
             (0x2603f40, RETURN),
-            (0x2603f38, 0x2000),
-            (0x2603f30, initial.registers.r14),
-            (0x2603f28, initial.registers.r13),
-            (0x2603f20, initial.registers.r12),
-            (0x2603f18, initial.registers.rbp),
-            (0x2603f10, 0x10000),
-            (0x2603f08, 0x2d8b226),
+            (0x2603f38, initial.registers.r12),
+            (0x2603f30, 0),
+            (0x2603f28, CHECKPOINT),
+            (0x2603f20, 0xffff_ffff_82d9_885c),
+            (0x2603f18, 0x100000001d),
+            (0x2603f10, 0xffff_ffff_8260_4000),
+            (0x2603f08, 0x01ff_0000_02d8_b226),
             (0x2603f00, 27),
             (0x2603ef8, 0x2e35000),
             (0x2603ef0, 0x264a000),
             (0x2603ee8, 0x2000),
             (0x2603ee0, 512),
             (0x2603ed8, 0x80000000),
-            (0x26041d0, 0x02d98e00001082ca),
-            (0x26041d8, 0),
         ] {
             expected_store(&memory, &mut changes, address, &value.to_le_bytes())?;
         }
@@ -366,6 +451,7 @@ mod native {
         let mut binder = binders.pop().context("missing VP binder")?;
         ensure!(binders.is_empty(), "unexpected additional VP");
         let mut vp = binder.bind()?;
+        vp.set_execution_checkpoint(Some(CHECKPOINT))?;
         {
             let mut state = vp.access_state(Vtl::Vtl0);
             state.set_mtrrs(&initial.mtrrs)?;
@@ -395,45 +481,48 @@ mod native {
             .lock()
             .take()
             .context("missing frontier diagnostic")?;
+        let stopped_rip = vp.access_state(Vtl::Vtl0).registers()?.rip;
         ensure!(
             matches!(
                 failure.downcast_ref::<Error>(),
-                Some(Error::Cpu(EventDiagnostic::Instruction(
-                    PagedDiagnostic::Unsupported
-                )))
+                Some(Error::Checkpoint {rip}) if *rip==CHECKPOINT
             ),
-            "wrong execution frontier: {failure}"
+            "did not reach the host checkpoint: stopped at {stopped_rip:#x}: {failure}"
         );
         let progress = vp.completed_batch_progress();
         ensure!(
-            progress.retired > 134 && progress.retired < 20000 && progress.delivered == 0,
+            progress.retired > 3700 && progress.retired < 2_000_000 && progress.delivered == 0,
             "wrong progress: {progress:?}"
         );
         let mut expected = initial.registers;
-        expected.cr0 |= 0x10;
-        expected.rax = ROOT;
-        expected.rbx = 0x10000;
-        expected.rdx = 0x1060;
-        expected.rcx = 0x30;
+        expected.cr0 = 0x80050033;
+        expected.cr4 = 0xb0;
+        expected.efer = 0xd01;
+        expected.rax = 0xffff_ffff_8360_0000;
+        expected.rbx = 0;
+        expected.rdx = 0;
+        expected.rcx = 0;
         expected.rsi = 0;
-        expected.rdi = ROOT;
+        expected.rdi = 0xffff_ffff_8363_0000;
+        expected.rbp = 0x2000;
         expected.r8 = 20;
-        expected.r9 = 8;
-        expected.r10 = 0x10000e3;
+        expected.r9 = 0;
+        expected.r10 = 0xffff_ffff_8360_0000;
         expected.r11 = 20;
         expected.cr3 = ROOT;
         expected.r15 = initial.registers.rsi;
         expected.rsp = STACK;
-        expected.rip = FRONTIER;
-        expected.rflags &= !0x108d5;
-        expected.gs.base = 0;
-        expected.gdtr.base = 0x30ae000;
+        expected.rip = CHECKPOINT;
+        expected.rflags = 0x46;
+        expected.gdtr.base = 0xffff_ffff_830a_e000;
         expected.gdtr.limit = 0x7f;
-        expected.idtr.base = 0x2604000;
+        expected.idtr.base = 0xffff_ffff_8260_4000;
         expected.idtr.limit = 0x1ff;
-        expected.ds.selector = 0x18;
-        expected.ss.selector = 0x18;
-        expected.es.selector = 0x18;
+        expected.ds = Default::default();
+        expected.ss = Default::default();
+        expected.es = Default::default();
+        expected.fs = Default::default();
+        expected.gs = Default::default();
         expected.cs.selector = 0x10;
         let mut state = vp.access_state(Vtl::Vtl0);
         let actual = state.registers()?;
@@ -452,12 +541,19 @@ mod native {
             );
         }
         ensure!(
+            check_zero_ranges(&memory, &projection)? == zero_bytes,
+            "changed clearing bounds"
+        );
+        ensure!(
             memory_digest(&memory, &changes)? == before,
             "RAM changed outside the projected tables/data, A/D, stack and #VC gate effects"
         );
-        let mut bytes = [0; 3];
-        memory.read_at(0x12f3c80, &mut bytes)?;
-        ensure!(bytes == [0x0f, 0x22, 0xe1], "wrong frontier bytes");
+        let mut bytes = [0; 7];
+        memory.read_at(0x2d98940, &mut bytes)?;
+        ensure!(
+            bytes == [0x48, 0xc7, 0xc7, 0, 0x40, 0x64, 0x82],
+            "wrong checkpoint bytes"
+        );
         let functions = [0, 1, 0x8000_0000, 0x8000_0001, 0x8000_0008];
         let cpuid: Vec<_> = functions
             .into_iter()
@@ -472,14 +568,17 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
-                "entry": ENTRY, "frontier": actual.rip, "frontier_hex": "0f22e1",
+                "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "48c7c700406482",
+                "stop_kind":"host_checkpoint","initial_memory_cleared":true,
+                "kernel_c_entry":true,"identity_mappings_removed":true,"zero_bytes":zero_bytes,
                 "r15": actual.r15, "rsp": actual.rsp, "return_address": RETURN,
                 "rflags": actual.rflags, "seconds": seconds,
                 "complete_register_image_checked": true, "whole_ram_checked": true,
                 "descriptor_setup_returned": true,
                 "verify_cpu_returned_success": true,
                 "kernel_page_tables_constructed": true,"high_virtual_fetch": true,
-                "root":actual.cr3,"target":TARGET,"mapping_oracle_words":words.len(),
+                "root":actual.cr3,"target":TARGET,"mapping_oracle_words":projected_words,
+                "cr0":actual.cr0,"cr4":actual.cr4,"efer":actual.efer,
                 "cpuid_target": cpuid, "cpuid_instruction_implemented": true,
                 "linux_boot": false, "snp": false,
             })

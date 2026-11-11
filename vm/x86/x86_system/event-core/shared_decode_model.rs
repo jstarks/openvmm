@@ -105,7 +105,9 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
                 _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
             }
         },
-        DecodeDecision::Wrmsr => match s.system {
+        DecodeDecision::Wrmsr => if (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64==0xc000_0080u64 {
+            privilege::write_efer(s,input.length)
+        } else {match s.system {
             None => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
             Some(system) => {
                 let result = gsbase::transition(system, s.core.cpu.rip as u64,
@@ -123,7 +125,7 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
                     _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
                 }
             },
-        },
+        }},
         DecodeDecision::NearCall { displacement } => {
             match near_call::plan(s.core.cpu.rip as u64, s.core.cpu.gpr[4] as u64,
                 s.core.cpu.flags & !0x10000u64, displacement, input.length) {

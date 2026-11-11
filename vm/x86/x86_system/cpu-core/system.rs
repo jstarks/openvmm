@@ -30,6 +30,10 @@ pub struct SystemState {
     pub cs: SegmentState, pub ss: SegmentState, pub ds: SegmentState, pub es: SegmentState,
     pub fs: SegmentState, pub gs: SegmentState, pub tr: SegmentState, pub ldtr: SegmentState,
     pub efer_sce: bool,
+    /// Retained CR0.MP/NE/AM only; CR0.WP is authoritative in MMU Config.
+    pub cr0_extra: u64,
+    /// Retained CR4.PSE/PGE; this profile keeps PAE enabled.
+    pub cr4_extra: u64,
     pub pat: u64,
     pub mtrr_def: u64,
     pub mtrr_fixed: [u64; 11],
@@ -51,9 +55,15 @@ pub mod model {
         s.base == 0 && s.limit == u32::MAX && s.attributes == 0xc093
         && s.selector != 0 && s.selector & 7u16 == 0
     }
+    pub open spec fn supported_data_or_null(s: SegmentState) -> bool {
+        s == NULL_SEGMENT || supported_data(s)
+    }
+    // APM Volume 2 §§4.5.3, 4.8.2: FS/GS bases can be set independently
+    // by their MSRs. This validates retained metadata, not MOV Sreg effects.
     pub open spec fn data_or_null(s: SegmentState) -> bool {
         (s.limit == 0 && s.selector == 0 && s.attributes == 0)
-        || (s.limit == u32::MAX && s.selector == 16 && s.attributes == 0xc093)
+        || (s.limit == u32::MAX && s.selector != 0 && s.selector & 7u16 == 0
+            && s.attributes == 0xc093)
     }
     pub open spec fn unused(s: SegmentState, attributes: u16) -> bool {
         s == NULL_SEGMENT || (s.base == 0 && s.limit == 0xffff
@@ -68,17 +78,18 @@ pub mod model {
         && (forall|i: int| 0 <= i < 16 ==> #[trigger] variable[i] == 0)
     }
     pub open spec fn supported(s: SystemState) -> bool {
-        supported_code(s.cs) && supported_data(s.ss) && supported_data(s.ds)
-        && supported_data(s.es) && data_or_null(s.fs) && data_or_null(s.gs)
+        supported_code(s.cs) && supported_data_or_null(s.ss) && supported_data_or_null(s.ds)
+        && supported_data_or_null(s.es) && data_or_null(s.fs) && data_or_null(s.gs)
         && canonical(s.fs.base) && canonical(s.gs.base)
         && unused(s.tr, 0x8b) && unused(s.ldtr, 0x82)
         && s.pat == DEFAULT_PAT
+        && s.cr0_extra & !0x40022u64 == 0 && s.cr4_extra & !0x90u64 == 0
         && mtrrs_supported(s.mtrr_def, s.mtrr_fixed@, s.mtrr_variable@)
     }
     pub open spec fn empty() -> SystemState {
         SystemState { cs: NULL_SEGMENT, ss: NULL_SEGMENT, ds: NULL_SEGMENT, es: NULL_SEGMENT,
             fs: NULL_SEGMENT, gs: NULL_SEGMENT, tr: NULL_SEGMENT, ldtr: NULL_SEGMENT,
-            efer_sce: false, pat: DEFAULT_PAT, mtrr_def: 0,
+            efer_sce: false, cr0_extra: 0, cr4_extra: 0, pat: DEFAULT_PAT, mtrr_def: 0,
             mtrr_fixed: [0u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             mtrr_variable: [0u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
     }
@@ -86,9 +97,21 @@ pub mod model {
 
 pub proof fn lemma_replace_data(s: SystemState, ss: SegmentState, ds: SegmentState,
     es: SegmentState)
-    requires model::supported(s), model::supported_data(ss),
-        model::supported_data(ds), model::supported_data(es),
+    requires model::supported(s), model::supported_data_or_null(ss),
+        model::supported_data_or_null(ds), model::supported_data_or_null(es),
     ensures model::supported(SystemState { ss, ds, es, ..s }),
+{
+}
+
+pub proof fn lemma_replace_control(s: SystemState, cr0_extra: u64, cr4_extra: u64,
+    efer_sce: bool)
+    requires model::supported(s),
+        cr0_extra & !0x40022u64 == 0, cr4_extra & !0x90u64 == 0,
+    ensures
+        model::supported(SystemState { cr0_extra, cr4_extra, efer_sce, ..s }),
+        (SystemState { cr0_extra: s.cr0_extra, cr4_extra: s.cr4_extra,
+            efer_sce: s.efer_sce,
+            ..SystemState { cr0_extra, cr4_extra, efer_sce, ..s } }) == s,
 {
 }
 
@@ -139,11 +162,18 @@ fn supported_data(s: SegmentState) -> (out: bool)
         && s.selector != 0 && s.selector & 7 == 0
 }
 
+fn supported_data_or_null(s: SegmentState) -> (out: bool)
+    ensures out == model::supported_data_or_null(s),
+{
+    s == NULL_SEGMENT || supported_data(s)
+}
+
 fn data_or_null(s: SegmentState) -> (out: bool)
     ensures out == model::data_or_null(s),
 {
     (s.limit == 0 && s.selector == 0 && s.attributes == 0)
-        || (s.limit == u32::MAX && s.selector == 16 && s.attributes == 0xc093)
+        || (s.limit == u32::MAX && s.selector != 0 && s.selector & 7 == 0
+            && s.attributes == 0xc093)
 }
 
 fn unused(s: SegmentState, attributes: u16) -> (out: bool)
@@ -160,7 +190,7 @@ impl SystemState {
     {
         let out = Self { cs: NULL_SEGMENT, ss: NULL_SEGMENT, ds: NULL_SEGMENT, es: NULL_SEGMENT,
             fs: NULL_SEGMENT, gs: NULL_SEGMENT, tr: NULL_SEGMENT, ldtr: NULL_SEGMENT,
-            efer_sce: false, pat: DEFAULT_PAT, mtrr_def: 0,
+            efer_sce: false, cr0_extra: 0, cr4_extra: 0, pat: DEFAULT_PAT, mtrr_def: 0,
             mtrr_fixed: [0; 11], mtrr_variable: [0; 16] };
         proof {
             assert(out.mtrr_fixed@ =~= model::empty().mtrr_fixed@);
@@ -174,12 +204,13 @@ impl SystemState {
     pub fn is_supported(self) -> (out: bool)
         ensures out == model::supported(self),
     {
-        supported_code(self.cs) && supported_data(self.ss) && supported_data(self.ds)
-            && supported_data(self.es) && data_or_null(self.fs) && data_or_null(self.gs)
+        supported_code(self.cs) && supported_data_or_null(self.ss) && supported_data_or_null(self.ds)
+            && supported_data_or_null(self.es) && data_or_null(self.fs) && data_or_null(self.gs)
             && (self.fs.base < 0x8000_0000_0000 || self.fs.base >= 0xffff_8000_0000_0000)
             && (self.gs.base < 0x8000_0000_0000 || self.gs.base >= 0xffff_8000_0000_0000)
             && unused(self.tr, 0x8b) && unused(self.ldtr, 0x82)
             && self.pat == DEFAULT_PAT
+            && self.cr0_extra & !0x40022u64 == 0 && self.cr4_extra & !0x90u64 == 0
             && mtrrs_supported(self.mtrr_def, &self.mtrr_fixed, &self.mtrr_variable)
     }
 }

@@ -5,6 +5,7 @@ use super::*;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::operand;
 use memory_core::cpu_core::operand::{Address, Operand, Register, Segment, SegmentBases, Width};
+use memory_core::cpu_core::system::NULL_SEGMENT;
 use memory_core::cpu_core::{control, descriptor, integer, profile, scalar as operations};
 
 verus! {
@@ -12,6 +13,7 @@ verus! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(inconsistent_fields)]
 pub enum Instruction {
+    Nop,
     Integer { operation: integer::Operation, dst: Register, source: Operand },
     Alu { operation: integer::Operation, destination: Operand, source: Operand },
     SignExtend { dst: Register, source: Operand, width: Width },
@@ -21,6 +23,10 @@ pub enum Instruction {
     ReadControl { number: u8, dst: Register },
     WriteControl { number: u8, source: Operand },
     IndirectJump { source: Operand },
+    IndirectCall { source: Operand },
+    Multiply { dst:Register, source:Operand, immediate:Option<u64> },
+    RepeatStore { width:Width },
+    ReadMsr,
     ZeroExtend { dst: Register, src: Register },
     Load { dst: Register, address: Address, width: Width },
     Store { address: Address, width: Width, source: Operand },
@@ -58,6 +64,9 @@ pub enum MemoryTask {
     SignedLoad { dst: Register, width: Width },
     Division { width: Width, signed: bool },
     JumpTarget,
+    CallTarget,
+    Multiply { dst:Register, immediate:Option<u64> },
+    RepeatStore { width:Width },
 }
 
 pub(super) fn scalar(cpu: State, source: Operand) -> (out: Option<u64>)
@@ -128,10 +137,19 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
         match instruction {
-            Instruction::Integer {..} | Instruction::Alu {..} => self.execute_integer(instruction,length),
+            Instruction::Integer {..} | Instruction::Alu {..} | Instruction::Multiply {..} =>
+                self.execute_integer(instruction,length),
+            Instruction::RepeatStore {width} => {
+                reveal(spec::entry::execute);
+                self.execute_repeat(width,length)
+            },
+            Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr => {
+                reveal(spec::entry::execute);
+                self.execute_control(instruction,length)
+            },
             Instruction::SignExtend {..} | Instruction::SignHigh {..} | Instruction::Divide {..}
-                | Instruction::Bit {..} | Instruction::ReadControl {..} | Instruction::WriteControl {..}
-                | Instruction::IndirectJump {..} => self.execute_scalar(instruction,length),
+                | Instruction::Bit {..} | Instruction::IndirectJump {..} | Instruction::IndirectCall {..}
+                => self.execute_scalar(instruction,length),
             _=>self.execute_legacy(instruction,length),
         }
     }
@@ -141,9 +159,10 @@ impl SharedEventMachine {
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
-            !(instruction is Integer || instruction is Alu || instruction is SignExtend
+            !(instruction is Integer || instruction is Alu || instruction is Multiply || instruction is SignExtend
                 || instruction is SignHigh || instruction is Divide || instruction is Bit
-                || instruction is ReadControl || instruction is WriteControl || instruction is IndirectJump),
+                || instruction is ReadControl || instruction is WriteControl || instruction is ReadMsr
+                || instruction is IndirectJump || instruction is IndirectCall || instruction is RepeatStore),
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
     {
@@ -158,6 +177,7 @@ impl SharedEventMachine {
         }
         let next = cpu.rip.wrapping_add(length as u64);
         match instruction {
+            Instruction::Nop=>self.retire_entry(cpu,length,false,false),
             Instruction::Cpuid => {
                 let function = (cpu.gpr[0] & 0xffff_ffff) as u32;
                 let subleaf = (cpu.gpr[1] & 0xffff_ffff) as u32;
@@ -245,13 +265,27 @@ impl SharedEventMachine {
                 self.entry_memory(linear, Width::Word, WordAccess::Read, length, MemoryTask::TableLimit { idt })
             },
             Instruction::Segment { segment: dst, src } => {
-                if !src.is_valid() || !matches!(dst, Segment::Ds | Segment::Ss | Segment::Es)
+                if !src.is_valid() || !matches!(dst, Segment::Ds | Segment::Ss | Segment::Es | Segment::Fs | Segment::Gs)
                     || self.system.is_none() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
                 let selector = (src.read(&cpu.gpr) & 0xffff) as u16;
+                let Some(mut system)=self.system else {assert(false);return Tick::Waiting;};
+                if (matches!(dst,Segment::Fs) && system.fs.base!=0)
+                    || (matches!(dst,Segment::Gs) && system.gs.base!=0) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                if selector==0 {
+                    match dst {
+                        Segment::Ds=>system.ds=NULL_SEGMENT,Segment::Ss=>system.ss=NULL_SEGMENT,
+                        Segment::Es=>system.es=NULL_SEGMENT,Segment::Fs=>system.fs=NULL_SEGMENT,
+                        Segment::Gs=>system.gs=NULL_SEGMENT,_=>{assert(false);},
+                    }
+                    self.system=Some(system);
+                    return self.retire_entry(cpu,length,matches!(dst,Segment::Ss),false);
+                }
                 let offset = (selector & !7u16) as u64;
-                if selector == 0 || selector % 8 != 0 || offset + 7 > self.tables.gdt_limit as u64
+                if selector % 8 != 0 || offset + 7 > self.tables.gdt_limit as u64
                     || self.tables.gdt_base > u64::MAX - offset {
                     return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
                 }
@@ -315,6 +349,9 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::RepeatStore {width} => return self.finish_repeat(width,length),
+            MemoryTask::CallTarget => return self.begin_indirect_call(value,length),
+            MemoryTask::Multiply {dst,immediate} => return self.finish_multiply(dst,value,immediate,length),
             MemoryTask::AluRegister {operation,dst} => {
                 if !dst.is_valid() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -414,7 +451,7 @@ impl SharedEventMachine {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
                 match dst { Segment::Ds => system.ds = segment, Segment::Ss => system.ss = segment,
-                    Segment::Es => system.es = segment,
+                    Segment::Es => system.es = segment,Segment::Fs=>system.fs=segment,Segment::Gs=>system.gs=segment,
                     _ => return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
                 }
                 self.system = Some(system);

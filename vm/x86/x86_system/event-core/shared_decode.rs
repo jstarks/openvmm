@@ -164,6 +164,9 @@ impl SharedEventMachine {
                 }
             },
             DecodeDecision::Wrmsr => {
+                if self.core.cpu().gpr[1]&0xffff_ffff==0xc000_0080 {
+                    return self.write_efer(input.length);
+                }
                 let Some(mut system) = self.system else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };

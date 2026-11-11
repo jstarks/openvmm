@@ -14,6 +14,7 @@ pub mod integer;
 pub mod model;
 pub mod near_call;
 pub mod operand;
+pub mod privilege;
 pub mod profile;
 pub mod scalar;
 pub mod system;

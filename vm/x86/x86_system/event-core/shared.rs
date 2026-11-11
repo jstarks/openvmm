@@ -19,6 +19,10 @@ pub mod alu;
 pub mod decode;
 #[path = "shared_entry.rs"]
 pub mod entry;
+#[path = "shared_privilege.rs"]
+pub mod privilege;
+#[path = "shared_repeat.rs"]
+pub mod repeat;
 use decode::{DecodeDecision, DecodeInput};
 
 verus! {
@@ -34,6 +38,7 @@ pub enum Phase {
     Admitted { input: DecodeInput, decision: DecodeDecision },
     NearCall { target: u64, stack: u64 },
     EntryMemory { address: u64, length: u8, task: entry::MemoryTask },
+    Repeat { width: memory_core::cpu_core::operand::Width, length: u8 },
     GateLow { event: Event, address: u64 },
     GateHigh { event: Event, low: u64 },
     Code { event: Event, low: u64, target: u64 },
@@ -83,6 +88,8 @@ impl SharedEventMachine {
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             Phase::Ordinary { .. } => self.core@.phase != CpuPhase::Boundary,
             Phase::Stopped { .. } => !mmu_core::shared_model::active(self.core@.mmu.phase),
+            Phase::Repeat { .. } => self.core@.phase == CpuPhase::Boundary
+                && !mmu_core::shared_model::active(self.core@.mmu.phase),
             _ => self.core@.phase == CpuPhase::Boundary,
         }
         && match self.phase {
@@ -123,6 +130,10 @@ impl SharedEventMachine {
     pub fn system(&self) -> (out: Option<SystemState>)
         ensures out == self@.system,
     { self.system }
+
+    pub fn at_instruction_boundary(&self) -> (out:bool)
+        ensures out == (self@.phase == Phase::Ready),
+    { matches!(self.phase,Phase::Ready) }
 
     pub fn configure_system(&mut self, system: SystemState) -> (accepted: bool)
         requires old(self).invariant(),
@@ -260,6 +271,7 @@ impl SharedEventMachine {
         ensures final(self).invariant(), (final(self)@, tick) == spec::advance(old(self)@),
     {
         match self.phase {
+            Phase::Repeat {width,length} => self.execute_repeat(width,length),
             Phase::Decode { input } => Tick::Decode(input),
             Phase::Admitted { .. } => self.advance_admitted(),
             Phase::DecodeFetch { input } => match self.core.request() {
@@ -419,7 +431,7 @@ impl SharedEventMachine {
         requires self.invariant(),
             !matches!(self.phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
-                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }),
+                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. } | Phase::Repeat { .. }),
         ensures out == spec::word_location(self@),
     {
         let cpu = self.core.cpu();
@@ -443,7 +455,7 @@ impl SharedEventMachine {
         requires old(self).invariant(),
             !matches!(old(self).phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
-                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }),
+                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. } | Phase::Repeat { .. }),
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::word_value(old(self)@, value),
     {

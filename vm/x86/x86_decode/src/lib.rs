@@ -342,16 +342,29 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     if decoder.last_error() != DecoderError::None
         || instruction.len() != encoding.length as usize
         || instruction.has_lock_prefix()
-        || instruction.has_rep_prefix()
-        || instruction.has_repne_prefix()
         || instruction.has_xacquire_prefix()
         || instruction.has_xrelease_prefix()
     {
         return None;
     }
     let size = address_size(encoding.bytes());
+    if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
+        let width = match instruction.mnemonic() {
+            Mnemonic::Stosb => Width::Byte,
+            Mnemonic::Stosw => Width::Word,
+            Mnemonic::Stosd => Width::Dword,
+            Mnemonic::Stosq => Width::Qword,
+            _ => return None,
+        };
+        return (instruction.has_rep_prefix()
+            && !instruction.has_repne_prefix()
+            && size == AddressSize::Bits64
+            && !encoding.bytes().contains(&0xf2))
+        .then_some(EntryInstruction::RepeatStore { width });
+    }
     let get = |index| operand(&instruction, index, Operation::Mov, size);
     match encoding.bytes() {
+        [0x0f, 0x32] => return Some(EntryInstruction::ReadMsr),
         [0x0f, 0xa2] => return Some(EntryInstruction::Cpuid),
         [0x48, 0xcb] => return Some(EntryInstruction::FarReturn),
         [0x9c] => return Some(EntryInstruction::PushFlags),
@@ -359,6 +372,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         _ => {}
     }
     match instruction.mnemonic() {
+        Mnemonic::Nop => Some(EntryInstruction::Nop),
         Mnemonic::Add
         | Mnemonic::Adc
         | Mnemonic::Sub
@@ -434,8 +448,58 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                 signed: instruction.mnemonic() == Mnemonic::Idiv,
             })
         }
-        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
+        Mnemonic::Imul if matches!(instruction.op_count(), 2 | 3) => {
             let Operand::Register(dst) = get(0)? else {
+                return None;
+            };
+            if !matches!(dst.width(), Width::Word | Width::Dword | Width::Qword) {
+                return None;
+            }
+            let source = get(1)?;
+            if !matches!(source, Operand::Register(_) | Operand::Memory { .. })
+                || operand_width(source)? != dst.width()
+            {
+                return None;
+            }
+            let immediate = if instruction.op_count() == 3 {
+                let Operand::Immediate(immediate) = get(2)? else {
+                    return None;
+                };
+                if immediate.width != dst.width() {
+                    return None;
+                }
+                Some(immediate.value)
+            } else {
+                None
+            };
+            Some(EntryInstruction::Multiply {
+                dst,
+                source,
+                immediate,
+            })
+        }
+        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
+            let destination = get(0)?;
+            if let Operand::Memory { width, .. } = destination {
+                let Operand::Immediate(mut immediate) = get(1)? else {
+                    return None;
+                };
+                if !matches!(width, Width::Word | Width::Dword | Width::Qword)
+                    || immediate.encoded_width != Width::Byte
+                    || immediate.value >= width.bits() as u64
+                {
+                    return None;
+                }
+                immediate.width = width;
+                let operation = match instruction.mnemonic() {
+                    Mnemonic::Bt => integer::Operation::BitTest,
+                    Mnemonic::Bts => integer::Operation::BitSet,
+                    Mnemonic::Btr => integer::Operation::BitReset,
+                    _ => integer::Operation::BitComplement,
+                };
+                return alu_entry(operation, destination, Operand::Immediate(immediate));
+            }
+            let Operand::Register(dst) = destination else {
                 return None;
             };
             let mut index = get(1)?;
@@ -472,17 +536,24 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                     return (dst.width() == Width::Qword)
                         .then_some(EntryInstruction::ReadControl { number, dst });
                 }
-                if instruction.op0_register() == IcedRegister::CR3 {
+                let control = match instruction.op0_register() {
+                    IcedRegister::CR0 => Some(0),
+                    IcedRegister::CR3 => Some(3),
+                    IcedRegister::CR4 => Some(4),
+                    _ => None,
+                };
+                if let Some(number) = control {
                     let source = register(instruction.op1_register())?;
                     return (source.width() == Width::Qword).then_some(
                         EntryInstruction::WriteControl {
-                            number: 3,
+                            number,
                             source: Operand::Register(source),
                         },
                     );
                 }
-                if let Some(dst @ (Segment::Ds | Segment::Ss | Segment::Es)) =
-                    segment(instruction.op0_register())
+                if let Some(
+                    dst @ (Segment::Ds | Segment::Ss | Segment::Es | Segment::Fs | Segment::Gs),
+                ) = segment(instruction.op0_register())
                 {
                     let source = register(instruction.op1_register())?;
                     return Some(EntryInstruction::Segment {
@@ -547,6 +618,11 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         }
         Mnemonic::Ret if encoding.bytes() == [0xc3] => Some(EntryInstruction::Return),
         Mnemonic::Leave if encoding.bytes() == [0xc9] => Some(EntryInstruction::Leave),
+        Mnemonic::Call if matches!(instruction.op0_kind(), OpKind::Register | OpKind::Memory) => {
+            let source = get(0)?;
+            (operand_width(source)? == Width::Qword)
+                .then_some(EntryInstruction::IndirectCall { source })
+        }
         Mnemonic::Jmp if matches!(instruction.op0_kind(), OpKind::Register | OpKind::Memory) => {
             let source = get(0)?;
             (operand_width(source)? == Width::Qword)

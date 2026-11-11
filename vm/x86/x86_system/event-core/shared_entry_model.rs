@@ -68,6 +68,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
+        Instruction::Nop=>retire(s,cpu,length,false,false),
         Instruction::Cpuid => {
             let values = profile::target(((cpu.gpr[0] as u64) & 0xffff_ffffu64) as u32,
                 ((cpu.gpr[1] as u64) & 0xffff_ffffu64) as u32);
@@ -112,6 +113,8 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         },
         Instruction::Integer {operation,dst,source}=>alu::execute(s,operation,Operand::Register(dst),source,length),
         Instruction::Alu {operation,destination,source}=>alu::execute(s,operation,destination,source,length),
+        Instruction::Multiply {dst,source,immediate}=>alu::multiply(s,dst,source,immediate,length),
+        Instruction::RepeatStore {width}=>repeat::execute(s,width,length),
         Instruction::SignExtend {dst,source,width}=>{
             if !dst.valid() || operand::model::bits(dst@.width)<=operand::model::bits(width) {unsupported(s)}
             else {match source {
@@ -156,29 +159,16 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                 retire(s,model::State {gpr:gpr.map(|i:int,v:u64|v as int),flags:result.flags,..cpu},length,false,false)
             }
         },
-        Instruction::ReadControl {number,dst}=>{
-            if !dst.valid() || dst@.width!=Width::Qword || (number!=0 && number!=3 && number!=4) {unsupported(s)}
-            else {
-                let value=if number==0 {0x8000_0011u64 | if s.core.mmu.inner.config.wp {0x10000u64}else{0u64}}
-                    else if number==3 {s.core.mmu.inner.config.root} else {0x20u64};
-                retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,value)
-                    .map(|i:int,v:u64|v as int),..cpu},length,false,false)
-            }
-        },
-        Instruction::WriteControl {number,source}=>match scalar(cpu,source) {
-            None=>unsupported(s),
-            Some(root)=>{
-                if number!=3 || root>=0x1_0000_0000_0000 || root%4096!=0 {unsupported(s)}
-                else {retire(State {core:c::boundary_reload(s.core,Config {root,..s.core.mmu.inner.config}).0,..s},
-                    cpu,length,false,true)}
-            },
-        },
-        Instruction::IndirectJump {source}=>match source {
+        Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr =>
+            privilege::execute(s,instruction,length),
+        Instruction::IndirectJump {source} | Instruction::IndirectCall {source}=>match source {
             Operand::Memory {address,width}=>{
                 if !address.valid() || width!=Width::Qword {unsupported(s)}
-                else {memory(s,linear(s,address,length),width,WordAccess::Read,length,MemoryTask::JumpTarget)}
+                else {memory(s,linear(s,address,length),width,WordAccess::Read,length,
+                    if instruction is IndirectCall {MemoryTask::CallTarget}else{MemoryTask::JumpTarget})}
             },
-            _=>match scalar(cpu,source) {None=>unsupported(s),Some(target)=>alu::jump(s,target)},
+            _=>match scalar(cpu,source) {None=>unsupported(s),Some(target)=>
+                if instruction is IndirectCall {alu::call(s,target,length)}else{alu::jump(s,target)}},
         },
         Instruction::Load { dst, address, width } => {
             if !dst.valid() || !address.valid() || operand::model::bits(dst@.width) < operand::model::bits(width) {
@@ -196,11 +186,21 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                 WordAccess::Read, length, MemoryTask::TableLimit { idt }) }
         },
         Instruction::Segment { segment: dst, src } => {
-            if !src.valid() || !(dst is Ds || dst is Ss || dst is Es) || s.system is None { unsupported(s) }
+            if !src.valid() || !(dst is Ds || dst is Ss || dst is Es || dst is Fs || dst is Gs) || s.system is None { unsupported(s) }
             else {
+                let system=s.system.unwrap();
                 let selector = (operand::model::read(registers(cpu), src) & 0xffffu64) as u16;
                 let offset = (selector & !7u16) as u64;
-                if selector == 0 || selector % 8 != 0 || offset as int + 7 > s.tables.gdt_limit as int
+                if (dst is Fs && system.fs.base!=0) || (dst is Gs && system.gs.base!=0) {unsupported(s)}
+                else if selector==0 {
+                    let null=super::super::memory_core::cpu_core::system::NULL_SEGMENT;
+                    let system=match dst {
+                        Segment::Ds=>SystemState {ds:null,..system},Segment::Ss=>SystemState {ss:null,..system},
+                        Segment::Es=>SystemState {es:null,..system},Segment::Fs=>SystemState {fs:null,..system},
+                        Segment::Gs=>SystemState {gs:null,..system},_=>system,
+                    };
+                    retire(State {system:Some(system),..s},cpu,length,dst is Ss,false)
+                } else if selector % 8 != 0 || offset as int + 7 > s.tables.gdt_limit as int
                     || s.tables.gdt_base as int + offset as int > u64::MAX {
                     stop(s, EventDiagnostic::Descriptor(Stage::Stack))
                 } else { memory(s, (s.tables.gdt_base as int + offset as int) as u64,
@@ -233,6 +233,9 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::RepeatStore {width}=>repeat::value(s,width,length),
+        MemoryTask::CallTarget=>alu::call(s,value,length),
+        MemoryTask::Multiply {dst,immediate}=>alu::multiply_value(s,dst,value,immediate,length),
         MemoryTask::AluRegister {operation,dst}=>{
             if !dst.valid() {unsupported(s)}
             else {alu::finish(s,operation,Some(dst),operand::model::read(registers(cpu),dst),value,dst@.width,length)}
@@ -313,9 +316,11 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
                         Segment::Ds => super::super::memory_core::cpu_core::system::SystemState { ds: segment, ..system },
                         Segment::Ss => super::super::memory_core::cpu_core::system::SystemState { ss: segment, ..system },
                         Segment::Es => super::super::memory_core::cpu_core::system::SystemState { es: segment, ..system },
+                        Segment::Fs => super::super::memory_core::cpu_core::system::SystemState { fs: segment, ..system },
+                        Segment::Gs => super::super::memory_core::cpu_core::system::SystemState { gs: segment, ..system },
                         _ => system,
                     };
-                    if !(dst is Ds || dst is Ss || dst is Es) { unsupported(s) }
+                    if !(dst is Ds || dst is Ss || dst is Es || dst is Fs || dst is Gs) { unsupported(s) }
                     else { retire(State { system: Some(system), ..s }, cpu, length, dst is Ss, false) }
                 },
             },

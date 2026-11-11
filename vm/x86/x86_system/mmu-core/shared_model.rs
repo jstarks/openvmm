@@ -103,7 +103,7 @@ pub open spec fn modify_size(width: Width) -> u8 {
     match width { Width::Byte => 1, Width::Word => 2, Width::Dword => 4, Width::Qword => 8 }
 }
 pub open spec fn modify_admitted(va: u64, operation: integer::Operation, width: Width) -> bool {
-    operation != integer::Operation::Cmp && operation != integer::Operation::Test
+    operation != integer::Operation::Cmp && operation != integer::Operation::Test && operation != integer::Operation::BitTest
         && (width == Width::Qword || va % 8 + modify_size(width) as int <= 8)
 }
 pub open spec fn modify_begin(s: State, va: u64, operation: integer::Operation,

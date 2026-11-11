@@ -133,6 +133,17 @@ fn ready<F: Future>(future: Pin<&mut F>) -> F::Output {
     }
 }
 
+fn ready_after_yields<F: Future>(mut future: Pin<&mut F>) -> F::Output {
+    let wake = waker(Arc::new(Wakes::default()));
+    let mut context = Context::from_waker(&wake);
+    for _ in 0..4096 {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+    panic!("RAM-only execution did not reach its host checkpoint");
+}
+
 async fn build(
     driver: &DefaultDriver,
     bytes: &[u8],
@@ -762,6 +773,134 @@ async fn mapping_families_reload_cr3_and_fetch_high_va_through_the_real_vp(drive
         actual, bytes,
         "complete RAM image, including old and new A/D effects"
     );
+}
+
+#[async_test]
+async fn bootstrap_control_and_null_segments_use_the_actual_vp_image(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    let program = [
+        0xb8, 0x01, 0x0d, 0, 0, 0x31, 0xd2, 0xb9, 0x80, 0, 0, 0xc0, 0x0f, 0x30, 0x0f, 0x32, 0xb8,
+        0xb0, 0, 0, 0, 0x0f, 0x22, 0xe0, 0xb8, 0x33, 0, 0x05, 0x80, 0x0f, 0x22, 0xc0, 0x31, 0xc0,
+        0x8e, 0xd8, 0x8e, 0xd0, 0x8e, 0xc0, 0x8e, 0xe0, 0x8e, 0xe8, 0xf4,
+    ];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    let mut cpu = owned.core.cpu;
+    cpu.flags = 2;
+    cpu.gpr[4] = 0x18000;
+    let mut config = super::shared_mmu_tests::config();
+    config.nxe = false;
+    let initial = long_mode_registers(cpu, config, owned.tables, owned.core.mmu.cr2());
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    park(run.as_mut());
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
+    let mut expected = initial;
+    expected.rax = 0;
+    expected.rdx = 0;
+    expected.rcx = 0xc0000080;
+    expected.rflags = 0x46;
+    expected.cr0 = 0x80050033;
+    expected.cr4 = 0xb0;
+    expected.efer = 0xd01;
+    expected.rip = CODE + program.len() as u64;
+    expected.ds = Default::default();
+    expected.ss = Default::default();
+    expected.es = Default::default();
+    expected.fs = Default::default();
+    expected.gs = Default::default();
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(vp.completed_batch_progress().retired, 16);
+    assert!(devices.faults.lock().is_empty());
+    for address in [0x1000, 0x2000, 0x3000, 0x4080] {
+        let word = u64::from_le_bytes(bytes[address..address + 8].try_into().unwrap()) | 0x20;
+        bytes[address..address + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    let mut actual = vec![0; bytes.len()];
+    memory.read_at(0, &mut actual).unwrap();
+    assert_eq!(actual, bytes);
+}
+
+#[async_test]
+async fn host_checkpoint_stops_after_complete_rep_and_can_resume_without_guest_changes(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    let program = [0xb9, 3, 0, 0, 0, 0xf3, 0x48, 0xab, 0xb8, 1, 0, 0, 0, 0xf4];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    for index in 0..4 {
+        bytes[0x16000 + index * 8..0x16008 + index * 8]
+            .copy_from_slice(&(index as u64 + 1).to_le_bytes());
+    }
+    let mut cpu = owned.core.cpu;
+    cpu.flags = 2;
+    cpu.gpr[0] = 0;
+    cpu.gpr[7] = 0x16000;
+    cpu.gpr[4] = 0x18000;
+    let initial = long_mode_registers(
+        cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        owned.core.mmu.cr2(),
+    );
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let checkpoint = CODE + 8;
+    vp.set_execution_checkpoint(Some(checkpoint)).unwrap();
+    assert!(vp.set_execution_checkpoint(Some(0x8000_0000_0000)).is_err());
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    assert!(matches!(
+        ready_after_yields(run.as_mut()),
+        Err(VpHaltReason::PowerOff)
+    ));
+    drop(run);
+    assert_eq!(
+        &*devices.faults.lock(),
+        &[format!("host execution checkpoint at {checkpoint:#x}")]
+    );
+    let mut expected = initial;
+    expected.rcx = 0;
+    expected.rdi = 0x16018;
+    expected.rip = checkpoint;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(
+        vp.completed_batch_progress().retired,
+        2,
+        "REP is one retired instruction, not three"
+    );
+    for address in [0x16000, 0x16008, 0x16010] {
+        assert_eq!(memory.read_plain::<u64>(address).unwrap(), 0);
+    }
+    assert_eq!(memory.read_plain::<u64>(0x16018).unwrap(), 4);
+    let mut before_resume = vec![0; bytes.len()];
+    memory.read_at(0, &mut before_resume).unwrap();
+    vp.set_execution_checkpoint(None).unwrap();
+    devices.faults.lock().clear();
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    park(run.as_mut());
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
+    expected.rax = 1;
+    expected.rip = CODE + program.len() as u64;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(vp.completed_batch_progress().retired, 4);
+    let mut after = vec![0; bytes.len()];
+    memory.read_at(0, &mut after).unwrap();
+    assert_eq!(
+        after, before_resume,
+        "checkpoint or resume changed RAM beyond the guest's stores"
+    );
+    assert!(devices.faults.lock().is_empty());
 }
 
 #[async_test]

@@ -25,6 +25,10 @@ pub mod alu;
 pub mod decode;
 #[path = "shared_entry_model.rs"]
 pub mod entry;
+#[path = "shared_privilege_model.rs"]
+pub mod privilege;
+#[path = "shared_repeat_model.rs"]
+pub mod repeat;
 
 verus! {
 
@@ -272,6 +276,7 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
 }
 pub open spec fn advance(s: State) -> (State, Tick) {
     match s.phase {
+        Phase::Repeat {width,length}=>repeat::execute(s,width,length),
         Phase::Decode { input } => (s, Tick::Decode(input)),
         Phase::Admitted { .. } => decode::admitted(s),
         Phase::DecodeFetch { input } => match m::request(s.core.mmu) {

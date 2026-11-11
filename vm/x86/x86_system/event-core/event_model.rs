@@ -30,7 +30,7 @@ pub open spec fn tables_supported(t: Tables) -> bool {
         && t.gdt_limit >= 23
 }
 pub open spec fn gate_supported(low: u64, high: u64) -> bool {
-    low & 0x0000_feff_ffff_0000u64 == 0x0000_8e00_0008_0000u64
+    low & 0x0000_9eff_ffff_0000u64 == 0x0000_8e00_0008_0000u64
         && high <= 4294967295u64
 }
 pub open spec fn gate_target(low: u64, high: u64) -> int {
@@ -43,7 +43,7 @@ pub open spec fn live_flags(flags: u64, low: u64) -> u64 {
 }
 pub open spec fn vector(event: Event) -> u8 {
     match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13,
-        Event::InvalidOpcode => 6, Event::External(v) => v }
+        Event::InvalidOpcode => 6, Event::Breakpoint=>3, Event::External(v) => v }
 }
 pub open spec fn has_error_code(event: Event) -> bool {
     event is PageFault || event is GeneralProtection
@@ -146,7 +146,7 @@ pub open spec fn enter(s: State, b: Seq<u8>, base: int, event: Event)
                     let stack = s.core.cpu.gpr[4] / 16 * 16;
                     let words = seq![16u64, s.core.cpu.gpr[4] as u64,
                         s.core.cpu.flags | 0x10000u64, 8u64, s.core.cpu.rip as u64, error(event)];
-                    let words = if event is External {
+                    let words = if event is External || event is Breakpoint {
                         seq![0u64, 16u64, s.core.cpu.gpr[4] as u64, s.core.cpu.flags, 8u64, s.core.cpu.rip as u64]
                     } else { words };
                     let words = if event is InvalidOpcode {

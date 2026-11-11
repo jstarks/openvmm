@@ -211,6 +211,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
         Instruction::ReadTimestamp=>timestamp(s,length),
+        Instruction::Breakpoint=>privilege::breakpoint(s,length),
         Instruction::LoadTask {source}=>load_task(s,source,length),
         Instruction::LoadLdt {source}=>{
             if s.system is None || !source.valid() || source@.width!=Width::Word
@@ -299,13 +300,18 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
             if cpu.gpr[4] < 8 || cpu.gpr[4] % 8 != 0 { unsupported(s) }
             else { memory(s,(cpu.gpr[4]-8) as u64,Width::Qword,
                 WordAccess::Write(control::model::flags_image(cpu.flags)),length,
-                MemoryTask::Push {stack:(cpu.gpr[4]-8) as u64}) }
+                MemoryTask::StackCommit {stack:(cpu.gpr[4]-8) as u64}) }
         },
         Instruction::Pop { dst } => {
             if !dst.valid() || dst@.width != Width::Qword || cpu.gpr[4] + 8 > u64::MAX
                 || cpu.gpr[4] % 8 != 0 { unsupported(s) }
             else { memory(s,cpu.gpr[4] as u64,Width::Qword,WordAccess::Read,length,
                 MemoryTask::Pop {stack:cpu.gpr[4] as u64,dst}) }
+        },
+        Instruction::PopMemory {address}=>{
+            if !address.valid() || cpu.gpr[4]+8>u64::MAX || cpu.gpr[4]%8!=0 {unsupported(s)}
+            else {memory(s,cpu.gpr[4] as u64,Width::Qword,WordAccess::Read,length,
+                MemoryTask::PopMemory {stack:cpu.gpr[4] as u64,address})}
         },
         Instruction::PopFlags => {
             if cpu.gpr[4] + 8 > u64::MAX || cpu.gpr[4] % 8 != 0 { unsupported(s) }
@@ -455,7 +461,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
             } else if scalar(cpu,source) is None {unsupported(s)}
             else {memory(s,(cpu.gpr[4]-8) as u64,Width::Qword,
                 WordAccess::Write(scalar(cpu,source).unwrap()),length,
-                MemoryTask::Push {stack:(cpu.gpr[4]-8) as u64})}
+                MemoryTask::StackCommit {stack:(cpu.gpr[4]-8) as u64})}
         },
         Instruction::Return | Instruction::Leave => {
             let stack = if instruction is Return { cpu.gpr[4] as u64 } else { cpu.gpr[5] as u64 };
@@ -470,6 +476,18 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
             else { retire(s, cpu, length, false, false) }
         },
     } }
+}
+#[verifier::opaque]
+pub open spec fn pop_memory_value(s:State,value:u64,destination:Address,stack:u64,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if !destination.valid() || stack as int+8>u64::MAX {unsupported(s)}
+    else {
+        let gpr=registers(cpu).update(4,(stack+8) as u64);
+        let at=operand::model::linear(gpr,
+            ((cpu.rip+length as int)%0x1_0000_0000_0000_0000int) as u64,destination,bases(s));
+        memory(s,at,Width::Qword,WordAccess::Write(value),length,
+            MemoryTask::StackCommit {stack:(stack+8) as u64})
+    }
 }
 pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     let (address, length, task) = match s.phase {
@@ -544,6 +562,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
                 retire(s,model::State {gpr:gpr.map(|i:int,v:u64|v as int),..cpu},length,false,false)
             }
         },
+        MemoryTask::PopMemory {stack,address:destination}=>pop_memory_value(s,value,destination,stack,length),
         MemoryTask::Flags {stack} => match control::model::restore_flags(value) {
             None => unsupported(s),
             Some(flags) => {
@@ -617,14 +636,14 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
                 },
             },
         },
-        MemoryTask::Push { stack } => retire(s, model::State {
+        MemoryTask::StackCommit { stack } => retire(s, model::State {
             gpr: cpu.gpr.update(4, stack as int), ..cpu }, length, false, false),
         MemoryTask::StoreTableBase {base}=>{
             if address>u64::MAX-2 {unsupported(s)}
             else {memory(s,(address+2) as u64,Width::Qword,WordAccess::Write(base),length,MemoryTask::Store)}
         },
         MemoryTask::PushValue {stack}=>memory(s,stack,Width::Qword,WordAccess::Write(value),length,
-            MemoryTask::Push {stack}),
+            MemoryTask::StackCommit {stack}),
         MemoryTask::Return { stack } => {
             if stack as int + 8 > u64::MAX || !mmu_model::canonical(value as int) { unsupported(s) }
             else { retire(s, model::State { gpr: cpu.gpr.update(4, stack as int + 8),

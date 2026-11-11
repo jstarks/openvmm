@@ -12,6 +12,17 @@ use super::super::shared::entry::Instruction;
 use super::*;
 
 verus! {
+#[verifier::opaque]
+pub open spec fn breakpoint(s:State,length:u8)->(State,Tick) {
+    if length!=1 {entry::unsupported(s)}
+    else if s.core.cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {
+        let retired=entry::retire(s,s.core.cpu,length,false,false);
+        let boundary=State {core:c::boundary(retired.0.core).0,..retired.0};
+        let delivered=entry(boundary,Event::Breakpoint);
+        (delivered.0,match delivered.1 {Tick::Pending=>Tick::Retired(false),other=>other})
+    }
+}
 pub open spec fn reload(s:State,config:Config,system:Option<SystemState>)->State {
     State {core:c::boundary_reload(s.core,config).0,system,..s}
 }

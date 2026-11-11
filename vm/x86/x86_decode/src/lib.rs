@@ -473,6 +473,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     }
     match instruction.mnemonic() {
         Mnemonic::Prefetchnta
+        | Mnemonic::Prefetchw
         | Mnemonic::Prefetcht0
         | Mnemonic::Prefetcht1
         | Mnemonic::Prefetcht2 => Some(EntryInstruction::Nop),
@@ -499,6 +500,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         Mnemonic::Nop => Some(EntryInstruction::Nop),
         Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => Some(EntryInstruction::Fence),
         Mnemonic::Fninit => Some(EntryInstruction::InitializeX87),
+        Mnemonic::Int3 if encoding.bytes() == [0xcc] => Some(EntryInstruction::Breakpoint),
         Mnemonic::Fxsave | Mnemonic::Fxsave64 => Some(EntryInstruction::SaveFp {
             address: address(&instruction, size)?,
             wide: instruction.mnemonic() == Mnemonic::Fxsave64,
@@ -873,12 +875,16 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             }
             Some(EntryInstruction::Push { source })
         }
-        Mnemonic::Pop => {
-            let Operand::Register(dst) = get(0)? else {
-                return None;
-            };
-            (dst.width() == Width::Qword).then_some(EntryInstruction::Pop { dst })
-        }
+        Mnemonic::Pop => match get(0)? {
+            Operand::Register(dst) if dst.width() == Width::Qword => {
+                Some(EntryInstruction::Pop { dst })
+            }
+            Operand::Memory {
+                address,
+                width: Width::Qword,
+            } => Some(EntryInstruction::PopMemory { address }),
+            _ => None,
+        },
         Mnemonic::Ret if encoding.bytes() == [0xc3] => Some(EntryInstruction::Return),
         Mnemonic::Leave if encoding.bytes() == [0xc9] => Some(EntryInstruction::Leave),
         Mnemonic::Call if matches!(instruction.op0_kind(), OpKind::Register | OpKind::Memory) => {

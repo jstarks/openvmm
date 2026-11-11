@@ -30,6 +30,40 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
 }
 
 #[test]
+fn memory_pop_retains_the_rsp_address_for_post_increment_evaluation() {
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(
+        entry(&[0x8f, 0x44, 0x24, 0x18]),
+        Instruction::PopMemory {
+            address: Address {
+                size: AddressSize::Bits64,
+                segment: Segment::Ss,
+                base: Base::Register(Gpr::new(4).unwrap()),
+                index: None,
+                scale: Scale::One,
+                displacement: 0x18,
+            }
+        }
+    );
+    assert_eq!(
+        admission(&[0x66, 0x8f, 0x04, 0x24]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+}
+
+#[test]
+fn int3_is_a_trap_instruction_not_an_invalid_opcode_or_generic_software_interrupt() {
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(entry(&[0xcc]), Instruction::Breakpoint);
+    for bytes in [&[0xcd, 3][..], &[0x66, 0xcc][..]] {
+        assert_eq!(
+            admission(bytes),
+            x86_system::shared::decode::DecodeDecision::Unsupported
+        );
+    }
+}
+
+#[test]
 fn fxsave_preserves_its_address_and_pointer_format_without_a_scalar_width() {
     use x86_system::shared::entry::Instruction;
     for (prefix, wide) in [(&[][..], false), (&[0x48][..], true)] {
@@ -122,6 +156,7 @@ fn cs_prefixed_relative_call_keeps_its_displacement_and_full_return_length() {
 #[test]
 fn cache_prefetch_hints_have_no_architectural_memory_operand_effect() {
     use x86_system::shared::entry::Instruction;
+    assert_eq!(entry(&[0x0f, 0x0d, 0x0c, 0x03]), Instruction::Nop);
     for extension in 0..4 {
         assert_eq!(
             entry(&[0x0f, 0x18, 0x04 | (extension << 3), 0x03]),

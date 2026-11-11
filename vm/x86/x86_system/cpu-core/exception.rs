@@ -36,7 +36,7 @@ pub mod model {
         let target = (low & 0xffffu64) | (((low >> 48) & 0xffffu64) << 16)
             | ((high & 0xffff_ffffu64) << 32);
         if (low >> 32) & 0xffu64 != 0 || high >> 32 != 0
-            || (attributes != 0x8e && attributes != 0x8f)
+            || (attributes&0x9fu64 != 0x8e && attributes&0x9fu64 != 0x8f)
             || selector == 0 || selector & 7u16 != 0
             || !system::model::canonical(target) {
             None
@@ -87,7 +87,7 @@ pub fn selectors(system: Option<SystemState>) -> (out: Selectors)
     }
 }
 
-/// APM Volume 2 §§8.9.1–8.9.2: bounded present DPL0 long-mode gates.
+/// APM Volume 2 §§8.9.1–8.9.2: bounded present long-mode gates at CPL0.
 /// IST, LDT and nonzero RPL are outside this same-CPL0 profile. None is
 /// unsupported, not an architectural exception. GDT bounds and the code
 /// image remain the caller's checks, using descriptor::load_code.
@@ -99,7 +99,7 @@ pub fn gate(low: u64, high: u64) -> (out: Option<Gate>)
     let target = (low & 0xffff) | (((low >> 48) & 0xffff) << 16)
         | ((high & 0xffff_ffff) << 32);
     if (low >> 32) & 0xff != 0 || high >> 32 != 0
-        || (attributes != 0x8e && attributes != 0x8f)
+        || (attributes&0x9f != 0x8e && attributes&0x9f != 0x8f)
         || selector == 0 || selector & 7 != 0
         || !(target < 0x8000_0000_0000 || target >= 0xffff_8000_0000_0000) {
         None
@@ -166,11 +166,13 @@ pub proof fn lemma_gate_fields(low: u64, high: u64)
             && system::model::canonical(g.target)
             && ((low >> 16) & 0xffffu64) == g.selector as u64
             && (low >> 32) & 0xffu64 == 0 && high >> 32 == 0
-            && ((low >> 40) & 0xffu64 == 0x8e
-                || (low >> 40) & 0xffu64 == 0x8f),
+            && ((low >> 40) & 0x9fu64 == 0x8e
+                || (low >> 40) & 0x9fu64 == 0x8f),
         None => true,
     },
 {
+    assert(((low>>16)&0xffffu64)<=0xffffu64) by(bit_vector);
+    assert((((low>>40)&0xffu64)&0x9fu64)==((low>>40)&0x9fu64)) by(bit_vector);
     let selector = ((low >> 16) & 0xffffu64) as u16;
     assert(((low >> 16) & 0xffffu64) == selector as u64) by(bit_vector)
         requires selector == ((low >> 16) & 0xffffu64) as u16;

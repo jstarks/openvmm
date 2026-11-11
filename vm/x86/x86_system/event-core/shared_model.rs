@@ -192,7 +192,7 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
 pub open spec fn frame_word(cpu: model::State, system: Option<SystemState>, event: Event, index: u8) -> u64 {
     exception::model::frame_word(cpu.rip as u64, cpu.gpr[4] as u64, cpu.flags,
         exception::model::selectors(system), e::has_error_code(event),
-        event is External, e::error(event) as u8, index)
+        event is External || event is Breakpoint, e::error(event) as u8, index)
 }
 pub open spec fn commit_return(s: State, words: ReturnWords, cs: SegmentState,
     ss: SegmentState) -> (State, Tick) {

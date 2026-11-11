@@ -17,6 +17,7 @@ pub enum Instruction {
     Nop,
     Fence,
     InitializeX87,
+    Breakpoint,
     SaveFp {address:Address,wide:bool},
     Integer { operation: integer::Operation, dst: Register, source: Operand },
     Alu { operation: integer::Operation, destination: Operand, source: Operand },
@@ -56,6 +57,7 @@ pub enum Instruction {
     ReadSegment {segment:Segment,destination:Operand},
     Push { source: Operand },
     Pop { dst: Register },
+    PopMemory {address:Address},
     PushFlags,
     PopFlags,
     FarReturn,
@@ -89,8 +91,9 @@ pub enum MemoryTask {
     TaskHigh {selector:u16,low:u64},
     TaskBusy {image:SegmentState,low:u64},
     Segment { segment: Segment, selector: u16 },
-    Push { stack: u64 },
+    StackCommit { stack: u64 },
     PushValue {stack:u64},
+    PopMemory {stack:u64,address:Address},
     Return { stack: u64 },
     Leave { stack: u64 },
     Pop { stack: u64, dst: Register },
@@ -182,6 +185,10 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
         match instruction {
+            Instruction::Breakpoint=>{
+                reveal(spec::entry::execute);
+                self.breakpoint(length)
+            },
             Instruction::InitializeX87=>{
                 reveal(spec::entry::execute);
                 self.initialize_x87(length)
@@ -553,7 +560,7 @@ impl SharedEventMachine {
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
-            instruction is PushFlags || instruction is Pop || instruction is PopFlags
+            instruction is PushFlags || instruction is Pop || instruction is PopMemory || instruction is PopFlags
                 || instruction is FarReturn || instruction is Load || instruction is Store
                 || instruction is Table || instruction is StoreTable || instruction is Segment || instruction is Push
                 || instruction is Return || instruction is Leave,
@@ -571,7 +578,7 @@ impl SharedEventMachine {
                 }
                 let stack = cpu.gpr[4] - 8;
                 self.entry_memory(stack, Width::Qword, WordAccess::Write(control::flags_image(cpu.flags)),
-                    length, MemoryTask::Push { stack })
+                    length, MemoryTask::StackCommit { stack })
             },
             Instruction::Pop { dst } => {
                 if !dst.is_valid() || dst.width() != Width::Qword || cpu.gpr[4] > u64::MAX - 8
@@ -580,6 +587,13 @@ impl SharedEventMachine {
                 }
                 self.entry_memory(cpu.gpr[4], Width::Qword, WordAccess::Read, length,
                     MemoryTask::Pop { stack: cpu.gpr[4], dst })
+            },
+            Instruction::PopMemory {address}=>{
+                if !address.is_valid() || cpu.gpr[4]>u64::MAX-8 || cpu.gpr[4]%8!=0 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                self.entry_memory(cpu.gpr[4],Width::Qword,WordAccess::Read,length,
+                    MemoryTask::PopMemory {stack:cpu.gpr[4],address})
             },
             Instruction::PopFlags => {
                 if cpu.gpr[4] > u64::MAX - 8 || cpu.gpr[4] % 8 != 0 {
@@ -679,7 +693,7 @@ impl SharedEventMachine {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
                 self.entry_memory(stack, Width::Qword, WordAccess::Write(value),
-                    length, MemoryTask::Push { stack })
+                    length, MemoryTask::StackCommit { stack })
             },
             Instruction::Return | Instruction::Leave => {
                 let stack = if matches!(instruction, Instruction::Return) { cpu.gpr[4] } else { cpu.gpr[5] };
@@ -803,6 +817,25 @@ impl SharedEventMachine {
         self.phase=Phase::EntryMemory {address:linear,length,
             task:MemoryTask::LockedAlu {operation,source:value,width}};
         Tick::Pending
+    }
+
+    pub(super) fn pop_memory_value(&mut self,value:u64,destination:Address,stack:u64,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::entry::pop_memory_value(old(self)@,value,destination,stack,length),
+    {
+        reveal(spec::entry::pop_memory_value);
+        if !destination.is_valid() || stack>u64::MAX-8 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let mut cpu=self.core.cpu();
+        let ghost registers=cpu.gpr@;
+        cpu.gpr[4]=stack+8;
+        assert(cpu.gpr@ =~= registers.update(4,(stack+8) as u64));
+        let linear=destination.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        self.entry_memory(linear,Width::Qword,WordAccess::Write(value),length,
+            MemoryTask::StackCommit {stack:stack+8})
     }
 
     pub(super) fn finish_conditional(&mut self,condition:control::Condition,dst:Register,
@@ -933,6 +966,9 @@ impl SharedEventMachine {
                 assert(cpu@.gpr =~= operand::model::write(registers, dst, value)
                     .map(|i: int, v: u64| v as int));
             },
+            MemoryTask::PopMemory {stack,address:destination}=>{
+                return self.pop_memory_value(value,destination,stack,length);
+            },
             MemoryTask::Flags { stack } => {
                 let Some(flags) = control::restore_flags(value) else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -1020,12 +1056,12 @@ impl SharedEventMachine {
                 }
                 return self.entry_memory(address+2,Width::Qword,WordAccess::Write(base),length,MemoryTask::Store);
             },
-            MemoryTask::Push { stack } => {
+            MemoryTask::StackCommit { stack } => {
                 cpu.gpr[4] = stack;
                 assert(cpu@.gpr =~= before.gpr.update(4, stack as int));
             },
             MemoryTask::PushValue {stack}=>{
-                return self.entry_memory(stack,Width::Qword,WordAccess::Write(value),length,MemoryTask::Push {stack});
+                return self.entry_memory(stack,Width::Qword,WordAccess::Write(value),length,MemoryTask::StackCommit {stack});
             },
             MemoryTask::Return { stack } => {
                 if stack > u64::MAX - 8 || !canonical(value) {

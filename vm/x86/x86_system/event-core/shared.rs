@@ -250,7 +250,8 @@ impl SharedEventMachine {
     {
         if self.handler_pending {
             let (vector, code) = match event { Event::PageFault(c) => (14, c),
-                Event::GeneralProtection => (13, 0), Event::InvalidOpcode => (6, 0), Event::External(v) => (v, 0) };
+                Event::GeneralProtection => (13, 0), Event::InvalidOpcode => (6, 0),
+                Event::Breakpoint=>(3,0), Event::External(v) => (v, 0) };
             return self.stop(EventDiagnostic::HandlerFault { vector, code });
         }
         let cpu = self.core.cpu();
@@ -266,7 +267,7 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Profile);
         }
         let vector: u8 = match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13,
-            Event::InvalidOpcode => 6, Event::External(v) => v };
+            Event::InvalidOpcode => 6, Event::Breakpoint=>3, Event::External(v) => v };
         let offset = vector as u64 * 16;
         if offset + 15 > self.tables.idt_limit as u64 || self.tables.idt_base > u64::MAX - offset - 15 {
             return self.stop(EventDiagnostic::Descriptor(Stage::Idt));
@@ -470,7 +471,7 @@ impl SharedEventMachine {
             Phase::GateLow { address, .. } => (Stage::Idt, address),
             Phase::GateHigh { event, .. } => (Stage::Idt, self.tables.idt_base
                 + (match event { Event::PageFault(_) => 14u64, Event::GeneralProtection => 13,
-                    Event::InvalidOpcode => 6, Event::External(v) => v as u64 }) * 16 + 8),
+                    Event::InvalidOpcode => 6, Event::Breakpoint=>3, Event::External(v) => v as u64 }) * 16 + 8),
             Phase::Code { selector, .. } => (Stage::Code, self.tables.gdt_base + selector as u64),
             Phase::ReturnCode { words } => (Stage::Code, self.tables.gdt_base + words.cs),
             Phase::ReturnStack { words, .. } => (Stage::Stack, self.tables.gdt_base + words.ss),
@@ -550,7 +551,8 @@ impl SharedEventMachine {
                     self.phase = Phase::Ready; self.handler_pending = true; self.shadow = false; self.halted = false;
                     if matches!(event, Event::External(_)) { self.pending = None; }
                     return Tick::Delivered(match event { Event::PageFault(_) => 14,
-                        Event::GeneralProtection => 13, Event::InvalidOpcode => 6, Event::External(v) => v });
+                        Event::GeneralProtection => 13, Event::InvalidOpcode => 6,
+                        Event::Breakpoint=>3, Event::External(v) => v });
                 }
                 let next = index + 1;
                 let start = if has_error_code(event) { 0u64 } else { 1u64 };
@@ -651,7 +653,7 @@ fn frame_word(cpu: State, system: Option<SystemState>, event: Event, index: u8) 
     ensures value == spec::frame_word(cpu@, system, event, index),
 {
     exception::frame_word(cpu.rip, cpu.gpr[4], cpu.flags, exception::selectors(system),
-        has_error_code(event), matches!(event, Event::External(_)),
+        has_error_code(event), matches!(event, Event::External(_) | Event::Breakpoint),
         match event { Event::PageFault(code) => code, _ => 0 }, index)
 }
 }

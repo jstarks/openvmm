@@ -10,6 +10,28 @@ use memory_core::cpu_core::{privilege, profile};
 
 verus! {
 impl SharedEventMachine {
+    pub(super) fn breakpoint(&mut self,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::breakpoint(old(self)@,length),
+    {
+        reveal(spec::privilege::breakpoint);
+        let cpu=self.core.cpu();
+        if length!=1 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let _retired=self.retire_entry(cpu,length,false,false);
+        let _accepted=self.core.boundary();
+        assert(_accepted);
+        match self.start_entry(Event::Breakpoint) {
+            Tick::Pending=>Tick::Retired(false),
+            other=>other,
+        }
+    }
+
     #[verifier::spinoff_prover]
     pub(super) fn execute_control(&mut self,instruction:Instruction,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,

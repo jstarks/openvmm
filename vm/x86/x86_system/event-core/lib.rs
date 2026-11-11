@@ -20,7 +20,7 @@ pub struct Tables {
     pub idt_base: u64, pub idt_limit: u16, pub gdt_base: u64, pub gdt_limit: u16,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Event { PageFault(u8), GeneralProtection, InvalidOpcode, External(u8) }
+pub enum Event { PageFault(u8), GeneralProtection, InvalidOpcode, Breakpoint, External(u8) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Injection { Queued, Busy, InvalidVector, Stopped(EventDiagnostic) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +97,7 @@ fn canonical(va: u64) -> (v: bool)
 { va < 0x8000_0000_0000 || va >= 0xffff_8000_0000_0000 }
 fn gate_supported(low: u64, high: u64) -> (v: bool)
     ensures v == event_model::gate_supported(low, high),
-{ low & 0x0000_feff_ffff_0000u64 == 0x0000_8e00_0008_0000u64 && high <= 4294967295 }
+{ low & 0x0000_9eff_ffff_0000u64 == 0x0000_8e00_0008_0000u64 && high <= 4294967295 }
 fn gate_target(low: u64, high: u64) -> (v: u64)
     requires high <= 4294967295,
     ensures v as int == event_model::gate_target(low, high),
@@ -188,6 +188,7 @@ impl EventMachine {
             let (vector, code) = match event {
                 Event::PageFault(code) => (14, code), Event::GeneralProtection => (13, 0),
                 Event::InvalidOpcode => (6, 0),
+                Event::Breakpoint => (3, 0),
                 Event::External(v) => (v, 0),
             };
             return EventReport { outcome: self.stop(EventDiagnostic::HandlerFault { vector, code }), table_reads: 0 };
@@ -206,6 +207,7 @@ impl EventMachine {
         let (vector, error): (u8, u64) = match event {
             Event::PageFault(code) => (14, code as u64), Event::GeneralProtection => (13, 0),
             Event::InvalidOpcode => (6, 0),
+            Event::Breakpoint => (3, 0),
             Event::External(v) => (v, 0),
         };
         let offset = vector as u64 * 16;
@@ -239,10 +241,10 @@ impl EventMachine {
         let words = [16u64, old_rsp, self.core.cpu.flags | 0x10000u64, 8u64, self.core.cpu.rip, error];
         assert(words@ =~= seq![16u64, old_rsp, self.core.cpu.flags | 0x10000u64,
             8u64, self.core.cpu.rip, error]);
-        let words = if external {
+        let words = if external || matches!(event,Event::Breakpoint) {
             [0u64, 16u64, old_rsp, self.core.cpu.flags, 8u64, self.core.cpu.rip]
         } else { words };
-        if external {
+        if external || matches!(event,Event::Breakpoint) {
             assert(words@ =~= seq![0u64, 16u64, old_rsp, self.core.cpu.flags, 8u64, self.core.cpu.rip]);
         }
         let words = if matches!(event, Event::InvalidOpcode) {

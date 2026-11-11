@@ -13,6 +13,8 @@ use mmu_core::shared::{self as memory, Reply, Request, RunError};
 #[cfg(verus_keep_ghost)]
 use paged_core::shared::CpuPhase;
 use paged_core::shared::{SharedMachine, Tick as CpuTick};
+#[path = "shared_alu.rs"]
+pub mod alu;
 #[path = "shared_decode.rs"]
 pub mod decode;
 #[path = "shared_entry.rs"]

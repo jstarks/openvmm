@@ -143,6 +143,26 @@ impl SharedMachine {
         self.mmu.begin_sized(address, word, size)
     }
 
+    pub(crate) fn boundary_modify(&mut self, address: u64,
+        operation: memory_core::cpu_core::integer::Operation, source: u64, flags: u64,
+        width: memory_core::cpu_core::operand::Width) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(), (final(self)@, accepted) ==
+            spec::boundary_modify(old(self)@, address, operation, source, flags, width),
+    {
+        if !matches!(self.phase, CpuPhase::Boundary) { return false; }
+        self.mmu.begin_modify(address, operation, source, flags, width)
+    }
+
+    pub(crate) fn boundary_reload(&mut self, config: Config) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(), (final(self)@, accepted) ==
+            spec::boundary_reload(old(self)@, config),
+    {
+        if !matches!(self.phase, CpuPhase::Boundary) { return false; }
+        self.mmu.reload(config)
+    }
+
     fn decoded(&mut self, rex: u8, opcode: u8, modrm: u8) -> (tick: Tick)
         requires old(self).mmu.invariant(),
             !mmu_core::shared_model::active(old(self).mmu@.phase),

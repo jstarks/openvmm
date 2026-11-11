@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#[cfg(verus_keep_ghost)]
+use super::memory_core::cpu_core::{integer, operand::Width};
 use super::shared::Phase;
 #[cfg(verus_keep_ghost)]
 use super::shared::io::{IoReply, IoRequest, IoRoute, Operand};
 #[cfg(verus_keep_ghost)]
-use super::shared::{Leaf, Reply, Request, WordData};
+use super::shared::{Leaf, Modifier, Reply, Request, WordData};
 use super::word::WordAccess;
 #[cfg(verus_keep_ghost)]
 use super::word::{WordReport, WordResult};
@@ -27,6 +29,7 @@ pub struct State {
     pub word: Option<WordAccess>,
     pub sequence: u64,
     pub size: u8,
+    pub modifier: Option<super::shared::Modifier>,
 }
 
 pub open spec fn active(p: Phase) -> bool {
@@ -70,7 +73,7 @@ pub open spec fn begin(s: State, va: u64, access: Access, user: bool, word: Opti
     span_begin(s, va, access, user, word, 8)
 }
 pub open spec fn span_begin(s: State, va: u64, access: Access, user: bool, word: Option<WordAccess>, size: u8) -> State {
-    let t = State { va, access, user, word, size, ..s };
+    let t = State { va, access, user, word, size, modifier: None, ..s };
     if word is Some && va as int + size as int - 1 > u64::MAX {
         State { phase: Phase::WordDone { report: WordReport { result: WordResult::Wrap,
             table_reads: 0, virtual_address: va } }, ..t }
@@ -95,6 +98,21 @@ pub open spec fn span_begin(s: State, va: u64, access: Access, user: bool, word:
 
 pub open spec fn sized(s: State, va: u64, word: WordAccess, size: u8) -> State {
     span_begin(s, va, word_model::request(word), false, Some(word), size)
+}
+pub open spec fn modify_size(width: Width) -> u8 {
+    match width { Width::Byte => 1, Width::Word => 2, Width::Dword => 4, Width::Qword => 8 }
+}
+pub open spec fn modify_admitted(va: u64, operation: integer::Operation, width: Width) -> bool {
+    operation != integer::Operation::Cmp && operation != integer::Operation::Test
+        && (width == Width::Qword || va % 8 + modify_size(width) as int <= 8)
+}
+pub open spec fn modify_begin(s: State, va: u64, operation: integer::Operation,
+    source: u64, flags: u64, width: Width) -> State {
+    if !modify_admitted(va, operation, width) { s } else {
+        let t = span_begin(s, va, Access::Write(0), false,
+            Some(WordAccess::Write(0)), modify_size(width));
+        State { modifier: Some(Modifier { operation, source, flags, width, original: 0 }), ..t }
+    }
 }
 pub open spec fn size_mask(size: u8) -> u64 {
     match size { 1 => 0xffu64, 2 => 0xffffu64, 4 => 0xffff_ffffu64, _ => u64::MAX }
@@ -239,6 +257,20 @@ pub open spec fn joined(first: u64, tail: u64, offset: u64) -> u64 {
         (first >> ((offset * 8) as u32)) | (tail << ((64 - offset * 8) as u32))
     }
 }
+pub open spec fn observed(s: State, first: u64, tail: u64) -> u64 {
+    if s.size == 8 { joined(first, tail, s.va % 8) }
+    else { (first >> ((s.va % 8 * 8) as u32)) & size_mask(s.size) }
+}
+pub open spec fn captured_modifier(modifier: Option<Modifier>, original: u64) -> Option<Modifier> {
+    match modifier { Some(m) => Some(Modifier { original, ..m }), None => None }
+}
+pub open spec fn modified_value(modifier: Option<Modifier>, original: u64, value: u64) -> u64 {
+    match modifier {
+        Some(m) => integer::model::evaluate(
+            m.operation, original, m.source, m.width, m.flags).value,
+        None => value,
+    }
+}
 pub open spec fn head_request(data: WordData) -> Request {
     let shift = (data.address % 8 * 8) as u32;
     let mask = u64::MAX << shift;
@@ -262,12 +294,16 @@ pub open spec fn word_loaded(s: State, frame: u64, permissions: Permissions,
             page: s.va as int / 4096, root: s.inner.config.root as int,
             frame: frame as int, permissions, large }), ..s.inner },
             phase: Phase::WordDone { report: WordReport { result: WordResult::Success(
-                if s.size == 8 { joined(first, tail, s.va % 8) }
-                else { (first >> ((s.va % 8 * 8) as u32)) & size_mask(s.size) }),
+                observed(s, first, tail)),
                 table_reads: reads, virtual_address: s.va } }, ..s },
         Some(WordAccess::Write(value)) => match leaf {
-            Some(pte) => State { phase: Phase::WordDirty { pte,
-                data: WordData { address, first, tail, value }, reads }, ..s },
+            Some(pte) => {
+                let original = observed(s, first, tail);
+                let replacement = modified_value(s.modifier, original, value);
+                State { modifier: captured_modifier(s.modifier, original),
+                    phase: Phase::WordDirty { pte,
+                        data: WordData { address, first, tail, value: replacement }, reads }, ..s }
+            },
             None => s,
         },
         None => s,
@@ -291,18 +327,62 @@ pub open spec fn word_tail(s: State, word: u64) -> State {
 }
 pub open spec fn word_store_done(s: State, value: u64, reads: u8) -> State {
     State { inner: m::State { cache: None, ..s.inner },
-        phase: Phase::WordDone { report: WordReport { result: WordResult::Success(value),
+        phase: Phase::WordDone { report: WordReport { result: WordResult::Success(
+            match s.modifier { Some(m) => m.original, None => value }),
             table_reads: reads, virtual_address: s.va } }, ..s }
 }
 
+/// The same operand observation determines the store and the eventual flag input.
+pub proof fn modify_capture(s: State, frame: u64, permissions: Permissions,
+    pte: Leaf, first: u64, tail: u64, reads: u8)
+    requires s.word == Some(WordAccess::Write(0)), s.modifier is Some,
+    ensures ({
+        let m = s.modifier.unwrap();
+        let original = observed(s, first, tail);
+        let t = word_loaded(s, frame, permissions, Some(pte), first, tail, reads);
+        t.modifier == Some(Modifier { original, ..m })
+            && t.phase == (Phase::WordDirty { pte, data: WordData {
+                address: (frame as int + s.va % 4096) as u64, first, tail,
+                value: integer::model::evaluate(
+                    m.operation, original, m.source, m.width, m.flags).value }, reads })
+    }),
+{ }
+
+/// PTE replacement requires a fresh walk; data contention only merges the beat.
+pub proof fn modify_retry(s: State, current: u64)
+    ensures changed(s, current).modifier == s.modifier,
+        s.phase is WordDirty ==> changed(s, current) == restart(s),
+        match s.phase {
+            Phase::SizedStore { data, reads } =>
+                changed(s, current).phase == (Phase::SizedStore {
+                    data: WordData { first: current, ..data }, reads }),
+            Phase::WordHead { data, reads } =>
+                changed(s, current).phase == (Phase::WordHead {
+                    data: WordData { first: current, ..data }, reads }),
+            Phase::WordLast { data, reads } =>
+                changed(s, current).phase == (Phase::WordLast {
+                    data: WordData { tail: current, ..data }, reads }),
+            _ => true,
+        },
+{ }
+
+pub proof fn modify_completion(s: State, value: u64, reads: u8)
+    requires s.modifier is Some,
+    ensures word_store_done(s, value, reads).phase == (Phase::WordDone {
+        report: WordReport { result: WordResult::Success(s.modifier.unwrap().original),
+            table_reads: reads, virtual_address: s.va } }),
+        s.phase is WordDone ==> changed(s, value) == s && exchanged(s) == s && read(s, value) == s,
+{ }
+
 pub open spec fn operand(s: State) -> Option<Operand> {
-    match (s.phase, s.word) {
+    if s.modifier is Some { None } else { match (s.phase, s.word) {
         (Phase::Data { frame, .. }, Some(access)) =>
             Some(Operand { address: (frame as int + s.va % 4096) as u64, access }),
         _ => None,
-    }
+    } }
 }
 pub open spec fn route_io(s: State) -> (State, IoRoute) {
+    if s.modifier is Some { (s, IoRoute::NotReady) } else {
     match (s.phase, s.word) {
         (Phase::Data { frame, leaf, reads, .. }, Some(access)) => {
             if s.va % 8 != 0 { (s, IoRoute::Unaligned) }
@@ -321,6 +401,7 @@ pub open spec fn route_io(s: State) -> (State, IoRoute) {
             }
         },
         _ => (s, IoRoute::NotReady),
+    }
     }
 }
 pub open spec fn complete_io(s: State, sequence: u64, reply: IoReply) -> (State, bool) {

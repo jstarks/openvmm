@@ -683,6 +683,88 @@ async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
 }
 
 #[async_test]
+async fn mapping_families_reload_cr3_and_fetch_high_va_through_the_real_vp(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    let tables = bytes[0x1000..0x5000].to_vec();
+    bytes[0x5000..0x9000].copy_from_slice(&tables);
+    for (address, value) in [
+        (0x5000, 0x6007u64),
+        (0x6000, 0x7007),
+        (0x7000, 0x8007),
+        (0x5800, 0x6007),
+        (0x80b0, 0x17007),
+        (0x16000, 0x1122_3344_ffff_ffff),
+        (0x17000, 0x5566_7788_ffff_fff9),
+    ] {
+        bytes[address..address + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let prefix = [
+        0x83, 0x07, 0x01, 0x9c, 0x41, 0x58, 0x8b, 0x07, 0x0f, 0x22, 0xde, 0x8b, 0x07, 0x99, 0xb9,
+        0x03, 0, 0, 0, 0xf7, 0xf9, 0xff, 0xe3,
+    ];
+    let suffix = [0xd3, 0xfa, 0xf4];
+    bytes[CODE as usize..CODE as usize + prefix.len()].copy_from_slice(&prefix);
+    bytes[CODE as usize + prefix.len()..CODE as usize + prefix.len() + suffix.len()]
+        .copy_from_slice(&suffix);
+    let target = 0xffff_8000_0000_0000 | (CODE + prefix.len() as u64);
+    let mut cpu = owned.core.cpu;
+    cpu.flags = 2;
+    cpu.gpr[4] = 0x18000;
+    cpu.gpr[6] = 0x5000;
+    cpu.gpr[7] = 0x16000;
+    cpu.gpr[3] = target;
+    let config = super::shared_mmu_tests::config();
+    let initial = long_mode_registers(cpu, config, owned.tables, owned.core.mmu.cr2());
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    park(run.as_mut());
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
+    let mut expected = initial;
+    expected.rax = 0xffff_fffe;
+    expected.rdx = 0xffff_ffff;
+    expected.rcx = 3;
+    expected.r8 = 0x57;
+    expected.rip = target + suffix.len() as u64;
+    expected.rflags = 0x87;
+    expected.cr3 = 0x5000;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    let progress = vp.completed_batch_progress();
+    assert_eq!((progress.retired, progress.delivered), (12, 0));
+    assert!(devices.faults.lock().is_empty());
+    for (address, bits) in [
+        (0x1000, 0x20u64),
+        (0x2000, 0x20),
+        (0x3000, 0x20),
+        (0x4080, 0x20),
+        (0x40b0, 0x60),
+        (0x40b8, 0x60),
+        (0x5000, 0x20),
+        (0x5800, 0x20),
+        (0x6000, 0x20),
+        (0x7000, 0x20),
+        (0x8080, 0x20),
+        (0x80b0, 0x20),
+    ] {
+        let word = u64::from_le_bytes(bytes[address..address + 8].try_into().unwrap()) | bits;
+        bytes[address..address + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x16000..0x16008].copy_from_slice(&0x1122_3344_0000_0000u64.to_le_bytes());
+    bytes[0x17ff8..0x18000].copy_from_slice(&0x57u64.to_le_bytes());
+    let mut actual = vec![0; bytes.len()];
+    memory.read_at(0, &mut actual).unwrap();
+    assert_eq!(
+        actual, bytes,
+        "complete RAM image, including old and new A/D effects"
+    );
+}
+
+#[async_test]
 async fn backend_cancelled_device_future_is_explicitly_fatal_not_replayed(driver: DefaultDriver) {
     let (mut bytes, owned) = fixture();
     bytes[CODE as usize..CODE as usize + 3].copy_from_slice(&[0x48, 0x89, 0x07]);

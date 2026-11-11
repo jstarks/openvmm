@@ -4,6 +4,7 @@
 //! Resumable MMU effects over concurrently modified physical RAM.
 use super::word::{WordAccess, WordReport, WordResult};
 use super::{shared_model as spec, *};
+use memory_core::cpu_core::{integer, operand::Width};
 use memory_core::shared::{BeatError, Exchange, PhysicalRam};
 #[path = "shared_io.rs"]
 pub mod io;
@@ -18,6 +19,15 @@ pub struct Leaf { pub address: u64, pub word: u64 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WordData { pub address: u64, pub first: u64, pub tail: u64, pub value: u64 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Modifier {
+    pub operation: integer::Operation,
+    pub source: u64,
+    pub flags: u64,
+    pub width: Width,
+    pub original: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -64,6 +74,7 @@ pub struct SharedMmu {
     word: Option<WordAccess>,
     sequence: u64,
     size: u8,
+    modifier: Option<Modifier>,
 }
 
 impl View for SharedMmu {
@@ -71,11 +82,22 @@ impl View for SharedMmu {
     closed spec fn view(&self) -> spec::State {
         spec::State { inner: self.inner@, phase: self.phase,
             va: self.va, access: self.access, user: self.user, word: self.word,
-            sequence: self.sequence, size: self.size }
+            sequence: self.sequence, size: self.size, modifier: self.modifier }
     }
 }
 
 impl SharedMmu {
+    pub closed spec fn valid_modifier(&self) -> bool {
+        match self.modifier {
+            Some(m) => self.word == Some(WordAccess::Write(0))
+                && self.access == Access::Write(0)
+                && self.size == spec::modify_size(m.width)
+                && spec::modify_admitted(self.va, m.operation, m.width)
+                && !(self.phase is IoDirty) && !(self.phase is IoReady),
+            None => true,
+        }
+    }
+
     pub closed spec fn valid_size(&self) -> bool {
         (self.size == 1 || self.size == 2 || self.size == 4 || self.size == 8)
         && (self.size < 8 ==> self.va % 8 + self.size as int <= 8)
@@ -84,6 +106,7 @@ impl SharedMmu {
     pub closed spec fn invariant(&self) -> bool {
         self.inner.invariant()
         && self.valid_size()
+        && self.valid_modifier()
         && (spec::active(self.phase) ==> mmu_model::valid_config(self.inner.config))
         && (spec::active(self.phase) && self.word is Some ==>
             self.va as int + self.size as int - 1 <= u64::MAX
@@ -140,7 +163,8 @@ impl SharedMmu {
             s@.phase == Phase::Idle, s@.sequence == 0,
     {
         Self { inner: Mmu::new(config, cr2), phase: Phase::Idle,
-            va: 0, access: Access::Read, user: false, word: None,             sequence: 0, size: 8 }
+            va: 0, access: Access::Read, user: false, word: None,
+            sequence: 0, size: 8, modifier: None }
     }
 
     pub fn cr2(&self) -> (v: u64)
@@ -176,6 +200,7 @@ impl SharedMmu {
         self.va = va; self.access = access; self.user = user;
         self.word = word;
         self.size = size;
+        self.modifier = None;
         if word.is_some() {
             if va > u64::MAX - (size as u64 - 1) {
                 self.phase = Phase::WordDone { report: WordReport { result: WordResult::Wrap,
@@ -239,7 +264,8 @@ impl SharedMmu {
     }
 
     fn restart(&mut self)
-        requires old(self).inner.invariant(), old(self).valid_size(), mmu_model::valid_config(old(self).inner.config),
+        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
+            mmu_model::valid_config(old(self).inner.config),
             old(self).word is Some ==> old(self).va as int + old(self).size as int - 1 <= u64::MAX
                 && old(self).va % 4096 + old(self).size as int <= 4096,
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
@@ -250,7 +276,7 @@ impl SharedMmu {
     }
 
     fn fail(&mut self, result: MmuResult, reads: u8)
-        requires old(self).inner.invariant(), old(self).valid_size(), !(result is Success),
+        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self)@ == spec::fault(old(self)@, result, reads), final(self).invariant(),
     {

@@ -7,6 +7,34 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
+    /// One WRITE-checked RAM translation, operand capture, and non-locked store.
+    /// Small operands must fit one beat; qwords retain the single-page checks.
+    /// Completion returns the original operand, not the stored result. Flags
+    /// remain the caller's responsibility. Leaf replacement recaptures data;
+    /// data-beat contention preserves neighbors without recomputing the result.
+    /// Compare/test and crossing small operands are rejected without mutation.
+    pub fn begin_modify(&mut self, va: u64, operation: integer::Operation,
+        source: u64, flags: u64, width: Width) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted == (!spec::active(old(self)@.phase) && spec::modify_admitted(va, operation, width)),
+            final(self)@ == if accepted {
+                spec::modify_begin(old(self)@, va, operation, source, flags, width)
+            } else { old(self)@ },
+    {
+        let size = match width { Width::Byte => 1u8, Width::Word => 2,
+            Width::Dword => 4, Width::Qword => 8 };
+        if matches!(operation, integer::Operation::Cmp | integer::Operation::Test)
+            || (size < 8 && va % 8 + size as u64 > 8) {
+            return false;
+        }
+        let accepted = self.begin_access(va, Access::Write(0), false, Some(WordAccess::Write(0)), size);
+        if accepted {
+            self.modifier = Some(Modifier { operation, source, flags, width, original: 0 });
+        }
+        accepted
+    }
+
     /// Small RAM operands fit in one atomic physical beat; crossing forms are not admitted.
     pub(crate) fn begin_sized(&mut self, va: u64, request: WordAccess, size: u8) -> (accepted: bool)
         requires old(self).invariant(), size == 1 || size == 2 || size == 4,
@@ -54,12 +82,43 @@ impl SharedMmu {
     }
 
     pub(super) fn precheck_failure(&mut self, result: MmuResult)
-        requires old(self).inner.invariant(), old(self).valid_size(), !(result is Success),
+        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(),
             final(self)@ == (spec::State { phase: spec::terminal(old(self)@, result, 0), ..old(self)@ }),
     { self.set_failure(result, 0); }
 
+    fn loaded_value(&self, first: u64, tail: u64) -> (value: u64)
+        requires self.valid_size(),
+        ensures value == spec::observed(self@, first, tail),
+    {
+        let offset = self.va % 8;
+        if self.size < 8 {
+            (first >> ((offset * 8) as u32)) & self.size_mask()
+        } else if offset == 0 { first } else {
+            let shift = (offset * 8) as u32;
+            (first >> shift) | (tail << (64 - shift))
+        }
+    }
+
+    fn modify_value(&mut self, original: u64, value: u64) -> (replacement: u64)
+        requires old(self).valid_modifier(),
+        ensures final(self).valid_modifier(),
+            final(self)@ == (spec::State {
+                modifier: spec::captured_modifier(old(self)@.modifier, original), ..old(self)@ }),
+            replacement == spec::modified_value(old(self)@.modifier, original, value),
+    {
+        match self.modifier {
+            Some(m) => {
+                let result = integer::evaluate(m.operation, original, m.source, m.width, m.flags);
+                self.modifier = Some(Modifier { original, ..m });
+                result.value
+            },
+            None => value,
+        }
+    }
+
+    #[verifier::spinoff_prover]
     pub(super) fn word_loaded(&mut self, frame: u64, permissions: Permissions,
         leaf: Option<Leaf>, first: u64, tail: u64, reads: u8)
         requires old(self).invariant(), old(self).word is Some,
@@ -77,21 +136,16 @@ impl SharedMmu {
             _ => { assert(false); return; },
         };
         let address = frame + self.va % 4096;
+        let original = self.loaded_value(first, tail);
         match self.word {
             Some(WordAccess::Read) => {
-                let offset = self.va % 8;
-                let value = if self.size < 8 {
-                    (first >> ((offset * 8) as u32)) & self.size_mask()
-                } else if offset == 0 { first } else {
-                    let shift = (offset * 8) as u32;
-                    (first >> shift) | (tail << (64 - shift))
-                };
                 self.inner.cache = Some(Mapping { page: self.va / 4096,
                     root: self.inner.config.root, frame, permissions, large });
-                self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(value),
+                self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(original),
                     table_reads: reads, virtual_address: self.va } };
             },
             Some(WordAccess::Write(value)) => {
+                let value = self.modify_value(original, value);
                 match leaf {
                     Some(pte) => self.phase = Phase::WordDirty { pte,
                         data: WordData { address, first, tail, value }, reads },
@@ -130,12 +184,13 @@ impl SharedMmu {
     }
 
     pub(super) fn word_store_done(&mut self, value: u64, reads: u8)
-        requires old(self).inner.invariant(), old(self).valid_size(), old(self).word is Some,
+        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(), old(self).word is Some,
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(), final(self)@ == spec::word_store_done(old(self)@, value, reads),
     {
         self.inner.cache = None;
-        self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(value),
+        let original = match self.modifier { Some(m) => m.original, None => value };
+        self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(original),
             table_reads: reads, virtual_address: self.va } };
     }
 

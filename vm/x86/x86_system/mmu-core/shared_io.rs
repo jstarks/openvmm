@@ -20,6 +20,7 @@ impl SharedMmu {
         requires self.invariant(),
         ensures out == spec::operand(self@),
     {
+        if self.modifier.is_some() { return None; }
         match (self.phase, self.word) {
             (Phase::Data { frame, .. }, Some(access)) =>
                 Some(Operand { address: frame + self.va % 4096, access }),
@@ -31,6 +32,7 @@ impl SharedMmu {
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, out) == spec::route_io(old(self)@),
     {
+        if self.modifier.is_some() { return IoRoute::NotReady; }
         match (self.phase, self.word) {
             (Phase::Data { frame, leaf, reads, .. }, Some(access)) => {
                 if self.va % 8 != 0 { return IoRoute::Unaligned; }

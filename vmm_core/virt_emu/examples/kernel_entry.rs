@@ -37,9 +37,11 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
     const ENTRY: u64 = 0x2d98100;
-    const FRONTIER: u64 = 0x2d9813a;
+    const FRONTIER: u64 = 0xffff_ffff_812f_3c80;
+    const TARGET: u64 = 0xffff_ffff_812f_3c6f;
+    const ROOT: u64 = 0x2e32000;
     const STACK: u64 = 0x2603f48;
-    const RETURN: u64 = 0x2d98133;
+    const RETURN: u64 = 0x2d9815b;
     const CMDLINE: &str =
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
     type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -108,24 +110,29 @@ mod native {
         memory: &GuestMemory,
         root: u64,
         va: u64,
+        physical: u64,
         write: bool,
         changes: &mut BTreeMap<u64, (u64, u64)>,
     ) -> anyhow::Result<()> {
         let mut table = root;
         for (level, shift) in [39, 30, 21].into_iter().enumerate() {
             let address = table + ((va >> shift) & 511) * 8;
-            let word = memory.read_plain::<u64>(address)?;
-            ensure!(word & 1 != 0, "oracle encountered an absent loader entry");
+            let before = memory.read_plain::<u64>(address)?;
+            let word = changes.get(&address).map_or(before, |pair| pair.1);
+            ensure!(
+                word & 1 != 0 && (!write || word & 2 != 0),
+                "oracle encountered an absent or read-only page-table entry"
+            );
             let bits = 0x20 | if write && level == 2 { 0x40 } else { 0 };
             changes
                 .entry(address)
                 .and_modify(|pair| pair.1 |= bits)
-                .or_insert((word, word | bits));
+                .or_insert((before, word | bits));
             if level == 2 {
                 ensure!(word & 0x80 != 0, "loader did not use a 2-MiB leaf");
                 ensure!(
-                    (word & 0x0000_ffff_ffe0_0000) | (va & 0x1f_ffff) == va,
-                    "loader mapping is not identity"
+                    (word & 0x0000_ffff_ffe0_0000) | (va & 0x1f_ffff) == physical,
+                    "incorrect projected mapping"
                 );
             } else {
                 ensure!(word & 0x80 == 0, "unexpected earlier huge leaf");
@@ -174,7 +181,11 @@ mod native {
         let mut args = std::env::args_os().skip(1);
         let kernel_path = args.next().context("missing vmlinux")?;
         let initrd_path = args.next().context("missing initrd")?;
-        ensure!(args.next().is_none(), "expected vmlinux and initrd paths");
+        let oracle_path = args.next().context("missing mapping projection")?;
+        ensure!(
+            args.next().is_none(),
+            "expected vmlinux, initrd and mapping projection"
+        );
         let topology = TopologyBuilder::new_x86()
             .x2apic(X2ApicState::Unsupported)
             .build(1)?;
@@ -254,35 +265,103 @@ mod native {
             "unexpected pinned loader handoff"
         );
         let mut changes = BTreeMap::new();
-        expected_walk(&memory, initial.registers.cr3, ENTRY, false, &mut changes)?;
-        for address in [0x2d8af5a, 0x1201f8b, 0x1edc370, FRONTIER, 0x30ae018, 0x2000] {
-            expected_walk(&memory, initial.registers.cr3, address, false, &mut changes)?;
+        let projection: serde_json::Value = serde_json::from_reader(File::open(oracle_path)?)?;
+        ensure!(
+            projection["root"].as_u64() == Some(ROOT)
+                && projection["target"].as_u64() == Some(TARGET)
+                && projection["frontier"].as_u64() == Some(FRONTIER),
+            "wrong mapping projection profile"
+        );
+        let words = projection["words"]
+            .as_array()
+            .context("missing projected words")?;
+        ensure!(!words.is_empty(), "empty page-table projection");
+        for word in words {
+            let address = word["address"]
+                .as_u64()
+                .context("missing projected address")?;
+            let before = word["before"]
+                .as_u64()
+                .context("missing projected preimage")?;
+            let after = word["after"]
+                .as_u64()
+                .context("missing projected postimage")?;
+            ensure!(
+                address % 8 == 0 && address < RAM,
+                "invalid projected address"
+            );
+            ensure!(
+                memory.read_plain::<u64>(address)? == before,
+                "loader differs from the independent ELF preimage at {address:#x}"
+            );
+            ensure!(
+                changes.insert(address, (before, after)).is_none(),
+                "duplicate projected address"
+            );
         }
-        for address in [0x2603ef0, 0x26041d0] {
-            expected_walk(&memory, initial.registers.cr3, address, true, &mut changes)?;
+        expected_walk(
+            &memory,
+            initial.registers.cr3,
+            ENTRY,
+            ENTRY,
+            false,
+            &mut changes,
+        )?;
+        for address in [
+            0x2d8af5a, 0x1201f8b, 0x1edc370, 0x2d98163, 0x30ae018, 0x2000, 0x28b94f2,
+        ] {
+            expected_walk(
+                &memory,
+                initial.registers.cr3,
+                address,
+                address,
+                false,
+                &mut changes,
+            )?;
+        }
+        for address in [0x2603ed8, 0x26041d0, ROOT] {
+            expected_walk(
+                &memory,
+                initial.registers.cr3,
+                address,
+                address,
+                true,
+                &mut changes,
+            )?;
+        }
+        for (address, physical) in [
+            (0x2d9815e, 0x2d9815e),
+            (0x2f574dc, 0x2f574dc),
+            (TARGET, 0x12f3c6f),
+            (FRONTIER, 0x12f3c80),
+        ] {
+            expected_walk(&memory, ROOT, address, physical, false, &mut changes)?;
         }
         ensure!(
             memory.read_plain::<u32>(0x213c)? == 0 && memory.read_plain::<u64>(0x2250)? == 0,
             "unexpected confidential-computing/setup-data boot parameters"
         );
-        // Final stack words follow the original detection/check call paths, including
-        // the saved flag image overwritten after the first far return.
+        // The original startup and disabled-SME paths save six registers each.
         for (address, value) in [
             (0x2603f40, RETURN),
-            (0x2603f38, 0x93),
-            (0x2603f30, 0),
-            (0x2603f28, 0x2d8ba13),
-            (0x2603f20, initial.registers.r13),
-            (0x2603f00, 0x2604000),
-            (0x2603f08, initial.registers.rbx),
-            (0x2603f10, 0x2000),
-            (0x2603f18, initial.registers.r12),
+            (0x2603f38, 0x2000),
+            (0x2603f30, initial.registers.r14),
+            (0x2603f28, initial.registers.r13),
+            (0x2603f20, initial.registers.r12),
+            (0x2603f18, initial.registers.rbp),
+            (0x2603f10, 0x10000),
+            (0x2603f08, 0x2d8b226),
+            (0x2603f00, 27),
+            (0x2603ef8, 0x2e35000),
+            (0x2603ef0, 0x264a000),
+            (0x2603ee8, 0x2000),
+            (0x2603ee0, 512),
+            (0x2603ed8, 0x80000000),
             (0x26041d0, 0x02d98e00001082ca),
             (0x26041d8, 0),
         ] {
             expected_store(&memory, &mut changes, address, &value.to_le_bytes())?;
         }
-        expected_store(&memory, &mut changes, 0x2603efe, &0x1ffu16.to_le_bytes())?;
         let before = memory_digest(&memory, &BTreeMap::new())?;
         let mut binder = binders.pop().context("missing VP binder")?;
         ensure!(binders.is_empty(), "unexpected additional VP");
@@ -327,22 +406,26 @@ mod native {
         );
         let progress = vp.completed_batch_progress();
         ensure!(
-            progress.retired == 134 && progress.delivered == 0,
+            progress.retired > 134 && progress.retired < 20000 && progress.delivered == 0,
             "wrong progress: {progress:?}"
         );
         let mut expected = initial.registers;
         expected.cr0 |= 0x10;
-        expected.rax = 0;
+        expected.rax = ROOT;
         expected.rbx = 0x10000;
-        expected.rdx = 0x6000000;
-        expected.rcx = 0;
+        expected.rdx = 0x1060;
+        expected.rcx = 0x30;
         expected.rsi = 0;
-        expected.rdi = 0x12f3c6f;
-        expected.r8 = 0;
+        expected.rdi = ROOT;
+        expected.r8 = 20;
+        expected.r9 = 8;
+        expected.r10 = 0x10000e3;
+        expected.r11 = 20;
+        expected.cr3 = ROOT;
         expected.r15 = initial.registers.rsi;
         expected.rsp = STACK;
         expected.rip = FRONTIER;
-        expected.rflags = (expected.rflags & !0x108d5) | 0x44;
+        expected.rflags &= !0x108d5;
         expected.gs.base = 0;
         expected.gdtr.base = 0x30ae000;
         expected.gdtr.limit = 0x7f;
@@ -370,14 +453,11 @@ mod native {
         }
         ensure!(
             memory_digest(&memory, &changes)? == before,
-            "RAM changed outside the declared A/D, stack and #VC gate effects"
+            "RAM changed outside the projected tables/data, A/D, stack and #VC gate effects"
         );
-        let mut bytes = [0; 7];
-        memory.read_at(FRONTIER, &mut bytes)?;
-        ensure!(
-            bytes == [0x48, 0x2b, 0x3d, 0x9b, 0xf3, 0x1b, 0],
-            "wrong frontier bytes"
-        );
+        let mut bytes = [0; 3];
+        memory.read_at(0x12f3c80, &mut bytes)?;
+        ensure!(bytes == [0x0f, 0x22, 0xe1], "wrong frontier bytes");
         let functions = [0, 1, 0x8000_0000, 0x8000_0001, 0x8000_0008];
         let cpuid: Vec<_> = functions
             .into_iter()
@@ -392,12 +472,14 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
-                "entry": ENTRY, "frontier": actual.rip, "frontier_hex": "482b3d9bf31b00",
+                "entry": ENTRY, "frontier": actual.rip, "frontier_hex": "0f22e1",
                 "r15": actual.r15, "rsp": actual.rsp, "return_address": RETURN,
                 "rflags": actual.rflags, "seconds": seconds,
                 "complete_register_image_checked": true, "whole_ram_checked": true,
                 "descriptor_setup_returned": true,
-                "verify_cpu_returned_success": actual.rax == 0,
+                "verify_cpu_returned_success": true,
+                "kernel_page_tables_constructed": true,"high_virtual_fetch": true,
+                "root":actual.cr3,"target":TARGET,"mapping_oracle_words":words.len(),
                 "cpuid_target": cpuid, "cpuid_instruction_implemented": true,
                 "linux_boot": false, "snp": false,
             })

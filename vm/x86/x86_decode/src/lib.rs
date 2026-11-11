@@ -10,7 +10,7 @@ pub use x86_system::memory_core::cpu_core::operand::*;
 use iced_x86::Register as IcedRegister;
 use iced_x86::{Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind};
 use x86_system::memory_core::cpu_core::control::Condition;
-use x86_system::memory_core::cpu_core::integer;
+use x86_system::memory_core::cpu_core::{integer, scalar};
 use x86_system::shared::decode::{DecodeDecision, DecodeInput};
 use x86_system::shared::entry::Instruction as EntryInstruction;
 
@@ -318,6 +318,17 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
                 | (Operation::Lea, [Operand::Register(dst), source @ Operand::Address(_)]) => {
                     DecodeDecision::Scalar { dst, source }
                 }
+                (operation, [destination, source])
+                    if matches!(operation, Operation::Add | Operation::Adc | Operation::Xor) =>
+                {
+                    let operation = match operation {
+                        Operation::Add => integer::Operation::Add,
+                        Operation::Adc => integer::Operation::Adc,
+                        _ => integer::Operation::Xor,
+                    };
+                    alu_entry(operation, destination, source)
+                        .map_or(DecodeDecision::Unsupported, DecodeDecision::Entry)
+                }
                 _ => admit_entry(decoded.encoding)
                     .map_or(DecodeDecision::Unsupported, DecodeDecision::Entry),
             }
@@ -349,44 +360,127 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     }
     match instruction.mnemonic() {
         Mnemonic::Add
+        | Mnemonic::Adc
         | Mnemonic::Sub
+        | Mnemonic::Sbb
         | Mnemonic::And
         | Mnemonic::Or
         | Mnemonic::Test
         | Mnemonic::Shl
         | Mnemonic::Shr
+        | Mnemonic::Sar
         | Mnemonic::Cmp
         | Mnemonic::Xor => {
-            let Operand::Register(dst) = get(0)? else {
-                return None;
-            };
-            let source = get(1)?;
-            let shift = matches!(instruction.mnemonic(), Mnemonic::Shl | Mnemonic::Shr);
-            match source {
-                Operand::Register(src) if src.width() == dst.width() && !shift => {}
-                Operand::Immediate(imm)
-                    if imm.width == dst.width() || (shift && imm.width == Width::Byte) => {}
-                _ => return None,
-            }
             let operation = match instruction.mnemonic() {
                 Mnemonic::Add => integer::Operation::Add,
+                Mnemonic::Adc => integer::Operation::Adc,
                 Mnemonic::Sub => integer::Operation::Sub,
+                Mnemonic::Sbb => integer::Operation::Sbb,
                 Mnemonic::And => integer::Operation::And,
                 Mnemonic::Or => integer::Operation::Or,
                 Mnemonic::Test => integer::Operation::Test,
                 Mnemonic::Shl => integer::Operation::Shl,
+                Mnemonic::Shr => integer::Operation::Shr,
+                Mnemonic::Sar => integer::Operation::Sar,
                 Mnemonic::Cmp => integer::Operation::Cmp,
-                Mnemonic::Xor => integer::Operation::Xor,
-                _ => integer::Operation::Shr,
+                _ => integer::Operation::Xor,
             };
-            Some(EntryInstruction::Integer {
+            alu_entry(operation, get(0)?, get(1)?)
+        }
+        Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Neg | Mnemonic::Not => {
+            let destination = get(0)?;
+            let width = operand_width(destination)?;
+            let operation = match instruction.mnemonic() {
+                Mnemonic::Inc => integer::Operation::Inc,
+                Mnemonic::Dec => integer::Operation::Dec,
+                Mnemonic::Neg => integer::Operation::Neg,
+                _ => integer::Operation::Not,
+            };
+            alu_entry(
                 operation,
+                destination,
+                Operand::Immediate(Immediate {
+                    encoded_width: width,
+                    width,
+                    value: 0,
+                }),
+            )
+        }
+        Mnemonic::Movsx | Mnemonic::Movsxd => {
+            let Operand::Register(dst) = get(0)? else {
+                return None;
+            };
+            let source = get(1)?;
+            let width = operand_width(source)?;
+            (width.bits() < dst.width().bits()).then_some(EntryInstruction::SignExtend {
                 dst,
                 source,
+                width,
+            })
+        }
+        Mnemonic::Cwd | Mnemonic::Cdq | Mnemonic::Cqo => Some(EntryInstruction::SignHigh {
+            width: match instruction.mnemonic() {
+                Mnemonic::Cwd => Width::Word,
+                Mnemonic::Cdq => Width::Dword,
+                _ => Width::Qword,
+            },
+        }),
+        Mnemonic::Div | Mnemonic::Idiv => {
+            let source = get(0)?;
+            let width = operand_width(source)?;
+            matches!(width, Width::Dword | Width::Qword).then_some(EntryInstruction::Divide {
+                source,
+                width,
+                signed: instruction.mnemonic() == Mnemonic::Idiv,
+            })
+        }
+        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
+            let Operand::Register(dst) = get(0)? else {
+                return None;
+            };
+            let mut index = get(1)?;
+            match index {
+                Operand::Register(src) if src.width() == dst.width() => {}
+                Operand::Immediate(mut immediate) if immediate.width == Width::Byte => {
+                    immediate.value &= dst.width().bits() as u64 - 1;
+                    index = Operand::Immediate(immediate);
+                }
+                _ => return None,
+            }
+            let operation = match instruction.mnemonic() {
+                Mnemonic::Bt => scalar::BitOperation::Test,
+                Mnemonic::Bts => scalar::BitOperation::Set,
+                Mnemonic::Btr => scalar::BitOperation::Reset,
+                _ => scalar::BitOperation::Complement,
+            };
+            Some(EntryInstruction::Bit {
+                operation,
+                dst,
+                index,
             })
         }
         Mnemonic::Mov | Mnemonic::Movzx => {
             if instruction.mnemonic() == Mnemonic::Mov {
+                let control = match instruction.op1_register() {
+                    IcedRegister::CR0 => Some(0),
+                    IcedRegister::CR3 => Some(3),
+                    IcedRegister::CR4 => Some(4),
+                    _ => None,
+                };
+                if let Some(number) = control {
+                    let dst = register(instruction.op0_register())?;
+                    return (dst.width() == Width::Qword)
+                        .then_some(EntryInstruction::ReadControl { number, dst });
+                }
+                if instruction.op0_register() == IcedRegister::CR3 {
+                    let source = register(instruction.op1_register())?;
+                    return (source.width() == Width::Qword).then_some(
+                        EntryInstruction::WriteControl {
+                            number: 3,
+                            source: Operand::Register(source),
+                        },
+                    );
+                }
                 if let Some(dst @ (Segment::Ds | Segment::Ss | Segment::Es)) =
                     segment(instruction.op0_register())
                 {
@@ -453,6 +547,11 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         }
         Mnemonic::Ret if encoding.bytes() == [0xc3] => Some(EntryInstruction::Return),
         Mnemonic::Leave if encoding.bytes() == [0xc9] => Some(EntryInstruction::Leave),
+        Mnemonic::Jmp if matches!(instruction.op0_kind(), OpKind::Register | OpKind::Memory) => {
+            let source = get(0)?;
+            (operand_width(source)? == Width::Qword)
+                .then_some(EntryInstruction::IndirectJump { source })
+        }
         Mnemonic::Jmp | Mnemonic::Je | Mnemonic::Jne
             if instruction.op0_kind() == OpKind::NearBranch64 =>
         {
@@ -504,6 +603,62 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         }
         _ => None,
     }
+}
+
+fn operand_width(operand: Operand) -> Option<Width> {
+    match operand {
+        Operand::Register(register) => Some(register.width()),
+        Operand::Memory { width, .. } => Some(width),
+        Operand::Immediate(immediate) => Some(immediate.width),
+        _ => None,
+    }
+}
+
+fn alu_entry(
+    operation: integer::Operation,
+    destination: Operand,
+    source: Operand,
+) -> Option<EntryInstruction> {
+    if !matches!(destination, Operand::Register(_) | Operand::Memory { .. }) {
+        return None;
+    }
+    let width = operand_width(destination)?;
+    if matches!(
+        operation,
+        integer::Operation::Shl | integer::Operation::Shr | integer::Operation::Sar
+    ) {
+        // Memory shifts need a separate zero-count/fault-ordering contract.
+        if !matches!(destination, Operand::Register(_)) {
+            return None;
+        }
+        match source {
+            Operand::Immediate(immediate) if immediate.width == Width::Byte => {}
+            Operand::Register(register)
+                if register.gpr().index() == 1
+                    && register.width() == Width::Byte
+                    && !register.high_byte() => {}
+            _ => return None,
+        }
+    } else if operand_width(source)? != width
+        || matches!(
+            (destination, source),
+            (Operand::Memory { .. }, Operand::Memory { .. })
+        )
+    {
+        return None;
+    }
+    Some(match destination {
+        Operand::Register(dst) => EntryInstruction::Integer {
+            operation,
+            dst,
+            source,
+        },
+        _ => EntryInstruction::Alu {
+            operation,
+            destination,
+            source,
+        },
+    })
 }
 
 fn normalize(instruction: &Instruction, encoding: Encoding) -> Option<Decoded> {

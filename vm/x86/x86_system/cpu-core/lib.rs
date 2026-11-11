@@ -15,6 +15,7 @@ pub mod model;
 pub mod near_call;
 pub mod operand;
 pub mod profile;
+pub mod scalar;
 pub mod system;
 pub mod xor32;
 

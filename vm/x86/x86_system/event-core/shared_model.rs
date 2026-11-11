@@ -19,6 +19,8 @@ use super::{
     WordResult, event_model as e, mmu_model, model,
 };
 use vstd::prelude::*;
+#[path = "shared_alu_model.rs"]
+pub mod alu;
 #[path = "shared_decode_model.rs"]
 pub mod decode;
 #[path = "shared_entry_model.rs"]

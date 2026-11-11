@@ -2,11 +2,15 @@
 // Licensed under the MIT License.
 
 #[cfg(verus_keep_ghost)]
+use super::super::Config;
+#[cfg(verus_keep_ghost)]
 use super::super::memory_core::cpu_core::operand::{
     Address, Operand, Segment, SegmentBases, Width,
 };
 #[cfg(verus_keep_ghost)]
-use super::super::memory_core::cpu_core::{control, descriptor, integer, operand, profile};
+use super::super::memory_core::cpu_core::{
+    control, descriptor, operand, profile, scalar as operations,
+};
 #[cfg(verus_keep_ghost)]
 use super::super::shared::entry::{Instruction, MemoryTask};
 use super::*;
@@ -44,15 +48,20 @@ pub open spec fn retire(s: State, cpu: model::State, length: u8, shadow: bool, s
 pub open spec fn memory(s: State, address: u64, width: Width, request: WordAccess,
     length: u8, task: MemoryTask) -> (State, Tick) {
     let size = (operand::model::bits(width) / 8) as u8;
-    if address as int + size as int - 1 > u64::MAX || address % 4096 + size as int > 4096
-        || !mmu_model::canonical(address as int) || !mmu_model::canonical(address as int + size as int - 1)
-        || (size < 8 && address % 8 + size as int > 8) { unsupported(s) }
+    if !supported_access(address,width) { unsupported(s) }
     else {
         let core = if size == 8 { c::boundary_begin(s.core, address, Some(request)).0 }
             else { c::boundary_sized(s.core, address, request, size).0 };
         (State { core, phase: Phase::EntryMemory { address, length, task }, ..s }, Tick::Pending)
     }
 }
+pub open spec fn supported_access(address:u64,width:Width)->bool {
+    let size=operand::model::bits(width)/8;
+    address as int+size-1<=u64::MAX && address%4096+size<=4096
+        && mmu_model::canonical(address as int) && mmu_model::canonical(address as int+size-1)
+        && (size==8 || address%8+size<=8)
+}
+#[verifier::opaque]
 pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (State, Tick) {
     let cpu = s.core.cpu;
     if length == 0 || length > 15 { unsupported(s) }
@@ -101,16 +110,75 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                 operand::model::read(registers(cpu), src)).map(|i: int, v: u64| v as int),
                 ..cpu }, length, false, false) }
         },
-        Instruction::Integer { operation, dst, source } => {
-            if !dst.valid() || scalar(cpu, source) is None { unsupported(s) }
+        Instruction::Integer {operation,dst,source}=>alu::execute(s,operation,Operand::Register(dst),source,length),
+        Instruction::Alu {operation,destination,source}=>alu::execute(s,operation,destination,source,length),
+        Instruction::SignExtend {dst,source,width}=>{
+            if !dst.valid() || operand::model::bits(dst@.width)<=operand::model::bits(width) {unsupported(s)}
+            else {match source {
+                Operand::Memory {address,width:actual}=>{
+                    if !address.valid() || actual!=width {unsupported(s)}
+                    else {memory(s,linear(s,address,length),width,WordAccess::Read,length,
+                        MemoryTask::SignedLoad {dst,width})}
+                },
+                _=>match scalar(cpu,source) {
+                    None=>unsupported(s),Some(value)=>alu::signed(s,dst,width,value,length),
+                },
+            }}
+        },
+        Instruction::SignHigh {width}=>{
+            if !(width is Word || width is Dword || width is Qword) {unsupported(s)}
             else {
-                let result = integer::model::evaluate(operation, operand::model::read(registers(cpu), dst),
-                    scalar(cpu, source).unwrap(), dst@.width, cpu.flags);
-                let gpr = if result.write { operand::model::write(registers(cpu), dst, result.value) }
-                    else { registers(cpu) };
-                retire(s, model::State { gpr: gpr.map(|i: int, value: u64| value as int),
-                    flags: result.flags, ..cpu }, length, false, false)
+                let value=operations::model::sign_high(cpu.gpr[0] as u64,width);
+                let high=if width==Width::Word {((cpu.gpr[2] as u64)&!0xffffu64)|value} else {value};
+                retire(s,model::State {gpr:cpu.gpr.update(2,high as int),..cpu},length,false,false)
             }
+        },
+        Instruction::Divide {source,width,signed}=>{
+            if !(width is Dword || width is Qword) {unsupported(s)}
+            else {match source {
+                Operand::Memory {address,width:actual}=>{
+                    if !address.valid() || actual!=width {unsupported(s)}
+                    else {memory(s,linear(s,address,length),width,WordAccess::Read,length,
+                        MemoryTask::Division {width,signed})}
+                },
+                _=>match scalar(cpu,source) {
+                    None=>unsupported(s),Some(divisor)=>alu::division(s,divisor,width,signed,length),
+                },
+            }}
+        },
+        Instruction::Bit {operation,dst,index}=>{
+            if !dst.valid() || !(dst@.width is Word || dst@.width is Dword || dst@.width is Qword)
+                || scalar(cpu,index) is None {unsupported(s)}
+            else {
+                let result=operations::model::bit(operation,operand::model::read(registers(cpu),dst),
+                    scalar(cpu,index).unwrap(),dst@.width,cpu.flags);
+                let gpr=if result.write {operand::model::write(registers(cpu),dst,result.value)} else {registers(cpu)};
+                retire(s,model::State {gpr:gpr.map(|i:int,v:u64|v as int),flags:result.flags,..cpu},length,false,false)
+            }
+        },
+        Instruction::ReadControl {number,dst}=>{
+            if !dst.valid() || dst@.width!=Width::Qword || (number!=0 && number!=3 && number!=4) {unsupported(s)}
+            else {
+                let value=if number==0 {0x8000_0011u64 | if s.core.mmu.inner.config.wp {0x10000u64}else{0u64}}
+                    else if number==3 {s.core.mmu.inner.config.root} else {0x20u64};
+                retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,value)
+                    .map(|i:int,v:u64|v as int),..cpu},length,false,false)
+            }
+        },
+        Instruction::WriteControl {number,source}=>match scalar(cpu,source) {
+            None=>unsupported(s),
+            Some(root)=>{
+                if number!=3 || root>=0x1_0000_0000_0000 || root%4096!=0 {unsupported(s)}
+                else {retire(State {core:c::boundary_reload(s.core,Config {root,..s.core.mmu.inner.config}).0,..s},
+                    cpu,length,false,true)}
+            },
+        },
+        Instruction::IndirectJump {source}=>match source {
+            Operand::Memory {address,width}=>{
+                if !address.valid() || width!=Width::Qword {unsupported(s)}
+                else {memory(s,linear(s,address,length),width,WordAccess::Read,length,MemoryTask::JumpTarget)}
+            },
+            _=>match scalar(cpu,source) {None=>unsupported(s),Some(target)=>alu::jump(s,target)},
         },
         Instruction::Load { dst, address, width } => {
             if !dst.valid() || !address.valid() || operand::model::bits(dst@.width) < operand::model::bits(width) {
@@ -165,6 +233,14 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::AluRegister {operation,dst}=>{
+            if !dst.valid() {unsupported(s)}
+            else {alu::finish(s,operation,Some(dst),operand::model::read(registers(cpu),dst),value,dst@.width,length)}
+        },
+        MemoryTask::AluMemory {operation,source,width}=>alu::finish(s,operation,None,value,source,width,length),
+        MemoryTask::SignedLoad {dst,width}=>alu::signed(s,dst,width,value,length),
+        MemoryTask::Division {width,signed}=>alu::division(s,value,width,signed,length),
+        MemoryTask::JumpTarget=>alu::jump(s,value),
         MemoryTask::Pop {stack,dst} => {
             if !dst.valid() || dst@.width != Width::Qword || stack as int + 8 > u64::MAX { unsupported(s) }
             else {

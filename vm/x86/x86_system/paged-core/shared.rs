@@ -133,13 +133,13 @@ impl SharedMachine {
         self.decoded(rex, opcode, modrm)
     }
 
-    pub(crate) fn boundary_sized(&mut self, address: u64, word: WordAccess, size: u8) -> (accepted: bool)
-        requires old(self).invariant(), size == 1 || size == 2 || size == 4,
+    pub(crate) fn boundary_span(&mut self, address: u64, word: WordAccess, size: u8) -> (accepted: bool)
+        requires old(self).invariant(), size == 1 || size == 2 || size == 4 || size == 8,
         ensures final(self).invariant(), (final(self)@, accepted) ==
-            spec::boundary_sized(old(self)@, address, word, size),
+            spec::boundary_span(old(self)@, address, word, size),
     {
         if !matches!(self.phase, CpuPhase::Boundary) { return false; }
-        self.mmu.begin_sized(address, word, size)
+        self.mmu.begin_span(address, word, size)
     }
 
     pub(crate) fn boundary_modify(&mut self, address: u64,
@@ -150,7 +150,7 @@ impl SharedMachine {
             spec::boundary_modify(old(self)@, address, operation, source, flags, width),
     {
         if !matches!(self.phase, CpuPhase::Boundary) { return false; }
-        self.mmu.begin_modify(address, operation, source, flags, width)
+        self.mmu.begin_modify_span(address, operation, source, flags, width)
     }
 
     pub(crate) fn boundary_compare_exchange(&mut self,address:u64,expected:u64,replacement:u64,

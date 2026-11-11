@@ -7,7 +7,9 @@ use super::shared::Phase;
 #[cfg(verus_keep_ghost)]
 use super::shared::io::{IoReply, IoRequest, IoRoute, Operand};
 #[cfg(verus_keep_ghost)]
-use super::shared::{AtomicOperation, Comparison, Leaf, Modifier, Reply, Request, WordData};
+use super::shared::{
+    AtomicOperation, Comparison, Leaf, Modifier, PageData, PageHead, Reply, Request, WordData,
+};
 use super::word::WordAccess;
 #[cfg(verus_keep_ghost)]
 use super::word::{WordReport, WordResult};
@@ -31,6 +33,7 @@ pub struct State {
     pub size: u8,
     pub modifier: Option<super::shared::Modifier>,
     pub comparison: Option<super::shared::Comparison>,
+    pub head: Option<super::shared::PageHead>,
 }
 
 pub open spec fn active(p: Phase) -> bool {
@@ -41,6 +44,7 @@ pub open spec fn can_commit(p: Phase) -> bool {
     p is Mark || p is Dirty || p is Store || p is WordDirty
         || p is WordStore || p is WordHead || p is WordLast || p is SizedStore
         || p is AtomicStore || p is IoDirty
+        || p is PageDirtyHead || p is PageDirtyTail || p is PageStoreHead || p is PageStoreTail
 }
 pub open spec fn can_change(p: Phase) -> bool { can_commit(p) && !(p is WordStore) }
 pub open spec fn respond(s: State, reply: Reply) -> (State, bool) {
@@ -60,6 +64,17 @@ pub open spec fn valid_span(d: WordData, size: u8) -> bool {
     if size == 8 { valid_data(d) }
     else { d.address < 0x1_0000_0000_0000u64 && d.address % 4096 + size as int <= 4096 }
 }
+pub open spec fn valid_page_head(h: PageHead) -> bool {
+    h.address < 0x1_0000_0000_0000u64 && h.address % 8 != 0
+        && match h.leaf { Some(l) => valid_leaf(l), None => true }
+}
+pub open spec fn valid_page_data(d: PageData) -> bool {
+    d.word.address < 0x1_0000_0000_0000u64 && d.word.address % 8 != 0
+        && d.tail_address < 0x1_0000_0000_0000u64 && d.tail_address % 4096 == 0
+}
+pub open spec fn walk_va(s: State) -> u64 {
+    if s.head is Some { ((s.va as int + 4096 - s.va % 4096) % 0x1_0000_0000_0000_0000int) as u64 } else { s.va }
+}
 pub open spec fn terminal(s: State, result: MmuResult, reads: u8) -> Phase {
     if s.word is Some {
         Phase::WordDone { report: WordReport { result: word_model::lift(result),
@@ -67,7 +82,7 @@ pub open spec fn terminal(s: State, result: MmuResult, reads: u8) -> Phase {
     } else { Phase::Done(Report { result, table_reads: reads, virtual_address: s.va }) }
 }
 pub open spec fn restart(s: State) -> State {
-    State { phase: Phase::Walk { table: s.inner.config.root, level: 0,
+    State { head: None, phase: Phase::Walk { table: s.inner.config.root, level: 0,
         permissions: Permissions { rw: true, user: true, nx: false } }, ..s }
 }
 
@@ -75,16 +90,21 @@ pub open spec fn begin(s: State, va: u64, access: Access, user: bool, word: Opti
     span_begin(s, va, access, user, word, 8)
 }
 pub open spec fn span_begin(s: State, va: u64, access: Access, user: bool, word: Option<WordAccess>, size: u8) -> State {
-    let t = State { va, access, user, word, size, modifier: None, comparison: None, ..s };
+    access_begin(s, va, access, user, word, size, false)
+}
+pub open spec fn access_begin(s: State, va: u64, access: Access, user: bool,
+    word: Option<WordAccess>, size: u8, allow_cross: bool) -> State {
+    let t = State { va, access, user, word, size, modifier: None, comparison: None, head: None, ..s };
     if word is Some && va as int + size as int - 1 > u64::MAX {
         State { phase: Phase::WordDone { report: WordReport { result: WordResult::Wrap,
             table_reads: 0, virtual_address: va } }, ..t }
-    } else if word is Some && va % 4096 + size as int > 4096 {
+    } else if !allow_cross && word is Some && va % 4096 + size as int > 4096 {
         State { phase: Phase::WordDone { report: WordReport { result: WordResult::CrossPage,
             table_reads: 0, virtual_address: va } }, ..t }
     } else if !m::valid_config(s.inner.config) {
         State { phase: terminal(t, MmuResult::InvalidConfig, 0), ..t }
-    } else if !m::canonical(va as int) {
+    } else if !m::canonical(va as int) || (allow_cross && word is Some
+        && !m::canonical((va as int + size as int - 1) as u64 as int)) {
         State { phase: terminal(t, MmuResult::GeneralProtection, 0), ..t }
     } else {
         match s.inner.cache {
@@ -109,9 +129,13 @@ pub open spec fn modify_admitted(va: u64, operation: integer::Operation, width: 
 }
 pub open spec fn modify_begin(s: State, va: u64, operation: integer::Operation,
     source: u64, flags: u64, width: Width) -> State {
+    modify_start(s, va, operation, source, flags, width, false)
+}
+pub open spec fn modify_start(s: State, va: u64, operation: integer::Operation,
+    source: u64, flags: u64, width: Width, allow_cross: bool) -> State {
     if !modify_admitted(va, operation, width) { s } else {
-        let t = span_begin(s, va, Access::Write(0), false,
-            Some(WordAccess::Write(0)), modify_size(width));
+        let t = access_begin(s, va, Access::Write(0), false,
+            Some(WordAccess::Write(0)), modify_size(width), allow_cross);
         State { modifier: Some(Modifier { operation, source, flags, width, original: 0 }), ..t }
     }
 }
@@ -201,19 +225,29 @@ pub open spec fn sized_request(data: WordData, size: u8) -> Request {
 
 pub open spec fn fault(s: State, result: MmuResult, reads: u8) -> State {
     State { inner: m::State { cache: None,
-        cr2: if result is PageFault { s.va as int } else { s.inner.cr2 }, ..s.inner },
-        phase: terminal(s, result, reads), ..s }
+        cr2: if result is PageFault { walk_va(s) as int } else { s.inner.cr2 }, ..s.inner },
+        head: None, phase: terminal(s, result, reads), ..s }
 }
 
+pub open spec fn dirty_request(pte: Leaf) -> Request {
+    Request::Compare { address: pte.address, expected: pte.word,
+        replacement: m::dirty(pte.word as int) as u64 }
+}
+pub open spec fn page_tail_request(data: PageData, size: u8) -> Request {
+    let shift = (64 - data.word.address % 8 * 8) as u32;
+    let mask = size_mask(size) >> shift;
+    Request::DataCompare { address: data.tail_address, expected: data.word.tail,
+        replacement: (data.word.tail & !mask) | ((data.word.value >> shift) & mask) }
+}
 pub open spec fn request(s: State) -> Request {
     match s.phase {
         Phase::Idle => Request::Idle,
         Phase::Done(r) => Request::Complete(r),
         Phase::Walk { table, level, .. } =>
-            Request::Read((table as int + m::index(s.va as int, level as nat) * 8) as u64),
+            Request::Read((table as int + m::index(walk_va(s) as int, level as nat) * 8) as u64),
         Phase::Mark { address, word, .. } =>
             Request::Compare { address, expected: word, replacement: m::accessed(word as int) as u64 },
-        Phase::Data { frame, .. } => Request::Read(((frame as int + s.va % 4096) / 8 * 8) as u64),
+        Phase::Data { frame, .. } => Request::Read(((frame as int + walk_va(s) % 4096) / 8 * 8) as u64),
         Phase::Dirty { pte, .. } =>
             Request::Compare { address: pte.address, expected: pte.word,
                 replacement: m::dirty(pte.word as int) as u64 },
@@ -229,6 +263,10 @@ pub open spec fn request(s: State) -> Request {
         Phase::WordLast { data, .. } => last_request(data, s.size),
         Phase::SizedStore { data, .. } => sized_request(data, s.size),
         Phase::AtomicStore { data, .. } => atomic_request(data, s.size, s.comparison.unwrap()),
+        Phase::PageDirtyHead { .. } => dirty_request(s.head.unwrap().leaf.unwrap()),
+        Phase::PageDirtyTail { pte, .. } => dirty_request(pte),
+        Phase::PageStoreHead { span: data, .. } => head_request(data.word, s.size),
+        Phase::PageStoreTail { span: data, .. } => page_tail_request(data, s.size),
         Phase::IoReady { address, access, .. } =>
             Request::Io(IoRequest { sequence: s.sequence, address, access }),
     }
@@ -253,8 +291,8 @@ pub open spec fn read(s: State, word: u64) -> State {
                 fault(s, MmuResult::HugePage, (level + 1) as u8)
             } else {
                 State { phase: Phase::Mark {
-                    address: (table as int + m::index(s.va as int, level as nat) * 8) as u64,
-                    word, level, frame: if e.huge { m::leaf_frame(e.base, s.va as int, level as nat) as u64 } else { e.base as u64 },
+                    address: (table as int + m::index(walk_va(s) as int, level as nat) * 8) as u64,
+                    word, level, frame: if e.huge { m::leaf_frame(e.base, walk_va(s) as int, level as nat) as u64 } else { e.base as u64 },
                     permissions: next }, ..s }
             }
         },
@@ -312,6 +350,14 @@ pub open spec fn exchanged(s: State) -> State {
             word_store_done(s, data.value, reads),
         Phase::AtomicStore { data, reads } =>
             word_store_done(s, atomic_observed(data, s.size), reads),
+        Phase::PageDirtyHead { tail, span: data, reads } => State { phase:
+            if s.head.unwrap().leaf.unwrap() == tail { Phase::PageStoreHead { span: data, reads } }
+            else { Phase::PageDirtyTail { pte: tail, span: data, reads } }, ..s },
+        Phase::PageDirtyTail { span: data, reads, .. } =>
+            State { phase: Phase::PageStoreHead { span: data, reads }, ..s },
+        Phase::PageStoreHead { span: data, reads } =>
+            State { phase: Phase::PageStoreTail { span: data, reads }, ..s },
+        Phase::PageStoreTail { span: data, reads } => word_store_done(s, data.word.value, reads),
         _ => s,
     }
 }
@@ -320,6 +366,7 @@ pub open spec fn changed(s: State, current: u64) -> State {
     match s.phase {
         Phase::Mark { .. } | Phase::Dirty { .. } => restart(s),
         Phase::WordDirty { .. } | Phase::IoDirty { .. } => restart(s),
+        Phase::PageDirtyHead { .. } | Phase::PageDirtyTail { .. } => restart(s),
         Phase::Store { address, reads, .. } =>
             State { phase: Phase::Store { address, word: current, reads }, ..s },
         Phase::WordHead { data, reads } =>
@@ -330,6 +377,10 @@ pub open spec fn changed(s: State, current: u64) -> State {
             State { phase: Phase::SizedStore { data: WordData { first: current, ..data }, reads }, ..s },
         Phase::AtomicStore { data, reads } =>
             State { phase: Phase::AtomicStore { data: WordData { first: current, ..data }, reads }, ..s },
+        Phase::PageStoreHead { span: data, reads } => State { phase: Phase::PageStoreHead {
+            span: PageData { word: WordData { first: current, ..data.word }, ..data }, reads }, ..s },
+        Phase::PageStoreTail { span: data, reads } => State { phase: Phase::PageStoreTail {
+            span: PageData { word: WordData { tail: current, ..data.word }, ..data }, reads }, ..s },
         _ => s,
     }
 }
@@ -391,10 +442,38 @@ pub open spec fn word_loaded(s: State, frame: u64, permissions: Permissions,
     }
 }
 pub open spec fn word_data(s: State, word: u64) -> State {
+    if s.va % 4096 + s.size as int > 4096 { page_data(s, word) } else {
     match s.phase {
         Phase::Data { frame, permissions, leaf, reads, large } => {
             if s.va % 8 + s.size as int <= 8 { word_loaded(s, frame, permissions, leaf, word, 0, reads) }
             else { State { phase: Phase::WordTail { frame, permissions, leaf, first: word, reads, large }, ..s } }
+        },
+        _ => s,
+    } }
+}
+pub open spec fn page_data(s: State, word: u64) -> State {
+    match s.phase {
+        Phase::Data { frame, leaf, reads, .. } => match s.head {
+            None => State { head: Some(PageHead {
+                address: (frame as int + s.va % 4096) as u64, first: word, leaf }),
+                inner: m::State { cache: None, ..s.inner },
+                phase: Phase::Walk { table: s.inner.config.root, level: 0,
+                    permissions: Permissions { rw: true, user: true, nx: false } }, ..s },
+            Some(head) => {
+                let original = observed(s, head.first, word);
+                match s.word {
+                    Some(WordAccess::Read) => word_store_done(s, original, reads),
+                    Some(WordAccess::Write(value)) => match leaf {
+                        Some(tail) => State { modifier: captured_modifier(s.modifier, original),
+                            phase: Phase::PageDirtyHead { tail, reads, span: PageData {
+                                tail_address: frame, word: WordData { address: head.address,
+                                    first: head.first, tail: word,
+                                    value: modified_value(s.modifier, original, value) } } }, ..s },
+                        None => s,
+                    },
+                    None => s,
+                }
+            },
         },
         _ => s,
     }
@@ -407,7 +486,7 @@ pub open spec fn word_tail(s: State, word: u64) -> State {
     }
 }
 pub open spec fn word_store_done(s: State, value: u64, reads: u8) -> State {
-    State { inner: m::State { cache: None, ..s.inner },
+    State { head: None, inner: m::State { cache: None, ..s.inner },
         phase: Phase::WordDone { report: WordReport { result: WordResult::Success(
             match s.modifier { Some(m) => m.original, None => value }),
             table_reads: reads, virtual_address: s.va } }, ..s }
@@ -491,12 +570,12 @@ pub proof fn compare_completion(s: State, data: WordData, reads: u8)
 pub open spec fn operand(s: State) -> Option<Operand> {
     if s.modifier is Some { None } else { match (s.phase, s.word) {
         (Phase::Data { frame, .. }, Some(access)) =>
-            Some(Operand { address: (frame as int + s.va % 4096) as u64, access }),
+            Some(Operand { address: (frame as int + walk_va(s) % 4096) as u64, access }),
         _ => None,
     } }
 }
 pub open spec fn route_io(s: State) -> (State, IoRoute) {
-    if s.modifier is Some || s.comparison is Some { (s, IoRoute::NotReady) } else {
+    if s.modifier is Some || s.comparison is Some || s.head is Some { (s, IoRoute::NotReady) } else {
     match (s.phase, s.word) {
         (Phase::Data { frame, leaf, reads, .. }, Some(access)) => {
             if s.va % 8 != 0 { (s, IoRoute::Unaligned) }

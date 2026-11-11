@@ -105,7 +105,12 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
                 _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
             }
         },
-        DecodeDecision::Wrmsr => if (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64==0xc000_0080u64 {
+        DecodeDecision::Wrmsr => if (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64
+            && !super::super::memory_core::cpu_core::profile::PRED_CMD_AVAILABLE {
+            if s.core.cpu.flags&0x100u64!=0 {
+                stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
+            } else {entry(s,Event::GeneralProtection)}
+        } else if (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64==0xc000_0080u64 {
             privilege::write_efer(s,input.length)
         } else {match s.system {
             None => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),

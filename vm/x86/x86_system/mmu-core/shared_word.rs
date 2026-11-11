@@ -104,27 +104,50 @@ impl SharedMmu {
             final(self)@ == if accepted {
                 spec::modify_begin(old(self)@, va, operation, source, flags, width)
             } else { old(self)@ },
+    { self.begin_modify_mode(va, operation, source, flags, width, false) }
+
+    pub(crate) fn begin_modify_span(&mut self, va: u64, operation: integer::Operation,
+        source: u64, flags: u64, width: Width) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted == (!spec::active(old(self)@.phase) && spec::modify_admitted(va, operation, width)),
+            final(self)@ == if accepted {
+                spec::modify_start(old(self)@, va, operation, source, flags, width, true)
+            } else { old(self)@ },
+    { self.begin_modify_mode(va, operation, source, flags, width, true) }
+
+    fn begin_modify_mode(&mut self, va: u64, operation: integer::Operation,
+        source: u64, flags: u64, width: Width, allow_cross: bool) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted == (!spec::active(old(self)@.phase) && spec::modify_admitted(va, operation, width)),
+            final(self)@ == if accepted {
+                spec::modify_start(old(self)@, va, operation, source, flags, width, allow_cross)
+            } else { old(self)@ },
     {
         let size = match width { Width::Byte => 1u8, Width::Word => 2,
             Width::Dword => 4, Width::Qword => 8 };
         if matches!(operation, integer::Operation::Cmp | integer::Operation::Test | integer::Operation::BitTest) {
             return false;
         }
-        let accepted = self.begin_access(va, Access::Write(0), false, Some(WordAccess::Write(0)), size);
+        let accepted = self.begin_access_mode(va, Access::Write(0), false,
+            Some(WordAccess::Write(0)), size, allow_cross);
         if accepted {
             self.modifier = Some(Modifier { operation, source, flags, width, original: 0 });
         }
         accepted
     }
 
-    /// Narrow RAM operands reuse the two-beat qword continuation.
-    pub(crate) fn begin_sized(&mut self, va: u64, request: WordAccess, size: u8) -> (accepted: bool)
-        requires old(self).invariant(), size == 1 || size == 2 || size == 4,
+    pub(crate) fn begin_span(&mut self, va: u64, request: WordAccess, size: u8) -> (accepted: bool)
+        requires old(self).invariant(), size == 1 || size == 2 || size == 4 || size == 8,
         ensures final(self).invariant(), accepted == !spec::active(old(self)@.phase),
-            final(self)@ == if accepted { spec::sized(old(self)@, va, request, size) } else { old(self)@ },
+            final(self)@ == if accepted {
+                spec::access_begin(old(self)@, va, word_model::request(request),
+                    false, Some(request), size, true)
+            } else { old(self)@ },
     {
         let access = match request { WordAccess::Read => Access::Read, WordAccess::Write(_) => Access::Write(0) };
-        self.begin_access(va, access, false, Some(request), size)
+        self.begin_access_mode(va, access, false, Some(request), size, true)
     }
 
     fn size_mask(&self) -> (mask: u64)
@@ -166,6 +189,7 @@ impl SharedMmu {
 
     pub(super) fn precheck_failure(&mut self, result: MmuResult)
         requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
+            old(self).head is None,
             old(self).valid_comparison(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(),
@@ -243,6 +267,10 @@ impl SharedMmu {
         requires old(self).invariant(), old(self).word is Some, old(self).phase is Data,
         ensures final(self).invariant(), final(self)@ == spec::word_data(old(self)@, word),
     {
+        if self.va % 4096 + self.size as u64 > 4096 {
+            self.page_data_read(word);
+            return;
+        }
         match self.phase {
             Phase::Data { frame, permissions, leaf, reads, large } => {
                 if self.va % 8 + self.size as u64 <= 8 {
@@ -273,13 +301,14 @@ impl SharedMmu {
         ensures final(self).invariant(), final(self)@ == spec::word_store_done(old(self)@, value, reads),
     {
         self.inner.cache = None;
+        self.head = None;
         let original = match self.modifier { Some(m) => m.original, None => value };
         self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(original),
             table_reads: reads, virtual_address: self.va } };
     }
 
     pub(super) fn word_head_request(&self, data: WordData) -> (out: Request)
-        requires spec::valid_data(data), data.address % 8 != 0,
+        requires data.address < 0x1_0000_0000_0000u64, data.address % 8 != 0,
         ensures out == spec::head_request(data, self.size),
             match out { Request::DataCompare { address, .. } =>
                 address < 0x1_0000_0000_0000u64 && address % 8 == 0, _ => false },
@@ -302,6 +331,69 @@ impl SharedMmu {
         proof { assert(value << 0u32 == value) by(bit_vector); }
         Request::DataCompare { address: beat.address(), expected: data.tail,
             replacement: beat.replace(data.tail, value) }
+    }
+
+    #[verifier::spinoff_prover]
+    fn page_data_read(&mut self, word: u64)
+        requires old(self).invariant(), old(self).word is Some, old(self).phase is Data,
+            old(self).va % 4096 + old(self).size as int > 4096,
+        ensures final(self).invariant(), final(self)@ == spec::page_data(old(self)@, word),
+    {
+        match self.phase {
+            Phase::Data { frame, leaf, reads, .. } => match self.head {
+                None => {
+                    self.head = Some(PageHead { address: frame + self.va % 4096, first: word, leaf });
+                    self.inner.cache = None;
+                    self.phase = Phase::Walk { table: self.inner.config.root, level: 0,
+                        permissions: Permissions { rw: true, user: true, nx: false } };
+                },
+                Some(head) => {
+                    let original = self.loaded_value(head.first, word);
+                    match self.word {
+                        Some(WordAccess::Read) => self.word_store_done(original, reads),
+                        Some(WordAccess::Write(value)) => {
+                            let value = self.modify_value(original, value);
+                            match leaf {
+                                Some(tail) => self.phase = Phase::PageDirtyHead { tail, reads,
+                                    span: PageData { tail_address: frame, word: WordData {
+                                        address: head.address, first: head.first, tail: word, value } } },
+                                None => { proof { assert(false); } },
+                            }
+                        },
+                        None => { proof { assert(false); } },
+                    }
+                },
+            },
+            _ => { proof { assert(false); } },
+        }
+    }
+
+    pub(super) fn dirty_request(pte: Leaf) -> (out: Request)
+        requires spec::valid_leaf(pte),
+        ensures out == spec::dirty_request(pte),
+            match out { Request::Compare { address, expected, replacement } =>
+                address < 0x1_0000_0000_0000u64 && address % 8 == 0
+                    && expected & 1 == 1 && replacement & !0x60u64 == expected & !0x60u64,
+                _ => false },
+    {
+        let word = pte.word;
+        let replacement = dirty(word);
+        proof { assert((word | 64u64) == word + if word / 64u64 % 2u64 == 1u64 { 0u64 } else { 64u64 }) by(bit_vector); }
+        proof { assert(word & 1 == 1 && replacement & !0x60u64 == word & !0x60u64)
+            by(bit_vector) requires word % 2 == 1, replacement == word | 64u64; }
+        Request::Compare { address: pte.address, expected: word, replacement }
+    }
+
+    pub(super) fn page_tail_request(&self, data: PageData) -> (out: Request)
+        requires spec::valid_page_data(data),
+        ensures out == spec::page_tail_request(data, self.size),
+            match out { Request::DataCompare { address, .. } =>
+                address < 0x1_0000_0000_0000u64 && address % 8 == 0, _ => false },
+    {
+        let shift = (64 - data.word.address % 8 * 8) as u32;
+        let mask = self.size_mask() >> shift;
+        Request::DataCompare { address: data.tail_address, expected: data.word.tail,
+            replacement: (data.word.tail & !mask) | ((data.word.value >> shift) & mask) }
     }
 }
 }

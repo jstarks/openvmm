@@ -59,7 +59,13 @@ pub open spec fn boundary_modify(s: State, address: u64,
     operation: super::memory_core::cpu_core::integer::Operation, source: u64, flags: u64,
     width: super::memory_core::cpu_core::operand::Width) -> (State, bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::modify_admitted(address, operation, width) {
-        (State { mmu: mm::modify_begin(s.mmu, address, operation, source, flags, width), ..s }, true)
+        (State { mmu: mm::modify_start(s.mmu, address, operation, source, flags, width, true), ..s }, true)
+    } else { (s, false) }
+}
+pub open spec fn boundary_span(s: State, address: u64, word: WordAccess, size: u8) -> (State, bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) {
+        (State { mmu: mm::access_begin(s.mmu, address, word_model::request(word),
+            false, Some(word), size, true), ..s }, true)
     } else { (s, false) }
 }
 pub open spec fn boundary_locked_modify(s:State,address:u64,

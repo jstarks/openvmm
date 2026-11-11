@@ -625,6 +625,24 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         }
         Mnemonic::Mov | Mnemonic::Movzx => {
             if instruction.mnemonic() == Mnemonic::Mov {
+                if let Some(segment) = segment(instruction.op1_register()) {
+                    let destination = get(0)?;
+                    return match destination {
+                        Operand::Register(dst) if dst.width() != Width::Byte => {
+                            Some(EntryInstruction::ReadSegment {
+                                segment,
+                                destination,
+                            })
+                        }
+                        Operand::Memory {
+                            width: Width::Word, ..
+                        } => Some(EntryInstruction::ReadSegment {
+                            segment,
+                            destination,
+                        }),
+                        _ => None,
+                    };
+                }
                 let control = match instruction.op1_register() {
                     IcedRegister::CR0 => Some(0),
                     IcedRegister::CR2 => Some(2),

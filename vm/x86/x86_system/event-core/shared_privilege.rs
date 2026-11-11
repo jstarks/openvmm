@@ -90,6 +90,9 @@ impl SharedEventMachine {
                 self.retire_entry(cpu,length,false,true)
             },
             Instruction::ReadMsr=>{
+                if cpu.gpr[1]&0xffff_ffff==0x49 {
+                    return self.start_entry(Event::GeneralProtection);
+                }
                 let Some(system)=self.system else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };

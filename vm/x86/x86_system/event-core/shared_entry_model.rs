@@ -52,14 +52,13 @@ pub open spec fn memory(s: State, address: u64, width: Width, request: WordAcces
     let size = (operand::model::bits(width) / 8) as u8;
     if !supported_access(address,width) { unsupported(s) }
     else {
-        let core = if size == 8 { c::boundary_begin(s.core, address, Some(request)).0 }
-            else { c::boundary_sized(s.core, address, request, size).0 };
+        let core = c::boundary_span(s.core, address, request, size).0;
         (State { core, phase: Phase::EntryMemory { address, length, task }, ..s }, Tick::Pending)
     }
 }
 pub open spec fn supported_access(address:u64,width:Width)->bool {
     let size=operand::model::bits(width)/8;
-    address as int+size-1<=u64::MAX && address%4096+size<=4096
+    address as int+size-1<=u64::MAX
         && mmu_model::canonical(address as int) && mmu_model::canonical(address as int+size-1)
 }
 pub open spec fn conditional_value(s:State,condition:control::Condition,
@@ -130,6 +129,29 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::CompareExchange {destination,source}=>compare_exchange(s,destination,source,length),
         Instruction::LockedAlu {operation,destination,source}=>locked_alu(s,operation,destination,source,length),
         Instruction::Scan {dst,source,reverse}=>alu::scan(s,dst,source,reverse,length),
+        Instruction::ReadSegment {segment,destination}=>match s.system {
+            None=>unsupported(s),
+            Some(image)=>{
+                let value=(match segment {
+                    Segment::Cs=>image.cs.selector,Segment::Ss=>image.ss.selector,
+                    Segment::Ds=>image.ds.selector,Segment::Es=>image.es.selector,
+                    Segment::Fs=>image.fs.selector,Segment::Gs=>image.gs.selector,
+                }) as u64;
+                match destination {
+                    Operand::Register(dst)=>{
+                        if !dst.valid() || dst@.width==Width::Byte {unsupported(s)}
+                        else {retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,value)
+                            .map(|i:int,v:u64|v as int),..cpu},length,false,false)}
+                    },
+                    Operand::Memory {address,width}=>{
+                        if !address.valid() || width!=Width::Word {unsupported(s)}
+                        else {memory(s,linear(s,address,length),width,WordAccess::Write(value),
+                            length,MemoryTask::Store)}
+                    },
+                    _=>unsupported(s),
+                }
+            },
+        },
         Instruction::Nop=>retire(s,cpu,length,false,false),
         Instruction::Direction {set}=>retire(s,model::State {
             flags:if set {cpu.flags|0x400u64} else {cpu.flags&!0x400u64},..cpu},length,false,false),

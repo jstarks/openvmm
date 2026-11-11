@@ -52,7 +52,9 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
                 _=>entry::unsupported(s),
             },
         },
-        Instruction::ReadMsr=>match s.system {
+        Instruction::ReadMsr=>if (cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64 {
+            entry(s,Event::GeneralProtection)
+        } else {match s.system {
             None=>entry::unsupported(s),
             Some(system)=>{
                 let number=(cpu.gpr[1] as u64)&0xffff_ffffu64;
@@ -64,7 +66,7 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
                         .update(2,(value>>32) as int),..cpu},length,false,false)
                 }
             },
-        },
+        }},
         _=>entry::unsupported(s),
     }}
 }

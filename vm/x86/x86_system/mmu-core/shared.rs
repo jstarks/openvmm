@@ -21,6 +21,12 @@ pub struct Leaf { pub address: u64, pub word: u64 }
 pub struct WordData { pub address: u64, pub first: u64, pub tail: u64, pub value: u64 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageHead { pub address: u64, pub first: u64, pub leaf: Option<Leaf> }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageData { pub word: WordData, pub tail_address: u64 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Modifier {
     pub operation: integer::Operation,
     pub source: u64,
@@ -57,6 +63,10 @@ pub enum Phase {
     WordLast { data: WordData, reads: u8 },
     SizedStore { data: WordData, reads: u8 },
     AtomicStore { data: WordData, reads: u8 },
+    PageDirtyHead { tail: Leaf, span: PageData, reads: u8 },
+    PageDirtyTail { pte: Leaf, span: PageData, reads: u8 },
+    PageStoreHead { span: PageData, reads: u8 },
+    PageStoreTail { span: PageData, reads: u8 },
     WordDone { report: WordReport },
     IoDirty { pte: Leaf, address: u64, value: u64, reads: u8 },
     IoReady { address: u64, access: WordAccess, reads: u8 },
@@ -89,6 +99,7 @@ pub struct SharedMmu {
     size: u8,
     modifier: Option<Modifier>,
     comparison: Option<Comparison>,
+    head: Option<PageHead>,
 }
 
 impl View for SharedMmu {
@@ -97,7 +108,7 @@ impl View for SharedMmu {
         spec::State { inner: self.inner@, phase: self.phase,
             va: self.va, access: self.access, user: self.user, word: self.word,
             sequence: self.sequence, size: self.size, modifier: self.modifier,
-            comparison: self.comparison }
+            comparison: self.comparison, head: self.head }
     }
 }
 
@@ -138,21 +149,35 @@ impl SharedMmu {
         self.size == 1 || self.size == 2 || self.size == 4 || self.size == 8
     }
 
+    pub closed spec fn valid_head(&self) -> bool {
+        match self.head {
+            Some(h) => spec::valid_page_head(h) && spec::active(self.phase)
+                && self.word is Some && self.comparison is None
+                && h.address % 4096 == self.va % 4096
+                && self.va % 4096 + self.size as int > 4096
+                && self.va as int + self.size as int - 1 <= u64::MAX
+                && (self.access is Write ==> h.leaf is Some),
+            None => true,
+        }
+    }
+
     pub closed spec fn invariant(&self) -> bool {
         self.inner.invariant()
         && self.valid_size()
         && self.valid_modifier()
         && self.valid_comparison()
+        && self.valid_head()
         && (spec::active(self.phase) ==> mmu_model::valid_config(self.inner.config))
         && (spec::active(self.phase) && self.word is Some ==>
-            self.va as int + self.size as int - 1 <= u64::MAX
-                && self.va % 4096 + self.size as int <= 4096)
+            self.va as int + self.size as int - 1 <= u64::MAX)
         && (self.word is Some ==> self.access == word_model::request(self.word.unwrap()))
         && match self.phase {
             Phase::Done(_) | Phase::Dirty { .. } | Phase::Store { .. } => self.word is None,
             Phase::WordTail { .. } | Phase::WordDirty { .. } | Phase::WordStore { .. }
                 | Phase::WordHead { .. } | Phase::WordLast { .. } | Phase::WordDone { .. }
                 | Phase::SizedStore { .. } | Phase::AtomicStore { .. }
+                | Phase::PageDirtyHead { .. } | Phase::PageDirtyTail { .. }
+                | Phase::PageStoreHead { .. } | Phase::PageStoreTail { .. }
                 | Phase::IoDirty { .. } | Phase::IoReady { .. } => self.word is Some,
             _ => true,
         }
@@ -173,6 +198,7 @@ impl SharedMmu {
             Phase::Store { address, .. } => self.access is Write && address < 0x1_0000_0000_0000u64,
             Phase::WordTail { frame, leaf, .. } => self.word is Some
                 && self.va % 8 + self.size as int > 8
+                && self.va % 4096 + self.size as int <= 4096
                 && frame < 0x1_0000_0000_0000u64 && frame % 4096 == 0
                 && (self.access is Write ==> leaf is Some)
                 && match leaf { Some(l) => spec::valid_leaf(l), None => true },
@@ -187,6 +213,15 @@ impl SharedMmu {
                 && data.address % 8 + self.size as int <= 8,
             Phase::AtomicStore { data, .. } => self.comparison is Some
                 && spec::valid_span(data, self.size),
+            Phase::PageDirtyHead { tail, span: data, .. } =>
+                self.access is Write && self.head is Some && spec::valid_leaf(tail)
+                && spec::valid_page_data(data) && data.word.address == self.head.unwrap().address,
+            Phase::PageDirtyTail { pte, span: data, .. } =>
+                self.access is Write && self.head is Some && spec::valid_leaf(pte)
+                && spec::valid_page_data(data) && data.word.address == self.head.unwrap().address,
+            Phase::PageStoreHead { span: data, .. } | Phase::PageStoreTail { span: data, .. } =>
+                self.access is Write && self.head is Some && spec::valid_page_data(data)
+                && data.word.address == self.head.unwrap().address,
             Phase::IoDirty { pte, address, value, .. } => spec::valid_leaf(pte)
                 && address < 0x1_0000_0000_0000u64 && address % 8 == 0
                 && self.word == Some(WordAccess::Write(value)),
@@ -204,7 +239,7 @@ impl SharedMmu {
     {
         Self { inner: Mmu::new(config, cr2), phase: Phase::Idle,
             va: 0, access: Access::Read, user: false, word: None,
-            sequence: 0, size: 8, modifier: None, comparison: None }
+            sequence: 0, size: 8, modifier: None, comparison: None, head: None }
     }
 
     pub fn cr2(&self) -> (v: u64)
@@ -234,6 +269,17 @@ impl SharedMmu {
         ensures final(self).invariant(),
             accepted == !spec::active(old(self)@.phase),
             final(self)@ == if accepted { spec::span_begin(old(self)@, va, access, user, word, size) } else { old(self)@ },
+    { self.begin_access_mode(va, access, user, word, size, false) }
+
+    fn begin_access_mode(&mut self, va: u64, access: Access, user: bool,
+        word: Option<WordAccess>, size: u8, allow_cross: bool) -> (accepted: bool)
+        requires old(self).invariant(),
+            size == 1 || size == 2 || size == 4 || size == 8,
+            word is Some ==> access == word_model::request(word.unwrap()),
+        ensures final(self).invariant(), accepted == !spec::active(old(self)@.phase),
+            final(self)@ == if accepted {
+                spec::access_begin(old(self)@, va, access, user, word, size, allow_cross)
+            } else { old(self)@ },
     {
         if self.active() { return false; }
         self.va = va; self.access = access; self.user = user;
@@ -241,13 +287,14 @@ impl SharedMmu {
         self.size = size;
         self.modifier = None;
         self.comparison = None;
+        self.head = None;
         if word.is_some() {
             if va > u64::MAX - (size as u64 - 1) {
                 self.phase = Phase::WordDone { report: WordReport { result: WordResult::Wrap,
                     table_reads: 0, virtual_address: va } };
                 return true;
             }
-            if va % 4096 + size as u64 > 4096 {
+            if !allow_cross && va % 4096 + size as u64 > 4096 {
                 self.phase = Phase::WordDone { report: WordReport { result: WordResult::CrossPage,
                     table_reads: 0, virtual_address: va } };
                 return true;
@@ -255,7 +302,8 @@ impl SharedMmu {
         }
         if !valid_config(self.inner.config) {
             self.precheck_failure(MmuResult::InvalidConfig);
-        } else if !canonical(va) {
+        } else if !canonical(va) || (allow_cross && word.is_some()
+            && !canonical(va + (size as u64 - 1))) {
             self.precheck_failure(MmuResult::GeneralProtection);
         } else {
             if let Some(m) = self.inner.cache {
@@ -307,11 +355,11 @@ impl SharedMmu {
         requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
             old(self).valid_comparison(),
             mmu_model::valid_config(old(self).inner.config),
-            old(self).word is Some ==> old(self).va as int + old(self).size as int - 1 <= u64::MAX
-                && old(self).va % 4096 + old(self).size as int <= 4096,
+            old(self).word is Some ==> old(self).va as int + old(self).size as int - 1 <= u64::MAX,
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self)@ == spec::restart(old(self)@), final(self).invariant(),
     {
+        self.head = None;
         self.phase = Phase::Walk { table: self.inner.config.root, level: 0,
             permissions: Permissions { rw: true, user: true, nx: false } };
     }
@@ -322,10 +370,19 @@ impl SharedMmu {
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self)@ == spec::fault(old(self)@, result, reads), final(self).invariant(),
     {
-        self.inner.fault(result, self.va);
+        self.inner.fault(result, self.walk_va());
+        self.head = None;
         self.set_failure(result, reads);
     }
 
+    fn walk_va(&self) -> (va: u64)
+        ensures va == spec::walk_va(self@),
+    {
+        if self.head.is_some() { self.va.wrapping_add(4096 - self.va % 4096) }
+        else { self.va }
+    }
+
+    #[verifier::spinoff_prover]
     pub fn request(&self) -> (out: Request)
         requires self.invariant(),
         ensures out == spec::request(self@),
@@ -342,7 +399,7 @@ impl SharedMmu {
         match self.phase {
             Phase::Idle => Request::Idle,
             Phase::Done(r) => Request::Complete(r),
-            Phase::Walk { table, level, .. } => Request::Read(table + index(self.va, level) * 8),
+            Phase::Walk { table, level, .. } => Request::Read(table + index(self.walk_va(), level) * 8),
             Phase::Mark { address, word, .. } => {
                 let replacement = accessed(word);
                 proof { assert((word | 32u64) == word + if word / 32u64 % 2u64 == 1u64 { 0u64 } else { 32u64 }) by(bit_vector); }
@@ -350,7 +407,7 @@ impl SharedMmu {
                     by(bit_vector) requires word % 2 == 1, replacement == word | 32u64; }
                 Request::Compare { address, expected: word, replacement }
             },
-            Phase::Data { frame, .. } => Request::Read((frame + self.va % 4096) / 8 * 8),
+            Phase::Data { frame, .. } => Request::Read((frame + self.walk_va() % 4096) / 8 * 8),
             Phase::Dirty { pte, .. } => {
                 let word = pte.word;
                 let replacement = dirty(word);
@@ -377,6 +434,10 @@ impl SharedMmu {
             Phase::WordLast { data, .. } => self.word_last_request(data),
             Phase::SizedStore { data, .. } => self.sized_store_request(data),
             Phase::AtomicStore { data, .. } => self.atomic_store_request(data),
+            Phase::PageDirtyHead { .. } => Self::dirty_request(self.head.unwrap().leaf.unwrap()),
+            Phase::PageDirtyTail { pte, .. } => Self::dirty_request(pte),
+            Phase::PageStoreHead { span: data, .. } => self.word_head_request(data.word),
+            Phase::PageStoreTail { span: data, .. } => self.page_tail_request(data),
             Phase::IoReady { address, access, .. } =>
                 Request::Io(IoRequest { sequence: self.sequence, address, access }),
         }
@@ -406,8 +467,8 @@ impl SharedMmu {
                 } else if e.huge && level == 1 {
                     self.fail(MmuResult::HugePage, level + 1);
                 } else {
-                    self.phase = Phase::Mark { address: table + index(self.va, level) * 8,
-                        word, level, frame: if e.huge { leaf_frame(e.base, self.va, level) } else { e.base },
+                    self.phase = Phase::Mark { address: table + index(self.walk_va(), level) * 8,
+                        word, level, frame: if e.huge { leaf_frame(e.base, self.walk_va(), level) } else { e.base },
                         permissions: next };
                 }
                 true
@@ -440,6 +501,7 @@ impl SharedMmu {
         }
     }
 
+    #[verifier::spinoff_prover]
     pub fn exchanged(&mut self) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
@@ -495,6 +557,21 @@ impl SharedMmu {
                 self.word_store_done(observed, reads);
                 true
             },
+            Phase::PageDirtyHead { tail, span: data, reads } => {
+                let head = self.head.unwrap().leaf.unwrap();
+                self.phase = if head.address == tail.address && head.word == tail.word { Phase::PageStoreHead { span: data, reads } }
+                    else { Phase::PageDirtyTail { pte: tail, span: data, reads } };
+                true
+            },
+            Phase::PageDirtyTail { span: data, reads, .. } => {
+                self.phase = Phase::PageStoreHead { span: data, reads }; true
+            },
+            Phase::PageStoreHead { span: data, reads } => {
+                self.phase = Phase::PageStoreTail { span: data, reads }; true
+            },
+            Phase::PageStoreTail { span: data, reads } => {
+                self.word_store_done(data.word.value, reads); true
+            },
             _ => false,
         }
     }
@@ -508,6 +585,7 @@ impl SharedMmu {
         match self.phase {
             Phase::Mark { .. } | Phase::Dirty { .. } => { self.restart(); true },
             Phase::WordDirty { .. } | Phase::IoDirty { .. } => { self.restart(); true },
+            Phase::PageDirtyHead { .. } | Phase::PageDirtyTail { .. } => { self.restart(); true },
             Phase::Store { address, reads, .. } => {
                 self.phase = Phase::Store { address, word: current, reads };
                 true
@@ -523,6 +601,14 @@ impl SharedMmu {
             },
             Phase::AtomicStore { data, reads } => {
                 self.phase = Phase::AtomicStore { data: WordData { first: current, ..data }, reads }; true
+            },
+            Phase::PageStoreHead { span: data, reads } => {
+                self.phase = Phase::PageStoreHead { span: PageData {
+                    word: WordData { first: current, ..data.word }, ..data }, reads }; true
+            },
+            Phase::PageStoreTail { span: data, reads } => {
+                self.phase = Phase::PageStoreTail { span: PageData {
+                    word: WordData { tail: current, ..data.word }, ..data }, reads }; true
             },
             _ => false,
         }

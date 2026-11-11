@@ -5,7 +5,7 @@ use super::*;
 use memory_core::cpu_core::operand::{
     Operand as ScalarOperand, Register, ScalarStatus, commit_scalar,
 };
-use memory_core::cpu_core::{gsbase, near_call, xor32};
+use memory_core::cpu_core::{gsbase, near_call, profile, xor32};
 
 verus! {
 
@@ -164,6 +164,12 @@ impl SharedEventMachine {
                 }
             },
             DecodeDecision::Wrmsr => {
+                if self.core.cpu().gpr[1]&0xffff_ffff==0x49 && !profile::PRED_CMD_AVAILABLE {
+                    if self.core.cpu().flags&0x100!=0 {
+                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+                    }
+                    return self.start_entry(Event::GeneralProtection);
+                }
                 if self.core.cpu().gpr[1]&0xffff_ffff==0xc000_0080 {
                     return self.write_efer(input.length);
                 }

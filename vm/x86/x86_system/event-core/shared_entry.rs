@@ -40,6 +40,7 @@ pub enum Instruction {
     Store { address: Address, width: Width, source: Operand },
     Table { address: Address, idt: bool },
     Segment { segment: Segment, src: Register },
+    ReadSegment {segment:Segment,destination:Operand},
     Push { source: Operand },
     Pop { dst: Register },
     PushFlags,
@@ -97,7 +98,7 @@ pub(super) fn supported_access(address:u64,width:Width)->(out:bool)
     ensures out == spec::entry::supported_access(address,width),
 {
     let size=(width.bits()/8) as u8;
-    address <= u64::MAX-(size as u64-1) && address%4096+size as u64<=4096
+    address <= u64::MAX-(size as u64-1)
         && canonical(address) && canonical(address+(size as u64-1))
 }
 
@@ -127,8 +128,7 @@ impl SharedEventMachine {
         if !supported_access(address,width) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
-        let _accepted = if size == 8 { self.core.boundary_word(address, request) }
-            else { self.core.boundary_sized(address, request, size) };
+        let _accepted = self.core.boundary_span(address, request, size);
         assert(_accepted);
         self.phase = Phase::EntryMemory { address, length, task };
         Tick::Pending
@@ -177,6 +177,7 @@ impl SharedEventMachine {
                 | Instruction::IndirectJump {..} | Instruction::IndirectCall {..}
                 => self.execute_scalar(instruction,length),
             Instruction::ConditionalMove {..} | Instruction::SetCondition {..} | Instruction::Direction {..}
+                | Instruction::ReadSegment {..}
                 => self.execute_conditions(instruction,length),
             Instruction::Nop | Instruction::Cpuid | Instruction::Branch {..}
                 | Instruction::ZeroExtend {..} | Instruction::Jump {..}
@@ -190,7 +191,8 @@ impl SharedEventMachine {
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
-            instruction is ConditionalMove || instruction is SetCondition || instruction is Direction,
+            instruction is ConditionalMove || instruction is SetCondition || instruction is Direction
+                || instruction is ReadSegment,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
     {
@@ -199,6 +201,36 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let next = cpu.rip.wrapping_add(length as u64);
         match instruction {
+            Instruction::ReadSegment {segment,destination}=>{
+                let Some(image)=self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                let value=(match segment {
+                    Segment::Cs=>image.cs.selector,Segment::Ss=>image.ss.selector,
+                    Segment::Ds=>image.ds.selector,Segment::Es=>image.es.selector,
+                    Segment::Fs=>image.fs.selector,Segment::Gs=>image.gs.selector,
+                }) as u64;
+                match destination {
+                    Operand::Register(dst)=>{
+                        if !dst.is_valid() || dst.width()==Width::Byte {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        let ghost registers=cpu.gpr@;
+                        dst.write(&mut cpu.gpr,value);
+                        assert(cpu@.gpr =~= operand::model::write(registers,dst,value)
+                            .map(|i:int,v:u64|v as int));
+                        self.retire_entry(cpu,length,false,false)
+                    },
+                    Operand::Memory {address,width}=>{
+                        if !address.is_valid() || width!=Width::Word {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        self.entry_memory(address.linear(&cpu.gpr,next,self.entry_bases()),
+                            width,WordAccess::Write(value),length,MemoryTask::Store)
+                    },
+                    _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
             Instruction::Direction {set}=>{
                 cpu.flags=if set {cpu.flags|0x400} else {cpu.flags&!0x400u64};
                 self.retire_entry(cpu,length,false,false)

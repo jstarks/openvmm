@@ -82,6 +82,44 @@ fn reg(index: u8, width: Width, high: bool) -> Register {
     Register::new(Gpr::new(index).unwrap(), width, high).unwrap()
 }
 
+#[test]
+fn segment_reads_preserve_selector_identity_and_register_or_memory_width() {
+    use x86_system::shared::entry::Instruction;
+    for (number, segment) in [
+        (0, Segment::Es),
+        (1, Segment::Cs),
+        (2, Segment::Ss),
+        (3, Segment::Ds),
+        (4, Segment::Fs),
+        (5, Segment::Gs),
+    ] {
+        for (prefix, width) in [
+            (&[][..], Width::Dword),
+            (&[0x66][..], Width::Word),
+            (&[0x48][..], Width::Qword),
+        ] {
+            let bytes = [prefix, &[0x8c, 0xc0 | (number << 3)]].concat();
+            assert_eq!(
+                entry(&bytes),
+                Instruction::ReadSegment {
+                    segment,
+                    destination: Operand::Register(reg(0, width, false)),
+                }
+            );
+        }
+        assert!(matches!(
+            entry(&[0x8c, (number << 3) | 7]),
+            Instruction::ReadSegment {
+                destination: Operand::Memory {
+                    width: Width::Word,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+}
+
 fn memory(decoded: Decoded) -> Address {
     match decoded.operands[1] {
         Operand::Memory { address, .. } | Operand::Address(address) => address,

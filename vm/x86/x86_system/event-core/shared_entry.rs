@@ -24,6 +24,8 @@ pub enum Instruction {
     Scan { dst:Register,source:Operand,reverse:bool },
     ReadControl { number: u8, dst: Register },
     WriteControl { number: u8, source: Operand },
+    ReadDebug {number:u8,dst:Register},
+    WriteDebug {number:u8,source:Register},
     IndirectJump { source: Operand },
     IndirectCall { source: Operand },
     Multiply { dst:Register, source:Operand, immediate:Option<u64> },
@@ -35,12 +37,17 @@ pub enum Instruction {
     Direction { set: bool },
     CompareExchange { destination: Operand, source: Register },
     LockedAlu { operation:integer::Operation,destination:Operand,source:Operand },
+    ExchangeAdd {destination:Operand,source:Register,locked:bool},
     ReadMsr,
+    ReadTimestamp,
     PortIo { port: Port, width: Width, write: bool },
     ZeroExtend { dst: Register, src: Register },
     Load { dst: Register, address: Address, width: Width },
     Store { address: Address, width: Width, source: Operand },
     Table { address: Address, idt: bool },
+    StoreTable {address:Address,idt:bool},
+    LoadTask {source:Register},
+    LoadLdt {source:Register},
     Segment { segment: Segment, src: Register },
     ReadSegment {segment:Segment,destination:Operand},
     Push { source: Operand },
@@ -72,8 +79,13 @@ pub enum MemoryTask {
     Store,
     TableLimit { idt: bool },
     TableBase { idt: bool, limit: u16 },
+    StoreTableBase {base:u64},
+    TaskLow {selector:u16},
+    TaskHigh {selector:u16,low:u64},
+    TaskBusy {image:SegmentState,low:u64},
     Segment { segment: Segment, selector: u16 },
     Push { stack: u64 },
+    PushValue {stack:u64},
     Return { stack: u64 },
     Leave { stack: u64 },
     Pop { stack: u64, dst: Register },
@@ -95,6 +107,7 @@ pub enum MemoryTask {
     ConditionalMove { condition: control::Condition, dst: Register },
     CompareExchange { width: Width },
     LockedAlu {operation:integer::Operation,source:u64,width:Width},
+    ExchangeAdd {register:Register,locked:bool},
     Scan {dst:Register,reverse:bool},
 }
 
@@ -164,6 +177,27 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
         match instruction {
+            Instruction::LoadTask {source}=>{
+                reveal(spec::entry::execute);
+                self.execute_task(source,length)
+            },
+            Instruction::LoadLdt {source}=>{
+                reveal(spec::entry::execute);
+                let Some(mut system)=self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                if !source.is_valid() || source.width()!=Width::Word
+                    || source.read(&cpu.gpr)!=0 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                system.ldtr=NULL_SEGMENT;
+                self.system=Some(system);
+                self.retire_entry(cpu,length,false,false)
+            },
+            Instruction::ReadTimestamp=>{
+                reveal(spec::entry::execute);
+                self.start_timestamp(length)
+            },
             Instruction::PortIo {port,width,write}=>{
                 reveal(spec::entry::execute);
                 self.start_port_io(port,width,write,length)
@@ -175,6 +209,10 @@ impl SharedEventMachine {
             Instruction::LockedAlu {operation,destination,source}=>{
                 reveal(spec::entry::execute);
                 self.execute_locked_alu(operation,destination,source,length)
+            },
+            Instruction::ExchangeAdd {destination,source,locked}=>{
+                reveal(spec::entry::execute);
+                self.execute_exchange_add(destination,source,locked,length)
             },
             Instruction::MultiplyWide {source,width,signed}=>{
                 reveal(spec::entry::execute);
@@ -190,7 +228,8 @@ impl SharedEventMachine {
                 reveal(spec::entry::execute);
                 self.execute_move(width,length)
             },
-            Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr => {
+            Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr
+                | Instruction::ReadDebug {..} | Instruction::WriteDebug {..} => {
                 reveal(spec::entry::execute);
                 self.execute_control(instruction,length)
             },
@@ -205,6 +244,64 @@ impl SharedEventMachine {
                 | Instruction::ZeroExtend {..} | Instruction::Jump {..}
                 => self.execute_register(instruction,length),
             _=>self.execute_legacy(instruction,length),
+        }
+    }
+
+    fn start_timestamp(&mut self,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),1<=length<=15,
+        ensures final(self).invariant(),(final(self)@,tick)==spec::entry::timestamp(old(self)@,length),
+    {
+        if profile::cpuid(1,0)[3]&16==0 {return self.start_entry(Event::InvalidOpcode);}
+        self.phase=Phase::Timestamp {sequence:self.decode_sequence,length,value:None};
+        Tick::Pending
+    }
+
+    fn execute_task(&mut self,source:Register,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::entry::load_task(old(self)@,source,length),
+    {
+        if !source.is_valid() || source.width()!=Width::Word || self.system.is_none() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let selector=source.read(&self.core.cpu().gpr) as u16;
+        if selector==0 || selector&7!=0 || selector as u64+15>self.tables.gdt_limit as u64
+            || self.tables.gdt_base>u64::MAX-selector as u64-15 {
+            return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
+        }
+        self.entry_memory(self.tables.gdt_base+selector as u64,Width::Qword,WordAccess::Read,length,
+            MemoryTask::TaskLow {selector})
+    }
+
+    pub fn complete_timestamp(&mut self,sequence:u64,clock:u64)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::entry::complete_timestamp(old(self)@,sequence,clock),
+    {
+        match self.phase {
+            Phase::Timestamp {sequence:pending,length,value:None} if pending==sequence=>{
+                self.phase=Phase::Timestamp {sequence,length,value:Some(clock)};
+                true
+            },
+            _=>false,
+        }
+    }
+
+    pub(super) fn finish_timestamp(&mut self)->(tick:Tick)
+        requires old(self).invariant(),old(self).phase is Timestamp,
+        ensures final(self).invariant(),(final(self)@,tick)==spec::entry::finish_timestamp(old(self)@),
+    {
+        match self.phase {
+            Phase::Timestamp {length,value:Some(value),..}=>{
+                let mut cpu=self.core.cpu();
+                let ghost before=cpu@;
+                cpu.gpr[0]=(value as u32) as u64;
+                cpu.gpr[2]=value>>32;
+                assert(cpu@.gpr =~= before.gpr.update(0,(value as u32) as int).update(2,(value>>32) as int));
+                self.retire_entry(cpu,length,false,false)
+            },
+            _=>Tick::Waiting,
         }
     }
 
@@ -443,7 +540,7 @@ impl SharedEventMachine {
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
             instruction is PushFlags || instruction is Pop || instruction is PopFlags
                 || instruction is FarReturn || instruction is Load || instruction is Store
-                || instruction is Table || instruction is Segment || instruction is Push
+                || instruction is Table || instruction is StoreTable || instruction is Segment || instruction is Push
                 || instruction is Return || instruction is Leave,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
@@ -500,6 +597,22 @@ impl SharedEventMachine {
                 let linear = address.linear(&cpu.gpr, next, self.entry_bases());
                 self.entry_memory(linear, width, WordAccess::Write(value), length, MemoryTask::Store)
             },
+            Instruction::StoreTable {address,idt}=>{
+                if !address.is_valid() {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let linear=address.linear(&cpu.gpr,next,self.entry_bases());
+                if linear>u64::MAX-9 || !canonical(linear) || !canonical(linear+9) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                if linear%4096>4086 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage));
+                }
+                let (base,limit)=if idt {(self.tables.idt_base,self.tables.idt_limit)}
+                    else {(self.tables.gdt_base,self.tables.gdt_limit)};
+                self.entry_memory(linear,Width::Word,WordAccess::Write(limit as u64),length,
+                    MemoryTask::StoreTableBase {base})
+            },
             Instruction::Table { address, idt } => {
                 if !address.is_valid() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -536,13 +649,20 @@ impl SharedEventMachine {
                     length, MemoryTask::Segment { segment: dst, selector })
             },
             Instruction::Push { source } => {
-                let Some(value) = scalar(cpu, source) else {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                };
                 if cpu.gpr[4] < 8 || cpu.gpr[4] % 8 != 0 {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
                 let stack = cpu.gpr[4] - 8;
+                if let Operand::Memory {address,width}=source {
+                    if !address.is_valid() || width!=Width::Qword {
+                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                    }
+                    let linear=address.linear(&cpu.gpr,next,self.entry_bases());
+                    return self.entry_memory(linear,Width::Qword,WordAccess::Read,length,MemoryTask::PushValue {stack});
+                }
+                let Some(value) = scalar(cpu, source) else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
                 self.entry_memory(stack, Width::Qword, WordAccess::Write(value),
                     length, MemoryTask::Push { stack })
             },
@@ -566,6 +686,33 @@ impl SharedEventMachine {
             Some(system) => SegmentBases { fs: system.fs.base, gs: system.gs.base },
             None => SegmentBases { fs: 0, gs: 0 },
         }
+    }
+
+    fn execute_exchange_add(&mut self,destination:Operand,source:Register,locked:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+            1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
+        ensures final(self).invariant(),(final(self)@,tick)==spec::entry::exchange_add(old(self)@,
+            destination,source,locked,length),
+    {
+        if !source.is_valid() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let Operand::Memory {width:memory_width,..}=destination else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if memory_width!=source.width() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let tick=if locked {
+            self.execute_locked_alu(integer::Operation::Add,destination,Operand::Register(source),length)
+        } else {
+            self.execute_alu(integer::Operation::Add,destination,Operand::Register(source),length)
+        };
+        if let Phase::EntryMemory {address,length,..}=self.phase {
+            self.phase=Phase::EntryMemory {address,length,task:MemoryTask::ExchangeAdd {register:source,locked}};
+        }
+        tick
     }
 
     pub(super) fn execute_compare_exchange(&mut self,destination:Operand,source:Register,length:u8)->(tick:Tick)
@@ -663,6 +810,7 @@ impl SharedEventMachine {
             self.retire_entry(cpu,length,false,false)
     }
 
+    #[verifier::spinoff_prover]
     pub(super) fn entry_value(&mut self, value: u64) -> (tick: Tick)
         requires old(self).invariant(), old(self).phase is EntryMemory,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
@@ -677,6 +825,54 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::ExchangeAdd {register:source,locked}=>{
+                if !source.is_valid() {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let result=integer::evaluate(integer::Operation::Add,value,source.read(&cpu.gpr),source.width(),cpu.flags);
+                let ghost registers=cpu.gpr@;
+                source.write(&mut cpu.gpr,value);
+                assert(cpu@.gpr =~= operand::model::write(registers,source,value).map(|i:int,v:u64|v as int));
+                cpu.flags=result.flags;
+                return self.retire_entry(cpu,length,false,locked);
+            },
+            MemoryTask::TaskLow {selector}=>{
+                if address>u64::MAX-8 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                return self.entry_memory(address+8,Width::Qword,WordAccess::Read,length,
+                    MemoryTask::TaskHigh {selector,low:value});
+            },
+            MemoryTask::TaskHigh {selector,low}=>{
+                let Some(image)=descriptor::load_task(low,value,selector) else {
+                    return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
+                };
+                if address<8 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let target=address-8;
+                let accepted=self.core.boundary_compare_exchange(target,low,low|(1u64<<41),Width::Qword);
+                if !accepted {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                self.phase=Phase::EntryMemory {address:target,length,task:MemoryTask::TaskBusy {image,low}};
+                return Tick::Pending;
+            },
+            MemoryTask::TaskBusy {image,low}=>{
+                if value!=low {
+                    return self.entry_memory(address,Width::Qword,WordAccess::Read,length,
+                        MemoryTask::TaskLow {selector:image.selector});
+                }
+                let Some(mut system)=self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                if !memory_core::cpu_core::system::supported_task(image) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                system.tr=image;
+                self.system=Some(system);
+                return self.retire_entry(cpu,length,false,false);
+            },
             MemoryTask::Scan {dst,reverse}=>return self.finish_scan(dst,value,reverse,length),
             MemoryTask::LockedAlu {operation,source,width}=>{
                 let result=integer::evaluate(operation,value,source,width,cpu.flags);
@@ -800,9 +996,18 @@ impl SharedEventMachine {
                 self.system = Some(system);
                 return self.retire_entry(cpu, length, matches!(dst, Segment::Ss), false);
             },
+            MemoryTask::StoreTableBase {base}=>{
+                if address>u64::MAX-2 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                return self.entry_memory(address+2,Width::Qword,WordAccess::Write(base),length,MemoryTask::Store);
+            },
             MemoryTask::Push { stack } => {
                 cpu.gpr[4] = stack;
                 assert(cpu@.gpr =~= before.gpr.update(4, stack as int));
+            },
+            MemoryTask::PushValue {stack}=>{
+                return self.entry_memory(stack,Width::Qword,WordAccess::Write(value),length,MemoryTask::Push {stack});
             },
             MemoryTask::Return { stack } => {
                 if stack > u64::MAX - 8 || !canonical(value) {

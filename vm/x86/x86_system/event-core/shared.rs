@@ -40,6 +40,7 @@ pub enum Phase {
     NearCall { target: u64, stack: u64 },
     EntryMemory { address: u64, length: u8, task: entry::MemoryTask },
     PortIo { request: entry::PortRequest, length: u8, reply: Option<IoReply> },
+    Timestamp {sequence:u64,length:u8,value:Option<u64>},
     Repeat { width: memory_core::cpu_core::operand::Width, length: u8 },
     RepeatMove { width: memory_core::cpu_core::operand::Width, length: u8 },
     GateLow { event: Event, address: u64 },
@@ -86,6 +87,7 @@ impl SharedEventMachine {
                     | (WordAccess::Write(_),Some(IoReply::Read(_)))=>false,
                     _=>true,
                 },
+            Phase::Timestamp {sequence,length,..}=>sequence==self.decode_sequence &&1<=length<=15,
             _=>true,
         }
         && match self.phase {
@@ -102,7 +104,8 @@ impl SharedEventMachine {
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             Phase::Ordinary { .. } => self.core@.phase != CpuPhase::Boundary,
             Phase::Stopped { .. } => !mmu_core::shared_model::active(self.core@.mmu.phase),
-            Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. } => self.core@.phase == CpuPhase::Boundary
+            Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
+                | Phase::Timestamp {..} => self.core@.phase == CpuPhase::Boundary
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             _ => self.core@.phase == CpuPhase::Boundary,
         }
@@ -299,6 +302,7 @@ impl SharedEventMachine {
             Phase::Decode { input } => Tick::Decode(input),
             Phase::Admitted { .. } => self.advance_admitted(),
             Phase::PortIo { .. } => self.finish_port_io(),
+            Phase::Timestamp {..}=>self.finish_timestamp(),
             Phase::DecodeFetch { input } => match self.core.request() {
                 Request::Complete(report) => match report.result {
                     MmuResult::Success(value) => self.append_decode(value),
@@ -457,7 +461,8 @@ impl SharedEventMachine {
             !matches!(self.phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
-                | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }),
+                | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
+                | Phase::Timestamp {..}),
         ensures out == spec::word_location(self@),
     {
         let cpu = self.core.cpu();
@@ -483,7 +488,8 @@ impl SharedEventMachine {
             !matches!(old(self).phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
-                | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }),
+                | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
+                | Phase::Timestamp {..}),
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::word_value(old(self)@, value),
     {
@@ -658,6 +664,7 @@ pub enum BatchStop {
     Stopped(EventDiagnostic),
     Io(IoRequest),
     PortIo(entry::PortRequest),
+    Timestamp { sequence: u64 },
     Decode(DecodeInput),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -729,6 +736,18 @@ impl SharedEventMachine {
                     });
                 }
                 Tick::Waiting => {
+                    if let Phase::Timestamp {
+                        sequence,
+                        value: None,
+                        ..
+                    } = self.phase
+                    {
+                        return Ok(Batch {
+                            retired,
+                            delivered,
+                            stop: BatchStop::Timestamp { sequence },
+                        });
+                    }
                     if let Phase::PortIo {
                         request,
                         reply: None,

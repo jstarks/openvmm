@@ -26,6 +26,51 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
         match instruction {
+            Instruction::ReadDebug {number,dst}=>{
+                if !dst.is_valid() || dst.width()!=Width::Qword {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let Some(system)=self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                let value=match number {
+                    0=>system.dr0,1=>system.dr1,2=>system.dr2,3=>system.dr3,
+                    4|6=>0xffff0ff0,5|7=>0x400,
+                    _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                };
+                let ghost registers=cpu.gpr@;
+                dst.write(&mut cpu.gpr,value);
+                assert(cpu@.gpr =~= operand::model::write(registers,dst,value).map(|i:int,v:u64|v as int));
+                self.retire_entry(cpu,length,false,false)
+            },
+            Instruction::WriteDebug {number,source}=>{
+                if !source.is_valid() || source.width()!=Width::Qword {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let Some(mut system)=self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                let value=source.read(&cpu.gpr);
+                if number<=3 && !canonical(value) {
+                    return self.start_entry(Event::GeneralProtection);
+                }
+                match number {
+                    0=>system.dr0=value,1=>system.dr1=value,2=>system.dr2=value,3=>system.dr3=value,
+                    4|6=>{
+                        if value!=0xffff0ff0 {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                    },
+                    5|7=>{
+                        if value!=0 && value!=0x400 {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                    },
+                    _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+                self.system=Some(system);
+                self.retire_entry(cpu,length,false,false)
+            },
             Instruction::ReadControl {number,dst}=>{
                 if !dst.is_valid() || dst.width()!=Width::Qword {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -99,7 +144,12 @@ impl SharedEventMachine {
                 let value=match cpu.gpr[1]&0xffff_ffff {
                     0xc000_0080=>privilege::read_efer(system.efer_sce,self.core.config().nxe),
                     0x8b=>profile::MICROCODE_REVISION as u64,
-                    _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                    0xc0000100=>system.fs.base,
+                    0xc0000101=>system.gs.base,
+                    number=>match privilege::read_entry(system.entry,number) {
+                        Some(value)=>value,
+                        None=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                    },
                 };
                 let ghost before=cpu@;
                 cpu.gpr[0]=value&0xffff_ffff;cpu.gpr[2]=value>>32;
@@ -109,6 +159,37 @@ impl SharedEventMachine {
             },
             _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
         }
+    }
+
+    pub(super) fn write_entry_msr(&mut self,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::write_entry_msr(old(self)@,length),
+    {
+        let cpu=self.core.cpu();
+        if length==0 || length>15 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        let number=cpu.gpr[1]&0xffff_ffff;
+        if privilege::read_entry(system.entry,number).is_none() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let value=(cpu.gpr[0]&0xffff_ffff)|((cpu.gpr[2]&0xffff_ffff)<<32);
+        if (number==0xc0000084 && value>0xffff_ffff) || (number==0x174 && value>0xffff) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let Some(entry)=privilege::write_entry(system.entry,number,value) else {
+            return self.start_entry(Event::GeneralProtection);
+        };
+        system.entry=entry;
+        self.system=Some(system);
+        self.retire_entry(cpu,length,false,true)
     }
 
     pub(super) fn write_efer(&mut self,length:u8)->(tick:Tick)

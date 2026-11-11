@@ -115,6 +115,10 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
         } else {match s.system {
             None => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
             Some(system) => {
+                if super::super::memory_core::cpu_core::privilege::model::read_entry(system.entry,
+                    (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64) is Some {
+                    privilege::write_entry_msr(s,input.length)
+                } else {
                 let result = gsbase::transition(system, s.core.cpu.rip as u64,
                     s.core.cpu.flags & !0x10000u64, s.core.cpu.gpr[0] as u64,
                     s.core.cpu.gpr[1] as u64, s.core.cpu.gpr[2] as u64, input.length);
@@ -128,6 +132,7 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
                     gsbase::Status::GeneralProtection => entry(s, Event::GeneralProtection),
                     gsbase::Status::DebugRequired => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired)),
                     _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
                 }
             },
         }},

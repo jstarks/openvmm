@@ -30,6 +30,173 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
 }
 
 #[test]
+fn cs_prefixed_relative_call_keeps_its_displacement_and_full_return_length() {
+    use x86_system::shared::decode::DecodeDecision;
+    assert_eq!(
+        admission(&[0x2e, 0xe8, 0xfa, 0xff, 0xff, 0xff]),
+        DecodeDecision::NearCall { displacement: -6 }
+    );
+}
+
+#[test]
+fn cache_prefetch_hints_have_no_architectural_memory_operand_effect() {
+    use x86_system::shared::entry::Instruction;
+    for extension in 0..4 {
+        assert_eq!(
+            entry(&[0x0f, 0x18, 0x04 | (extension << 3), 0x03]),
+            Instruction::Nop
+        );
+    }
+    assert_eq!(
+        admission(&[0xf0, 0x0f, 0x18, 0x08]),
+        x86_system::shared::decode::DecodeDecision::InvalidOpcode
+    );
+}
+
+#[test]
+fn memory_shift_count_and_width_are_retained_without_admitting_memory_rotates() {
+    use x86_system::memory_core::cpu_core::integer::Operation;
+    use x86_system::shared::entry::Instruction;
+    assert!(matches!(
+        entry(&[0x66, 0xd1, 0x7d, 0x1c]),
+        Instruction::Alu {
+            operation: Operation::Sar,
+            destination: Operand::Memory {
+                width: Width::Word,
+                ..
+            },
+            source: Operand::Immediate(Immediate { value: 1, .. }),
+        }
+    ));
+    assert!(matches!(entry(&[0x48,0xd3,0x28]),Instruction::Alu {
+        operation:Operation::Shr,source:Operand::Register(source),..
+    } if source==reg(1,Width::Byte,false)));
+    assert_eq!(
+        admission(&[0xd1, 0x00]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+}
+
+#[test]
+fn xadd_memory_preserves_width_source_and_lock_without_admitting_register_destinations() {
+    use x86_system::shared::entry::Instruction;
+    for (prefix, width) in [
+        (&[][..], Width::Dword),
+        (&[0x66][..], Width::Word),
+        (&[0x48][..], Width::Qword),
+    ] {
+        for locked in [false, true] {
+            let bytes = [
+                if locked { &[0xf0][..] } else { &[][..] },
+                prefix,
+                &[0x0f, 0xc1, 0x07][..],
+            ]
+            .concat();
+            assert!(matches!(entry(&bytes),Instruction::ExchangeAdd {
+                destination:Operand::Memory {width:w,..},source,locked:l
+            } if w==width && source==reg(0,width,false) && l==locked));
+        }
+    }
+    assert_eq!(
+        admission(&[0x0f, 0xc1, 0xc0]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+}
+
+#[test]
+fn debug_register_moves_keep_the_selected_number_and_full_gpr_width() {
+    use x86_system::shared::entry::Instruction;
+    for number in 0..8 {
+        let modrm = 0xc0 | (number << 3);
+        assert_eq!(
+            entry(&[0x0f, 0x21, modrm]),
+            Instruction::ReadDebug {
+                number,
+                dst: reg(0, Width::Qword, false)
+            }
+        );
+        assert_eq!(
+            entry(&[0x0f, 0x23, modrm]),
+            Instruction::WriteDebug {
+                number,
+                source: reg(0, Width::Qword, false)
+            }
+        );
+    }
+}
+
+#[test]
+fn ltr_admits_a_word_register_not_an_unimplemented_memory_selector() {
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(
+        entry(&[0x0f, 0x00, 0xd8]),
+        Instruction::LoadTask {
+            source: reg(0, Width::Word, false)
+        }
+    );
+    assert_eq!(
+        admission(&[0x0f, 0x00, 0x18]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+    assert_eq!(
+        entry(&[0x0f, 0x00, 0xd0]),
+        Instruction::LoadLdt {
+            source: reg(0, Width::Word, false)
+        }
+    );
+}
+
+#[test]
+fn descriptor_table_stores_admit_the_actual_stack_address() {
+    use x86_system::shared::entry::Instruction;
+    for (modrm, idt) in [(0x44, false), (0x4c, true)] {
+        let Instruction::StoreTable {
+            address,
+            idt: actual,
+        } = entry(&[0x0f, 0x01, modrm, 0x24, 0x0e])
+        else {
+            panic!("missing descriptor-table store");
+        };
+        assert_eq!(actual, idt);
+        assert_eq!(address.base, Base::Register(Gpr::new(4).unwrap()));
+        assert_eq!(address.displacement, 14);
+    }
+}
+
+#[test]
+fn memory_push_admits_qword_rsp_and_rip_sources_only() {
+    use x86_system::shared::entry::Instruction;
+    for bytes in [&[0xff, 0x74, 0x24, 0x08][..], &[0xff, 0x35, 0, 0, 0, 0][..]] {
+        assert!(matches!(
+            entry(bytes),
+            Instruction::Push {
+                source: Operand::Memory {
+                    width: Width::Qword,
+                    ..
+                }
+            }
+        ));
+    }
+    assert_eq!(
+        admission(&[0x66, 0xff, 0x30]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+}
+
+#[test]
+fn rdtsc_admission_does_not_admit_rdtscp_or_lock_prefixes() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(entry(&[0x0f, 0x31]), Instruction::ReadTimestamp);
+    for bytes in [&[0x0f, 0x01, 0xf9][..], &[0xf0, 0x0f, 0x31][..]] {
+        assert!(matches!(
+            admission(bytes),
+            DecodeDecision::Unsupported | DecodeDecision::InvalidOpcode
+        ));
+    }
+}
+
+#[test]
 fn accumulator_sign_extensions_reuse_the_owned_source_and_destination_widths() {
     use x86_system::shared::entry::Instruction;
     for (bytes, source, destination) in [
@@ -1199,7 +1366,7 @@ fn unary_alu_keeps_width_high_byte_aliases_and_fs_address32() {
 }
 
 #[test]
-fn register_shift_counts_keep_cl_aliases_and_memory_shifts_unsupported() {
+fn shift_counts_keep_cl_aliases_for_register_and_memory_destinations() {
     use x86_system::memory_core::cpu_core::integer::Operation as Integer;
     use x86_system::shared::decode::DecodeDecision;
     for (prefix, width) in [
@@ -1231,7 +1398,10 @@ fn register_shift_counts_keep_cl_aliases_and_memory_shifts_unsupported() {
                 );
                 let opcode_index = prefix.len();
                 bytes[opcode_index + 1] &= 0x3f;
-                assert_eq!(admission(&bytes), DecodeDecision::Unsupported);
+                let (actual, destination, source) = alu(&bytes);
+                assert_eq!(actual, operation);
+                assert!(matches!(destination,Operand::Memory {width:w,..} if w==width));
+                assert_eq!(source, count);
             }
         }
     }
@@ -1239,10 +1409,10 @@ fn register_shift_counts_keep_cl_aliases_and_memory_shifts_unsupported() {
         alu(&[0x48, 0xd1, 0xe0]).2,
         Operand::Immediate(Immediate { value: 1, .. })
     ));
-    assert_eq!(
+    assert!(matches!(
         admission(&[0x48, 0xc1, 0x20, 0]),
-        DecodeDecision::Unsupported
-    );
+        DecodeDecision::Entry(_)
+    ));
 }
 
 #[test]
@@ -1422,7 +1592,6 @@ fn control_moves_indirect_jumps_and_prefix_frontiers_are_explicit() {
         &[0x0f, 0x22, 0xd0][..],
         &[0x44, 0x0f, 0x22, 0xc0][..],
         &[0x44, 0x0f, 0x20, 0xc0][..],
-        &[0x0f, 0x21, 0xc0][..],
         &[0x0f, 0x33][..],
         &[0xff, 0x28][..],
         &[0xf3, 0x48, 0x83, 0x28, 1][..],
@@ -2048,13 +2217,25 @@ fn locked_compare_exchange_memory_preserves_kernel_bytes_and_normalized_addresse
 }
 
 #[test]
-fn compare_exchange_rejects_unlocked_memory_repeat_hle_and_wider_atomic_families() {
+fn compare_exchange_admits_unlocked_memory_but_rejects_repeat_hle_and_wider_atomic_families() {
     use x86_system::shared::decode::DecodeDecision;
+    for (bytes, width) in [
+        (&[0x0f, 0xb0, 0x08][..], Width::Byte),
+        (&[0x66, 0x0f, 0xb1, 0x08][..], Width::Word),
+        (&[0x0f, 0xb1, 0x08][..], Width::Dword),
+        (&[0x48, 0x0f, 0xb1, 0x08][..], Width::Qword),
+    ] {
+        assert!(
+            matches!(entry(bytes),x86_system::shared::entry::Instruction::CompareExchange {
+            destination:Operand::Memory {width:w,..},source,
+        } if w==width && source==reg(1,width,false))
+        );
+    }
+    assert!(matches!(entry(&[0x65,0x40,0x0f,0xb0,0x37]),
+        x86_system::shared::entry::Instruction::CompareExchange {
+            destination:Operand::Memory {address,width:Width::Byte},source,
+        } if address.segment==Segment::Gs && source==reg(6,Width::Byte,false)));
     for bytes in [
-        &[0x0f, 0xb0, 0x08][..],
-        &[0x66, 0x0f, 0xb1, 0x08][..],
-        &[0x0f, 0xb1, 0x08][..],
-        &[0x48, 0x0f, 0xb1, 0x08][..],
         &[0x0f, 0xc7, 0x08][..],
         &[0x48, 0x0f, 0xc7, 0x08][..],
         &[0xf0, 0x0f, 0xc7, 0x08][..],
@@ -2353,7 +2534,6 @@ fn locked_alu_packets_reject_other_families_prefixes_and_inexact_lengths() {
         }
     }
     for bytes in [
-        &[0xf0, 0x0f, 0xc1, 0x08][..],
         &[0xf0, 0xf2, 0xff, 0x43, 0x58][..],
         &[0xf0, 0xf3, 0xff, 0x43, 0x58][..],
     ] {

@@ -320,12 +320,16 @@ impl SharedEventMachine {
                 self.finish_alu(operation,Some(dst),dst.read(&cpu.gpr),right,dst.width(),length)
             },
             Operand::Memory {address,width} => {
-                if !address.is_valid() || shift(operation) {
+                if !address.is_valid() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
                 let Some(right)=entry::scalar(cpu,source) else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
+                if shift(operation) && (matches!(operation,integer::Operation::Rol|integer::Operation::Ror)
+                    || right & (if width==Width::Qword {63u64} else {31u64})==0) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
                 let address=memory_address(operation,address,source,right,width);
                 let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
                 let task=MemoryTask::AluMemory {operation,source:right,width};

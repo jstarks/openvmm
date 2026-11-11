@@ -279,7 +279,7 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
             // Iced validated the full packet; these exact forms have no scalar operand packet.
             match encoding.bytes() {
                 [0x0f, 0x30] => DecodeDecision::Wrmsr,
-                [0xe8, a, b, c, d] => DecodeDecision::NearCall {
+                [0xe8, a, b, c, d] | [0x2e, 0xe8, a, b, c, d] => DecodeDecision::NearCall {
                     displacement: i32::from_le_bytes([*a, *b, *c, *d]),
                 },
                 _ => {
@@ -352,6 +352,21 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     let size = address_size(encoding.bytes());
     if instruction.mnemonic() == Mnemonic::Cmpxchg {
         return admit_compare_exchange(&instruction, encoding, size);
+    }
+    if instruction.mnemonic() == Mnemonic::Xadd {
+        if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
+            return None;
+        }
+        let destination = operand(&instruction, 0, Operation::Mov, size)?;
+        let Operand::Register(source) = operand(&instruction, 1, Operation::Mov, size)? else {
+            return None;
+        };
+        return matches!(destination,Operand::Memory {width,..} if width==source.width())
+            .then_some(EntryInstruction::ExchangeAdd {
+                destination,
+                source,
+                locked: instruction.has_lock_prefix(),
+            });
     }
     if matches!(
         instruction.mnemonic(),
@@ -446,6 +461,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     }
     let get = |index| operand(&instruction, index, Operation::Mov, size);
     match encoding.bytes() {
+        [0x0f, 0x31] => return Some(EntryInstruction::ReadTimestamp),
         [0x0f, 0x32] => return Some(EntryInstruction::ReadMsr),
         [0x0f, 0xa2] => return Some(EntryInstruction::Cpuid),
         [0x48, 0xcb] => return Some(EntryInstruction::FarReturn),
@@ -456,6 +472,10 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         _ => {}
     }
     match instruction.mnemonic() {
+        Mnemonic::Prefetchnta
+        | Mnemonic::Prefetcht0
+        | Mnemonic::Prefetcht1
+        | Mnemonic::Prefetcht2 => Some(EntryInstruction::Nop),
         Mnemonic::In | Mnemonic::Out => {
             use x86_system::shared::entry::Port;
             let write = instruction.mnemonic() == Mnemonic::Out;
@@ -694,6 +714,24 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                     IcedRegister::CR4 => Some(4),
                     _ => None,
                 };
+                if (IcedRegister::DR0..=IcedRegister::DR7).contains(&instruction.op1_register()) {
+                    let dst = register(instruction.op0_register())?;
+                    return (dst.width() == Width::Qword).then_some(EntryInstruction::ReadDebug {
+                        number: (instruction.op1_register() as u32 - IcedRegister::DR0 as u32)
+                            as u8,
+                        dst,
+                    });
+                }
+                if (IcedRegister::DR0..=IcedRegister::DR7).contains(&instruction.op0_register()) {
+                    let source = register(instruction.op1_register())?;
+                    return (source.width() == Width::Qword).then_some(
+                        EntryInstruction::WriteDebug {
+                            number: (instruction.op0_register() as u32 - IcedRegister::DR0 as u32)
+                                as u8,
+                            source,
+                        },
+                    );
+                }
                 if let Some(number) = control {
                     let dst = register(instruction.op0_register())?;
                     return (dst.width() == Width::Qword)
@@ -764,11 +802,35 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                 idt: instruction.mnemonic() == Mnemonic::Lidt,
             })
         }
+        Mnemonic::Sgdt | Mnemonic::Sidt => Some(EntryInstruction::StoreTable {
+            address: address(&instruction, size)?,
+            idt: instruction.mnemonic() == Mnemonic::Sidt,
+        }),
+        Mnemonic::Ltr => {
+            let Operand::Register(source) = get(0)? else {
+                return None;
+            };
+            Some(EntryInstruction::LoadTask {
+                source: Register::new(source.gpr(), Width::Word, false)?,
+            })
+        }
+        Mnemonic::Lldt => {
+            let Operand::Register(source) = get(0)? else {
+                return None;
+            };
+            Some(EntryInstruction::LoadLdt {
+                source: Register::new(source.gpr(), Width::Word, false)?,
+            })
+        }
         Mnemonic::Push => {
             let source = get(0)?;
             match source {
                 Operand::Register(reg) if reg.width() == Width::Qword => {}
                 Operand::Immediate(imm) if imm.width == Width::Qword => {}
+                Operand::Memory {
+                    width: Width::Qword,
+                    ..
+                } => {}
                 _ => return None,
             }
             Some(EntryInstruction::Push { source })
@@ -924,7 +986,7 @@ fn admit_compare_exchange(
             if !instruction.has_lock_prefix()
                 && size == AddressSize::Bits64
                 && instruction.segment_prefix() == IcedRegister::None => {}
-        Operand::Memory { .. } if instruction.has_lock_prefix() => {}
+        Operand::Memory { .. } => {}
         _ => return None,
     }
     Some(EntryInstruction::CompareExchange {
@@ -1001,8 +1063,13 @@ fn alu_entry(
             | integer::Operation::Rol
             | integer::Operation::Ror
     ) {
-        // Memory shifts need a separate zero-count/fault-ordering contract.
-        if !matches!(destination, Operand::Register(_)) {
+        if !matches!(destination, Operand::Register(_))
+            && !(matches!(destination, Operand::Memory { .. })
+                && matches!(
+                    operation,
+                    integer::Operation::Shl | integer::Operation::Shr | integer::Operation::Sar
+                ))
+        {
             return None;
         }
         match source {

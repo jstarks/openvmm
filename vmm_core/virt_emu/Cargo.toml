@@ -35,6 +35,10 @@ vmotherboard.workspace = true
 serial_16550.workspace = true
 serial_16550_resources.workspace = true
 serial_core.workspace = true
+chipset.workspace = true
+chipset_device.workspace = true
+missing_dev.workspace = true
+local_clock = { workspace = true, features = ["inspect"] }
 
 [build-dependencies]
 build_rs_guest_arch.workspace = true

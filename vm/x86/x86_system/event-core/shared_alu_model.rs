@@ -63,10 +63,13 @@ pub open spec fn execute(s:State,operation:integer::Operation,destination:Operan
             }}
         },
         Operand::Memory {address,width}=>{
-            if !address.valid() || shift(operation) {entry::unsupported(s)}
+            if !address.valid() {entry::unsupported(s)}
             else {match entry::scalar(cpu,source) {
                 None=>entry::unsupported(s),
                 Some(right)=>{
+                    if shift(operation) && (operation==integer::Operation::Rol || operation==integer::Operation::Ror
+                        || right & (if width==Width::Qword {63u64} else {31u64})==0) {entry::unsupported(s)}
+                    else {
                     let adjusted=memory_address(operation,address,source,right,width);
                     let linear=entry::linear(s,adjusted,length);
                     let task=MemoryTask::AluMemory {operation,source:right,width};
@@ -74,6 +77,7 @@ pub open spec fn execute(s:State,operation:integer::Operation,destination:Operan
                     else if !entry::supported_access(linear,width) {entry::unsupported(s)}
                     else {(State {core:c::boundary_modify(s.core,linear,operation,right,cpu.flags,width).0,
                         phase:Phase::EntryMemory {address:linear,length,task},..s},Tick::Pending)}
+                    }
                 },
             }}
         },

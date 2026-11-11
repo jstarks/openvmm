@@ -39,10 +39,12 @@ pub open spec fn execute_move(s: State, width: Width, length: u8) -> (State, Tic
     if length == 0 || length > 15 { entry::unsupported(s) }
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
-    } else if !e::flags_supported(cpu.flags) || cpu.flags & 0x200u64 != 0 {
+    } else if !e::flags_supported(cpu.flags) || (cpu.flags & 0x200u64 != 0 && s.shadow) {
         entry::unsupported(s)
     } else if cpu.gpr[1] == 0 {
         entry::retire(s, cpu, length, false, false)
+    } else if cpu.flags&0x200u64!=0 && s.pending is Some {
+        entry(s,Event::External(s.pending.unwrap()))
     } else {
         entry::memory(s, cpu.gpr[6] as u64, width, WordAccess::Read,
             length, MemoryTask::RepeatRead { width })
@@ -193,10 +195,12 @@ pub open spec fn execute(s: State, width: Width, length: u8) -> (State, Tick) {
     if length == 0 || length > 15 { entry::unsupported(s) }
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
-    } else if !e::flags_supported(cpu.flags) || cpu.flags & 0x200u64 != 0 {
+    } else if !e::flags_supported(cpu.flags) || (cpu.flags & 0x200u64 != 0 && s.shadow) {
         entry::unsupported(s)
     } else if cpu.gpr[1] == 0 {
         entry::retire(s, cpu, length, false, false)
+    } else if cpu.flags&0x200u64!=0 && s.pending is Some {
+        entry(s,Event::External(s.pending.unwrap()))
     } else {
         entry::memory(s, cpu.gpr[7] as u64, width, WordAccess::Write(cpu.gpr[0] as u64),
             length, MemoryTask::RepeatStore { width })

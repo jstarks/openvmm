@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use super::system::EntryMsrs;
 use vstd::prelude::*;
 
 verus! {
@@ -47,6 +48,53 @@ pub mod model {
     }
     pub open spec fn read_efer(sce: bool, nxe: bool) -> u64 {
         0x500u64 | (if sce { 1u64 } else { 0u64 }) | if nxe { 0x800u64 } else { 0u64 }
+    }
+    pub open spec fn read_entry(s:EntryMsrs,number:u64)->Option<u64> {
+        match number {
+            0xc0000081=>Some(s.star),0xc0000082=>Some(s.lstar),0xc0000083=>Some(s.cstar),
+            0xc0000084=>Some(s.sfmask),0x174=>Some(s.sysenter_cs),0x175=>Some(s.sysenter_esp),
+            0x176=>Some(s.sysenter_eip),0xc0000102=>Some(s.kernel_gs_base),_=>None,
+        }
+    }
+    pub open spec fn write_entry(s:EntryMsrs,number:u64,value:u64)->Option<EntryMsrs> {
+        if (number==0xc0000082 || number==0xc0000083 || number==0xc0000102)
+            && !super::super::system::model::canonical(value) {None}
+        else {match number {
+            0xc0000081=>Some(EntryMsrs {star:value,..s}),
+            0xc0000082=>Some(EntryMsrs {lstar:value,..s}),
+            0xc0000083=>Some(EntryMsrs {cstar:value,..s}),
+            0xc0000084=>if value>0xffff_ffff {None} else {Some(EntryMsrs {sfmask:value,..s})},
+            0x174=>if value>0xffff {None} else {Some(EntryMsrs {sysenter_cs:value,..s})},
+            0x175=>Some(EntryMsrs {sysenter_esp:value&0xffff_ffffu64,..s}),
+            0x176=>Some(EntryMsrs {sysenter_eip:value&0xffff_ffffu64,..s}),
+            0xc0000102=>Some(EntryMsrs {kernel_gs_base:value,..s}),_=>None,
+        }}
+    }
+}
+
+pub fn read_entry(s:EntryMsrs,number:u64)->(out:Option<u64>)
+    ensures out==model::read_entry(s,number),
+{
+    match number {
+        0xc0000081=>Some(s.star),0xc0000082=>Some(s.lstar),0xc0000083=>Some(s.cstar),
+        0xc0000084=>Some(s.sfmask),0x174=>Some(s.sysenter_cs),0x175=>Some(s.sysenter_esp),
+        0x176=>Some(s.sysenter_eip),0xc0000102=>Some(s.kernel_gs_base),_=>None,
+    }
+}
+pub fn write_entry(s:EntryMsrs,number:u64,value:u64)->(out:Option<EntryMsrs>)
+    ensures out==model::write_entry(s,number,value),
+{
+    if (number==0xc0000082 || number==0xc0000083 || number==0xc0000102)
+        && !(value<0x8000_0000_0000 || value>=0xffff_8000_0000_0000) {return None;}
+    match number {
+        0xc0000081=>Some(EntryMsrs {star:value,..s}),
+        0xc0000082=>Some(EntryMsrs {lstar:value,..s}),
+        0xc0000083=>Some(EntryMsrs {cstar:value,..s}),
+        0xc0000084=>if value>0xffff_ffff {None} else {Some(EntryMsrs {sfmask:value,..s})},
+        0x174=>if value>0xffff {None} else {Some(EntryMsrs {sysenter_cs:value,..s})},
+        0x175=>Some(EntryMsrs {sysenter_esp:value&0xffff_ffff,..s}),
+        0x176=>Some(EntryMsrs {sysenter_eip:value&0xffff_ffff,..s}),
+        0xc0000102=>Some(EntryMsrs {kernel_gs_base:value,..s}),_=>None,
     }
 }
 

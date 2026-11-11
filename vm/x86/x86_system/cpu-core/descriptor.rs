@@ -47,6 +47,47 @@ pub mod model {
     pub open spec fn load_code(word: u64, selector: u16) -> Option<SegmentState> {
         if admitted_code(word, selector) { Some(image(word, selector)) } else { None }
     }
+    pub open spec fn task_image(low:u64,high:u64,selector:u16)->SegmentState {
+        SegmentState {base:base(low)|((high&0xffff_ffffu64)<<32),
+            limit:limit(low),selector,attributes:0x8b}
+    }
+    pub open spec fn load_task(low:u64,high:u64,selector:u16)->Option<SegmentState> {
+        let image=task_image(low,high,selector);
+        if selector!=0 && selector&7u16==0 && attributes(low)==0x89
+            && high>>32==0 && system::model::supported_task(image) {Some(image)}
+        else {None}
+    }
+}
+
+/// Bounded present DPL0 available 64-bit TSS, with byte granularity.
+pub fn load_task(low:u64,high:u64,selector:u16)->(out:Option<SegmentState>)
+    ensures out==model::load_task(low,high,selector),
+        out.is_some() ==> system::model::supported_task(out.unwrap()),
+{
+    let base=((low>>16)&0x00ff_ffff)|((low>>32)&0xff00_0000)|((high&0xffff_ffff)<<32);
+    let raw=(low&0xffff)|((low>>32)&0xf0000);
+    proof {
+        assert(raw<=0xfffffu64) by(bit_vector)
+            requires raw==(low&0xffffu64)|((low>>32)&0xf0000u64);
+        assert(((raw<<12)|0xfffu64)<=0xffff_ffffu64) by(bit_vector)
+            requires raw<=0xfffffu64;
+        assert((((low>>40)&0xffu64)|((low>>40)&0xf000u64))<=0xffffu64) by(bit_vector);
+    }
+    let limit=if low&(1u64<<55)!=0 {((raw<<12)|0xfff) as u32} else {raw as u32};
+    let attributes=(((low>>40)&0xff)|((low>>40)&0xf000)) as u16;
+    proof {
+        assert(base==model::task_image(low,high,selector).base) by(bit_vector)
+            requires base==((low>>16)&0x00ff_ffffu64)|((low>>32)&0xff00_0000u64)|((high&0xffff_ffffu64)<<32);
+        assert(limit==model::limit(low)) by(bit_vector)
+            requires raw==(low&0xffffu64)|((low>>32)&0xf0000u64),
+                limit==if low&(1u64<<55)!=0 {((raw<<12)|0xfffu64) as u32} else {raw as u32};
+        assert(attributes==model::attributes(low)) by(bit_vector)
+            requires attributes==(((low>>40)&0xffu64)|((low>>40)&0xf000u64)) as u16;
+    }
+    let image=SegmentState {base,limit,selector,attributes:0x8b};
+    if selector==0 || selector&7!=0 || attributes!=0x89 || high>>32!=0
+        || !super::system::supported_task(image) {return None;}
+    Some(image)
 }
 
 /// Bounded CPL0 nonconforming readable/accessed long code, L=G=1,

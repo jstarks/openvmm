@@ -20,12 +20,15 @@ pub open spec fn transition(s: SystemState, rip: u64, flags: u64,
     rax: u64, rcx: u64, rdx: u64, length: u8) -> (SystemState, u64, Status) {
     if length != 2 { (s, rip, Status::InvalidLength) }
     else if flags & 0x10100u64 != 0 { (s, rip, Status::DebugRequired) }
-    else if rcx as int % 0x1_0000_0000int != 0xc0000101int {
+    else if rcx as int % 0x1_0000_0000int != 0xc0000101int
+        && rcx as int % 0x1_0000_0000int != 0xc0000100int {
         (s, rip, Status::UnsupportedMsr)
     } else if !system::model::canonical(value(rax, rdx)) {
         (s, rip, Status::GeneralProtection)
     } else {
-        (SystemState { gs: SegmentState { base: value(rax, rdx), ..s.gs }, ..s },
+        (if rcx as int % 0x1_0000_0000int==0xc0000100int {
+            SystemState {fs:SegmentState {base:value(rax,rdx),..s.fs},..s}
+        } else {SystemState { gs: SegmentState { base: value(rax, rdx), ..s.gs }, ..s }},
             ((rip as int + 2) % 0x1_0000_0000_0000_0000int) as u64, Status::Advanced)
     }
 }
@@ -40,12 +43,15 @@ pub fn commit(s: &mut SystemState, rip: &mut u64, flags: u64,
 {
     if length != 2 { return Status::InvalidLength; }
     if flags & 0x10100u64 != 0 { return Status::DebugRequired; }
-    if rcx % 0x1_0000_0000u64 != 0xc0000101 { return Status::UnsupportedMsr; }
+    if rcx % 0x1_0000_0000u64 != 0xc0000101 && rcx % 0x1_0000_0000u64 != 0xc0000100 {
+        return Status::UnsupportedMsr;
+    }
     let base = (rdx % 0x1_0000_0000u64) * 0x1_0000_0000u64 + rax % 0x1_0000_0000u64;
     if base >= 0x8000_0000_0000 && base < 0xffff_8000_0000_0000 {
         return Status::GeneralProtection;
     }
-    s.gs.base = base;
+    if rcx % 0x1_0000_0000u64==0xc0000100 {s.fs.base=base;}
+    else {s.gs.base = base;}
     *rip = (*rip).wrapping_add(2);
     Status::Advanced
 }

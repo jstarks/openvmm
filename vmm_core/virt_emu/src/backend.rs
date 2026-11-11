@@ -26,6 +26,7 @@ use virt::{
     PartitionConfig, PlatformInfo, Processor, ProtoPartition, ProtoPartitionConfig,
     ProtoPartitionIsolation, StopVp, VpHaltReason, VpIndex,
 };
+use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
 use x86_system::memory_core::cpu_core::system::{self, SegmentState, SystemState};
 use x86_system::memory_core::shared::{Exchange, PhysicalRam};
 use x86_system::mmu_core::shared::RunError;
@@ -190,6 +191,7 @@ pub struct EmuHypervisor;
 /// Validated profile awaiting existing backing.
 pub struct EmuProtoPartition {
     caps: Arc<PartitionCapabilities>,
+    clock: VmTimeSource,
 }
 
 /// Partition control and bounded external event ingress.
@@ -214,6 +216,7 @@ pub struct EmuProcessorBinder {
     ram: Arc<Ram>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
+    clock: VmTimeAccess,
 }
 
 /// Bound access to that CPU context and the real VP run loop.
@@ -222,6 +225,7 @@ pub struct EmuProcessor<'a> {
     ram: Arc<Ram>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
+    clock: &'a VmTimeAccess,
 }
 
 /// Progress from successfully returned core batches, not transport-error totals.
@@ -279,6 +283,7 @@ impl Hypervisor for EmuHypervisor {
         )?;
         Ok(EmuProtoPartition {
             caps: Arc::new(caps),
+            clock: config.vmtime.clone(),
         })
     }
 }
@@ -323,6 +328,7 @@ impl ProtoPartition for EmuProtoPartition {
             control: control.clone(),
         };
         let binder = EmuProcessorBinder {
+            clock: self.clock.access("emu-tsc"),
             state: VpState {
                 core: None,
                 initial_system: Some(SystemState::empty()),
@@ -410,6 +416,7 @@ impl BindProcessor for EmuProcessorBinder {
     type Error = Error;
     fn bind(&mut self) -> Result<EmuProcessor<'_>, Error> {
         Ok(EmuProcessor {
+            clock: &self.clock,
             state: &mut self.state,
             ram: self.ram.clone(),
             caps: self.caps.clone(),
@@ -489,6 +496,14 @@ impl Processor for EmuProcessor<'_> {
             };
             self.state.progress = CompletedBatchProgress { retired, delivered };
             match batch.stop {
+                BatchStop::Timestamp { sequence } => {
+                    let ticks = self.clock.now().as_100ns().wrapping_mul(
+                        x86_system::memory_core::cpu_core::profile::TSC_HZ / 10_000_000,
+                    );
+                    if !core.complete_timestamp(sequence, ticks) {
+                        return Err(dev.fatal_error(Box::new(Error::Completion)));
+                    }
+                }
                 BatchStop::Decode(input) => {
                     if !core.complete_decode(input.sequence, x86_decode::admit(input)) {
                         return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));

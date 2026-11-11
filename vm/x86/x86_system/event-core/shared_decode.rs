@@ -176,6 +176,9 @@ impl SharedEventMachine {
                 let Some(mut system) = self.system else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
+                if memory_core::cpu_core::privilege::read_entry(system.entry,self.core.cpu().gpr[1]&0xffff_ffff).is_some() {
+                    return self.write_entry_msr(input.length);
+                }
                 let mut cpu = self.core.cpu();
                 cpu.flags &= !0x10000u64;
                 let status = gsbase::commit(&mut system, &mut cpu.rip, cpu.flags,

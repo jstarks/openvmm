@@ -139,7 +139,7 @@ impl SharedMachine {
             spec::boundary_span(old(self)@, address, word, size),
     {
         if !matches!(self.phase, CpuPhase::Boundary) { return false; }
-        self.mmu.begin_span(address, word, size)
+        self.mmu.begin_span(address, word, size,false)
     }
 
     pub(crate) fn boundary_modify(&mut self, address: u64,
@@ -204,7 +204,7 @@ impl SharedMachine {
                 let address = self.cpu.gpr[base as usize];
                 let request = match op { memory_core::Op::Store { reg, .. } =>
                     WordAccess::Write(self.cpu.gpr[reg as usize]), _ => WordAccess::Read };
-                let _accepted = self.mmu.begin_word(address, request, self.user);
+                let _accepted = self.mmu.begin_span(address, request,8,self.user);
                 assert(_accepted);
                 self.phase = CpuPhase::Data { op };
                 Tick::Pending

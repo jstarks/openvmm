@@ -315,6 +315,7 @@ pub open spec fn advance(s: State) -> (State, Tick) {
         Phase::Decode { input } => (s, Tick::Decode(input)),
         Phase::Admitted { .. } => decode::admitted(s),
         Phase::PortIo { .. } => entry::finish_port_io(s),
+        Phase::Timestamp {..}=>entry::finish_timestamp(s),
         Phase::DecodeFetch { input } => match m::request(s.core.mmu) {
             Request::Complete(report) => match report.result {
                 MmuResult::Success(value) => decode::append(s, value),

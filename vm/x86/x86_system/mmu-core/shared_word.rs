@@ -138,16 +138,16 @@ impl SharedMmu {
         accepted
     }
 
-    pub(crate) fn begin_span(&mut self, va: u64, request: WordAccess, size: u8) -> (accepted: bool)
+    pub(crate) fn begin_span(&mut self, va: u64, request: WordAccess, size: u8,user:bool) -> (accepted: bool)
         requires old(self).invariant(), size == 1 || size == 2 || size == 4 || size == 8,
         ensures final(self).invariant(), accepted == !spec::active(old(self)@.phase),
             final(self)@ == if accepted {
                 spec::access_begin(old(self)@, va, word_model::request(request),
-                    false, Some(request), size, true)
+                    user, Some(request), size, true)
             } else { old(self)@ },
     {
         let access = match request { WordAccess::Read => Access::Read, WordAccess::Write(_) => Access::Write(0) };
-        self.begin_access_mode(va, access, false, Some(request), size, true)
+        self.begin_access_mode(va, access, user, Some(request), size, true)
     }
 
     fn size_mask(&self) -> (mask: u64)

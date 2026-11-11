@@ -23,11 +23,14 @@ impl SharedEventMachine {
         if cpu.flags & 0x100 != 0 {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
-        if !flags_supported(cpu.flags) || cpu.flags & 0x200 != 0 {
+        if !flags_supported(cpu.flags) || (cpu.flags & 0x200 != 0 && self.shadow) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         if cpu.gpr[1] == 0 {
             return self.retire_entry(cpu, length, false, false);
+        }
+        if cpu.flags&0x200!=0 {
+            if let Some(vector)=self.pending {return self.start_entry(Event::External(vector));}
         }
         self.entry_memory(cpu.gpr[6], width, WordAccess::Read, length,
             MemoryTask::RepeatRead { width })
@@ -95,12 +98,15 @@ impl SharedEventMachine {
         if cpu.flags & 0x100 != 0 {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
-        // Interruptible repetitions and their inhibition rules are outside this profile.
-        if !flags_supported(cpu.flags) || cpu.flags & 0x200 != 0 {
+        // Repetitions following STI or MOV SS remain outside this profile.
+        if !flags_supported(cpu.flags) || (cpu.flags & 0x200 != 0 && self.shadow) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         if cpu.gpr[1] == 0 {
             return self.retire_entry(cpu, length, false, false);
+        }
+        if cpu.flags&0x200!=0 {
+            if let Some(vector)=self.pending {return self.start_entry(Event::External(vector));}
         }
         self.entry_memory(cpu.gpr[7], width, WordAccess::Write(cpu.gpr[0]), length,
             MemoryTask::RepeatStore { width })

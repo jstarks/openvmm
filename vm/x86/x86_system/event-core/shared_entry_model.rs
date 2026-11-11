@@ -43,6 +43,47 @@ pub open spec fn linear(s: State, address: Address, length: u8) -> u64 {
 pub open spec fn unsupported(s: State) -> (State, Tick) {
     stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported))
 }
+pub open spec fn exchange_add(s:State,destination:Operand,source:operand::Register,locked:bool,length:u8)->(State,Tick) {
+    if !source.valid() || !(destination is Memory) {unsupported(s)}
+    else if destination->width!=source@.width {unsupported(s)}
+    else {
+        let result=if locked {entry::locked_alu(s,integer::Operation::Add,destination,Operand::Register(source),length)}
+            else {alu::execute(s,integer::Operation::Add,destination,Operand::Register(source),length)};
+        match result.0.phase {
+            Phase::EntryMemory {address,length,..}=>(State {phase:Phase::EntryMemory {
+                address,length,task:MemoryTask::ExchangeAdd {register:source,locked}},..result.0},result.1),
+            _=>result,
+        }
+    }
+}
+pub open spec fn load_task(s:State,source:operand::Register,length:u8)->(State,Tick) {
+    let selector=operand::model::read(registers(s.core.cpu),source) as u16;
+    if !source.valid() || source@.width!=Width::Word || s.system is None {unsupported(s)}
+    else if selector==0 || selector&7u16!=0 || selector as int+15>s.tables.gdt_limit as int
+        || s.tables.gdt_base as int+selector as int+15>u64::MAX {
+        stop(s,EventDiagnostic::Descriptor(Stage::Stack))
+    } else {memory(s,(s.tables.gdt_base+selector) as u64,Width::Qword,WordAccess::Read,length,
+        MemoryTask::TaskLow {selector})}
+}
+pub open spec fn timestamp(s:State,length:u8)->(State,Tick) {
+    if profile::target(1,0)[3]&16u32==0 {entry(s,Event::InvalidOpcode)}
+    else {(State {phase:Phase::Timestamp {sequence:s.decode_sequence,length,value:None},..s},Tick::Pending)}
+}
+pub open spec fn complete_timestamp(s:State,sequence:u64,clock:u64)->(State,bool) {
+    match s.phase {
+        Phase::Timestamp {sequence:pending,length,value:None} if pending==sequence=>
+            (State {phase:Phase::Timestamp {sequence,length,value:Some(clock)},..s},true),
+        _=>(s,false),
+    }
+}
+pub open spec fn finish_timestamp(s:State)->(State,Tick) {
+    match s.phase {
+        Phase::Timestamp {length,value:Some(value),..}=>retire(s,model::State {
+            gpr:s.core.cpu.gpr.update(0,(value as u32) as int).update(2,(value>>32) as int),
+            ..s.core.cpu},length,false,false),
+        _=>(s,Tick::Waiting),
+    }
+}
 pub open spec fn port_io(s:State,port:Port,width:Width,write:bool,length:u8)->(State,Tick) {
     if width==Width::Qword {unsupported(s)} else {
         let port=match port {Port::Dx=>s.core.cpu.gpr[2] as u16,Port::Immediate(port)=>port as u16};
@@ -169,9 +210,19 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
+        Instruction::ReadTimestamp=>timestamp(s,length),
+        Instruction::LoadTask {source}=>load_task(s,source,length),
+        Instruction::LoadLdt {source}=>{
+            if s.system is None || !source.valid() || source@.width!=Width::Word
+                || operand::model::read(registers(cpu),source)!=0 {unsupported(s)}
+            else {retire(State {system:Some(super::super::memory_core::cpu_core::system::SystemState {
+                ldtr:super::super::memory_core::cpu_core::system::NULL_SEGMENT,
+                ..s.system.unwrap()}),..s},cpu,length,false,false)}
+        },
         Instruction::PortIo {port,width,write}=>port_io(s,port,width,write,length),
         Instruction::CompareExchange {destination,source}=>compare_exchange(s,destination,source,length),
         Instruction::LockedAlu {operation,destination,source}=>locked_alu(s,operation,destination,source,length),
+        Instruction::ExchangeAdd {destination,source,locked}=>exchange_add(s,destination,source,locked,length),
         Instruction::Scan {dst,source,reverse}=>alu::scan(s,dst,source,reverse,length),
         Instruction::ReadSegment {segment,destination}=>match s.system {
             None=>unsupported(s),
@@ -322,7 +373,8 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                 retire(s,model::State {gpr:gpr.map(|i:int,v:u64|v as int),flags:result.flags,..cpu},length,false,false)
             }
         },
-        Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr =>
+        Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr
+            | Instruction::ReadDebug {..} | Instruction::WriteDebug {..} =>
             privilege::execute(s,instruction,length),
         Instruction::IndirectJump {source} | Instruction::IndirectCall {source}=>match source {
             Operand::Memory {address,width}=>{
@@ -370,11 +422,25 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                     Width::Qword, WordAccess::Read, length, MemoryTask::Segment { segment: dst, selector }) }
             }
         },
+        Instruction::StoreTable {address,idt}=>{
+            let at=linear(s,address,length);
+            if !address.valid() || at>u64::MAX-9 || !mmu_model::canonical(at as int)
+                || !mmu_model::canonical(at as int+9) {unsupported(s)}
+            else if at%4096>4086 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage))}
+            else {memory(s,at,Width::Word,WordAccess::Write(
+                if idt {s.tables.idt_limit as u64} else {s.tables.gdt_limit as u64}),length,
+                MemoryTask::StoreTableBase {base:if idt {s.tables.idt_base} else {s.tables.gdt_base}})}
+        },
         Instruction::Push { source } => {
-            if scalar(cpu, source) is None || cpu.gpr[4] < 8 || cpu.gpr[4] % 8 != 0 { unsupported(s) }
-            else { memory(s, (cpu.gpr[4] - 8) as u64, Width::Qword,
-                WordAccess::Write(scalar(cpu, source).unwrap()), length,
-                MemoryTask::Push { stack: (cpu.gpr[4] - 8) as u64 }) }
+            if cpu.gpr[4] < 8 || cpu.gpr[4] % 8 != 0 { unsupported(s) }
+            else if let Operand::Memory {address,width}=source {
+                if !address.valid() || width!=Width::Qword {unsupported(s)}
+                else {memory(s,linear(s,address,length),Width::Qword,WordAccess::Read,length,
+                    MemoryTask::PushValue {stack:(cpu.gpr[4]-8) as u64})}
+            } else if scalar(cpu,source) is None {unsupported(s)}
+            else {memory(s,(cpu.gpr[4]-8) as u64,Width::Qword,
+                WordAccess::Write(scalar(cpu,source).unwrap()),length,
+                MemoryTask::Push {stack:(cpu.gpr[4]-8) as u64})}
         },
         Instruction::Return | Instruction::Leave => {
             let stack = if instruction is Return { cpu.gpr[4] as u64 } else { cpu.gpr[5] as u64 };
@@ -396,6 +462,42 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::ExchangeAdd {register:source,locked}=>{
+            if !source.valid() {unsupported(s)} else {
+                let result=integer::model::evaluate(integer::Operation::Add,value,
+                    operand::model::read(registers(cpu),source),source@.width,cpu.flags);
+                retire(s,model::State {gpr:operand::model::write(registers(cpu),source,value)
+                    .map(|i:int,v:u64|v as int),flags:result.flags,..cpu},length,false,locked)
+            }
+        },
+        MemoryTask::TaskLow {selector}=>{
+            if address>u64::MAX-8 {unsupported(s)}
+            else {memory(s,(address+8) as u64,Width::Qword,WordAccess::Read,length,
+                MemoryTask::TaskHigh {selector,low:value})}
+        },
+        MemoryTask::TaskHigh {selector,low}=>{
+            match descriptor::model::load_task(low,value,selector) {
+                None=>stop(s,EventDiagnostic::Descriptor(Stage::Stack)),
+                Some(image)=>{
+                    if address<8 {unsupported(s)}
+                    else {
+                        let at=(address-8) as u64;
+                        let result=c::boundary_compare_exchange(s.core,at,low,low|(1u64<<41),Width::Qword);
+                        if !result.1 {unsupported(s)}
+                        else {(State {core:result.0,phase:Phase::EntryMemory {address:at,length,
+                            task:MemoryTask::TaskBusy {image,low}},..s},Tick::Pending)}
+                    }
+                },
+            }
+        },
+        MemoryTask::TaskBusy {image,low}=>{
+            if value!=low {memory(s,address,Width::Qword,WordAccess::Read,length,
+                MemoryTask::TaskLow {selector:image.selector})}
+            else if s.system is None || !super::super::memory_core::cpu_core::system::model::supported_task(image) {
+                unsupported(s)
+            } else {retire(State {system:Some(super::super::memory_core::cpu_core::system::SystemState {
+                tr:image,..s.system.unwrap()}),..s},cpu,length,false,false)}
+        },
         MemoryTask::Scan {dst,reverse}=>alu::scan_value(s,dst,value,reverse,length),
         MemoryTask::LockedAlu {operation,source,width}=>{
             let result=integer::model::evaluate(operation,value,source,width,cpu.flags);
@@ -501,6 +603,12 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
         },
         MemoryTask::Push { stack } => retire(s, model::State {
             gpr: cpu.gpr.update(4, stack as int), ..cpu }, length, false, false),
+        MemoryTask::StoreTableBase {base}=>{
+            if address>u64::MAX-2 {unsupported(s)}
+            else {memory(s,(address+2) as u64,Width::Qword,WordAccess::Write(base),length,MemoryTask::Store)}
+        },
+        MemoryTask::PushValue {stack}=>memory(s,stack,Width::Qword,WordAccess::Write(value),length,
+            MemoryTask::Push {stack}),
         MemoryTask::Return { stack } => {
             if stack as int + 8 > u64::MAX || !mmu_model::canonical(value as int) { unsupported(s) }
             else { retire(s, model::State { gpr: cpu.gpr.update(4, stack as int + 8),

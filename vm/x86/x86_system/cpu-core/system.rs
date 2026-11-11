@@ -26,7 +26,18 @@ pub const DEFAULT_PAT: u64 = 0x0007_0406_0007_0406;
 pub const FIXED_WB: u64 = 0x0606_0606_0606_0606;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub struct EntryMsrs {
+    pub star:u64,pub lstar:u64,pub cstar:u64,pub sfmask:u64,
+    pub sysenter_cs:u64,pub sysenter_esp:u64,pub sysenter_eip:u64,pub kernel_gs_base:u64,
+}
+pub const EMPTY_ENTRY_MSRS:EntryMsrs=EntryMsrs {
+    star:0,lstar:0,cstar:0,sfmask:0,sysenter_cs:0,sysenter_esp:0,sysenter_eip:0,kernel_gs_base:0,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
 pub struct SystemState {
+    pub entry:EntryMsrs,
+    pub dr0:u64,pub dr1:u64,pub dr2:u64,pub dr3:u64,
     pub cs: SegmentState, pub ss: SegmentState, pub ds: SegmentState, pub es: SegmentState,
     pub fs: SegmentState, pub gs: SegmentState, pub tr: SegmentState, pub ldtr: SegmentState,
     pub efer_sce: bool,
@@ -69,6 +80,10 @@ pub mod model {
         s == NULL_SEGMENT || (s.base == 0 && s.limit == 0xffff
             && s.selector == 0 && s.attributes == attributes)
     }
+    pub open spec fn supported_task(s:SegmentState)->bool {
+        unused(s,0x8b) || (s.selector!=0 && s.selector&7u16==0 && canonical(s.base)
+            && 0x67<=s.limit<=0xfffff && s.attributes==0x8b)
+    }
     pub open spec fn fixed_value(def: u64, index: int) -> u64 {
         if def == 0xc00 && index < 2 { FIXED_WB } else { 0u64 }
     }
@@ -81,13 +96,13 @@ pub mod model {
         supported_code(s.cs) && supported_data_or_null(s.ss) && supported_data_or_null(s.ds)
         && supported_data_or_null(s.es) && data_or_null(s.fs) && data_or_null(s.gs)
         && canonical(s.fs.base) && canonical(s.gs.base)
-        && unused(s.tr, 0x8b) && unused(s.ldtr, 0x82)
+        && supported_task(s.tr) && unused(s.ldtr, 0x82)
         && s.pat == DEFAULT_PAT
         && s.cr0_extra & !0x40022u64 == 0 && s.cr4_extra & !0x90u64 == 0
         && mtrrs_supported(s.mtrr_def, s.mtrr_fixed@, s.mtrr_variable@)
     }
     pub open spec fn empty() -> SystemState {
-        SystemState { cs: NULL_SEGMENT, ss: NULL_SEGMENT, ds: NULL_SEGMENT, es: NULL_SEGMENT,
+        SystemState {entry:EMPTY_ENTRY_MSRS,dr0:0,dr1:0,dr2:0,dr3:0, cs: NULL_SEGMENT, ss: NULL_SEGMENT, ds: NULL_SEGMENT, es: NULL_SEGMENT,
             fs: NULL_SEGMENT, gs: NULL_SEGMENT, tr: NULL_SEGMENT, ldtr: NULL_SEGMENT,
             efer_sce: false, cr0_extra: 0, cr4_extra: 0, pat: DEFAULT_PAT, mtrr_def: 0,
             mtrr_fixed: [0u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -183,12 +198,20 @@ fn unused(s: SegmentState, attributes: u16) -> (out: bool)
         && s.selector == 0 && s.attributes == attributes)
 }
 
+pub fn supported_task(s:SegmentState)->(out:bool)
+    ensures out==model::supported_task(s),
+{
+    unused(s,0x8b) || (s.selector!=0 && s.selector&7==0
+        && (s.base<0x8000_0000_0000 || s.base>=0xffff_8000_0000_0000)
+        && s.limit>=0x67 && s.limit<=0xfffff && s.attributes==0x8b)
+}
+
 impl SystemState {
     /// An incomplete import buffer, not an architectural reset CPU image.
     pub fn empty() -> (out: Self)
         ensures out == model::empty(),
     {
-        let out = Self { cs: NULL_SEGMENT, ss: NULL_SEGMENT, ds: NULL_SEGMENT, es: NULL_SEGMENT,
+        let out = Self {entry:EMPTY_ENTRY_MSRS,dr0:0,dr1:0,dr2:0,dr3:0, cs: NULL_SEGMENT, ss: NULL_SEGMENT, ds: NULL_SEGMENT, es: NULL_SEGMENT,
             fs: NULL_SEGMENT, gs: NULL_SEGMENT, tr: NULL_SEGMENT, ldtr: NULL_SEGMENT,
             efer_sce: false, cr0_extra: 0, cr4_extra: 0, pat: DEFAULT_PAT, mtrr_def: 0,
             mtrr_fixed: [0; 11], mtrr_variable: [0; 16] };
@@ -208,7 +231,7 @@ impl SystemState {
             && supported_data_or_null(self.es) && data_or_null(self.fs) && data_or_null(self.gs)
             && (self.fs.base < 0x8000_0000_0000 || self.fs.base >= 0xffff_8000_0000_0000)
             && (self.gs.base < 0x8000_0000_0000 || self.gs.base >= 0xffff_8000_0000_0000)
-            && unused(self.tr, 0x8b) && unused(self.ldtr, 0x82)
+            && supported_task(self.tr) && unused(self.ldtr, 0x82)
             && self.pat == DEFAULT_PAT
             && self.cr0_extra & !0x40022u64 == 0 && self.cr4_extra & !0x90u64 == 0
             && mtrrs_supported(self.mtrr_def, &self.mtrr_fixed, &self.mtrr_variable)

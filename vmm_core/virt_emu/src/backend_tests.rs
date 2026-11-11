@@ -32,6 +32,7 @@ const VALUE: u64 = 0xfedc_ba98_7654_3210;
 
 struct Devices {
     port_io: bool,
+    pm: Option<Mutex<chipset::pm::PowerManagementDevice>>,
     ports: Mutex<Vec<(bool, u16, Vec<u8>)>>,
     released: AtomicBool,
     wait: AtomicWaker,
@@ -46,6 +47,7 @@ impl Devices {
     fn new() -> Self {
         Self {
             port_io: false,
+            pm: None,
             ports: Mutex::new(Vec::new()),
             released: AtomicBool::new(false),
             wait: AtomicWaker::new(),
@@ -99,6 +101,17 @@ impl CpuIo for Devices {
         self.writes_done.fetch_add(1, Ordering::SeqCst);
     }
     async fn read_io(&self, _vp: VpIndex, port: u16, data: &mut [u8]) {
+        if let Some(pm) = &self.pm {
+            use chipset_device::pio::PortIoIntercept;
+            assert_eq!(port, 0x408);
+            assert_eq!(data.len(), 4);
+            assert!(matches!(
+                pm.lock().io_read(port, data),
+                chipset_device::io::IoResult::Ok
+            ));
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
         assert!(self.port_io && matches!(port, 0x80 | 0xcdef));
         assert!(matches!(data.len(), 1 | 2 | 4));
         self.reads.fetch_add(1, Ordering::SeqCst);
@@ -116,6 +129,182 @@ impl CpuIo for Devices {
     fn fatal_error(&self, error: Box<dyn std::error::Error + Send + Sync>) -> VpHaltReason {
         self.faults.lock().push(error.to_string());
         VpHaltReason::PowerOff
+    }
+}
+
+#[async_test]
+async fn unlocked_gs_byte_cmpxchg_preserves_the_percpu_base_and_rex_byte_source(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    let program = [0x65, 0x40, 0x0f, 0xb0, 0x37];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    bytes[0x16008] = 0x11;
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.gs.base = 0x16000;
+    initial.rdi = 8;
+    initial.rax = 0x1234_5678_89ab_cd11;
+    initial.rsi = 0xaabb_ccdd_eeff_0022;
+    initial.rflags = (initial.rflags & !0x200) | 0x10000;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let target = CODE + program.len() as u64;
+    vp.set_execution_checkpoint(Some(target)).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let mut expected = initial;
+    expected.rip = target;
+    expected.rflags = (initial.rflags & !(0x10000 | 0x8d5)) | 0x44;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(memory.read_plain::<u8>(0x16008).unwrap(), 0x22);
+    assert_eq!(memory.read_plain::<u8>(8).unwrap(), bytes[8]);
+    assert_eq!(vp.completed_batch_progress().retired, 1);
+}
+
+#[async_test]
+async fn three_byte_memory_mov_uses_the_general_two_page_operand_path(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    let program = [0x4c, 0x8b, 0x1e, 0x4c, 0x89, 0x1f];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    let source = 0x16ffdusize;
+    let destination = 0x18ffdusize;
+    bytes[source..source + 8].copy_from_slice(&VALUE.to_le_bytes());
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.rsi = source as u64;
+    initial.rdi = destination as u64;
+    initial.rflags = (initial.rflags & !0x200) | 0x10000;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let target = CODE + program.len() as u64;
+    vp.set_execution_checkpoint(Some(target)).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let mut expected = initial;
+    expected.r11 = VALUE;
+    expected.rip = target;
+    expected.rflags &= !0x10000;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(memory.read_plain::<u64>(destination as u64).unwrap(), VALUE);
+    assert_eq!(memory.read_plain::<u64>(source as u64).unwrap(), VALUE);
+    assert_eq!(devices.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(devices.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(vp.completed_batch_progress().retired, 2);
+}
+
+#[async_test]
+async fn rdtsc_and_existing_pm_timer_use_the_same_stopped_clock(driver: DefaultDriver) {
+    use chipset_device::pio::{ControlPortIoIntercept, RegisterPortIoIntercept};
+    struct PmPorts(Option<u16>);
+    impl ControlPortIoIntercept for PmPorts {
+        fn region_name(&self) -> &str {
+            "pm"
+        }
+        fn map(&mut self, addr: u16) {
+            self.0 = Some(addr);
+        }
+        fn unmap(&mut self) {
+            self.0 = None;
+        }
+        fn addr(&self) -> Option<u16> {
+            self.0
+        }
+        fn len(&self) -> u16 {
+            0x37
+        }
+        fn offset_of(&self, addr: u16) -> Option<u16> {
+            addr.checked_sub(self.0?)
+                .filter(|offset| *offset < self.len())
+        }
+    }
+    impl RegisterPortIoIntercept for PmPorts {
+        fn new_io_region(&mut self, _name: &str, len: u16) -> Box<dyn ControlPortIoIntercept> {
+            assert_eq!(len, 0x37);
+            Box::new(PmPorts(None))
+        }
+    }
+    for now in [0, 0x1234_5678_abcd] {
+        let (mut bytes, owned) = fixture();
+        let program = [
+            0x0f, 0x31, 0x48, 0x89, 0xc3, 0x48, 0x89, 0xd1, 0xba, 0x08, 0x04, 0, 0, 0xed, 0x48,
+            0x89, 0xc6, 0x0f, 0x31,
+        ];
+        bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+        let (_, mut binder, _, keeper) =
+            build_at_time(&driver, &bytes, VmTime::from_100ns(now)).await;
+        let time = keeper.builder().build(&driver).await.unwrap();
+        let pm = chipset::pm::PowerManagementDevice::new(
+            Box::new(|action| panic!("unexpected PM action {action:?}")),
+            vmcore::line_interrupt::LineInterrupt::new_with_target(
+                "pm",
+                vmcore::line_interrupt::test_helpers::TestLineInterruptTarget::new_arc(),
+                9,
+            ),
+            &mut PmPorts(None),
+            time.access("pm"),
+            None,
+            None,
+            None,
+        );
+        let mut devices = Devices::new();
+        devices.pm = Some(Mutex::new(pm));
+        devices
+            .pm
+            .as_ref()
+            .unwrap()
+            .lock()
+            .update_dynamic_pio_mappings(Some(0x400));
+        let mut vp = binder.bind().unwrap();
+        let mut initial = long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        );
+        initial.rax = u64::MAX;
+        initial.rdx = u64::MAX;
+        initial.rflags = (initial.rflags & !0x200) | 0x10000;
+        vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+        let target = CODE + program.len() as u64;
+        vp.set_execution_checkpoint(Some(target)).unwrap();
+        let stop = StopVpSource::new();
+        assert!(matches!(
+            vp.run_vp(stop.checker(), &devices).await,
+            Err(VpHaltReason::PowerOff)
+        ));
+        let ticks = now.wrapping_mul(100);
+        let mut expected = initial;
+        expected.rax = u64::from(ticks as u32);
+        expected.rdx = ticks >> 32;
+        expected.rbx = expected.rax;
+        expected.rcx = expected.rdx;
+        expected.rsi = ((u128::from(now) * 3_579_545 / 10_000_000) as u32).into();
+        expected.rip = target;
+        expected.rflags &= !0x10000;
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert_eq!(devices.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(vp.completed_batch_progress().retired, 7);
+        assert_eq!(devices.faults.lock().len(), 1);
+        assert!(devices.faults.lock()[0].contains("checkpoint"));
     }
 }
 
@@ -262,6 +451,14 @@ async fn build(
     driver: &DefaultDriver,
     bytes: &[u8],
 ) -> (EmuPartition, EmuProcessorBinder, GuestMemory, VmTimeKeeper) {
+    build_at_time(driver, bytes, VmTime::from_100ns(0)).await
+}
+
+async fn build_at_time(
+    driver: &DefaultDriver,
+    bytes: &[u8],
+    now: VmTime,
+) -> (EmuPartition, EmuProcessorBinder, GuestMemory, VmTimeKeeper) {
     let topology = TopologyBuilder::new_x86()
         .x2apic(X2ApicState::Unsupported)
         .build(1)
@@ -276,7 +473,7 @@ async fn build(
     .unwrap();
     let memory = GuestMemory::allocate(bytes.len());
     memory.write_at(0, bytes).unwrap();
-    let keeper = VmTimeKeeper::new(driver, VmTime::from_100ns(0));
+    let keeper = VmTimeKeeper::new(driver, now);
     let time = keeper.builder().build(driver).await.unwrap();
     let mut hv = EmuHypervisor;
     let proto = hv

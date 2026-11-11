@@ -115,8 +115,8 @@ pub open spec fn decoded(s: State, rex: u8, opcode: u8, value: u8) -> (State, Ti
             let executable = match op { memory_model::Op::Load(_, _) =>
                 memory_core::Op::Load { reg: reg as u8, base: base as u8 },
                 _ => memory_core::Op::Store { reg: reg as u8, base: base as u8 } };
-            (State { mmu: mm::begin(s.mmu, s.cpu.gpr[base] as u64,
-                word_model::request(request), s.user, Some(request)),
+            (State { mmu: mm::access_begin(s.mmu, s.cpu.gpr[base] as u64,
+                word_model::request(request), s.user, Some(request),8,true),
                 phase: CpuPhase::Data { op: executable }, ..s }, Tick::Pending)
         },
     }

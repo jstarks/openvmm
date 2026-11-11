@@ -16,7 +16,7 @@ pub enum Plan {
 pub open spec fn plan(rip: u64, rsp: u64, flags: u64, displacement: i32, length: u8) -> Plan {
     let next = ((rip as int + length as int) % 0x1_0000_0000_0000_0000int) as u64;
     let target = ((next as int + displacement as int) % 0x1_0000_0000_0000_0000int) as u64;
-    if length != 5 { Plan::InvalidLength }
+    if length != 5 && length != 6 { Plan::InvalidLength }
     else if flags & 0x10100u64 != 0 { Plan::DebugRequired }
     else if !system::model::canonical(target) { Plan::UnsupportedTarget }
     else if rsp < 8 || rsp as int % 8 != 0
@@ -33,11 +33,11 @@ pub fn prepare(rip: u64, rsp: u64, flags: u64, displacement: i32, length: u8) ->
                 system::model::canonical(target) && system::model::canonical(stack)
                 && stack as int + 8 == rsp as int && stack as int % 8 == 0
                 && stack as int % 4096 <= 4088
-                && return_address as int == (rip as int + 5) % 0x1_0000_0000_0000_0000int,
+                && return_address as int == (rip as int + length as int) % 0x1_0000_0000_0000_0000int,
             _ => true,
         },
 {
-    if length != 5 { return Plan::InvalidLength; }
+    if length != 5 && length != 6 { return Plan::InvalidLength; }
     if flags & 0x10100u64 != 0 { return Plan::DebugRequired; }
     let next = rip.wrapping_add(length as u64);
     let target = if displacement >= 0 {

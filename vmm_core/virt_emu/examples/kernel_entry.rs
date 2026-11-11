@@ -21,6 +21,7 @@ mod native {
     use std::fs::File;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context as TaskContext, Poll};
     use std::time::Instant;
     use virt::io::CpuIo;
@@ -45,6 +46,7 @@ mod native {
     const ROOT: u64 = 0x2e32000;
     const STACK: u64 = 0xffff_ffff_8260_3e98;
     const RETURN: u64 = 0xffff_ffff_812f_3dad;
+    const PM_BASE: u16 = 0x400;
     const CMDLINE: &str =
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
     type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -142,12 +144,24 @@ mod native {
     struct WitnessIo {
         events: Arc<DeviceEvents>,
         chipset: Option<Arc<vmotherboard::Chipset>>,
+        pm_reads: AtomicU64,
+        pm_stalls: bool,
+        pm_stalls_injected: AtomicU64,
     }
 
     impl WitnessIo {
         fn configured_port(port: u16, size: usize) -> bool {
-            ((0xcf8..=0xcff).contains(&port) || (0x3f8..=0x3ff).contains(&port))
-                && usize::from(port & 7) + size <= 8
+            (size == 1
+                && ((0x20..=0x21).contains(&port)
+                    || (0xa0..=0xa1).contains(&port)
+                    || (0x4d0..=0x4d1).contains(&port)
+                    || (0x40..=0x43).contains(&port)
+                    || (0x70..=0x71).contains(&port)
+                    || port == 0x61
+                    || port == 0x80))
+                || (port >= PM_BASE && usize::from(port - PM_BASE) + size <= 0x37)
+                || (((0xcf8..=0xcff).contains(&port) || (0x3f8..=0x3ff).contains(&port))
+                    && usize::from(port & 7) + size <= 8)
         }
         fn unexpected(&self, operation: &str) {
             self.fatal_error(Box::new(std::io::Error::other(format!(
@@ -190,6 +204,14 @@ mod native {
         async fn read_io(&self, vp: VpIndex, port: u16, data: &mut [u8]) {
             if let Some(chipset) = &self.chipset {
                 if Self::configured_port(port, data.len()) {
+                    if port == PM_BASE + 8 {
+                        let read = self.pm_reads.fetch_add(1, Ordering::Relaxed) + 1;
+                        if self.pm_stalls && read.is_multiple_of(7) {
+                            // Deschedule the VP's host thread without pausing guest time.
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            self.pm_stalls_injected.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     chipset.io_read(vp.index(), port, data).await;
                     return;
                 }
@@ -686,12 +708,13 @@ mod native {
             .next()
             .context("missing pre-reset mapping projection")?;
         let option = args.next();
+        let pm_stalls = option.as_deref() == Some(std::ffi::OsStr::new("--probe-pm-stalls"));
         let loader_inputs = option.as_deref() == Some(std::ffi::OsStr::new("--loader-inputs"));
         let probe = match option {
             None => false,
             Some(argument) => {
                 ensure!(
-                    argument == "--probe" || loader_inputs,
+                    argument == "--probe" || pm_stalls || loader_inputs,
                     "unknown witness option"
                 );
                 !loader_inputs
@@ -754,7 +777,7 @@ mod native {
                 with_pic: false,
                 with_pit: false,
                 with_psp: false,
-                pm_base: 0x400,
+                pm_base: PM_BASE,
                 acpi_irq: 9,
                 iommu: None,
             },
@@ -978,7 +1001,10 @@ mod native {
             state.set_pat(&initial.pat)?;
             state.commit()?;
         }
-        let mut devices = WitnessIo::default();
+        let mut devices = WitnessIo {
+            pm_stalls,
+            ..WitnessIo::default()
+        };
         let console = Arc::new(Mutex::new(Vec::new()));
         let mut units = state_unit::StateUnits::new();
         let time_unit = units
@@ -1013,6 +1039,67 @@ mod native {
                     &vm_resource::ResourceResolver::new(),
                 )
                 .await?;
+            output
+                .chipset_builder
+                .arc_mutex_device("absent-pcat")
+                .omit_saved_state()
+                .add(|services| {
+                    missing_dev::MissingDev::from_manifest(
+                        missing_dev::MissingDevManifest::new()
+                            .claim_pio("primary-pic", 0x20..=0x21)
+                            .claim_pio("secondary-pic", 0xa0..=0xa1)
+                            .claim_pio("pic-elcr", 0x4d0..=0x4d1)
+                            .claim_pio("pit", 0x40..=0x43)
+                            .claim_pio("speaker", 0x61..=0x61)
+                            .claim_pio("post-delay", 0x80..=0x80),
+                        &mut services.register_mmio(),
+                        &mut services.register_pio(),
+                    )
+                })?;
+            output
+                .chipset_builder
+                .arc_mutex_device("pm")
+                .add(|services| {
+                    let events = devices.events.clone();
+                    let mut pm = chipset::pm::PowerManagementDevice::new(
+                        Box::new(move |action| {
+                            events.fail(Box::new(std::io::Error::other(format!(
+                                "unexpected PM action {action:?}"
+                            ))));
+                        }),
+                        vmcore::line_interrupt::LineInterrupt::new_with_target(
+                            "pm",
+                            devices.events.clone(),
+                            9,
+                        ),
+                        &mut services.register_pio(),
+                        services.register_vmtime().access("pm"),
+                        None,
+                        None,
+                        None,
+                    );
+                    pm.update_dynamic_pio_mappings(Some(PM_BASE));
+                    pm
+                })?;
+            output
+                .chipset_builder
+                .arc_mutex_device("rtc")
+                .add(|services| {
+                    chipset::cmos_rtc::Rtc::new(
+                        Box::new(local_clock::SystemTimeClock::new(
+                            local_clock::LocalClockDelta::ZERO,
+                        )),
+                        vmcore::line_interrupt::LineInterrupt::new_with_target(
+                            "rtc",
+                            devices.events.clone(),
+                            8,
+                        ),
+                        services.register_vmtime(),
+                        0x32,
+                        None,
+                        false,
+                    )
+                })?;
             output
                 .chipset_builder
                 .arc_mutex_device("com1")
@@ -1108,6 +1195,14 @@ mod native {
                     "stack_words":stack_words,
                     "serial_bytes":serial_bytes,
                     "serial_output":serial_output,
+                    "calibration":{
+                        "cpu_khz":memory.read_plain::<u32>(0x28b95f8)?,
+                        "tsc_khz":memory.read_plain::<u32>(0x28b95f4)?,
+                        "pm_reads":devices.pm_reads.load(Ordering::Relaxed),
+                        "pm_stalls":devices.pm_stalls,
+                        "pm_stalls_injected":devices.pm_stalls_injected.load(Ordering::Relaxed),
+                        "tsc_hz":x86_system::memory_core::cpu_core::profile::TSC_HZ,
+                    },
                 })
             );
             return Ok(());

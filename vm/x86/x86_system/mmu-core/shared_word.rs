@@ -7,6 +7,85 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
+    /// WRITE-checked, naturally aligned RAM CAS in one physical beat.
+    /// Completion reports the operand observed by the successful host CAS,
+    /// including on architectural mismatch (a same-value write cycle).
+    /// No CPU state is changed here; classified device operands are rejected by
+    /// route_io rather than silently executed as ordinary device writes.
+    pub fn begin_compare_exchange(&mut self, va: u64, expected: u64,
+        replacement: u64, width: Width) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted == (!spec::active(old(self)@.phase) && spec::compare_admitted(va, width)),
+            final(self)@ == if accepted {
+                spec::compare_begin(old(self)@, va, expected, replacement, width)
+            } else { old(self)@ },
+    {
+        let size = match width { Width::Byte => 1u8, Width::Word => 2,
+            Width::Dword => 4, Width::Qword => 8 };
+        if va % size as u64 != 0 || va % 8 + size as u64 > 8
+            || va % 4096 + size as u64 > 4096 || va > u64::MAX - (size as u64 - 1) {
+            return false;
+        }
+        let accepted = self.begin_access(va, Access::Write(0), false, Some(WordAccess::Write(0)), size);
+        if accepted { self.comparison = Some(Comparison {
+            operation: AtomicOperation::CompareExchange { expected, replacement }, width }); }
+        accepted
+    }
+
+    /// Locked integer operations share the conditional-CAS retry protocol.
+    /// Every data conflict recomputes from the current target while retaining
+    /// the captured source/flags and the already validated writable mapping.
+    pub fn begin_locked_modify(&mut self, va: u64, operation: integer::Operation,
+        source: u64, flags: u64, width: Width) -> (accepted: bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted == (!spec::active(old(self)@.phase) && spec::locked_admitted(va, operation, width)),
+            final(self)@ == if accepted {
+                spec::locked_begin(old(self)@, va, operation, source, flags, width)
+            } else { old(self)@ },
+    {
+        if !matches!(operation, integer::Operation::Add | integer::Operation::Adc
+            | integer::Operation::Sub | integer::Operation::Sbb | integer::Operation::And
+            | integer::Operation::Or | integer::Operation::Xor | integer::Operation::Inc
+            | integer::Operation::Dec | integer::Operation::Neg | integer::Operation::Not) {
+            return false;
+        }
+        let size = match width { Width::Byte => 1u8, Width::Word => 2,
+            Width::Dword => 4, Width::Qword => 8 };
+        if va % size as u64 != 0 || va % 8 + size as u64 > 8
+            || va % 4096 + size as u64 > 4096 || va > u64::MAX - (size as u64 - 1) {
+            return false;
+        }
+        let accepted = self.begin_access(va, Access::Write(0), false, Some(WordAccess::Write(0)), size);
+        if accepted { self.comparison = Some(Comparison {
+            operation: AtomicOperation::Integer { operation, source, flags }, width }); }
+        accepted
+    }
+
+    pub(super) fn atomic_observed(&self, data: WordData) -> (value: u64)
+        ensures value == spec::atomic_observed(data, self.size),
+    {
+        (data.first >> ((data.address % 8 * 8) as u32)) & self.size_mask()
+    }
+
+    pub(super) fn atomic_store_request(&self, data: WordData) -> (out: Request)
+        requires self.comparison is Some, spec::valid_span(data, self.size),
+        ensures out == spec::atomic_request(data, self.size, self.comparison.unwrap()),
+            match out { Request::DataCompare { address, .. } =>
+                address < 0x1_0000_0000_0000u64 && address % 8 == 0, _ => false },
+    {
+        let comparison = self.comparison.unwrap();
+        let original = self.atomic_observed(data);
+        let value = match comparison.operation {
+            AtomicOperation::CompareExchange { expected, replacement } =>
+                if original == expected & self.size_mask() { replacement } else { original },
+            AtomicOperation::Integer { operation, source, flags } =>
+                integer::evaluate(operation, original, source, comparison.width, flags).value,
+        };
+        self.sized_store_request(WordData { value, ..data })
+    }
+
     /// One WRITE-checked RAM translation, operand capture, and non-locked store.
     /// Small operands must fit one beat; qwords retain the single-page checks.
     /// Completion returns the original operand, not the stored result. Flags
@@ -55,6 +134,8 @@ impl SharedMmu {
     pub(super) fn sized_store_request(&self, data: WordData) -> (out: Request)
         requires spec::valid_span(data, self.size),
         ensures out == spec::sized_request(data, self.size),
+            match out { Request::DataCompare { address, .. } =>
+                address < 0x1_0000_0000_0000u64 && address % 8 == 0, _ => false },
     {
         let shift = (data.address % 8 * 8) as u32;
         let mask = self.size_mask() << shift;
@@ -82,7 +163,8 @@ impl SharedMmu {
     }
 
     pub(super) fn precheck_failure(&mut self, result: MmuResult)
-        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(), !(result is Success),
+        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
+            old(self).valid_comparison(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(),
             final(self)@ == (spec::State { phase: spec::terminal(old(self)@, result, 0), ..old(self)@ }),
@@ -184,7 +266,8 @@ impl SharedMmu {
     }
 
     pub(super) fn word_store_done(&mut self, value: u64, reads: u8)
-        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(), old(self).word is Some,
+        requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
+            old(self).valid_comparison(), old(self).word is Some,
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(), final(self)@ == spec::word_store_done(old(self)@, value, reads),
     {

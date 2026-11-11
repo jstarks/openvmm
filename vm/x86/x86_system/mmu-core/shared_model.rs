@@ -7,7 +7,7 @@ use super::shared::Phase;
 #[cfg(verus_keep_ghost)]
 use super::shared::io::{IoReply, IoRequest, IoRoute, Operand};
 #[cfg(verus_keep_ghost)]
-use super::shared::{Leaf, Modifier, Reply, Request, WordData};
+use super::shared::{AtomicOperation, Comparison, Leaf, Modifier, Reply, Request, WordData};
 use super::word::WordAccess;
 #[cfg(verus_keep_ghost)]
 use super::word::{WordReport, WordResult};
@@ -30,6 +30,7 @@ pub struct State {
     pub sequence: u64,
     pub size: u8,
     pub modifier: Option<super::shared::Modifier>,
+    pub comparison: Option<super::shared::Comparison>,
 }
 
 pub open spec fn active(p: Phase) -> bool {
@@ -38,7 +39,8 @@ pub open spec fn active(p: Phase) -> bool {
 
 pub open spec fn can_commit(p: Phase) -> bool {
     p is Mark || p is Dirty || p is Store || p is WordDirty
-        || p is WordStore || p is WordHead || p is WordLast || p is SizedStore || p is IoDirty
+        || p is WordStore || p is WordHead || p is WordLast || p is SizedStore
+        || p is AtomicStore || p is IoDirty
 }
 pub open spec fn can_change(p: Phase) -> bool { can_commit(p) && !(p is WordStore) }
 pub open spec fn respond(s: State, reply: Reply) -> (State, bool) {
@@ -73,7 +75,7 @@ pub open spec fn begin(s: State, va: u64, access: Access, user: bool, word: Opti
     span_begin(s, va, access, user, word, 8)
 }
 pub open spec fn span_begin(s: State, va: u64, access: Access, user: bool, word: Option<WordAccess>, size: u8) -> State {
-    let t = State { va, access, user, word, size, modifier: None, ..s };
+    let t = State { va, access, user, word, size, modifier: None, comparison: None, ..s };
     if word is Some && va as int + size as int - 1 > u64::MAX {
         State { phase: Phase::WordDone { report: WordReport { result: WordResult::Wrap,
             table_reads: 0, virtual_address: va } }, ..t }
@@ -117,6 +119,78 @@ pub open spec fn modify_begin(s: State, va: u64, operation: integer::Operation,
 pub open spec fn size_mask(size: u8) -> u64 {
     match size { 1 => 0xffu64, 2 => 0xffffu64, 4 => 0xffff_ffffu64, _ => u64::MAX }
 }
+pub open spec fn compare_admitted(va: u64, width: Width) -> bool {
+    let size = modify_size(width);
+    va % (size as u64) == 0 && va % 8 + size as int <= 8
+        && va % 4096 + size as int <= 4096
+        && va as int + size as int - 1 <= u64::MAX
+}
+pub open spec fn compare_begin(s: State, va: u64, expected: u64, replacement: u64, width: Width) -> State {
+    if !compare_admitted(va, width) { s } else {
+        let t = span_begin(s, va, Access::Write(0), false,
+            Some(WordAccess::Write(0)), modify_size(width));
+        State { comparison: Some(Comparison {
+            operation: AtomicOperation::CompareExchange { expected, replacement }, width }), ..t }
+    }
+}
+pub open spec fn locked_admitted(va: u64, operation: integer::Operation, width: Width) -> bool {
+    compare_admitted(va, width) && match operation {
+        integer::Operation::Add | integer::Operation::Adc | integer::Operation::Sub
+        | integer::Operation::Sbb | integer::Operation::And | integer::Operation::Or
+        | integer::Operation::Xor | integer::Operation::Inc | integer::Operation::Dec
+        | integer::Operation::Neg | integer::Operation::Not => true,
+        _ => false,
+    }
+}
+pub open spec fn locked_begin(s: State, va: u64, operation: integer::Operation,
+    source: u64, flags: u64, width: Width) -> State {
+    if !locked_admitted(va, operation, width) { s } else {
+        let t = span_begin(s, va, Access::Write(0), false,
+            Some(WordAccess::Write(0)), modify_size(width));
+        State { comparison: Some(Comparison {
+            operation: AtomicOperation::Integer { operation, source, flags }, width }), ..t }
+    }
+}
+pub open spec fn atomic_observed(data: WordData, size: u8) -> u64 {
+    (data.first >> ((data.address % 8 * 8) as u32)) & size_mask(size)
+}
+pub open spec fn atomic_value(original: u64, size: u8, comparison: Comparison) -> u64 {
+    match comparison.operation {
+        AtomicOperation::CompareExchange { expected, replacement } =>
+            if original == expected & size_mask(size) { replacement } else { original },
+        AtomicOperation::Integer { operation, source, flags } =>
+            integer::model::evaluate(operation, original, source, comparison.width, flags).value,
+    }
+}
+pub open spec fn atomic_request(data: WordData, size: u8, comparison: Comparison) -> Request {
+    sized_request(WordData {
+        value: atomic_value(atomic_observed(data, size), size, comparison), ..data }, size)
+}
+
+/// A conditional masked write frames neighbors and still writes on mismatch.
+pub proof fn conditional_cas_outcomes(first: u64, expected: u64,
+    replacement: u64, mask: u64, shift: u32)
+    requires shift < 64,
+    ensures ({
+        let original = (first >> shift) & mask;
+        let field = mask << shift;
+        let selected = if original == expected & mask { replacement } else { original };
+        let result = (first & !field) | ((selected << shift) & field);
+        result & !field == first & !field
+            && (original != expected & mask ==> result == first)
+            && (original == expected & mask ==> result & field == (replacement << shift) & field)
+    }),
+{
+    assert({
+        let original = (first >> shift) & mask;
+        let field = mask << shift;
+        let selected = if original == expected & mask { replacement } else { original };
+        let result = (first & !field) | ((selected << shift) & field);
+        result & !field == first & !field
+            && (original != expected & mask ==> result == first)
+            && (original == expected & mask ==> result & field == (replacement << shift) & field)
+    }) by(bit_vector);
+}
 pub open spec fn sized_request(data: WordData, size: u8) -> Request {
     let shift = (data.address % 8 * 8) as u32;
     let mask = size_mask(size) << shift;
@@ -153,6 +227,7 @@ pub open spec fn request(s: State) -> Request {
         Phase::WordHead { data, .. } => head_request(data),
         Phase::WordLast { data, .. } => last_request(data),
         Phase::SizedStore { data, .. } => sized_request(data, s.size),
+        Phase::AtomicStore { data, .. } => atomic_request(data, s.size, s.comparison.unwrap()),
         Phase::IoReady { address, access, .. } =>
             Request::Io(IoRequest { sequence: s.sequence, address, access }),
     }
@@ -222,7 +297,9 @@ pub open spec fn exchanged(s: State) -> State {
             phase: Phase::Done(Report { result: MmuResult::Success(
                 match s.access { Access::Write(v) => v, _ => 0 }),
                 table_reads: reads, virtual_address: s.va }), ..s },
-        Phase::WordDirty { data, reads, .. } => State { phase: if s.size < 8 {
+        Phase::WordDirty { data, reads, .. } => State { phase: if s.comparison is Some {
+            Phase::AtomicStore { data, reads }
+        } else if s.size < 8 {
             Phase::SizedStore { data, reads }
         } else if data.address % 8 == 0 {
             Phase::WordStore { data, reads }
@@ -232,6 +309,8 @@ pub open spec fn exchanged(s: State) -> State {
             phase: Phase::IoReady { address, access: WordAccess::Write(value), reads }, ..s },
         Phase::WordStore { data, reads } | Phase::WordLast { data, reads } | Phase::SizedStore { data, reads } =>
             word_store_done(s, data.value, reads),
+        Phase::AtomicStore { data, reads } =>
+            word_store_done(s, atomic_observed(data, s.size), reads),
         _ => s,
     }
 }
@@ -248,6 +327,8 @@ pub open spec fn changed(s: State, current: u64) -> State {
             State { phase: Phase::WordLast { data: WordData { tail: current, ..data }, reads }, ..s },
         Phase::SizedStore { data, reads } =>
             State { phase: Phase::SizedStore { data: WordData { first: current, ..data }, reads }, ..s },
+        Phase::AtomicStore { data, reads } =>
+            State { phase: Phase::AtomicStore { data: WordData { first: current, ..data }, reads }, ..s },
         _ => s,
     }
 }
@@ -374,6 +455,39 @@ pub proof fn modify_completion(s: State, value: u64, reads: u8)
         s.phase is WordDone ==> changed(s, value) == s && exchanged(s) == s && read(s, value) == s,
 { }
 
+/// Host contention refreshes the comparison, never the captured source operands.
+pub proof fn compare_retry(s: State, current: u64)
+    requires s.comparison is Some,
+    ensures changed(s, current).comparison == s.comparison,
+        changed(s, current).inner == s.inner,
+        changed(s, current).va == s.va,
+        s.phase is WordDirty ==> changed(s, current) == restart(s),
+        match s.phase {
+            Phase::AtomicStore { data, reads } => {
+                let t = changed(s, current);
+                t.phase == (Phase::AtomicStore {
+                    data: WordData { first: current, ..data }, reads })
+                    && request(t) == atomic_request(WordData { first: current, ..data },
+                        s.size, s.comparison.unwrap())
+            },
+            _ => true,
+        },
+{ }
+
+/// Only a completed host CAS publishes the operand used for CPU comparison.
+pub proof fn compare_completion(s: State, data: WordData, reads: u8)
+    requires s.phase == (Phase::AtomicStore { data, reads }),
+        s.comparison is Some, s.modifier is None,
+    ensures exchanged(s).phase == (Phase::WordDone { report: WordReport {
+            result: WordResult::Success(atomic_observed(data, s.size)),
+            table_reads: reads, virtual_address: s.va } }),
+        exchanged(s).inner.cr2 == s.inner.cr2,
+        exchanged(s).comparison == s.comparison,
+        read(exchanged(s), data.first) == exchanged(s),
+        changed(exchanged(s), data.first) == exchanged(s),
+        exchanged(exchanged(s)) == exchanged(s),
+{ }
+
 pub open spec fn operand(s: State) -> Option<Operand> {
     if s.modifier is Some { None } else { match (s.phase, s.word) {
         (Phase::Data { frame, .. }, Some(access)) =>
@@ -382,7 +496,7 @@ pub open spec fn operand(s: State) -> Option<Operand> {
     } }
 }
 pub open spec fn route_io(s: State) -> (State, IoRoute) {
-    if s.modifier is Some { (s, IoRoute::NotReady) } else {
+    if s.modifier is Some || s.comparison is Some { (s, IoRoute::NotReady) } else {
     match (s.phase, s.word) {
         (Phase::Data { frame, leaf, reads, .. }, Some(access)) => {
             if s.va % 8 != 0 { (s, IoRoute::Unaligned) }

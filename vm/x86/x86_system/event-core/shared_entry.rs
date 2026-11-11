@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use super::*;
+use memory_core::cpu_core::compare;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::operand;
 use memory_core::cpu_core::operand::{Address, Operand, Register, Segment, SegmentBases, Width};
@@ -30,6 +31,8 @@ pub enum Instruction {
     ConditionalMove { condition: control::Condition, dst: Register, source: Operand },
     SetCondition { condition: control::Condition, destination: Operand },
     Direction { set: bool },
+    CompareExchange { destination: Operand, source: Register },
+    LockedAlu { operation:integer::Operation,destination:Operand,source:Operand },
     ReadMsr,
     ZeroExtend { dst: Register, src: Register },
     Load { dst: Register, address: Address, width: Width },
@@ -74,6 +77,8 @@ pub enum MemoryTask {
     RepeatRead { width:Width },
     RepeatWrite { width:Width },
     ConditionalMove { condition: control::Condition, dst: Register },
+    CompareExchange { width: Width },
+    LockedAlu {operation:integer::Operation,source:u64,width:Width},
 }
 
 pub(super) fn scalar(cpu: State, source: Operand) -> (out: Option<u64>)
@@ -144,6 +149,14 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
         match instruction {
+            Instruction::CompareExchange {destination,source}=>{
+                reveal(spec::entry::execute);
+                self.execute_compare_exchange(destination,source,length)
+            },
+            Instruction::LockedAlu {operation,destination,source}=>{
+                reveal(spec::entry::execute);
+                self.execute_locked_alu(operation,destination,source,length)
+            },
             Instruction::Integer {..} | Instruction::Alu {..} | Instruction::Multiply {..} =>
                 self.execute_integer(instruction,length),
             Instruction::RepeatStore {width} => {
@@ -430,6 +443,79 @@ impl SharedEventMachine {
         }
     }
 
+    pub(super) fn execute_compare_exchange(&mut self,destination:Operand,source:Register,length:u8)->(tick:Tick)
+            requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+                !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+            ensures final(self).invariant(),(final(self)@,tick)==
+                spec::entry::compare_exchange(old(self)@,destination,source,length),
+        {
+            let cpu=self.core.cpu();
+            if length==0 || length>15 {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            if cpu.flags&0x100!=0 {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+            }
+            if !source.is_valid() {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            match destination {
+                Operand::Register(dst)=>{
+                    match compare::registers(cpu,dst,source) {
+                        Some(updated)=>self.retire_entry(updated,length,false,false),
+                        None=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                    }
+                },
+                Operand::Memory {address,width}=>{
+                    if !address.is_valid() || width!=source.width() {
+                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                    }
+                    let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+                    let accepted=self.core.boundary_compare_exchange(linear,cpu.gpr[0],source.read(&cpu.gpr),width);
+                    if !accepted {
+                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                    }
+                    self.phase=Phase::EntryMemory {address:linear,length,task:MemoryTask::CompareExchange {width}};
+                    Tick::Pending
+                },
+                _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+            }
+    }
+
+    pub(super) fn execute_locked_alu(&mut self,operation:integer::Operation,destination:Operand,
+        source:Operand,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==
+            spec::entry::locked_alu(old(self)@,operation,destination,source,length),
+    {
+        let cpu=self.core.cpu();
+        if length==0 || length>15 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let (address,width)=match destination {
+            Operand::Memory {address,width}=>(address,width),
+            _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+        };
+        if !address.is_valid() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let Some(value)=scalar(cpu,source) else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        let accepted=self.core.boundary_locked_modify(linear,operation,value,cpu.flags,width);
+        if !accepted {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        self.phase=Phase::EntryMemory {address:linear,length,
+            task:MemoryTask::LockedAlu {operation,source:value,width}};
+        Tick::Pending
+    }
+
     pub(super) fn finish_conditional(&mut self,condition:control::Condition,dst:Register,
             value:u64,length:u8)->(tick:Tick)
             requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
@@ -464,6 +550,15 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::LockedAlu {operation,source,width}=>{
+                let result=integer::evaluate(operation,value,source,width,cpu.flags);
+                cpu.flags=result.flags;
+                return self.retire_entry(cpu,length,false,true);
+            },
+            MemoryTask::CompareExchange {width}=>{
+                let updated=compare::memory(cpu,value,width);
+                return self.retire_entry(updated,length,false,true);
+            },
             MemoryTask::RepeatStore {width} => return self.finish_repeat(width,length),
             MemoryTask::RepeatRead {width} => return self.finish_move_read(width,value,length),
             MemoryTask::RepeatWrite {width} => return self.finish_move(width,length),

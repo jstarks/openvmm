@@ -288,8 +288,11 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
             }
         }
         Some(Outcome::Normalized(decoded)) => {
-            if decoded.prefixes.lock
-                || decoded.prefixes.repeat != Repeat::None
+            if decoded.prefixes.lock {
+                return admit_entry(decoded.encoding)
+                    .map_or(DecodeDecision::Unsupported, DecodeDecision::Entry);
+            }
+            if decoded.prefixes.repeat != Repeat::None
                 || decoded.prefixes.transaction != TransactionHint::None
             {
                 return DecodeDecision::Unsupported;
@@ -341,13 +344,47 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     let instruction = decoder.decode();
     if decoder.last_error() != DecoderError::None
         || instruction.len() != encoding.length as usize
-        || instruction.has_lock_prefix()
         || instruction.has_xacquire_prefix()
         || instruction.has_xrelease_prefix()
     {
         return None;
     }
     let size = address_size(encoding.bytes());
+    if instruction.mnemonic() == Mnemonic::Cmpxchg {
+        return admit_compare_exchange(&instruction, encoding, size);
+    }
+    if instruction.has_lock_prefix() {
+        if has_repeat_prefix(encoding) {
+            return None;
+        }
+        let EntryInstruction::Alu {
+            operation,
+            destination,
+            source,
+        } = admit_alu(&instruction, size)?
+        else {
+            return None;
+        };
+        return (matches!(
+            operation,
+            integer::Operation::Add
+                | integer::Operation::Adc
+                | integer::Operation::Sub
+                | integer::Operation::Sbb
+                | integer::Operation::And
+                | integer::Operation::Or
+                | integer::Operation::Xor
+                | integer::Operation::Inc
+                | integer::Operation::Dec
+                | integer::Operation::Neg
+                | integer::Operation::Not
+        ) && matches!(source, Operand::Register(_) | Operand::Immediate(_)))
+        .then_some(EntryInstruction::LockedAlu {
+            operation,
+            destination,
+            source,
+        });
+    }
     if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
         if !instruction.has_rep_prefix()
             || instruction.has_repne_prefix()
@@ -461,42 +498,11 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         | Mnemonic::Shr
         | Mnemonic::Sar
         | Mnemonic::Cmp
-        | Mnemonic::Xor => {
-            let operation = match instruction.mnemonic() {
-                Mnemonic::Add => integer::Operation::Add,
-                Mnemonic::Adc => integer::Operation::Adc,
-                Mnemonic::Sub => integer::Operation::Sub,
-                Mnemonic::Sbb => integer::Operation::Sbb,
-                Mnemonic::And => integer::Operation::And,
-                Mnemonic::Or => integer::Operation::Or,
-                Mnemonic::Test => integer::Operation::Test,
-                Mnemonic::Shl => integer::Operation::Shl,
-                Mnemonic::Shr => integer::Operation::Shr,
-                Mnemonic::Sar => integer::Operation::Sar,
-                Mnemonic::Cmp => integer::Operation::Cmp,
-                _ => integer::Operation::Xor,
-            };
-            alu_entry(operation, get(0)?, get(1)?)
-        }
-        Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Neg | Mnemonic::Not => {
-            let destination = get(0)?;
-            let width = operand_width(destination)?;
-            let operation = match instruction.mnemonic() {
-                Mnemonic::Inc => integer::Operation::Inc,
-                Mnemonic::Dec => integer::Operation::Dec,
-                Mnemonic::Neg => integer::Operation::Neg,
-                _ => integer::Operation::Not,
-            };
-            alu_entry(
-                operation,
-                destination,
-                Operand::Immediate(Immediate {
-                    encoded_width: width,
-                    width,
-                    value: 0,
-                }),
-            )
-        }
+        | Mnemonic::Xor
+        | Mnemonic::Inc
+        | Mnemonic::Dec
+        | Mnemonic::Neg
+        | Mnemonic::Not => admit_alu(&instruction, size),
         Mnemonic::Movsx | Mnemonic::Movsxd => {
             let Operand::Register(dst) = get(0)? else {
                 return None;
@@ -765,6 +771,46 @@ fn condition(mnemonic: Mnemonic) -> Option<Condition> {
     })
 }
 
+fn has_repeat_prefix(encoding: Encoding) -> bool {
+    encoding
+        .bytes()
+        .iter()
+        .take_while(|&&byte| {
+            matches!(byte, 0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3 | 0x40..=0x4f)
+        })
+        .any(|&byte| matches!(byte, 0xf2 | 0xf3))
+}
+
+/// LOCK is required only for memory; alignment and atomic access belong to the CPU/MMU.
+fn admit_compare_exchange(
+    instruction: &Instruction,
+    encoding: Encoding,
+    size: AddressSize,
+) -> Option<EntryInstruction> {
+    if instruction.op_count() != 2 || has_repeat_prefix(encoding) {
+        return None;
+    }
+    let destination = operand(instruction, 0, Operation::Mov, size)?;
+    let Operand::Register(source) = operand(instruction, 1, Operation::Mov, size)? else {
+        return None;
+    };
+    if operand_width(destination)? != source.width() {
+        return None;
+    }
+    match destination {
+        Operand::Register(_)
+            if !instruction.has_lock_prefix()
+                && size == AddressSize::Bits64
+                && instruction.segment_prefix() == IcedRegister::None => {}
+        Operand::Memory { .. } if instruction.has_lock_prefix() => {}
+        _ => return None,
+    }
+    Some(EntryInstruction::CompareExchange {
+        destination,
+        source,
+    })
+}
+
 fn operand_width(operand: Operand) -> Option<Width> {
     match operand {
         Operand::Register(register) => Some(register.width()),
@@ -772,6 +818,46 @@ fn operand_width(operand: Operand) -> Option<Width> {
         Operand::Immediate(immediate) => Some(immediate.width),
         _ => None,
     }
+}
+
+fn admit_alu(instruction: &Instruction, size: AddressSize) -> Option<EntryInstruction> {
+    let operation = match instruction.mnemonic() {
+        Mnemonic::Add => integer::Operation::Add,
+        Mnemonic::Adc => integer::Operation::Adc,
+        Mnemonic::Sub => integer::Operation::Sub,
+        Mnemonic::Sbb => integer::Operation::Sbb,
+        Mnemonic::And => integer::Operation::And,
+        Mnemonic::Or => integer::Operation::Or,
+        Mnemonic::Test => integer::Operation::Test,
+        Mnemonic::Shl => integer::Operation::Shl,
+        Mnemonic::Shr => integer::Operation::Shr,
+        Mnemonic::Sar => integer::Operation::Sar,
+        Mnemonic::Cmp => integer::Operation::Cmp,
+        Mnemonic::Xor => integer::Operation::Xor,
+        Mnemonic::Inc => integer::Operation::Inc,
+        Mnemonic::Dec => integer::Operation::Dec,
+        Mnemonic::Neg => integer::Operation::Neg,
+        Mnemonic::Not => integer::Operation::Not,
+        _ => return None,
+    };
+    let destination = operand(instruction, 0, Operation::Mov, size)?;
+    let source = if matches!(
+        operation,
+        integer::Operation::Inc
+            | integer::Operation::Dec
+            | integer::Operation::Neg
+            | integer::Operation::Not
+    ) {
+        let width = operand_width(destination)?;
+        Operand::Immediate(Immediate {
+            encoded_width: width,
+            width,
+            value: 0,
+        })
+    } else {
+        operand(instruction, 1, Operation::Mov, size)?
+    };
+    alu_entry(operation, destination, source)
 }
 
 fn alu_entry(

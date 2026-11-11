@@ -6,6 +6,7 @@ use vstd::prelude::*;
 
 #[path = "../x86-add-experiment/lib.rs"]
 pub mod arithmetic;
+pub mod compare;
 pub mod control;
 pub mod decoder;
 pub mod descriptor;

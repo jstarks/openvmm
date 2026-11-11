@@ -67,6 +67,50 @@ fn compare(mut data: Vec<u8>, c: Config, va: u64, access: Access, user: bool) {
 }
 
 #[test]
+fn shared_atomic_operations_recompute_after_dma_and_linearize_through_cas() {
+    use x86_system::WordResult;
+    use x86_system::memory_core::cpu_core::{integer::Operation, operand::Width};
+    for arithmetic in [false, true] {
+        let data = bytes();
+        let (memory, ram) = fixture(&data);
+        let mut mmu = SharedMmu::new(config(), 0x77);
+        let accepted = if arithmetic {
+            mmu.begin_locked_modify(0, Operation::Inc, 0, 1, Width::Byte)
+        } else {
+            mmu.begin_compare_exchange(0, 0xa1, 0x22, Width::Byte)
+        };
+        assert!(accepted);
+        let mut raced = false;
+        let mut completed = None;
+        for _ in 0..128 {
+            if matches!(
+                mmu.request(),
+                Request::DataCompare {
+                    address: 0x5000,
+                    ..
+                }
+            ) && !raced
+            {
+                assert_ne!(memory.read_plain::<u64>(0x4000).unwrap() & 0x40, 0);
+                memory.write_plain(0x5000, &0xa5u64).unwrap();
+                raced = true;
+            }
+            if let Progress::CompleteWord(report) = mmu.run(&ram, 1).unwrap() {
+                completed = Some(report.result);
+                break;
+            }
+        }
+        assert!(raced);
+        assert_eq!(completed, Some(WordResult::Success(0xa5)));
+        assert_eq!(
+            memory.read_plain::<u64>(0x5000).unwrap(),
+            if arithmetic { 0xa6 } else { 0xa5 }
+        );
+        assert_eq!(mmu.cr2(), 0x77);
+    }
+}
+
+#[test]
 fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
     let mut data = vec![0; 0x400000];
     for (address, value) in [(0x1000, 0x2007u64), (0x2000, 0x3007), (0x3008, 0x201087)] {

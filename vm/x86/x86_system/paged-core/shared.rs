@@ -154,6 +154,27 @@ impl SharedMachine {
         self.mmu.begin_modify(address, operation, source, flags, width)
     }
 
+    pub(crate) fn boundary_compare_exchange(&mut self,address:u64,expected:u64,replacement:u64,
+        width:memory_core::cpu_core::operand::Width)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),(final(self)@,accepted)==
+            spec::boundary_compare_exchange(old(self)@,address,expected,replacement,width),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_compare_exchange(address,expected,replacement,width)
+    }
+
+    pub(crate) fn boundary_locked_modify(&mut self,address:u64,
+        operation:memory_core::cpu_core::integer::Operation,source:u64,flags:u64,
+        width:memory_core::cpu_core::operand::Width)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),(final(self)@,accepted)==
+            spec::boundary_locked_modify(old(self)@,address,operation,source,flags,width),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_locked_modify(address,operation,source,flags,width)
+    }
+
     pub(crate) fn boundary_reload(&mut self, config: Config) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, accepted) ==

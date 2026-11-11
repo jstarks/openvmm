@@ -32,7 +32,7 @@ impl SharedMmu {
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, out) == spec::route_io(old(self)@),
     {
-        if self.modifier.is_some() { return IoRoute::NotReady; }
+        if self.modifier.is_some() || self.comparison.is_some() { return IoRoute::NotReady; }
         match (self.phase, self.word) {
             (Phase::Data { frame, leaf, reads, .. }, Some(access)) => {
                 if self.va % 8 != 0 { return IoRoute::Unaligned; }

@@ -62,12 +62,25 @@ pub open spec fn boundary_modify(s: State, address: u64,
         (State { mmu: mm::modify_begin(s.mmu, address, operation, source, flags, width), ..s }, true)
     } else { (s, false) }
 }
+pub open spec fn boundary_locked_modify(s:State,address:u64,
+    operation:super::memory_core::cpu_core::integer::Operation,source:u64,flags:u64,
+    width:super::memory_core::cpu_core::operand::Width)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::locked_admitted(address,operation,width) {
+        (State {mmu:mm::locked_begin(s.mmu,address,operation,source,flags,width),..s},true)
+    } else {(s,false)}
+}
 pub open spec fn boundary_reload(s: State, config: super::Config) -> (State, bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) {
         (State { mmu: mm::State {
             inner: super::mmu_model::reload(s.mmu.inner, config),
             phase: super::mmu_core::shared::Phase::Idle, ..s.mmu }, ..s }, true)
     } else { (s, false) }
+}
+pub open spec fn boundary_compare_exchange(s:State,address:u64,expected:u64,replacement:u64,
+    width:super::memory_core::cpu_core::operand::Width)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::compare_admitted(address,width) {
+        (State {mmu:mm::compare_begin(s.mmu,address,expected,replacement,width),..s},true)
+    } else {(s,false)}
 }
 pub open spec fn invalidate(s: State, va: u64) -> (State, bool) {
     if (s.phase is Ready || s.phase is Stopped || s.phase is Boundary) && !mm::active(s.mmu.phase) {

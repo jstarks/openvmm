@@ -1215,7 +1215,6 @@ fn control_moves_indirect_jumps_and_prefix_frontiers_are_explicit() {
         &[0xf2, 0x48, 0x83, 0x28, 1][..],
         &[0xf2, 0xf0, 0x48, 0x83, 0x28, 1][..],
         &[0xf3, 0xf0, 0x48, 0x83, 0x28, 1][..],
-        &[0xf0, 0x48, 0x83, 0x28, 1][..],
     ] {
         assert_eq!(
             admission(bytes),
@@ -1668,6 +1667,508 @@ fn nop_admission_ignores_operands_but_keeps_pause_and_forbidden_prefixes_distinc
             "{bytes:02x?}"
         );
     }
+}
+
+#[test]
+fn compare_exchange_registers_preserve_widths_extensions_and_byte_aliases() {
+    use x86_system::shared::entry::Instruction;
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for dst in 0..16 {
+            for src in 0..16 {
+                let mut bytes = Vec::new();
+                if width == Width::Word {
+                    bytes.push(0x66);
+                }
+                let rex = 0x40
+                    | if width == Width::Qword { 8 } else { 0 }
+                    | ((src >> 3) << 2)
+                    | (dst >> 3);
+                if rex != 0x40 || width == Width::Byte {
+                    bytes.push(rex);
+                }
+                bytes.extend_from_slice(&[
+                    0x0f,
+                    if width == Width::Byte { 0xb0 } else { 0xb1 },
+                    0xc0 | ((src & 7) << 3) | (dst & 7),
+                ]);
+                assert_eq!(
+                    entry(&bytes),
+                    Instruction::CompareExchange {
+                        destination: Operand::Register(reg(dst, width, false)),
+                        source: reg(src, width, false),
+                    },
+                    "{bytes:02x?}"
+                );
+            }
+        }
+    }
+    for dst in 0..8 {
+        for src in 0..8 {
+            assert_eq!(
+                entry(&[0x0f, 0xb0, 0xc0 | (src << 3) | dst]),
+                Instruction::CompareExchange {
+                    destination: Operand::Register(reg(dst & 3, Width::Byte, dst >= 4)),
+                    source: reg(src & 3, Width::Byte, src >= 4),
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn locked_compare_exchange_memory_preserves_kernel_bytes_and_normalized_addresses() {
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    use x86_system::shared::entry::Instruction;
+    let bytes = [0xf0, 0x48, 0x0f, 0xb1, 0x55, 0x00];
+    let mut input = DecodeInput {
+        sequence: 967_066,
+        rip: 0xffff_ffff_81ed_6583,
+        length: bytes.len() as u8,
+        bytes: [0; 15],
+    };
+    input.bytes[..bytes.len()].copy_from_slice(&bytes);
+    assert_eq!(
+        admit(input),
+        DecodeDecision::Entry(Instruction::CompareExchange {
+            destination: Operand::Memory {
+                address: Address {
+                    size: AddressSize::Bits64,
+                    segment: Segment::Ss,
+                    base: Base::Register(Gpr::new(5).unwrap()),
+                    index: None,
+                    scale: Scale::One,
+                    displacement: 0,
+                },
+                width: Width::Qword,
+            },
+            source: reg(2, Width::Qword, false),
+        })
+    );
+    for (prefix, opcode, width, source) in [
+        (&[][..], 0xb0, Width::Byte, reg(0, Width::Byte, true)),
+        (&[0x40][..], 0xb0, Width::Byte, reg(4, Width::Byte, false)),
+        (&[0x44][..], 0xb0, Width::Byte, reg(12, Width::Byte, false)),
+        (
+            &[0x66, 0x44][..],
+            0xb1,
+            Width::Word,
+            reg(12, Width::Word, false),
+        ),
+        (
+            &[0x44][..],
+            0xb1,
+            Width::Dword,
+            reg(12, Width::Dword, false),
+        ),
+        (
+            &[0x4c][..],
+            0xb1,
+            Width::Qword,
+            reg(12, Width::Qword, false),
+        ),
+    ] {
+        let bytes = [&[0xf0][..], prefix, &[0x0f, opcode, 0x60, 0xf2]].concat();
+        assert_eq!(
+            entry(&bytes),
+            Instruction::CompareExchange {
+                destination: Operand::Memory {
+                    address: Address {
+                        size: AddressSize::Bits64,
+                        segment: Segment::Ds,
+                        base: Base::Register(Gpr::new(0).unwrap()),
+                        index: None,
+                        scale: Scale::One,
+                        displacement: (-14i64) as u64,
+                    },
+                    width,
+                },
+                source,
+            },
+            "{bytes:02x?}"
+        );
+    }
+    for (prefix, segment) in [(0x64, Segment::Fs), (0x65, Segment::Gs)] {
+        let Instruction::CompareExchange {
+            destination: Operand::Memory { address, width },
+            source,
+        } = entry(&[prefix, 0x67, 0xf0, 0x4f, 0x0f, 0xb1, 0x44, 0x8c, 0xf8])
+        else {
+            panic!("locked address32 memory CMPXCHG")
+        };
+        assert_eq!(width, Width::Qword);
+        assert_eq!(source, reg(8, Width::Qword, false));
+        assert_eq!(
+            address,
+            Address {
+                size: AddressSize::Bits32,
+                segment,
+                base: Base::Register(Gpr::new(12).unwrap()),
+                index: Gpr::new(9),
+                scale: Scale::Four,
+                displacement: 0xffff_fff8,
+            }
+        );
+        let mut registers = [0; 16];
+        registers[12] = 0x1234_5678_ffff_fffc;
+        registers[9] = 4;
+        assert_eq!(
+            address.linear(
+                &registers,
+                0,
+                SegmentBases {
+                    fs: 0x1_0000_0000,
+                    gs: 0x1_0000_0000,
+                }
+            ),
+            0x1_0000_0004
+        );
+    }
+    let Instruction::CompareExchange {
+        destination: Operand::Memory { address, .. },
+        ..
+    } = entry(&[0xf0, 0x48, 0x0f, 0xb1, 0x15, 0xf8, 0xff, 0xff, 0xff])
+    else {
+        panic!("RIP-relative CMPXCHG")
+    };
+    assert_eq!(address.base, Base::NextRip);
+    assert_eq!(address.displacement, (-8i64) as u64);
+}
+
+#[test]
+fn compare_exchange_rejects_unlocked_memory_repeat_hle_and_wider_atomic_families() {
+    use x86_system::shared::decode::DecodeDecision;
+    for bytes in [
+        &[0x0f, 0xb0, 0x08][..],
+        &[0x66, 0x0f, 0xb1, 0x08][..],
+        &[0x0f, 0xb1, 0x08][..],
+        &[0x48, 0x0f, 0xb1, 0x08][..],
+        &[0x0f, 0xc7, 0x08][..],
+        &[0x48, 0x0f, 0xc7, 0x08][..],
+        &[0xf0, 0x0f, 0xc7, 0x08][..],
+        &[0xf0, 0x48, 0x0f, 0xc7, 0x08][..],
+        &[0x67, 0x0f, 0xb1, 0xc1][..],
+        &[0x64, 0x0f, 0xb1, 0xc1][..],
+    ] {
+        assert_eq!(
+            admission(bytes),
+            DecodeDecision::Unsupported,
+            "{bytes:02x?}"
+        );
+    }
+    for prefix in [
+        &[0xf2][..],
+        &[0xf3][..],
+        &[0xf2, 0xf3][..],
+        &[0xf3, 0xf2][..],
+        &[0xf2, 0xf0][..],
+        &[0xf3, 0xf0][..],
+        &[0xf0, 0xf2][..],
+        &[0xf0, 0xf3][..],
+    ] {
+        let bytes = [prefix, &[0x48, 0x0f, 0xb1, 0x08]].concat();
+        assert_eq!(
+            admission(&bytes),
+            DecodeDecision::Unsupported,
+            "{bytes:02x?}"
+        );
+    }
+    for prefix in [0xf2, 0xf3] {
+        let bytes = [prefix, 0x48, 0x0f, 0xb1, 0xc1];
+        assert_eq!(admission(&bytes), DecodeDecision::Unsupported);
+    }
+    for bytes in [
+        &[0xf0, 0x0f, 0xb0, 0xc1][..],
+        &[0xf0, 0x66, 0x0f, 0xb1, 0xc1][..],
+        &[0xf0, 0x0f, 0xb1, 0xc1][..],
+        &[0xf0, 0x48, 0x0f, 0xb1, 0xc1][..],
+        &[0xf2, 0xf0, 0x48, 0x0f, 0xb1, 0xc1][..],
+        &[0xf3, 0xf0, 0x48, 0x0f, 0xb1, 0xc1][..],
+    ] {
+        assert!(matches!(outcome(bytes, 0), Outcome::InvalidOpcode(_)));
+        assert_eq!(admission(bytes), DecodeDecision::InvalidOpcode);
+    }
+}
+
+#[test]
+fn compare_exchange_retained_packets_are_incremental_exact_and_bounded() {
+    use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+    for bytes in [
+        &[0x0f, 0xb0, 0xe0][..],
+        &[0x66, 0x45, 0x0f, 0xb1, 0xc1][..],
+        &[0xf0, 0x48, 0x0f, 0xb1, 0x55, 0][..],
+        &[
+            0x64, 0x67, 0xf0, 0x4f, 0x0f, 0xb1, 0x84, 0x8c, 0xf8, 0xff, 0xff, 0xff,
+        ][..],
+    ] {
+        let expected = admission(bytes);
+        assert!(matches!(expected, DecodeDecision::Entry(_)));
+        let mut decoder = FetchDecoder::new(u64::MAX - 2);
+        for (index, &byte) in bytes.iter().enumerate() {
+            if index != 0 {
+                assert_eq!(admission(&bytes[..index]), DecodeDecision::More);
+                assert!(decoder.outcome().is_none());
+            }
+            let request = decoder.request().unwrap();
+            assert_eq!(request.address, (u64::MAX - 2).wrapping_add(index as u64));
+            decoder.complete(request, byte).unwrap();
+        }
+        assert!(decoder.request().is_none());
+        assert_eq!(decoder.fetched(), bytes);
+        let mut input = DecodeInput {
+            sequence: u64::MAX,
+            rip: u64::MAX - 2,
+            length: bytes.len() as u8,
+            bytes: [0; 15],
+        };
+        input.bytes[..bytes.len()].copy_from_slice(bytes);
+        assert_eq!(admit(input), expected);
+        input.bytes[bytes.len()] = 0x90;
+        input.length += 1;
+        assert_eq!(admit(input), DecodeDecision::Rejected);
+    }
+    let mut maximum = [0x66; 15];
+    maximum[9..].copy_from_slice(&[0xf0, 0x48, 0x0f, 0xb1, 0x55, 0]);
+    for length in 1..maximum.len() {
+        assert_eq!(admission(&maximum[..length]), DecodeDecision::More);
+    }
+    assert!(matches!(admission(&maximum), DecodeDecision::Entry(_)));
+    let mut exhausted = [0x66; 15];
+    exhausted[11..].copy_from_slice(&[0xf0, 0x48, 0x0f, 0xb1]);
+    assert_eq!(admission(&exhausted), DecodeDecision::Rejected);
+    assert!(matches!(outcome(&exhausted, 0), Outcome::Rejected(_)));
+}
+
+#[test]
+fn locked_binary_alu_families_reuse_scalar_register_and_immediate_operands() {
+    use x86_system::memory_core::cpu_core::integer::Operation as Integer;
+    use x86_system::shared::entry::Instruction;
+    for (opcode, extension, operation) in [
+        (0x00, 0, Integer::Add),
+        (0x10, 2, Integer::Adc),
+        (0x28, 5, Integer::Sub),
+        (0x18, 3, Integer::Sbb),
+        (0x20, 4, Integer::And),
+        (0x08, 1, Integer::Or),
+        (0x30, 6, Integer::Xor),
+    ] {
+        for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+            let mut prefix = vec![0xf0];
+            if width == Width::Word {
+                prefix.push(0x66);
+            }
+            prefix.push(if width == Width::Qword { 0x4c } else { 0x44 });
+            let bytes = [
+                &prefix[..],
+                &[opcode | u8::from(width != Width::Byte), 0x60, 0x58],
+            ]
+            .concat();
+            let destination = Operand::Memory {
+                address: Address {
+                    size: AddressSize::Bits64,
+                    segment: Segment::Ds,
+                    base: Base::Register(Gpr::new(0).unwrap()),
+                    index: None,
+                    scale: Scale::One,
+                    displacement: 0x58,
+                },
+                width,
+            };
+            assert_eq!(
+                entry(&bytes),
+                Instruction::LockedAlu {
+                    operation,
+                    destination,
+                    source: Operand::Register(reg(12, width, false)),
+                },
+                "{bytes:02x?}"
+            );
+            let bytes = [
+                &prefix[..],
+                &[
+                    if width == Width::Byte { 0x80 } else { 0x83 },
+                    0x40 | (extension << 3),
+                    0x58,
+                    0x80,
+                ],
+            ]
+            .concat();
+            assert_eq!(
+                entry(&bytes),
+                Instruction::LockedAlu {
+                    operation,
+                    destination,
+                    source: Operand::Immediate(Immediate {
+                        encoded_width: Width::Byte,
+                        width,
+                        value: (-128i64) as u64 & width.mask(),
+                    }),
+                },
+                "{bytes:02x?}"
+            );
+        }
+    }
+    for (prefix, source) in [
+        (&[][..], reg(0, Width::Byte, true)),
+        (&[0x40][..], reg(4, Width::Byte, false)),
+    ] {
+        let bytes = [&[0xf0][..], prefix, &[0x00, 0x20]].concat();
+        let Instruction::LockedAlu {
+            operation,
+            source: Operand::Register(actual),
+            ..
+        } = entry(&bytes)
+        else {
+            panic!("locked byte ADD")
+        };
+        assert_eq!(operation, Integer::Add);
+        assert_eq!(actual, source);
+    }
+}
+
+#[test]
+fn locked_unary_alu_families_cover_measured_inc_and_normalized_memory() {
+    use x86_system::memory_core::cpu_core::integer::Operation as Integer;
+    use x86_system::shared::entry::Instruction;
+    for (opcode, extension, operation) in [
+        (0xfe, 0, Integer::Inc),
+        (0xfe, 1, Integer::Dec),
+        (0xf6, 3, Integer::Neg),
+        (0xf6, 2, Integer::Not),
+    ] {
+        for (prefix, width) in [
+            (&[][..], Width::Byte),
+            (&[0x66][..], Width::Word),
+            (&[][..], Width::Dword),
+            (&[0x48][..], Width::Qword),
+        ] {
+            let bytes = [
+                &[0xf0][..],
+                prefix,
+                &[
+                    opcode | u8::from(width != Width::Byte),
+                    0x43 | (extension << 3),
+                    0x58,
+                ],
+            ]
+            .concat();
+            assert_eq!(
+                entry(&bytes),
+                Instruction::LockedAlu {
+                    operation,
+                    destination: Operand::Memory {
+                        address: Address {
+                            size: AddressSize::Bits64,
+                            segment: Segment::Ds,
+                            base: Base::Register(Gpr::new(3).unwrap()),
+                            index: None,
+                            scale: Scale::One,
+                            displacement: 0x58,
+                        },
+                        width,
+                    },
+                    source: Operand::Immediate(Immediate {
+                        encoded_width: width,
+                        width,
+                        value: 0,
+                    }),
+                },
+                "{bytes:02x?}"
+            );
+        }
+    }
+    for (prefix, segment) in [(0x64, Segment::Fs), (0x65, Segment::Gs)] {
+        let Instruction::LockedAlu {
+            operation,
+            destination: Operand::Memory { address, width },
+            ..
+        } = entry(&[prefix, 0x67, 0xf0, 0x4b, 0xff, 0x44, 0x8c, 0xf8])
+        else {
+            panic!("locked address32 INC")
+        };
+        assert_eq!(operation, Integer::Inc);
+        assert_eq!(width, Width::Qword);
+        assert_eq!(
+            address,
+            Address {
+                size: AddressSize::Bits32,
+                segment,
+                base: Base::Register(Gpr::new(12).unwrap()),
+                index: Gpr::new(9),
+                scale: Scale::Four,
+                displacement: 0xffff_fff8,
+            }
+        );
+    }
+}
+
+#[test]
+fn locked_alu_packets_reject_other_families_prefixes_and_inexact_lengths() {
+    use x86_system::shared::decode::DecodeDecision;
+    for bytes in [
+        &[0xf0, 0xff, 0x43, 0x58][..],
+        &[0xf0, 0x48, 0x01, 0x08][..],
+        &[0xf0, 0x48, 0x83, 0x28, 1][..],
+        &[0xf0, 0x83, 0x00, 0xf2][..],
+        &[0x64, 0x67, 0xf0, 0x4b, 0xf7, 0x5c, 0x8c, 0xf8][..],
+    ] {
+        assert!(
+            matches!(admission(bytes), DecodeDecision::Entry(_)),
+            "{bytes:02x?}"
+        );
+        for length in 1..bytes.len() {
+            assert_eq!(admission(&bytes[..length]), DecodeDecision::More);
+        }
+        assert_eq!(
+            admission(&[bytes, &[0x90]].concat()),
+            DecodeDecision::Rejected
+        );
+        for prefix in [
+            &[0xf2][..],
+            &[0xf3][..],
+            &[0xf2, 0xf3][..],
+            &[0xf3, 0xf2][..],
+        ] {
+            assert_eq!(
+                admission(&[prefix, bytes].concat()),
+                DecodeDecision::Unsupported,
+                "{prefix:02x?} {bytes:02x?}"
+            );
+        }
+    }
+    for bytes in [
+        &[0xf0, 0x0f, 0xc1, 0x08][..],
+        &[0xf0, 0x0f, 0xab, 0x08][..],
+        &[0xf0, 0x0f, 0xb3, 0x08][..],
+        &[0xf0, 0x0f, 0xbb, 0x08][..],
+        &[0xf0, 0x0f, 0xba, 0x28, 1][..],
+        &[0xf0, 0xf2, 0xff, 0x43, 0x58][..],
+        &[0xf0, 0xf3, 0xff, 0x43, 0x58][..],
+    ] {
+        assert_eq!(
+            admission(bytes),
+            DecodeDecision::Unsupported,
+            "{bytes:02x?}"
+        );
+    }
+    for bytes in [
+        &[0xf0, 0x01, 0xc8][..],
+        &[0xf0, 0xff, 0xc0][..],
+        &[0xf0, 0xf7, 0xd8][..],
+        &[0xf0, 0xd1, 0x20][..],
+        &[0xf0, 0xd1, 0x28][..],
+        &[0xf0, 0xd1, 0x38][..],
+        &[0xf0, 0x39, 0x08][..],
+        &[0xf0, 0x85, 0x08][..],
+    ] {
+        assert_eq!(
+            admission(bytes),
+            DecodeDecision::InvalidOpcode,
+            "{bytes:02x?}"
+        );
+    }
+    let mut maximum = [0x66; 15];
+    maximum[11..].copy_from_slice(&[0xf0, 0xff, 0x43, 0x58]);
+    assert!(matches!(admission(&maximum), DecodeDecision::Entry(_)));
 }
 
 fn conditions() -> [x86_system::memory_core::cpu_core::control::Condition; 16] {

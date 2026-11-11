@@ -36,11 +36,11 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
     const ENTRY: u64 = 0x2d98100;
-    const CHECKPOINT: u64 = 0xffff_ffff_82d9_8800;
+    const CHECKPOINT: u64 = 0xffff_ffff_81ed_6589;
     const PROBE_TARGET: u64 = 0xffff_ffff_82d9_8800;
     const TARGET: u64 = 0xffff_ffff_82d9_8890;
     const ROOT: u64 = 0x2e32000;
-    const STACK: u64 = 0xffff_ffff_8260_3f28;
+    const STACK: u64 = 0xffff_ffff_8260_3e98;
     const RETURN: u64 = 0xffff_ffff_812f_3dad;
     const CMDLINE: &str =
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
@@ -142,11 +142,17 @@ mod native {
         Ok(())
     }
 
+    struct MemoryDigest {
+        whole: Vec<u8>,
+        chunks: Vec<Vec<u8>>,
+    }
+
     fn memory_digest(
         memory: &GuestMemory,
         restore: &BTreeMap<u64, (u64, u64)>,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<MemoryDigest> {
         let mut hash = Sha256::new();
+        let mut chunks = Vec::new();
         let mut bytes = vec![0; 65536];
         for address in (0..RAM).step_by(bytes.len()) {
             memory.read_at(address, &mut bytes)?;
@@ -156,8 +162,12 @@ mod native {
             }
 
             hash.update(&bytes);
+            chunks.push(Sha256::digest(&bytes).to_vec());
         }
-        Ok(hash.finalize().to_vec())
+        Ok(MemoryDigest {
+            whole: hash.finalize().to_vec(),
+            chunks,
+        })
     }
 
     fn expected_store(
@@ -394,6 +404,66 @@ mod native {
         Ok(())
     }
 
+    fn main_kernel_stack(
+        memory: &GuestMemory,
+        changes: &mut BTreeMap<u64, (u64, u64)>,
+    ) -> anyhow::Result<()> {
+        let stack = 0xffff_ffff_8260_0000u64;
+        // Reservations repeats copy_bootdata because the loader header version
+        // is zero; SME-disabled calls still leave their ordinary return slots.
+        for (offset, value) in [
+            (0, 0x57ac6e9d),
+            (0x3f00, 0xffff_ffff_82db_8d8e),
+            (0x3f08, 0xffff_ffff_82db_8e2f),
+            (0x3f18, 0x2000),
+            (0x3f20, 0xffff_ffff_82d9_8814),
+            // start_kernel, build_id_parse_buf and parse_build_id prologues.
+            (0x3f18, 0),
+            (0x3f10, 0),
+            (0x3f08, 0xb0),
+            (0x3f00, 0x2000),
+            (0x3ef8, 0),
+            (0x3ee0, 0),
+            (0x3ed8, 0),
+            (0x3ed0, 0),
+            (0x3ec8, 0),
+            (0x3ec0, 0x88),
+            (0x3eb8, 0xffff_ffff_8256_fa2c),
+            (0x3eb0, 0),
+            (0x3ea8, 0),
+            (0x3e90, 0x2000),
+            (0x3e88, 0),
+            (0x3e80, 0),
+            (0x3e78, 0xb0),
+            (0x3e70, 0x2000),
+            (0x3e68, 0),
+            (0x3e60, 20u64 << 32),
+            // freader_fetch's second GNU-note fetch: offset 16, length 20.
+            (0x3e58, 0xffff_ffff_81e9_de0e),
+            (0x3e50, 0x88),
+            (0x3e48, stack + 0x3ea8),
+            (0x3e40, 0x88),
+            (0x3e38, 20),
+            (0x3e30, 16),
+            // cgroup_init_early, first cpuset initialization and mutex_lock.
+            (0x3ee8, 0xffff_ffff_82d8_7b07),
+            (0x3ee0, 0),
+            (0x3ed8, 0xb0),
+            (0x3ed0, 0x2000),
+            (0x3ec8, 0),
+            (0x3ec0, 0xffff_ffff_82dc_696a),
+            (0x3eb8, 0xffff_ffff_8245_6242),
+            (0x3eb0, 0xffff_ffff_827b_95a0),
+            (0x3ea8, 0),
+            (0x3ea0, 0xffff_ffff_82dc_66d6),
+            (0x3e98, 0xffff_ffff_827b_95a0),
+            (0x3e90, 0xffff_ffff_81ed_6579),
+        ] {
+            expected_store(memory, changes, 0x2600000 + offset, &value.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
     fn check_zero_ranges(
         memory: &GuestMemory,
         projection: &serde_json::Value,
@@ -477,6 +547,23 @@ mod native {
                 );
                 !loader_inputs
             }
+        };
+        let probe_target = if probe {
+            match args.next() {
+                None => PROBE_TARGET,
+                Some(value) => {
+                    let value = value.to_str().context("non-UTF8 probe checkpoint")?;
+                    u64::from_str_radix(
+                        value
+                            .strip_prefix("0x")
+                            .context("probe checkpoint needs 0x prefix")?,
+                        16,
+                    )
+                    .context("invalid probe checkpoint")?
+                }
+            }
+        } else {
+            PROBE_TARGET
         };
         ensure!(args.next().is_none(), "unexpected witness arguments");
         let topology = TopologyBuilder::new_x86()
@@ -718,11 +805,23 @@ mod native {
             "unexpected early CPIO input"
         );
         bootdata_stack(&memory, &mut changes, initrd_address, initrd_size)?;
+        main_kernel_stack(&memory, &mut changes)?;
+        let current_task = memory.read_plain::<u64>(0x30bc018)?;
+        let first_subsystem = memory.read_plain::<u64>(0x27b6ac0)?;
+        ensure!(
+            current_task == 0xffff_ffff_8260_d380 && first_subsystem == 0xffff_ffff_827b_95a0,
+            "unexpected first cgroup/task inputs"
+        );
+        let first_css_alloc = memory.read_plain::<u64>(first_subsystem - 0xffff_ffff_8000_0000)?;
+        let first_css_free =
+            memory.read_plain::<u64>(first_subsystem - 0xffff_ffff_8000_0000 + 0x20)?;
         let before = memory_digest(&memory, &BTreeMap::new())?;
+        let mut initial_stack_task = vec![0; 65536];
+        memory.read_at(0x2600000, &mut initial_stack_task)?;
         let mut binder = binders.pop().context("missing VP binder")?;
         ensure!(binders.is_empty(), "unexpected additional VP");
         let mut vp = binder.bind()?;
-        vp.set_execution_checkpoint(Some(if probe { PROBE_TARGET } else { CHECKPOINT }))?;
+        vp.set_execution_checkpoint(Some(if probe { probe_target } else { CHECKPOINT }))?;
         {
             let mut state = vp.access_state(Vtl::Vtl0);
             state.set_mtrrs(&initial.mtrrs)?;
@@ -781,7 +880,7 @@ mod native {
             println!(
                 "{}",
                 serde_json::json!({
-                    "probe":true,"acceptance":false,"stop":failure.to_string(),"target":PROBE_TARGET,
+                    "probe":true,"acceptance":false,"stop":failure.to_string(),"target":probe_target,
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
                     "kernel_image_bytes":encoding,
@@ -808,29 +907,23 @@ mod native {
         expected.cr0 = 0x80050033;
         expected.cr4 = 0xb0;
         expected.efer = 0xd01;
-        expected.rax = changes
-            .get(&(ROOT + 511 * 8))
-            .context("missing projected high root slot")?
-            .1;
-        expected.rbx = 0;
-        expected.rdx = 0;
-        expected.rcx = 37;
-        expected.rsi = 0xffff_8880_0000_0000 + initrd_address + 6;
-        expected.rdi = 0x2000;
-        expected.rbp = 0x2000;
-        expected.r8 = 0;
-        expected.r9 =
-            u64::from(u32::from(memory.read_plain::<u8>(initrd_address)?).wrapping_sub(0x30));
-        expected.r10 = 1;
+        expected.rax = 0;
+        expected.rbx = first_subsystem;
+        expected.rdx = current_task;
+        expected.rcx = first_css_alloc;
+        expected.rsi = 1;
+        expected.rdi = 0xffff_ffff_827b_6be0;
+        expected.rbp = expected.rdi;
+        expected.r8 = first_css_free;
+        expected.r9 = 0;
+        expected.r10 = 0xffff_ffff_8256_fa2c;
         expected.r11 = 1;
-        expected.r12 = expected.cr4;
+        expected.r12 = 1;
         expected.cr3 = ROOT;
         expected.r15 = initial.registers.rsi;
         expected.rsp = STACK;
         expected.rip = CHECKPOINT;
-        // The AMD loader's final ADD RSP,0x60 supplies flags; the caller's
-        // root-slot copy and CALL to reservations leave them unchanged.
-        expected.rflags = 0x86;
+        expected.rflags = 0x46;
         expected.cr2 = 0xffff_8880_0000_0000 + initrd_address;
         expected.gdtr.base = 0xffff_ffff_830a_e000;
         expected.gdtr.limit = 0x7f;
@@ -862,14 +955,41 @@ mod native {
             check_zero_ranges(&memory, &projection)? == zero_bytes,
             "changed clearing bounds"
         );
+        let after = memory_digest(&memory, &changes)?;
+        let mismatched_chunks: Vec<_> = before
+            .chunks
+            .iter()
+            .zip(&after.chunks)
+            .enumerate()
+            .filter(|(_, pair)| pair.0 != pair.1)
+            .map(|(index, _)| format!("{:#x}", index * 65536))
+            .collect();
+        if after.whole != before.whole {
+            let mut unknown = Vec::new();
+            let mut count = 0usize;
+            for (index, bytes) in initial_stack_task.chunks_exact(8).enumerate() {
+                let address = 0x2600000 + index as u64 * 8;
+                let original = u64::from_le_bytes(bytes.try_into()?);
+                let actual = memory.read_plain::<u64>(address)?;
+                if !changes.contains_key(&address) && original != actual {
+                    count += 1;
+                    if unknown.len() < 16 {
+                        unknown.push(format!("{address:#x}: {original:#x}->{actual:#x}"));
+                    }
+                }
+            }
+            bail!(
+                "RAM changed outside projected effects; chunks {mismatched_chunks:?}; unprojected stack/task words {count}: {unknown:?}"
+            );
+        }
         ensure!(
-            memory_digest(&memory, &changes)? == before,
-            "RAM changed outside the projected tables/data, A/D, stack and #VC gate effects"
+            after.whole == before.whole,
+            "RAM changed outside projected effects; mismatched 64-KiB chunks: {mismatched_chunks:?}"
         );
         let mut bytes = [0; 7];
         memory.read_at(CHECKPOINT - 0xffff_ffff_8000_0000, &mut bytes)?;
         ensure!(
-            bytes == [0x66, 0x83, 0x3d, 0x1e, 0x60, 0x35, 0],
+            bytes == [0x75, 0x06, 0x5d, 0xe9, 0xdf, 0x5d, 0],
             "wrong checkpoint bytes"
         );
         let functions = [0, 1, 0x8000_0000, 0x8000_0001, 0x8000_0008];
@@ -886,11 +1006,12 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
-                "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "66833d1e603500",
+                "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "75065de9df5d00",
                 "stop_kind":"host_checkpoint","initial_memory_cleared":true,
                 "kernel_c_entry":true,"identity_mappings_removed":true,"zero_bytes":zero_bytes,
                 "boot_parameters_copied":true,"command_line_copied":true,
                 "guest_page_faults_repaired":true,"reservations_entry":true,
+                "main_kernel_entry":true,"first_mutex_acquired":true,
                 "r15": actual.r15, "rsp": actual.rsp, "return_address": RETURN,
                 "rflags": actual.rflags, "seconds": seconds,
                 "complete_register_image_checked": true, "whole_ram_checked": true,

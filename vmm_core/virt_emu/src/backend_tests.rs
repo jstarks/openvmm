@@ -368,6 +368,91 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
 }
 
 #[async_test]
+async fn locked_compare_exchange_uses_actual_vp_state_and_atomic_ram(driver: DefaultDriver) {
+    for (matched, flags) in [(true, 0x46), (false, 0x97)] {
+        let (mut bytes, owned) = fixture();
+        let program = [0xf0, 0x48, 0x0f, 0xb1, 0x55, 0, 0xf4];
+        bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+        bytes[0x16000..0x16008]
+            .copy_from_slice(&(if matched { 0x11u64 } else { 0x33 }).to_le_bytes());
+        let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+        let mut vp = binder.bind().unwrap();
+        let mut initial = long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        );
+        initial.rax = 0x11;
+        initial.rdx = 0x22;
+        initial.rbp = 0x16000;
+        vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+        vp.set_execution_checkpoint(Some(CODE + 6)).unwrap();
+        let devices = Devices::new();
+        let stop = StopVpSource::new();
+        assert!(matches!(
+            vp.run_vp(stop.checker(), &devices).await,
+            Err(VpHaltReason::PowerOff)
+        ));
+        assert_eq!(devices.faults.lock().len(), 1);
+        assert!(devices.faults.lock()[0].contains("checkpoint"));
+        let mut expected = initial;
+        expected.rip = CODE + 6;
+        expected.rflags = (initial.rflags & !0x108d5) | flags;
+        if !matched {
+            expected.rax = 0x33;
+        }
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert_eq!(
+            memory.read_plain::<u64>(0x16000).unwrap(),
+            if matched { 0x22 } else { 0x33 }
+        );
+        let progress = vp.completed_batch_progress();
+        assert_eq!((progress.retired, progress.delivered), (1, 0));
+    }
+}
+
+#[async_test]
+async fn locked_integer_modify_preserves_neighbor_bits_and_carry_through_the_real_vp(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    let program = [0xf0, 0xff, 0x43, 0x58, 0xf4];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    bytes[0x16000..0x16008].copy_from_slice(&0xaabb_ccdd_ffff_ffffu64.to_le_bytes());
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.rbx = 0x16000 - 0x58;
+    initial.rflags |= 1;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + 4)).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    assert_eq!(devices.faults.lock().len(), 1);
+    assert!(devices.faults.lock()[0].contains("checkpoint"));
+    let mut expected = initial;
+    expected.rip = CODE + 4;
+    expected.rflags = (initial.rflags & !0x108d5) | 0x57;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(
+        memory.read_plain::<u64>(0x16000).unwrap(),
+        0xaabb_ccdd_0000_0000
+    );
+    let progress = vp.completed_batch_progress();
+    assert_eq!((progress.retired, progress.delivered), (1, 0));
+}
+
+#[async_test]
 async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: DefaultDriver) {
     for iret in [false, true] {
         let (mut bytes, owned) = fixture();

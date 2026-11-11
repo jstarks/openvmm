@@ -8,6 +8,8 @@ use super::super::memory_core::cpu_core::operand::{
     Address, Operand, Segment, SegmentBases, Width,
 };
 #[cfg(verus_keep_ghost)]
+use super::super::memory_core::cpu_core::{compare, integer};
+#[cfg(verus_keep_ghost)]
 use super::super::memory_core::cpu_core::{
     control, descriptor, operand, profile, scalar as operations,
 };
@@ -72,6 +74,52 @@ pub open spec fn conditional_value(s:State,condition:control::Condition,
             .map(|i:int,v:u64|v as int),..cpu},length,false,false)
     }
 }
+pub open spec fn compare_exchange(s:State,destination:Operand,source:operand::Register,length:u8)->(State,Tick) {
+        let cpu=s.core.cpu;
+        if length==0 || length>15 {unsupported(s)}
+        else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+        else if !source.valid() {unsupported(s)}
+        else {match destination {
+            Operand::Register(dst)=>match compare::model::registers(cpu,dst,source) {
+                Some(updated)=>retire(s,updated,length,false,false),None=>unsupported(s),
+            },
+            Operand::Memory {address,width}=>{
+                if !address.valid() || width!=source@.width {unsupported(s)}
+                else {
+                    let va=linear(s,address,length);
+                    let start=c::boundary_compare_exchange(s.core,va,cpu.gpr[0] as u64,
+                        operand::model::read(registers(cpu),source),width);
+                    if !start.1 {unsupported(s)}
+                    else {
+                        (State {core:start.0,phase:Phase::EntryMemory {address:va,length,
+                            task:MemoryTask::CompareExchange {width}},..s},Tick::Pending)
+                    }
+                }
+            },
+            _=>unsupported(s),
+        }}
+}
+pub open spec fn locked_alu(s:State,operation:integer::Operation,destination:Operand,
+    source:Operand,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if length==0 || length>15 {unsupported(s)}
+    else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {match destination {
+        Operand::Memory {address,width}=>{
+            if !address.valid() || scalar(cpu,source) is None {unsupported(s)}
+            else {
+                let va=linear(s,address,length);
+                let value=scalar(cpu,source).unwrap();
+                let start=c::boundary_locked_modify(s.core,va,operation,value,cpu.flags,width);
+                if !start.1 {unsupported(s)} else {
+                    (State {core:start.0,phase:Phase::EntryMemory {address:va,length,
+                        task:MemoryTask::LockedAlu {operation,source:value,width}},..s},Tick::Pending)
+                }
+            }
+        },
+        _=>unsupported(s),
+    }}
+}
 #[verifier::opaque]
 pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (State, Tick) {
     let cpu = s.core.cpu;
@@ -79,6 +127,8 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
+        Instruction::CompareExchange {destination,source}=>compare_exchange(s,destination,source,length),
+        Instruction::LockedAlu {operation,destination,source}=>locked_alu(s,operation,destination,source,length),
         Instruction::Nop=>retire(s,cpu,length,false,false),
         Instruction::Direction {set}=>retire(s,model::State {
             flags:if set {cpu.flags|0x400u64} else {cpu.flags&!0x400u64},..cpu},length,false,false),
@@ -278,6 +328,12 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::LockedAlu {operation,source,width}=>{
+            let result=integer::model::evaluate(operation,value,source,width,cpu.flags);
+            retire(s,model::State {flags:result.flags,..cpu},length,false,true)
+        },
+        MemoryTask::CompareExchange {width}=>
+            retire(s,compare::model::memory(cpu,value,width),length,false,true),
         MemoryTask::RepeatStore {width}=>repeat::value(s,width,length),
         MemoryTask::RepeatRead {width}=>repeat::move_read(s,width,value,length),
         MemoryTask::RepeatWrite {width}=>repeat::move_value(s,width,length),

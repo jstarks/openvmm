@@ -14,7 +14,9 @@ use super::super::memory_core::cpu_core::{
     control, descriptor, operand, profile, scalar as operations,
 };
 #[cfg(verus_keep_ghost)]
-use super::super::shared::entry::{Instruction, MemoryTask};
+use super::super::mmu_core::shared::io::IoReply;
+#[cfg(verus_keep_ghost)]
+use super::super::shared::entry::{Instruction, MemoryTask, Port, PortRequest};
 use super::*;
 
 verus! {
@@ -40,6 +42,47 @@ pub open spec fn linear(s: State, address: Address, length: u8) -> u64 {
 }
 pub open spec fn unsupported(s: State) -> (State, Tick) {
     stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported))
+}
+pub open spec fn port_io(s:State,port:Port,width:Width,write:bool,length:u8)->(State,Tick) {
+    if width==Width::Qword {unsupported(s)} else {
+        let port=match port {Port::Dx=>s.core.cpu.gpr[2] as u16,Port::Immediate(port)=>port as u16};
+        let access=if write {WordAccess::Write(s.core.cpu.gpr[0] as u64&operand::model::mask(width))}
+            else {WordAccess::Read};
+        (State {phase:Phase::PortIo {request:PortRequest {sequence:s.decode_sequence,port,width,access},
+            length,reply:None},..s},Tick::Pending)
+    }
+}
+pub open spec fn complete_port_io(s:State,sequence:u64,completion:IoReply)->(State,bool) {
+    match s.phase {
+        Phase::PortIo {request,length,reply:None}=>{
+            if sequence!=request.sequence {(s,false)} else {
+                match (request.access,completion) {
+                    (WordAccess::Read,IoReply::Read(_)) | (WordAccess::Write(_),IoReply::Written)=>
+                        (State {phase:Phase::PortIo {request,length,reply:Some(completion)},..s},true),
+                    _=>(s,false),
+                }
+            }
+        },
+        _=>(s,false),
+    }
+}
+pub open spec fn finish_port_io(s:State)->(State,Tick) {
+    match s.phase {
+        Phase::PortIo {request,length,reply:Some(completion)}=>{
+            let cpu=match completion {
+                IoReply::Read(value)=>{
+                    let mask=operand::model::mask(request.width);
+                    let value=value&mask;
+                    let value=if request.width==Width::Dword || request.width==Width::Qword {value}
+                        else {(s.core.cpu.gpr[0] as u64&!mask)|value};
+                    model::State {gpr:s.core.cpu.gpr.update(0,value as int),..s.core.cpu}
+                },
+                IoReply::Written=>s.core.cpu,
+            };
+            retire(s,cpu,length,false,false)
+        },
+        _=>(s,Tick::Waiting),
+    }
 }
 pub open spec fn retire(s: State, cpu: model::State, length: u8, shadow: bool, serializing: bool) -> (State, Tick) {
     let cpu = model::State { rip: (cpu.rip + length as int) % 0x1_0000_0000_0000_0000int,
@@ -126,6 +169,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
+        Instruction::PortIo {port,width,write}=>port_io(s,port,width,write,length),
         Instruction::CompareExchange {destination,source}=>compare_exchange(s,destination,source,length),
         Instruction::LockedAlu {operation,destination,source}=>locked_alu(s,operation,destination,source,length),
         Instruction::Scan {dst,source,reverse}=>alu::scan(s,dst,source,reverse,length),
@@ -231,6 +275,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::Integer {operation,dst,source}=>alu::execute(s,operation,Operand::Register(dst),source,length),
         Instruction::Alu {operation,destination,source}=>alu::execute(s,operation,destination,source,length),
         Instruction::Multiply {dst,source,immediate}=>alu::multiply(s,dst,source,immediate,length),
+        Instruction::MultiplyWide {source,width,signed}=>alu::wide_multiply(s,source,width,signed,length),
         Instruction::RepeatStore {width}=>repeat::execute(s,width,length),
         Instruction::RepeatMove {width}=>repeat::execute_move(s,width,length),
         Instruction::SignExtend {dst,source,width}=>{
@@ -364,6 +409,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
         MemoryTask::ConditionalMove {condition,dst}=>conditional_value(s,condition,dst,value,length),
         MemoryTask::CallTarget=>alu::call(s,value,length),
         MemoryTask::Multiply {dst,immediate}=>alu::multiply_value(s,dst,value,immediate,length),
+        MemoryTask::MultiplyWide {width,signed}=>alu::wide_product(s,value,width,signed,length),
         MemoryTask::AluRegister {operation,dst}=>{
             if !dst.valid() {unsupported(s)}
             else {alu::finish(s,operation,Some(dst),operand::model::read(registers(cpu),dst),value,dst@.width,length)}

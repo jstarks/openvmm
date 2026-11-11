@@ -39,6 +39,7 @@ pub enum Phase {
     Admitted { input: DecodeInput, decision: DecodeDecision },
     NearCall { target: u64, stack: u64 },
     EntryMemory { address: u64, length: u8, task: entry::MemoryTask },
+    PortIo { request: entry::PortRequest, length: u8, reply: Option<IoReply> },
     Repeat { width: memory_core::cpu_core::operand::Width, length: u8 },
     RepeatMove { width: memory_core::cpu_core::operand::Width, length: u8 },
     GateLow { event: Event, address: u64 },
@@ -77,6 +78,17 @@ impl SharedEventMachine {
         self.core.invariant()
         && self.system_supported()
         && match self.phase {
+            Phase::PortIo {request,length,reply} =>
+                request.width != memory_core::cpu_core::operand::Width::Qword
+                && request.sequence == self.decode_sequence && 1 <= length <= 15
+                && match (request.access,reply) {
+                    (WordAccess::Read,Some(IoReply::Written))
+                    | (WordAccess::Write(_),Some(IoReply::Read(_)))=>false,
+                    _=>true,
+                },
+            _=>true,
+        }
+        && match self.phase {
             Phase::Decode { input } | Phase::Admitted { input, .. } =>
                 spec::decode::valid_input(self@, input)
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
@@ -90,7 +102,7 @@ impl SharedEventMachine {
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             Phase::Ordinary { .. } => self.core@.phase != CpuPhase::Boundary,
             Phase::Stopped { .. } => !mmu_core::shared_model::active(self.core@.mmu.phase),
-            Phase::Repeat { .. } | Phase::RepeatMove { .. } => self.core@.phase == CpuPhase::Boundary
+            Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. } => self.core@.phase == CpuPhase::Boundary
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             _ => self.core@.phase == CpuPhase::Boundary,
         }
@@ -286,6 +298,7 @@ impl SharedEventMachine {
             Phase::RepeatMove {width,length} => self.execute_move(width,length),
             Phase::Decode { input } => Tick::Decode(input),
             Phase::Admitted { .. } => self.advance_admitted(),
+            Phase::PortIo { .. } => self.finish_port_io(),
             Phase::DecodeFetch { input } => match self.core.request() {
                 Request::Complete(report) => match report.result {
                     MmuResult::Success(value) => self.append_decode(value),
@@ -444,7 +457,7 @@ impl SharedEventMachine {
             !matches!(self.phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
-                | Phase::Repeat { .. } | Phase::RepeatMove { .. }),
+                | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }),
         ensures out == spec::word_location(self@),
     {
         let cpu = self.core.cpu();
@@ -470,7 +483,7 @@ impl SharedEventMachine {
             !matches!(old(self).phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
-                | Phase::Repeat { .. } | Phase::RepeatMove { .. }),
+                | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }),
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::word_value(old(self)@, value),
     {
@@ -644,6 +657,7 @@ pub enum BatchStop {
     Waiting,
     Stopped(EventDiagnostic),
     Io(IoRequest),
+    PortIo(entry::PortRequest),
     Decode(DecodeInput),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -715,6 +729,18 @@ impl SharedEventMachine {
                     });
                 }
                 Tick::Waiting => {
+                    if let Phase::PortIo {
+                        request,
+                        reply: None,
+                        ..
+                    } = self.phase
+                    {
+                        return Ok(Batch {
+                            retired,
+                            delivered,
+                            stop: BatchStop::PortIo(request),
+                        });
+                    }
                     if let Some(operand) = self.io_operand() {
                         if is_mmio(operand.address, 8) {
                             let route = self.route_io();

@@ -125,6 +125,33 @@ pub open spec fn call(s:State,target:u64,length:u8)->(State,Tick) {
     else {(word(s,(cpu.gpr[4]-8) as u64,WordAccess::Write((cpu.rip+length as int) as u64),
         Phase::NearCall {target,stack:(cpu.gpr[4]-8) as u64}),Tick::Pending)}
 }
+pub open spec fn wide_multiply(s:State,source:Operand,width:Width,signed:bool,length:u8)->(State,Tick) {
+    match source {
+        Operand::Memory {address,width:actual}=>{
+            if !address.valid() || actual!=width {entry::unsupported(s)}
+            else {entry::memory(s,entry::linear(s,address,length),width,WordAccess::Read,length,
+                MemoryTask::MultiplyWide {width,signed})}
+        },
+        Operand::Register(reg)=>{
+            if !reg.valid() || reg@.width!=width {entry::unsupported(s)}
+            else {wide_product(s,operand::model::read(entry::registers(s.core.cpu),reg),width,signed,length)}
+        },
+        _=>entry::unsupported(s),
+    }
+}
+pub open spec fn wide_product(s:State,value:u64,width:Width,signed:bool,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    let p=scalar::model::multiply_wide(cpu.gpr[0] as u64,value,width,signed,cpu.flags);
+    let gpr=if width==Width::Byte {
+        cpu.gpr.update(0,((cpu.gpr[0] as u64&!0xffffu64)|p.low|(p.high<<8)) as int)
+    } else {
+        cpu.gpr.update(0,(if width==Width::Word {(cpu.gpr[0] as u64&!0xffffu64)|p.low}
+            else {p.low}) as int).update(2,(if width==Width::Word {
+                (cpu.gpr[2] as u64&!0xffffu64)|p.high
+            } else {p.high}) as int)
+    };
+    entry::retire(s,model::State {gpr,flags:p.flags,..cpu},length,false,false)
+}
 pub open spec fn multiply(s:State,dst:Register,source:Operand,immediate:Option<u64>,length:u8)->(State,Tick) {
     if !dst.valid() || dst@.width==Width::Byte {entry::unsupported(s)}
     else {match source {

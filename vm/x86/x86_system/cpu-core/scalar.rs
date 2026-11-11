@@ -43,6 +43,21 @@ pub mod model {
         } else { 0 }
     }
 
+    #[verifier::opaque]
+    pub open spec fn multiply_wide(left:u64,right:u64,width:Width,signed:bool,flags:u64)->Product {
+        let mask=super::super::operand::model::mask(width);
+        let bits=super::super::operand::model::bits(width);
+        let product=if signed {
+            integer::signed((left&mask) as int,integer::modulus(width))
+                *integer::signed((right&mask) as int,integer::modulus(width))
+        } else {(left&mask) as int*(right&mask) as int};
+        let exact=(product%0x1_0000_0000_0000_0000_0000_0000_0000_0000int) as u128;
+        let low=(exact as u64)&mask;
+        let high=((exact>>bits) as u64)&mask;
+        let overflow=if signed {high!=sign_high(low,width)} else {high!=0};
+        Product {low,high,flags:(flags&!0x801u64)|if overflow {0x801u64} else {0u64}}
+    }
+
     pub open spec fn bit(operation: BitOperation, value: u64, index: u64,
         width: Width, flags: u64) -> integer::Outcome
     {
@@ -136,6 +151,38 @@ pub enum BitOperation { Test, Set, Reset, Complement }
 pub struct Division {
     pub quotient: u64,
     pub remainder: u64,
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct Product {pub low:u64,pub high:u64,pub flags:u64}
+
+pub fn multiply_wide(left:u64,right:u64,width:Width,signed:bool,flags:u64)->(out:Product)
+    ensures out==model::multiply_wide(left,right,width,signed,flags),
+{
+    reveal(model::multiply_wide);
+    let mask=width.mask();
+    let bits=width.bits();
+    let a=left&mask;
+    let b=right&mask;
+    let exact=if signed {
+        let modulus=mask as u128+1;
+        proof {assert(a<=mask && b<=mask) by(bit_vector)
+            requires a==left&mask,b==right&mask;}
+        let exact=integer::signed_product(a,b,width,modulus);
+        if exact<0 {0u128.wrapping_sub((-exact) as u128)} else {exact as u128}
+    } else {
+        proof {
+            assert(a as int*b as int<=u128::MAX) by(nonlinear_arith)
+                requires 0<=a as int<=u64::MAX,0<=b as int<=u64::MAX;
+            vstd::arithmetic::div_mod::lemma_small_mod(a as nat*b as nat,
+                0x1_0000_0000_0000_0000_0000_0000_0000_0000nat);
+        }
+        a as u128*b as u128
+    };
+    let low=(exact as u64)&mask;
+    let high=((exact>>bits) as u64)&mask;
+    let overflow=if signed {high!=sign_high(low,width)} else {high!=0};
+    Product {low,high,flags:(flags&!0x801u64)|if overflow {0x801u64} else {0u64}}
 }
 
 pub fn extend(value: u64, width: Width) -> (out: u64)

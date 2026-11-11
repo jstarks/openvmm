@@ -29,6 +29,12 @@ sha2.workspace = true
 test_with_tracing.workspace = true
 pal_async.workspace = true
 parking_lot.workspace = true
+state_unit.workspace = true
+vm_resource.workspace = true
+vmotherboard.workspace = true
+serial_16550.workspace = true
+serial_16550_resources.workspace = true
+serial_core.workspace = true
 
 [build-dependencies]
 build_rs_guest_arch.workspace = true

@@ -499,6 +499,33 @@ impl Processor for EmuProcessor<'_> {
                         decode_work = 0;
                     }
                 }
+                BatchStop::PortIo(request) => {
+                    self.state.io_active = true;
+                    self.ram.barrier();
+                    let size = (request.width.bits() / 8) as usize;
+                    let reply = match request.access {
+                        WordAccess::Read => {
+                            let mut bytes = [0; 8];
+                            dev.read_io(VpIndex::new(0), request.port, &mut bytes[..size])
+                                .await;
+                            IoReply::Read(u64::from_le_bytes(bytes))
+                        }
+                        WordAccess::Write(value) => {
+                            dev.write_io(
+                                VpIndex::new(0),
+                                request.port,
+                                &value.to_le_bytes()[..size],
+                            )
+                            .await;
+                            IoReply::Written
+                        }
+                    };
+                    self.ram.barrier();
+                    if !core.complete_port_io(request.sequence, reply) {
+                        return Err(dev.fatal_error(Box::new(Error::Completion)));
+                    }
+                    self.state.io_active = false;
+                }
                 BatchStop::Io(request) => {
                     self.state.io_active = true;
                     self.ram.barrier();

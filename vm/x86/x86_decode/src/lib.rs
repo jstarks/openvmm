@@ -456,6 +456,26 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         _ => {}
     }
     match instruction.mnemonic() {
+        Mnemonic::In | Mnemonic::Out => {
+            use x86_system::shared::entry::Port;
+            let write = instruction.mnemonic() == Mnemonic::Out;
+            let accumulator = if write { 1 } else { 0 };
+            let port = 1 - accumulator;
+            let width = match instruction.op_register(accumulator) {
+                iced_x86::Register::AL => Width::Byte,
+                iced_x86::Register::AX => Width::Word,
+                iced_x86::Register::EAX => Width::Dword,
+                _ => return None,
+            };
+            let port = match instruction.op_kind(port) {
+                OpKind::Register if instruction.op_register(port) == iced_x86::Register::DX => {
+                    Port::Dx
+                }
+                OpKind::Immediate8 => Port::Immediate(instruction.immediate8()),
+                _ => return None,
+            };
+            Some(EntryInstruction::PortIo { port, width, write })
+        }
         Mnemonic::Nop => Some(EntryInstruction::Nop),
         Mnemonic::Cmovo
         | Mnemonic::Cmovno
@@ -548,6 +568,19 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                 width,
             })
         }
+        Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe => {
+            let (width, destination) = match instruction.mnemonic() {
+                Mnemonic::Cbw => (Width::Byte, Width::Word),
+                Mnemonic::Cwde => (Width::Word, Width::Dword),
+                _ => (Width::Dword, Width::Qword),
+            };
+            let accumulator = Gpr::new(0)?;
+            Some(EntryInstruction::SignExtend {
+                dst: Register::new(accumulator, destination, false)?,
+                source: Operand::Register(Register::new(accumulator, width, false)?),
+                width,
+            })
+        }
         Mnemonic::Cwd | Mnemonic::Cdq | Mnemonic::Cqo => Some(EntryInstruction::SignHigh {
             width: match instruction.mnemonic() {
                 Mnemonic::Cwd => Width::Word,
@@ -562,6 +595,17 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                 source,
                 width,
                 signed: instruction.mnemonic() == Mnemonic::Idiv,
+            })
+        }
+        Mnemonic::Mul | Mnemonic::Imul if instruction.op_count() == 1 => {
+            let source = get(0)?;
+            if !matches!(source, Operand::Register(_) | Operand::Memory { .. }) {
+                return None;
+            }
+            Some(EntryInstruction::MultiplyWide {
+                source,
+                width: operand_width(source)?,
+                signed: instruction.mnemonic() == Mnemonic::Imul,
             })
         }
         Mnemonic::Imul if matches!(instruction.op_count(), 2 | 3) => {

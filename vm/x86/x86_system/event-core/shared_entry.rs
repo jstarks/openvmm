@@ -27,6 +27,7 @@ pub enum Instruction {
     IndirectJump { source: Operand },
     IndirectCall { source: Operand },
     Multiply { dst:Register, source:Operand, immediate:Option<u64> },
+    MultiplyWide {source:Operand,width:Width,signed:bool},
     RepeatStore { width:Width },
     RepeatMove { width:Width },
     ConditionalMove { condition: control::Condition, dst: Register, source: Operand },
@@ -35,6 +36,7 @@ pub enum Instruction {
     CompareExchange { destination: Operand, source: Register },
     LockedAlu { operation:integer::Operation,destination:Operand,source:Operand },
     ReadMsr,
+    PortIo { port: Port, width: Width, write: bool },
     ZeroExtend { dst: Register, src: Register },
     Load { dst: Register, address: Address, width: Width },
     Store { address: Address, width: Width, source: Operand },
@@ -51,6 +53,17 @@ pub enum Instruction {
     Return,
     Leave,
     Jump { target: u64, zero: Option<bool> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Port { Dx, Immediate(u8) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortRequest {
+    pub sequence: u64,
+    pub port: u16,
+    pub width: Width,
+    pub access: WordAccess,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +88,7 @@ pub enum MemoryTask {
     JumpTarget,
     CallTarget,
     Multiply { dst:Register, immediate:Option<u64> },
+    MultiplyWide {width:Width,signed:bool},
     RepeatStore { width:Width },
     RepeatRead { width:Width },
     RepeatWrite { width:Width },
@@ -150,6 +164,10 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
         match instruction {
+            Instruction::PortIo {port,width,write}=>{
+                reveal(spec::entry::execute);
+                self.start_port_io(port,width,write,length)
+            },
             Instruction::CompareExchange {destination,source}=>{
                 reveal(spec::entry::execute);
                 self.execute_compare_exchange(destination,source,length)
@@ -157,6 +175,10 @@ impl SharedEventMachine {
             Instruction::LockedAlu {operation,destination,source}=>{
                 reveal(spec::entry::execute);
                 self.execute_locked_alu(operation,destination,source,length)
+            },
+            Instruction::MultiplyWide {source,width,signed}=>{
+                reveal(spec::entry::execute);
+                self.execute_wide_multiply(source,width,signed,length)
             },
             Instruction::Integer {..} | Instruction::Alu {..} | Instruction::Multiply {..} =>
                 self.execute_integer(instruction,length),
@@ -183,6 +205,75 @@ impl SharedEventMachine {
                 | Instruction::ZeroExtend {..} | Instruction::Jump {..}
                 => self.execute_register(instruction,length),
             _=>self.execute_legacy(instruction,length),
+        }
+    }
+
+    fn start_port_io(&mut self, port: Port, width: Width, write: bool, length: u8) -> (tick: Tick)
+        requires old(self).invariant(), old(self).core@.phase == CpuPhase::Boundary,
+            1 <= length <= 15,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick) == spec::entry::port_io(old(self)@,port,width,write,length),
+    {
+        if width == Width::Qword {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let cpu=self.core.cpu();
+        let port=match port {Port::Dx=>cpu.gpr[2] as u16,Port::Immediate(port)=>port as u16};
+        let access=if write {WordAccess::Write(cpu.gpr[0]&width.mask())} else {WordAccess::Read};
+        self.phase=Phase::PortIo {request:PortRequest {sequence:self.decode_sequence,port,width,access},
+            length,reply:None};
+        Tick::Pending
+    }
+
+    pub fn complete_port_io(&mut self, sequence:u64, completion:IoReply) -> (accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::entry::complete_port_io(old(self)@,sequence,completion),
+    {
+        match self.phase {
+            Phase::PortIo {request,length,reply:None}=>{
+                if sequence!=request.sequence {return false;}
+                match (request.access,completion) {
+                    (WordAccess::Read,IoReply::Read(_)) | (WordAccess::Write(_),IoReply::Written)=>{
+                        self.phase=Phase::PortIo {request,length,reply:Some(completion)};
+                        true
+                    },
+                    _=>false,
+                }
+            },
+            _=>false,
+        }
+    }
+
+    pub(super) fn finish_port_io(&mut self) -> (tick:Tick)
+        requires old(self).invariant(), old(self).phase is PortIo,
+        ensures final(self).invariant(),(final(self)@,tick)==spec::entry::finish_port_io(old(self)@),
+    {
+        match self.phase {
+            Phase::PortIo {request,length,reply:Some(completion)}=>{
+                let mut cpu=self.core.cpu();
+                if let IoReply::Read(value)=completion {
+                    let dst=Register::new(memory_core::cpu_core::operand::Gpr::new(0).unwrap(),
+                        request.width,false).unwrap();
+                    let ghost before=cpu@;
+                    assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
+                    dst.write(&mut cpu.gpr,value);
+                    assert(cpu@.gpr =~= operand::model::write(
+                        spec::entry::registers(before),dst,value).map(|i:int,v:u64|v as int));
+                    proof {
+                        let mask=operand::model::mask(request.width);
+                        let original=before.gpr[0] as u64;
+                        assert((original&!(mask<<0u32))|((value&mask)<<0u32)
+                            ==(original&!mask)|(value&mask)) by(bit_vector);
+                        assert(cpu@.gpr =~= before.gpr.update(0,
+                            (if request.width==Width::Dword {value&mask}
+                            else {(original&!mask)|(value&mask)}) as int));
+                    }
+                }
+                self.retire_entry(cpu,length,false,false)
+            },
+            _=>Tick::Waiting,
         }
     }
 
@@ -603,6 +694,7 @@ impl SharedEventMachine {
                 return self.finish_conditional(condition,dst,value,length),
             MemoryTask::CallTarget => return self.begin_indirect_call(value,length),
             MemoryTask::Multiply {dst,immediate} => return self.finish_multiply(dst,value,immediate,length),
+            MemoryTask::MultiplyWide {width,signed}=>return self.finish_wide_multiply(value,width,signed,length),
             MemoryTask::AluRegister {operation,dst} => {
                 if !dst.is_valid() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));

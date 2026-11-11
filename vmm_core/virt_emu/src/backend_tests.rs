@@ -31,6 +31,8 @@ const DEVICE: u64 = 0x20000;
 const VALUE: u64 = 0xfedc_ba98_7654_3210;
 
 struct Devices {
+    port_io: bool,
+    ports: Mutex<Vec<(bool, u16, Vec<u8>)>>,
     released: AtomicBool,
     wait: AtomicWaker,
     writes: AtomicUsize,
@@ -43,6 +45,8 @@ struct Devices {
 impl Devices {
     fn new() -> Self {
         Self {
+            port_io: false,
+            ports: Mutex::new(Vec::new()),
             released: AtomicBool::new(false),
             wait: AtomicWaker::new(),
             writes: AtomicUsize::new(0),
@@ -55,6 +59,17 @@ impl Devices {
     fn release(&self) {
         self.released.store(true, Ordering::Release);
         self.wait.wake();
+    }
+    async fn wait_for_release(&self) {
+        std::future::poll_fn(|cx| {
+            self.wait.register(cx.waker());
+            if self.released.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 }
 
@@ -80,26 +95,125 @@ impl CpuIo for Devices {
             u64::from_le_bytes(data.try_into().unwrap()),
             Ordering::SeqCst,
         );
-        std::future::poll_fn(|cx| {
-            self.wait.register(cx.waker());
-            if self.released.load(Ordering::Acquire) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
+        self.wait_for_release().await;
         self.writes_done.fetch_add(1, Ordering::SeqCst);
     }
-    async fn read_io(&self, _vp: VpIndex, _port: u16, _data: &mut [u8]) {
-        panic!("unexpected PIO")
+    async fn read_io(&self, _vp: VpIndex, port: u16, data: &mut [u8]) {
+        assert!(self.port_io && matches!(port, 0x80 | 0xcdef));
+        assert!(matches!(data.len(), 1 | 2 | 4));
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        data.copy_from_slice(&VALUE.to_le_bytes()[..data.len()]);
+        self.ports.lock().push((false, port, data.to_vec()));
     }
-    async fn write_io(&self, _vp: VpIndex, _port: u16, _data: &[u8]) {
-        panic!("unexpected PIO")
+    async fn write_io(&self, _vp: VpIndex, port: u16, data: &[u8]) {
+        assert!(self.port_io && matches!(port, 0x80 | 0xcdef));
+        assert!(matches!(data.len(), 1 | 2 | 4));
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.ports.lock().push((true, port, data.to_vec()));
+        self.wait_for_release().await;
+        self.writes_done.fetch_add(1, Ordering::SeqCst);
     }
     fn fatal_error(&self, error: Box<dyn std::error::Error + Send + Sync>) -> VpHaltReason {
         self.faults.lock().push(error.to_string());
         VpHaltReason::PowerOff
+    }
+}
+
+#[async_test]
+async fn scalar_port_io_uses_exact_width_and_retains_completed_output_across_stop(
+    driver: DefaultDriver,
+) {
+    for (prefix, size) in [(&[][..], 1usize), (&[0x66][..], 2), (&[0x48][..], 4)] {
+        for immediate in [false, true] {
+            let (mut bytes, owned) = fixture();
+            let mut program = Vec::new();
+            for write in [true, false] {
+                program.extend_from_slice(prefix);
+                program.push(match (immediate, write, size == 1) {
+                    (false, true, true) => 0xee,
+                    (false, true, false) => 0xef,
+                    (false, false, true) => 0xec,
+                    (false, false, false) => 0xed,
+                    (true, true, true) => 0xe6,
+                    (true, true, false) => 0xe7,
+                    (true, false, true) => 0xe4,
+                    (true, false, false) => 0xe5,
+                });
+                if immediate {
+                    program.push(0x80);
+                }
+            }
+            bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+            let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+            let mut vp = binder.bind().unwrap();
+            let mut initial = long_mode_registers(
+                owned.core.cpu,
+                super::shared_mmu_tests::config(),
+                owned.tables,
+                77,
+            );
+            initial.rax = 0xaabb_ccdd_eeff_0011;
+            initial.rdx = 0x1234_5678_89ab_cdef;
+            initial.rflags = (initial.rflags & !0x200) | 0x10000;
+            vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+            let target = CODE + program.len() as u64;
+            vp.set_execution_checkpoint(Some(target)).unwrap();
+            let mut devices = Devices::new();
+            devices.port_io = true;
+            let stop = StopVpSource::new();
+            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            park(run.as_mut());
+            assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
+            assert_eq!(devices.writes_done.load(Ordering::SeqCst), 0);
+            assert_eq!(devices.reads.load(Ordering::SeqCst), 0);
+            stop.stop();
+            devices.release();
+            assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+            drop(run);
+            assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), initial);
+            assert_eq!(vp.completed_batch_progress().retired, 0);
+            let mut before = vec![0; bytes.len()];
+            memory.read_at(0, &mut before).unwrap();
+            let stop = StopVpSource::new();
+            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            assert!(matches!(
+                ready_after_yields(run.as_mut()),
+                Err(VpHaltReason::PowerOff)
+            ));
+            drop(run);
+            let mut expected = initial;
+            let mask = (1u64 << (size * 8)) - 1;
+            expected.rax = if size == 4 {
+                VALUE & mask
+            } else {
+                (initial.rax & !mask) | (VALUE & mask)
+            };
+            expected.rip = target;
+            expected.rflags &= !0x10000;
+            assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+            assert_eq!(
+                (
+                    vp.completed_batch_progress().retired,
+                    vp.completed_batch_progress().delivered
+                ),
+                (2, 0)
+            );
+            let port = if immediate { 0x80 } else { 0xcdef };
+            assert_eq!(
+                *devices.ports.lock(),
+                vec![
+                    (true, port, initial.rax.to_le_bytes()[..size].to_vec()),
+                    (false, port, VALUE.to_le_bytes()[..size].to_vec()),
+                ]
+            );
+            assert_eq!(devices.writes_done.load(Ordering::SeqCst), 1);
+            let mut after = vec![0; bytes.len()];
+            memory.read_at(0, &mut after).unwrap();
+            assert_eq!(
+                after, before,
+                "PIO must not touch the RAM at its port address"
+            );
+        }
     }
 }
 

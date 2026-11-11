@@ -181,6 +181,53 @@ impl SharedEventMachine {
         Tick::Pending
     }
 
+    pub(super) fn execute_wide_multiply(&mut self,source:Operand,width:Width,signed:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::alu::wide_multiply(old(self)@,source,width,signed,length),
+    {
+        let cpu=self.core.cpu();
+        if let Operand::Memory {address,width:actual}=source {
+            if !address.is_valid() || actual!=width {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            return self.entry_memory(address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),
+                self.entry_bases()),width,WordAccess::Read,length,MemoryTask::MultiplyWide {width,signed});
+        }
+        if match source {Operand::Register(reg)=>!reg.is_valid() || reg.width()!=width,_=>true} {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let Some(value)=entry::scalar(cpu,source) else {assert(false);return Tick::Waiting;};
+        self.finish_wide_multiply(value,width,signed,length)
+    }
+
+    pub(super) fn finish_wide_multiply(&mut self,value:u64,width:Width,signed:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::alu::wide_product(old(self)@,value,width,signed,length),
+    {
+        let mut cpu=self.core.cpu();
+        let product=scalar::multiply_wide(cpu.gpr[0],value,width,signed,cpu.flags);
+        let ghost before=cpu@;
+        if width==Width::Byte {
+            cpu.gpr[0]=(cpu.gpr[0]&!0xffffu64)|product.low|(product.high<<8);
+            assert(cpu@.gpr =~= before.gpr.update(0,((before.gpr[0] as u64&!0xffffu64)
+                |product.low|(product.high<<8)) as int));
+        } else {
+            cpu.gpr[0]=if width==Width::Word {(cpu.gpr[0]&!0xffffu64)|product.low} else {product.low};
+            cpu.gpr[2]=if width==Width::Word {(cpu.gpr[2]&!0xffffu64)|product.high} else {product.high};
+            assert(cpu@.gpr =~= before.gpr.update(0,(if width==Width::Word {
+                (before.gpr[0] as u64&!0xffffu64)|product.low
+            } else {product.low}) as int).update(2,(if width==Width::Word {
+                (before.gpr[2] as u64&!0xffffu64)|product.high
+            } else {product.high}) as int));
+        }
+        cpu.flags=product.flags;
+        self.retire_entry(cpu,length,false,false)
+    }
+
     pub(super) fn execute_multiply(&mut self,dst:Register,source:Operand,immediate:Option<u64>,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),

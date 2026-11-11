@@ -314,6 +314,7 @@ pub open spec fn advance(s: State) -> (State, Tick) {
         Phase::RepeatMove {width,length}=>repeat::execute_move(s,width,length),
         Phase::Decode { input } => (s, Tick::Decode(input)),
         Phase::Admitted { .. } => decode::admitted(s),
+        Phase::PortIo { .. } => entry::finish_port_io(s),
         Phase::DecodeFetch { input } => match m::request(s.core.mmu) {
             Request::Complete(report) => match report.result {
                 MmuResult::Success(value) => decode::append(s, value),

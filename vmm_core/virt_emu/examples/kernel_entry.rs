@@ -19,7 +19,9 @@ mod native {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
     use std::fs::File;
-    use std::task::Poll;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll};
     use std::time::Instant;
     use virt::io::CpuIo;
     use virt::vp::AccessVpState;
@@ -31,6 +33,7 @@ mod native {
     use vm_topology::memory::MemoryLayout;
     use vm_topology::processor::TopologyBuilder;
     use vm_topology::processor::x86::X2ApicState;
+    use vmcore::vm_task::{VmTaskDriverSource, thread::ThreadDriverBackend};
     use vmcore::vmtime::{VmTime, VmTimeKeeper};
     use vmm_core::acpi_builder::{AcpiArchConfig, AcpiTablesBuilder};
 
@@ -46,13 +49,106 @@ mod native {
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
     type Failure = Box<dyn std::error::Error + Send + Sync>;
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("unconfigured {operation} port {port:#x}/{size}")]
+    struct UnconfiguredPort {
+        operation: &'static str,
+        port: u16,
+        size: usize,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("unsupported asserted chipset IRQ {0}")]
+    struct UnsupportedIrq(u32);
+
+    struct ConsoleCapture(Arc<Mutex<Vec<u8>>>);
+    impl futures::AsyncRead for ConsoleCapture {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            data: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if data.is_empty() {
+                Poll::Ready(Ok(0))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    impl futures::AsyncWrite for ConsoleCapture {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[derive(Default)]
-    struct NoIo {
+    struct DeviceEvents {
         error: Mutex<Option<Failure>>,
         wake: AtomicWaker,
     }
 
-    impl NoIo {
+    impl DeviceEvents {
+        fn fail(&self, error: Failure) -> VpHaltReason {
+            let mut first = self.error.lock();
+            if first.is_none() {
+                *first = Some(error);
+            }
+            drop(first);
+            self.wake.wake();
+            VpHaltReason::PowerOff
+        }
+    }
+
+    impl vmotherboard::PowerEventHandler for DeviceEvents {
+        fn on_power_event(&self, _event: vmotherboard::PowerEvent) {
+            self.fail(Box::new(std::io::Error::other(
+                "unexpected chipset power event",
+            )));
+        }
+    }
+    impl vmotherboard::DebugEventHandler for DeviceEvents {
+        fn on_debug_break(&self, _vp: Option<u32>) {
+            self.fail(Box::new(std::io::Error::other(
+                "unexpected chipset debug event",
+            )));
+        }
+    }
+    impl vmcore::line_interrupt::LineSetTarget for DeviceEvents {
+        fn set_irq(&self, vector: u32, high: bool) {
+            if high {
+                self.fail(Box::new(UnsupportedIrq(vector)));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct WitnessIo {
+        events: Arc<DeviceEvents>,
+        chipset: Option<Arc<vmotherboard::Chipset>>,
+    }
+
+    impl WitnessIo {
+        fn configured_port(port: u16, size: usize) -> bool {
+            ((0xcf8..=0xcff).contains(&port) || (0x3f8..=0x3ff).contains(&port))
+                && usize::from(port & 7) + size <= 8
+        }
         fn unexpected(&self, operation: &str) {
             self.fatal_error(Box::new(std::io::Error::other(format!(
                 "unexpected {operation} before the declared entry frontier"
@@ -61,8 +157,8 @@ mod native {
 
         async fn failed(&self) {
             std::future::poll_fn(|cx| {
-                self.wake.register(cx.waker());
-                if self.error.lock().is_some() {
+                self.events.wake.register(cx.waker());
+                if self.events.error.lock().is_some() {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -72,7 +168,7 @@ mod native {
         }
     }
 
-    impl CpuIo for NoIo {
+    impl CpuIo for WitnessIo {
         fn is_mmio(&self, _address: u64) -> bool {
             false
         }
@@ -91,18 +187,71 @@ mod native {
             self.unexpected("MMIO write");
             std::future::pending().await
         }
-        async fn read_io(&self, _vp: VpIndex, _port: u16, _data: &mut [u8]) {
-            self.unexpected("PIO read");
+        async fn read_io(&self, vp: VpIndex, port: u16, data: &mut [u8]) {
+            if let Some(chipset) = &self.chipset {
+                if Self::configured_port(port, data.len()) {
+                    chipset.io_read(vp.index(), port, data).await;
+                    return;
+                }
+            }
+            self.fatal_error(Box::new(UnconfiguredPort {
+                operation: "input",
+                port,
+                size: data.len(),
+            }));
             std::future::pending().await
         }
-        async fn write_io(&self, _vp: VpIndex, _port: u16, _data: &[u8]) {
-            self.unexpected("PIO write");
+        async fn write_io(&self, vp: VpIndex, port: u16, data: &[u8]) {
+            if let Some(chipset) = &self.chipset {
+                if Self::configured_port(port, data.len()) {
+                    chipset.io_write(vp.index(), port, data).await;
+                    return;
+                }
+            }
+            self.fatal_error(Box::new(UnconfiguredPort {
+                operation: "output",
+                port,
+                size: data.len(),
+            }));
             std::future::pending().await
         }
         fn fatal_error(&self, error: Failure) -> VpHaltReason {
-            *self.error.lock() = Some(error);
-            self.wake.wake();
-            VpHaltReason::PowerOff
+            self.events.fail(error)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn asserted_unimplemented_irq_is_explicit_and_preserves_the_first_stop() {
+            for existing in [false, true] {
+                let events = Arc::new(DeviceEvents::default());
+                let line = vmcore::line_interrupt::LineInterrupt::new_with_target(
+                    "com1",
+                    events.clone(),
+                    4,
+                );
+                line.set_level(false);
+                assert!(events.error.lock().is_none());
+                if existing {
+                    events.fail(Box::new(UnconfiguredPort {
+                        operation: "input",
+                        port: 0x61,
+                        size: 1,
+                    }));
+                }
+                line.set_level(true);
+                let error = events.error.lock().take().unwrap();
+                if existing {
+                    assert!(error.is::<UnconfiguredPort>());
+                } else {
+                    assert!(matches!(
+                        error.downcast_ref::<UnsupportedIrq>(),
+                        Some(UnsupportedIrq(4))
+                    ));
+                }
+            }
         }
     }
 
@@ -829,15 +978,78 @@ mod native {
             state.set_pat(&initial.pat)?;
             state.commit()?;
         }
-        let devices = NoIo::default();
+        let mut devices = WitnessIo::default();
+        let console = Arc::new(Mutex::new(Vec::new()));
+        let mut units = state_unit::StateUnits::new();
+        let time_unit = units
+            .add("vmtime")
+            .spawn(driver.clone(), move |recv| async move {
+                let mut keeper = keeper;
+                vmm_core::vmtime_unit::run_vmtime(&mut keeper, recv).await;
+                keeper
+            })?;
+        let driver_source = VmTaskDriverSource::new(ThreadDriverBackend::new(driver.clone()));
+        let _chipset_devices = if probe {
+            let mut config = vmotherboard::options::BaseChipsetDevices::empty();
+            config.deps_generic_pci_bus = Some(vmotherboard::options::dev::GenericPciBusDeps {
+                bus_id: vmotherboard::BusIdPci::new("pci"),
+                pio_addr: 0xcf8,
+                pio_data: 0xcfc,
+            });
+            let foundation = vmotherboard::options::BaseChipsetFoundation {
+                is_restoring: false,
+                untrusted_dma_memory: memory.clone(),
+                trusted_vtl0_dma_memory: memory.clone(),
+                power_event_handler: devices.events.clone(),
+                debug_event_handler: devices.events.clone(),
+                vmtime: &time,
+                vmtime_unit: time_unit.handle(),
+                doorbell_registration: None,
+            };
+            let output = vmotherboard::BaseChipsetBuilder::new(foundation, config)
+                .build(
+                    &driver_source,
+                    &units,
+                    &vm_resource::ResourceResolver::new(),
+                )
+                .await?;
+            output
+                .chipset_builder
+                .arc_mutex_device("com1")
+                .try_add(|_services| {
+                    serial_16550::Serial16550::new(
+                        "com1".to_owned(),
+                        serial_16550_resources::MmioOrIoPort::IoPort(0x3f8),
+                        1,
+                        vmcore::line_interrupt::LineInterrupt::new_with_target(
+                            "com1",
+                            devices.events.clone(),
+                            4,
+                        ),
+                        Box::new(serial_core::serial_io::Connected::new(ConsoleCapture(
+                            console.clone(),
+                        ))),
+                        false,
+                        None,
+                    )
+                })?;
+            let (chipset, registered) = output.chipset_builder.build()?;
+            devices.chipset = Some(chipset);
+            units.start().await;
+            Some(registered)
+        } else {
+            None
+        };
         let stop = StopVpSource::new();
         let started = Instant::now();
         let run = Box::pin(vp.run_vp(stop.checker(), &devices));
         match select(run, Box::pin(devices.failed())).await {
             Either::Left((Err(VpHaltReason::PowerOff), _)) => {}
             Either::Left((other, _)) => bail!("unexpected VP outcome: {other:?}"),
+            Either::Right(_) if probe => {}
             Either::Right(_) => {
                 let failure = devices
+                    .events
                     .error
                     .lock()
                     .take()
@@ -846,7 +1058,11 @@ mod native {
             }
         }
         let seconds = started.elapsed().as_secs_f64();
+        if probe {
+            units.stop().await;
+        }
         let failure = devices
+            .events
             .error
             .lock()
             .take()
@@ -857,7 +1073,8 @@ mod native {
                 matches!(
                     failure.downcast_ref::<Error>(),
                     Some(Error::Cpu(_) | Error::Checkpoint { .. })
-                ),
+                ) || failure.is::<UnconfiguredPort>()
+                    || failure.is::<UnsupportedIrq>(),
                 "unexpected probe transport/device failure: {failure}"
             );
             let registers = vp.access_state(Vtl::Vtl0).registers()?;
@@ -877,6 +1094,8 @@ mod native {
                 memory.read_at(stopped_rip - 0xffff_ffff_8000_0000, &mut bytes)?;
                 encoding = Some(bytes);
             }
+            let serial_bytes = console.lock().clone();
+            let serial_output = String::from_utf8_lossy(&serial_bytes).into_owned();
             println!(
                 "{}",
                 serde_json::json!({
@@ -887,6 +1106,8 @@ mod native {
                     "instruction_walk":walk_trace(&memory,registers.cr3,registers.rip)?,
                     "cr2_walk":walk_trace(&memory,registers.cr3,registers.cr2)?,
                     "stack_words":stack_words,
+                    "serial_bytes":serial_bytes,
+                    "serial_output":serial_output,
                 })
             );
             return Ok(());

@@ -30,6 +30,121 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
 }
 
 #[test]
+fn accumulator_sign_extensions_reuse_the_owned_source_and_destination_widths() {
+    use x86_system::shared::entry::Instruction;
+    for (bytes, source, destination) in [
+        (&[0x66, 0x98][..], Width::Byte, Width::Word),
+        (&[0x98][..], Width::Word, Width::Dword),
+        (&[0x48, 0x98][..], Width::Dword, Width::Qword),
+    ] {
+        assert_eq!(
+            entry(bytes),
+            Instruction::SignExtend {
+                dst: reg(0, destination, false),
+                source: Operand::Register(reg(0, source, false)),
+                width: source,
+            }
+        );
+    }
+}
+
+#[test]
+fn implicit_multiply_admits_all_widths_and_keeps_source_aliases() {
+    use x86_system::shared::entry::Instruction;
+    for (prefix, width) in [
+        (&[][..], Width::Dword),
+        (&[0x66][..], Width::Word),
+        (&[0x48][..], Width::Qword),
+    ] {
+        for signed in [false, true] {
+            for byte in [false, true] {
+                let opcode = if byte { 0xf6 } else { 0xf7 };
+                let modrm = if signed { 0xea } else { 0xe2 };
+                let bytes = [prefix, &[opcode, modrm]].concat();
+                let actual = if byte { Width::Byte } else { width };
+                assert_eq!(
+                    entry(&bytes),
+                    Instruction::MultiplyWide {
+                        source: Operand::Register(reg(2, actual, false)),
+                        width: actual,
+                        signed
+                    }
+                );
+                let bytes = [prefix, &[opcode, modrm & 0x3f]].concat();
+                assert!(matches!(entry(&bytes),Instruction::MultiplyWide {
+                    source:Operand::Memory {..},width:w,signed:s} if w==actual && s==signed));
+            }
+        }
+    }
+    assert_eq!(
+        entry(&[0xf6, 0xe4]),
+        Instruction::MultiplyWide {
+            source: Operand::Register(reg(0, Width::Byte, true)),
+            width: Width::Byte,
+            signed: false
+        }
+    );
+}
+
+#[test]
+fn scalar_port_encodings_own_width_direction_and_port_without_admitting_string_io() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::{Instruction, Port};
+    for (prefix, width) in [
+        (&[][..], Width::Dword),
+        (&[0x66][..], Width::Word),
+        (&[0x48][..], Width::Dword),
+    ] {
+        for write in [false, true] {
+            for immediate in [false, true] {
+                for byte in [false, true] {
+                    let opcode = match (write, immediate, byte) {
+                        (false, false, true) => 0xec,
+                        (false, false, false) => 0xed,
+                        (true, false, true) => 0xee,
+                        (true, false, false) => 0xef,
+                        (false, true, true) => 0xe4,
+                        (false, true, false) => 0xe5,
+                        (true, true, true) => 0xe6,
+                        (true, true, false) => 0xe7,
+                    };
+                    let mut bytes = prefix.to_vec();
+                    bytes.push(opcode);
+                    if immediate {
+                        bytes.push(0x80);
+                    }
+                    assert_eq!(
+                        entry(&bytes),
+                        Instruction::PortIo {
+                            port: if immediate {
+                                Port::Immediate(0x80)
+                            } else {
+                                Port::Dx
+                            },
+                            width: if byte { Width::Byte } else { width },
+                            write
+                        }
+                    );
+                }
+            }
+        }
+    }
+    for bytes in [
+        &[0xf0, 0xef][..],
+        &[0x6c],
+        &[0x6d],
+        &[0x6e],
+        &[0x6f],
+        &[0xf3, 0x6f],
+    ] {
+        assert!(matches!(
+            admission(bytes),
+            DecodeDecision::Unsupported | DecodeDecision::InvalidOpcode
+        ));
+    }
+}
+
+#[test]
 fn rotations_admit_register_widths_and_keep_memory_forms_unsupported() {
     use x86_system::memory_core::cpu_core::integer::Operation as Integer;
     for (bytes, operation) in [
@@ -1404,19 +1519,10 @@ fn imul_packets_cover_two_and_three_operands_and_signed_immediates() {
     assert_eq!(address.segment, Segment::Gs);
     assert_eq!(address.base, Base::Register(Gpr::new(12).unwrap()));
     assert_eq!(address.index, Gpr::new(1));
-    for bytes in [
-        &[0xf6, 0xe9][..],
-        &[0xf7, 0xe9][..],
-        &[0x66, 0xf7, 0x28][..],
-        &[0x48, 0xf7, 0x28][..],
-        &[0xf3, 0x48, 0x0f, 0xaf, 0xc1][..],
-    ] {
-        assert_eq!(
-            admission(bytes),
-            DecodeDecision::Unsupported,
-            "{bytes:02x?}"
-        );
-    }
+    assert_eq!(
+        admission(&[0xf3, 0x48, 0x0f, 0xaf, 0xc1]),
+        DecodeDecision::Unsupported
+    );
     assert_eq!(admission(&[0x48, 0x6b, 0xc1]), DecodeDecision::More);
     assert_eq!(
         admission(&[0xf0, 0x48, 0x0f, 0xaf, 0xc1]),

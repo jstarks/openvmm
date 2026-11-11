@@ -236,6 +236,18 @@ pub proof fn product_bounds(a: int, b: int)
             -9223372036854775808 <= b <= 9223372036854775807;
 }
 
+pub(super) fn signed_product(a:u64,b:u64,_width:Width,m:u128)->(out:i128)
+    requires m as int==modulus(_width),a<m,b<m,
+    ensures out as int==signed(a as int,m as int)*signed(b as int,m as int),
+        -85070591730234615865843651857942052864<=out
+            <=85070591730234615865843651857942052864,
+{
+    let x=if (a as u128)<m/2 {a as i128} else {(a as i128)-m as i128};
+    let y=if (b as u128)<m/2 {b as i128} else {(b as i128)-m as i128};
+    proof {product_bounds(x as int,y as int);}
+    x*y
+}
+
 fn multiply(a: u64, b: u64, _width: Width, m: u128) -> (out: (u64, bool))
     requires
         m as int == modulus(_width), a < m, b < m,
@@ -246,10 +258,7 @@ fn multiply(a: u64, b: u64, _width: Width, m: u128) -> (out: (u64, bool))
             * signed(b as int, m as int), _width),
 {
     let half = (m / 2) as i128;
-    let x = if (a as u128) < m / 2 { a as i128 } else { (a as i128) - m as i128 };
-    let y = if (b as u128) < m / 2 { b as i128 } else { (b as i128) - m as i128 };
-    proof { product_bounds(x as int, y as int); }
-    let exact = x * y;
+    let exact = signed_product(a,b,_width,m);
     // Adding a multiple of every scalar modulus avoids a negative remainder
     // without overflowing i128, including the minimum-times-minimum case.
     let offset = 85070591730234615865843651857942052864i128;

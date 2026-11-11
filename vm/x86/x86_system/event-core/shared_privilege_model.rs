@@ -4,9 +4,9 @@
 #[cfg(verus_keep_ghost)]
 use super::super::Config;
 #[cfg(verus_keep_ghost)]
-use super::super::memory_core::cpu_core::operand::Width;
+use super::super::memory_core::cpu_core::operand::{Address, Width};
 #[cfg(verus_keep_ghost)]
-use super::super::memory_core::cpu_core::{operand, privilege, profile};
+use super::super::memory_core::cpu_core::{operand, privilege, profile, system};
 #[cfg(verus_keep_ghost)]
 use super::super::shared::entry::Instruction;
 use super::*;
@@ -93,6 +93,7 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
                     else if number==0xc000_0080 {Some(privilege::model::read_efer(system.efer_sce,config.nxe))}
                     else if number==0xc0000100 {Some(system.fs.base)}
                     else if number==0xc0000101 {Some(system.gs.base)}
+                    else if number==0xc0011029 {Some(system.de_cfg)}
                     else {privilege::model::read_entry(system.entry,number)};
                 match value {
                     None=>entry::unsupported(s),
@@ -104,6 +105,46 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
         _=>entry::unsupported(s),
     }}
 }
+#[verifier::opaque]
+pub open spec fn save_fp(s:State,address:Address,wide:bool,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if length==0 || length>15 || !address.valid() {entry::unsupported(s)}
+    else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {match s.system {
+        None=>entry::unsupported(s),
+        Some(system)=>{
+            let at=entry::linear(s,address,length);
+            if system.cr4_extra&0x200u64==0 || system.fp.mxcsr&!profile::MXCSR_MASK!=0
+                || system.fp.opcode>0x7ff
+                || (!wide && (system.fp.ip!=0 || system.fp.dp!=0)) {entry::unsupported(s)}
+            else if at%16!=0 {entry(s,Event::GeneralProtection)}
+            else if at%4096>3584 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage))}
+            else {entry::memory(s,at,Width::Qword,WordAccess::Write(system::model::fp_word(system.fp,0,wide)),
+                length,super::super::shared::entry::MemoryTask::SaveFp {index:0,wide})}
+        },
+    }}
+}
+#[verifier::opaque]
+pub open spec fn save_fp_value(s:State,address:u64,index:u8,wide:bool,length:u8)->(State,Tick) {
+    if index>=52 {entry::unsupported(s)}
+    else if index==51 {entry::retire(s,s.core.cpu,length,false,false)}
+    else if address>u64::MAX-8 || s.system is None {entry::unsupported(s)}
+    else {entry::memory(s,(address+8) as u64,Width::Qword,WordAccess::Write(
+        system::model::fp_word(s.system.unwrap().fp,index as int+1,wide)),
+        length,super::super::shared::entry::MemoryTask::SaveFp {index:(index+1) as u8,wide})}
+}
+#[verifier::opaque]
+pub open spec fn initialize_x87(s:State,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if length==0 || length>15 {entry::unsupported(s)}
+    else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {match s.system {
+        None=>entry::unsupported(s),
+        Some(system)=>entry::retire(State {system:Some(SystemState {
+            fp:system::LegacyFpState {control:0x37f,status:0,tags:0xffff,opcode:0,ip:0,dp:0,..system.fp},
+            ..system}),..s},cpu,length,false,false),
+    }}
+}
 pub open spec fn write_entry_msr(s:State,length:u8)->(State,Tick) {
     let cpu=s.core.cpu;
     let number=(cpu.gpr[1] as u64)&0xffff_ffffu64;
@@ -112,10 +153,14 @@ pub open spec fn write_entry_msr(s:State,length:u8)->(State,Tick) {
     else {match s.system {
         None=>entry::unsupported(s),
         Some(system)=>{
-            if privilege::model::read_entry(system.entry,number) is None {entry::unsupported(s)}
+            if number!=0xc0011029 && privilege::model::read_entry(system.entry,number) is None {entry::unsupported(s)}
             else {
                 let value=((cpu.gpr[0] as u64)&0xffff_ffffu64)|(((cpu.gpr[2] as u64)&0xffff_ffffu64)<<32);
-                if (number==0xc0000084 && value>0xffff_ffff) || (number==0x174 && value>0xffff) {
+                if number==0xc0011029 {
+                    if value&!2u64!=0 {entry::unsupported(s)}
+                    else {entry::retire(State {system:Some(SystemState {de_cfg:value,..system}),..s},
+                        cpu,length,false,true)}
+                } else if (number==0xc0000084 && value>0xffff_ffff) || (number==0x174 && value>0xffff) {
                     entry::unsupported(s)
                 } else {match privilege::model::write_entry(system.entry,number,value) {
                     None=>entry(s,Event::GeneralProtection),

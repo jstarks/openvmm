@@ -248,6 +248,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
             },
         },
         Instruction::Nop=>retire(s,cpu,length,false,false),
+        Instruction::Fence=>retire(s,cpu,length,false,true),
         Instruction::Direction {set}=>retire(s,model::State {
             flags:if set {cpu.flags|0x400u64} else {cpu.flags&!0x400u64},..cpu},length,false,false),
         Instruction::ConditionalMove {condition,dst,source}=>{
@@ -342,6 +343,18 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                 },
             }}
         },
+        Instruction::DoubleShift {dst,source,count,left}=>{
+            if !dst.valid() || !source.valid() || dst@.width!=source@.width {unsupported(s)}
+            else {match scalar(cpu,count) {
+                None=>unsupported(s),
+                Some(count)=>match operations::model::double_shift(operand::model::read(registers(cpu),dst),
+                    operand::model::read(registers(cpu),source),count,dst@.width,left,cpu.flags) {
+                    None=>unsupported(s),
+                    Some(result)=>retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,result.value)
+                        .map(|i:int,v:u64|v as int),flags:result.flags,..cpu},length,false,false),
+                },
+            }}
+        },
         Instruction::SignHigh {width}=>{
             if !(width is Word || width is Dword || width is Qword) {unsupported(s)}
             else {
@@ -376,6 +389,8 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr
             | Instruction::ReadDebug {..} | Instruction::WriteDebug {..} =>
             privilege::execute(s,instruction,length),
+        Instruction::InitializeX87=>privilege::initialize_x87(s,length),
+        Instruction::SaveFp {address,wide}=>privilege::save_fp(s,address,wide,length),
         Instruction::IndirectJump {source} | Instruction::IndirectCall {source}=>match source {
             Operand::Memory {address,width}=>{
                 if !address.valid() || width!=Width::Qword {unsupported(s)}
@@ -462,6 +477,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::SaveFp {index,wide}=>privilege::save_fp_value(s,address,index,wide,length),
         MemoryTask::ExchangeAdd {register:source,locked}=>{
             if !source.valid() {unsupported(s)} else {
                 let result=integer::model::evaluate(integer::Operation::Add,value,

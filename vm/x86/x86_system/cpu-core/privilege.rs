@@ -23,7 +23,7 @@ pub mod model {
     use super::*;
 
     // APM Volume 2 §§3.1.1, 3.1.3, 3.1.7. This bounded long64 profile
-    // retains MP/NE/AM and PSE/PGE; WP/NXE belong to the MMU configuration.
+    // retains MP/NE/AM and PSE/PGE/OSFXSR/OSXMMEXCPT; WP/NXE belong to the MMU configuration.
     // ET is read-only one, PAE/PG/PE stay enabled, and EFER.LMA must be
     // preserved at one along with LME. Other features/mode changes are outside
     // this profile, not necessarily architecturally invalid.
@@ -33,8 +33,8 @@ pub mod model {
             wp: value & 0x0001_0000u64 != 0 }) }
     }
     pub open spec fn cr4(value: u64) -> Option<u64> {
-        if value & !0x90u64 != 0x20u64 { None }
-        else { Some(value & 0x90u64) }
+        if value & !0x690u64 != 0x20u64 { None }
+        else { Some(value & 0x690u64) }
     }
     pub open spec fn efer(value: u64) -> Option<Efer> {
         if value & !0x801u64 != 0x500u64 { None }
@@ -44,7 +44,7 @@ pub mod model {
         0x8000_0011u64 | (extra & 0x0004_0022u64) | if wp { 0x10000u64 } else { 0u64 }
     }
     pub open spec fn read_cr4(extra: u64) -> u64 {
-        0x20u64 | (extra & 0x90u64)
+        0x20u64 | (extra & 0x690u64)
     }
     pub open spec fn read_efer(sce: bool, nxe: bool) -> u64 {
         0x500u64 | (if sce { 1u64 } else { 0u64 }) | if nxe { 0x800u64 } else { 0u64 }
@@ -111,8 +111,8 @@ pub fn cr0(value: u64) -> (out: Option<Cr0>)
 pub fn cr4(value: u64) -> (out: Option<u64>)
     ensures out == model::cr4(value),
 {
-    if value & !0x90u64 != 0x20u64 { None }
-    else { Some(value & 0x90u64) }
+    if value & !0x690u64 != 0x20u64 { None }
+    else { Some(value & 0x690u64) }
 }
 
 pub fn efer(value: u64) -> (out: Option<Efer>)
@@ -132,7 +132,7 @@ pub fn read_cr0(extra: u64, wp: bool) -> (out: u64)
 pub fn read_cr4(extra: u64) -> (out: u64)
     ensures out == model::read_cr4(extra),
 {
-    0x20u64 | (extra & 0x90u64)
+    0x20u64 | (extra & 0x690u64)
 }
 
 pub fn read_efer(sce: bool, nxe: bool) -> (out: u64)
@@ -170,17 +170,17 @@ pub proof fn lemma_cr0_round_trip(value: u64, extra: u64, wp: bool)
 pub proof fn lemma_cr4_round_trip(value: u64, extra: u64)
     ensures
         match model::cr4(value) {
-            Some(image) => image & !0x90u64 == 0 && model::read_cr4(image) == value,
+            Some(image) => image & !0x690u64 == 0 && model::read_cr4(image) == value,
             None => true,
         },
-        model::cr4(model::read_cr4(extra)) == Some(extra & 0x90u64),
+        model::cr4(model::read_cr4(extra)) == Some(extra & 0x690u64),
 {
-    assert(value & !0x90u64 == 0x20u64 ==> (0x20u64 | (value & 0x90u64)) == value)
+    assert(value & !0x690u64 == 0x20u64 ==> (0x20u64 | (value & 0x690u64)) == value)
         by(bit_vector);
-    assert((value & 0x90u64) & !0x90u64 == 0) by(bit_vector);
-    assert((value & 0x90u64) & 0x90u64 == value & 0x90u64) by(bit_vector);
-    assert((0x20u64 | (extra & 0x90u64)) & !0x90u64 == 0x20u64
-        && (0x20u64 | (extra & 0x90u64)) & 0x90u64 == extra & 0x90u64)
+    assert((value & 0x690u64) & !0x690u64 == 0) by(bit_vector);
+    assert((value & 0x690u64) & 0x690u64 == value & 0x690u64) by(bit_vector);
+    assert((0x20u64 | (extra & 0x690u64)) & !0x690u64 == 0x20u64
+        && (0x20u64 | (extra & 0x690u64)) & 0x690u64 == extra & 0x690u64)
         by(bit_vector);
 }
 

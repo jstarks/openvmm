@@ -15,10 +15,14 @@ verus! {
 #[allow(inconsistent_fields)]
 pub enum Instruction {
     Nop,
+    Fence,
+    InitializeX87,
+    SaveFp {address:Address,wide:bool},
     Integer { operation: integer::Operation, dst: Register, source: Operand },
     Alu { operation: integer::Operation, destination: Operand, source: Operand },
     SignExtend { dst: Register, source: Operand, width: Width },
     SignHigh { width: Width },
+    DoubleShift {dst:Register,source:Register,count:Operand,left:bool},
     Divide { source: Operand, width: Width, signed: bool },
     Bit { operation: operations::BitOperation, dst: Register, index: Operand },
     Scan { dst:Register,source:Operand,reverse:bool },
@@ -80,6 +84,7 @@ pub enum MemoryTask {
     TableLimit { idt: bool },
     TableBase { idt: bool, limit: u16 },
     StoreTableBase {base:u64},
+    SaveFp {index:u8,wide:bool},
     TaskLow {selector:u16},
     TaskHigh {selector:u16,low:u64},
     TaskBusy {image:SegmentState,low:u64},
@@ -177,6 +182,14 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
         match instruction {
+            Instruction::InitializeX87=>{
+                reveal(spec::entry::execute);
+                self.initialize_x87(length)
+            },
+            Instruction::SaveFp {address,wide}=>{
+                reveal(spec::entry::execute);
+                self.save_fp(address,wide,length)
+            },
             Instruction::LoadTask {source}=>{
                 reveal(spec::entry::execute);
                 self.execute_task(source,length)
@@ -234,13 +247,14 @@ impl SharedEventMachine {
                 self.execute_control(instruction,length)
             },
             Instruction::SignExtend {..} | Instruction::SignHigh {..} | Instruction::Divide {..}
+                | Instruction::DoubleShift {..}
                 | Instruction::Bit {..} | Instruction::Scan {..}
                 | Instruction::IndirectJump {..} | Instruction::IndirectCall {..}
                 => self.execute_scalar(instruction,length),
             Instruction::ConditionalMove {..} | Instruction::SetCondition {..} | Instruction::Direction {..}
                 | Instruction::ReadSegment {..}
                 => self.execute_conditions(instruction,length),
-            Instruction::Nop | Instruction::Cpuid | Instruction::Branch {..}
+            Instruction::Nop | Instruction::Fence | Instruction::Cpuid | Instruction::Branch {..}
                 | Instruction::ZeroExtend {..} | Instruction::Jump {..}
                 => self.execute_register(instruction,length),
             _=>self.execute_legacy(instruction,length),
@@ -477,7 +491,7 @@ impl SharedEventMachine {
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
-            instruction is Nop || instruction is Cpuid || instruction is Branch
+            instruction is Nop || instruction is Fence || instruction is Cpuid || instruction is Branch
                 || instruction is ZeroExtend || instruction is Jump,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
@@ -487,6 +501,7 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         match instruction {
             Instruction::Nop=>self.retire_entry(cpu,length,false,false),
+            Instruction::Fence=>self.retire_entry(cpu,length,false,true),
             Instruction::Cpuid => {
                 let function = (cpu.gpr[0] & 0xffff_ffff) as u32;
                 let subleaf = (cpu.gpr[1] & 0xffff_ffff) as u32;
@@ -825,6 +840,9 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::SaveFp {index,wide}=>{
+                return self.finish_fp_save(address,index,wide,length);
+            },
             MemoryTask::ExchangeAdd {register:source,locked}=>{
                 if !source.is_valid() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));

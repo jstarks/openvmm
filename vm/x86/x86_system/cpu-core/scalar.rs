@@ -43,6 +43,24 @@ pub mod model {
         } else { 0 }
     }
 
+    pub open spec fn double_shift(low:u64,high:u64,count:u64,width:Width,left:bool,flags:u64)->Option<integer::Outcome> {
+        let n=super::super::operand::model::bits(width);
+        let c=(count&(if width==Width::Qword {63u64} else {31u64})) as u32;
+        let mask=super::super::operand::model::mask(width);
+        let a=low&mask;
+        let b=high&mask;
+        if width==Width::Byte || c>n {None}
+        else if c==0 {Some(integer::Outcome {value:a,flags,write:true})}
+        else {
+            let value=(if c==n {b} else if left {(a<<c)|(b>>((n-c) as u32))}
+                else {(a>>c)|(b<<((n-c) as u32))})&mask;
+            let cf=if left {(a>>((n-c) as u32))&1u64} else {(a>>((c-1) as u32))&1u64};
+            let of=c==1 && ((a^value)>>((n-1) as u32))&1u64!=0;
+            let tested=integer::model::evaluate(integer::Operation::Test,value,value,width,flags).flags;
+            Some(integer::Outcome {value,flags:(tested&!0x801u64)|cf|if of {0x800u64}else{0u64},write:true})
+        }
+    }
+
     #[verifier::opaque]
     pub open spec fn multiply_wide(left:u64,right:u64,width:Width,signed:bool,flags:u64)->Product {
         let mask=super::super::operand::model::mask(width);
@@ -155,6 +173,24 @@ pub struct Division {
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct Product {pub low:u64,pub high:u64,pub flags:u64}
+
+pub fn double_shift(low:u64,high:u64,count:u64,width:Width,left:bool,flags:u64)->(out:Option<integer::Outcome>)
+    ensures out==model::double_shift(low,high,count,width,left,flags),
+{
+    let n=width.bits();
+    let c=(count&(if width==Width::Qword {63u64} else {31u64})) as u32;
+    let mask=width.mask();
+    let a=low&mask;
+    let b=high&mask;
+    if width==Width::Byte || c>n {return None;}
+    if c==0 {return Some(integer::Outcome {value:a,flags,write:true});}
+    let value=(if c==n {b} else if left {(a<<c)|(b>>(n-c))}
+        else {(a>>c)|(b<<(n-c))})&mask;
+    let cf=if left {(a>>(n-c))&1} else {(a>>(c-1))&1};
+    let of=c==1 && ((a^value)>>(n-1))&1!=0;
+    let tested=integer::evaluate(integer::Operation::Test,value,value,width,flags).flags;
+    Some(integer::Outcome {value,flags:(tested&!0x801)|cf|if of {0x800}else{0},write:true})
+}
 
 pub fn multiply_wide(left:u64,right:u64,width:Width,signed:bool,flags:u64)->(out:Product)
     ensures out==model::multiply_wide(left,right,width,signed,flags),

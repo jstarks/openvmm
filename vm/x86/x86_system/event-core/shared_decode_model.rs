@@ -115,7 +115,8 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
         } else {match s.system {
             None => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
             Some(system) => {
-                if super::super::memory_core::cpu_core::privilege::model::read_entry(system.entry,
+                if (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64==0xc0011029
+                    || super::super::memory_core::cpu_core::privilege::model::read_entry(system.entry,
                     (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64) is Some {
                     privilege::write_entry_msr(s,input.length)
                 } else {

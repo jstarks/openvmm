@@ -59,6 +59,7 @@ impl SharedEventMachine {
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
             instruction is SignExtend || instruction is SignHigh || instruction is Divide
+                || instruction is DoubleShift
                 || instruction is Bit || instruction is Scan
                 || instruction is IndirectJump || instruction is IndirectCall,
         ensures final(self).invariant(),
@@ -69,6 +70,23 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let next=cpu.rip.wrapping_add(length as u64);
         match instruction {
+            Instruction::DoubleShift {dst,source,count,left}=>{
+                if !dst.is_valid() || !source.is_valid() || dst.width()!=source.width() {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let Some(count)=entry::scalar(cpu,count) else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                let Some(result)=scalar::double_shift(dst.read(&cpu.gpr),source.read(&cpu.gpr),
+                    count,dst.width(),left,cpu.flags) else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                let ghost registers=cpu.gpr@;
+                dst.write(&mut cpu.gpr,result.value);
+                assert(cpu@.gpr =~= operand::model::write(registers,dst,result.value).map(|i:int,v:u64|v as int));
+                cpu.flags=result.flags;
+                self.retire_entry(cpu,length,false,false)
+            },
             Instruction::Scan {dst,source,reverse}=>{
                 if !dst.is_valid() || dst.width()==Width::Byte {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));

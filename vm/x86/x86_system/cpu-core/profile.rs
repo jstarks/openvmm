@@ -14,6 +14,9 @@ pub const PRED_CMD_AVAILABLE:bool=false;
 
 pub const TSC_HZ:u64=1_000_000_000;
 
+// DAZ is not exposed by the bounded legacy SSE state profile.
+pub const MXCSR_MASK:u32=0xffbf;
+
 pub open spec fn target(function: u32, _subleaf: u32) -> [u32; 4] {
     match function {
         0 => [1, 0x6874_7541, 0x444d_4163, 0x6974_6e65],

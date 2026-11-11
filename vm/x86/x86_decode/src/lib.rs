@@ -497,6 +497,44 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             Some(EntryInstruction::PortIo { port, width, write })
         }
         Mnemonic::Nop => Some(EntryInstruction::Nop),
+        Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => Some(EntryInstruction::Fence),
+        Mnemonic::Fninit => Some(EntryInstruction::InitializeX87),
+        Mnemonic::Fxsave | Mnemonic::Fxsave64 => Some(EntryInstruction::SaveFp {
+            address: address(&instruction, size)?,
+            wide: instruction.mnemonic() == Mnemonic::Fxsave64,
+        }),
+        Mnemonic::Shld | Mnemonic::Shrd => {
+            let Operand::Register(dst) = get(0)? else {
+                return None;
+            };
+            let Operand::Register(source) = get(1)? else {
+                return None;
+            };
+            let count = get(2)?;
+            if dst.width() == Width::Byte
+                || dst.width() != source.width()
+                || !matches!(
+                    count,
+                    Operand::Immediate(Immediate {
+                        width: Width::Byte,
+                        ..
+                    }) | Operand::Register(_)
+                )
+            {
+                return None;
+            }
+            if let Operand::Register(reg) = count {
+                if reg.gpr().index() != 1 || reg.width() != Width::Byte || reg.high_byte() {
+                    return None;
+                }
+            }
+            Some(EntryInstruction::DoubleShift {
+                dst,
+                source,
+                count,
+                left: instruction.mnemonic() == Mnemonic::Shld,
+            })
+        }
         Mnemonic::Cmovo
         | Mnemonic::Cmovno
         | Mnemonic::Cmovb

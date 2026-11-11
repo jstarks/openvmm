@@ -30,6 +30,87 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
 }
 
 #[test]
+fn fxsave_preserves_its_address_and_pointer_format_without_a_scalar_width() {
+    use x86_system::shared::entry::Instruction;
+    for (prefix, wide) in [(&[][..], false), (&[0x48][..], true)] {
+        let bytes = [prefix, &[0x0f, 0xae, 0x00]].concat();
+        assert_eq!(
+            entry(&bytes),
+            Instruction::SaveFp {
+                address: Address {
+                    size: AddressSize::Bits64,
+                    segment: Segment::Ds,
+                    base: Base::Register(Gpr::new(0).unwrap()),
+                    index: None,
+                    scale: Scale::One,
+                    displacement: 0
+                },
+                wide,
+            }
+        );
+    }
+}
+
+#[test]
+fn fninit_is_an_owned_state_transition_not_a_nop_or_waiting_alias() {
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(entry(&[0xdb, 0xe3]), Instruction::InitializeX87);
+    assert_eq!(
+        admission(&[0x9b, 0xdb, 0xe3]),
+        x86_system::shared::decode::DecodeDecision::Rejected
+    );
+}
+
+#[test]
+fn sse_memory_fences_request_the_owned_ordering_boundary() {
+    use x86_system::shared::entry::Instruction;
+    for modrm in [0xe8, 0xf0, 0xf8] {
+        assert_eq!(entry(&[0x0f, 0xae, modrm]), Instruction::Fence);
+    }
+}
+
+#[test]
+fn double_shift_register_forms_own_width_count_and_direction() {
+    use x86_system::shared::entry::Instruction;
+    for (prefix, width) in [
+        (&[0x66][..], Width::Word),
+        (&[][..], Width::Dword),
+        (&[0x48][..], Width::Qword),
+    ] {
+        for (opcode, left) in [(0xa4, true), (0xac, false)] {
+            for cl in [false, true] {
+                let mut bytes = [prefix, &[0x0f, opcode + u8::from(cl), 0xd0]].concat();
+                if !cl {
+                    bytes.push(1);
+                }
+                let count = if cl {
+                    Operand::Register(reg(1, Width::Byte, false))
+                } else {
+                    Operand::Immediate(Immediate {
+                        value: 1,
+                        width: Width::Byte,
+                        encoded_width: Width::Byte,
+                    })
+                };
+                assert_eq!(
+                    entry(&bytes),
+                    Instruction::DoubleShift {
+                        dst: reg(0, width, false),
+                        source: reg(2, width, false),
+                        count,
+                        left
+                    }
+                );
+            }
+        }
+    }
+    assert_eq!(
+        admission(&[0x48, 0x0f, 0xad, 0x10]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+}
+
+#[test]
 fn cs_prefixed_relative_call_keeps_its_displacement_and_full_return_length() {
     use x86_system::shared::decode::DecodeDecision;
     assert_eq!(

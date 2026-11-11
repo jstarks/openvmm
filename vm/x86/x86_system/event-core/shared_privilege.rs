@@ -5,7 +5,7 @@ use super::entry::{Instruction, scalar};
 use super::*;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::operand;
-use memory_core::cpu_core::operand::Width;
+use memory_core::cpu_core::operand::{Address, Width};
 use memory_core::cpu_core::{privilege, profile};
 
 verus! {
@@ -122,9 +122,9 @@ impl SharedEventMachine {
                         let Some(mut system)=self.system else {
                             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                         };
-                        assert(extra==value&0x90u64);
-                        assert(extra&!0x90u64==0) by(bit_vector)
-                            requires extra==value&0x90u64;
+                        assert(extra==value&0x690u64);
+                        assert(extra&!0x690u64==0) by(bit_vector)
+                            requires extra==value&0x690u64;
                         system.cr4_extra=extra;self.system=Some(system);
                         assert(system::model::supported(system));
                     },
@@ -146,6 +146,7 @@ impl SharedEventMachine {
                     0x8b=>profile::MICROCODE_REVISION as u64,
                     0xc0000100=>system.fs.base,
                     0xc0000101=>system.gs.base,
+                    0xc0011029=>system.de_cfg,
                     number=>match privilege::read_entry(system.entry,number) {
                         Some(value)=>value,
                         None=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
@@ -159,6 +160,87 @@ impl SharedEventMachine {
             },
             _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
         }
+    }
+
+    pub(super) fn save_fp(&mut self,address:Address,wide:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::save_fp(old(self)@,address,wide,length),
+    {
+        reveal(spec::privilege::save_fp);
+        let cpu=self.core.cpu();
+        if length==0 || length>15 || !address.is_valid() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let Some(system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        // Only reset pointers have a modeled selector image in the 32-bit format.
+        if system.cr4_extra&0x200==0 || system.fp.mxcsr&!profile::MXCSR_MASK!=0
+            || system.fp.opcode>0x7ff
+            || (!wide && (system.fp.ip!=0 || system.fp.dp!=0)) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        if linear%16!=0 {
+            return self.start_entry(Event::GeneralProtection);
+        }
+        if linear%4096>3584 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage));
+        }
+        let word=system.fp.save_word(0,wide);
+        self.entry_memory(linear,Width::Qword,WordAccess::Write(word),length,
+            entry::MemoryTask::SaveFp {index:0,wide})
+    }
+
+    pub(super) fn finish_fp_save(&mut self,address:u64,index:u8,wide:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::privilege::save_fp_value(old(self)@,address,index,wide,length),
+    {
+        reveal(spec::privilege::save_fp_value);
+        if index>=52 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let cpu=self.core.cpu();
+        if index==51 {
+            return self.retire_entry(cpu,length,false,false);
+        }
+        if address>u64::MAX-8 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let Some(system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        let next=index+1;
+        let word=system.fp.save_word(next,wide);
+        self.entry_memory(address+8,Width::Qword,WordAccess::Write(word),length,
+            entry::MemoryTask::SaveFp {index:next,wide})
+    }
+
+    pub(super) fn initialize_x87(&mut self,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::initialize_x87(old(self)@,length),
+    {
+        reveal(spec::privilege::initialize_x87);
+        let cpu=self.core.cpu();
+        if length==0 || length>15 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        system.fp=system.fp.initialize_x87();
+        self.system=Some(system);
+        self.retire_entry(cpu,length,false,false)
     }
 
     pub(super) fn write_entry_msr(&mut self,length:u8)->(tick:Tick)
@@ -177,10 +259,18 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
         let number=cpu.gpr[1]&0xffff_ffff;
-        if privilege::read_entry(system.entry,number).is_none() {
+        if number!=0xc0011029 && privilege::read_entry(system.entry,number).is_none() {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         let value=(cpu.gpr[0]&0xffff_ffff)|((cpu.gpr[2]&0xffff_ffff)<<32);
+        if number==0xc0011029 {
+            if value&!2u64!=0 {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            system.de_cfg=value;
+            self.system=Some(system);
+            return self.retire_entry(cpu,length,false,true);
+        }
         if (number==0xc0000084 && value>0xffff_ffff) || (number==0x174 && value>0xffff) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }

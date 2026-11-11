@@ -1353,8 +1353,6 @@ fn repeat_store_admission_distinguishes_width_address_size_and_prefixes() {
         &[0xf3, 0xf2, 0x48, 0xab][..],
         &[0xf3, 0x67, 0xaa][..],
         &[0x67, 0xf3, 0x48, 0xab][..],
-        &[0xf3, 0xa4][..],
-        &[0xf3, 0x48, 0xa5][..],
         &[0xf3, 0xac][..],
         &[0xf3, 0xae][..],
         &[0xf3, 0xa6][..],
@@ -1668,6 +1666,375 @@ fn nop_admission_ignores_operands_but_keeps_pause_and_forbidden_prefixes_distinc
             admission(bytes),
             DecodeDecision::InvalidOpcode,
             "{bytes:02x?}"
+        );
+    }
+}
+
+fn conditions() -> [x86_system::memory_core::cpu_core::control::Condition; 16] {
+    use x86_system::memory_core::cpu_core::control::Condition::*;
+    [
+        Overflow,
+        NotOverflow,
+        Below,
+        AboveEqual,
+        Equal,
+        NotEqual,
+        BelowEqual,
+        Above,
+        Sign,
+        NotSign,
+        Parity,
+        NotParity,
+        Less,
+        GreaterEqual,
+        LessEqual,
+        Greater,
+    ]
+}
+
+#[test]
+fn conditional_moves_cover_all_conditions_widths_and_register_extensions() {
+    use x86_system::shared::entry::Instruction;
+    for (cc, condition) in conditions().into_iter().enumerate() {
+        for width in [Width::Word, Width::Dword, Width::Qword] {
+            for dst in 0..16 {
+                let src = 15 - dst;
+                let rex = 0x40
+                    | if width == Width::Qword { 8 } else { 0 }
+                    | ((dst >> 3) << 2)
+                    | (src >> 3);
+                let mut bytes = Vec::new();
+                if width == Width::Word {
+                    bytes.push(0x66);
+                }
+                if rex != 0x40 {
+                    bytes.push(rex);
+                }
+                bytes.extend_from_slice(&[
+                    0x0f,
+                    0x40 | cc as u8,
+                    0xc0 | ((dst & 7) << 3) | (src & 7),
+                ]);
+                assert_eq!(
+                    entry(&bytes),
+                    Instruction::ConditionalMove {
+                        condition,
+                        dst: reg(dst, width, false),
+                        source: Operand::Register(reg(src, width, false)),
+                    },
+                    "{bytes:02x?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_moves_preserve_memory_reads_for_every_condition_and_width() {
+    use x86_system::shared::entry::Instruction;
+    for (cc, condition) in conditions().into_iter().enumerate() {
+        for (prefix, width) in [
+            (&[0x66][..], Width::Word),
+            (&[][..], Width::Dword),
+            (&[0x48][..], Width::Qword),
+        ] {
+            let bytes = [
+                prefix,
+                &[0x0f, 0x40 | cc as u8, 0x0d, 0xf8, 0xff, 0xff, 0xff],
+            ]
+            .concat();
+            assert_eq!(
+                entry(&bytes),
+                Instruction::ConditionalMove {
+                    condition,
+                    dst: reg(1, width, false),
+                    source: Operand::Memory {
+                        address: Address {
+                            size: AddressSize::Bits64,
+                            segment: Segment::Ds,
+                            base: Base::NextRip,
+                            index: None,
+                            scale: Scale::One,
+                            displacement: (-8i64) as u64,
+                        },
+                        width,
+                    },
+                },
+                "{bytes:02x?}"
+            );
+        }
+    }
+    for (prefix, segment) in [(0x64, Segment::Fs), (0x65, Segment::Gs)] {
+        let Instruction::ConditionalMove {
+            condition,
+            dst,
+            source: Operand::Memory { address, width },
+        } = entry(&[prefix, 0x67, 0x4f, 0x0f, 0x45, 0x44, 0x8c, 0xf8])
+        else {
+            panic!("CMOVNE must retain its memory read even when ZF might be set")
+        };
+        assert_eq!(condition, conditions()[5]);
+        assert_eq!(dst, reg(8, Width::Qword, false));
+        assert_eq!(width, Width::Qword);
+        assert_eq!(
+            address,
+            Address {
+                size: AddressSize::Bits32,
+                segment,
+                base: Base::Register(Gpr::new(12).unwrap()),
+                index: Gpr::new(9),
+                scale: Scale::Four,
+                displacement: 0xffff_fff8,
+            }
+        );
+        let mut registers = [0; 16];
+        registers[12] = 0x1234_5678_ffff_fffc;
+        registers[9] = 4;
+        assert_eq!(
+            address.linear(
+                &registers,
+                0,
+                SegmentBases {
+                    fs: 0x1_0000_0000,
+                    gs: 0x1_0000_0000,
+                }
+            ),
+            0x1_0000_0004
+        );
+    }
+}
+
+#[test]
+fn set_conditions_cover_all_conditions_rex_low_bytes_and_legacy_high_bytes() {
+    use x86_system::shared::entry::Instruction;
+    for (cc, condition) in conditions().into_iter().enumerate() {
+        for index in 0..16 {
+            assert_eq!(
+                entry(&[
+                    0x40 | (index >> 3),
+                    0x0f,
+                    0x90 | cc as u8,
+                    0xc0 | (index & 7)
+                ]),
+                Instruction::SetCondition {
+                    condition,
+                    destination: Operand::Register(reg(index, Width::Byte, false)),
+                }
+            );
+        }
+        for index in 0..8 {
+            assert_eq!(
+                entry(&[0x0f, 0x90 | cc as u8, 0xc0 | index]),
+                Instruction::SetCondition {
+                    condition,
+                    destination: Operand::Register(reg(index & 3, Width::Byte, index >= 4)),
+                }
+            );
+        }
+    }
+    assert_eq!(
+        entry(&[0x40, 0x0f, 0x92, 0xc5]),
+        Instruction::SetCondition {
+            condition: conditions()[2],
+            destination: Operand::Register(reg(5, Width::Byte, false)),
+        }
+    );
+}
+
+#[test]
+fn set_conditions_keep_byte_memory_addresses_and_ignore_operand_size_prefixes() {
+    use x86_system::shared::entry::Instruction;
+    for (cc, condition) in conditions().into_iter().enumerate() {
+        for (prefix, segment) in [(0x64, Segment::Fs), (0x65, Segment::Gs)] {
+            assert_eq!(
+                entry(&[prefix, 0x67, 0x43, 0x0f, 0x90 | cc as u8, 0x44, 0x8c, 0xf8]),
+                Instruction::SetCondition {
+                    condition,
+                    destination: Operand::Memory {
+                        address: Address {
+                            size: AddressSize::Bits32,
+                            segment,
+                            base: Base::Register(Gpr::new(12).unwrap()),
+                            index: Gpr::new(9),
+                            scale: Scale::Four,
+                            displacement: 0xffff_fff8,
+                        },
+                        width: Width::Byte,
+                    },
+                }
+            );
+        }
+    }
+    for bytes in [
+        &[0x0f, 0x92, 0x05, 0xf9, 0xff, 0xff, 0xff][..],
+        &[0x66, 0x0f, 0x92, 0x05, 0xf9, 0xff, 0xff, 0xff][..],
+        &[0x48, 0x0f, 0x92, 0x05, 0xf9, 0xff, 0xff, 0xff][..],
+    ] {
+        let Instruction::SetCondition {
+            destination: Operand::Memory { address, width },
+            ..
+        } = entry(bytes)
+        else {
+            panic!("SETB memory destination")
+        };
+        assert_eq!(width, Width::Byte);
+        assert_eq!(address.base, Base::NextRip);
+        assert_eq!(address.displacement, (-7i64) as u64);
+        assert_eq!(address.size, AddressSize::Bits64);
+    }
+}
+
+#[test]
+fn conditional_forms_reject_repeat_lock_and_unrelated_operand_families() {
+    use x86_system::shared::decode::DecodeDecision;
+    for bytes in [
+        &[0x48, 0x0f, 0x45, 0xc1][..],
+        &[0x48, 0x0f, 0x45, 0x08][..],
+        &[0x40, 0x0f, 0x92, 0xc5][..],
+        &[0x0f, 0x92, 0x00][..],
+    ] {
+        for prefix in [0xf2, 0xf3] {
+            assert_eq!(
+                admission(&[&[prefix], bytes].concat()),
+                DecodeDecision::Unsupported,
+                "{prefix:02x} {bytes:02x?}"
+            );
+        }
+        assert_eq!(
+            admission(&[&[0xf0], bytes].concat()),
+            DecodeDecision::InvalidOpcode
+        );
+    }
+    for bytes in [
+        &[0x0f, 0x10, 0xc1][..],
+        &[0x0f, 0x50, 0xc1][..],
+        &[0xf3, 0x0f, 0x10, 0xc1][..],
+    ] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+}
+
+#[test]
+fn direction_flags_admit_only_unprefixed_cld_and_std() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for (byte, set) in [(0xfc, false), (0xfd, true)] {
+        assert_eq!(entry(&[byte]), Instruction::Direction { set });
+        for prefix in [
+            0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0x40, 0x48, 0xf2, 0xf3,
+        ] {
+            assert_eq!(
+                admission(&[prefix, byte]),
+                DecodeDecision::Unsupported,
+                "{prefix:02x} {byte:02x}"
+            );
+        }
+        assert_eq!(admission(&[0xf0, byte]), DecodeDecision::InvalidOpcode);
+    }
+}
+
+#[test]
+fn repeat_moves_admit_only_the_bounded_string_widths_and_default_segments() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for (bytes, width) in [
+        (&[0xf3, 0xa4][..], Width::Byte),
+        (&[0xf3, 0x66, 0xa5][..], Width::Word),
+        (&[0x66, 0xf3, 0xa5][..], Width::Word),
+        (&[0xf3, 0xa5][..], Width::Dword),
+        (&[0xf3, 0x48, 0xa5][..], Width::Qword),
+    ] {
+        assert_eq!(entry(bytes), Instruction::RepeatMove { width });
+        for prefix in [0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x67, 0xf2] {
+            assert_eq!(
+                admission(&[&[prefix], bytes].concat()),
+                DecodeDecision::Unsupported,
+                "{prefix:02x} {bytes:02x?}"
+            );
+        }
+        assert_eq!(
+            admission(&[&[0xf0], bytes].concat()),
+            DecodeDecision::InvalidOpcode
+        );
+    }
+    for bytes in [
+        &[0xa4][..],
+        &[0xa5][..],
+        &[0x66, 0xa5][..],
+        &[0x48, 0xa5][..],
+        &[0xf2, 0xa4][..],
+        &[0xf2, 0x48, 0xa5][..],
+        &[0xf3, 0xf2, 0x48, 0xa5][..],
+        &[0xf3, 0x67, 0x48, 0xa5][..],
+        &[0xf3, 0x64, 0x48, 0xa5][..],
+        &[0xf3, 0x65, 0x3e, 0x48, 0xa5][..],
+        &[0xf3, 0x0f, 0x10, 0xc1][..],
+        &[0xf2, 0x0f, 0x10, 0xc1][..],
+        &[0xf3, 0xac][..],
+        &[0xf3, 0xa6][..],
+        &[0xf3, 0xae][..],
+    ] {
+        assert_eq!(
+            admission(bytes),
+            DecodeDecision::Unsupported,
+            "{bytes:02x?}"
+        );
+    }
+}
+
+#[test]
+fn cr2_reads_use_qword_gprs_without_admitting_cr2_writes_or_other_controls() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for index in 0..16 {
+        let prefix: &[u8] = if index < 8 { &[] } else { &[0x41] };
+        assert_eq!(
+            entry(&[prefix, &[0x0f, 0x20, 0xd0 | (index & 7)]].concat()),
+            Instruction::ReadControl {
+                number: 2,
+                dst: reg(index, Width::Qword, false),
+            }
+        );
+        assert_eq!(
+            admission(&[prefix, &[0x0f, 0x22, 0xd0 | (index & 7)]].concat()),
+            DecodeDecision::Unsupported
+        );
+    }
+    for bytes in [&[0x0f, 0x20, 0xd8][..], &[0x0f, 0x20, 0xe0][..]] {
+        assert!(matches!(entry(bytes), Instruction::ReadControl { .. }));
+    }
+    for bytes in [
+        &[0x44, 0x0f, 0x20, 0xc0][..],
+        &[0xf3, 0x0f, 0x20, 0xd0][..],
+        &[0xf2, 0x0f, 0x20, 0xd0][..],
+    ] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+    assert_eq!(
+        admission(&[0xf0, 0x0f, 0x20, 0xd0]),
+        DecodeDecision::InvalidOpcode
+    );
+}
+
+#[test]
+fn fault_handler_and_boot_copy_forms_keep_incremental_and_exact_packet_bounds() {
+    use x86_system::shared::decode::DecodeDecision;
+    for bytes in [
+        &[0xfc][..],
+        &[0xfd][..],
+        &[0x48, 0x0f, 0x45, 0xc1][..],
+        &[0x48, 0x0f, 0x45, 0x0d, 0xf8, 0xff, 0xff, 0xff][..],
+        &[0x40, 0x0f, 0x92, 0xc5][..],
+        &[0x0f, 0x20, 0xd0][..],
+        &[0xf3, 0x48, 0xa5][..],
+    ] {
+        assert!(matches!(admission(bytes), DecodeDecision::Entry(_)));
+        for length in 1..bytes.len() {
+            assert_eq!(admission(&bytes[..length]), DecodeDecision::More);
+        }
+        assert_eq!(
+            admission(&[bytes, &[0x90]].concat()),
+            DecodeDecision::Rejected
         );
     }
 }

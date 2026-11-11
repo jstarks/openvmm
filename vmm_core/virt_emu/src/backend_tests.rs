@@ -239,13 +239,15 @@ async fn descriptor_entry_updates_real_vp_state_and_preserves_store_neighbors(
 }
 
 #[async_test]
-async fn loaded_nonlegacy_ss_rejects_iret_without_fabricating_segment_state(driver: DefaultDriver) {
+async fn loaded_nondefault_ss_iret_restores_the_actual_frame_and_segment_state(
+    driver: DefaultDriver,
+) {
     let (mut bytes, mut owned) = fixture();
-    let program = [0xb8, 0x18, 0, 0, 0, 0x8e, 0xd0, 0x48, 0xcf];
+    let program = [0xb8, 0x18, 0, 0, 0, 0x8e, 0xd0, 0x48, 0xcf, 0xf4];
     bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
     bytes[0x9018..0x9020].copy_from_slice(&0x00cf93000000ffffu64.to_le_bytes());
     owned.tables.gdt_limit = 31;
-    let (_, mut binder, _memory, _keeper) = build(&driver, &bytes).await;
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
     let mut vp = binder.bind().unwrap();
     let initial = long_mode_registers(
         owned.core.cpu,
@@ -253,23 +255,116 @@ async fn loaded_nonlegacy_ss_rejects_iret_without_fabricating_segment_state(driv
         owned.tables,
         77,
     );
+    for (index, value) in [CODE + 9, 8, initial.rflags, 0x18040, 0x18]
+        .into_iter()
+        .enumerate()
+    {
+        memory
+            .write_plain(initial.rsp + index as u64 * 8, &value)
+            .unwrap();
+    }
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
-        Err(VpHaltReason::PowerOff)
-    ));
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    park(run.as_mut());
+    stop.stop();
+    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+    drop(run);
     let mut expected = initial;
     expected.rax = 0x18;
     expected.ss.selector = 0x18;
-    expected.rip = CODE + 7;
+    expected.rip = CODE + 10;
+    expected.rsp = 0x18040;
     expected.rflags &= !0x10000;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
     let progress = vp.completed_batch_progress();
-    assert_eq!((progress.retired, progress.delivered), (2, 0));
-    assert_eq!(devices.faults.lock().len(), 1);
-    assert!(devices.faults.lock()[0].contains("Profile"));
+    assert_eq!((progress.retired, progress.delivered), (4, 0));
+    assert!(devices.faults.lock().is_empty());
+}
+
+#[async_test]
+async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: DefaultDriver) {
+    for supported_msr in [true, false] {
+        let (mut bytes, owned) = fixture();
+        let data = 0x16000u64;
+        let mut program = vec![0xfc, 0xb9, 3, 0, 0, 0, 0x48, 0xbe];
+        program.extend(data.to_le_bytes());
+        program.extend([0x48, 0xbf]);
+        program.extend((data + 8).to_le_bytes());
+        program.extend([0xf3, 0x48, 0xa5, 0x31, 0xc0, 0x0f, 0x45, 0xda]);
+        program.extend([0x0f, 0x45, 0x1c, 0x25]);
+        program.extend((data as u32).to_le_bytes());
+        program.extend([0x0f, 0x95, 0x04, 0x25]);
+        program.extend(((data + 0x40) as u32).to_le_bytes());
+        program.extend([0x41, 0x0f, 0x20, 0xd0, 0xb9]);
+        program.extend((if supported_msr { 0x8bu32 } else { 0x8c }).to_le_bytes());
+        let msr_rip = CODE + program.len() as u64;
+        program.extend([0x0f, 0x32, 0xf4]);
+        bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+        bytes[data as usize..data as usize + 8]
+            .copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        bytes[data as usize + 0x40..data as usize + 0x48].fill(0xff);
+        let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+        let mut vp = binder.bind().unwrap();
+        let mut initial = long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        );
+        initial.rflags = (initial.rflags & !0x200) | 0x400;
+        initial.rbx = 0xaaaa_bbbb_cccc_dddd;
+        initial.rdx = 0x1234_5678;
+        vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+        let devices = Devices::new();
+        let stop = StopVpSource::new();
+        if supported_msr {
+            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            park(run.as_mut());
+            stop.stop();
+            assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+            drop(run);
+            assert!(devices.faults.lock().is_empty());
+        } else {
+            assert!(matches!(
+                vp.run_vp(stop.checker(), &devices).await,
+                Err(VpHaltReason::PowerOff)
+            ));
+            assert_eq!(devices.faults.lock().len(), 1);
+            assert!(devices.faults.lock()[0].contains("Unsupported"));
+        }
+        let mut expected = initial;
+        expected.rax = 0;
+        expected.rbx = 0xcccc_dddd;
+        expected.rcx = if supported_msr { 0x8b } else { 0x8c };
+        expected.rdx = if supported_msr { 0 } else { initial.rdx };
+        expected.rsi = data + 24;
+        expected.rdi = data + 32;
+        expected.r8 = 77;
+        expected.rflags = (initial.rflags & !0x10cd5) | 0x44;
+        expected.rip = if supported_msr {
+            CODE + program.len() as u64
+        } else {
+            msr_rip
+        };
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        for offset in [0, 8, 16, 24] {
+            assert_eq!(
+                memory.read_plain::<u64>(data + offset).unwrap(),
+                0x1122_3344_5566_7788
+            );
+        }
+        assert_eq!(
+            memory.read_plain::<u64>(data + 0x40).unwrap(),
+            0xffff_ffff_ffff_ff00
+        );
+        let progress = vp.completed_batch_progress();
+        assert_eq!(
+            (progress.retired, progress.delivered),
+            (if supported_msr { 13 } else { 11 }, 0)
+        );
+    }
 }
 
 #[async_test]
@@ -305,7 +400,7 @@ async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: D
                 Err(VpHaltReason::PowerOff)
             ));
             assert_eq!(devices.faults.lock().len(), 1);
-            assert!(devices.faults.lock()[0].contains("Profile"));
+            assert!(devices.faults.lock()[0].contains("ReturnImage"));
         } else {
             let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
             park(run.as_mut());

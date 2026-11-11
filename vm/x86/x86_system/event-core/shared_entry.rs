@@ -26,6 +26,10 @@ pub enum Instruction {
     IndirectCall { source: Operand },
     Multiply { dst:Register, source:Operand, immediate:Option<u64> },
     RepeatStore { width:Width },
+    RepeatMove { width:Width },
+    ConditionalMove { condition: control::Condition, dst: Register, source: Operand },
+    SetCondition { condition: control::Condition, destination: Operand },
+    Direction { set: bool },
     ReadMsr,
     ZeroExtend { dst: Register, src: Register },
     Load { dst: Register, address: Address, width: Width },
@@ -67,6 +71,9 @@ pub enum MemoryTask {
     CallTarget,
     Multiply { dst:Register, immediate:Option<u64> },
     RepeatStore { width:Width },
+    RepeatRead { width:Width },
+    RepeatWrite { width:Width },
+    ConditionalMove { condition: control::Condition, dst: Register },
 }
 
 pub(super) fn scalar(cpu: State, source: Operand) -> (out: Option<u64>)
@@ -143,6 +150,10 @@ impl SharedEventMachine {
                 reveal(spec::entry::execute);
                 self.execute_repeat(width,length)
             },
+            Instruction::RepeatMove {width} => {
+                reveal(spec::entry::execute);
+                self.execute_move(width,length)
+            },
             Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr => {
                 reveal(spec::entry::execute);
                 self.execute_control(instruction,length)
@@ -150,32 +161,95 @@ impl SharedEventMachine {
             Instruction::SignExtend {..} | Instruction::SignHigh {..} | Instruction::Divide {..}
                 | Instruction::Bit {..} | Instruction::IndirectJump {..} | Instruction::IndirectCall {..}
                 => self.execute_scalar(instruction,length),
+            Instruction::ConditionalMove {..} | Instruction::SetCondition {..} | Instruction::Direction {..}
+                => self.execute_conditions(instruction,length),
+            Instruction::Nop | Instruction::Cpuid | Instruction::Branch {..}
+                | Instruction::ZeroExtend {..} | Instruction::Jump {..}
+                => self.execute_register(instruction,length),
             _=>self.execute_legacy(instruction,length),
         }
     }
 
     #[verifier::spinoff_prover]
-    pub(super) fn execute_legacy(&mut self, instruction: Instruction, length: u8) -> (tick: Tick)
+    pub(super) fn execute_conditions(&mut self,instruction:Instruction,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
-            !(instruction is Integer || instruction is Alu || instruction is Multiply || instruction is SignExtend
-                || instruction is SignHigh || instruction is Divide || instruction is Bit
-                || instruction is ReadControl || instruction is WriteControl || instruction is ReadMsr
-                || instruction is IndirectJump || instruction is IndirectCall || instruction is RepeatStore),
+            instruction is ConditionalMove || instruction is SetCondition || instruction is Direction,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
     {
         reveal(spec::entry::execute);
         let mut cpu = self.core.cpu();
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
-        if length == 0 || length > 15 {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-        }
-        if cpu.flags & 0x100 != 0 {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
-        }
         let next = cpu.rip.wrapping_add(length as u64);
+        match instruction {
+            Instruction::Direction {set}=>{
+                cpu.flags=if set {cpu.flags|0x400} else {cpu.flags&!0x400u64};
+                self.retire_entry(cpu,length,false,false)
+            },
+            Instruction::ConditionalMove {condition,dst,source}=>{
+                if !dst.is_valid() || dst.width()==Width::Byte {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                match source {
+                    Operand::Register(src)=>{
+                        if !src.is_valid() || src.width()!=dst.width() {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        self.finish_conditional(condition,dst,src.read(&cpu.gpr),length)
+                    },
+                    Operand::Memory {address,width}=>{
+                        if !address.is_valid() || width!=dst.width() {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        let linear=address.linear(&cpu.gpr,next,self.entry_bases());
+                        self.entry_memory(linear,width,WordAccess::Read,length,
+                            MemoryTask::ConditionalMove {condition,dst})
+                    },
+                    _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
+            Instruction::SetCondition {condition,destination}=>{
+                let value=if control::condition(condition,cpu.flags) {1u64} else {0u64};
+                match destination {
+                    Operand::Register(dst)=>{
+                        if !dst.is_valid() || dst.width()!=Width::Byte {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        let ghost registers=cpu.gpr@;
+                        dst.write(&mut cpu.gpr,value);
+                        assert(cpu@.gpr =~= operand::model::write(registers,dst,value)
+                            .map(|i:int,v:u64|v as int));
+                        self.retire_entry(cpu,length,false,false)
+                    },
+                    Operand::Memory {address,width}=>{
+                        if !address.is_valid() || width!=Width::Byte {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        let linear=address.linear(&cpu.gpr,next,self.entry_bases());
+                        self.entry_memory(linear,width,WordAccess::Write(value),length,MemoryTask::Store)
+                    },
+                    _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
+            _=>{assert(false);Tick::Waiting},
+        }
+    }
+
+    #[verifier::spinoff_prover]
+    pub(super) fn execute_register(&mut self, instruction: Instruction, length: u8) -> (tick: Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+            1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
+            instruction is Nop || instruction is Cpuid || instruction is Branch
+                || instruction is ZeroExtend || instruction is Jump,
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
+    {
+        reveal(spec::entry::execute);
+        let mut cpu=self.core.cpu();
+        assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         match instruction {
             Instruction::Nop=>self.retire_entry(cpu,length,false,false),
             Instruction::Cpuid => {
@@ -198,6 +272,49 @@ impl SharedEventMachine {
                     self.retire_entry(cpu, 0, false, false)
                 } else { self.retire_entry(cpu, length, false, false) }
             },
+            Instruction::ZeroExtend { dst, src } => {
+                if !dst.is_valid() || !src.is_valid() || dst.width().bits() <= src.width().bits()
+                    || !matches!(src.width(), Width::Byte | Width::Word) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let value = src.read(&cpu.gpr);
+                let ghost registers = cpu.gpr@;
+                dst.write(&mut cpu.gpr, value);
+                assert(cpu@.gpr =~= operand::model::write(registers, dst, value)
+                    .map(|i: int, v: u64| v as int));
+                self.retire_entry(cpu, length, false, false)
+            },
+            Instruction::Jump { target, zero } => {
+                let taken = match zero { None => true, Some(wanted) => (cpu.flags & 0x40 != 0) == wanted };
+                if taken {
+                    if !canonical(target) {
+                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                    }
+                    cpu.rip = target;
+                    self.retire_entry(cpu, 0, false, false)
+                } else { self.retire_entry(cpu, length, false, false) }
+            },
+            _=>{assert(false);Tick::Waiting},
+        }
+    }
+
+    #[verifier::spinoff_prover]
+    pub(super) fn execute_legacy(&mut self, instruction: Instruction, length: u8) -> (tick: Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+            1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
+            instruction is PushFlags || instruction is Pop || instruction is PopFlags
+                || instruction is FarReturn || instruction is Load || instruction is Store
+                || instruction is Table || instruction is Segment || instruction is Push
+                || instruction is Return || instruction is Leave,
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
+    {
+        reveal(spec::entry::execute);
+        let cpu=self.core.cpu();
+        assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
+        let next=cpu.rip.wrapping_add(length as u64);
+        match instruction {
             Instruction::PushFlags => {
                 if cpu.gpr[4] < 8 || cpu.gpr[4] % 8 != 0 {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -227,18 +344,6 @@ impl SharedEventMachine {
                 }
                 self.entry_memory(cpu.gpr[4], Width::Qword, WordAccess::Read, length,
                     MemoryTask::FarTarget { stack: cpu.gpr[4] })
-            },
-            Instruction::ZeroExtend { dst, src } => {
-                if !dst.is_valid() || !src.is_valid() || dst.width().bits() <= src.width().bits()
-                    || !matches!(src.width(), Width::Byte | Width::Word) {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                }
-                let value = src.read(&cpu.gpr);
-                let ghost registers = cpu.gpr@;
-                dst.write(&mut cpu.gpr, value);
-                assert(cpu@.gpr =~= operand::model::write(registers, dst, value)
-                    .map(|i: int, v: u64| v as int));
-                self.retire_entry(cpu, length, false, false)
             },
             Instruction::Load { dst, address, width } => {
                 if !dst.is_valid() || !address.is_valid() || dst.width().bits() < width.bits() {
@@ -312,16 +417,6 @@ impl SharedEventMachine {
                     else { MemoryTask::Leave { stack } };
                 self.entry_memory(stack, Width::Qword, WordAccess::Read, length, task)
             },
-            Instruction::Jump { target, zero } => {
-                let taken = match zero { None => true, Some(wanted) => (cpu.flags & 0x40 != 0) == wanted };
-                if taken {
-                    if !canonical(target) {
-                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                    }
-                    cpu.rip = target;
-                    self.retire_entry(cpu, 0, false, false)
-                } else { self.retire_entry(cpu, length, false, false) }
-            },
             _=>{assert(false);Tick::Waiting},
         }
     }
@@ -333,6 +428,26 @@ impl SharedEventMachine {
             Some(system) => SegmentBases { fs: system.fs.base, gs: system.gs.base },
             None => SegmentBases { fs: 0, gs: 0 },
         }
+    }
+
+    pub(super) fn finish_conditional(&mut self,condition:control::Condition,dst:Register,
+            value:u64,length:u8)->(tick:Tick)
+            requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+                !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+            ensures final(self).invariant(),
+                (final(self)@,tick)==spec::entry::conditional_value(old(self)@,condition,dst,value,length),
+        {
+            let mut cpu=self.core.cpu();
+            if !dst.is_valid() || dst.width()==Width::Byte {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
+            let selected=if control::condition(condition,cpu.flags) {value} else {dst.read(&cpu.gpr)};
+            let ghost registers=cpu.gpr@;
+            dst.write(&mut cpu.gpr,selected);
+            assert(cpu@.gpr =~= operand::model::write(registers,dst,selected)
+                .map(|i:int,v:u64|v as int));
+            self.retire_entry(cpu,length,false,false)
     }
 
     pub(super) fn entry_value(&mut self, value: u64) -> (tick: Tick)
@@ -350,6 +465,10 @@ impl SharedEventMachine {
         let ghost before = cpu@;
         match task {
             MemoryTask::RepeatStore {width} => return self.finish_repeat(width,length),
+            MemoryTask::RepeatRead {width} => return self.finish_move_read(width,value,length),
+            MemoryTask::RepeatWrite {width} => return self.finish_move(width,length),
+            MemoryTask::ConditionalMove {condition,dst} =>
+                return self.finish_conditional(condition,dst,value,length),
             MemoryTask::CallTarget => return self.begin_indirect_call(value,length),
             MemoryTask::Multiply {dst,immediate} => return self.finish_multiply(dst,value,immediate,length),
             MemoryTask::AluRegister {operation,dst} => {

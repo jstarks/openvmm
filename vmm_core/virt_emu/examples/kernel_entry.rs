@@ -36,10 +36,11 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
     const ENTRY: u64 = 0x2d98100;
-    const CHECKPOINT: u64 = 0xffff_ffff_82d9_8940;
+    const CHECKPOINT: u64 = 0xffff_ffff_82d9_8800;
+    const PROBE_TARGET: u64 = 0xffff_ffff_82d9_8800;
     const TARGET: u64 = 0xffff_ffff_82d9_8890;
     const ROOT: u64 = 0x2e32000;
-    const STACK: u64 = 0xffff_ffff_8260_3f30;
+    const STACK: u64 = 0xffff_ffff_8260_3f28;
     const RETURN: u64 = 0xffff_ffff_812f_3dad;
     const CMDLINE: &str =
         "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 nokaslr maxcpus=1 rdinit=/init";
@@ -210,6 +211,189 @@ mod native {
         Ok(words.len())
     }
 
+    fn bootdata_stack(
+        memory: &GuestMemory,
+        changes: &mut BTreeMap<u64, (u64, u64)>,
+        initrd: u64,
+        initrd_size: u64,
+    ) -> anyhow::Result<()> {
+        let direct = 0xffff_8880_0000_0000;
+        let boot_params = direct + 0x2000;
+        let image = direct + initrd;
+        let stack = 0xffff_ffff_8260_0000u64;
+        let mut word = |offset: u64, value: u64| {
+            expected_store(memory, changes, 0x2600000 + offset, &value.to_le_bytes())
+        };
+
+        // First #PF: copy_bootdata's original registers, then the early handler's
+        // pt_regs, do_early_exception and __early_make_pgtable prologues.
+        for (offset, value) in [
+            (0x3f18, 0),
+            (0x3f10, stack + 0x3f20),
+            (0x3f08, 0x10046),
+            (0x3f00, 16),
+            (0x3ef8, 0xffff_ffff_82d9_8349),
+            (0x3ef0, 0),
+            (0x3ee8, 1),
+            (0x3ee0, 0xffff_ffff),
+            (0x3ed8, 0xffff_ffff_82d9_8290),
+            (0x3ed0, 0xffff_ffff_830e_2200),
+            (0x3ec8, 0),
+            (0x3ec0, 0xffff_0000_ffff_ffff),
+            (0x3eb8, 0xffff_ffff_0000_ffff),
+            (0x3eb0, 0xffff_ffff_82d9_8290),
+            (0x3ea8, 20),
+            (0x3ea0, 0),
+            (0x3e98, boot_params),
+            (0x3e90, 0xb0),
+            (0x3e88, 0),
+            (0x3e80, 0),
+            (0x3e78, 0x2000),
+            (0x3e70, 0xffff_ffff_82d9_82bf),
+            (0x3e68, 0xb0),
+            (0x3e60, boot_params),
+            (0x3e58, 0xffff_ffff_82d9_87d0),
+            (0x3e50, 0x2000),
+            (0x3e48, 0),
+            (0x3e40, 0),
+            (0x3e38, stack + 0x3e78),
+            (0x3e30, 14),
+            (0x3e28, 0),
+            (0x3e20, 0x8000_0000_0000_00e3),
+        ] {
+            word(offset, value)?;
+        }
+
+        // The wrapper clears its option buffer, restores its registers and
+        // tail-calls the AMD loader. Its x86_family return survives a dword store.
+        for offset in (0x3ec8..=0x3f08).step_by(8) {
+            word(offset, 0)?;
+        }
+        word(0x3eb8, 0xffff_ffff_82da_7a7f)?;
+        word(0x3f20, 0x2000)?;
+        word(0x3f18, 0)?;
+        word(0x3f10, 0)?;
+        for offset in (0x3ec0..=0x3f00).step_by(8) {
+            word(offset, 0)?;
+        }
+        word(0x3eb0, 0xffff_ffff_82da_82b4)?;
+        word(0x3ea8, 0x00a0_0f11)?;
+        word(0x3ea0, 0)?;
+
+        // snprintf/vsnprintf's saved registers and surviving locals. The final
+        // literal memcpy overwrites only the low byte of a saved format pointer.
+        for (offset, value) in [
+            (0x3dc8, stack + 0x3e28),
+            (0x3dc0, 0x2000),
+            (0x3db8, 0),
+            (0x3db0, 0),
+            (0x3da8, 0xb0),
+            (0x3da0, stack + 0x3ee0),
+            (0x3dd0, 0xffff_ffff_81eb_f9c8),
+            (0x3d78, 36),
+            (0x3d70, 0xffff_ffff_8243_2e01),
+            (0x3d68, 0xffff_ffff_8243_2e5e),
+            (0x3d60, 0xffff_ffff_81eb_f6d4),
+            (0x3d58, stack + 0x3dc8),
+        ] {
+            word(offset, value)?;
+        }
+
+        // find_microcode_in_initrd and find_cpio_data. The gzip byte is not a
+        // hexadecimal CPIO digit, so the initialized empty result is returned.
+        for (offset, value) in [
+            (0x3e30, 0xffff_ffff_82da_7f98),
+            (0x3e28, 0xb0),
+            (0x3e20, 0),
+            (0x3e18, 0xffff_ffff_82da_7b5f),
+            (0x3e10, 0x2000),
+            (0x3e08, 0),
+            (0x3e00, 0),
+            (0x3df8, stack + 0x3e50),
+            (0x3df0, 0xffff_ffff_830f_36a0),
+            (0x3de8, stack + 0x3ee0),
+            (0x3de0, 0),
+            (0x3d50, 0),
+            (0x3d80, 0),
+            (0x3d88, 0),
+            (0x3d90, 0),
+            (0x3d98, 0),
+            (0x3e50, 0),
+            (0x3e58, 0),
+            (0x3e60, 0),
+            (0x3e68, 0),
+            (0x3e70, (stack + 0x3ee0) & !0xffff),
+        ] {
+            word(offset, value)?;
+        }
+
+        // Second #PF: the first initrd byte, before CPIO parsing can alter its
+        // arguments. CMP initrd_size,0x6e supplies the saved arithmetic flags.
+        ensure!(
+            initrd_size > 0x6e && initrd_size < RAM,
+            "unexpected initrd comparison profile"
+        );
+        let difference = initrd_size - 0x6e;
+        let flags =
+            2 | if (difference as u8).count_ones().is_multiple_of(2) {
+                4
+            } else {
+                0
+            } | if (initrd_size ^ 0x6e ^ difference) & 0x10 != 0 {
+                0x10
+            } else {
+                0
+            };
+        for (offset, value) in [
+            (0x3d48, 0),
+            (0x3d40, stack + 0x3d50),
+            (0x3d38, flags | 0x10000),
+            (0x3d30, 16),
+            (0x3d28, 0xffff_ffff_81e9_ecfa),
+            (0x3d20, 0),
+            (0x3d18, 0xffff_ffff_8202_2d00),
+            (0x3d10, 0xffff_ffff_8202_2d00),
+            (0x3d08, image),
+            (0x3d00, 37),
+            (0x3cf8, 37),
+            (0x3cf0, stack + 0x3ddc),
+            (0x3ce8, 0xffff_ffff_8243_2e5e),
+            (0x3ce0, 1),
+            (0x3cd8, 1),
+            (0x3cd0, image),
+            (0x3cc8, initrd_size),
+            (0x3cc0, stack + 0x3e50),
+            (0x3cb8, 0),
+            (0x3cb0, image),
+            (0x3ca8, 0xffff_ffff_8202_2d00),
+            (0x3ca0, 0xffff_ffff_82d9_82bf),
+            (0x3c98, stack + 0x3e50),
+            (0x3c90, initrd_size),
+            (0x3c88, 0xffff_ffff_82d9_87d0),
+            (0x3c80, 0xffff_ffff_8202_2d00),
+            (0x3c78, image),
+            (0x3c70, 0),
+            (0x3c68, stack + 0x3ca8),
+            (0x3c60, 14),
+            (0x3c58, image),
+            (0x3c50, (initrd & !0x1f_ffff) | 0x8000_0000_0000_00e3),
+            (0x3f28, 0xffff_ffff_82d9_899c),
+        ] {
+            word(offset, value)?;
+        }
+        expected_store(memory, changes, 0x2603ebc, &0u32.to_le_bytes())?;
+        expected_store(memory, changes, 0x2603dd8, &32u32.to_le_bytes())?;
+        expected_store(memory, changes, 0x2603da0, &0u16.to_le_bytes())?;
+        expected_store(memory, changes, 0x2603e9c, &0u32.to_le_bytes())?;
+        expected_store(
+            memory,
+            changes,
+            0x2603e7c,
+            b"amd-ucode/microcode_amd_fam19h.bin\0",
+        )?;
+        Ok(())
+    }
+
     fn check_zero_ranges(
         memory: &GuestMemory,
         projection: &serde_json::Value,
@@ -217,8 +401,9 @@ mod native {
         let ranges = projection["zero_ranges"]
             .as_array()
             .context("missing exact zero ranges")?;
-        ensure!(ranges.len() == 2, "expected BSS and brk ranges");
+        ensure!(!ranges.is_empty(), "missing residual BSS/brk zero ranges");
         let mut total = 0;
+        let mut previous_end = 0x30e1000;
         let mut buffer = vec![0; 65536];
         for range in ranges {
             let start = range["start"]
@@ -226,7 +411,10 @@ mod native {
                 .context("missing zero-range start")?;
             let end = range["end"].as_u64().context("missing zero-range end")?;
             ensure!(
-                start < end && end <= RAM && range["loader_preimage_zero"].as_bool() == Some(true),
+                previous_end <= start
+                    && start < end
+                    && end <= 0x3630000
+                    && range["loader_preimage_zero"].as_bool() == Some(true),
                 "invalid zero-range profile"
             );
             let mut address = start;
@@ -242,8 +430,32 @@ mod native {
                 address += count as u64;
             }
             total += end - start;
+            previous_end = end;
         }
         Ok(total)
+    }
+
+    fn walk_trace(
+        memory: &GuestMemory,
+        root: u64,
+        va: u64,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut table = root;
+        let mut trace = Vec::new();
+        for shift in [39, 30, 21, 12] {
+            let address = table + ((va >> shift) & 511) * 8;
+            if address >= RAM {
+                trace.push(serde_json::json!({"shift":shift,"address":address,"outside_ram":true}));
+                break;
+            }
+            let word = memory.read_plain::<u64>(address)?;
+            trace.push(serde_json::json!({"shift":shift,"address":address,"word":word}));
+            if word & 1 == 0 || shift == 12 || ((shift == 30 || shift == 21) && word & 0x80 != 0) {
+                break;
+            }
+            table = word & 0x0000_ffff_ffff_f000;
+        }
+        Ok(trace)
     }
 
     async fn witness(driver: DefaultDriver) -> anyhow::Result<()> {
@@ -254,10 +466,19 @@ mod native {
         let initial_mapping_path = args
             .next()
             .context("missing pre-reset mapping projection")?;
-        ensure!(
-            args.next().is_none(),
-            "expected vmlinux, initrd and both mapping projections"
-        );
+        let option = args.next();
+        let loader_inputs = option.as_deref() == Some(std::ffi::OsStr::new("--loader-inputs"));
+        let probe = match option {
+            None => false,
+            Some(argument) => {
+                ensure!(
+                    argument == "--probe" || loader_inputs,
+                    "unknown witness option"
+                );
+                !loader_inputs
+            }
+        };
+        ensure!(args.next().is_none(), "unexpected witness arguments");
         let topology = TopologyBuilder::new_x86()
             .x2apic(X2ApicState::Unsupported)
             .build(1)?;
@@ -336,8 +557,47 @@ mod native {
                 && initial.registers.cr3 == 0x4000,
             "unexpected pinned loader handoff"
         );
+        if loader_inputs {
+            let mut boot_params = vec![0; 4096];
+            memory.read_at(initial.registers.rsi, &mut boot_params)?;
+            let command_line_address =
+                u64::from(u32::from_le_bytes(boot_params[0x228..0x22c].try_into()?))
+                    | (u64::from(u32::from_le_bytes(boot_params[0xc8..0xcc].try_into()?)) << 32);
+            ensure!(
+                command_line_address < RAM - 2048,
+                "invalid loader command-line pointer"
+            );
+            let mut command_line = vec![0; 2048];
+            memory.read_at(command_line_address, &mut command_line)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "loader_inputs":true,"guest_executed":false,
+                    "boot_params_address":initial.registers.rsi,
+                    "command_line_address":command_line_address,
+                    "boot_params_hex":boot_params.iter().map(|byte|format!("{byte:02x}")).collect::<String>(),
+                    "command_line_hex":command_line.iter().map(|byte|format!("{byte:02x}")).collect::<String>(),
+                })
+            );
+            return Ok(());
+        }
         let mut changes = BTreeMap::new();
         let projection: serde_json::Value = serde_json::from_reader(File::open(oracle_path)?)?;
+        for (address, size, name) in [
+            (0x2000, 4096, "boot_params"),
+            (0x3000, 2048, "command_line"),
+        ] {
+            let mut input = vec![0; size];
+            memory.read_at(address, &mut input)?;
+            let actual = Sha256::digest(&input)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            ensure!(
+                projection["loader_input_sha256"][name].as_str() == Some(actual.as_str()),
+                "loader input differs from its pre-execution projection: {name}"
+            );
+        }
         ensure!(
             projection["root"].as_u64() == Some(ROOT)
                 && projection["target"].as_u64() == Some(TARGET)
@@ -433,7 +693,7 @@ mod native {
             (0x2603f40, RETURN),
             (0x2603f38, initial.registers.r12),
             (0x2603f30, 0),
-            (0x2603f28, CHECKPOINT),
+            (0x2603f28, 0xffff_ffff_82d9_8940),
             (0x2603f20, 0xffff_ffff_82d9_885c),
             (0x2603f18, 0x100000001d),
             (0x2603f10, 0xffff_ffff_8260_4000),
@@ -447,11 +707,22 @@ mod native {
         ] {
             expected_store(&memory, &mut changes, address, &value.to_le_bytes())?;
         }
+        let initrd_address = u64::from(memory.read_plain::<u32>(0x2218)?)
+            | (u64::from(memory.read_plain::<u32>(0x20c0)?) << 32);
+        ensure!(
+            initrd_address == 0x3c00000,
+            "unexpected pinned initrd address"
+        );
+        ensure!(
+            memory.read_plain::<u8>(initrd_address)? == 0x1f,
+            "unexpected early CPIO input"
+        );
+        bootdata_stack(&memory, &mut changes, initrd_address, initrd_size)?;
         let before = memory_digest(&memory, &BTreeMap::new())?;
         let mut binder = binders.pop().context("missing VP binder")?;
         ensure!(binders.is_empty(), "unexpected additional VP");
         let mut vp = binder.bind()?;
-        vp.set_execution_checkpoint(Some(CHECKPOINT))?;
+        vp.set_execution_checkpoint(Some(if probe { PROBE_TARGET } else { CHECKPOINT }))?;
         {
             let mut state = vp.access_state(Vtl::Vtl0);
             state.set_mtrrs(&initial.mtrrs)?;
@@ -482,6 +753,45 @@ mod native {
             .take()
             .context("missing frontier diagnostic")?;
         let stopped_rip = vp.access_state(Vtl::Vtl0).registers()?.rip;
+        if probe {
+            ensure!(
+                matches!(
+                    failure.downcast_ref::<Error>(),
+                    Some(Error::Cpu(_) | Error::Checkpoint { .. })
+                ),
+                "unexpected probe transport/device failure: {failure}"
+            );
+            let registers = vp.access_state(Vtl::Vtl0).registers()?;
+            let progress = vp.completed_batch_progress();
+            let mut stack_words = Vec::new();
+            for address in (0x2603c00..0x2603f48).step_by(8) {
+                let value = memory.read_plain::<u64>(address)?;
+                if value != 0 {
+                    stack_words.push(serde_json::json!({"address":address,"value":value}));
+                }
+            }
+            let mut encoding = None;
+            if stopped_rip >= 0xffff_ffff_8000_0000
+                && stopped_rip - 0xffff_ffff_8000_0000 < RAM - 16
+            {
+                let mut bytes = [0; 16];
+                memory.read_at(stopped_rip - 0xffff_ffff_8000_0000, &mut bytes)?;
+                encoding = Some(bytes);
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "probe":true,"acceptance":false,"stop":failure.to_string(),"target":PROBE_TARGET,
+                    "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
+                    "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
+                    "kernel_image_bytes":encoding,
+                    "instruction_walk":walk_trace(&memory,registers.cr3,registers.rip)?,
+                    "cr2_walk":walk_trace(&memory,registers.cr3,registers.cr2)?,
+                    "stack_words":stack_words,
+                })
+            );
+            return Ok(());
+        }
         ensure!(
             matches!(
                 failure.downcast_ref::<Error>(),
@@ -491,33 +801,41 @@ mod native {
         );
         let progress = vp.completed_batch_progress();
         ensure!(
-            progress.retired > 3700 && progress.retired < 2_000_000 && progress.delivered == 0,
+            progress.retired > 960613 && progress.retired < 2_000_000 && progress.delivered == 2,
             "wrong progress: {progress:?}"
         );
         let mut expected = initial.registers;
         expected.cr0 = 0x80050033;
         expected.cr4 = 0xb0;
         expected.efer = 0xd01;
-        expected.rax = 0xffff_ffff_8360_0000;
+        expected.rax = changes
+            .get(&(ROOT + 511 * 8))
+            .context("missing projected high root slot")?
+            .1;
         expected.rbx = 0;
         expected.rdx = 0;
-        expected.rcx = 0;
-        expected.rsi = 0;
-        expected.rdi = 0xffff_ffff_8363_0000;
+        expected.rcx = 37;
+        expected.rsi = 0xffff_8880_0000_0000 + initrd_address + 6;
+        expected.rdi = 0x2000;
         expected.rbp = 0x2000;
-        expected.r8 = 20;
-        expected.r9 = 0;
-        expected.r10 = 0xffff_ffff_8360_0000;
-        expected.r11 = 20;
+        expected.r8 = 0;
+        expected.r9 =
+            u64::from(u32::from(memory.read_plain::<u8>(initrd_address)?).wrapping_sub(0x30));
+        expected.r10 = 1;
+        expected.r11 = 1;
+        expected.r12 = expected.cr4;
         expected.cr3 = ROOT;
         expected.r15 = initial.registers.rsi;
         expected.rsp = STACK;
         expected.rip = CHECKPOINT;
-        expected.rflags = 0x46;
+        // The AMD loader's final ADD RSP,0x60 supplies flags; the caller's
+        // root-slot copy and CALL to reservations leave them unchanged.
+        expected.rflags = 0x86;
+        expected.cr2 = 0xffff_8880_0000_0000 + initrd_address;
         expected.gdtr.base = 0xffff_ffff_830a_e000;
         expected.gdtr.limit = 0x7f;
-        expected.idtr.base = 0xffff_ffff_8260_4000;
-        expected.idtr.limit = 0x1ff;
+        expected.idtr.base = 0xffff_ffff_830e_2000;
+        expected.idtr.limit = 0xfff;
         expected.ds = Default::default();
         expected.ss = Default::default();
         expected.es = Default::default();
@@ -549,9 +867,9 @@ mod native {
             "RAM changed outside the projected tables/data, A/D, stack and #VC gate effects"
         );
         let mut bytes = [0; 7];
-        memory.read_at(0x2d98940, &mut bytes)?;
+        memory.read_at(CHECKPOINT - 0xffff_ffff_8000_0000, &mut bytes)?;
         ensure!(
-            bytes == [0x48, 0xc7, 0xc7, 0, 0x40, 0x64, 0x82],
+            bytes == [0x66, 0x83, 0x3d, 0x1e, 0x60, 0x35, 0],
             "wrong checkpoint bytes"
         );
         let functions = [0, 1, 0x8000_0000, 0x8000_0001, 0x8000_0008];
@@ -568,9 +886,11 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
-                "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "48c7c700406482",
+                "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "66833d1e603500",
                 "stop_kind":"host_checkpoint","initial_memory_cleared":true,
                 "kernel_c_entry":true,"identity_mappings_removed":true,"zero_bytes":zero_bytes,
+                "boot_parameters_copied":true,"command_line_copied":true,
+                "guest_page_faults_repaired":true,"reservations_entry":true,
                 "r15": actual.r15, "rsp": actual.rsp, "return_address": RETURN,
                 "rflags": actual.rflags, "seconds": seconds,
                 "complete_register_image_checked": true, "whole_ram_checked": true,

@@ -9,6 +9,7 @@ pub mod arithmetic;
 pub mod control;
 pub mod decoder;
 pub mod descriptor;
+pub mod exception;
 pub mod gsbase;
 pub mod integer;
 pub mod model;

@@ -6,7 +6,7 @@ use super::super::Config;
 #[cfg(verus_keep_ghost)]
 use super::super::memory_core::cpu_core::operand::Width;
 #[cfg(verus_keep_ghost)]
-use super::super::memory_core::cpu_core::{operand, privilege};
+use super::super::memory_core::cpu_core::{operand, privilege, profile};
 #[cfg(verus_keep_ghost)]
 use super::super::shared::entry::Instruction;
 use super::*;
@@ -22,12 +22,13 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
     else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
     else {match instruction {
         Instruction::ReadControl {number,dst}=>{
-            if !dst.valid() || dst@.width!=Width::Qword || (number!=0 && number!=3 && number!=4) {
+            if !dst.valid() || dst@.width!=Width::Qword || (number!=0 && number!=2 && number!=3 && number!=4) {
                 entry::unsupported(s)
             } else {
                 let cr0_extra=match s.system {Some(system)=>system.cr0_extra,None=>0u64};
                 let cr4_extra=match s.system {Some(system)=>system.cr4_extra,None=>0u64};
                 let value=if number==0 {privilege::model::read_cr0(cr0_extra,config.wp)}
+                    else if number==2 {s.core.mmu.inner.cr2 as u64}
                     else if number==3 {config.root} else {privilege::model::read_cr4(cr4_extra)};
                 entry::retire(s,model::State {gpr:operand::model::write(entry::registers(cpu),dst,value)
                     .map(|i:int,v:u64|v as int),..cpu},length,false,false)
@@ -54,9 +55,11 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
         Instruction::ReadMsr=>match s.system {
             None=>entry::unsupported(s),
             Some(system)=>{
-                if (cpu.gpr[1] as u64)&0xffff_ffffu64!=0xc000_0080u64 {entry::unsupported(s)}
+                let number=(cpu.gpr[1] as u64)&0xffff_ffffu64;
+                if number!=0xc000_0080u64 && number!=0x8bu64 {entry::unsupported(s)}
                 else {
-                    let value=privilege::model::read_efer(system.efer_sce,config.nxe);
+                    let value=if number==0x8b {profile::MICROCODE_REVISION as u64}
+                        else {privilege::model::read_efer(system.efer_sce,config.nxe)};
                     entry::retire(s,model::State {gpr:cpu.gpr.update(0,(value&0xffff_ffffu64) as int)
                         .update(2,(value>>32) as int),..cpu},length,false,false)
                 }

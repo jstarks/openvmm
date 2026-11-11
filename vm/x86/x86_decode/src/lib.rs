@@ -8,7 +8,7 @@
 pub use x86_system::memory_core::cpu_core::operand::*;
 
 use iced_x86::Register as IcedRegister;
-use iced_x86::{Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind};
+use iced_x86::{Code, Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind};
 use x86_system::memory_core::cpu_core::control::Condition;
 use x86_system::memory_core::cpu_core::{integer, scalar};
 use x86_system::shared::decode::{DecodeDecision, DecodeInput};
@@ -349,6 +349,24 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     }
     let size = address_size(encoding.bytes());
     if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
+        if !instruction.has_rep_prefix()
+            || instruction.has_repne_prefix()
+            || size != AddressSize::Bits64
+            || encoding.bytes().contains(&0xf2)
+        {
+            return None;
+        }
+        let move_width = match instruction.code() {
+            Code::Movsb_m8_m8 => Some(Width::Byte),
+            Code::Movsw_m16_m16 => Some(Width::Word),
+            Code::Movsd_m32_m32 => Some(Width::Dword),
+            Code::Movsq_m64_m64 => Some(Width::Qword),
+            _ => None,
+        };
+        if let Some(width) = move_width {
+            return (instruction.segment_prefix() == IcedRegister::None)
+                .then_some(EntryInstruction::RepeatMove { width });
+        }
         let width = match instruction.mnemonic() {
             Mnemonic::Stosb => Width::Byte,
             Mnemonic::Stosw => Width::Word,
@@ -356,11 +374,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             Mnemonic::Stosq => Width::Qword,
             _ => return None,
         };
-        return (instruction.has_rep_prefix()
-            && !instruction.has_repne_prefix()
-            && size == AddressSize::Bits64
-            && !encoding.bytes().contains(&0xf2))
-        .then_some(EntryInstruction::RepeatStore { width });
+        return Some(EntryInstruction::RepeatStore { width });
     }
     let get = |index| operand(&instruction, index, Operation::Mov, size);
     match encoding.bytes() {
@@ -369,10 +383,73 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         [0x48, 0xcb] => return Some(EntryInstruction::FarReturn),
         [0x9c] => return Some(EntryInstruction::PushFlags),
         [0x9d] => return Some(EntryInstruction::PopFlags),
+        [0xfc] => return Some(EntryInstruction::Direction { set: false }),
+        [0xfd] => return Some(EntryInstruction::Direction { set: true }),
         _ => {}
     }
     match instruction.mnemonic() {
         Mnemonic::Nop => Some(EntryInstruction::Nop),
+        Mnemonic::Cmovo
+        | Mnemonic::Cmovno
+        | Mnemonic::Cmovb
+        | Mnemonic::Cmovae
+        | Mnemonic::Cmove
+        | Mnemonic::Cmovne
+        | Mnemonic::Cmovbe
+        | Mnemonic::Cmova
+        | Mnemonic::Cmovs
+        | Mnemonic::Cmovns
+        | Mnemonic::Cmovp
+        | Mnemonic::Cmovnp
+        | Mnemonic::Cmovl
+        | Mnemonic::Cmovge
+        | Mnemonic::Cmovle
+        | Mnemonic::Cmovg
+            if instruction.op_count() == 2 =>
+        {
+            let Operand::Register(dst) = get(0)? else {
+                return None;
+            };
+            let source = get(1)?;
+            if !matches!(dst.width(), Width::Word | Width::Dword | Width::Qword)
+                || !matches!(source, Operand::Register(_) | Operand::Memory { .. })
+                || operand_width(source)? != dst.width()
+            {
+                return None;
+            }
+            // Memory remains an unconditional read obligation for the executor.
+            Some(EntryInstruction::ConditionalMove {
+                condition: condition(instruction.mnemonic())?,
+                dst,
+                source,
+            })
+        }
+        Mnemonic::Seto
+        | Mnemonic::Setno
+        | Mnemonic::Setb
+        | Mnemonic::Setae
+        | Mnemonic::Sete
+        | Mnemonic::Setne
+        | Mnemonic::Setbe
+        | Mnemonic::Seta
+        | Mnemonic::Sets
+        | Mnemonic::Setns
+        | Mnemonic::Setp
+        | Mnemonic::Setnp
+        | Mnemonic::Setl
+        | Mnemonic::Setge
+        | Mnemonic::Setle
+        | Mnemonic::Setg
+            if instruction.op_count() == 1 =>
+        {
+            let destination = get(0)?;
+            (matches!(destination, Operand::Register(_) | Operand::Memory { .. })
+                && operand_width(destination)? == Width::Byte)
+                .then_some(EntryInstruction::SetCondition {
+                    condition: condition(instruction.mnemonic())?,
+                    destination,
+                })
+        }
         Mnemonic::Add
         | Mnemonic::Adc
         | Mnemonic::Sub
@@ -527,6 +604,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             if instruction.mnemonic() == Mnemonic::Mov {
                 let control = match instruction.op1_register() {
                     IcedRegister::CR0 => Some(0),
+                    IcedRegister::CR2 => Some(2),
                     IcedRegister::CR3 => Some(3),
                     IcedRegister::CR4 => Some(4),
                     _ => None,
@@ -656,29 +734,35 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         | Mnemonic::Jg
             if instruction.op0_kind() == OpKind::NearBranch64 =>
         {
-            let condition = match instruction.mnemonic() {
-                Mnemonic::Jo => Condition::Overflow,
-                Mnemonic::Jno => Condition::NotOverflow,
-                Mnemonic::Jb => Condition::Below,
-                Mnemonic::Jae => Condition::AboveEqual,
-                Mnemonic::Jbe => Condition::BelowEqual,
-                Mnemonic::Ja => Condition::Above,
-                Mnemonic::Js => Condition::Sign,
-                Mnemonic::Jns => Condition::NotSign,
-                Mnemonic::Jp => Condition::Parity,
-                Mnemonic::Jnp => Condition::NotParity,
-                Mnemonic::Jl => Condition::Less,
-                Mnemonic::Jge => Condition::GreaterEqual,
-                Mnemonic::Jle => Condition::LessEqual,
-                _ => Condition::Greater,
-            };
             Some(EntryInstruction::Branch {
                 target: instruction.near_branch64(),
-                condition,
+                condition: condition(instruction.mnemonic())?,
             })
         }
         _ => None,
     }
+}
+
+fn condition(mnemonic: Mnemonic) -> Option<Condition> {
+    Some(match mnemonic {
+        Mnemonic::Jo | Mnemonic::Cmovo | Mnemonic::Seto => Condition::Overflow,
+        Mnemonic::Jno | Mnemonic::Cmovno | Mnemonic::Setno => Condition::NotOverflow,
+        Mnemonic::Jb | Mnemonic::Cmovb | Mnemonic::Setb => Condition::Below,
+        Mnemonic::Jae | Mnemonic::Cmovae | Mnemonic::Setae => Condition::AboveEqual,
+        Mnemonic::Je | Mnemonic::Cmove | Mnemonic::Sete => Condition::Equal,
+        Mnemonic::Jne | Mnemonic::Cmovne | Mnemonic::Setne => Condition::NotEqual,
+        Mnemonic::Jbe | Mnemonic::Cmovbe | Mnemonic::Setbe => Condition::BelowEqual,
+        Mnemonic::Ja | Mnemonic::Cmova | Mnemonic::Seta => Condition::Above,
+        Mnemonic::Js | Mnemonic::Cmovs | Mnemonic::Sets => Condition::Sign,
+        Mnemonic::Jns | Mnemonic::Cmovns | Mnemonic::Setns => Condition::NotSign,
+        Mnemonic::Jp | Mnemonic::Cmovp | Mnemonic::Setp => Condition::Parity,
+        Mnemonic::Jnp | Mnemonic::Cmovnp | Mnemonic::Setnp => Condition::NotParity,
+        Mnemonic::Jl | Mnemonic::Cmovl | Mnemonic::Setl => Condition::Less,
+        Mnemonic::Jge | Mnemonic::Cmovge | Mnemonic::Setge => Condition::GreaterEqual,
+        Mnemonic::Jle | Mnemonic::Cmovle | Mnemonic::Setle => Condition::LessEqual,
+        Mnemonic::Jg | Mnemonic::Cmovg | Mnemonic::Setg => Condition::Greater,
+        _ => return None,
+    })
 }
 
 fn operand_width(operand: Operand) -> Option<Width> {

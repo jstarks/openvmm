@@ -6,7 +6,8 @@ use super::shared_model as spec;
 use super::*;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::system;
-use memory_core::cpu_core::system::SystemState;
+use memory_core::cpu_core::system::{SegmentState, SystemState};
+use memory_core::cpu_core::{descriptor, exception};
 use memory_core::shared::PhysicalRam;
 use mmu_core::shared::io::{IoReply, IoRequest, IoRoute, Operand};
 use mmu_core::shared::{self as memory, Reply, Request, RunError};
@@ -39,12 +40,13 @@ pub enum Phase {
     NearCall { target: u64, stack: u64 },
     EntryMemory { address: u64, length: u8, task: entry::MemoryTask },
     Repeat { width: memory_core::cpu_core::operand::Width, length: u8 },
+    RepeatMove { width: memory_core::cpu_core::operand::Width, length: u8 },
     GateLow { event: Event, address: u64 },
     GateHigh { event: Event, low: u64 },
-    Code { event: Event, low: u64, target: u64 },
-    Push { event: Event, low: u64, target: u64, stack: u64, index: u8 },
+    Code { event: Event, low: u64, target: u64, selector: u16 },
+    Push { event: Event, low: u64, target: u64, cs: SegmentState, stack: u64, index: u8 },
     Pop { index: u8, words: ReturnWords },
-    ReturnCode { words: ReturnWords }, ReturnStack { words: ReturnWords },
+    ReturnCode { words: ReturnWords }, ReturnStack { words: ReturnWords, cs: SegmentState },
     Stopped { reason: EventDiagnostic },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +90,7 @@ impl SharedEventMachine {
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             Phase::Ordinary { .. } => self.core@.phase != CpuPhase::Boundary,
             Phase::Stopped { .. } => !mmu_core::shared_model::active(self.core@.mmu.phase),
-            Phase::Repeat { .. } => self.core@.phase == CpuPhase::Boundary
+            Phase::Repeat { .. } | Phase::RepeatMove { .. } => self.core@.phase == CpuPhase::Boundary
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             _ => self.core@.phase == CpuPhase::Boundary,
         }
@@ -108,9 +110,18 @@ impl SharedEventMachine {
         && match self.phase {
             Phase::GateLow { event, .. } | Phase::GateHigh { event, .. }
                 | Phase::Code { event, .. } | Phase::Push { event, .. } =>
-                spec::entry_profile(self.core@.cpu, self.tables, event),
+                spec::entry_profile(self.core@.cpu, self.tables, event, self.system),
             Phase::Pop { .. } | Phase::ReturnCode { .. } | Phase::ReturnStack { .. } =>
-                event_model::tables_supported(self.tables),
+                spec::tables_supported(self.tables, self.system),
+            _ => true,
+        }
+        && match self.phase {
+            Phase::Code { selector, .. } => spec::descriptor_address(self.tables, selector),
+            Phase::Push { cs, .. } => system::model::supported_code(cs),
+            Phase::ReturnCode { words } => spec::return_image(words, self.tables, self.system),
+            Phase::ReturnStack { words, cs } =>
+                spec::return_image(words, self.tables, self.system)
+                && words.ss != 0 && system::model::supported_code(cs),
             _ => true,
         }
     }
@@ -234,9 +245,9 @@ impl SharedEventMachine {
         }
         let count = if has_error_code(event) { 6u64 } else { 5u64 };
         let stack = cpu.gpr[4] / 16 * 16;
-        if !flags_supported(cpu.flags) || !tables_supported(self.tables)
+        if !flags_supported(cpu.flags) || !shared_tables_supported(self.tables, self.system)
             || !canonical(cpu.rip) || !canonical(cpu.gpr[4]) || stack < count * 8
-            || match self.system { Some(system) => system.ss.selector != 16 || system.cs.selector != 8, None => false } {
+        {
             return self.stop(EventDiagnostic::Profile);
         }
         let vector: u8 = match event { Event::PageFault(_) => 14, Event::GeneralProtection => 13,
@@ -257,8 +268,8 @@ impl SharedEventMachine {
         ensures final(self).invariant(), (final(self)@, tick) == spec::iret(old(self)@),
     {
         let cpu = self.core.cpu();
-        if !flags_supported(cpu.flags) || !tables_supported(self.tables) || cpu.gpr[4] > u64::MAX - 40
-            || match self.system { Some(system) => system.ss.selector != 16 || system.cs.selector != 8, None => false } {
+        if !flags_supported(cpu.flags) || !shared_tables_supported(self.tables, self.system)
+            || cpu.gpr[4] > u64::MAX - 40 {
             return self.stop(EventDiagnostic::Profile);
         }
         self.begin_word(cpu.gpr[4], WordAccess::Read, Phase::Pop { index: 0,
@@ -272,6 +283,7 @@ impl SharedEventMachine {
     {
         match self.phase {
             Phase::Repeat {width,length} => self.execute_repeat(width,length),
+            Phase::RepeatMove {width,length} => self.execute_move(width,length),
             Phase::Decode { input } => Tick::Decode(input),
             Phase::Admitted { .. } => self.advance_admitted(),
             Phase::DecodeFetch { input } => match self.core.request() {
@@ -431,7 +443,8 @@ impl SharedEventMachine {
         requires self.invariant(),
             !matches!(self.phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
-                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. } | Phase::Repeat { .. }),
+                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
+                | Phase::Repeat { .. } | Phase::RepeatMove { .. }),
         ensures out == spec::word_location(self@),
     {
         let cpu = self.core.cpu();
@@ -440,8 +453,9 @@ impl SharedEventMachine {
             Phase::GateHigh { event, .. } => (Stage::Idt, self.tables.idt_base
                 + (match event { Event::PageFault(_) => 14u64, Event::GeneralProtection => 13,
                     Event::InvalidOpcode => 6, Event::External(v) => v as u64 }) * 16 + 8),
-            Phase::Code { .. } | Phase::ReturnCode { .. } => (Stage::Code, self.tables.gdt_base + 8),
-            Phase::ReturnStack { .. } => (Stage::Stack, self.tables.gdt_base + 16),
+            Phase::Code { selector, .. } => (Stage::Code, self.tables.gdt_base + selector as u64),
+            Phase::ReturnCode { words } => (Stage::Code, self.tables.gdt_base + words.cs),
+            Phase::ReturnStack { words, .. } => (Stage::Stack, self.tables.gdt_base + words.ss),
             Phase::Push { event, stack, index, .. } =>
                 (Stage::Push, stack - 8 * (index as u64 - if has_error_code(event) { 0 } else { 1 } + 1)),
             Phase::Pop { index, .. } => (Stage::Pop, cpu.gpr[4] + index as u64 * 8),
@@ -455,7 +469,8 @@ impl SharedEventMachine {
         requires old(self).invariant(),
             !matches!(old(self).phase, Phase::Ready | Phase::First | Phase::Second { .. }
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
-                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. } | Phase::Repeat { .. }),
+                | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
+                | Phase::Repeat { .. } | Phase::RepeatMove { .. }),
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::word_value(old(self)@, value),
     {
@@ -477,19 +492,31 @@ impl SharedEventMachine {
                 self.begin_word(address + 8, WordAccess::Read, Phase::GateHigh { event, low: value });
             },
             Phase::GateHigh { event, low } => {
-                if !gate_supported(low, value) { return self.stop(EventDiagnostic::Descriptor(Stage::Idt)); }
-                let target = gate_target(low, value);
-                if !canonical(target) { return self.stop(EventDiagnostic::Descriptor(Stage::Idt)); }
-                self.begin_word(self.tables.gdt_base + 8, WordAccess::Read, Phase::Code { event, low, target });
+                let gate = match exception::gate(low, value) {
+                    Some(gate) => gate,
+                    None => return self.stop(EventDiagnostic::Descriptor(Stage::Idt)),
+                };
+                if self.system.is_none() && gate.selector != 8 {
+                    return self.stop(EventDiagnostic::Descriptor(Stage::Idt));
+                }
+                if !descriptor_address(self.tables, gate.selector) {
+                    return self.stop(EventDiagnostic::Descriptor(Stage::Code));
+                }
+                self.begin_word(self.tables.gdt_base + gate.selector as u64, WordAccess::Read,
+                    Phase::Code { event, low, target: gate.target, selector: gate.selector });
             },
-            Phase::Code { event, low, target } => {
-                if value != 0x00af9b000000ffffu64 { return self.stop(EventDiagnostic::Descriptor(Stage::Code)); }
+            Phase::Code { event, low, target, selector } => {
+                let cs = match descriptor::load_code(value, selector) {
+                    Some(cs) => cs,
+                    None => return self.stop(EventDiagnostic::Descriptor(Stage::Code)),
+                };
                 let index = if has_error_code(event) { 0u8 } else { 1u8 };
                 let stack = cpu.gpr[4] / 16 * 16;
-                let word = frame_word(cpu, event, index);
-                self.begin_word(stack - 8, WordAccess::Write(word), Phase::Push { event, low, target, stack, index });
+                let word = frame_word(cpu, self.system, event, index);
+                self.begin_word(stack - 8, WordAccess::Write(word),
+                    Phase::Push { event, low, target, cs, stack, index });
             },
-            Phase::Push { event, low, target, stack, index } => {
+            Phase::Push { event, low, target, cs, stack, index } => {
                 if index == 5 {
                     let count = if has_error_code(event) { 6u64 } else { 5u64 };
                     let ghost before = cpu@;
@@ -497,6 +524,10 @@ impl SharedEventMachine {
                     assert(cpu@.gpr =~= before.gpr.update(4, stack as int - count as int * 8));
                     cpu.flags = live_flags(cpu.flags, low); cpu.rip = target;
                     let _accepted = self.core.boundary_commit(cpu, true); assert(_accepted);
+                    if let Some(system) = self.system {
+                        proof { system::lemma_replace_code(system, cs); }
+                        self.system = Some(SystemState { cs, ..system });
+                    }
                     self.phase = Phase::Ready; self.handler_pending = true; self.shadow = false; self.halted = false;
                     if matches!(event, Event::External(_)) { self.pending = None; }
                     return Tick::Delivered(match event { Event::PageFault(_) => 14,
@@ -505,8 +536,8 @@ impl SharedEventMachine {
                 let next = index + 1;
                 let start = if has_error_code(event) { 0u64 } else { 1u64 };
                 let address = stack - 8 * (next as u64 - start + 1);
-                self.begin_word(address, WordAccess::Write(frame_word(cpu, event, next)),
-                    Phase::Push { event, low, target, stack, index: next });
+                self.begin_word(address, WordAccess::Write(frame_word(cpu, self.system, event, next)),
+                    Phase::Push { event, low, target, cs, stack, index: next });
             },
             Phase::Pop { index, mut words } => {
                 match index { 0 => words.ip = value, 1 => words.cs = value, 2 => words.flags = value,
@@ -515,43 +546,94 @@ impl SharedEventMachine {
                     self.begin_word(cpu.gpr[4] + (index as u64 + 1) * 8, WordAccess::Read,
                         Phase::Pop { index: index + 1, words });
                 } else {
-                    if words.cs != 8 || words.ss != 16 || !flags_supported(words.flags)
-                        || !canonical(words.ip) || !canonical(words.rsp) { return self.stop(EventDiagnostic::ReturnImage); }
-                    self.begin_word(self.tables.gdt_base + 8, WordAccess::Read, Phase::ReturnCode { words });
+                    if !return_image(words, self.tables, self.system) {
+                        return self.stop(EventDiagnostic::ReturnImage);
+                    }
+                    self.begin_word(self.tables.gdt_base + words.cs, WordAccess::Read, Phase::ReturnCode { words });
                 }
             },
             Phase::ReturnCode { words } => {
-                if value != 0x00af9b000000ffffu64 { return self.stop(EventDiagnostic::Descriptor(Stage::Code)); }
-                self.begin_word(self.tables.gdt_base + 16, WordAccess::Read, Phase::ReturnStack { words });
+                let cs = match descriptor::load_code(value, words.cs as u16) {
+                    Some(cs) => cs,
+                    None => return self.stop(EventDiagnostic::Descriptor(Stage::Code)),
+                };
+                if words.ss == 0 {
+                    let ss = exception::stack(0, 0).unwrap();
+                    return self.commit_return(words, cs, ss);
+                }
+                self.begin_word(self.tables.gdt_base + words.ss, WordAccess::Read,
+                    Phase::ReturnStack { words, cs });
             },
-            Phase::ReturnStack { words } => {
-                if value != 0x00cf93000000ffffu64 { return self.stop(EventDiagnostic::Descriptor(Stage::Stack)); }
-                let ghost before = cpu@;
-                cpu.gpr[4] = words.rsp;
-                assert(cpu@.gpr =~= before.gpr.update(4, words.rsp as int));
-                cpu.flags = words.flags; cpu.rip = words.ip;
-                let _accepted = self.core.boundary_commit(cpu, true); assert(_accepted);
-                self.phase = Phase::Ready; self.handler_pending = false; self.shadow = false;
-                return Tick::Retired(true);
+            Phase::ReturnStack { words, cs } => {
+                let ss = match exception::stack(value, words.ss as u16) {
+                    Some(ss) => ss,
+                    None => return self.stop(EventDiagnostic::Descriptor(Stage::Stack)),
+                };
+                return self.commit_return(words, cs, ss);
             },
             _ => { assert(false); },
         }
         Tick::Pending
     }
+
+    fn commit_return(&mut self, words: ReturnWords, cs: SegmentState, ss: SegmentState) -> (tick: Tick)
+        requires old(self).core.invariant(), old(self).system_supported(),
+            old(self).core@.phase == CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+            system::model::supported_code(cs), system::model::supported_data_or_null(ss),
+        ensures final(self).invariant(),
+            (final(self)@, tick) == spec::commit_return(old(self)@, words, cs, ss),
+    {
+        let mut cpu = self.core.cpu();
+        let ghost before = cpu@;
+        cpu.gpr[4] = words.rsp;
+        assert(cpu@.gpr =~= before.gpr.update(4, words.rsp as int));
+        cpu.flags = words.flags; cpu.rip = words.ip;
+        let _accepted = self.core.boundary_commit(cpu, true); assert(_accepted);
+        if let Some(system) = self.system {
+            proof {
+                system::lemma_replace_code(system, cs);
+                system::lemma_replace_data(SystemState { cs, ..system }, ss, system.ds, system.es);
+            }
+            self.system = Some(SystemState { cs, ss, ..system });
+        }
+        self.phase = Phase::Ready; self.handler_pending = false; self.shadow = false;
+        Tick::Retired(true)
+    }
 }
 
-fn frame_word(cpu: State, event: Event, index: u8) -> (value: u64)
-    requires index < 6,
-    ensures value == spec::frame_word(cpu@, event, index),
+fn shared_tables_supported(t: Tables, system: Option<SystemState>) -> (out: bool)
+    ensures out == spec::tables_supported(t, system),
 {
-    if matches!(event, Event::External(_)) {
-        match index { 0 => 0, 1 => 16, 2 => cpu.gpr[4], 3 => cpu.flags, 4 => 8, _ => cpu.rip }
-    } else if matches!(event, Event::InvalidOpcode) {
-        match index { 0 => 0, 1 => 16, 2 => cpu.gpr[4], 3 => cpu.flags | 0x10000u64, 4 => 8, _ => cpu.rip }
-    } else {
-        match index { 0 => 16, 1 => cpu.gpr[4], 2 => cpu.flags | 0x10000u64, 3 => 8, 4 => cpu.rip,
-            _ => match event { Event::PageFault(code) => code as u64, _ => 0 } }
-    }
+    if system.is_none() { tables_supported(t) }
+    else { t.idt_base % 16 == 0 && t.gdt_base % 8 == 0 }
+}
+
+fn descriptor_address(t: Tables, selector: u16) -> (out: bool)
+    ensures out == spec::descriptor_address(t, selector),
+{
+    selector != 0 && selector & 7 == 0
+        && selector as u64 + 7 <= t.gdt_limit as u64
+        && t.gdt_base <= u64::MAX - selector as u64 - 7
+}
+
+fn return_image(w: ReturnWords, t: Tables, system: Option<SystemState>) -> (out: bool)
+    ensures out == spec::return_image(w, t, system),
+{
+    (system.is_some() || (w.cs == 8 && w.ss == 16))
+        && w.cs <= u16::MAX as u64 && w.ss <= u16::MAX as u64
+        && descriptor_address(t, w.cs as u16)
+        && (w.ss == 0 || descriptor_address(t, w.ss as u16))
+        && flags_supported(w.flags) && canonical(w.ip) && canonical(w.rsp)
+}
+
+fn frame_word(cpu: State, system: Option<SystemState>, event: Event, index: u8) -> (value: u64)
+    requires index < 6,
+    ensures value == spec::frame_word(cpu@, system, event, index),
+{
+    exception::frame_word(cpu.rip, cpu.gpr[4], cpu.flags, exception::selectors(system),
+        has_error_code(event), matches!(event, Event::External(_)),
+        match event { Event::PageFault(code) => code, _ => 0 }, index)
 }
 }
 

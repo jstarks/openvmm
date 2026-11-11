@@ -6,7 +6,7 @@ use super::*;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::operand;
 use memory_core::cpu_core::operand::Width;
-use memory_core::cpu_core::privilege;
+use memory_core::cpu_core::{privilege, profile};
 
 verus! {
 impl SharedEventMachine {
@@ -34,6 +34,7 @@ impl SharedEventMachine {
                 let cr4_extra=match self.system {Some(s)=>s.cr4_extra,None=>0};
                 let value=match number {
                     0=>privilege::read_cr0(cr0_extra,self.core.config().wp),
+                    2=>self.core.cr2(),
                     3=>self.core.config().root,4=>privilege::read_cr4(cr4_extra),
                     _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
                 };
@@ -92,10 +93,11 @@ impl SharedEventMachine {
                 let Some(system)=self.system else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
-                if cpu.gpr[1]&0xffff_ffff!=0xc000_0080 {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                }
-                let value=privilege::read_efer(system.efer_sce,self.core.config().nxe);
+                let value=match cpu.gpr[1]&0xffff_ffff {
+                    0xc000_0080=>privilege::read_efer(system.efer_sce,self.core.config().nxe),
+                    0x8b=>profile::MICROCODE_REVISION as u64,
+                    _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                };
                 let ghost before=cpu@;
                 cpu.gpr[0]=value&0xffff_ffff;cpu.gpr[2]=value>>32;
                 assert(cpu@.gpr =~= before.gpr.update(0,(value&0xffff_ffffu64) as int)

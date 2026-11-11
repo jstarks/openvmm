@@ -8,6 +8,78 @@ use memory_core::cpu_core::operand::Width;
 verus! {
 
 impl SharedEventMachine {
+    pub(super) fn execute_move(&mut self, width: Width, length: u8) -> (tick: Tick)
+        requires
+            old(self).invariant(), old(self).core@.phase == CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures
+            final(self).invariant(),
+            (final(self)@, tick) == spec::repeat::execute_move(old(self)@, width, length),
+    {
+        let cpu = self.core.cpu();
+        if length == 0 || length > 15 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags & 0x100 != 0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        if !flags_supported(cpu.flags) || cpu.flags & 0x200 != 0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.gpr[1] == 0 {
+            return self.retire_entry(cpu, length, false, false);
+        }
+        self.entry_memory(cpu.gpr[6], width, WordAccess::Read, length,
+            MemoryTask::RepeatRead { width })
+    }
+
+    pub(super) fn finish_move_read(&mut self, width: Width, value: u64, length: u8) -> (tick: Tick)
+        requires
+            old(self).invariant(), old(self).core@.phase == CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures
+            final(self).invariant(),
+            (final(self)@, tick) == spec::repeat::move_read(old(self)@, width, value, length),
+    {
+        let cpu = self.core.cpu();
+        self.entry_memory(cpu.gpr[7], width, WordAccess::Write(value), length,
+            MemoryTask::RepeatWrite { width })
+    }
+
+    pub(super) fn finish_move(&mut self, width: Width, length: u8) -> (tick: Tick)
+        requires
+            old(self).invariant(), old(self).core@.phase == CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures
+            final(self).invariant(),
+            (final(self)@, tick) == spec::repeat::move_value(old(self)@, width, length),
+    {
+        let mut cpu = self.core.cpu();
+        if cpu.gpr[1] == 0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let ghost before = cpu@;
+        let bytes = (width.bits() / 8) as u64;
+        cpu.gpr[1] = cpu.gpr[1] - 1;
+        if cpu.flags & 0x400 == 0 {
+            cpu.gpr[6] = cpu.gpr[6].wrapping_add(bytes);
+            cpu.gpr[7] = cpu.gpr[7].wrapping_add(bytes);
+        } else {
+            cpu.gpr[6] = cpu.gpr[6].wrapping_sub(bytes);
+            cpu.gpr[7] = cpu.gpr[7].wrapping_sub(bytes);
+        }
+        assert(cpu@.gpr =~= spec::repeat::move_progress(before, width).gpr);
+        assert(cpu@ == spec::repeat::move_progress(before, width));
+        if cpu.gpr[1] == 0 {
+            self.retire_entry(cpu, length, false, false)
+        } else {
+            let _accepted = self.core.boundary_commit(cpu, false);
+            assert(_accepted);
+            self.phase = Phase::RepeatMove { width, length };
+            Tick::Pending
+        }
+    }
+
     pub(super) fn execute_repeat(&mut self, width: Width, length: u8) -> (tick: Tick)
         requires
             old(self).invariant(), old(self).core@.phase == CpuPhase::Boundary,

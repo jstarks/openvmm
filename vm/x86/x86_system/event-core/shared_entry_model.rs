@@ -61,6 +61,17 @@ pub open spec fn supported_access(address:u64,width:Width)->bool {
         && mmu_model::canonical(address as int) && mmu_model::canonical(address as int+size-1)
         && (size==8 || address%8+size<=8)
 }
+pub open spec fn conditional_value(s:State,condition:control::Condition,
+    dst:operand::Register,value:u64,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if !dst.valid() || dst@.width==Width::Byte {unsupported(s)}
+    else {
+        let selected=if control::model::condition(condition,cpu.flags) {value}
+            else {operand::model::read(registers(cpu),dst)};
+        retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,selected)
+            .map(|i:int,v:u64|v as int),..cpu},length,false,false)
+    }
+}
 #[verifier::opaque]
 pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (State, Tick) {
     let cpu = s.core.cpu;
@@ -69,6 +80,39 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
         Instruction::Nop=>retire(s,cpu,length,false,false),
+        Instruction::Direction {set}=>retire(s,model::State {
+            flags:if set {cpu.flags|0x400u64} else {cpu.flags&!0x400u64},..cpu},length,false,false),
+        Instruction::ConditionalMove {condition,dst,source}=>{
+            if !dst.valid() || dst@.width==Width::Byte {unsupported(s)}
+            else {match source {
+                Operand::Register(src)=>{
+                    if !src.valid() || src@.width!=dst@.width {unsupported(s)}
+                    else {conditional_value(s,condition,dst,operand::model::read(registers(cpu),src),length)}
+                },
+                Operand::Memory {address,width}=>{
+                    if !address.valid() || width!=dst@.width {unsupported(s)}
+                    else {memory(s,linear(s,address,length),width,WordAccess::Read,length,
+                        MemoryTask::ConditionalMove {condition,dst})}
+                },
+                _=>unsupported(s),
+            }}
+        },
+        Instruction::SetCondition {condition,destination}=>{
+            let value=if control::model::condition(condition,cpu.flags) {1u64} else {0u64};
+            match destination {
+                Operand::Register(dst)=>{
+                    if !dst.valid() || dst@.width!=Width::Byte {unsupported(s)}
+                    else {retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,value)
+                        .map(|i:int,v:u64|v as int),..cpu},length,false,false)}
+                },
+                Operand::Memory {address,width}=>{
+                    if !address.valid() || width!=Width::Byte {unsupported(s)}
+                    else {memory(s,linear(s,address,length),width,WordAccess::Write(value),
+                        length,MemoryTask::Store)}
+                },
+                _=>unsupported(s),
+            }
+        },
         Instruction::Cpuid => {
             let values = profile::target(((cpu.gpr[0] as u64) & 0xffff_ffffu64) as u32,
                 ((cpu.gpr[1] as u64) & 0xffff_ffffu64) as u32);
@@ -115,6 +159,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::Alu {operation,destination,source}=>alu::execute(s,operation,destination,source,length),
         Instruction::Multiply {dst,source,immediate}=>alu::multiply(s,dst,source,immediate,length),
         Instruction::RepeatStore {width}=>repeat::execute(s,width,length),
+        Instruction::RepeatMove {width}=>repeat::execute_move(s,width,length),
         Instruction::SignExtend {dst,source,width}=>{
             if !dst.valid() || operand::model::bits(dst@.width)<=operand::model::bits(width) {unsupported(s)}
             else {match source {
@@ -234,6 +279,9 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     let cpu = s.core.cpu;
     match task {
         MemoryTask::RepeatStore {width}=>repeat::value(s,width,length),
+        MemoryTask::RepeatRead {width}=>repeat::move_read(s,width,value,length),
+        MemoryTask::RepeatWrite {width}=>repeat::move_value(s,width,length),
+        MemoryTask::ConditionalMove {condition,dst}=>conditional_value(s,condition,dst,value,length),
         MemoryTask::CallTarget=>alu::call(s,value,length),
         MemoryTask::Multiply {dst,immediate}=>alu::multiply_value(s,dst,value,immediate,length),
         MemoryTask::AluRegister {operation,dst}=>{

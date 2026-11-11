@@ -135,7 +135,6 @@ impl SharedMachine {
 
     pub(crate) fn boundary_sized(&mut self, address: u64, word: WordAccess, size: u8) -> (accepted: bool)
         requires old(self).invariant(), size == 1 || size == 2 || size == 4,
-            address % 8 + size as u64 <= 8,
         ensures final(self).invariant(), (final(self)@, accepted) ==
             spec::boundary_sized(old(self)@, address, word, size),
     {

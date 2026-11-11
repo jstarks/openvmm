@@ -58,7 +58,7 @@ pub open spec fn valid_data(d: WordData) -> bool {
 }
 pub open spec fn valid_span(d: WordData, size: u8) -> bool {
     if size == 8 { valid_data(d) }
-    else { d.address < 0x1_0000_0000_0000u64 && d.address % 8 + size as int <= 8 }
+    else { d.address < 0x1_0000_0000_0000u64 && d.address % 4096 + size as int <= 4096 }
 }
 pub open spec fn terminal(s: State, result: MmuResult, reads: u8) -> Phase {
     if s.word is Some {
@@ -106,7 +106,6 @@ pub open spec fn modify_size(width: Width) -> u8 {
 }
 pub open spec fn modify_admitted(va: u64, operation: integer::Operation, width: Width) -> bool {
     operation != integer::Operation::Cmp && operation != integer::Operation::Test && operation != integer::Operation::BitTest
-        && (width == Width::Qword || va % 8 + modify_size(width) as int <= 8)
 }
 pub open spec fn modify_begin(s: State, va: u64, operation: integer::Operation,
     source: u64, flags: u64, width: Width) -> State {
@@ -226,8 +225,8 @@ pub open spec fn request(s: State) -> Request {
         Phase::WordDirty { pte, .. } | Phase::IoDirty { pte, .. } => Request::Compare { address: pte.address,
             expected: pte.word, replacement: m::dirty(pte.word as int) as u64 },
         Phase::WordStore { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
-        Phase::WordHead { data, .. } => head_request(data),
-        Phase::WordLast { data, .. } => last_request(data),
+        Phase::WordHead { data, .. } => head_request(data, s.size),
+        Phase::WordLast { data, .. } => last_request(data, s.size),
         Phase::SizedStore { data, .. } => sized_request(data, s.size),
         Phase::AtomicStore { data, .. } => atomic_request(data, s.size, s.comparison.unwrap()),
         Phase::IoReady { address, access, .. } =>
@@ -301,7 +300,7 @@ pub open spec fn exchanged(s: State) -> State {
                 table_reads: reads, virtual_address: s.va }), ..s },
         Phase::WordDirty { data, reads, .. } => State { phase: if s.comparison is Some {
             Phase::AtomicStore { data, reads }
-        } else if s.size < 8 {
+        } else if s.size < 8 && data.address % 8 + s.size as int <= 8 {
             Phase::SizedStore { data, reads }
         } else if data.address % 8 == 0 {
             Phase::WordStore { data, reads }
@@ -341,8 +340,7 @@ pub open spec fn joined(first: u64, tail: u64, offset: u64) -> u64 {
     }
 }
 pub open spec fn observed(s: State, first: u64, tail: u64) -> u64 {
-    if s.size == 8 { joined(first, tail, s.va % 8) }
-    else { (first >> ((s.va % 8 * 8) as u32)) & size_mask(s.size) }
+    joined(first, tail, s.va % 8) & size_mask(s.size)
 }
 pub open spec fn captured_modifier(modifier: Option<Modifier>, original: u64) -> Option<Modifier> {
     match modifier { Some(m) => Some(Modifier { original, ..m }), None => None }
@@ -354,15 +352,15 @@ pub open spec fn modified_value(modifier: Option<Modifier>, original: u64, value
         None => value,
     }
 }
-pub open spec fn head_request(data: WordData) -> Request {
+pub open spec fn head_request(data: WordData, size: u8) -> Request {
     let shift = (data.address % 8 * 8) as u32;
-    let mask = u64::MAX << shift;
+    let mask = size_mask(size) << shift;
     Request::DataCompare { address: (data.address / 8 * 8) as u64, expected: data.first,
         replacement: (data.first & !mask) | ((data.value << shift) & mask) }
 }
-pub open spec fn last_request(data: WordData) -> Request {
+pub open spec fn last_request(data: WordData, size: u8) -> Request {
     let shift = (64 - data.address % 8 * 8) as u32;
-    let mask = u64::MAX >> shift;
+    let mask = size_mask(size) >> shift;
     Request::DataCompare { address: (data.address / 8 * 8 + 8) as u64, expected: data.tail,
         replacement: (data.tail & !mask) | ((data.value >> shift) & mask) }
 }
@@ -395,7 +393,7 @@ pub open spec fn word_loaded(s: State, frame: u64, permissions: Permissions,
 pub open spec fn word_data(s: State, word: u64) -> State {
     match s.phase {
         Phase::Data { frame, permissions, leaf, reads, large } => {
-            if s.va % 8 == 0 || s.size < 8 { word_loaded(s, frame, permissions, leaf, word, 0, reads) }
+            if s.va % 8 + s.size as int <= 8 { word_loaded(s, frame, permissions, leaf, word, 0, reads) }
             else { State { phase: Phase::WordTail { frame, permissions, leaf, first: word, reads, large }, ..s } }
         },
         _ => s,

@@ -10,7 +10,7 @@ pub use x86_system::memory_core::cpu_core::operand::*;
 use iced_x86::Register as IcedRegister;
 use iced_x86::{Code, Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind};
 use x86_system::memory_core::cpu_core::control::Condition;
-use x86_system::memory_core::cpu_core::{integer, scalar};
+use x86_system::memory_core::cpu_core::{integer, profile, scalar};
 use x86_system::shared::decode::{DecodeDecision, DecodeInput};
 use x86_system::shared::entry::Instruction as EntryInstruction;
 
@@ -353,6 +353,31 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     if instruction.mnemonic() == Mnemonic::Cmpxchg {
         return admit_compare_exchange(&instruction, encoding, size);
     }
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Tzcnt | Mnemonic::Lzcnt
+    ) {
+        if instruction.has_lock_prefix() || instruction.has_repne_prefix() {
+            return None;
+        }
+        let reverse = matches!(instruction.mnemonic(), Mnemonic::Bsr | Mnemonic::Lzcnt);
+        if (instruction.mnemonic() == Mnemonic::Tzcnt && profile::cpuid(7, 0)[1] & (1 << 3) != 0)
+            || (instruction.mnemonic() == Mnemonic::Lzcnt
+                && profile::cpuid(0x80000001, 0)[2] & (1 << 5) != 0)
+        {
+            return None;
+        }
+        let Operand::Register(dst) = operand(&instruction, 0, Operation::Mov, size)? else {
+            return None;
+        };
+        let source = operand(&instruction, 1, Operation::Mov, size)?;
+        return (dst.width() != Width::Byte && operand_width(source) == Some(dst.width()))
+            .then_some(EntryInstruction::Scan {
+                dst,
+                source,
+                reverse,
+            });
+    }
     if instruction.has_lock_prefix() {
         if has_repeat_prefix(encoding) {
             return None;
@@ -503,6 +528,8 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         | Mnemonic::Shl
         | Mnemonic::Shr
         | Mnemonic::Sar
+        | Mnemonic::Rol
+        | Mnemonic::Ror
         | Mnemonic::Cmp
         | Mnemonic::Xor
         | Mnemonic::Inc
@@ -865,6 +892,8 @@ fn admit_alu(instruction: &Instruction, size: AddressSize) -> Option<EntryInstru
         Mnemonic::Shl => integer::Operation::Shl,
         Mnemonic::Shr => integer::Operation::Shr,
         Mnemonic::Sar => integer::Operation::Sar,
+        Mnemonic::Rol => integer::Operation::Rol,
+        Mnemonic::Ror => integer::Operation::Ror,
         Mnemonic::Cmp => integer::Operation::Cmp,
         Mnemonic::Xor => integer::Operation::Xor,
         Mnemonic::Inc => integer::Operation::Inc,
@@ -904,7 +933,11 @@ fn alu_entry(
     let width = operand_width(destination)?;
     if matches!(
         operation,
-        integer::Operation::Shl | integer::Operation::Shr | integer::Operation::Sar
+        integer::Operation::Shl
+            | integer::Operation::Shr
+            | integer::Operation::Sar
+            | integer::Operation::Rol
+            | integer::Operation::Ror
     ) {
         // Memory shifts need a separate zero-count/fault-ordering contract.
         if !matches!(destination, Operand::Register(_)) {

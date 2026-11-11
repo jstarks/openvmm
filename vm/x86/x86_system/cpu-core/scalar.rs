@@ -19,6 +19,23 @@ pub mod model {
         } else { low }
     }
 
+    pub open spec fn scan_bits(value:u64,bits:u32,reverse:bool)->Option<u64>
+        decreases bits,
+    {
+        if bits==0 || value==0 {None}
+        else if !reverse && value&1u64!=0 {Some(0)}
+        else {match scan_bits(value>>1,(bits-1) as u32,reverse) {
+            Some(index)=>Some((index+1) as u64),
+            None=>if value&1u64!=0 {Some(0)} else {None},
+        }}
+    }
+
+    #[verifier::opaque]
+    pub open spec fn scan(value:u64,width:Width,reverse:bool)->Option<u64> {
+        scan_bits(value & super::super::operand::model::mask(width),
+            super::super::operand::model::bits(width),reverse)
+    }
+
     pub open spec fn sign_high(value: u64, width: Width) -> u64 {
         let mask = super::super::operand::model::mask(width);
         if value & (1u64 << (super::super::operand::model::bits(width) - 1)) != 0 {
@@ -127,6 +144,28 @@ pub fn extend(value: u64, width: Width) -> (out: u64)
     let mask = width.mask();
     let low = value & mask;
     if low & (1u64 << (width.bits() - 1)) != 0 { low | !mask } else { low }
+}
+
+fn scan_bits(value:u64,bits:u32,reverse:bool)->(out:Option<u64>)
+    requires bits<=64,
+    ensures out==model::scan_bits(value,bits,reverse),
+        match out {Some(index)=>index<bits,None=>true},
+    decreases bits,
+{
+    if bits==0 || value==0 {None}
+    else if !reverse && value&1!=0 {Some(0)}
+    else {match scan_bits(value>>1,bits-1,reverse) {
+        Some(index)=>Some(index+1),
+        None=>if value&1!=0 {Some(0)} else {None},
+    }}
+}
+
+pub fn scan(value:u64,width:Width,reverse:bool)->(out:Option<u64>)
+    ensures out==model::scan(value,width,reverse),
+        match out {Some(index)=>index<super::operand::model::bits(width),None=>true},
+{
+    reveal(model::scan);
+    scan_bits(value & width.mask(),width.bits(),reverse)
 }
 
 pub fn sign_high(value: u64, width: Width) -> (out: u64)

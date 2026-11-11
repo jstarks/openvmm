@@ -506,6 +506,59 @@ async fn locked_bit_strings_use_signed_word_addresses_through_the_real_vp(driver
 }
 
 #[async_test]
+async fn narrow_cross_beat_memmove_and_scan_aliases_preserve_real_vp_state_and_neighbors(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    let program = [
+        0x44, 0x8b, 0x54, 0x16, 0xfc, 0x44, 0x89, 0x54, 0x17, 0xfc, 0xf3, 0x49, 0x0f, 0xbc, 0xc2,
+        0x66, 0xc1, 0xc3, 8, 0xf4,
+    ];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    for (offset, value) in (0u8..16).enumerate() {
+        bytes[0x16000 + offset] = value;
+    }
+    bytes[0x16100..0x16110].fill(0xa5);
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.rsi = 0x16002;
+    initial.rdi = 0x16102;
+    initial.rdx = 7;
+    initial.rbx = 0x1122_3344_5566_1234;
+    initial.rflags |= 1;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + 19)).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    assert_eq!(devices.faults.lock().len(), 1);
+    assert!(devices.faults.lock()[0].contains("checkpoint"));
+    let mut expected = initial;
+    expected.rip = CODE + 19;
+    expected.rax = 0;
+    expected.rbx = 0x1122_3344_5566_3412;
+    expected.r10 = 0x0807_0605;
+    expected.rflags &= !0x10041;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    let mut actual = [0; 16];
+    memory.read_at(0x16100, &mut actual).unwrap();
+    let mut expected = [0xa5; 16];
+    expected[5..9].copy_from_slice(&[5, 6, 7, 8]);
+    assert_eq!(actual, expected);
+    let progress = vp.completed_batch_progress();
+    assert_eq!((progress.retired, progress.delivered), (4, 0));
+}
+
+#[async_test]
 async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: DefaultDriver) {
     for iret in [false, true] {
         let (mut bytes, owned) = fixture();

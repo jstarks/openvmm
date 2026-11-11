@@ -61,7 +61,6 @@ pub open spec fn supported_access(address:u64,width:Width)->bool {
     let size=operand::model::bits(width)/8;
     address as int+size-1<=u64::MAX && address%4096+size<=4096
         && mmu_model::canonical(address as int) && mmu_model::canonical(address as int+size-1)
-        && (size==8 || address%8+size<=8)
 }
 pub open spec fn conditional_value(s:State,condition:control::Condition,
     dst:operand::Register,value:u64,length:u8)->(State,Tick) {
@@ -130,6 +129,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     } else { match instruction {
         Instruction::CompareExchange {destination,source}=>compare_exchange(s,destination,source,length),
         Instruction::LockedAlu {operation,destination,source}=>locked_alu(s,operation,destination,source,length),
+        Instruction::Scan {dst,source,reverse}=>alu::scan(s,dst,source,reverse,length),
         Instruction::Nop=>retire(s,cpu,length,false,false),
         Instruction::Direction {set}=>retire(s,model::State {
             flags:if set {cpu.flags|0x400u64} else {cpu.flags&!0x400u64},..cpu},length,false,false),
@@ -329,6 +329,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::Scan {dst,reverse}=>alu::scan_value(s,dst,value,reverse,length),
         MemoryTask::LockedAlu {operation,source,width}=>{
             let result=integer::model::evaluate(operation,value,source,width,cpu.flags);
             retire(s,model::State {flags:result.flags,..cpu},length,false,true)

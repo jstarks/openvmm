@@ -21,6 +21,7 @@ pub enum Instruction {
     SignHigh { width: Width },
     Divide { source: Operand, width: Width, signed: bool },
     Bit { operation: operations::BitOperation, dst: Register, index: Operand },
+    Scan { dst:Register,source:Operand,reverse:bool },
     ReadControl { number: u8, dst: Register },
     WriteControl { number: u8, source: Operand },
     IndirectJump { source: Operand },
@@ -79,6 +80,7 @@ pub enum MemoryTask {
     ConditionalMove { condition: control::Condition, dst: Register },
     CompareExchange { width: Width },
     LockedAlu {operation:integer::Operation,source:u64,width:Width},
+    Scan {dst:Register,reverse:bool},
 }
 
 pub(super) fn scalar(cpu: State, source: Operand) -> (out: Option<u64>)
@@ -97,7 +99,6 @@ pub(super) fn supported_access(address:u64,width:Width)->(out:bool)
     let size=(width.bits()/8) as u8;
     address <= u64::MAX-(size as u64-1) && address%4096+size as u64<=4096
         && canonical(address) && canonical(address+(size as u64-1))
-        && (size==8 || address%8+size as u64<=8)
 }
 
 impl SharedEventMachine {
@@ -172,7 +173,8 @@ impl SharedEventMachine {
                 self.execute_control(instruction,length)
             },
             Instruction::SignExtend {..} | Instruction::SignHigh {..} | Instruction::Divide {..}
-                | Instruction::Bit {..} | Instruction::IndirectJump {..} | Instruction::IndirectCall {..}
+                | Instruction::Bit {..} | Instruction::Scan {..}
+                | Instruction::IndirectJump {..} | Instruction::IndirectCall {..}
                 => self.execute_scalar(instruction,length),
             Instruction::ConditionalMove {..} | Instruction::SetCondition {..} | Instruction::Direction {..}
                 => self.execute_conditions(instruction,length),
@@ -482,6 +484,7 @@ impl SharedEventMachine {
             }
     }
 
+    #[verifier::spinoff_prover]
     pub(super) fn execute_locked_alu(&mut self,operation:integer::Operation,destination:Operand,
         source:Operand,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
@@ -551,6 +554,7 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::Scan {dst,reverse}=>return self.finish_scan(dst,value,reverse,length),
             MemoryTask::LockedAlu {operation,source,width}=>{
                 let result=integer::evaluate(operation,value,source,width,cpu.flags);
                 cpu.flags=result.flags;

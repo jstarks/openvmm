@@ -21,7 +21,7 @@ verus! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
 pub enum Operation {
     Add, Sub, Cmp, And, Or, Xor, Test, Shl, Shr, Adc, Sbb, Inc, Dec, Neg, Not, Sar,
-    Imul, BitTest, BitSet, BitReset, BitComplement,
+    Imul, BitTest, BitSet, BitReset, BitComplement, Rol, Ror,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +89,24 @@ pub open spec fn count(right: u64, width: Width) -> u32 {
     (right & (if width == Width::Qword { 63u64 } else { 31u64 })) as u32
 }
 
+pub open spec fn rotate_result(left:u64,right:u64,width:Width,flags:u64,reverse:bool)->Outcome {
+    let n=super::operand::model::bits(width);
+    let mask=super::operand::model::mask(width);
+    let a=left & mask;
+    let c=count(right,width);
+    let r=c%n;
+    let value=if r==0 {a} else if reverse {((a>>r)|(a<<(n-r))) & mask}
+        else {((a<<r)|(a>>(n-r))) & mask};
+    let cf=if reverse {value>>(n-1)!=0} else {value&1u64!=0};
+    let of=if reverse {((value>>(n-1))^(value>>(n-2)))&1u64!=0}
+        else {(value>>(n-1)!=0)!=cf};
+    let next=if c==0 {flags} else {
+        let carry=(flags & !1u64) | if cf {1u64} else {0u64};
+        if c==1 {(carry & !0x800u64) | if of {0x800u64} else {0u64}} else {carry}
+    };
+    Outcome {value,flags:next,write:true}
+}
+
 pub open spec fn core(operation: Operation, a: u64, b: u64, width: Width)
     -> (u64, bool, bool, bool)
 {
@@ -102,6 +120,10 @@ pub open spec fn core_with_carry(operation: Operation, a: u64, b: u64,
     let mask = super::operand::model::mask(width);
     let c = count(b, width);
     match operation {
+        Operation::Rol | Operation::Ror => {
+            let out=rotate_result(a,b,width,0,operation==Operation::Ror);
+            (out.value,out.flags&1u64!=0,false,out.flags&0x800u64!=0)
+        },
         Operation::Add | Operation::Adc | Operation::Sub | Operation::Sbb
             | Operation::Cmp | Operation::Inc | Operation::Dec | Operation::Neg => {
             let sub = operation == Operation::Sub || operation == Operation::Sbb
@@ -169,7 +191,10 @@ pub open spec fn transition(operation: Operation, left: u64, right: u64,
     let mask = super::operand::model::mask(width);
     let a = left & mask;
     let b = right & mask;
-    if operation == Operation::BitTest || operation == Operation::BitSet
+    if operation==Operation::Rol || operation==Operation::Ror {
+        let out=rotate_result(left,right,width,flags,operation==Operation::Ror);
+        (out.value,out.flags,true)
+    } else if operation == Operation::BitTest || operation == Operation::BitSet
         || operation == Operation::BitReset || operation == Operation::BitComplement {
         let out = scalar::model::bit(bit_operation(operation), left, right, width, flags);
         (out.value, out.flags, out.write)
@@ -441,6 +466,31 @@ pub proof fn logical_family(operation: Operation, left: u64, right: u64,
 /// indexes wrap within width, only CF changes, and BT does not write.
 /// Inputs are already semantically extended by the decoder; this function
 /// neither extends immediates nor commits register aliases or memory.
+pub fn rotate_value(left:u64,right:u64,width:Width,flags:u64,reverse:bool)->(out:Outcome)
+    ensures out==rotate_result(left,right,width,flags,reverse),
+        out.flags & !0x801u64 == flags & !0x801u64,
+{
+    let n=width.bits();
+    let a=left & width.mask();
+    let c=(right & if width==Width::Qword {63u64} else {31u64}) as u32;
+    let r=c%n;
+    let value=if r==0 {a} else if reverse {((a>>r)|(a<<(n-r))) & width.mask()}
+        else {((a<<r)|(a>>(n-r))) & width.mask()};
+    let cf=if reverse {value>>(n-1)!=0} else {value&1!=0};
+    let of=if reverse {((value>>(n-1))^(value>>(n-2)))&1!=0}
+        else {(value>>(n-1)!=0)!=cf};
+    let next=if c==0 {flags} else {
+        let carry=(flags & !1u64) | if cf {1u64} else {0u64};
+        if c==1 {(carry & !0x800u64) | if of {0x800u64} else {0u64}} else {carry}
+    };
+    assert(next & !0x801u64 == flags & !0x801u64) by(bit_vector)
+        requires next==if c==0 {flags} else {
+            let carry=(flags & !1u64) | if cf {1u64} else {0u64};
+            if c==1 {(carry & !0x800u64) | if of {0x800u64} else {0u64}} else {carry}
+        };
+    Outcome {value,flags:next,write:true}
+}
+
 #[verifier::rlimit(30)]
 pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags: u64)
     -> (out: Outcome)
@@ -450,6 +500,13 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
         out.write == (operation != Operation::Test && operation != Operation::Cmp
             && operation != Operation::BitTest),
 {
+    if operation==Operation::Rol || operation==Operation::Ror {
+        let out=rotate_value(left,right,width,flags,operation==Operation::Ror);
+        let ghost next=out.flags;
+        assert(next & !0x8d5u64 == flags & !0x8d5u64) by(bit_vector)
+            requires next & !0x801u64 == flags & !0x801u64;
+        return out;
+    }
     let mask = width.mask();
     let n = width.bits();
     let a = left & mask;
@@ -534,7 +591,7 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
             arithmetic_value(sub, x, y, carry, m)
         },
         Operation::Not => { return Outcome { value: (!a) & mask, flags, write: true }; },
-        Operation::Imul | Operation::BitTest | Operation::BitSet
+        Operation::Rol | Operation::Ror | Operation::Imul | Operation::BitTest | Operation::BitSet
             | Operation::BitReset | Operation::BitComplement => {
             assert(false);
             panic!("operation returned before the arithmetic dispatch");

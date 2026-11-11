@@ -29,6 +29,55 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
     }
 }
 
+#[test]
+fn rotations_admit_register_widths_and_keep_memory_forms_unsupported() {
+    use x86_system::memory_core::cpu_core::integer::Operation as Integer;
+    for (bytes, operation) in [
+        (&[0x66, 0xc1, 0xc0, 8][..], Integer::Rol),
+        (&[0x48, 0xd3, 0xc8][..], Integer::Ror),
+        (&[0xc0, 0xc4, 1][..], Integer::Rol),
+        (&[0x41, 0xc1, 0xc8, 31][..], Integer::Ror),
+    ] {
+        assert_eq!(alu(bytes).0, operation);
+    }
+    assert_eq!(
+        admission(&[0x66, 0xc1, 0x00, 8]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+}
+
+#[test]
+fn scans_and_disabled_count_features_share_bsf_bsr_semantics() {
+    use x86_system::shared::entry::Instruction;
+    for (prefix, width) in [
+        (&[0x66][..], Width::Word),
+        (&[][..], Width::Dword),
+        (&[0x48][..], Width::Qword),
+    ] {
+        for (opcode, reverse) in [(0xbc, false), (0xbd, true)] {
+            for repeat in [&[][..], &[0xf3][..]] {
+                let bytes = [repeat, prefix, &[0x0f, opcode, 0xc1]].concat();
+                assert_eq!(
+                    entry(&bytes),
+                    Instruction::Scan {
+                        dst: reg(0, width, false),
+                        source: Operand::Register(reg(1, width, false)),
+                        reverse,
+                    }
+                );
+                let bytes = [repeat, prefix, &[0x0f, opcode, 0x41, 5]].concat();
+                assert!(matches!(
+                    entry(&bytes),
+                    Instruction::Scan {
+                        source: Operand::Memory { .. },
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+}
+
 fn reg(index: u8, width: Width, high: bool) -> Register {
     Register::new(Gpr::new(index).unwrap(), width, high).unwrap()
 }

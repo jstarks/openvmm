@@ -15,7 +15,8 @@ fn read_only(operation: integer::Operation) -> (out: bool)
 
 fn shift(operation: integer::Operation) -> (out: bool)
     ensures out == spec::alu::shift(operation),
-{ matches!(operation, integer::Operation::Shl | integer::Operation::Shr | integer::Operation::Sar) }
+{ matches!(operation, integer::Operation::Shl | integer::Operation::Shr | integer::Operation::Sar
+    | integer::Operation::Rol | integer::Operation::Ror) }
 
 pub(super) fn memory_address(operation:integer::Operation,address:Address,
     source:Operand,index:u64,width:Width)->(out:Address)
@@ -58,7 +59,8 @@ impl SharedEventMachine {
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
             instruction is SignExtend || instruction is SignHigh || instruction is Divide
-                || instruction is Bit || instruction is IndirectJump || instruction is IndirectCall,
+                || instruction is Bit || instruction is Scan
+                || instruction is IndirectJump || instruction is IndirectCall,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
     {
@@ -67,6 +69,22 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let next=cpu.rip.wrapping_add(length as u64);
         match instruction {
+            Instruction::Scan {dst,source,reverse}=>{
+                if !dst.is_valid() || dst.width()==Width::Byte {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                if let Operand::Memory {address,width}=source {
+                    if !address.is_valid() || width!=dst.width() {
+                        return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                    }
+                    return self.entry_memory(address.linear(&cpu.gpr,next,self.entry_bases()),
+                        width,WordAccess::Read,length,MemoryTask::Scan {dst,reverse});
+                }
+                let Some(value)=entry::scalar(cpu,source) else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                self.finish_scan(dst,value,reverse,length)
+            },
             Instruction::SignExtend {dst,source,width}=>{
                 if !dst.is_valid() || dst.width().bits()<=width.bits() {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -277,6 +295,29 @@ impl SharedEventMachine {
             },
             _ => self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
         }
+    }
+
+    pub(super) fn finish_scan(&mut self,dst:Register,value:u64,reverse:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==
+            spec::alu::scan_value(old(self)@,dst,value,reverse,length),
+    {
+        if !dst.is_valid() || dst.width()==Width::Byte {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let mut cpu=self.core.cpu();
+        assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
+        let ghost registers=cpu.gpr@;
+        let result=scalar::scan(value,dst.width(),reverse);
+        match result {
+            Some(index)=>{dst.write(&mut cpu.gpr,index);cpu.flags=cpu.flags & !0x40u64;},
+            None=>{cpu.flags=cpu.flags | 0x40u64;},
+        }
+        assert(cpu@.gpr =~= (match result {
+            Some(index)=>operand::model::write(registers,dst,index),None=>registers,
+        }).map(|i:int,v:u64|v as int));
+        self.retire_entry(cpu,length,false,false)
     }
 
     pub(super) fn finish_signed(&mut self, dst: Register, width: Width, value: u64, length: u8) -> (tick: Tick)

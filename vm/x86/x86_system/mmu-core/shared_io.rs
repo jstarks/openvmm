@@ -28,6 +28,7 @@ impl SharedMmu {
         }
     }
 
+    #[verifier::spinoff_prover]
     pub fn route_io(&mut self) -> (out: IoRoute)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, out) == spec::route_io(old(self)@),

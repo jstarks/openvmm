@@ -14,7 +14,7 @@ pub open spec fn read_only(operation:integer::Operation)->bool {
     operation is Cmp || operation is Test || operation is BitTest
 }
 pub open spec fn shift(operation:integer::Operation)->bool {
-    operation is Shl || operation is Shr || operation is Sar
+    operation is Shl || operation is Shr || operation is Sar || operation is Rol || operation is Ror
 }
 #[verifier::opaque]
 pub open spec fn memory_address(operation:integer::Operation,address:operand::Address,
@@ -84,6 +84,30 @@ pub open spec fn signed(s:State,dst:Register,width:Width,value:u64,length:u8)->(
     if !dst.valid() || operand::model::bits(dst@.width)<=operand::model::bits(width) {entry::unsupported(s)}
     else {entry::retire(s,model::State {gpr:operand::model::write(entry::registers(s.core.cpu),dst,
         scalar::model::extend(value,width)).map(|i:int,v:u64|v as int),..s.core.cpu},length,false,false)}
+}
+pub open spec fn scan_value(s:State,dst:Register,value:u64,reverse:bool,length:u8)->(State,Tick) {
+    if !dst.valid() || dst@.width==Width::Byte {entry::unsupported(s)}
+    else {
+        let result=scalar::model::scan(value,dst@.width,reverse);
+        let registers=entry::registers(s.core.cpu);
+        let gpr=match result {Some(index)=>operand::model::write(registers,dst,index),None=>registers};
+        let flags=match result {Some(_)=>s.core.cpu.flags & !0x40u64,None=>s.core.cpu.flags | 0x40u64};
+        entry::retire(s,model::State {gpr:gpr.map(|i:int,v:u64|v as int),flags,..s.core.cpu},
+            length,false,false)
+    }
+}
+pub open spec fn scan(s:State,dst:Register,source:Operand,reverse:bool,length:u8)->(State,Tick) {
+    if !dst.valid() || dst@.width==Width::Byte {entry::unsupported(s)}
+    else {match source {
+        Operand::Memory {address,width}=>{
+            if !address.valid() || width!=dst@.width {entry::unsupported(s)}
+            else {entry::memory(s,entry::linear(s,address,length),width,WordAccess::Read,length,
+                MemoryTask::Scan {dst,reverse})}
+        },
+        _=>match entry::scalar(s.core.cpu,source) {
+            Some(value)=>scan_value(s,dst,value,reverse,length),None=>entry::unsupported(s),
+        },
+    }}
 }
 pub open spec fn division(s:State,divisor:u64,width:Width,signed:bool,length:u8)->(State,Tick) {
     let cpu=s.core.cpu;

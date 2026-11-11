@@ -91,11 +91,11 @@ impl SharedMmu {
     }
 
     /// One WRITE-checked RAM translation, operand capture, and non-locked store.
-    /// Small operands must fit one beat; qwords retain the single-page checks.
+    /// Operands retain the single-page checks and may span two physical beats.
     /// Completion returns the original operand, not the stored result. Flags
     /// remain the caller's responsibility. Leaf replacement recaptures data;
     /// data-beat contention preserves neighbors without recomputing the result.
-    /// Compare/test and crossing small operands are rejected without mutation.
+    /// Compare/test are rejected without mutation.
     pub fn begin_modify(&mut self, va: u64, operation: integer::Operation,
         source: u64, flags: u64, width: Width) -> (accepted: bool)
         requires old(self).invariant(),
@@ -107,8 +107,7 @@ impl SharedMmu {
     {
         let size = match width { Width::Byte => 1u8, Width::Word => 2,
             Width::Dword => 4, Width::Qword => 8 };
-        if matches!(operation, integer::Operation::Cmp | integer::Operation::Test | integer::Operation::BitTest)
-            || (size < 8 && va % 8 + size as u64 > 8) {
+        if matches!(operation, integer::Operation::Cmp | integer::Operation::Test | integer::Operation::BitTest) {
             return false;
         }
         let accepted = self.begin_access(va, Access::Write(0), false, Some(WordAccess::Write(0)), size);
@@ -118,10 +117,9 @@ impl SharedMmu {
         accepted
     }
 
-    /// Small RAM operands fit in one atomic physical beat; crossing forms are not admitted.
+    /// Narrow RAM operands reuse the two-beat qword continuation.
     pub(crate) fn begin_sized(&mut self, va: u64, request: WordAccess, size: u8) -> (accepted: bool)
         requires old(self).invariant(), size == 1 || size == 2 || size == 4,
-            va % 8 + size as u64 <= 8,
         ensures final(self).invariant(), accepted == !spec::active(old(self)@.phase),
             final(self)@ == if accepted { spec::sized(old(self)@, va, request, size) } else { old(self)@ },
     {
@@ -179,12 +177,11 @@ impl SharedMmu {
         ensures value == spec::observed(self@, first, tail),
     {
         let offset = self.va % 8;
-        if self.size < 8 {
-            (first >> ((offset * 8) as u32)) & self.size_mask()
-        } else if offset == 0 { first } else {
+        let value=if offset == 0 { first } else {
             let shift = (offset * 8) as u32;
             (first >> shift) | (tail << (64 - shift))
-        }
+        };
+        value & self.size_mask()
     }
 
     fn modify_value(&mut self, original: u64, value: u64) -> (replacement: u64)
@@ -248,7 +245,7 @@ impl SharedMmu {
     {
         match self.phase {
             Phase::Data { frame, permissions, leaf, reads, large } => {
-                if self.va % 8 == 0 || self.size < 8 {
+                if self.va % 8 + self.size as u64 <= 8 {
                     self.word_loaded(frame, permissions, leaf, word, 0, reads);
                 } else {
                     self.phase = Phase::WordTail { frame, permissions, leaf, first: word, reads, large };
@@ -283,24 +280,24 @@ impl SharedMmu {
 
     pub(super) fn word_head_request(&self, data: WordData) -> (out: Request)
         requires spec::valid_data(data), data.address % 8 != 0,
-        ensures out == spec::head_request(data),
+        ensures out == spec::head_request(data, self.size),
             match out { Request::DataCompare { address, .. } =>
                 address < 0x1_0000_0000_0000u64 && address % 8 == 0, _ => false },
     {
         let shift = (data.address % 8 * 8) as u32;
-        let beat = Beat::masked(data.address / 8 * 8, shift, u64::MAX << shift);
+        let beat = Beat::masked(data.address / 8 * 8, shift, self.size_mask() << shift);
         Request::DataCompare { address: beat.address(), expected: data.first,
             replacement: beat.replace(data.first, data.value) }
     }
 
     pub(super) fn word_last_request(&self, data: WordData) -> (out: Request)
         requires spec::valid_data(data), data.address % 8 != 0,
-        ensures out == spec::last_request(data),
+        ensures out == spec::last_request(data, self.size),
             match out { Request::DataCompare { address, .. } =>
                 address < 0x1_0000_0000_0000u64 && address % 8 == 0, _ => false },
     {
         let shift = (64 - data.address % 8 * 8) as u32;
-        let beat = Beat::masked(data.address / 8 * 8 + 8, 0, u64::MAX >> shift);
+        let beat = Beat::masked(data.address / 8 * 8 + 8, 0, self.size_mask() >> shift);
         let value = data.value >> shift;
         proof { assert(value << 0u32 == value) by(bit_vector); }
         Request::DataCompare { address: beat.address(), expected: data.tail,

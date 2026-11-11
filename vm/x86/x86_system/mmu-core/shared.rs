@@ -113,7 +113,12 @@ impl SharedMmu {
                     AtomicOperation::Integer { operation, .. } =>
                         spec::locked_admitted(self.va, operation, c.width),
                 }
-                && !(self.phase is IoDirty) && !(self.phase is IoReady),
+                && !(self.phase is IoDirty) && !(self.phase is IoReady)
+                && match self.phase {
+                    Phase::WordDirty { data, .. } | Phase::AtomicStore { data, .. } =>
+                        data.address % 8 + self.size as int <= 8,
+                    _ => true,
+                },
             None => true,
         }
     }
@@ -130,8 +135,7 @@ impl SharedMmu {
     }
 
     pub closed spec fn valid_size(&self) -> bool {
-        (self.size == 1 || self.size == 2 || self.size == 4 || self.size == 8)
-        && (self.size < 8 ==> self.va % 8 + self.size as int <= 8)
+        self.size == 1 || self.size == 2 || self.size == 4 || self.size == 8
     }
 
     pub closed spec fn invariant(&self) -> bool {
@@ -168,7 +172,7 @@ impl SharedMmu {
                 && pte.word % 2 == 1 && address < 0x1_0000_0000_0000u64,
             Phase::Store { address, .. } => self.access is Write && address < 0x1_0000_0000_0000u64,
             Phase::WordTail { frame, leaf, .. } => self.word is Some
-                && self.va % 8 != 0 && self.size == 8
+                && self.va % 8 + self.size as int > 8
                 && frame < 0x1_0000_0000_0000u64 && frame % 4096 == 0
                 && (self.access is Write ==> leaf is Some)
                 && match leaf { Some(l) => spec::valid_leaf(l), None => true },
@@ -179,7 +183,8 @@ impl SharedMmu {
             Phase::WordHead { data, .. } | Phase::WordLast { data, .. } => self.word is Some
                 && self.access is Write && spec::valid_data(data) && data.address % 8 != 0,
             Phase::SizedStore { data, .. } => self.word is Some
-                && self.access is Write && spec::valid_span(data, self.size) && self.size < 8,
+                && self.access is Write && spec::valid_span(data, self.size) && self.size < 8
+                && data.address % 8 + self.size as int <= 8,
             Phase::AtomicStore { data, .. } => self.comparison is Some
                 && spec::valid_span(data, self.size),
             Phase::IoDirty { pte, address, value, .. } => spec::valid_leaf(pte)
@@ -225,7 +230,6 @@ impl SharedMmu {
     fn begin_access(&mut self, va: u64, access: Access, user: bool, word: Option<WordAccess>, size: u8) -> (accepted: bool)
         requires old(self).invariant(),
             size == 1 || size == 2 || size == 4 || size == 8,
-            size < 8 ==> va % 8 + size as int <= 8,
             word is Some ==> access == word_model::request(word.unwrap()),
         ensures final(self).invariant(),
             accepted == !spec::active(old(self)@.phase),
@@ -467,7 +471,9 @@ impl SharedMmu {
             },
             Phase::WordDirty { data, reads, .. } => {
                 self.phase = if self.comparison.is_some() { Phase::AtomicStore { data, reads } }
-                    else if self.size < 8 { Phase::SizedStore { data, reads } }
+                    else if self.size < 8 && data.address % 8 + self.size as u64 <= 8 {
+                        Phase::SizedStore { data, reads }
+                    }
                     else if data.address % 8 == 0 { Phase::WordStore { data, reads } }
                     else { Phase::WordHead { data, reads } };
                 true

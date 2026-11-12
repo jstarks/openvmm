@@ -50,7 +50,7 @@ impl SharedMmu {
                     WordAccess::Read => Phase::IoReady { address, access, reads },
                     WordAccess::Write(value) => match leaf {
                         Some(pte) => Phase::IoDirty { pte, address, value, reads },
-                        None => return IoRoute::NotReady,
+                        None => Phase::IoReady { address, access, reads },
                     },
                 };
                 self.sequence = self.sequence + 1;

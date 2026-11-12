@@ -92,6 +92,8 @@ pub enum Reply { Read(u64), Committed, Changed(u64) }
 
 pub struct SharedMmu {
     inner: Mmu,
+    /// Dirty qualification belongs to the existing data translation slot.
+    cache_dirty: bool,
     phase: Phase,
     va: u64,
     access: Access,
@@ -107,7 +109,7 @@ pub struct SharedMmu {
 impl View for SharedMmu {
     type V = spec::State;
     closed spec fn view(&self) -> spec::State {
-        spec::State { inner: self.inner@, phase: self.phase,
+        spec::State { inner: self.inner@, cache_dirty: self.cache_dirty, phase: self.phase,
             va: self.va, access: self.access, user: self.user, word: self.word,
             sequence: self.sequence, size: self.size, modifier: self.modifier,
             comparison: self.comparison, head: self.head }
@@ -157,8 +159,7 @@ impl SharedMmu {
                 && self.word is Some && self.comparison is None
                 && h.address % 4096 == self.va % 4096
                 && self.va % 4096 + self.size as int > 4096
-                && self.va as int + self.size as int - 1 <= u64::MAX
-                && (self.access is Write ==> h.leaf is Some),
+                && self.va as int + self.size as int - 1 <= u64::MAX,
             None => true,
         }
     }
@@ -192,7 +193,7 @@ impl SharedMmu {
                     && address < 0x1_0000_0000_0000u64 && address % 8 == 0 && word % 2 == 1,
             Phase::Data { frame, leaf, .. } =>
                 frame < 0x1_0000_0000_0000u64 && frame % 4096 == 0
-                    && (self.access is Write ==> leaf is Some)
+                    && (self.access is Write && self.head is Some ==> leaf is Some)
                     && match leaf { Some(l) => l.address < 0x1_0000_0000_0000u64
                         && l.address % 8 == 0 && l.word % 2 == 1, None => true },
             Phase::Dirty { pte, address, .. } => self.access is Write
@@ -203,7 +204,6 @@ impl SharedMmu {
                 && self.va % 8 + self.size as int > 8
                 && self.va % 4096 + self.size as int <= 4096
                 && frame < 0x1_0000_0000_0000u64 && frame % 4096 == 0
-                && (self.access is Write ==> leaf is Some)
                 && match leaf { Some(l) => spec::valid_leaf(l), None => true },
             Phase::WordDirty { pte, data, .. } => self.word is Some
                 && self.access is Write && spec::valid_leaf(pte) && spec::valid_span(data, self.size),
@@ -218,6 +218,7 @@ impl SharedMmu {
                 && spec::valid_span(data, self.size),
             Phase::PageDirtyHead { tail, span: data, .. } =>
                 self.access is Write && self.head is Some && spec::valid_leaf(tail)
+                && self.head.unwrap().leaf is Some
                 && spec::valid_page_data(data) && data.word.address == self.head.unwrap().address,
             Phase::PageDirtyTail { pte, span: data, .. } =>
                 self.access is Write && self.head is Some && spec::valid_leaf(pte)
@@ -240,7 +241,7 @@ impl SharedMmu {
                 config, cache: None, fetch_cache:None, cr2: cr2 as int }),
             s@.phase == Phase::Idle, s@.sequence == 0,
     {
-        Self { inner: Mmu::new(config, cr2), phase: Phase::Idle,
+        Self { inner: Mmu::new(config, cr2), cache_dirty: false, phase: Phase::Idle,
             va: 0, access: Access::Read, user: false, word: None,
             sequence: 0, size: 8, modifier: None, comparison: None, head: None }
     }
@@ -315,7 +316,8 @@ impl SharedMmu {
         } else {
             if let Some(m) = if matches!(access,Access::Fetch) {self.inner.fetch_cache} else {self.inner.cache} {
                 if m.page == va / 4096 && m.root == self.inner.config.root
-                    && !matches!(access, Access::Write(_)) && allowed(m.permissions, self.inner.config, access, user) {
+                    && (!matches!(access, Access::Write(_)) || self.cache_dirty)
+                    && allowed(m.permissions, self.inner.config, access, user) {
                     self.phase = Phase::Data { frame: m.frame, permissions: m.permissions,
                         leaf: None, reads: 0, large: m.large };
                     return true;
@@ -508,6 +510,10 @@ impl SharedMmu {
                     self.phase = Phase::Mark { address: table + index(self.walk_va(), level) * 8,
                         word, level, frame: if e.huge { leaf_frame(e.base, self.walk_va(), level) } else { e.base },
                         permissions: next };
+                    if word & 32 != 0 {
+                        let _accepted = self.exchanged();
+                        assert(_accepted);
+                    }
                 }
                 true
             },
@@ -516,12 +522,13 @@ impl SharedMmu {
                     self.word_data_read(word);
                     return true;
                 }
+                self.remember_data();
                 let address = frame + self.va % 4096;
                 match self.access {
                     Access::Write(_) => {
                         match leaf {
                             Some(l) => self.phase = Phase::Dirty { pte: l, address, word, reads },
-                            None => { proof { assert(false); } return false; },
+                            None => self.phase = Phase::Store { address, word, reads },
                         }
                     },
                     _ => {
@@ -567,7 +574,7 @@ impl SharedMmu {
                 true
             },
             Phase::Store { reads, .. } => {
-                self.inner.cache = None;
+                self.cache_dirty = true;
                 self.phase = Phase::Done(Report { result: MmuResult::Success(
                     match self.access { Access::Write(v) => v, _ => 0 }),
                     table_reads: reads, virtual_address: self.va });

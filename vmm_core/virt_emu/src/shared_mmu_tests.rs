@@ -60,7 +60,14 @@ fn compare(mut data: Vec<u8>, c: Config, va: u64, access: Access, user: bool) {
     assert!(shared.begin(va, access, user));
     assert_eq!(finish(&mut shared, &ram), expected);
     assert_eq!(shared.cr2(), owned.cr2());
-    assert_eq!(shared.cache_count(), owned.cache_count());
+    assert_eq!(
+        shared.cache_count(),
+        if matches!(access, Access::Write(_)) && matches!(expected.result, MmuResult::Success(_)) {
+            1
+        } else {
+            owned.cache_count()
+        }
+    );
     let mut actual = vec![0; SIZE];
     memory.read_at(0, &mut actual).unwrap();
     assert_eq!(actual, data);

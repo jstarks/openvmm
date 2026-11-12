@@ -19,7 +19,6 @@ impl SharedMmu {
         }
         accepted
     }
-
     /// WRITE-checked, naturally aligned RAM CAS in one physical beat.
     /// Completion reports the operand observed by the successful host CAS,
     /// including on architectural mismatch (a same-value write cycle).
@@ -247,7 +246,6 @@ impl SharedMmu {
             frame < 0x1_0000_0000_0000u64, frame % 4096 == 0,
             old(self).va as int + old(self).size as int - 1 <= u64::MAX,
             old(self).va % 4096 + old(self).size as int <= 4096,
-            old(self).access is Write ==> leaf is Some,
             match leaf { Some(l) => spec::valid_leaf(l), None => true },
         ensures final(self).invariant(), final(self)@ ==
             spec::word_loaded(old(self)@, frame, permissions, leaf, first, tail, reads),
@@ -270,7 +268,14 @@ impl SharedMmu {
                 match leaf {
                     Some(pte) => self.phase = Phase::WordDirty { pte,
                         data: WordData { address, first, tail, value }, reads },
-                    None => { proof { assert(false); } },
+                    None => {
+                        let data = WordData { address, first, tail, value };
+                        self.phase = if self.comparison.is_some() { Phase::AtomicStore { data, reads } }
+                            else if self.size < 8 && address % 8 + self.size as u64 <= 8 {
+                                Phase::SizedStore { data, reads }
+                            } else if address % 8 == 0 { Phase::WordStore { data, reads } }
+                            else { Phase::WordHead { data, reads } };
+                    },
                 }
             },
             None => { proof { assert(false); } },
@@ -281,6 +286,7 @@ impl SharedMmu {
         requires old(self).invariant(), old(self).word is Some, old(self).phase is Data,
         ensures final(self).invariant(), final(self)@ == spec::word_data(old(self)@, word),
     {
+        self.remember_data();
         if self.va % 4096 + self.size as u64 > 4096 {
             self.page_data_read(word);
             return;
@@ -314,7 +320,10 @@ impl SharedMmu {
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(), final(self)@ == spec::word_store_done(old(self)@, value, reads),
     {
-        self.inner.cache = None;
+        let ram_store = matches!(self.phase, Phase::WordStore {..} | Phase::WordLast {..}
+            | Phase::SizedStore {..} | Phase::AtomicStore {..} | Phase::PageStoreTail {..});
+        if !ram_store { self.inner.cache = None; }
+        self.cache_dirty = ram_store;
         self.head = None;
         let original = match self.modifier { Some(m) => m.original, None => value };
         self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(original),
@@ -357,7 +366,6 @@ impl SharedMmu {
             Phase::Data { frame, leaf, reads, .. } => match self.head {
                 None => {
                     self.head = Some(PageHead { address: frame + self.va % 4096, first: word, leaf });
-                    self.inner.cache = None;
                     self.phase = Phase::Walk { table: self.inner.config.root, level: 0,
                         permissions: Permissions { rw: true, user: true, nx: false } };
                 },
@@ -368,15 +376,37 @@ impl SharedMmu {
                         Some(WordAccess::Write(value)) => {
                             let value = self.modify_value(original, value);
                             match leaf {
-                                Some(tail) => self.phase = Phase::PageDirtyHead { tail, reads,
-                                    span: PageData { tail_address: frame, word: WordData {
-                                        address: head.address, first: head.first, tail: word, value } } },
+                                Some(tail) => {
+                                    let span = PageData { tail_address: frame, word: WordData {
+                                        address: head.address, first: head.first, tail: word, value } };
+                                    self.phase = if head.leaf.is_some() {
+                                        Phase::PageDirtyHead { tail, reads, span }
+                                    } else { Phase::PageDirtyTail { pte: tail, reads, span } };
+                                },
                                 None => { proof { assert(false); } },
                             }
+
                         },
                         None => { proof { assert(false); } },
                     }
                 },
+            },
+            _ => { proof { assert(false); } },
+        }
+    }
+
+    pub(super) fn remember_data(&mut self)
+        requires old(self).invariant(), old(self).phase is Data,
+        ensures final(self).invariant(), final(self)@ == spec::remember_data(old(self)@),
+    {
+        if matches!(self.access, Access::Fetch) { return; }
+        match self.phase {
+            Phase::Data { frame, permissions, leaf, large, .. } => {
+                self.cache_dirty = match leaf {
+                    Some(l) => l.word & 64 != 0, None => self.cache_dirty,
+                };
+                self.inner.cache = Some(Mapping { page: self.walk_va() / 4096,
+                    root: self.inner.config.root, frame, permissions, large });
             },
             _ => { proof { assert(false); } },
         }

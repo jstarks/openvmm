@@ -638,6 +638,9 @@ impl Processor for EmuProcessor<'_> {
                 },
             ) {
                 Ok(batch) => batch,
+                Err(RunError::DecodeCompletion(_)) => {
+                    return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));
+                }
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Memory(error)))),
             };
             let Some(retired) = self.state.progress.retired.checked_add(batch.retired) else {

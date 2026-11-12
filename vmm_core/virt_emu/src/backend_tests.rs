@@ -31,6 +31,9 @@ const DEVICE: u64 = 0x20000;
 const VALUE: u64 = 0xfedc_ba98_7654_3210;
 
 struct Devices {
+    apic: bool,
+    eois: Mutex<Vec<u32>>,
+    ioapic: Option<Arc<Mutex<chipset::ioapic::IoApicDevice>>>,
     port_io: bool,
     pm: Option<Mutex<chipset::pm::PowerManagementDevice>>,
     ports: Mutex<Vec<(bool, u16, Vec<u8>)>>,
@@ -47,6 +50,9 @@ struct Devices {
 impl Devices {
     fn new() -> Self {
         Self {
+            apic: false,
+            eois: Mutex::new(Vec::new()),
+            ioapic: None,
             port_io: false,
             pm: None,
             ports: Mutex::new(Vec::new()),
@@ -84,8 +90,21 @@ impl CpuIo for Devices {
     fn acknowledge_pic_interrupt(&self) -> Option<u8> {
         panic!("no PIC in this profile")
     }
-    fn handle_eoi(&self, _irq: u32) {
-        panic!("no EOI instruction in this profile")
+    fn handle_eoi(&self, irq: u32) {
+        assert!(self.apic, "no EOI instruction in this profile");
+        let count = {
+            let mut eois = self.eois.lock();
+            eois.push(irq);
+            eois.len()
+        };
+        if let Some(ioapic) = &self.ioapic {
+            use chipset_device::interrupt::{HandleEoi, LineInterruptTarget};
+            let mut ioapic = ioapic.lock();
+            if count == 2 {
+                ioapic.set_irq(9, false);
+            }
+            ioapic.handle_eoi(irq);
+        }
     }
     async fn read_mmio(&self, _vp: VpIndex, address: u64, data: &mut [u8]) {
         let offset = (address - DEVICE) as usize;
@@ -134,6 +153,73 @@ impl CpuIo for Devices {
     fn fatal_error(&self, error: Box<dyn std::error::Error + Send + Sync>) -> VpHaltReason {
         self.faults.lock().push(error.to_string());
         VpHaltReason::PowerOff
+    }
+}
+
+struct TestIoApicRoutes {
+    partition: Arc<EmuPartition>,
+    routes: Mutex<[Option<(u64, u32)>; 24]>,
+}
+impl chipset_resources::ioapic::IoApicRouting for TestIoApicRoutes {
+    fn set_route(&self, irq: u8, request: Option<(u64, u32)>) {
+        self.routes.lock()[usize::from(irq)] = request;
+    }
+    fn assert(&self, irq: u8) {
+        let (address, data) = self.routes.lock()[usize::from(irq)]
+            .expect("IOAPIC must publish a route before assertion");
+        self.partition
+            .request_msi(Vtl::Vtl0, virt::irqcon::MsiRequest { address, data });
+    }
+}
+
+#[async_test]
+async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
+    driver: DefaultDriver,
+) {
+    let iterations = 100_000u32;
+    for (apic, bypass) in [(false, true), (false, false), (true, false)] {
+        let (mut bytes, owned) = fixture();
+        let mut code = vec![0xb9];
+        code.extend_from_slice(&iterations.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x83, 0xc0, 1, 0x48, 0xff, 0xc9, 0x75, 0xf7]);
+        bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+        let (_, mut binder, _memory, _keeper) =
+            build_profile(&driver, &bytes, VmTime::from_100ns(0), apic).await;
+        let mut vp = binder.bind().unwrap();
+        if bypass {
+            vp.bypass_decode_cache();
+        }
+        let mut initial = long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        );
+        initial.rax = 0;
+        vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+        vp.set_execution_checkpoint(Some(CODE + code.len() as u64))
+            .unwrap();
+        let devices = Devices::new();
+        let stop = StopVpSource::new();
+        let start = std::time::Instant::now();
+        assert!(matches!(
+            vp.run_vp(stop.checker(), &devices).await,
+            Err(VpHaltReason::PowerOff)
+        ));
+        let seconds = start.elapsed().as_secs_f64();
+        let retired = u64::from(iterations) * 3 + 1;
+        let mut expected = initial;
+        expected.rax = u64::from(iterations);
+        expected.rcx = 0;
+        expected.rip = CODE + code.len() as u64;
+        expected.rflags = (initial.rflags & !0x108d5) | 0x44;
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert_eq!(vp.completed_batch_progress().retired, retired);
+        println!(
+            "apic={apic} decode_cache={} instructions={retired} seconds={seconds:.6} mips={:.3}",
+            !bypass,
+            retired as f64 / seconds / 1e6
+        );
     }
 }
 
@@ -464,8 +550,21 @@ async fn build_at_time(
     bytes: &[u8],
     now: VmTime,
 ) -> (EmuPartition, EmuProcessorBinder, GuestMemory, VmTimeKeeper) {
+    build_profile(driver, bytes, now, false).await
+}
+
+async fn build_profile(
+    driver: &DefaultDriver,
+    bytes: &[u8],
+    now: VmTime,
+    apic: bool,
+) -> (EmuPartition, EmuProcessorBinder, GuestMemory, VmTimeKeeper) {
     let topology = TopologyBuilder::new_x86()
-        .x2apic(X2ApicState::Unsupported)
+        .x2apic(if apic {
+            X2ApicState::Supported
+        } else {
+            X2ApicState::Unsupported
+        })
         .build(1)
         .unwrap();
     let memory_layout = MemoryLayout::new(
@@ -481,15 +580,19 @@ async fn build_at_time(
     let keeper = VmTimeKeeper::new(driver, now);
     let time = keeper.builder().build(driver).await.unwrap();
     let mut hv = EmuHypervisor;
-    let proto = hv
-        .new_partition(ProtoPartitionConfig {
-            processor_topology: &topology,
-            hv_config: None,
-            vmtime: &time,
-            isolation: ProtoPartitionIsolation::None,
-            nested_virt: false,
-        })
-        .unwrap();
+    let config = ProtoPartitionConfig {
+        processor_topology: &topology,
+        hv_config: None,
+        vmtime: &time,
+        isolation: ProtoPartitionIsolation::None,
+        nested_virt: false,
+    };
+    let proto = if apic {
+        hv.new_partition(config)
+    } else {
+        hv.new_legacy_fixture(config)
+    }
+    .unwrap();
     assert_eq!(proto.max_physical_address_size(), 48);
     let (partition, mut binders) = proto
         .build(PartitionConfig {
@@ -502,6 +605,124 @@ async fn build_at_time(
         .unwrap();
     assert_eq!(binders.len(), 1);
     (partition, binders.pop().unwrap(), memory, keeper)
+}
+
+#[async_test]
+async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real_eoi(
+    driver: DefaultDriver,
+) {
+    fn store(code: &mut Vec<u8>, offset: u32, value: u32) {
+        code.extend_from_slice(&[0xc7, 0x87]);
+        code.extend_from_slice(&offset.to_le_bytes());
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    let (mut bytes, owned) = fixture();
+    bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
+    let target = 0x12000u64;
+    let gate = (target & 0xffff) | (8 << 16) | (0x8eu64 << 40) | ((target >> 16) << 48);
+    bytes[0xae00..0xae08].copy_from_slice(&gate.to_le_bytes());
+    bytes[0xae08..0xae10].fill(0);
+    let mut handler = vec![0x4d, 0x01, 0xda];
+    store(&mut handler, 0xb0, 0);
+    handler.extend_from_slice(&[0x48, 0xcf]);
+    bytes[target as usize..target as usize + handler.len()].copy_from_slice(&handler);
+    let mut code = vec![
+        0xb9, 0x1b, 0, 0, 0, 0x0f, 0x32, 0xb8, 5, 0, 0, 0, 0x44, 0x0f, 0x22, 0xc0, 0x44, 0x0f,
+        0x20, 0xc3, 0x31, 0xc0, 0x44, 0x0f, 0x22, 0xc0,
+    ];
+    store(&mut code, 0xf0, 0x1ff);
+    store(&mut code, 0x3e0, 11);
+    store(&mut code, 0x320, 0xe0);
+    store(&mut code, 0x380, 1_000_000);
+    code.push(0xf4);
+    code.push(0x90);
+    let after_timer = CODE + code.len() as u64;
+    code.push(0xf4);
+    bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+    let (partition, mut binder, _memory, mut keeper) =
+        build_profile(&driver, &bytes, VmTime::from_100ns(0), true).await;
+    let mut vp = binder.bind().unwrap();
+    let mut registers = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    registers.rdi = DEVICE;
+    vp.access_state(Vtl::Vtl0)
+        .set_registers(&registers)
+        .unwrap();
+    vp.set_execution_checkpoint(Some(after_timer)).unwrap();
+    let mut devices = Devices::new();
+    devices.apic = true;
+    let stop = StopVpSource::new();
+    let result = {
+        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        park(run.as_mut());
+        // Guest time stays stopped until the VP has actually reached HLT.
+        keeper.start().await;
+        let mut timeout = pal_async::timer::PolledTimer::new(&driver);
+        let result = futures::future::select(
+            run,
+            Box::pin(timeout.sleep(std::time::Duration::from_secs(2))),
+        )
+        .await;
+        match result {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => {
+                panic!("owned LAPIC timer did not wake the halted VP")
+            }
+        }
+    };
+    assert!(matches!(result, Err(VpHaltReason::PowerOff)));
+    keeper.stop().await;
+    let current = vp.access_state(Vtl::Vtl0).registers().unwrap();
+    assert_eq!(
+        (current.rip, current.r10, current.rbx, current.cr8),
+        (after_timer, 1, 5, 0)
+    );
+    assert_eq!(vp.completed_batch_progress().delivered, 1);
+    assert!(
+        devices.eois.lock().is_empty(),
+        "edge timer EOI must not be broadcast"
+    );
+    assert!(
+        devices.mmio.lock().is_empty(),
+        "LAPIC registers must not reach generic CpuIo"
+    );
+    vp.set_execution_checkpoint(Some(after_timer + 1)).unwrap();
+    use chipset_device::{interrupt::LineInterruptTarget, mmio::MmioIntercept};
+    let ioapic = Arc::new(Mutex::new(chipset::ioapic::IoApicDevice::new(
+        24,
+        Box::new(TestIoApicRoutes {
+            partition: Arc::new(partition),
+            routes: Mutex::new([None; 24]),
+        }),
+    )));
+    {
+        let mut ioapic = ioapic.lock();
+        assert!(matches!(
+            ioapic.mmio_write(0xfec0_0000, &0x22u32.to_le_bytes()),
+            chipset_device::io::IoResult::Ok
+        ));
+        assert!(matches!(
+            ioapic.mmio_write(0xfec0_0010, &0x8040u32.to_le_bytes()),
+            chipset_device::io::IoResult::Ok
+        ));
+        ioapic.set_irq(9, true);
+    }
+    devices.ioapic = Some(ioapic);
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap().r10, 3);
+    assert_eq!(vp.completed_batch_progress().delivered, 3);
+    assert_eq!(&*devices.eois.lock(), &[64, 64]);
+    assert_eq!(
+        vp.apic_diagnostics().unwrap().delivered,
+        [(64, 2), (224, 1)]
+    );
 }
 
 #[async_test]

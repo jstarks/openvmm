@@ -16,6 +16,8 @@ use paged_core::shared::CpuPhase;
 use paged_core::shared::{SharedMachine, Tick as CpuTick};
 #[path = "shared_alu.rs"]
 pub mod alu;
+#[path = "shared_control.rs"]
+pub mod control_io;
 #[path = "shared_decode.rs"]
 pub mod decode;
 #[path = "shared_entry.rs"]
@@ -24,6 +26,7 @@ pub mod entry;
 pub mod privilege;
 #[path = "shared_repeat.rs"]
 pub mod repeat;
+use control_io::{ControlAccess, ControlReply};
 use decode::{DecodeDecision, DecodeInput};
 
 verus! {
@@ -31,6 +34,7 @@ verus! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReturnWords { pub ip: u64, pub cs: u64, pub flags: u64, pub rsp: u64, pub ss: u64 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(inconsistent_fields)]
 pub enum Phase {
     Ready, First, Second { first: u8 }, Third,
     Ordinary { flags: u64 },
@@ -41,6 +45,7 @@ pub enum Phase {
     EntryMemory { address: u64, length: u8, task: entry::MemoryTask },
     PortIo { request: entry::PortRequest, length: u8, reply: Option<IoReply> },
     Timestamp {sequence:u64,length:u8,value:Option<u64>},
+    ControlIo {sequence:u64,length:u8,access:ControlAccess,reply:Option<ControlReply>},
     Repeat { width: memory_core::cpu_core::operand::Width, length: u8 },
     RepeatMove { width: memory_core::cpu_core::operand::Width, length: u8 },
     GateLow { event: Event, address: u64 },
@@ -60,6 +65,7 @@ pub struct SharedEventMachine {
     pending: Option<u8>, shadow: bool, halted: bool, handler_pending: bool,
     external_decode: bool, decode_sequence: u64,
     system: Option<SystemState>,
+    apic_id:Option<u32>,
 }
 impl View for SharedEventMachine {
     type V = spec::State;
@@ -67,7 +73,7 @@ impl View for SharedEventMachine {
         spec::State { core: self.core@, tables: self.tables, phase: self.phase,
             pending: self.pending, shadow: self.shadow, halted: self.halted,
             handler_pending: self.handler_pending, external_decode: self.external_decode,
-            decode_sequence: self.decode_sequence, system: self.system }
+            decode_sequence: self.decode_sequence, system: self.system,apic_id:self.apic_id }
     }
 }
 impl SharedEventMachine {
@@ -88,6 +94,9 @@ impl SharedEventMachine {
                     _=>true,
                 },
             Phase::Timestamp {sequence,length,..}=>sequence==self.decode_sequence &&1<=length<=15,
+            Phase::ControlIo {sequence,length,access,reply}=>sequence==self.decode_sequence &&1<=length<=15
+                && match access {ControlAccess::ReadPriority(dst)=>dst.valid() && dst@.width==memory_core::cpu_core::operand::Width::Qword,_=>true}
+                && match reply {Some(value)=>spec::control_io::valid_reply(access,value),None=>true},
             _=>true,
         }
         && match self.phase {
@@ -105,7 +114,7 @@ impl SharedEventMachine {
             Phase::Ordinary { .. } => self.core@.phase != CpuPhase::Boundary,
             Phase::Stopped { .. } => !mmu_core::shared_model::active(self.core@.mmu.phase),
             Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
-                | Phase::Timestamp {..} => self.core@.phase == CpuPhase::Boundary
+                | Phase::Timestamp {..} | Phase::ControlIo {..} => self.core@.phase == CpuPhase::Boundary
                 && !mmu_core::shared_model::active(self.core@.mmu.phase),
             _ => self.core@.phase == CpuPhase::Boundary,
         }
@@ -144,13 +153,13 @@ impl SharedEventMachine {
     pub fn new(cpu: State, config: Config, cr2: u64, tables: Tables) -> (s: Self)
         ensures s.invariant(), s@.core.cpu == cpu@, s@.phase == Phase::Ready,
             s@.tables == tables, s@.pending is None, !s@.shadow, !s@.halted, !s@.handler_pending,
-            s@.system is None,
+            s@.system is None,s@.apic_id is None,
     {
         let core = SharedMachine::new(cpu, config, cr2, false);
         proof { core.boundary_facts(); }
         Self { core, tables, phase: Phase::Ready,
             pending: None, shadow: false, halted: false, handler_pending: false,
-            external_decode: false, decode_sequence: 0, system: None }
+            external_decode: false, decode_sequence: 0, system: None,apic_id:None }
     }
 
     pub fn system(&self) -> (out: Option<SystemState>)
@@ -160,6 +169,10 @@ impl SharedEventMachine {
     pub fn at_instruction_boundary(&self) -> (out:bool)
         ensures out == (self@.phase == Phase::Ready),
     { matches!(self.phase,Phase::Ready) }
+
+    pub fn at_interrupt_boundary(&self)->(out:bool)
+        ensures out==(self@.phase is Ready || self@.phase is Repeat || self@.phase is RepeatMove),
+    {matches!(self.phase,Phase::Ready | Phase::Repeat {..} | Phase::RepeatMove {..})}
 
     pub fn configure_system(&mut self, system: SystemState) -> (accepted: bool)
         requires old(self).invariant(),
@@ -312,6 +325,7 @@ impl SharedEventMachine {
             Phase::Admitted { .. } => self.advance_admitted(),
             Phase::PortIo { .. } => self.finish_port_io(),
             Phase::Timestamp {..}=>self.finish_timestamp(),
+            Phase::ControlIo {..}=>self.finish_control(),
             Phase::DecodeFetch { input } => match self.core.request() {
                 Request::Complete(report) => match report.result {
                     MmuResult::Success(value) => self.append_decode(value),
@@ -471,7 +485,7 @@ impl SharedEventMachine {
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
                 | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
-                | Phase::Timestamp {..}),
+                | Phase::Timestamp {..} | Phase::ControlIo {..}),
         ensures out == spec::word_location(self@),
     {
         let cpu = self.core.cpu();
@@ -498,7 +512,7 @@ impl SharedEventMachine {
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
                 | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
-                | Phase::Timestamp {..}),
+                | Phase::Timestamp {..} | Phase::ControlIo {..}),
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::word_value(old(self)@, value),
     {
@@ -674,7 +688,13 @@ pub enum BatchStop {
     Stopped(EventDiagnostic),
     Io(IoRequest),
     PortIo(entry::PortRequest),
-    Timestamp { sequence: u64 },
+    Timestamp {
+        sequence: u64,
+    },
+    ControlIo {
+        sequence: u64,
+        access: ControlAccess,
+    },
     Decode(DecodeInput),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -708,6 +728,16 @@ impl SharedEventMachine {
                     retired,
                     delivered,
                     stop: BatchStop::Budget,
+                });
+            }
+            if self.apic_id.is_some()
+                && (steps != 0 || effects != 0)
+                && self.at_interrupt_boundary()
+            {
+                return Ok(Batch {
+                    retired,
+                    delivered,
+                    stop: BatchStop::Yield,
                 });
             }
             match self.advance() {
@@ -746,6 +776,19 @@ impl SharedEventMachine {
                     });
                 }
                 Tick::Waiting => {
+                    if let Phase::ControlIo {
+                        sequence,
+                        access,
+                        reply: None,
+                        ..
+                    } = self.phase
+                    {
+                        return Ok(Batch {
+                            retired,
+                            delivered,
+                            stop: BatchStop::ControlIo { sequence, access },
+                        });
+                    }
                     if let Phase::Timestamp {
                         sequence,
                         value: None,

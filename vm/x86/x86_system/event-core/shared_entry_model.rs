@@ -299,7 +299,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
             }
         },
         Instruction::Cpuid => {
-            let values = profile::target(((cpu.gpr[0] as u64) & 0xffff_ffffu64) as u32,
+            let values = control_io::cpuid(s,((cpu.gpr[0] as u64) & 0xffff_ffffu64) as u32,
                 ((cpu.gpr[1] as u64) & 0xffff_ffffu64) as u32);
             retire(s, model::State { gpr: cpu.gpr.update(0,values[0] as int)
                 .update(3,values[1] as int).update(1,values[2] as int).update(2,values[3] as int),

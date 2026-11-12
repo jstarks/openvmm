@@ -123,6 +123,9 @@ impl SharedEventMachine {
                 if !dst.is_valid() || dst.width()!=Width::Qword {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
+                if number==8 && self.apic_id.is_some() {
+                    return self.start_control(ControlAccess::ReadPriority(dst),length);
+                }
                 let cr0_extra=match self.system {Some(s)=>s.cr0_extra,None=>0};
                 let cr4_extra=match self.system {Some(s)=>s.cr4_extra,None=>0};
                 let value=match number {
@@ -140,6 +143,9 @@ impl SharedEventMachine {
                 let Some(value)=scalar(cpu,source) else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
+                if number==8 && self.apic_id.is_some() {
+                    return self.start_control(ControlAccess::WritePriority(value),length);
+                }
                 let mut config=self.core.config();
                 match number {
                     0=>{
@@ -183,6 +189,15 @@ impl SharedEventMachine {
                 self.retire_entry(cpu,length,false,true)
             },
             Instruction::ReadMsr=>{
+                let low=cpu.gpr[1]&0xffff_ffff;
+                let _rcx=cpu.gpr[1];
+                assert(low<=0xffff_ffff) by(bit_vector) requires low==_rcx&0xffff_ffffu64;
+                let number=low as u32;
+                assert(number==_rcx as u32) by(bit_vector)
+                    requires number==(_rcx&0xffff_ffffu64) as u32;
+                if self.apic_id.is_some() && control_io::apic_msr(number) {
+                    return self.start_control(ControlAccess::ReadMsr(number),length);
+                }
                 if cpu.gpr[1]&0xffff_ffff==0x49 || profile::core_pmu_absent(cpu.gpr[1]&0xffff_ffff) {
                     return self.start_entry(Event::GeneralProtection);
                 }

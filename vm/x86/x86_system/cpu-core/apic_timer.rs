@@ -105,6 +105,7 @@ impl Timer {
 
     pub fn deadline(self)->(out:Deadline)
         requires self.valid(),
+        ensures out==model::deadline(self),
     {
         if self.current==0 {return Deadline::Stopped;}
         let count=self.current as u64;
@@ -123,6 +124,30 @@ impl Timer {
 pub mod model {
     #[cfg(verus_keep_ghost)]
     use super::*;
+    pub open spec fn deadline(s:Timer)->Deadline {
+        let value=s.last as int+s.current as int*s.divisor as int-s.phase as int;
+        if s.current==0 {Deadline::Stopped}
+        else if value>u64::MAX {Deadline::BeyondClock}
+        else {Deadline::At(value as u64)}
+    }
+
+    pub proof fn no_expiry_before_deadline(s:Timer,now:u64,end:u64)
+        requires s.valid(),s.last<=now,deadline(s)==Deadline::At(end),now<end,
+        ensures expirations(s,now)==0,
+    {
+        let d=s.divisor as int;
+        let count=s.current as int;
+        let elapsed=now as int-s.last as int+s.phase as int;
+        assert(count>=1);
+        assert(count*d>s.phase as int) by(nonlinear_arith)
+            requires count>=1,d>=1,0<=(s.phase as int)<d;
+        assert(end as int==s.last as int+count*d-s.phase as int);
+        assert(elapsed<count*d) by(nonlinear_arith)
+            requires end as int==s.last as int+count*d-s.phase as int,now<end,
+                elapsed==now as int-s.last as int+s.phase as int;
+        assert(elapsed/d<count) by(nonlinear_arith)
+            requires d>=1,elapsed>=0,elapsed<count*d;
+    }
     pub open spec fn expirations(s:Timer,now:u64)->nat {
         let ticks=(now as int-s.last as int+s.phase as int) / s.divisor as int;
         if now<s.last || s.current==0 || ticks<s.current as int {0}

@@ -13,6 +13,7 @@ mod native {
     use hvdef::Vtl;
     use loader::linux::{AcpiTables, InitrdAddressType, InitrdConfig};
 
+    use chipset_device_resources::IRQ_LINE_SET;
     use pal_async::{DefaultDriver, DefaultPool};
     use parking_lot::Mutex;
     use sha2::{Digest, Sha256};
@@ -30,7 +31,7 @@ mod native {
         BindProcessor, Hypervisor, Partition, PartitionConfig, Processor, ProtoPartition,
         ProtoPartitionConfig, ProtoPartitionIsolation, StopVpSource, VpHaltReason, VpIndex,
     };
-    use virt_emu::backend::{EmuHypervisor, Error};
+    use virt_emu::backend::{EmuHypervisor, EmuPartition, Error};
     use vm_topology::memory::MemoryLayout;
     use vm_topology::processor::TopologyBuilder;
     use vm_topology::processor::x86::X2ApicState;
@@ -62,6 +63,29 @@ mod native {
     #[derive(Debug, thiserror::Error)]
     #[error("unsupported asserted chipset IRQ {0}")]
     struct UnsupportedIrq(u32);
+
+    struct IoApicRoutes {
+        partition: Arc<EmuPartition>,
+        routes: Mutex<[Option<virt::irqcon::MsiRequest>; 24]>,
+        events: Arc<DeviceEvents>,
+    }
+    impl chipset_resources::ioapic::IoApicRouting for IoApicRoutes {
+        fn set_route(&self, irq: u8, request: Option<(u64, u32)>) {
+            self.routes.lock()[usize::from(irq)] =
+                request.map(|(address, data)| virt::irqcon::MsiRequest { address, data });
+        }
+        fn assert(&self, irq: u8) {
+            let request = self.routes.lock()[usize::from(irq)];
+            match request {
+                Some(request) => self.partition.request_msi(Vtl::Vtl0, request),
+                None => {
+                    self.events.fail(Box::new(std::io::Error::other(
+                        "IOAPIC asserted an unconfigured route",
+                    )));
+                }
+            }
+        }
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("bounded kernel probe reached its {0}-second deadline")]
@@ -146,6 +170,7 @@ mod native {
 
     #[derive(Default)]
     struct WitnessIo {
+        with_ioapic: bool,
         events: Arc<DeviceEvents>,
         chipset: Option<Arc<vmotherboard::Chipset>>,
         pm_reads: AtomicU64,
@@ -188,21 +213,39 @@ mod native {
     }
 
     impl CpuIo for WitnessIo {
-        fn is_mmio(&self, _address: u64) -> bool {
-            false
+        fn is_mmio(&self, address: u64) -> bool {
+            self.with_ioapic && (0xfec0_0000..0xfec0_0020).contains(&address)
         }
         fn acknowledge_pic_interrupt(&self) -> Option<u8> {
             self.unexpected("PIC acknowledgement");
             None
         }
-        fn handle_eoi(&self, _irq: u32) {
+        fn handle_eoi(&self, irq: u32) {
+            if self.with_ioapic {
+                if let Some(chipset) = &self.chipset {
+                    chipset.handle_eoi(irq);
+                    return;
+                }
+            }
             self.unexpected("EOI");
         }
-        async fn read_mmio(&self, _vp: VpIndex, _address: u64, _data: &mut [u8]) {
+        async fn read_mmio(&self, vp: VpIndex, address: u64, data: &mut [u8]) {
+            if self.is_mmio(address) {
+                if let Some(chipset) = &self.chipset {
+                    chipset.mmio_read(vp.index(), address, data).await;
+                    return;
+                }
+            }
             self.unexpected("MMIO read");
             std::future::pending().await
         }
-        async fn write_mmio(&self, _vp: VpIndex, _address: u64, _data: &[u8]) {
+        async fn write_mmio(&self, vp: VpIndex, address: u64, data: &[u8]) {
+            if self.is_mmio(address) {
+                if let Some(chipset) = &self.chipset {
+                    chipset.mmio_write(vp.index(), address, data).await;
+                    return;
+                }
+            }
             self.unexpected("MMIO write");
             std::future::pending().await
         }
@@ -713,13 +756,14 @@ mod native {
             .next()
             .context("missing pre-reset mapping projection")?;
         let option = args.next();
+        let probe_apic = option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic"));
         let pm_stalls = option.as_deref() == Some(std::ffi::OsStr::new("--probe-pm-stalls"));
         let loader_inputs = option.as_deref() == Some(std::ffi::OsStr::new("--loader-inputs"));
         let probe = match option {
             None => false,
             Some(argument) => {
                 ensure!(
-                    argument == "--probe" || pm_stalls || loader_inputs,
+                    argument == "--probe" || probe_apic || pm_stalls || loader_inputs,
                     "unknown witness option"
                 );
                 !loader_inputs
@@ -757,20 +801,29 @@ mod native {
         ensure!(probe_seconds > 0, "probe deadline must be positive");
         ensure!(args.next().is_none(), "unexpected witness arguments");
         let topology = TopologyBuilder::new_x86()
-            .x2apic(X2ApicState::Unsupported)
+            .x2apic(if probe_apic {
+                X2ApicState::Supported
+            } else {
+                X2ApicState::Unsupported
+            })
             .build(1)?;
         let layout = MemoryLayout::new(RAM, &[], &[], &[], None)?;
         let memory = GuestMemory::allocate(usize::try_from(RAM)?);
         let keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
         let time = keeper.builder().build(&driver).await?;
         let mut hypervisor = EmuHypervisor;
-        let proto = hypervisor.new_partition(ProtoPartitionConfig {
+        let config = ProtoPartitionConfig {
             processor_topology: &topology,
             hv_config: None,
             vmtime: &time,
             isolation: ProtoPartitionIsolation::None,
             nested_virt: false,
-        })?;
+        };
+        let proto = if probe_apic {
+            hypervisor.new_partition(config)?
+        } else {
+            hypervisor.new_legacy_fixture(config)?
+        };
         let (partition, mut binders) = proto.build(PartitionConfig {
             mem_layout: &layout,
             guest_memory: &memory,
@@ -791,7 +844,7 @@ mod native {
             slit_info: None,
             generic_initiators: &[],
             arch: AcpiArchConfig::X86 {
-                with_ioapic: false,
+                with_ioapic: probe_apic,
                 with_pic: false,
                 with_pit: false,
                 with_psp: false,
@@ -1020,6 +1073,7 @@ mod native {
             state.commit()?;
         }
         let mut devices = WitnessIo {
+            with_ioapic: probe_apic,
             pm_stalls,
             ..WitnessIo::default()
         };
@@ -1059,6 +1113,23 @@ mod native {
                     &vm_resource::ResourceResolver::new(),
                 )
                 .await?;
+            if probe_apic {
+                let partition = Arc::new(partition);
+                output
+                    .chipset_builder
+                    .arc_mutex_device("ioapic")
+                    .add(|services| {
+                        services.add_line_target(IRQ_LINE_SET, 0..=23, 0);
+                        chipset::ioapic::IoApicDevice::new(
+                            24,
+                            Box::new(IoApicRoutes {
+                                partition,
+                                routes: Mutex::new([None; 24]),
+                                events: devices.events.clone(),
+                            }),
+                        )
+                    })?;
+            }
             output
                 .chipset_builder
                 .arc_mutex_device("absent-pcat")
@@ -1088,11 +1159,15 @@ mod native {
                                 "unexpected PM action {action:?}"
                             ))));
                         }),
-                        vmcore::line_interrupt::LineInterrupt::new_with_target(
-                            "pm",
-                            devices.events.clone(),
-                            9,
-                        ),
+                        if probe_apic {
+                            services.new_line(IRQ_LINE_SET, "pm", 9)
+                        } else {
+                            vmcore::line_interrupt::LineInterrupt::new_with_target(
+                                "pm",
+                                devices.events.clone(),
+                                9,
+                            )
+                        },
                         &mut services.register_pio(),
                         services.register_vmtime().access("pm"),
                         None,
@@ -1110,11 +1185,15 @@ mod native {
                         Box::new(local_clock::SystemTimeClock::new(
                             local_clock::LocalClockDelta::ZERO,
                         )),
-                        vmcore::line_interrupt::LineInterrupt::new_with_target(
-                            "rtc",
-                            devices.events.clone(),
-                            8,
-                        ),
+                        if probe_apic {
+                            services.new_line(IRQ_LINE_SET, "rtc", 8)
+                        } else {
+                            vmcore::line_interrupt::LineInterrupt::new_with_target(
+                                "rtc",
+                                devices.events.clone(),
+                                8,
+                            )
+                        },
                         services.register_vmtime(),
                         0x32,
                         None,
@@ -1124,16 +1203,20 @@ mod native {
             output
                 .chipset_builder
                 .arc_mutex_device("com1")
-                .try_add(|_services| {
+                .try_add(|services| {
                     serial_16550::Serial16550::new(
                         "com1".to_owned(),
                         serial_16550_resources::MmioOrIoPort::IoPort(0x3f8),
                         1,
-                        vmcore::line_interrupt::LineInterrupt::new_with_target(
-                            "com1",
-                            devices.events.clone(),
-                            4,
-                        ),
+                        if probe_apic {
+                            services.new_line(IRQ_LINE_SET, "com1", 4)
+                        } else {
+                            vmcore::line_interrupt::LineInterrupt::new_with_target(
+                                "com1",
+                                devices.events.clone(),
+                                4,
+                            )
+                        },
                         Box::new(serial_core::serial_io::Connected::new(ConsoleCapture(
                             console.clone(),
                         ))),
@@ -1149,6 +1232,7 @@ mod native {
             None
         };
         let stop = StopVpSource::new();
+        let initial_jiffies = memory.read_plain::<u64>(0x2609980)?;
         let started = Instant::now();
         let run = Box::pin(vp.run_vp(stop.checker(), &devices));
         let diagnostic = async {
@@ -1192,7 +1276,13 @@ mod native {
             ensure!(
                 matches!(
                     failure.downcast_ref::<Error>(),
-                    Some(Error::Cpu(_) | Error::Checkpoint { .. })
+                    Some(
+                        Error::Cpu(_)
+                            | Error::Checkpoint { .. }
+                            | Error::Apic(_)
+                            | Error::ApicIngress(_)
+                            | Error::UnsupportedInterrupt
+                    )
                 ) || failure.is::<UnconfiguredPort>()
                     || failure.is::<UnsupportedIrq>()
                     || failure.is::<ProbeDeadline>(),
@@ -1200,6 +1290,20 @@ mod native {
             );
             let registers = vp.access_state(Vtl::Vtl0).registers()?;
             let progress = vp.completed_batch_progress();
+            let final_jiffies = memory.read_plain::<u64>(0x2609980)?;
+            let apic=vp.apic_diagnostics().map(|snapshot| {
+                let apic=snapshot.registers;
+                serde_json::json!({
+                    "base":apic.base,"svr":apic.svr,"tpr":apic.tpr,"lvt":apic.lvt,
+                    "irr":apic.interrupts.irr.words,"isr":apic.interrupts.isr.words,
+                    "timer_initial":apic.timer.initial,"timer_current":apic.timer.current,
+                    "timer_divisor":apic.timer.divisor,"timer_periodic":apic.timer.periodic,
+                    "timer_last":apic.timer.last,"vm_time_100ns":snapshot.vm_time_100ns,
+                    "delivered":snapshot.delivered,"first_interrupt_retired":snapshot.first_interrupt_retired,
+                    "jiffies_initial":initial_jiffies,"jiffies_final":final_jiffies,
+                    "jiffies_delta":final_jiffies.wrapping_sub(initial_jiffies),
+                })
+            });
             let current_stack_walk = walk_trace(&memory, registers.cr3, registers.rsp)?;
             let mut current_stack_words = Vec::new();
             if let Some(leaf) = current_stack_walk.last() {
@@ -1259,6 +1363,7 @@ mod native {
                         "pm_stalls_injected":devices.pm_stalls_injected.load(Ordering::Relaxed),
                         "tsc_hz":x86_system::memory_core::cpu_core::profile::TSC_HZ,
                     },
+                    "apic":apic,
                 })
             );
             return Ok(());

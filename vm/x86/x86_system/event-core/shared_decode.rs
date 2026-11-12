@@ -164,6 +164,17 @@ impl SharedEventMachine {
                 }
             },
             DecodeDecision::Wrmsr => {
+                let cpu=self.core.cpu();
+                let ghost rcx=cpu.gpr[1];
+                let low=cpu.gpr[1]&0xffff_ffff;
+                assert(low<=0xffff_ffff) by(bit_vector) requires low==rcx&0xffff_ffffu64;
+                let number=low as u32;
+                assert(number==rcx as u32) by(bit_vector)
+                    requires number==(rcx&0xffff_ffffu64) as u32;
+                if self.apic_id.is_some() && control_io::apic_msr(number) {
+                    let value=(cpu.gpr[0]&0xffff_ffff)|((cpu.gpr[2]&0xffff_ffff)<<32);
+                    return self.start_control(ControlAccess::WriteMsr {number,value},input.length);
+                }
                 if (self.core.cpu().gpr[1]&0xffff_ffff==0x49 && !profile::PRED_CMD_AVAILABLE)
                     || profile::core_pmu_absent(self.core.cpu().gpr[1]&0xffff_ffff) {
                     if self.core.cpu().flags&0x100!=0 {

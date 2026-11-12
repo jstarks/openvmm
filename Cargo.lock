@@ -10449,6 +10449,8 @@ dependencies = [
  "build_rs_guest_arch",
  "chipset",
  "chipset_device",
+ "chipset_device_resources",
+ "chipset_resources",
  "futures",
  "guestmem",
  "hvdef",

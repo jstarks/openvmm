@@ -772,6 +772,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                     IcedRegister::CR2 => Some(2),
                     IcedRegister::CR3 => Some(3),
                     IcedRegister::CR4 => Some(4),
+                    IcedRegister::CR8 => Some(8),
                     _ => None,
                 };
                 if (IcedRegister::DR0..=IcedRegister::DR7).contains(&instruction.op1_register()) {
@@ -801,6 +802,7 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
                     IcedRegister::CR0 => Some(0),
                     IcedRegister::CR3 => Some(3),
                     IcedRegister::CR4 => Some(4),
+                    IcedRegister::CR8 => Some(8),
                     _ => None,
                 };
                 if let Some(number) = control {

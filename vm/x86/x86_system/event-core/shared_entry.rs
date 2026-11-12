@@ -523,7 +523,7 @@ impl SharedEventMachine {
             Instruction::Cpuid => {
                 let function = (cpu.gpr[0] & 0xffff_ffff) as u32;
                 let subleaf = (cpu.gpr[1] & 0xffff_ffff) as u32;
-                let values = profile::cpuid(function, subleaf);
+                let values = self.cpuid(function, subleaf);
                 let ghost before = cpu@;
                 cpu.gpr[0] = values[0] as u64; cpu.gpr[3] = values[1] as u64;
                 cpu.gpr[1] = values[2] as u64; cpu.gpr[2] = values[3] as u64;

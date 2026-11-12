@@ -23,6 +23,8 @@ use super::{
 use vstd::prelude::*;
 #[path = "shared_alu_model.rs"]
 pub mod alu;
+#[path = "shared_control_model.rs"]
+pub mod control_io;
 #[path = "shared_decode_model.rs"]
 pub mod decode;
 #[path = "shared_entry_model.rs"]
@@ -39,6 +41,7 @@ pub struct State {
     pub pending: Option<u8>, pub shadow: bool, pub halted: bool, pub handler_pending: bool,
     pub external_decode: bool, pub decode_sequence: u64,
     pub system: Option<SystemState>,
+    pub apic_id:Option<u32>,
 }
 pub open spec fn configure_system(s: State, system: SystemState) -> (State, bool) {
     if s.phase is Ready && super::memory_core::cpu_core::system::model::supported(system) {
@@ -323,6 +326,7 @@ pub open spec fn advance(s: State) -> (State, Tick) {
         Phase::Admitted { .. } => decode::admitted(s),
         Phase::PortIo { .. } => entry::finish_port_io(s),
         Phase::Timestamp {..}=>entry::finish_timestamp(s),
+        Phase::ControlIo {..}=>control_io::finish(s),
         Phase::DecodeFetch { input } => match m::request(s.core.mmu) {
             Request::Complete(report) => match report.result {
                 MmuResult::Success(value) => decode::append(s, value),

@@ -78,7 +78,11 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
             }
         },
         Instruction::ReadControl {number,dst}=>{
-            if !dst.valid() || dst@.width!=Width::Qword || (number!=0 && number!=2 && number!=3 && number!=4) {
+            if !dst.valid() || dst@.width!=Width::Qword {
+                entry::unsupported(s)
+            } else if number==8 && s.apic_id is Some {
+                control_io::start(s,super::super::shared::control_io::ControlAccess::ReadPriority(dst),length)
+            } else if number!=0 && number!=2 && number!=3 && number!=4 {
                 entry::unsupported(s)
             } else {
                 let cr0_extra=match s.system {Some(system)=>system.cr0_extra,None=>0u64};
@@ -93,6 +97,9 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
         Instruction::WriteControl {number,source}=>match entry::scalar(cpu,source) {
             None=>entry::unsupported(s),
             Some(value)=>match number {
+                8=>if s.apic_id is Some {
+                    control_io::start(s,super::super::shared::control_io::ControlAccess::WritePriority(value),length)
+                } else {entry::unsupported(s)},
                 0=>match (privilege::model::cr0(value),s.system) {
                     (Some(update),Some(system))=>entry::retire(reload(s,Config {wp:update.wp,..config},
                         Some(SystemState {cr0_extra:update.extra,..system})),cpu,length,false,true),
@@ -108,7 +115,11 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
                 _=>entry::unsupported(s),
             },
         },
-        Instruction::ReadMsr=>if (cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64
+        Instruction::ReadMsr=>if s.apic_id is Some
+            && (((cpu.gpr[1] as u64)&0xffff_ffffu64)==0x1b
+                || 0x800<=((cpu.gpr[1] as u64)&0xffff_ffffu64)<=0x8ff) {
+            control_io::start(s,super::super::shared::control_io::ControlAccess::ReadMsr((cpu.gpr[1] as u64) as u32),length)
+        } else if (cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64
             || profile::absent_core_pmu((cpu.gpr[1] as u64)&0xffff_ffffu64) {
             entry(s,Event::GeneralProtection)
         } else {match s.system {

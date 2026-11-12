@@ -1756,8 +1756,6 @@ fn control_moves_indirect_jumps_and_prefix_frontiers_are_explicit() {
     assert_eq!(address.offset(&registers, 0), 8);
     for bytes in [
         &[0x0f, 0x22, 0xd0][..],
-        &[0x44, 0x0f, 0x22, 0xc0][..],
-        &[0x44, 0x0f, 0x20, 0xc0][..],
         &[0x0f, 0x33][..],
         &[0xff, 0x28][..],
         &[0xf3, 0x48, 0x83, 0x28, 1][..],
@@ -2044,7 +2042,6 @@ fn startup_control_msr_and_segment_packets_remain_cpu_independent() {
         &[0x66, 0x0f, 0x32][..],
         &[0xf3, 0x0f, 0x32][..],
         &[0x0f, 0x22, 0xd0][..],
-        &[0x44, 0x0f, 0x22, 0xc0][..],
     ] {
         assert_eq!(
             admission(bytes),
@@ -3043,7 +3040,7 @@ fn repeat_moves_admit_only_the_bounded_string_widths_and_default_segments() {
 }
 
 #[test]
-fn cr2_reads_use_qword_gprs_without_admitting_cr2_writes_or_other_controls() {
+fn cr2_reads_use_qword_gprs_without_admitting_cr2_writes() {
     use x86_system::shared::decode::DecodeDecision;
     use x86_system::shared::entry::Instruction;
     for index in 0..16 {
@@ -3063,17 +3060,36 @@ fn cr2_reads_use_qword_gprs_without_admitting_cr2_writes_or_other_controls() {
     for bytes in [&[0x0f, 0x20, 0xd8][..], &[0x0f, 0x20, 0xe0][..]] {
         assert!(matches!(entry(bytes), Instruction::ReadControl { .. }));
     }
-    for bytes in [
-        &[0x44, 0x0f, 0x20, 0xc0][..],
-        &[0xf3, 0x0f, 0x20, 0xd0][..],
-        &[0xf2, 0x0f, 0x20, 0xd0][..],
-    ] {
+    for bytes in [&[0xf3, 0x0f, 0x20, 0xd0][..], &[0xf2, 0x0f, 0x20, 0xd0][..]] {
         assert_eq!(admission(bytes), DecodeDecision::Unsupported);
     }
+
     assert_eq!(
         admission(&[0xf0, 0x0f, 0x20, 0xd0]),
         DecodeDecision::InvalidOpcode
     );
+}
+
+#[test]
+fn cr8_moves_use_the_owned_priority_control_request_for_all_gprs() {
+    use x86_system::shared::entry::Instruction;
+    for index in 0..16 {
+        let rex = 0x44 | u8::from(index >= 8);
+        assert_eq!(
+            entry(&[rex, 0x0f, 0x20, 0xc0 | (index & 7)]),
+            Instruction::ReadControl {
+                number: 8,
+                dst: reg(index, Width::Qword, false)
+            }
+        );
+        assert_eq!(
+            entry(&[rex, 0x0f, 0x22, 0xc0 | (index & 7)]),
+            Instruction::WriteControl {
+                number: 8,
+                source: Operand::Register(reg(index, Width::Qword, false))
+            }
+        );
+    }
 }
 
 #[test]

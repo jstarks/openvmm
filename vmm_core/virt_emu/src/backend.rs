@@ -3,7 +3,7 @@
 
 //! Restricted single-VP long-mode backend, not a Linux-capable machine backend.
 //!
-//! Initial register import is supported; reset, migration, APIC/MSI, other VTLs
+//! Initial register import and owned APIC/MSI are supported; reset, migration, other VTLs
 //! and subsequent register writes are rejected. Stop is deferred until an
 //! already-started device operation completes. Cancelling its run future poisons
 //! that VP rather than reissuing a possibly side-effecting operation.
@@ -16,7 +16,7 @@ use memory_range::MemoryRange;
 use std::convert::Infallible;
 use std::future::poll_fn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::task::Poll;
 use virt::io::CpuIo;
 use virt::vp::{self, AccessVpState};
@@ -27,12 +27,18 @@ use virt::{
     ProtoPartitionIsolation, StopVp, VpHaltReason, VpIndex,
 };
 use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
+use x86_system::memory_core::cpu_core::apic::registers::LocalApic;
 use x86_system::memory_core::cpu_core::system::{self, SegmentState, SystemState};
 use x86_system::memory_core::shared::{Exchange, PhysicalRam};
 use x86_system::mmu_core::shared::RunError;
 use x86_system::mmu_core::shared::io::IoReply;
 use x86_system::shared::{BatchStop, SharedEventMachine};
 use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
+
+#[path = "backend_apic.rs"]
+mod apic;
+#[path = "backend_decode_cache.rs"]
+mod decode_cache;
 
 /// Unsupported profile, invalid lifecycle operation, or execution failure.
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +62,7 @@ pub enum Error {
     #[error("invalid interrupt ingress state")]
     InterruptIngress,
     /// An unsupported controller request was latched for the VP.
-    #[error("APIC/MSI or an invalid VP target was requested")]
+    #[error("unsupported interrupt message or an invalid VP target was requested")]
     UnsupportedInterrupt,
     /// The core rejected an external input.
     #[error("selected interrupt rejected: {0:?}")]
@@ -91,9 +97,18 @@ pub enum Error {
     /// Topology and capability metadata were incompatible.
     #[error("partition capabilities")]
     Capabilities(#[from] virt::PartitionCapabilitiesError),
+    /// The owned controller rejected an unimplemented device profile.
+    #[error("owned APIC stopped: {0:?}")]
+    Apic(x86_system::memory_core::cpu_core::apic::registers::Error),
+    /// A controller message could not enter its architectural image.
+    #[error("owned APIC ingress rejected: {0:?}")]
+    ApicIngress(x86_system::memory_core::cpu_core::apic::Rejection),
 }
 
 struct Control {
+    has_apic: bool,
+    routing: AtomicU64,
+    incoming: [AtomicU64; 8],
     pending: AtomicU16,
     unsupported: AtomicBool,
     waker: AtomicWaker,
@@ -101,8 +116,11 @@ struct Control {
 }
 
 impl Control {
-    fn new() -> Self {
+    fn new(has_apic: bool) -> Self {
         Self {
+            has_apic,
+            routing: AtomicU64::new(0),
+            incoming: std::array::from_fn(|_| AtomicU64::new(0)),
             pending: AtomicU16::new(0),
             unsupported: AtomicBool::new(false),
             waker: AtomicWaker::new(),
@@ -192,6 +210,8 @@ pub struct EmuHypervisor;
 pub struct EmuProtoPartition {
     caps: Arc<PartitionCapabilities>,
     clock: VmTimeSource,
+    architectural_apic: bool,
+    apic_id: u32,
 }
 
 /// Partition control and bounded external event ingress.
@@ -201,6 +221,11 @@ pub struct EmuPartition {
 }
 
 struct VpState {
+    decoder: decode_cache::DecodeCache,
+    lapic: Option<LocalApic>,
+    apic_offer: Option<u8>,
+    apic_delivered: [u64; 256],
+    first_apic_retired: Option<u64>,
     core: Option<SharedEventMachine>,
     initial_system: Option<SystemState>,
     started: bool,
@@ -225,7 +250,7 @@ pub struct EmuProcessor<'a> {
     ram: Arc<Ram>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
-    clock: &'a VmTimeAccess,
+    clock: &'a mut VmTimeAccess,
 }
 
 /// Progress from successfully returned core batches, not transport-error totals.
@@ -237,7 +262,39 @@ pub struct CompletedBatchProgress {
     pub delivered: u64,
 }
 
+/// Read-only interrupt telemetry, not a restartable migration snapshot.
+#[derive(Debug)]
+pub struct ApicDiagnostics {
+    /// The single owned register image.
+    pub registers: LocalApic,
+    /// Successfully delivered vectors and counts.
+    pub delivered: Vec<(u8, u64)>,
+    /// Retirements at the first successful APIC delivery.
+    pub first_interrupt_retired: Option<u64>,
+    /// Current time in the shared VM clock domain.
+    pub vm_time_100ns: u64,
+}
+
 impl EmuProcessor<'_> {
+    #[cfg(test)]
+    pub(crate) fn bypass_decode_cache(&mut self) {
+        self.state.decoder.bypass = true;
+    }
+    /// Captures the owned controller and delivery counters without changing them.
+    pub fn apic_diagnostics(&self) -> Option<ApicDiagnostics> {
+        self.state.lapic.map(|registers| ApicDiagnostics {
+            registers,
+            delivered: self
+                .state
+                .apic_delivered
+                .iter()
+                .enumerate()
+                .filter_map(|(vector, &count)| (count != 0).then_some((vector as u8, count)))
+                .collect(),
+            first_interrupt_retired: self.state.first_apic_retired,
+            vm_time_100ns: self.clock.now().as_100ns(),
+        })
+    }
     /// Configure an out-of-band instruction-boundary stop without changing guest state.
     pub fn set_execution_checkpoint(&mut self, address: Option<u64>) -> Result<(), Error> {
         if address
@@ -268,6 +325,24 @@ impl Hypervisor for EmuHypervisor {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<EmuProtoPartition, Error> {
+        self.partition(config, true)
+    }
+}
+
+impl EmuHypervisor {
+    /// Constructs the frozen pre-APIC regression fixture, not a production option.
+    pub fn new_legacy_fixture<'a>(
+        &'a mut self,
+        config: ProtoPartitionConfig<'a>,
+    ) -> Result<EmuProtoPartition, Error> {
+        self.partition(config, false)
+    }
+
+    fn partition(
+        &mut self,
+        config: ProtoPartitionConfig<'_>,
+        architectural_apic: bool,
+    ) -> Result<EmuProtoPartition, Error> {
         if config.processor_topology.vps().count() != 1
             || config.hv_config.is_some()
             || config.nested_virt
@@ -277,13 +352,34 @@ impl Hypervisor for EmuHypervisor {
                 "one VP, no isolation/HV1/nested virtualization",
             ));
         }
+        let apic_id = config.processor_topology.max_apic_id();
+        if architectural_apic
+            && (apic_id > 255
+                || config.processor_topology.apic_mode()
+                    != vm_topology::processor::x86::ApicMode::X2ApicSupported)
+        {
+            return Err(Error::Profile(
+                "initial APIC profile requires an 8-bit boot ID and x2APIC-capable legacy mode",
+            ));
+        }
         let caps = PartitionCapabilities::from_cpuid(
             config.processor_topology,
-            &mut x86_system::memory_core::cpu_core::profile::cpuid,
+            &mut |function, subleaf| {
+                let mut values =
+                    x86_system::memory_core::cpu_core::profile::cpuid(function, subleaf);
+                if architectural_apic && function == 1 {
+                    values[1] = (values[1] & 0x00ff_ffff) | (apic_id << 24);
+                    values[2] |= 1 << 21;
+                    values[3] |= 1 << 9;
+                }
+                values
+            },
         )?;
         Ok(EmuProtoPartition {
             caps: Arc::new(caps),
             clock: config.vmtime.clone(),
+            architectural_apic,
+            apic_id,
         })
     }
 }
@@ -322,7 +418,7 @@ impl ProtoPartition for EmuProtoPartition {
         if banks.is_empty() {
             return Err(Error::Profile("no RAM"));
         }
-        let control = Arc::new(Control::new());
+        let control = Arc::new(Control::new(self.architectural_apic));
         let partition = EmuPartition {
             caps: self.caps.clone(),
             control: control.clone(),
@@ -330,6 +426,15 @@ impl ProtoPartition for EmuProtoPartition {
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
             state: VpState {
+                decoder: decode_cache::DecodeCache::new(),
+                lapic: if self.architectural_apic {
+                    Some(LocalApic::new(self.apic_id, true, 0))
+                } else {
+                    None
+                },
+                apic_offer: None,
+                apic_delivered: [0; 256],
+                first_apic_retired: None,
                 core: None,
                 initial_system: Some(SystemState::empty()),
                 started: false,
@@ -349,6 +454,11 @@ impl ProtoPartition for EmuProtoPartition {
 impl EmuPartition {
     /// Offers an already-selected vector, not an APIC/PIC arbitration interface.
     pub fn inject_selected(&self, vector: u8) -> Result<(), Error> {
+        if self.control.has_apic {
+            return Err(Error::Profile(
+                "selected-vector ingress bypasses the owned LAPIC",
+            ));
+        }
         if vector < 32 {
             return Err(Error::InterruptVector);
         }
@@ -395,9 +505,13 @@ impl Partition for EmuPartition {
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
         None
     }
-    fn request_msi(&self, _vtl: Vtl, _request: virt::irqcon::MsiRequest) {
-        self.control.unsupported.store(true, Ordering::Release);
-        self.control.waker.wake();
+    fn request_msi(&self, vtl: Vtl, request: virt::irqcon::MsiRequest) {
+        if vtl == Vtl::Vtl0 {
+            self.control.request_apic_msi(request);
+        } else {
+            self.control.unsupported.store(true, Ordering::Release);
+            self.control.waker.wake();
+        }
     }
     fn caps(&self) -> &PartitionCapabilities {
         &self.caps
@@ -416,7 +530,7 @@ impl BindProcessor for EmuProcessorBinder {
     type Error = Error;
     fn bind(&mut self) -> Result<EmuProcessor<'_>, Error> {
         Ok(EmuProcessor {
-            clock: &self.clock,
+            clock: &mut self.clock,
             state: &mut self.state,
             ram: self.ram.clone(),
             caps: self.caps.clone(),
@@ -459,9 +573,15 @@ impl Processor for EmuProcessor<'_> {
             return Err(dev.fatal_error(Box::new(Error::CancelledIo)));
         }
         self.state.started = true;
-        let mut decode_work = 0u8;
+        let mut batch_work = 0u8;
         loop {
             stop.check()?;
+            if let Err(error) = apic::poll(self.state, &self.control, self.clock) {
+                return Err(dev.fatal_error(Box::new(error)));
+            }
+            let local_window = self.state.lapic.as_ref().and_then(|apic| {
+                (apic.base & 0x800 != 0 && !apic.x2apic()).then_some(apic.base & !0xfff)
+            });
             let checkpoint = self.state.checkpoint;
             if let Some(error) = self.state.fault.take() {
                 return Err(dev.fatal_error(Box::new(error)));
@@ -482,7 +602,11 @@ impl Processor for EmuProcessor<'_> {
             let retirements = if checkpoint.is_some() { 1 } else { 64 };
             let batch = match core.run_with_mmio(&*self.ram, 64, retirements, |address, width| {
                 (0..u64::from(width)).all(|offset| {
-                    !self.ram.is_ram(address + offset) && dev.is_mmio(address + offset)
+                    !self.ram.is_ram(address + offset)
+                        && (dev.is_mmio(address + offset)
+                            || local_window.is_some_and(|base| {
+                                address + offset >= base && address + offset - base < 4096
+                            }))
                 })
             }) {
                 Ok(batch) => batch,
@@ -495,7 +619,41 @@ impl Processor for EmuProcessor<'_> {
                 return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
             };
             self.state.progress = CompletedBatchProgress { retired, delivered };
+            // Frequent controller/checkpoint returns are not executor-yield requests.
+            batch_work += 1;
+            if batch_work == 64 {
+                self.control.yield_requested.request_yield();
+                batch_work = 0;
+            }
+            match apic::acknowledge(&mut self.state.lapic, &mut self.state.apic_offer, core) {
+                Ok(Some(vector)) => {
+                    let slot = &mut self.state.apic_delivered[usize::from(vector)];
+                    let Some(count) = slot.checked_add(1) else {
+                        return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+                    };
+                    *slot = count;
+                    self.state.first_apic_retired.get_or_insert(retired);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(dev.fatal_error(Box::new(error))),
+            }
             match batch.stop {
+                BatchStop::ControlIo { sequence, access } => {
+                    let Some(lapic) = self.state.lapic.as_mut() else {
+                        return Err(
+                            dev.fatal_error(Box::new(Error::Profile("missing owned LAPIC")))
+                        );
+                    };
+                    let reply = match apic::ticks(self.clock.now())
+                        .and_then(|now| apic::control(lapic, access, now, &self.control, dev))
+                    {
+                        Ok(reply) => reply,
+                        Err(error) => return Err(dev.fatal_error(Box::new(error))),
+                    };
+                    if !core.complete_control(sequence, reply) {
+                        return Err(dev.fatal_error(Box::new(Error::Completion)));
+                    }
+                }
                 BatchStop::Timestamp { sequence } => {
                     let ticks = self.clock.now().as_100ns().wrapping_mul(
                         x86_system::memory_core::cpu_core::profile::TSC_HZ / 10_000_000,
@@ -505,13 +663,8 @@ impl Processor for EmuProcessor<'_> {
                     }
                 }
                 BatchStop::Decode(input) => {
-                    if !core.complete_decode(input.sequence, x86_decode::admit(input)) {
+                    if !core.complete_decode(input.sequence, self.state.decoder.decode(input)) {
                         return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));
-                    }
-                    decode_work += 1;
-                    if decode_work == 64 {
-                        self.control.yield_requested.request_yield();
-                        decode_work = 0;
                     }
                 }
                 BatchStop::PortIo(request) => {
@@ -545,6 +698,53 @@ impl Processor for EmuProcessor<'_> {
                     self.state.io_active = true;
                     self.ram.barrier();
                     let size = usize::from(request.size);
+                    if let Some(base) = local_window
+                        .filter(|&base| request.address >= base && request.address - base < 4096)
+                    {
+                        let Some(lapic) = self.state.lapic.as_mut() else {
+                            return Err(dev.fatal_error(Box::new(Error::Profile(
+                                "missing local APIC window owner",
+                            ))));
+                        };
+                        let now = match apic::ticks(self.clock.now()) {
+                            Ok(now) => now,
+                            Err(error) => return Err(dev.fatal_error(Box::new(error))),
+                        };
+                        let offset = (request.address - base) as u16;
+                        let reply = match request.access {
+                            WordAccess::Read => match lapic.mmio_read(offset, request.size, now) {
+                                Ok((next, value)) => {
+                                    *lapic = next;
+                                    IoReply::Read(u64::from(value))
+                                }
+                                Err(error) => {
+                                    return Err(dev.fatal_error(Box::new(Error::Apic(error))));
+                                }
+                            },
+                            WordAccess::Write(value) => {
+                                match lapic.mmio_write(offset, request.size, value as u32, now) {
+                                    Ok((next, effects)) => {
+                                        *lapic = next;
+                                        if let Err(error) =
+                                            apic::effect(lapic, &self.control, effects, dev)
+                                        {
+                                            return Err(dev.fatal_error(Box::new(error)));
+                                        }
+                                        IoReply::Written
+                                    }
+                                    Err(error) => {
+                                        return Err(dev.fatal_error(Box::new(Error::Apic(error))));
+                                    }
+                                }
+                            }
+                        };
+                        self.ram.barrier();
+                        if !core.complete_io(request.sequence, reply) {
+                            return Err(dev.fatal_error(Box::new(Error::Completion)));
+                        }
+                        self.state.io_active = false;
+                        continue;
+                    }
                     let reply = match request.access {
                         WordAccess::Read => {
                             let mut bytes = [0; 8];
@@ -568,15 +768,15 @@ impl Processor for EmuProcessor<'_> {
                     }
                     self.state.io_active = false;
                 }
-                BatchStop::Budget | BatchStop::Yield => {
-                    self.control.yield_requested.request_yield();
-                }
+                BatchStop::Budget | BatchStop::Yield => {}
                 BatchStop::Waiting => {
                     let can_accept = core.pending().is_none();
                     stop.until_stop(poll_fn(|cx| {
                         self.control.waker.register(cx.waker());
                         if self.control.unsupported.load(Ordering::Acquire)
                             || (can_accept && self.control.pending.load(Ordering::Acquire) != 0)
+                            || self.control.apic_work_pending()
+                            || self.clock.poll_timeout(cx).is_ready()
                         {
                             Poll::Ready(())
                         } else {
@@ -749,10 +949,14 @@ impl AccessVpState for EmuStateAccess<'_> {
     }
     fn registers(&mut self) -> Result<vp::Registers, Error> {
         let core = self.core()?;
-        Ok(with_system(
+        let mut registers = with_system(
             long_mode_registers(core.cpu(), core.config(), core.tables(), core.cr2()),
             self.system()?,
-        ))
+        );
+        if let Some(apic) = &self.state.lapic {
+            registers.cr8 = u64::from(apic.tpr >> 4);
+        }
+        Ok(registers)
     }
     fn set_registers(&mut self, regs: &vp::Registers) -> Result<(), Error> {
         if self.vtl != Vtl::Vtl0 {
@@ -789,6 +993,12 @@ impl AccessVpState for EmuStateAccess<'_> {
         };
         let mut normalized = *regs;
         normalized.cr0 |= 0x10;
+        if self.state.lapic.is_some() {
+            if regs.cr8 > 15 {
+                return Err(Error::Profile("initial CR8"));
+            }
+            normalized.cr8 = 0;
+        }
         if !system.is_supported()
             || normalized != with_system(long_mode_registers(cpu, config, tables, regs.cr2), system)
             || config.root >= 1u64 << 48
@@ -802,6 +1012,12 @@ impl AccessVpState for EmuStateAccess<'_> {
             return Err(Error::Profile("initial long-mode register image"));
         }
         let mut core = SharedEventMachine::new(cpu, config, regs.cr2, tables);
+        if let Some(apic) = &mut self.state.lapic {
+            if !core.configure_apic(apic.id) {
+                return Err(Error::Profile("initial APIC metadata"));
+            }
+            *apic = apic.write_cr8(regs.cr8).map_err(Error::Apic)?;
+        }
         if !core.configure_system(system) || !core.enable_decode() {
             return Err(Error::Profile("initial system/decoder state"));
         }

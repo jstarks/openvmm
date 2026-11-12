@@ -195,6 +195,7 @@ impl SharedEventMachine {
                     0xc0000100=>system.fs.base,
                     0xc0000101=>system.gs.base,
                     0xc0011029=>system.de_cfg,
+                    0xc001001f=>profile::NB_CFG,
                     number=>match privilege::read_entry(system.entry,number) {
                         Some(value)=>value,
                         None=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
@@ -307,10 +308,16 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
         let number=cpu.gpr[1]&0xffff_ffff;
-        if number!=0xc0011029 && privilege::read_entry(system.entry,number).is_none() {
+        if number!=0xc0011029 && number!=0xc001001f && privilege::read_entry(system.entry,number).is_none() {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         let value=(cpu.gpr[0]&0xffff_ffff)|((cpu.gpr[2]&0xffff_ffff)<<32);
+        if number==0xc001001f {
+            if value!=profile::NB_CFG {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            return self.retire_entry(cpu,length,false,true);
+        }
         if number==0xc0011029 {
             if value&!2u64!=0 {
                 return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));

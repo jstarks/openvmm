@@ -255,10 +255,12 @@ impl<'a> BaseChipsetBuilder<'a> {
             bus_id,
             pio_addr,
             pio_data,
+            amd_extended_config,
         }) = deps_generic_pci_bus
         {
             let pci = builder.arc_mutex_device("pci_bus").add(|services| {
                 pci_bus::GenericPciBus::new(&mut services.register_pio(), pio_addr, pio_data)
+                    .with_amd_extended_config(amd_extended_config)
             })?;
 
             builder.register_weak_mutex_pci_bus(bus_id, Box::new(pci));
@@ -1154,6 +1156,8 @@ pub mod options {
             pub pio_addr: u16,
             /// Port io address of the 32-bit PCI DATA register
             pub pio_data: u16,
+            /// Enable fixed AMD CF8 extended configuration addressing.
+            pub amd_extended_config: bool,
         }
 
         /// PIIX4 PCI Bus

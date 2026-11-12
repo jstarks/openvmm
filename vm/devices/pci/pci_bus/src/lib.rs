@@ -191,6 +191,7 @@ struct GenericPciBusState {
 /// A generic PCI bus.
 #[derive(InspectMut)]
 pub struct GenericPciBus {
+    amd_extended_config: bool,
     // Runtime glue
     pio_addr: Box<dyn ControlPortIoIntercept>,
     pio_data: Box<dyn ControlPortIoIntercept>,
@@ -226,6 +227,7 @@ impl GenericPciBus {
         addr_control.map(pio_addr);
         data_control.map(pio_data);
         GenericPciBus {
+            amd_extended_config: false,
             pio_addr: addr_control,
             pio_data: data_control,
             pci_devices: BTreeMap::new(),
@@ -234,6 +236,13 @@ impl GenericPciBus {
                 pio_addr_reg: AddressRegister::new(),
             },
         }
+    }
+
+    /// Enables AMD CF8[27:24] routing to configuration offset bits [11:8].
+    /// This is a fixed machine capability, not a mutable CPU NB_CFG register.
+    pub fn with_amd_extended_config(mut self, enabled: bool) -> Self {
+        self.amd_extended_config = enabled;
+        self
     }
 
     /// Try to add a PCI device.
@@ -274,7 +283,7 @@ impl GenericPciBus {
         let addr = value.merge(self.state.pio_addr_reg.0);
         let addr_fixup = {
             let mut addr = AddressRegister(addr);
-            addr.fixup();
+            addr.fixup(self.amd_extended_config);
             addr
         };
 
@@ -525,8 +534,123 @@ struct AddressRegister {
     #[bits(3)] function: u8,
     #[bits(5)] device: u8,
     #[bits(8)] bus: u8,
-    #[bits(7)] reserved: u8,
+    #[bits(4)] extended_register: u8,
+    #[bits(3)] reserved: u8,
     #[bits(1)] enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chipset_device::pio::ExternallyManagedPortIoIntercepts;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use vmcore::save_restore::SaveRestore;
+
+    struct Offsets(Arc<AtomicU64>);
+
+    impl GenericPciBusDevice for Offsets {
+        fn pci_cfg_read(
+            &mut self,
+            offset: u16,
+            mut value: ByteEnabledDwordRead<'_>,
+        ) -> Option<IoResult> {
+            value.set(u32::from(offset));
+            Some(IoResult::Ok)
+        }
+
+        fn pci_cfg_write(&mut self, offset: u16, value: ByteEnabledDwordWrite) -> Option<IoResult> {
+            self.0.store(
+                (u64::from(offset) << 32) | u64::from(value.merge(0)),
+                Ordering::SeqCst,
+            );
+            Some(IoResult::Ok)
+        }
+    }
+
+    fn bus(extended: bool) -> GenericPciBus {
+        GenericPciBus::new(&mut ExternallyManagedPortIoIntercepts, 0xcf8, 0xcfc)
+            .with_amd_extended_config(extended)
+    }
+
+    #[test]
+    fn extended_cf8_routes_full_offsets_and_legacy_mode_keeps_its_original_mask() {
+        let enable = PciConfigByteEnable::from_offset_len(0, 4).unwrap();
+        for extended in [false, true] {
+            let writes = Arc::new(AtomicU64::new(0));
+            let mut bus = bus(extended);
+            assert!(
+                bus.add_pci_device(0, 0, 0, "offsets", Offsets(writes.clone()))
+                    .is_ok()
+            );
+            for high in 0..16u32 {
+                for low in [0, 0x7c, 0xfc] {
+                    let raw = 0xf000_0003 | (high << 24) | low;
+                    assert!(matches!(
+                        bus.handle_addr_write(ByteEnabledDwordWrite::new(raw, enable)),
+                        IoResult::Ok
+                    ));
+                    let expected = low | if extended { high << 8 } else { 0 };
+                    let mut data = 0u32;
+                    assert!(matches!(
+                        bus.handle_data_read(ByteEnabledDwordRead::new(&mut data, enable)),
+                        IoResult::Ok
+                    ));
+                    assert_eq!(data, expected);
+                    assert!(matches!(
+                        bus.handle_data_write(ByteEnabledDwordWrite::new(0x1234_5678, enable)),
+                        IoResult::Ok
+                    ));
+                    assert_eq!(
+                        writes.load(Ordering::SeqCst),
+                        (u64::from(expected) << 32) | 0x1234_5678
+                    );
+                    assert_eq!(
+                        {
+                            let mut readback = 0;
+                            assert!(matches!(
+                                bus.handle_addr_read(ByteEnabledDwordRead::new(
+                                    &mut readback,
+                                    enable
+                                )),
+                                IoResult::Ok
+                            ));
+                            readback
+                        },
+                        0x8000_0000 | low | if extended { high << 24 } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extended_cf8_save_restore_requires_the_matching_machine_capability() {
+        let enable = PciConfigByteEnable::from_offset_len(0, 4).unwrap();
+        let mut original = bus(true);
+        assert!(matches!(
+            original.handle_addr_write(ByteEnabledDwordWrite::new(0x8f00_00fc, enable)),
+            IoResult::Ok
+        ));
+        let saved = original.save().unwrap();
+        let mut restored = bus(true);
+        restored.restore(saved).unwrap();
+        assert_eq!(
+            restored
+                .state
+                .pio_addr_reg
+                .config_address()
+                .unwrap()
+                .byte_offset(),
+            0xffc
+        );
+        assert!(bus(false).restore(original.save().unwrap()).is_err());
+        original.state.pio_addr_reg = AddressRegister(0x8000_00fc);
+        bus(false).restore(original.save().unwrap()).unwrap();
+        original.state.pio_addr_reg = AddressRegister(0x9000_0000);
+        assert!(bus(true).restore(original.save().unwrap()).is_err());
+        original.state.pio_addr_reg = AddressRegister(0x8000_0001);
+        assert!(bus(true).restore(original.save().unwrap()).is_err());
+    }
 }
 
 impl AddressRegister {
@@ -542,22 +666,30 @@ impl AddressRegister {
         PciConfigAddress::new(
             self.bus(),
             (self.device() << 3) | self.function(),
-            (self.register() / 4).into(),
+            u16::from(self.register() / 4) | (u16::from(self.extended_register()) << 6),
         )
     }
 
     /// Set all reserved / zero bits to zero
-    fn fixup(&mut self) {
+    fn fixup(&mut self, amd_extended_config: bool) {
         // the register accessed is always DWORD aligned
         // (the low two bits are hard-coded to 0)
         self.set_register(self.register() & !0b11);
         self.set_reserved(0);
+        if !amd_extended_config {
+            self.set_extended_register(0);
+        }
     }
 }
 
 impl core::fmt::Display for AddressRegister {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{:04x}", self.address(), self.register())
+        write!(
+            f,
+            "{}@{:04x}",
+            self.address(),
+            u16::from(self.register()) | (u16::from(self.extended_register()) << 8)
+        )
     }
 }
 
@@ -609,7 +741,10 @@ mod save_restore {
 
             // saved state sanity checks
             {
-                if self.state.pio_addr_reg.reserved() != 0 {
+                if self.state.pio_addr_reg.reserved() != 0
+                    || (!self.amd_extended_config
+                        && self.state.pio_addr_reg.extended_register() != 0)
+                {
                     return Err(RestoreError::InvalidSavedState(
                         GenericPciBusRestoreError::AddressNonZeroReserved.into(),
                     ));

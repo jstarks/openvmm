@@ -120,6 +120,7 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
                     else if number==0xc0000100 {Some(system.fs.base)}
                     else if number==0xc0000101 {Some(system.gs.base)}
                     else if number==0xc0011029 {Some(system.de_cfg)}
+                    else if number==0xc001001f {Some(profile::NB_CFG)}
                     else {privilege::model::read_entry(system.entry,number)};
                 match value {
                     None=>entry::unsupported(s),
@@ -179,10 +180,14 @@ pub open spec fn write_entry_msr(s:State,length:u8)->(State,Tick) {
     else {match s.system {
         None=>entry::unsupported(s),
         Some(system)=>{
-            if number!=0xc0011029 && privilege::model::read_entry(system.entry,number) is None {entry::unsupported(s)}
+            if number!=0xc0011029 && number!=0xc001001f
+                && privilege::model::read_entry(system.entry,number) is None {entry::unsupported(s)}
             else {
                 let value=((cpu.gpr[0] as u64)&0xffff_ffffu64)|(((cpu.gpr[2] as u64)&0xffff_ffffu64)<<32);
-                if number==0xc0011029 {
+                if number==0xc001001f {
+                    if value!=profile::NB_CFG {entry::unsupported(s)}
+                    else {entry::retire(s,cpu,length,false,true)}
+                } else if number==0xc0011029 {
                     if value&!2u64!=0 {entry::unsupported(s)}
                     else {entry::retire(State {system:Some(SystemState {de_cfg:value,..system}),..s},
                         cpu,length,false,true)}

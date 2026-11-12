@@ -63,6 +63,10 @@ mod native {
     #[error("unsupported asserted chipset IRQ {0}")]
     struct UnsupportedIrq(u32);
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("bounded kernel probe reached its {0}-second deadline")]
+    struct ProbeDeadline(u32);
+
     struct ConsoleCapture(Arc<Mutex<Vec<u8>>>);
     impl futures::AsyncRead for ConsoleCapture {
         fn poll_read(
@@ -160,6 +164,7 @@ mod native {
                     || port == 0x61
                     || port == 0x80))
                 || (port >= PM_BASE && usize::from(port - PM_BASE) + size <= 0x37)
+                || (port >= 0xc000 && usize::from(port - 0xc000) + size <= 0x1000)
                 || (((0xcf8..=0xcff).contains(&port) || (0x3f8..=0x3ff).contains(&port))
                     && usize::from(port & 7) + size <= 8)
         }
@@ -737,6 +742,19 @@ mod native {
         } else {
             PROBE_TARGET
         };
+        let probe_seconds = if probe {
+            match args.next() {
+                None => 120,
+                Some(value) => value
+                    .to_str()
+                    .context("non-UTF8 probe deadline")?
+                    .parse::<u32>()
+                    .context("invalid probe deadline in seconds")?,
+            }
+        } else {
+            120
+        };
+        ensure!(probe_seconds > 0, "probe deadline must be positive");
         ensure!(args.next().is_none(), "unexpected witness arguments");
         let topology = TopologyBuilder::new_x86()
             .x2apic(X2ApicState::Unsupported)
@@ -1021,6 +1039,8 @@ mod native {
                 bus_id: vmotherboard::BusIdPci::new("pci"),
                 pio_addr: 0xcf8,
                 pio_data: 0xcfc,
+                amd_extended_config: x86_system::memory_core::cpu_core::profile::NB_CFG & (1 << 46)
+                    != 0,
             });
             let foundation = vmotherboard::options::BaseChipsetFoundation {
                 is_restoring: false,
@@ -1051,7 +1071,8 @@ mod native {
                             .claim_pio("pic-elcr", 0x4d0..=0x4d1)
                             .claim_pio("pit", 0x40..=0x43)
                             .claim_pio("speaker", 0x61..=0x61)
-                            .claim_pio("post-delay", 0x80..=0x80),
+                            .claim_pio("post-delay", 0x80..=0x80)
+                            .claim_pio("absent-pci-config-type2", 0xc000..=0xcfff),
                         &mut services.register_mmio(),
                         &mut services.register_pio(),
                     )
@@ -1130,7 +1151,19 @@ mod native {
         let stop = StopVpSource::new();
         let started = Instant::now();
         let run = Box::pin(vp.run_vp(stop.checker(), &devices));
-        match select(run, Box::pin(devices.failed())).await {
+        let diagnostic = async {
+            let deadline = async {
+                if !probe {
+                    std::future::pending::<()>().await;
+                }
+                pal_async::timer::PolledTimer::new(&driver)
+                    .sleep(std::time::Duration::from_secs(u64::from(probe_seconds)))
+                    .await;
+                devices.events.fail(Box::new(ProbeDeadline(probe_seconds)));
+            };
+            select(Box::pin(devices.failed()), Box::pin(deadline)).await;
+        };
+        match select(run, Box::pin(diagnostic)).await {
             Either::Left((Err(VpHaltReason::PowerOff), _)) => {}
             Either::Left((other, _)) => bail!("unexpected VP outcome: {other:?}"),
             Either::Right(_) if probe => {}
@@ -1161,11 +1194,32 @@ mod native {
                     failure.downcast_ref::<Error>(),
                     Some(Error::Cpu(_) | Error::Checkpoint { .. })
                 ) || failure.is::<UnconfiguredPort>()
-                    || failure.is::<UnsupportedIrq>(),
+                    || failure.is::<UnsupportedIrq>()
+                    || failure.is::<ProbeDeadline>(),
                 "unexpected probe transport/device failure: {failure}"
             );
             let registers = vp.access_state(Vtl::Vtl0).registers()?;
             let progress = vp.completed_batch_progress();
+            let current_stack_walk = walk_trace(&memory, registers.cr3, registers.rsp)?;
+            let mut current_stack_words = Vec::new();
+            if let Some(leaf) = current_stack_walk.last() {
+                if let (Some(word), Some(shift)) = (leaf["word"].as_u64(), leaf["shift"].as_u64()) {
+                    if word & 1 != 0
+                        && (shift == 12 || ((shift == 21 || shift == 30) && word & 0x80 != 0))
+                    {
+                        let offset_mask = (1u64 << shift) - 1;
+                        let physical = (word & 0x0000_ffff_ffff_f000 & !offset_mask)
+                            | (registers.rsp & offset_mask);
+                        let bytes = (0x1000 - (registers.rsp & 0xfff)).min(1024);
+                        for offset in (0..bytes.saturating_sub(7)).step_by(8) {
+                            current_stack_words.push(serde_json::json!({
+                                "address":registers.rsp+offset,
+                                "value":memory.read_plain::<u64>(physical+offset)?,
+                            }));
+                        }
+                    }
+                }
+            }
             let mut stack_words = Vec::new();
             for address in (0x2603c00..0x2603f48).step_by(8) {
                 let value = memory.read_plain::<u64>(address)?;
@@ -1193,6 +1247,8 @@ mod native {
                     "instruction_walk":walk_trace(&memory,registers.cr3,registers.rip)?,
                     "cr2_walk":walk_trace(&memory,registers.cr3,registers.cr2)?,
                     "stack_words":stack_words,
+                    "current_stack_walk":current_stack_walk,
+                    "current_stack_words":current_stack_words,
                     "serial_bytes":serial_bytes,
                     "serial_output":serial_output,
                     "calibration":{

@@ -178,6 +178,7 @@ impl SharedEventMachine {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
                 if self.core.cpu().gpr[1]&0xffff_ffff==0xc0011029
+                    || self.core.cpu().gpr[1]&0xffff_ffff==0xc001001f
                     || memory_core::cpu_core::privilege::read_entry(system.entry,self.core.cpu().gpr[1]&0xffff_ffff).is_some() {
                     return self.write_entry_msr(input.length);
                 }

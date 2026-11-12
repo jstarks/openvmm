@@ -28,6 +28,9 @@ pub fn core_pmu_absent(number:u64)->(out:bool)
 
 pub const TSC_HZ:u64=1_000_000_000;
 
+// The initial AMD platform keeps extended CF8 configuration permanently enabled.
+pub const NB_CFG:u64=1u64<<46;
+
 // DAZ is not exposed by the bounded legacy SSE state profile.
 pub const MXCSR_MASK:u32=0xffbf;
 

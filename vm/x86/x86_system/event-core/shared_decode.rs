@@ -111,9 +111,23 @@ impl SharedEventMachine {
             final(self)@.core==old(self)@.core,
     {
         let window=match self.decode_window() {Some(w)=>w,None=>return false};
-        if window.input.sequence!=sequence || length<window.input.length || length>window.available {
+        if window.input.sequence!=sequence {
             return false;
         }
+        self.complete_observed_window(window,length,decision)
+    }
+
+    #[inline(always)]
+    /// The driver retains this observation across a callback that cannot mutate the core.
+    pub(super) fn complete_observed_window(&mut self,window:DecodeWindow,length:u8,
+        decision:DecodeDecision)->(accepted:bool)
+        requires old(self).invariant(),spec::decode::window(old(self)@)==Some(window),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::decode::complete_window(
+                old(self)@,window.input.sequence,length,decision),
+            final(self)@.core==old(self)@.core,
+    {
+        if length<window.input.length || length>window.available {return false;}
         let input=if length==window.input.length {window.input}
             else {DecodeInput {bytes:window.bytes,length,..window.input}};
         self.phase=Phase::Admitted {input,decision};

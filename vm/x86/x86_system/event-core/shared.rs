@@ -792,7 +792,7 @@ impl SharedEventMachine {
                         let accepted = if length == input.length {
                             self.complete_decode(input.sequence, decision)
                         } else {
-                            self.complete_decode_window(input.sequence, length, decision)
+                            self.complete_observed_window(window, length, decision)
                         };
                         if !accepted {
                             return Err(RunError::DecodeCompletion(input.sequence));

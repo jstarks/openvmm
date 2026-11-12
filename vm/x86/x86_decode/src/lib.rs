@@ -477,6 +477,13 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         return Some(EntryInstruction::RepeatStore { width });
     }
     let get = |index| operand(&instruction, index, Operation::Mov, size);
+    if instruction.mnemonic() == Mnemonic::Bswap {
+        let Operand::Register(dst) = get(0)? else {
+            return None;
+        };
+        return matches!(dst.width(), Width::Dword | Width::Qword)
+            .then_some(EntryInstruction::ByteSwap { dst });
+    }
     match encoding.bytes() {
         [0x0f, 0x31] => return Some(EntryInstruction::ReadTimestamp),
         [0x0f, 0x32] => return Some(EntryInstruction::ReadMsr),

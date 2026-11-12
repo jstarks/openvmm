@@ -40,6 +40,45 @@ fn pause_hint_is_not_misclassified_as_rep_string_execution() {
 }
 
 #[test]
+fn byte_swap_admits_defined_widths_and_extended_opcode_registers() {
+    use x86_system::shared::{decode::DecodeDecision, entry::Instruction};
+    for index in 0..16 {
+        for width in [Width::Dword, Width::Qword] {
+            let rex =
+                0x40 | if index >= 8 { 1 } else { 0 } | if width == Width::Qword { 8 } else { 0 };
+            let mut bytes = Vec::new();
+            if rex != 0x40 {
+                bytes.push(rex);
+            }
+            bytes.extend_from_slice(&[0x0f, 0xc8 | (index % 8)]);
+            assert_eq!(
+                entry(&bytes),
+                Instruction::ByteSwap {
+                    dst: reg(index, width, false)
+                }
+            );
+        }
+    }
+    assert_eq!(
+        entry(&[0x66, 0x48, 0x0f, 0xc8]),
+        Instruction::ByteSwap {
+            dst: reg(0, Width::Qword, false)
+        }
+    );
+    assert_eq!(
+        admission(&[0xf0, 0x0f, 0xc8]),
+        DecodeDecision::InvalidOpcode
+    );
+    for bytes in [
+        &[0x66, 0x0f, 0xc8][..],
+        &[0xf2, 0x0f, 0xc8],
+        &[0xf3, 0x0f, 0xc8],
+    ] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+}
+
+#[test]
 fn memory_xchg_owns_all_scalar_widths_and_implicit_or_explicit_locking() {
     use x86_system::shared::entry::Instruction;
     for (prefix, opcode, width) in [

@@ -28,6 +28,7 @@ pub enum Instruction {
     Divide { source: Operand, width: Width, signed: bool },
     Bit { operation: operations::BitOperation, dst: Register, index: Operand },
     Scan { dst:Register,source:Operand,reverse:bool },
+    ByteSwap { dst:Register },
     ReadControl { number: u8, dst: Register },
     WriteControl { number: u8, source: Operand },
     ReadDebug {number:u8,dst:Register},
@@ -130,6 +131,25 @@ pub(super) fn scalar(cpu: State, source: Operand) -> (out: Option<u64>)
         Operand::Immediate(imm) => Some(imm.value),
         _ => None,
     }
+}
+
+fn byte_swap(value:u64,wide:bool)->(out:u64)
+    ensures out==spec::entry::byte_swap(value,wide),
+{
+    let pairs=((value & 0x00ff_00ff_00ff_00ffu64)<<8)
+        | ((value>>8)&0x00ff_00ff_00ff_00ffu64);
+    let halves=((pairs & 0x0000_ffff_0000_ffffu64)<<16)
+        | ((pairs>>16)&0x0000_ffff_0000_ffffu64);
+    let swapped=(halves<<32)|(halves>>32);
+    proof {
+        assert(swapped==spec::entry::byte_swap(value,true)) by(bit_vector)
+            requires pairs==((value & 0x00ff_00ff_00ff_00ffu64)<<8)
+                    | ((value>>8)&0x00ff_00ff_00ff_00ffu64),
+                halves==((pairs & 0x0000_ffff_0000_ffffu64)<<16)
+                    | ((pairs>>16)&0x0000_ffff_0000_ffffu64),
+                swapped==(halves<<32)|(halves>>32);
+    }
+    if wide {swapped} else {swapped>>32}
 }
 
 pub(super) fn supported_access(address:u64,width:Width)->(out:bool)
@@ -274,7 +294,7 @@ impl SharedEventMachine {
                 | Instruction::ReadSegment {..}
                 => self.execute_conditions(instruction,length),
             Instruction::Nop | Instruction::Fence | Instruction::Cpuid | Instruction::Branch {..}
-                | Instruction::ZeroExtend {..} | Instruction::Jump {..}
+                | Instruction::ZeroExtend {..} | Instruction::Jump {..} | Instruction::ByteSwap {..}
                 => self.execute_register(instruction,length),
             _=>self.execute_legacy(instruction,length),
         }
@@ -511,7 +531,7 @@ impl SharedEventMachine {
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
             1<=length<=15,old(self).core@.cpu.flags&0x100u64==0,
             instruction is Nop || instruction is Fence || instruction is Cpuid || instruction is Branch
-                || instruction is ZeroExtend || instruction is Jump,
+                || instruction is ZeroExtend || instruction is Jump || instruction is ByteSwap,
         ensures final(self).invariant(),
             (final(self)@,tick)==spec::entry::execute(old(self)@,instruction,length),
     {
@@ -521,6 +541,17 @@ impl SharedEventMachine {
         match instruction {
             Instruction::Nop=>self.retire_entry(cpu,length,false,false),
             Instruction::Fence=>self.retire_entry(cpu,length,false,true),
+            Instruction::ByteSwap {dst}=>{
+                if !dst.is_valid() || !matches!(dst.width(),Width::Dword | Width::Qword) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let value=byte_swap(dst.read(&cpu.gpr),dst.width()==Width::Qword);
+                let ghost registers=cpu.gpr@;
+                dst.write(&mut cpu.gpr,value);
+                assert(cpu@.gpr =~= operand::model::write(registers,dst,value)
+                    .map(|i:int,v:u64|v as int));
+                self.retire_entry(cpu,length,false,false)
+            },
             Instruction::Cpuid => {
                 let function = (cpu.gpr[0] & 0xffff_ffff) as u32;
                 let subleaf = (cpu.gpr[1] & 0xffff_ffff) as u32;

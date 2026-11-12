@@ -23,6 +23,13 @@ verus! {
 pub open spec fn registers(cpu: model::State) -> Seq<u64> {
     cpu.gpr.map(|i: int, value: int| value as u64)
 }
+pub open spec fn byte_swap(value:u64,wide:bool)->u64 {
+    let swapped=((value&0xffu64)<<56) | ((value&0xff00u64)<<40)
+        | ((value&0xff0000u64)<<24) | ((value&0xff000000u64)<<8)
+        | ((value>>8)&0xff000000u64) | ((value>>24)&0xff0000u64)
+        | ((value>>40)&0xff00u64) | (value>>56);
+    if wide {swapped} else {swapped>>32}
+}
 pub open spec fn scalar(cpu: model::State, source: Operand) -> Option<u64> {
     match source {
         Operand::Register(reg) => if reg.valid() { Some(operand::model::read(registers(cpu), reg)) } else { None },
@@ -223,6 +230,12 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
+        Instruction::ByteSwap {dst}=>{
+            if !dst.valid() || !(dst@.width is Dword || dst@.width is Qword) {unsupported(s)}
+            else {retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,
+                byte_swap(operand::model::read(registers(cpu),dst),dst@.width==Width::Qword))
+                    .map(|i:int,v:u64|v as int),..cpu},length,false,false)}
+        },
         Instruction::ReadTimestamp=>timestamp(s,length),
         Instruction::ExchangeMemory {address,source}=>exchange_memory(s,address,source,length),
         Instruction::Breakpoint=>privilege::breakpoint(s,length),

@@ -38,6 +38,7 @@ pub struct Modifier {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AtomicOperation {
     CompareExchange { expected: u64, replacement: u64 },
+    Exchange {replacement:u64},
     Integer { operation: integer::Operation, source: u64, flags: u64 },
 }
 
@@ -120,7 +121,7 @@ impl SharedMmu {
                 && self.size == spec::modify_size(c.width)
                 && spec::compare_admitted(self.va, c.width)
                 && match c.operation {
-                    AtomicOperation::CompareExchange { .. } => true,
+                    AtomicOperation::CompareExchange { .. } | AtomicOperation::Exchange {..} => true,
                     AtomicOperation::Integer { operation, .. } =>
                         spec::locked_admitted(self.va, operation, c.width),
                 }

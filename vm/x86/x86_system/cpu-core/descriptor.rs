@@ -39,6 +39,11 @@ pub mod model {
     pub open spec fn load_data(word: u64, selector: u16) -> Option<SegmentState> {
         if admitted(word, selector) { Some(image(word, selector)) } else { None }
     }
+    pub open spec fn load_thread_data(word:u64,selector:u16)->Option<SegmentState> {
+        if admitted(word&!(3u64<<45),selector&!3u16)
+            && (selector&3u16) as u64 <= (word>>45)&3u64 {Some(image(word,selector))}
+        else {None}
+    }
     pub open spec fn admitted_code(word: u64, selector: u16) -> bool {
         selector != 0 && selector & 7u16 == 0
         && base(word) == 0 && limit(word) == u32::MAX
@@ -88,6 +93,33 @@ pub fn load_task(low:u64,high:u64,selector:u16)->(out:Option<SegmentState>)
     if selector==0 || selector&7!=0 || attributes!=0x89 || high>>32!=0
         || !super::system::supported_task(image) {return None;}
     Some(image)
+}
+
+/// Flat accessed writable GDT data for FS/GS at CPL0, with RPL <= DPL.
+pub fn load_thread_data(word:u64,selector:u16)->(out:Option<SegmentState>)
+    ensures out==model::load_thread_data(word,selector),
+        out.is_some() ==> system::model::data_or_null(out.unwrap()) && out.unwrap().base==0,
+{
+    let normalized=word&!(3u64<<45);
+    let clean=selector&!3u16;
+    proof {lemma_flat_correspondence(normalized,clean);}
+    let Some(segment)=load_data(normalized,clean) else {return None;};
+    let raw_dpl=(word>>45)&3u64;
+    assert(raw_dpl<=3) by(bit_vector) requires raw_dpl==(word>>45)&3u64;
+    let dpl=raw_dpl as u16;
+    if selector&3>dpl {return None;}
+    let attributes=0xc093u16|(dpl<<5);
+    proof {
+        assert(selector>=8 && selector&4u16==0) by(bit_vector)
+            requires clean==selector&!3u16,clean!=0,clean&7u16==0;
+        assert((attributes&!0x60u16)==0xc093u16 && ((attributes>>5)&3u16)==dpl) by(bit_vector)
+            requires attributes==0xc093u16|(dpl<<5),dpl<=3;
+        assert(model::base(word)==0 && model::limit(word)==u32::MAX
+            && model::attributes(word)==attributes) by(bit_vector)
+            requires normalized==word&!(3u64<<45),normalized==0x00cf_9300_0000_ffffu64,
+                dpl==((word>>45)&3u64) as u16,attributes==0xc093u16|(dpl<<5);
+    }
+    Some(SegmentState {selector,attributes,..segment})
 }
 
 /// Bounded CPL0 nonconforming readable/accessed long code, L=G=1,

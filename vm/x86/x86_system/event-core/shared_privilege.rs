@@ -10,6 +10,32 @@ use memory_core::cpu_core::{privilege, profile};
 
 verus! {
 impl SharedEventMachine {
+    pub(super) fn swap_gs(&mut self,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::swap_gs(old(self)@,length),
+    {
+        reveal(spec::privilege::swap_gs);
+        let cpu=self.core.cpu();
+        if length==0 || length>15 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        let base=system.entry.kernel_gs_base;
+        if !canonical(base) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        system.entry.kernel_gs_base=system.gs.base;
+        system.gs.base=base;
+        self.system=Some(system);
+        self.retire_entry(cpu,length,false,false)
+    }
+
     pub(super) fn breakpoint(&mut self,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
@@ -157,7 +183,7 @@ impl SharedEventMachine {
                 self.retire_entry(cpu,length,false,true)
             },
             Instruction::ReadMsr=>{
-                if cpu.gpr[1]&0xffff_ffff==0x49 {
+                if cpu.gpr[1]&0xffff_ffff==0x49 || profile::core_pmu_absent(cpu.gpr[1]&0xffff_ffff) {
                     return self.start_entry(Event::GeneralProtection);
                 }
                 let Some(system)=self.system else {

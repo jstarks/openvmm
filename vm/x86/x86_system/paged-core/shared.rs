@@ -153,6 +153,16 @@ impl SharedMachine {
         self.mmu.begin_modify_span(address, operation, source, flags, width)
     }
 
+    pub(crate) fn boundary_exchange(&mut self,address:u64,replacement:u64,
+        width:memory_core::cpu_core::operand::Width)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),(final(self)@,accepted)==
+            spec::boundary_exchange(old(self)@,address,replacement,width),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_exchange(address,replacement,width)
+    }
+
     pub(crate) fn boundary_compare_exchange(&mut self,address:u64,expected:u64,replacement:u64,
         width:memory_core::cpu_core::operand::Width)->(accepted:bool)
         requires old(self).invariant(),

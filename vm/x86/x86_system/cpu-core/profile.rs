@@ -12,6 +12,20 @@ pub const MICROCODE_REVISION:u32=0;
 // Neither IBPB nor SBPB is exposed by this target; PRED_CMD is absent.
 pub const PRED_CMD_AVAILABLE:bool=false;
 
+// Neither legacy core counters nor their extended aliases are implemented.
+pub const CORE_PMU_AVAILABLE:bool=false;
+
+pub open spec fn absent_core_pmu(number:u64)->bool {
+    !CORE_PMU_AVAILABLE && ((0xc0010000<=number<=0xc0010007)
+        || (0xc0010200<=number<=0xc001020b))
+}
+pub fn core_pmu_absent(number:u64)->(out:bool)
+    ensures out==absent_core_pmu(number),
+{
+    !CORE_PMU_AVAILABLE && ((number>=0xc0010000 && number<=0xc0010007)
+        || (number>=0xc0010200 && number<=0xc001020b))
+}
+
 pub const TSC_HZ:u64=1_000_000_000;
 
 // DAZ is not exposed by the bounded legacy SSE state profile.

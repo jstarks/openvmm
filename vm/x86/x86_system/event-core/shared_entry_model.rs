@@ -204,6 +204,19 @@ pub open spec fn locked_alu(s:State,operation:integer::Operation,destination:Ope
     }}
 }
 #[verifier::opaque]
+pub open spec fn exchange_memory(s:State,address:Address,source:operand::Register,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if length==0 || length>15 || !address.valid() || !source.valid() {unsupported(s)}
+    else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {
+        let at=linear(s,address,length);
+        let result=c::boundary_exchange(s.core,at,operand::model::read(registers(cpu),source),source@.width);
+        if !result.1 {unsupported(s)}
+        else {(State {core:result.0,phase:Phase::EntryMemory {address:at,length,
+            task:MemoryTask::Exchange {register:source}},..s},Tick::Pending)}
+    }
+}
+#[verifier::opaque]
 pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (State, Tick) {
     let cpu = s.core.cpu;
     if length == 0 || length > 15 { unsupported(s) }
@@ -211,7 +224,9 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
     } else { match instruction {
         Instruction::ReadTimestamp=>timestamp(s,length),
+        Instruction::ExchangeMemory {address,source}=>exchange_memory(s,address,source,length),
         Instruction::Breakpoint=>privilege::breakpoint(s,length),
+        Instruction::SwapGs=>privilege::swap_gs(s,length),
         Instruction::LoadTask {source}=>load_task(s,source,length),
         Instruction::LoadLdt {source}=>{
             if s.system is None || !source.valid() || source@.width!=Width::Word
@@ -427,16 +442,19 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                 let system=s.system.unwrap();
                 let selector = (operand::model::read(registers(cpu), src) & 0xffffu64) as u16;
                 let offset = (selector & !7u16) as u64;
-                if (dst is Fs && system.fs.base!=0) || (dst is Gs && system.gs.base!=0) {unsupported(s)}
-                else if selector==0 {
+                if selector==0 || (selector<4 && (dst is Fs || dst is Gs)) {
                     let null=super::super::memory_core::cpu_core::system::NULL_SEGMENT;
                     let system=match dst {
                         Segment::Ds=>SystemState {ds:null,..system},Segment::Ss=>SystemState {ss:null,..system},
-                        Segment::Es=>SystemState {es:null,..system},Segment::Fs=>SystemState {fs:null,..system},
-                        Segment::Gs=>SystemState {gs:null,..system},_=>system,
+                        Segment::Es=>SystemState {es:null,..system},
+                        Segment::Fs=>SystemState {fs:super::super::memory_core::cpu_core::system::SegmentState {
+                            base:system.fs.base,selector,..null},..system},
+                        Segment::Gs=>SystemState {gs:super::super::memory_core::cpu_core::system::SegmentState {
+                            base:system.gs.base,selector,..null},..system},_=>system,
                     };
                     retire(State {system:Some(system),..s},cpu,length,dst is Ss,false)
-                } else if selector % 8 != 0 || offset as int + 7 > s.tables.gdt_limit as int
+                } else if (if dst is Fs || dst is Gs {selector&4u16!=0} else {selector%8!=0})
+                    || offset as int + 7 > s.tables.gdt_limit as int
                     || s.tables.gdt_base as int + offset as int > u64::MAX {
                     stop(s, EventDiagnostic::Descriptor(Stage::Stack))
                 } else { memory(s, (s.tables.gdt_base as int + offset as int) as u64,
@@ -478,6 +496,32 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     } }
 }
 #[verifier::opaque]
+pub open spec fn exchange_value(s:State,register:operand::Register,value:u64,length:u8)->(State,Tick) {
+    if !register.valid() {unsupported(s)}
+    else {retire(s,model::State {gpr:operand::model::write(registers(s.core.cpu),register,value)
+        .map(|i:int,v:u64|v as int),..s.core.cpu},length,false,true)}
+}
+#[verifier::opaque]
+pub open spec fn segment_value(s:State,dst:Segment,selector:u16,value:u64,length:u8)->(State,Tick) {
+    let loaded=if dst is Fs || dst is Gs {descriptor::model::load_thread_data(value,selector)}
+        else {descriptor::model::load_data(value,selector)};
+    match loaded {
+        None=>stop(s,EventDiagnostic::Descriptor(Stage::Stack)),
+        Some(segment)=>match s.system {
+            None=>unsupported(s),
+            Some(system)=>{
+                let updated=match dst {
+                    Segment::Ds=>SystemState {ds:segment,..system},Segment::Ss=>SystemState {ss:segment,..system},
+                    Segment::Es=>SystemState {es:segment,..system},Segment::Fs=>SystemState {fs:segment,..system},
+                    Segment::Gs=>SystemState {gs:segment,..system},_=>system,
+                };
+                if !(dst is Ds || dst is Ss || dst is Es || dst is Fs || dst is Gs) {unsupported(s)}
+                else {retire(State {system:Some(updated),..s},s.core.cpu,length,dst is Ss,false)}
+            },
+        },
+    }
+}
+#[verifier::opaque]
 pub open spec fn pop_memory_value(s:State,value:u64,destination:Address,stack:u64,length:u8)->(State,Tick) {
     let cpu=s.core.cpu;
     if !destination.valid() || stack as int+8>u64::MAX {unsupported(s)}
@@ -495,6 +539,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::Exchange {register}=>exchange_value(s,register,value,length),
         MemoryTask::SaveFp {index,wide}=>privilege::save_fp_value(s,address,index,wide,length),
         MemoryTask::ExchangeAdd {register:source,locked}=>{
             if !source.valid() {unsupported(s)} else {
@@ -618,24 +663,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
                 retire(State { tables, ..s }, cpu, length, false, false)
             }
         },
-        MemoryTask::Segment { segment: dst, selector } => match descriptor::model::load_data(value, selector) {
-            None => stop(s, EventDiagnostic::Descriptor(Stage::Stack)),
-            Some(segment) => match s.system {
-                None => unsupported(s),
-                Some(system) => {
-                    let system = match dst {
-                        Segment::Ds => super::super::memory_core::cpu_core::system::SystemState { ds: segment, ..system },
-                        Segment::Ss => super::super::memory_core::cpu_core::system::SystemState { ss: segment, ..system },
-                        Segment::Es => super::super::memory_core::cpu_core::system::SystemState { es: segment, ..system },
-                        Segment::Fs => super::super::memory_core::cpu_core::system::SystemState { fs: segment, ..system },
-                        Segment::Gs => super::super::memory_core::cpu_core::system::SystemState { gs: segment, ..system },
-                        _ => system,
-                    };
-                    if !(dst is Ds || dst is Ss || dst is Es || dst is Fs || dst is Gs) { unsupported(s) }
-                    else { retire(State { system: Some(system), ..s }, cpu, length, dst is Ss, false) }
-                },
-            },
-        },
+        MemoryTask::Segment {segment:dst,selector}=>segment_value(s,dst,selector,value,length),
         MemoryTask::StackCommit { stack } => retire(s, model::State {
             gpr: cpu.gpr.update(4, stack as int), ..cpu }, length, false, false),
         MemoryTask::StoreTableBase {base}=>{

@@ -18,6 +18,7 @@ pub enum Instruction {
     Fence,
     InitializeX87,
     Breakpoint,
+    SwapGs,
     SaveFp {address:Address,wide:bool},
     Integer { operation: integer::Operation, dst: Register, source: Operand },
     Alu { operation: integer::Operation, destination: Operand, source: Operand },
@@ -43,6 +44,7 @@ pub enum Instruction {
     CompareExchange { destination: Operand, source: Register },
     LockedAlu { operation:integer::Operation,destination:Operand,source:Operand },
     ExchangeAdd {destination:Operand,source:Register,locked:bool},
+    ExchangeMemory {address:Address,source:Register},
     ReadMsr,
     ReadTimestamp,
     PortIo { port: Port, width: Width, write: bool },
@@ -116,6 +118,7 @@ pub enum MemoryTask {
     CompareExchange { width: Width },
     LockedAlu {operation:integer::Operation,source:u64,width:Width},
     ExchangeAdd {register:Register,locked:bool},
+    Exchange {register:Register},
     Scan {dst:Register,reverse:bool},
 }
 
@@ -189,6 +192,10 @@ impl SharedEventMachine {
                 reveal(spec::entry::execute);
                 self.breakpoint(length)
             },
+            Instruction::SwapGs=>{
+                reveal(spec::entry::execute);
+                self.swap_gs(length)
+            },
             Instruction::InitializeX87=>{
                 reveal(spec::entry::execute);
                 self.initialize_x87(length)
@@ -233,6 +240,10 @@ impl SharedEventMachine {
             Instruction::ExchangeAdd {destination,source,locked}=>{
                 reveal(spec::entry::execute);
                 self.execute_exchange_add(destination,source,locked,length)
+            },
+            Instruction::ExchangeMemory {address,source}=>{
+                reveal(spec::entry::execute);
+                self.execute_exchange_memory(address,source,length)
             },
             Instruction::MultiplyWide {source,width,signed}=>{
                 reveal(spec::entry::execute);
@@ -656,21 +667,21 @@ impl SharedEventMachine {
                 }
                 let selector = (src.read(&cpu.gpr) & 0xffff) as u16;
                 let Some(mut system)=self.system else {assert(false);return Tick::Waiting;};
-                if (matches!(dst,Segment::Fs) && system.fs.base!=0)
-                    || (matches!(dst,Segment::Gs) && system.gs.base!=0) {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                }
-                if selector==0 {
+                if selector==0 || (selector<4 && matches!(dst,Segment::Fs|Segment::Gs)) {
+                    // This synthetic profile preserves null-loaded FS/GS bases where AMD leaves them undefined.
                     match dst {
                         Segment::Ds=>system.ds=NULL_SEGMENT,Segment::Ss=>system.ss=NULL_SEGMENT,
-                        Segment::Es=>system.es=NULL_SEGMENT,Segment::Fs=>system.fs=NULL_SEGMENT,
-                        Segment::Gs=>system.gs=NULL_SEGMENT,_=>{assert(false);},
+                        Segment::Es=>system.es=NULL_SEGMENT,
+                        Segment::Fs=>system.fs=SegmentState {base:system.fs.base,selector,..NULL_SEGMENT},
+                        Segment::Gs=>system.gs=SegmentState {base:system.gs.base,selector,..NULL_SEGMENT},
+                        _=>{assert(false);},
                     }
                     self.system=Some(system);
                     return self.retire_entry(cpu,length,matches!(dst,Segment::Ss),false);
                 }
                 let offset = (selector & !7u16) as u64;
-                if selector % 8 != 0 || offset + 7 > self.tables.gdt_limit as u64
+                if (if matches!(dst,Segment::Fs|Segment::Gs) {selector&4!=0} else {selector%8!=0})
+                    || offset + 7 > self.tables.gdt_limit as u64
                     || self.tables.gdt_base > u64::MAX - offset {
                     return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
                 }
@@ -783,6 +794,29 @@ impl SharedEventMachine {
             }
     }
 
+    pub(super) fn execute_exchange_memory(&mut self,address:Address,source:Register,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::entry::exchange_memory(old(self)@,address,source,length),
+    {
+        reveal(spec::entry::exchange_memory);
+        let cpu=self.core.cpu();
+        if length==0 || length>15 || !address.is_valid() || !source.is_valid() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        let accepted=self.core.boundary_exchange(linear,source.read(&cpu.gpr),source.width());
+        if !accepted {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        self.phase=Phase::EntryMemory {address:linear,length,task:MemoryTask::Exchange {register:source}};
+        Tick::Pending
+    }
+
     #[verifier::spinoff_prover]
     pub(super) fn execute_locked_alu(&mut self,operation:integer::Operation,destination:Operand,
         source:Operand,length:u8)->(tick:Tick)
@@ -817,6 +851,50 @@ impl SharedEventMachine {
         self.phase=Phase::EntryMemory {address:linear,length,
             task:MemoryTask::LockedAlu {operation,source:value,width}};
         Tick::Pending
+    }
+
+    pub(super) fn exchange_value(&mut self,register:Register,value:u64,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::entry::exchange_value(old(self)@,register,value,length),
+    {
+        reveal(spec::entry::exchange_value);
+        if !register.is_valid() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let mut cpu=self.core.cpu();
+        assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
+        let ghost registers=cpu.gpr@;
+        register.write(&mut cpu.gpr,value);
+        assert(cpu@.gpr =~= operand::model::write(registers,register,value)
+            .map(|i:int,v:u64|v as int));
+        self.retire_entry(cpu,length,false,true)
+    }
+
+    pub(super) fn segment_value(&mut self,dst:Segment,selector:u16,value:u64,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::entry::segment_value(old(self)@,dst,selector,value,length),
+    {
+        reveal(spec::entry::segment_value);
+        let loaded=if matches!(dst,Segment::Fs|Segment::Gs) {descriptor::load_thread_data(value,selector)}
+            else {descriptor::load_data(value,selector)};
+        let Some(segment)=loaded else {
+            return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
+        };
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        match dst {
+            Segment::Ds=>system.ds=segment,Segment::Ss=>system.ss=segment,Segment::Es=>system.es=segment,
+            Segment::Fs=>system.fs=segment,Segment::Gs=>system.gs=segment,
+            _=>return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+        }
+        self.system=Some(system);
+        let cpu=self.core.cpu();
+        self.retire_entry(cpu,length,matches!(dst,Segment::Ss),false)
     }
 
     pub(super) fn pop_memory_value(&mut self,value:u64,destination:Address,stack:u64,length:u8)->(tick:Tick)
@@ -873,6 +951,9 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::Exchange {register}=>{
+                return self.exchange_value(register,value,length);
+            },
             MemoryTask::SaveFp {index,wide}=>{
                 return self.finish_fp_save(address,index,wide,length);
             },
@@ -1037,18 +1118,7 @@ impl SharedEventMachine {
                 return self.retire_entry(cpu, length, false, false);
             },
             MemoryTask::Segment { segment: dst, selector } => {
-                let Some(segment) = descriptor::load_data(value, selector) else {
-                    return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
-                };
-                let Some(mut system) = self.system else {
-                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-                };
-                match dst { Segment::Ds => system.ds = segment, Segment::Ss => system.ss = segment,
-                    Segment::Es => system.es = segment,Segment::Fs=>system.fs=segment,Segment::Gs=>system.gs=segment,
-                    _ => return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
-                }
-                self.system = Some(system);
-                return self.retire_entry(cpu, length, matches!(dst, Segment::Ss), false);
+                return self.segment_value(dst,selector,value,length);
             },
             MemoryTask::StoreTableBase {base}=>{
                 if address>u64::MAX-2 {

@@ -143,9 +143,10 @@ pub mod model {
     // APM Volume 2 §§4.5.3, 4.8.2: FS/GS bases can be set independently
     // by their MSRs. This validates retained metadata, not MOV Sreg effects.
     pub open spec fn data_or_null(s: SegmentState) -> bool {
-        (s.limit == 0 && s.selector == 0 && s.attributes == 0)
-        || (s.limit == u32::MAX && s.selector != 0 && s.selector & 7u16 == 0
-            && s.attributes == 0xc093)
+        (s.limit == 0 && s.selector < 4 && s.attributes == 0)
+        || (s.limit == u32::MAX && s.selector >= 8 && s.selector & 4u16 == 0
+            && s.attributes & !0x60u16 == 0xc093
+            && s.selector & 3u16 <= (s.attributes >> 5) & 3u16)
     }
     pub open spec fn unused(s: SegmentState, attributes: u16) -> bool {
         s == NULL_SEGMENT || (s.base == 0 && s.limit == 0xffff
@@ -257,9 +258,10 @@ fn supported_data_or_null(s: SegmentState) -> (out: bool)
 fn data_or_null(s: SegmentState) -> (out: bool)
     ensures out == model::data_or_null(s),
 {
-    (s.limit == 0 && s.selector == 0 && s.attributes == 0)
-        || (s.limit == u32::MAX && s.selector != 0 && s.selector & 7 == 0
-            && s.attributes == 0xc093)
+    (s.limit == 0 && s.selector < 4 && s.attributes == 0)
+        || (s.limit == u32::MAX && s.selector >= 8 && s.selector & 4 == 0
+            && s.attributes & !0x60 == 0xc093
+            && s.selector & 3 <= (s.attributes >> 5) & 3)
 }
 
 fn unused(s: SegmentState, attributes: u16) -> (out: bool)

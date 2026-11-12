@@ -176,11 +176,17 @@ pub open spec fn locked_begin(s: State, va: u64, operation: integer::Operation,
             operation: AtomicOperation::Integer { operation, source, flags }, width }), ..t }
     }
 }
+pub open spec fn exchange_begin(s:State,va:u64,replacement:u64,width:Width)->State {
+    if !compare_admitted(va,width) {s}
+    else {State {comparison:Some(Comparison {operation:AtomicOperation::Exchange {replacement},width}),
+        ..compare_begin(s,va,0,replacement,width)}}
+}
 pub open spec fn atomic_observed(data: WordData, size: u8) -> u64 {
     (data.first >> ((data.address % 8 * 8) as u32)) & size_mask(size)
 }
 pub open spec fn atomic_value(original: u64, size: u8, comparison: Comparison) -> u64 {
     match comparison.operation {
+        AtomicOperation::Exchange {replacement}=>replacement,
         AtomicOperation::CompareExchange { expected, replacement } =>
             if original == expected & size_mask(size) { replacement } else { original },
         AtomicOperation::Integer { operation, source, flags } =>

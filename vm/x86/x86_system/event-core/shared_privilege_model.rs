@@ -13,6 +13,20 @@ use super::*;
 
 verus! {
 #[verifier::opaque]
+pub open spec fn swap_gs(s:State,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if length==0 || length>15 {entry::unsupported(s)}
+    else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {match s.system {
+        None=>entry::unsupported(s),
+        Some(system)=>if !mmu_model::canonical(system.entry.kernel_gs_base as int) {entry::unsupported(s)}
+            else {entry::retire(State {system:Some(SystemState {
+                entry:system::EntryMsrs {kernel_gs_base:system.gs.base,..system.entry},
+                gs:system::SegmentState {base:system.entry.kernel_gs_base,..system.gs},..system}),..s},
+                cpu,length,false,false)},
+    }}
+}
+#[verifier::opaque]
 pub open spec fn breakpoint(s:State,length:u8)->(State,Tick) {
     if length!=1 {entry::unsupported(s)}
     else if s.core.cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
@@ -94,7 +108,8 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
                 _=>entry::unsupported(s),
             },
         },
-        Instruction::ReadMsr=>if (cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64 {
+        Instruction::ReadMsr=>if (cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64
+            || profile::absent_core_pmu((cpu.gpr[1] as u64)&0xffff_ffffu64) {
             entry(s,Event::GeneralProtection)
         } else {match s.system {
             None=>entry::unsupported(s),

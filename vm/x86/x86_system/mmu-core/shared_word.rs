@@ -7,6 +7,19 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
+    pub fn begin_exchange(&mut self,va:u64,replacement:u64,width:Width)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted==(!spec::active(old(self)@.phase) && spec::compare_admitted(va,width)),
+            final(self)@==if accepted {spec::exchange_begin(old(self)@,va,replacement,width)} else {old(self)@},
+    {
+        let accepted=self.begin_compare_exchange(va,0,replacement,width);
+        if accepted {
+            self.comparison=Some(Comparison {operation:AtomicOperation::Exchange {replacement},width});
+        }
+        accepted
+    }
+
     /// WRITE-checked, naturally aligned RAM CAS in one physical beat.
     /// Completion reports the operand observed by the successful host CAS,
     /// including on architectural mismatch (a same-value write cycle).
@@ -82,6 +95,7 @@ impl SharedMmu {
         let comparison = self.comparison.unwrap();
         let original = self.atomic_observed(data);
         let value = match comparison.operation {
+            AtomicOperation::Exchange {replacement}=>replacement,
             AtomicOperation::CompareExchange { expected, replacement } =>
                 if original == expected & self.size_mask() { replacement } else { original },
             AtomicOperation::Integer { operation, source, flags } =>

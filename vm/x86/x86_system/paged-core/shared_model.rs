@@ -82,6 +82,12 @@ pub open spec fn boundary_reload(s: State, config: super::Config) -> (State, boo
             phase: super::mmu_core::shared::Phase::Idle, ..s.mmu }, ..s }, true)
     } else { (s, false) }
 }
+pub open spec fn boundary_exchange(s:State,address:u64,replacement:u64,
+    width:super::memory_core::cpu_core::operand::Width)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::compare_admitted(address,width) {
+        (State {mmu:mm::exchange_begin(s.mmu,address,replacement,width),..s},true)
+    } else {(s,false)}
+}
 pub open spec fn boundary_compare_exchange(s:State,address:u64,expected:u64,replacement:u64,
     width:super::memory_core::cpu_core::operand::Width)->(State,bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::compare_admitted(address,width) {

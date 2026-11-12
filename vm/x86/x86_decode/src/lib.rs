@@ -350,8 +350,25 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         return None;
     }
     let size = address_size(encoding.bytes());
+    if instruction.mnemonic() == Mnemonic::Pause && encoding.bytes() == [0xf3, 0x90] {
+        return Some(EntryInstruction::Nop);
+    }
     if instruction.mnemonic() == Mnemonic::Cmpxchg {
         return admit_compare_exchange(&instruction, encoding, size);
+    }
+    if instruction.mnemonic() == Mnemonic::Xchg {
+        if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
+            return None;
+        }
+        let Operand::Memory { address, width } = operand(&instruction, 0, Operation::Mov, size)?
+        else {
+            return None;
+        };
+        let Operand::Register(source) = operand(&instruction, 1, Operation::Mov, size)? else {
+            return None;
+        };
+        return (width == source.width())
+            .then_some(EntryInstruction::ExchangeMemory { address, source });
     }
     if instruction.mnemonic() == Mnemonic::Xadd {
         if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
@@ -501,6 +518,9 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => Some(EntryInstruction::Fence),
         Mnemonic::Fninit => Some(EntryInstruction::InitializeX87),
         Mnemonic::Int3 if encoding.bytes() == [0xcc] => Some(EntryInstruction::Breakpoint),
+        Mnemonic::Swapgs if encoding.bytes() == [0x0f, 0x01, 0xf8] => {
+            Some(EntryInstruction::SwapGs)
+        }
         Mnemonic::Fxsave | Mnemonic::Fxsave64 => Some(EntryInstruction::SaveFp {
             address: address(&instruction, size)?,
             wide: instruction.mnemonic() == Mnemonic::Fxsave64,

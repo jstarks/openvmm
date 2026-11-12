@@ -30,6 +30,56 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
 }
 
 #[test]
+fn pause_hint_is_not_misclassified_as_rep_string_execution() {
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(entry(&[0xf3, 0x90]), Instruction::Nop);
+    assert_eq!(
+        admission(&[0xf2, 0x90]),
+        x86_system::shared::decode::DecodeDecision::Unsupported
+    );
+}
+
+#[test]
+fn memory_xchg_owns_all_scalar_widths_and_implicit_or_explicit_locking() {
+    use x86_system::shared::entry::Instruction;
+    for (prefix, opcode, width) in [
+        (&[][..], 0x86, Width::Byte),
+        (&[0x66][..], 0x87, Width::Word),
+        (&[][..], 0x87, Width::Dword),
+        (&[0x48][..], 0x87, Width::Qword),
+    ] {
+        for locked in [false, true] {
+            let bytes = [
+                if locked { &[0xf0][..] } else { &[][..] },
+                prefix,
+                &[opcode, 0x03],
+            ]
+            .concat();
+            assert_eq!(
+                entry(&bytes),
+                Instruction::ExchangeMemory {
+                    address: Address {
+                        size: AddressSize::Bits64,
+                        segment: Segment::Ds,
+                        base: Base::Register(Gpr::new(3).unwrap()),
+                        index: None,
+                        scale: Scale::One,
+                        displacement: 0
+                    },
+                    source: reg(0, width, false),
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn swapgs_is_an_owned_privileged_state_exchange() {
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(entry(&[0x0f, 0x01, 0xf8]), Instruction::SwapGs);
+}
+
+#[test]
 fn memory_pop_retains_the_rsp_address_for_post_increment_evaluation() {
     use x86_system::shared::entry::Instruction;
     assert_eq!(

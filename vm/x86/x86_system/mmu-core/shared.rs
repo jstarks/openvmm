@@ -57,6 +57,7 @@ pub enum Phase {
     Dirty { pte: Leaf, address: u64, word: u64, reads: u8 },
     Store { address: u64, word: u64, reads: u8 },
     Done(Report),
+    FetchDone {word:u64,reads:u8},
     WordTail { frame: u64, permissions: Permissions, leaf: Option<Leaf>, first: u64, reads: u8, large: bool },
     WordDirty { pte: Leaf, data: WordData, reads: u8 },
     WordStore { data: WordData, reads: u8 },
@@ -174,6 +175,7 @@ impl SharedMmu {
         && (self.word is Some ==> self.access == word_model::request(self.word.unwrap()))
         && match self.phase {
             Phase::Done(_) | Phase::Dirty { .. } | Phase::Store { .. } => self.word is None,
+            Phase::FetchDone {..}=>self.word is None && self.access==Access::Fetch,
             Phase::WordTail { .. } | Phase::WordDirty { .. } | Phase::WordStore { .. }
                 | Phase::WordHead { .. } | Phase::WordLast { .. } | Phase::WordDone { .. }
                 | Phase::SizedStore { .. } | Phase::AtomicStore { .. }
@@ -326,7 +328,24 @@ impl SharedMmu {
 
     pub fn active(&self) -> (out: bool)
         ensures out == spec::active(self@.phase),
-    { !matches!(self.phase, Phase::Idle | Phase::Done(_) | Phase::WordDone { .. }) }
+    { !matches!(self.phase, Phase::Idle | Phase::Done(_) | Phase::WordDone { .. } | Phase::FetchDone {..}) }
+
+    /// Continues one instruction's fetch; a new instruction must use `begin`.
+    #[inline]
+    pub fn begin_fetch_next(&mut self,va:u64,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::begin_fetch_next(old(self)@,va,user),
+    {
+        if let Phase::FetchDone {word,..}=self.phase {
+            if self.va/8==va/8 && self.user==user && valid_config(self.inner.config) && canonical(va) {
+                self.va=va;
+                self.phase=Phase::FetchDone {word,reads:0};
+                return true;
+            }
+        }
+        self.begin(va,Access::Fetch,user)
+    }
 
     pub fn reload(&mut self, config: Config) -> (accepted: bool)
         requires old(self).invariant(),
@@ -405,6 +424,10 @@ impl SharedMmu {
         match self.phase {
             Phase::Idle => Request::Idle,
             Phase::Done(r) => Request::Complete(r),
+            Phase::FetchDone {word,reads}=>Request::Complete(Report {
+                result:MmuResult::Success(((word>>((self.va%8*8) as u32))&255) as u8),
+                table_reads:reads,virtual_address:self.va,
+            }),
             Phase::Walk { table, level, .. } => Request::Read(table + index(self.walk_va(), level) * 8),
             Phase::Mark { address, word, .. } => {
                 let replacement = accessed(word);
@@ -498,9 +521,10 @@ impl SharedMmu {
                             root: self.inner.config.root, frame, permissions, large });
                         if matches!(self.access,Access::Fetch) {self.inner.fetch_cache=mapping;}
                         else {self.inner.cache=mapping;}
-                        self.phase = Phase::Done(Report { result: MmuResult::Success(
-                            ((word >> ((self.va % 8 * 8) as u32)) & 255) as u8),
-                            table_reads: reads, virtual_address: self.va });
+                        self.phase = if matches!(self.access,Access::Fetch) {Phase::FetchDone {word,reads}}
+                            else {Phase::Done(Report { result: MmuResult::Success(
+                                ((word >> ((self.va % 8 * 8) as u32)) & 255) as u8),
+                                table_reads: reads, virtual_address: self.va })};
                     },
                 }
                 true

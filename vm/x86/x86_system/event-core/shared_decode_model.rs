@@ -85,7 +85,7 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
             else if input.rip as int + input.length as int > u64::MAX {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap))
             } else {
-                (fetch(s, (input.rip + input.length) as u64, Phase::DecodeFetch { input }), Tick::Pending)
+                (fetch_next(s,(input.rip+input.length) as u64,Phase::DecodeFetch {input}),Tick::Pending)
             }
         },
         DecodeDecision::Rejected => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DecodeRejected)),

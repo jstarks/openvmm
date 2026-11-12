@@ -131,7 +131,7 @@ impl SharedEventMachine {
                 if input.rip > u64::MAX - input.length as u64 {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap));
                 }
-                let _accepted = self.core.boundary_fetch(input.rip + input.length as u64);
+                let _accepted = self.core.boundary_fetch_next(input.rip + input.length as u64);
                 assert(_accepted);
                 self.phase = Phase::DecodeFetch { input };
                 Tick::Pending

@@ -95,6 +95,9 @@ pub open spec fn word(s: State, address: u64, request: WordAccess, phase: Phase)
 pub open spec fn fetch(s: State, address: u64, phase: Phase) -> State {
     State { core: c::boundary_begin(s.core, address, None).0, phase, ..s }
 }
+pub open spec fn fetch_next(s:State,address:u64,phase:Phase)->State {
+    State {core:c::boundary_fetch_next(s.core,address).0,phase,..s}
+}
 pub open spec fn tables_supported(t: Tables, system: Option<SystemState>) -> bool {
     if system is None { e::tables_supported(t) }
     else { t.idt_base % 16 == 0 && t.gdt_base % 8 == 0 }
@@ -163,7 +166,7 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
             } else if cpu.rip == u64::MAX {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap))
             } else {
-                (fetch(s, (cpu.rip + 1) as u64, Phase::Second { first: value }), Tick::Pending)
+                (fetch_next(s, (cpu.rip + 1) as u64, Phase::Second { first: value }), Tick::Pending)
             }
         },
         Phase::Second { first } => {
@@ -179,7 +182,7 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported))
             } else if cpu.rip == u64::MAX - 1 {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap))
-            } else { (fetch(s, (cpu.rip + 2) as u64, Phase::Third), Tick::Pending) }
+            } else { (fetch_next(s, (cpu.rip + 2) as u64, Phase::Third), Tick::Pending) }
         },
         Phase::Third => {
             if s.external_decode && value != 0x3f {

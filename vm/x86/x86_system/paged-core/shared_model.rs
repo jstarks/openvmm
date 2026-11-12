@@ -105,8 +105,15 @@ pub open spec fn stopped(s: State, outcome: StepOutcome) -> (State, Tick) {
     (State { phase: CpuPhase::Stopped { outcome }, ..s }, Tick::Stopped(outcome))
 }
 pub open spec fn fetch(s: State, offset: u64, phase: CpuPhase) -> (State, Tick) {
-    (State { mmu: mm::begin(s.mmu, (s.cpu.rip + offset) as u64, Access::Fetch, s.user, None),
+    (State { mmu: if offset==0 {mm::begin(s.mmu,s.cpu.rip as u64,Access::Fetch,s.user,None)}
+        else {mm::begin_fetch_next(s.mmu,(s.cpu.rip+offset) as u64,s.user).0},
         phase, ..s }, Tick::Pending)
+}
+pub open spec fn boundary_fetch_next(s:State,address:u64)->(State,bool) {
+    if s.phase is Boundary {
+        let next=mm::begin_fetch_next(s.mmu,address,false);
+        (State {mmu:next.0,..s},next.1)
+    } else {(s,false)}
 }
 pub open spec fn decoded(s: State, rex: u8, opcode: u8, value: u8) -> (State, Tick) {
     let op = memory_model::decode(rex, opcode, value);

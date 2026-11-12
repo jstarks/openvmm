@@ -104,6 +104,16 @@ impl SharedMachine {
         self.mmu.begin(address, Access::Fetch, false)
     }
 
+    #[inline]
+    pub(crate) fn boundary_fetch_next(&mut self,address:u64)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::boundary_fetch_next(old(self)@,address),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_fetch_next(address,false)
+    }
+
     pub(crate) fn boundary_word(&mut self, address: u64, request: WordAccess) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, accepted) ==
@@ -340,7 +350,7 @@ impl SharedMachine {
                 if self.cpu.rip == u64::MAX {
                     return self.stop(StepOutcome::Diagnostic(PagedDiagnostic::FetchWrap));
                 }
-                let _accepted = self.mmu.begin(self.cpu.rip + 1, Access::Fetch, self.user);
+                let _accepted = self.mmu.begin_fetch_next(self.cpu.rip + 1, self.user);
                 assert(_accepted);
                 self.phase = CpuPhase::Second { rex: value };
                 Tick::Pending
@@ -352,7 +362,7 @@ impl SharedMachine {
                 if self.cpu.rip == u64::MAX - 1 {
                     return self.stop(StepOutcome::Diagnostic(PagedDiagnostic::FetchWrap));
                 }
-                let _accepted = self.mmu.begin(self.cpu.rip + 2, Access::Fetch, self.user);
+                let _accepted = self.mmu.begin_fetch_next(self.cpu.rip + 2, self.user);
                 assert(_accepted);
                 self.phase = CpuPhase::Third { rex, opcode: value };
                 Tick::Pending

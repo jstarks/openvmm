@@ -37,9 +37,17 @@ pub struct State {
 }
 
 pub open spec fn active(p: Phase) -> bool {
-    !(p is Idle) && !(p is Done) && !(p is WordDone)
+    !(p is Idle) && !(p is Done) && !(p is WordDone) && !(p is FetchDone)
 }
 
+pub open spec fn begin_fetch_next(s:State,va:u64,user:bool)->(State,bool) {
+    match s.phase {
+        Phase::FetchDone {word,..} if s.va/8==va/8 && s.user==user
+            && m::valid_config(s.inner.config) && m::canonical(va as int) =>
+            (State {va,phase:Phase::FetchDone {word,reads:0},..s},true),
+        _=>if active(s.phase) {(s,false)} else {(begin(s,va,Access::Fetch,user,None),true)},
+    }
+}
 pub open spec fn can_commit(p: Phase) -> bool {
     p is Mark || p is Dirty || p is Store || p is WordDirty
         || p is WordStore || p is WordHead || p is WordLast || p is SizedStore
@@ -249,6 +257,10 @@ pub open spec fn request(s: State) -> Request {
     match s.phase {
         Phase::Idle => Request::Idle,
         Phase::Done(r) => Request::Complete(r),
+        Phase::FetchDone {word,reads}=>Request::Complete(Report {
+            result:MmuResult::Success(((word>>((s.va%8*8) as u32))&255) as u8),
+            table_reads:reads,virtual_address:s.va,
+        }),
         Phase::Walk { table, level, .. } =>
             Request::Read((table as int + m::index(walk_va(s) as int, level as nat) * 8) as u64),
         Phase::Mark { address, word, .. } =>
@@ -313,9 +325,9 @@ pub open spec fn read(s: State, word: u64) -> State {
                 _ => State { inner: m::remember(s.inner,s.access,m::Mapping {
                         page: s.va as int / 4096, root: s.inner.config.root as int,
                         frame: frame as int, permissions, large }),
-                    phase: Phase::Done(Report { result: MmuResult::Success(
+                    phase: if s.access is Fetch {Phase::FetchDone {word,reads}} else {Phase::Done(Report { result: MmuResult::Success(
                         ((word >> ((s.va % 8 * 8) as u32)) & 255) as u8),
-                        table_reads: reads, virtual_address: s.va }), ..s },
+                        table_reads: reads, virtual_address: s.va })}, ..s },
             } }
         },
         Phase::WordTail { .. } => word_tail(s, word),

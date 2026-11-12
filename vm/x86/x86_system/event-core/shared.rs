@@ -452,7 +452,7 @@ impl SharedEventMachine {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
                 if cpu.rip == u64::MAX { return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap)); }
-                let _accepted = self.core.boundary_fetch(cpu.rip + 1); assert(_accepted);
+                let _accepted = self.core.boundary_fetch_next(cpu.rip + 1); assert(_accepted);
                 self.phase = Phase::Second { first: value }; Tick::Pending
             },
             Phase::Second { first } => {
@@ -467,7 +467,7 @@ impl SharedEventMachine {
                 }
                 if value != 1 { return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)); }
                 if cpu.rip == u64::MAX - 1 { return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::FetchWrap)); }
-                let _accepted = self.core.boundary_fetch(cpu.rip + 2); assert(_accepted);
+                let _accepted = self.core.boundary_fetch_next(cpu.rip + 2); assert(_accepted);
                 self.phase = Phase::Third; Tick::Pending
             },
             Phase::Third => {

@@ -49,17 +49,24 @@ pub open spec fn visible_cpu(s: State) -> model::State {
     match s.phase { Phase::Ordinary { flags } => model::State { flags, ..s.core.cpu },
         _ => s.core.cpu }
 }
+pub open spec fn io_permitted(s:State)->bool {
+    match s.phase {
+        Phase::Ordinary {..}=>true,
+        Phase::EntryMemory {task,..}=>task is Load || task is Store,
+        _=>false,
+    }
+}
 pub open spec fn io_operand(s: State) -> Option<super::mmu_core::shared::io::Operand> {
-    if s.phase is Ordinary || s.phase is EntryMemory { c::io_operand(s.core) } else { None }
+    if io_permitted(s) { c::io_operand(s.core) } else { None }
 }
 pub open spec fn route_io(s: State) -> (State, super::mmu_core::shared::io::IoRoute) {
-    if s.phase is Ordinary || s.phase is EntryMemory {
+    if io_permitted(s) {
         let (core, result) = c::route_io(s.core);
         (State { core, ..s }, result)
     } else { (s, super::mmu_core::shared::io::IoRoute::NotReady) }
 }
 pub open spec fn complete_io(s: State, sequence: u64, reply: super::mmu_core::shared::io::IoReply) -> (State, bool) {
-    if s.phase is Ordinary || s.phase is EntryMemory {
+    if io_permitted(s) {
         let (core, accepted) = c::complete_io(s.core, sequence, reply);
         (State { core, ..s }, accepted)
     } else { (s, false) }

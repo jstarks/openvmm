@@ -185,24 +185,32 @@ impl SharedEventMachine {
     pub fn shadow(&self) -> (v: bool) ensures v == self@.shadow { self.shadow }
     pub fn handler_pending(&self) -> (v: bool) ensures v == self@.handler_pending { self.handler_pending }
 
+    fn io_permitted(&self)->(out:bool)
+        ensures out==spec::io_permitted(self@),
+    {
+        matches!(self.phase, Phase::Ordinary { .. }
+            | Phase::EntryMemory {task:entry::MemoryTask::Load {..},..}
+            | Phase::EntryMemory {task:entry::MemoryTask::Store,..})
+    }
+
     pub fn io_operand(&self) -> (out: Option<Operand>)
         requires self.invariant(),
         ensures out == spec::io_operand(self@),
     {
-        if matches!(self.phase, Phase::Ordinary { .. } | Phase::EntryMemory { .. }) { self.core.io_operand() } else { None }
+        if self.io_permitted() { self.core.io_operand() } else { None }
     }
     pub fn route_io(&mut self) -> (out: IoRoute)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, out) == spec::route_io(old(self)@),
     {
-        if matches!(self.phase, Phase::Ordinary { .. } | Phase::EntryMemory { .. }) { self.core.route_io() } else { IoRoute::NotReady }
+        if self.io_permitted() { self.core.route_io() } else { IoRoute::NotReady }
     }
     pub fn complete_io(&mut self, sequence: u64, reply: IoReply) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
             (final(self)@, accepted) == spec::complete_io(old(self)@, sequence, reply),
     {
-        if matches!(self.phase, Phase::Ordinary { .. } | Phase::EntryMemory { .. }) { self.core.complete_io(sequence, reply) } else { false }
+        if self.io_permitted() { self.core.complete_io(sequence, reply) } else { false }
     }
 
     pub fn inject(&mut self, vector: u8) -> (r: Injection)

@@ -742,6 +742,7 @@ impl SharedMmu {
 }
 
 /// Performs exactly one requested physical effect; never advances a CPU/MMU.
+#[inline(always)]
 pub fn perform<R: PhysicalRam>(ram: &R, request: Request) -> Result<Reply, RunError<R::Error>> {
     let exchange = match request {
         Request::Read(address) => {

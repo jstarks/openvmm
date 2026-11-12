@@ -1291,6 +1291,14 @@ mod native {
             let registers = vp.access_state(Vtl::Vtl0).registers()?;
             let progress = vp.completed_batch_progress();
             let final_jiffies = memory.read_plain::<u64>(0x2609980)?;
+            let (decode, first_decode) = vp.decode_diagnostics();
+            let decode_json = |d: virt_emu::backend::DecodeDiagnostics| {
+                serde_json::json!({
+                    "entries":d.entries,"bytes":d.bytes,
+                    "windows":d.windows,"hits":d.hits,"empty":d.empty,"collisions":d.collisions,
+                    "changed":d.changed,"admissions":d.admissions,"prefix_checks":d.prefix_checks,
+                })
+            };
             let apic=vp.apic_diagnostics().map(|snapshot| {
                 let apic=snapshot.registers;
                 serde_json::json!({
@@ -1301,6 +1309,14 @@ mod native {
                     "timer_last":apic.timer.last,"vm_time_100ns":snapshot.vm_time_100ns,
                     "delivered":snapshot.delivered,"first_interrupt_retired":snapshot.first_interrupt_retired,
                     "first_interrupt_time_100ns":snapshot.first_interrupt_time_100ns,
+                    "decode":decode_json(decode),"decode_at_first_interrupt":first_decode.map(decode_json),
+                    "layout":{
+                        "event_phase":size_of::<x86_system::shared::Phase>(),
+                        "decode_decision":size_of::<x86_system::shared::decode::DecodeDecision>(),
+                        "request":size_of::<x86_system::mmu_core::shared::Request>(),
+                        "reply":size_of::<x86_system::mmu_core::shared::Reply>(),
+                        "effect_result":size_of::<Result<x86_system::mmu_core::shared::Reply,x86_system::mmu_core::shared::RunError<virt_emu::native_memory::RamError>>>(),
+                    },
                     "jiffies_initial":initial_jiffies,"jiffies_final":final_jiffies,
                     "jiffies_delta":final_jiffies.wrapping_sub(initial_jiffies),
                 })

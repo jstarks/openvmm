@@ -3,6 +3,29 @@
 
 use x86_system::shared::decode::{DecodeDecision, DecodeInput, DecodeWindow};
 
+/// Cache geometry and modular counters; they do not participate in guest execution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecodeDiagnostics {
+    /// Maximum retained encodings.
+    pub entries: usize,
+    /// Storage allocated for cache sets, excluding allocator metadata.
+    pub bytes: usize,
+    /// Valid observed-window queries.
+    pub windows: u64,
+    /// Matching full or partial cached receipts.
+    pub hits: u64,
+    /// Queries whose cache slot was empty.
+    pub empty: u64,
+    /// Queries displaced by another RIP.
+    pub collisions: u64,
+    /// Same-RIP receipts whose observed bytes or length no longer match.
+    pub changed: u64,
+    /// Uncached decoder admissions.
+    pub admissions: u64,
+    /// Additional shorter-prefix admissions before caching a terminal result.
+    pub prefix_checks: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Receipt {
     rip: u64,
@@ -11,23 +34,41 @@ struct Receipt {
     decision: DecodeDecision,
 }
 
+#[derive(Default)]
+struct Set {
+    slots: [Option<Receipt>; 2],
+    victim: usize,
+}
+
 pub(super) struct DecodeCache {
-    slots: Box<[Option<Receipt>]>,
+    sets: Box<[Set]>,
+    diagnostics: DecodeDiagnostics,
     #[cfg(test)]
     pub(super) bypass: bool,
 }
 
 fn index(rip: u64) -> usize {
-    ((rip ^ (rip >> 12) ^ (rip >> 24)) & 4095) as usize
+    ((rip ^ (rip >> 12) ^ (rip >> 24)) & 8191) as usize
 }
 
 impl DecodeCache {
     pub(super) fn new() -> Self {
+        let sets: Box<[Set]> = std::iter::repeat_with(Set::default).take(8192).collect();
+        let diagnostics = DecodeDiagnostics {
+            entries: sets.len() * 2,
+            bytes: size_of_val(&*sets),
+            ..DecodeDiagnostics::default()
+        };
         Self {
-            slots: std::iter::repeat_with(|| None).take(4096).collect(),
+            sets,
+            diagnostics,
             #[cfg(test)]
             bypass: false,
         }
+    }
+
+    pub(super) fn diagnostics(&self) -> DecodeDiagnostics {
+        self.diagnostics
     }
 
     pub(super) fn decode(&mut self, input: DecodeInput) -> DecodeDecision {
@@ -39,19 +80,23 @@ impl DecodeCache {
         if length == 0 || length > input.bytes.len() {
             return x86_decode::admit(input);
         }
-        let slot = &mut self.slots[index(input.rip)];
-        if let Some(receipt) = slot {
-            if receipt.rip == input.rip
-                && input.length <= receipt.length
-                && receipt.bytes[..length] == input.bytes[..length]
-            {
-                return if input.length == receipt.length {
-                    receipt.decision
-                } else {
-                    DecodeDecision::More
-                };
+        let set = &mut self.sets[index(input.rip)];
+        for (way, slot) in set.slots.iter().enumerate() {
+            if let Some(receipt) = slot {
+                if receipt.rip == input.rip
+                    && input.length <= receipt.length
+                    && receipt.bytes[..length] == input.bytes[..length]
+                {
+                    set.victim = way ^ 1;
+                    return if input.length == receipt.length {
+                        receipt.decision
+                    } else {
+                        DecodeDecision::More
+                    };
+                }
             }
         }
+        self.diagnostics.admissions = self.diagnostics.admissions.wrapping_add(1);
         let decision = x86_decode::admit(input);
         if matches!(
             decision,
@@ -66,17 +111,24 @@ impl DecodeCache {
             // Every lookup still checks freshly fetched bytes; RAM/PTE/code
             // observations and current decode-token identity are never cached.
             if (1..input.length).all(|length| {
+                self.diagnostics.prefix_checks = self.diagnostics.prefix_checks.wrapping_add(1);
                 matches!(
                     x86_decode::admit(DecodeInput { length, ..input }),
                     DecodeDecision::More
                 )
             }) {
-                *slot = Some(Receipt {
+                let way = set
+                    .slots
+                    .iter()
+                    .position(|slot| slot.as_ref().is_some_and(|r| r.rip == input.rip))
+                    .unwrap_or(set.victim);
+                set.slots[way] = Some(Receipt {
                     rip: input.rip,
                     bytes: input.bytes,
                     length: input.length,
                     decision,
                 });
+                set.victim = way ^ 1;
             }
         }
         decision
@@ -87,17 +139,25 @@ impl DecodeCache {
         if input.length == 0 || window.available < input.length || window.available > 15 {
             return (input.length, DecodeDecision::Rejected);
         }
+        self.diagnostics.windows = self.diagnostics.windows.wrapping_add(1);
         #[cfg(test)]
         let bypass = self.bypass;
         #[cfg(not(test))]
         let bypass = false;
         if !bypass {
-            if let Some(receipt) = &self.slots[index(input.rip)] {
+            let set = &mut self.sets[index(input.rip)];
+            if let Some((way, receipt)) = set.slots.iter().enumerate().find_map(|(way, slot)| {
+                slot.as_ref()
+                    .filter(|r| r.rip == input.rip)
+                    .map(|r| (way, r))
+            }) {
                 let length = window.available.min(receipt.length);
                 if receipt.rip == input.rip
                     && input.length <= length
                     && receipt.bytes[..usize::from(length)] == window.bytes[..usize::from(length)]
                 {
+                    self.diagnostics.hits = self.diagnostics.hits.wrapping_add(1);
+                    set.victim = way ^ 1;
                     return (
                         length,
                         if length == receipt.length {
@@ -107,6 +167,11 @@ impl DecodeCache {
                         },
                     );
                 }
+                self.diagnostics.changed = self.diagnostics.changed.wrapping_add(1);
+            } else if set.slots.iter().all(Option::is_some) {
+                self.diagnostics.collisions = self.diagnostics.collisions.wrapping_add(1);
+            } else {
+                self.diagnostics.empty = self.diagnostics.empty.wrapping_add(1);
             }
         }
         for length in input.length..=window.available {
@@ -126,6 +191,10 @@ impl DecodeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn colliding(rip: u64) -> impl Iterator<Item = u64> {
+        (rip + 1..rip + 0x10000).filter(move |&candidate| index(candidate) == index(rip))
+    }
 
     fn input(rip: u64, bytes: &[u8]) -> DecodeInput {
         let mut input = DecodeInput {
@@ -234,10 +303,65 @@ mod tests {
     }
 
     #[test]
+    fn colliding_hot_rips_reuse_receipts_and_evict_only_the_least_recent() {
+        let mut cache = DecodeCache::new();
+        let a = 0x10000;
+        let mut collisions = colliding(a);
+        let b = collisions.next().unwrap();
+        let c = collisions.next().unwrap();
+        assert_eq!(index(a), index(b));
+        assert_eq!(index(a), index(c));
+        let window = |rip| {
+            let full = input(rip, &[0x75, 0xf7]);
+            DecodeWindow {
+                input: DecodeInput { length: 1, ..full },
+                bytes: full.bytes,
+                available: 2,
+            }
+        };
+        for rip in [a, b] {
+            let w = window(rip);
+            assert_eq!(
+                cache.decode_window(w),
+                (
+                    2,
+                    x86_decode::admit(DecodeInput {
+                        length: 2,
+                        ..w.input
+                    })
+                )
+            );
+        }
+        let warm = cache.diagnostics();
+        for rip in [a, b].into_iter().cycle().take(128) {
+            let w = window(rip);
+            assert_eq!(
+                cache.decode_window(w),
+                (
+                    2,
+                    x86_decode::admit(DecodeInput {
+                        length: 2,
+                        ..w.input
+                    })
+                )
+            );
+        }
+        assert_eq!(cache.diagnostics().admissions, warm.admissions);
+        assert_eq!(cache.diagnostics().prefix_checks, warm.prefix_checks);
+        cache.decode_window(window(a));
+        cache.decode_window(window(c));
+        let replaced = cache.diagnostics().admissions;
+        cache.decode_window(window(a));
+        assert_eq!(cache.diagnostics().admissions, replaced);
+        cache.decode_window(window(b));
+        assert!(cache.diagnostics().admissions > replaced);
+    }
+
+    #[test]
     fn same_slot_different_rip_never_reuses_a_relative_target() {
         let mut cache = DecodeCache::new();
         let first = input(0x10000, &[0x75, 0xf7]);
-        let second = input(first.rip ^ 0x1001, &[0x75, 0xf7]);
+        let second = input(colliding(first.rip).next().unwrap(), &[0x75, 0xf7]);
         assert_eq!(index(first.rip), index(second.rip));
         for current in [first, second, first] {
             assert_eq!(cache.decode(current), x86_decode::admit(current));

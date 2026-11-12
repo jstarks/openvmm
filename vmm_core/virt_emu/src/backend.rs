@@ -10,6 +10,7 @@
 
 use crate::native_memory::{NativeRam, RamError};
 use crate::{state_from_registers, update_registers};
+pub use decode_cache::DecodeDiagnostics;
 use futures::task::AtomicWaker;
 use hvdef::Vtl;
 use memory_range::MemoryRange;
@@ -233,6 +234,7 @@ struct VpState {
     apic_delivered: [u64; 256],
     first_apic_retired: Option<u64>,
     first_apic_time: Option<u64>,
+    first_apic_decode: Option<DecodeDiagnostics>,
     core: Option<SharedEventMachine>,
     initial_system: Option<SystemState>,
     started: bool,
@@ -285,6 +287,14 @@ pub struct ApicDiagnostics {
 }
 
 impl EmuProcessor<'_> {
+    /// Returns current decoder counters and their first-interrupt baseline.
+    pub fn decode_diagnostics(&self) -> (DecodeDiagnostics, Option<DecodeDiagnostics>) {
+        (
+            self.state.decoder.diagnostics(),
+            self.state.first_apic_decode,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn bypass_decode_cache(&mut self) {
         self.state.decoder.bypass = true;
@@ -458,6 +468,7 @@ impl ProtoPartition for EmuProtoPartition {
                 apic_delivered: [0; 256],
                 first_apic_retired: None,
                 first_apic_time: None,
+                first_apic_decode: None,
                 core: None,
                 initial_system: Some(SystemState::empty()),
                 started: false,
@@ -722,6 +733,7 @@ impl Processor for EmuProcessor<'_> {
                     self.state.first_apic_retired.get_or_insert(retired);
                     if self.state.first_apic_time.is_none() {
                         self.state.first_apic_time = Some(self.clock.now().as_100ns());
+                        self.state.first_apic_decode = Some(self.state.decoder.diagnostics());
                     }
                 }
                 Ok(None) => {}

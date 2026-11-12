@@ -775,25 +775,15 @@ impl SharedEventMachine {
         mut yield_at_boundary: impl FnMut(&Self) -> bool,
     ) -> Result<Batch, RunError<R::Error>> {
         let (mut steps, mut effects, mut retired, mut delivered) = (0, 0, 0, 0);
+        if step_budget == 0 {
+            return Ok(Batch {
+                retired,
+                delivered,
+                stop: BatchStop::Budget,
+            });
+        }
         loop {
-            if steps == step_budget {
-                return Ok(Batch {
-                    retired,
-                    delivered,
-                    stop: BatchStop::Budget,
-                });
-            }
-            if (steps != 0 || effects != 0)
-                && self.at_interrupt_boundary()
-                && yield_at_boundary(self)
-            {
-                return Ok(Batch {
-                    retired,
-                    delivered,
-                    stop: BatchStop::Yield,
-                });
-            }
-            match self.advance() {
+            let boundary = match self.advance() {
                 Tick::Decode(input) => {
                     let Some(window) = self.decode_window() else {
                         return Err(RunError::DecodeCompletion(input.sequence));
@@ -815,18 +805,34 @@ impl SharedEventMachine {
                         stop: BatchStop::Decode(input),
                     });
                 }
-                Tick::Pending => {}
+                Tick::Pending => self.at_interrupt_boundary() && (steps != 0 || effects != 0),
                 Tick::Retired(serializing) => {
                     if serializing {
                         ram.barrier();
                     }
                     steps += 1;
                     retired += 1;
+                    if steps == step_budget {
+                        return Ok(Batch {
+                            retired,
+                            delivered,
+                            stop: BatchStop::Budget,
+                        });
+                    }
+                    true
                 }
                 Tick::Delivered(_) => {
                     ram.barrier();
                     steps += 1;
                     delivered += 1;
+                    if steps == step_budget {
+                        return Ok(Batch {
+                            retired,
+                            delivered,
+                            stop: BatchStop::Budget,
+                        });
+                    }
+                    true
                 }
                 Tick::Halted => {
                     return Ok(Batch {
@@ -908,7 +914,15 @@ impl SharedEventMachine {
                         return Err(RunError::Protocol(request));
                     }
                     effects += 1;
+                    false
                 }
+            };
+            if boundary && yield_at_boundary(self) {
+                return Ok(Batch {
+                    retired,
+                    delivered,
+                    stop: BatchStop::Yield,
+                });
             }
         }
     }

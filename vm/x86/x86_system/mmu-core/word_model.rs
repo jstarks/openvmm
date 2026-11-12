@@ -48,7 +48,7 @@ pub open spec fn lift(r: MmuResult) -> WordResult {
 
 pub open spec fn fault(s: mmu_model::State, b: Seq<u8>, r: WordResult, va: int, n: nat)
     -> (mmu_model::State, Seq<u8>, WordResult, nat) {
-    (mmu_model::State { cache: None,
+    (mmu_model::State { cache: None, fetch_cache:None,
         cr2: if r is PageFault { va } else { s.cr2 }, ..s }, b, r, n)
 }
 

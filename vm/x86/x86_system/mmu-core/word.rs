@@ -37,10 +37,11 @@ pub(super) fn failure(r: MmuResult) -> (v: WordResult)
 impl Mmu {
     fn word_fault(&mut self, r: WordResult, va: u64)
         ensures final(self)@ == (mmu_model::State {
-            cache: None, cr2: if r is PageFault { va as int } else { old(self).cr2 as int },
+            cache: None, fetch_cache:None, cr2: if r is PageFault { va as int } else { old(self).cr2 as int },
             ..old(self)@ }), final(self).invariant(),
     {
         self.cache = None;
+        self.fetch_cache=None;
         if let WordResult::PageFault(_) = r { self.cr2 = va; }
     }
 

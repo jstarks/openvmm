@@ -129,6 +129,11 @@ pub(super) fn poll(
     if state.apic_offer.is_some() || !core.at_interrupt_boundary() {
         return Ok(());
     }
+    // APIC register accesses materialize the counter themselves. With IF clear,
+    // defer timer-only work until it can affect entry, observation, or a wait.
+    if core.cpu().flags & 0x200 == 0 && !core.halted() && !control.apic_work_pending() {
+        return Ok(());
+    }
     let now = ticks(clock.now())?;
     if now < apic.timer.last {
         return Err(Error::Apic(ApicError::Timer(TimerError::BackwardsTime)));

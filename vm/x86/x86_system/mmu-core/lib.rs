@@ -41,37 +41,45 @@ impl View for Mapping {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Mmu { config: Config, cache: Option<Mapping>, cr2: u64 }
+pub struct Mmu { config: Config, cache: Option<Mapping>, fetch_cache:Option<Mapping>, cr2: u64 }
 impl View for Mmu {
     type V = mmu_model::State;
     closed spec fn view(&self) -> mmu_model::State {
         mmu_model::State { config: self.config, cr2: self.cr2 as int,
-            cache: match self.cache { Some(m) => Some(m@), None => None } }
+            cache: match self.cache { Some(m) => Some(m@), None => None },
+            fetch_cache: match self.fetch_cache { Some(m) => Some(m@), None => None } }
     }
 }
 impl Mmu {
     pub closed spec fn invariant(&self) -> bool {
-        match self.cache {
+        (match self.cache {
+            Some(m) => m.frame < 0x1_0000_0000_0000u64 && m.frame % 4096 == 0,
+            None => true,
+        }) && match self.fetch_cache {
             Some(m) => m.frame < 0x1_0000_0000_0000u64 && m.frame % 4096 == 0,
             None => true,
         }
     }
     pub fn new(config: Config, cr2: u64) -> (s: Self)
-        ensures s.invariant(), s@ == (mmu_model::State { config, cache: None, cr2: cr2 as int }),
-    { Self { config, cache: None, cr2 } }
+        ensures s.invariant(), s@ == (mmu_model::State { config, cache: None, fetch_cache:None, cr2: cr2 as int }),
+    { Self { config, cache: None, fetch_cache:None, cr2 } }
     pub fn cr2(&self) -> (v: u64) ensures v as int == self@.cr2 { self.cr2 }
     pub fn cache_count(&self) -> (v: u8)
-        ensures v == if self@.cache is Some { 1u8 } else { 0u8 },
-    { if self.cache.is_some() { 1 } else { 0 } }
+        ensures v as int==(if self@.cache is Some {1int} else {0int})
+            +(if self@.fetch_cache is Some {1int} else {0int}),
+    { (if self.cache.is_some() {1u8} else {0u8})+(if self.fetch_cache.is_some() {1u8} else {0u8}) }
     pub fn reload(&mut self, config: Config)
         ensures final(self)@ == mmu_model::reload(old(self)@, config), final(self).invariant(),
-    { self.config = config; self.cache = None; }
+    { self.config = config; self.cache = None; self.fetch_cache=None; }
     pub fn invalidate(&mut self, va: u64)
         requires old(self).invariant(),
         ensures final(self)@ == mmu_model::invalidate(old(self)@, va as int), final(self).invariant(),
     {
         if let Some(m) = self.cache {
             if m.page == va / 4096 || (m.large && m.page / 512 == va / 2097152) { self.cache = None; }
+        }
+        if let Some(m)=self.fetch_cache {
+            if m.page==va/4096 || (m.large && m.page/512==va/2097152) {self.fetch_cache=None;}
         }
     }
 }
@@ -84,10 +92,14 @@ fn index(va: u64, level: u8) -> (v: u64)
     requires level < 4,
     ensures v as int == mmu_model::index(va as int, level as nat), v < 512,
 {
-    let divisor: u64 = if level == 0 { 549755813888 }
-        else if level == 1 { 1073741824 }
-        else if level == 2 { 2097152 } else { 4096 };
-    (va / divisor) % 512
+    let shift:u32=if level==0 {39} else if level==1 {30} else if level==2 {21} else {12};
+    let out=(va >> shift)&511;
+    assert(out==(va/(if level==0 {549755813888u64}
+        else if level==1 {1073741824u64} else if level==2 {2097152u64} else {4096u64}))%512)
+        by(bit_vector) requires level<4u8,
+            shift==if level==0 {39u32} else if level==1 {30u32} else if level==2 {21u32} else {12u32},
+            out==(va>>shift)&511u64;
+    out
 }
 
 struct Entry { base: u64, present: bool, rw: bool, user: bool, nx: bool, reserved: bool, huge: bool }
@@ -264,10 +276,11 @@ fn write_byte(ram: &mut Vec<u8>, i: usize, value: u8)
 impl Mmu {
     fn fault(&mut self, result: MmuResult, va: u64)
         ensures final(self)@ == (mmu_model::State {
-            cache: None, cr2: if result is PageFault { va as int } else { old(self).cr2 as int },
+            cache: None, fetch_cache:None, cr2: if result is PageFault { va as int } else { old(self).cr2 as int },
             ..old(self)@ }), final(self).invariant(),
     {
         self.cache = None;
+        self.fetch_cache=None;
         if let MmuResult::PageFault(_) = result { self.cr2 = va; }
     }
     pub fn access(&mut self, ram: &mut Vec<u8>, base: u64, va: u64, a: Access, user: bool)
@@ -287,7 +300,7 @@ impl Mmu {
             return Report { result: MmuResult::GeneralProtection, table_reads: 0, virtual_address: va };
         }
         let write = match a { Access::Write(_) => true, _ => false };
-        if let Some(m) = self.cache {
+        if let Some(m) = if matches!(a,Access::Fetch) {self.fetch_cache} else {self.cache} {
             if m.page == va / 4096 && m.root == self.config.root
                 && !write && allowed(m.permissions, self.config, a, user) {
                 assert(m.page as int == va as int / 4096 && m.root == self.config.root);
@@ -331,8 +344,9 @@ impl Mmu {
                         value
                     },
                     _ => {
-                        self.cache = Some(Mapping { page: va / 4096, root: self.config.root,
+                        let mapping=Some(Mapping { page: va / 4096, root: self.config.root,
                             frame, permissions, large });
+                        if matches!(a,Access::Fetch) {self.fetch_cache=mapping;} else {self.cache=mapping;}
                         ram[i]
                     },
                 };

@@ -637,7 +637,14 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     code.push(0xf4);
     code.push(0x90);
     let after_timer = CODE + code.len() as u64;
-    code.push(0xf4);
+    code.push(0x90);
+    code.push(0xfa);
+    store(&mut code, 0x380, 1_000_000);
+    let after_rearm = CODE + code.len() as u64;
+    code.extend_from_slice(&[0x8b, 0x87, 0x70, 0x02, 0, 0]);
+    let after_irr = CODE + code.len() as u64;
+    code.extend_from_slice(&[0xfb, 0x90, 0x90]);
+    let after_unmask = CODE + code.len() as u64;
     bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
     let (partition, mut binder, _memory, mut keeper) =
         build_profile(&driver, &bytes, VmTime::from_100ns(0), true).await;
@@ -723,6 +730,39 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
         vp.apic_diagnostics().unwrap().delivered,
         [(64, 2), (224, 1)]
     );
+    vp.set_execution_checkpoint(Some(after_rearm)).unwrap();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    keeper.start().await;
+    pal_async::timer::PolledTimer::new(&driver)
+        .sleep(std::time::Duration::from_millis(20))
+        .await;
+    vp.set_execution_checkpoint(Some(after_irr)).unwrap();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let current = vp.access_state(Vtl::Vtl0).registers().unwrap();
+    assert_eq!(
+        current.rax, 1,
+        "IRR read must observe the expired timer with IF clear"
+    );
+    assert_eq!(current.rflags & 0x200, 0);
+    assert_eq!(vp.completed_batch_progress().delivered, 3);
+    vp.set_execution_checkpoint(Some(after_unmask)).unwrap();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    keeper.stop().await;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap().r10, 4);
+    assert_eq!(
+        vp.apic_diagnostics().unwrap().delivered,
+        [(64, 2), (224, 2)]
+    );
+    assert_eq!(&*devices.eois.lock(), &[64, 64]);
 }
 
 #[async_test]

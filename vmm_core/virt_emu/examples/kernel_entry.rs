@@ -1300,6 +1300,7 @@ mod native {
                     "timer_divisor":apic.timer.divisor,"timer_periodic":apic.timer.periodic,
                     "timer_last":apic.timer.last,"vm_time_100ns":snapshot.vm_time_100ns,
                     "delivered":snapshot.delivered,"first_interrupt_retired":snapshot.first_interrupt_retired,
+                    "first_interrupt_time_100ns":snapshot.first_interrupt_time_100ns,
                     "jiffies_initial":initial_jiffies,"jiffies_final":final_jiffies,
                     "jiffies_delta":final_jiffies.wrapping_sub(initial_jiffies),
                 })

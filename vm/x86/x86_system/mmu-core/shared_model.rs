@@ -107,7 +107,7 @@ pub open spec fn access_begin(s: State, va: u64, access: Access, user: bool,
         && !m::canonical((va as int + size as int - 1) as u64 as int)) {
         State { phase: terminal(t, MmuResult::GeneralProtection, 0), ..t }
     } else {
-        match s.inner.cache {
+        match m::cached(s.inner,access) {
             Some(c) => if c.page == va as int / 4096 && c.root == s.inner.config.root as int
                 && !(access is Write) && m::allowed(c.permissions, s.inner.config, access, user) {
                 State { phase: Phase::Data { frame: c.frame as u64,
@@ -230,7 +230,7 @@ pub open spec fn sized_request(data: WordData, size: u8) -> Request {
 }
 
 pub open spec fn fault(s: State, result: MmuResult, reads: u8) -> State {
-    State { inner: m::State { cache: None,
+    State { inner: m::State { cache: None, fetch_cache:None,
         cr2: if result is PageFault { walk_va(s) as int } else { s.inner.cr2 }, ..s.inner },
         head: None, phase: terminal(s, result, reads), ..s }
 }
@@ -310,9 +310,9 @@ pub open spec fn read(s: State, word: u64) -> State {
                     Some(l) => State { phase: Phase::Dirty { pte: l, address, word, reads }, ..s },
                     None => s,
                 },
-                _ => State { inner: m::State { cache: Some(m::Mapping {
+                _ => State { inner: m::remember(s.inner,s.access,m::Mapping {
                         page: s.va as int / 4096, root: s.inner.config.root as int,
-                        frame: frame as int, permissions, large }), ..s.inner },
+                        frame: frame as int, permissions, large }),
                     phase: Phase::Done(Report { result: MmuResult::Success(
                         ((word >> ((s.va % 8 * 8) as u32)) & 255) as u8),
                         table_reads: reads, virtual_address: s.va }), ..s },

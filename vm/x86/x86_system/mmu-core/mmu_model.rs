@@ -19,6 +19,7 @@ pub struct Mapping {
 pub struct State {
     pub config: Config,
     pub cache: Option<Mapping>,
+    pub fetch_cache: Option<Mapping>,
     pub cr2: int,
 }
 
@@ -136,10 +137,19 @@ pub open spec fn invalidate(s: State, va: int) -> State {
             None
         } else { Some(m) },
         None => None,
+    }, fetch_cache:match s.fetch_cache {
+        Some(m)=>if m.page==va/4096 || (m.large && m.page/512==va/2097152) {None} else {Some(m)},
+        None=>None,
     }, ..s }
 }
+pub open spec fn cached(s:State,a:Access)->Option<Mapping> {
+    if a is Fetch {s.fetch_cache} else {s.cache}
+}
+pub open spec fn remember(s:State,a:Access,m:Mapping)->State {
+    if a is Fetch {State {fetch_cache:Some(m),..s}} else {State {cache:Some(m),..s}}
+}
 pub open spec fn reload(s: State, c: Config) -> State {
-    State { config: c, cache: None, ..s }
+    State { config: c, cache: None, fetch_cache:None, ..s }
 }
 pub open spec fn finish(s: State, b: Seq<u8>, r: MmuResult, reads: nat)
     -> (State, Seq<u8>, MmuResult, nat) {
@@ -147,7 +157,7 @@ pub open spec fn finish(s: State, b: Seq<u8>, r: MmuResult, reads: nat)
 }
 pub open spec fn fault(s: State, b: Seq<u8>, r: MmuResult, va: int, reads: nat)
     -> (State, Seq<u8>, MmuResult, nat) {
-    (State { cache: None, cr2: if r is PageFault { va } else { s.cr2 }, ..s }, b, r, reads)
+    (State { cache: None, fetch_cache:None, cr2: if r is PageFault { va } else { s.cr2 }, ..s }, b, r, reads)
 }
 
 #[verifier::opaque]
@@ -158,13 +168,13 @@ pub open spec fn access(s: State, b: Seq<u8>, base: int, va: int, a: Access, use
     } else if !canonical(va) {
         finish(s, b, MmuResult::GeneralProtection, 0)
     } else {
-        let hit = match s.cache {
+        let hit = match cached(s,a) {
             Some(m) => m.page == va / 4096 && m.root == s.config.root as int
                 && !(a is Write) && allowed(m.permissions, s.config, a, user),
             None => false,
         };
         if hit {
-            let m = s.cache.unwrap();
+            let m = cached(s,a).unwrap();
             let pa = m.frame + va % 4096;
             if memory_model::span(base, b.len() as int, pa, 1) {
                 finish(s, b, MmuResult::Success(b[pa - base]), 0)
@@ -186,9 +196,9 @@ pub open spec fn access(s: State, b: Seq<u8>, base: int, va: int, a: Access, use
                                 finish(State { cache: None, ..s },
                                     d.update(pa - base, value), MmuResult::Success(value), walked.2)
                             },
-                            _ => finish(State { cache: Some(Mapping {
+                            _ => finish(remember(s,a,Mapping {
                                 page: va / 4096, root: s.config.root as int, frame, permissions, large,
-                            }), ..s }, walked.0, MmuResult::Success(walked.0[pa - base]), walked.2),
+                            }), walked.0, MmuResult::Success(walked.0[pa - base]), walked.2),
                         }
                     }
                 },

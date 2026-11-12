@@ -166,10 +166,12 @@ impl SharedEventMachine {
         ensures out == self@.system,
     { self.system }
 
+    #[inline]
     pub fn at_instruction_boundary(&self) -> (out:bool)
         ensures out == (self@.phase == Phase::Ready),
     { matches!(self.phase,Phase::Ready) }
 
+    #[inline]
     pub fn at_interrupt_boundary(&self)->(out:bool)
         ensures out==(self@.phase is Ready || self@.phase is Repeat || self@.phase is RepeatMove),
     {matches!(self.phase,Phase::Ready | Phase::Repeat {..} | Phase::RepeatMove {..})}
@@ -185,6 +187,7 @@ impl SharedEventMachine {
         true
     }
 
+    #[inline]
     pub fn cpu(&self) -> (v: State) ensures v@ == spec::visible_cpu(self@) {
         let mut cpu = self.core.cpu();
         if let Phase::Ordinary { flags } = self.phase { cpu.flags = flags; }
@@ -193,8 +196,10 @@ impl SharedEventMachine {
     pub fn cr2(&self) -> (v: u64) ensures v as int == self@.core.mmu.inner.cr2 { self.core.cr2() }
     pub fn config(&self) -> (v: Config) ensures v == self@.core.mmu.inner.config { self.core.config() }
     pub fn tables(&self) -> (v: Tables) ensures v == self@.tables { self.tables }
+    #[inline]
     pub fn pending(&self) -> (v: Option<u8>) ensures v == self@.pending { self.pending }
     pub fn halted(&self) -> (v: bool) ensures v == self@.halted { self.halted }
+    #[inline]
     pub fn shadow(&self) -> (v: bool) ensures v == self@.shadow { self.shadow }
     pub fn handler_pending(&self) -> (v: bool) ensures v == self@.handler_pending { self.handler_pending }
 
@@ -237,6 +242,7 @@ impl SharedEventMachine {
         Injection::Queued
     }
 
+    #[inline]
     pub fn request(&self) -> (r: Request)
         requires self.invariant(),
         ensures r == mmu_core::shared_model::request(self@.core.mmu),
@@ -822,7 +828,8 @@ impl SharedEventMachine {
                             continue;
                         }
                     }
-                    if let Request::Io(request) = self.request() {
+                    let request = self.request();
+                    if let Request::Io(request) = request {
                         return Ok(Batch {
                             retired,
                             delivered,
@@ -836,7 +843,6 @@ impl SharedEventMachine {
                             stop: BatchStop::Yield,
                         });
                     }
-                    let request = self.request();
                     if !self.respond(memory::perform(ram, request)?) {
                         return Err(RunError::Protocol(request));
                     }

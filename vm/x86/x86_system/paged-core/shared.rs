@@ -52,6 +52,7 @@ impl SharedMachine {
         ensures s.invariant(), s@.cpu == cpu@, s@.phase == CpuPhase::Ready,
     { Self { cpu, mmu: SharedMmu::new(config, cr2), phase: CpuPhase::Ready, user } }
 
+    #[inline]
     pub fn cpu(&self) -> (out: State) ensures out@ == self@.cpu { self.cpu }
     pub fn cr2(&self) -> (out: u64) ensures out as int == self@.mmu.inner.cr2 { self.mmu.cr2() }
     pub fn config(&self) -> (out: Config) ensures out == self@.mmu.inner.config { self.mmu.config() }
@@ -227,6 +228,7 @@ impl SharedMachine {
         ensures final(self).invariant(), (final(self)@, tick) == spec::stopped(old(self)@, outcome),
     { self.phase = CpuPhase::Stopped { outcome }; Tick::Stopped(outcome) }
 
+    #[inline]
     pub fn request(&self) -> (request: Request)
         requires self.invariant(),
         ensures request == mmu_core::shared_model::request(self@.mmu),

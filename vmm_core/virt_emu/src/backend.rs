@@ -226,6 +226,7 @@ struct VpState {
     apic_offer: Option<u8>,
     apic_delivered: [u64; 256],
     first_apic_retired: Option<u64>,
+    first_apic_time: Option<u64>,
     core: Option<SharedEventMachine>,
     initial_system: Option<SystemState>,
     started: bool,
@@ -271,6 +272,8 @@ pub struct ApicDiagnostics {
     pub delivered: Vec<(u8, u64)>,
     /// Retirements at the first successful APIC delivery.
     pub first_interrupt_retired: Option<u64>,
+    /// Shared VM time at the first successful APIC delivery.
+    pub first_interrupt_time_100ns: Option<u64>,
     /// Current time in the shared VM clock domain.
     pub vm_time_100ns: u64,
 }
@@ -292,6 +295,7 @@ impl EmuProcessor<'_> {
                 .filter_map(|(vector, &count)| (count != 0).then_some((vector as u8, count)))
                 .collect(),
             first_interrupt_retired: self.state.first_apic_retired,
+            first_interrupt_time_100ns: self.state.first_apic_time,
             vm_time_100ns: self.clock.now().as_100ns(),
         })
     }
@@ -435,6 +439,7 @@ impl ProtoPartition for EmuProtoPartition {
                 apic_offer: None,
                 apic_delivered: [0; 256],
                 first_apic_retired: None,
+                first_apic_time: None,
                 core: None,
                 initial_system: Some(SystemState::empty()),
                 started: false,
@@ -633,6 +638,9 @@ impl Processor for EmuProcessor<'_> {
                     };
                     *slot = count;
                     self.state.first_apic_retired.get_or_insert(retired);
+                    if self.state.first_apic_time.is_none() {
+                        self.state.first_apic_time = Some(self.clock.now().as_100ns());
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => return Err(dev.fatal_error(Box::new(error))),

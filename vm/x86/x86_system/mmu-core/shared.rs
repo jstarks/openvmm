@@ -235,7 +235,7 @@ impl SharedMmu {
 
     pub fn new(config: Config, cr2: u64) -> (s: Self)
         ensures s.invariant(), s@.inner == (mmu_model::State {
-                config, cache: None, cr2: cr2 as int }),
+                config, cache: None, fetch_cache:None, cr2: cr2 as int }),
             s@.phase == Phase::Idle, s@.sequence == 0,
     {
         Self { inner: Mmu::new(config, cr2), phase: Phase::Idle,
@@ -252,7 +252,8 @@ impl SharedMmu {
     pub fn virtual_address(&self) -> (v: u64) ensures v == self@.va { self.va }
 
     pub fn cache_count(&self) -> (v: u8)
-        ensures v == if self@.inner.cache is Some { 1u8 } else { 0u8 },
+        ensures v as int==(if self@.inner.cache is Some {1int} else {0int})
+            +(if self@.inner.fetch_cache is Some {1int} else {0int}),
     { self.inner.cache_count() }
 
     /// False means another access is pending; state is unchanged.
@@ -307,7 +308,7 @@ impl SharedMmu {
             && !canonical(va + (size as u64 - 1))) {
             self.precheck_failure(MmuResult::GeneralProtection);
         } else {
-            if let Some(m) = self.inner.cache {
+            if let Some(m) = if matches!(access,Access::Fetch) {self.inner.fetch_cache} else {self.inner.cache} {
                 if m.page == va / 4096 && m.root == self.inner.config.root
                     && !matches!(access, Access::Write(_)) && allowed(m.permissions, self.inner.config, access, user) {
                     self.phase = Phase::Data { frame: m.frame, permissions: m.permissions,
@@ -488,8 +489,10 @@ impl SharedMmu {
                         }
                     },
                     _ => {
-                        self.inner.cache = Some(Mapping { page: self.va / 4096,
+                        let mapping=Some(Mapping { page: self.va / 4096,
                             root: self.inner.config.root, frame, permissions, large });
+                        if matches!(self.access,Access::Fetch) {self.inner.fetch_cache=mapping;}
+                        else {self.inner.cache=mapping;}
                         self.phase = Phase::Done(Report { result: MmuResult::Success(
                             ((word >> ((self.va % 8 * 8) as u32)) & 255) as u8),
                             table_reads: reads, virtual_address: self.va });

@@ -274,7 +274,7 @@ pub open spec fn request(s: State) -> Request {
         Phase::PageStoreHead { span: data, .. } => head_request(data.word, s.size),
         Phase::PageStoreTail { span: data, .. } => page_tail_request(data, s.size),
         Phase::IoReady { address, access, .. } =>
-            Request::Io(IoRequest { sequence: s.sequence, address, access }),
+            Request::Io(IoRequest { sequence: s.sequence, address, access, size:s.size }),
     }
 }
 
@@ -576,7 +576,7 @@ pub proof fn compare_completion(s: State, data: WordData, reads: u8)
 pub open spec fn operand(s: State) -> Option<Operand> {
     if s.modifier is Some { None } else { match (s.phase, s.word) {
         (Phase::Data { frame, .. }, Some(access)) =>
-            Some(Operand { address: (frame as int + walk_va(s) % 4096) as u64, access }),
+            Some(Operand { address: (frame as int + walk_va(s) % 4096) as u64, access, size:s.size }),
         _ => None,
     } }
 }
@@ -584,7 +584,7 @@ pub open spec fn route_io(s: State) -> (State, IoRoute) {
     if s.modifier is Some || s.comparison is Some || s.head is Some { (s, IoRoute::NotReady) } else {
     match (s.phase, s.word) {
         (Phase::Data { frame, leaf, reads, .. }, Some(access)) => {
-            if s.va % 8 != 0 { (s, IoRoute::Unaligned) }
+            if s.va % s.size as u64 != 0 { (s, IoRoute::Unaligned) }
             else if s.sequence == u64::MAX { (s, IoRoute::Exhausted) }
             else {
                 let address = (frame as int + s.va % 4096) as u64;

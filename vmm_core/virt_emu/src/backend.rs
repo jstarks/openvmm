@@ -544,16 +544,21 @@ impl Processor for EmuProcessor<'_> {
                 BatchStop::Io(request) => {
                     self.state.io_active = true;
                     self.ram.barrier();
+                    let size = usize::from(request.size);
                     let reply = match request.access {
                         WordAccess::Read => {
                             let mut bytes = [0; 8];
-                            dev.read_mmio(VpIndex::new(0), request.address, &mut bytes)
+                            dev.read_mmio(VpIndex::new(0), request.address, &mut bytes[..size])
                                 .await;
                             IoReply::Read(u64::from_le_bytes(bytes))
                         }
                         WordAccess::Write(value) => {
-                            dev.write_mmio(VpIndex::new(0), request.address, &value.to_le_bytes())
-                                .await;
+                            dev.write_mmio(
+                                VpIndex::new(0),
+                                request.address,
+                                &value.to_le_bytes()[..size],
+                            )
+                            .await;
                             IoReply::Written
                         }
                     };

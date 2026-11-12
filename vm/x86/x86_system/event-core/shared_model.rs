@@ -50,16 +50,16 @@ pub open spec fn visible_cpu(s: State) -> model::State {
         _ => s.core.cpu }
 }
 pub open spec fn io_operand(s: State) -> Option<super::mmu_core::shared::io::Operand> {
-    if s.phase is Ordinary { c::io_operand(s.core) } else { None }
+    if s.phase is Ordinary || s.phase is EntryMemory { c::io_operand(s.core) } else { None }
 }
 pub open spec fn route_io(s: State) -> (State, super::mmu_core::shared::io::IoRoute) {
-    if s.phase is Ordinary {
+    if s.phase is Ordinary || s.phase is EntryMemory {
         let (core, result) = c::route_io(s.core);
         (State { core, ..s }, result)
     } else { (s, super::mmu_core::shared::io::IoRoute::NotReady) }
 }
 pub open spec fn complete_io(s: State, sequence: u64, reply: super::mmu_core::shared::io::IoReply) -> (State, bool) {
-    if s.phase is Ordinary {
+    if s.phase is Ordinary || s.phase is EntryMemory {
         let (core, accepted) = c::complete_io(s.core, sequence, reply);
         (State { core, ..s }, accepted)
     } else { (s, false) }

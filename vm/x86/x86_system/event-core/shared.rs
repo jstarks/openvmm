@@ -189,20 +189,20 @@ impl SharedEventMachine {
         requires self.invariant(),
         ensures out == spec::io_operand(self@),
     {
-        if matches!(self.phase, Phase::Ordinary { .. }) { self.core.io_operand() } else { None }
+        if matches!(self.phase, Phase::Ordinary { .. } | Phase::EntryMemory { .. }) { self.core.io_operand() } else { None }
     }
     pub fn route_io(&mut self) -> (out: IoRoute)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, out) == spec::route_io(old(self)@),
     {
-        if matches!(self.phase, Phase::Ordinary { .. }) { self.core.route_io() } else { IoRoute::NotReady }
+        if matches!(self.phase, Phase::Ordinary { .. } | Phase::EntryMemory { .. }) { self.core.route_io() } else { IoRoute::NotReady }
     }
     pub fn complete_io(&mut self, sequence: u64, reply: IoReply) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
             (final(self)@, accepted) == spec::complete_io(old(self)@, sequence, reply),
     {
-        if matches!(self.phase, Phase::Ordinary { .. }) { self.core.complete_io(sequence, reply) } else { false }
+        if matches!(self.phase, Phase::Ordinary { .. } | Phase::EntryMemory { .. }) { self.core.complete_io(sequence, reply) } else { false }
     }
 
     pub fn inject(&mut self, vector: u8) -> (r: Injection)
@@ -763,7 +763,7 @@ impl SharedEventMachine {
                         });
                     }
                     if let Some(operand) = self.io_operand() {
-                        if is_mmio(operand.address, 8) {
+                        if is_mmio(operand.address, operand.size) {
                             let route = self.route_io();
                             if route != IoRoute::Accepted {
                                 return Err(RunError::IoProfile(route));

@@ -224,10 +224,10 @@ impl SharedMmu {
                 self.access is Write && self.head is Some && spec::valid_page_data(data)
                 && data.word.address == self.head.unwrap().address,
             Phase::IoDirty { pte, address, value, .. } => spec::valid_leaf(pte)
-                && address < 0x1_0000_0000_0000u64 && address % 8 == 0
+                && address < 0x1_0000_0000_0000u64 && address % self.size as u64 == 0
                 && self.word == Some(WordAccess::Write(value)),
             Phase::IoReady { address, access, .. } =>
-                address < 0x1_0000_0000_0000u64 && address % 8 == 0
+                address < 0x1_0000_0000_0000u64 && address % self.size as u64 == 0
                 && self.word == Some(access),
             _ => true,
         }
@@ -440,7 +440,7 @@ impl SharedMmu {
             Phase::PageStoreHead { span: data, .. } => self.word_head_request(data.word),
             Phase::PageStoreTail { span: data, .. } => self.page_tail_request(data),
             Phase::IoReady { address, access, .. } =>
-                Request::Io(IoRequest { sequence: self.sequence, address, access }),
+                Request::Io(IoRequest { sequence: self.sequence, address, access, size:self.size }),
         }
     }
 

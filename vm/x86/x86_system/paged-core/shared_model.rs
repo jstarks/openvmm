@@ -19,16 +19,16 @@ verus! {
 pub struct State { pub cpu: model::State, pub mmu: mm::State, pub phase: CpuPhase, pub user: bool }
 
 pub open spec fn io_operand(s: State) -> Option<super::mmu_core::shared::io::Operand> {
-    if s.phase is Data { mm::operand(s.mmu) } else { None }
+    if s.phase is Data || s.phase is Boundary { mm::operand(s.mmu) } else { None }
 }
 pub open spec fn route_io(s: State) -> (State, super::mmu_core::shared::io::IoRoute) {
-    if s.phase is Data {
+    if s.phase is Data || s.phase is Boundary {
         let (mmu, result) = mm::route_io(s.mmu);
         (State { mmu, ..s }, result)
     } else { (s, super::mmu_core::shared::io::IoRoute::NotReady) }
 }
 pub open spec fn complete_io(s: State, sequence: u64, reply: super::mmu_core::shared::io::IoReply) -> (State, bool) {
-    if s.phase is Data {
+    if s.phase is Data || s.phase is Boundary {
         let (mmu, accepted) = mm::complete_io(s.mmu, sequence, reply);
         (State { mmu, ..s }, accepted)
     } else { (s, false) }

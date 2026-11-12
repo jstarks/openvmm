@@ -7,9 +7,9 @@ use super::*;
 verus! {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Operand { pub address: u64, pub access: WordAccess }
+pub struct Operand { pub address: u64, pub access: WordAccess, pub size:u8 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IoRequest { pub sequence: u64, pub address: u64, pub access: WordAccess }
+pub struct IoRequest { pub sequence: u64, pub address: u64, pub access: WordAccess, pub size:u8 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoReply { Read(u64), Written }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +23,7 @@ impl SharedMmu {
         if self.modifier.is_some() { return None; }
         match (self.phase, self.word) {
             (Phase::Data { frame, .. }, Some(access)) =>
-                Some(Operand { address: frame + self.walk_va() % 4096, access }),
+                Some(Operand { address: frame + self.walk_va() % 4096, access, size:self.size }),
             _ => None,
         }
     }
@@ -36,13 +36,15 @@ impl SharedMmu {
         if self.modifier.is_some() || self.comparison.is_some() || self.head.is_some() { return IoRoute::NotReady; }
         match (self.phase, self.word) {
             (Phase::Data { frame, leaf, reads, .. }, Some(access)) => {
-                if self.va % 8 != 0 { return IoRoute::Unaligned; }
+                if self.va % self.size as u64 != 0 { return IoRoute::Unaligned; }
                 if self.sequence == u64::MAX { return IoRoute::Exhausted; }
                 let va = self.va;
                 let address = frame + va % 4096;
                 proof {
-                    assert(address % 8 == 0) by(bit_vector)
-                        requires address == frame + va % 4096, frame % 4096 == 0, va % 8 == 0;
+                    let size=self.size as u64;
+                    assert(address % size == 0) by(bit_vector)
+                        requires address == frame + va % 4096, frame % 4096 == 0,
+                            va % size == 0, size==1 || size==2 || size==4 || size==8;
                 }
                 let phase = match access {
                     WordAccess::Read => Phase::IoReady { address, access, reads },

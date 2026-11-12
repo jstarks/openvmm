@@ -34,6 +34,7 @@ struct Devices {
     port_io: bool,
     pm: Option<Mutex<chipset::pm::PowerManagementDevice>>,
     ports: Mutex<Vec<(bool, u16, Vec<u8>)>>,
+    mmio: Mutex<Vec<(bool, u64, Vec<u8>)>>,
     released: AtomicBool,
     wait: AtomicWaker,
     writes: AtomicUsize,
@@ -49,6 +50,7 @@ impl Devices {
             port_io: false,
             pm: None,
             ports: Mutex::new(Vec::new()),
+            mmio: Mutex::new(Vec::new()),
             released: AtomicBool::new(false),
             wait: AtomicWaker::new(),
             writes: AtomicUsize::new(0),
@@ -86,17 +88,20 @@ impl CpuIo for Devices {
         panic!("no EOI instruction in this profile")
     }
     async fn read_mmio(&self, _vp: VpIndex, address: u64, data: &mut [u8]) {
-        assert_eq!(address, DEVICE);
+        let offset = (address - DEVICE) as usize;
+        assert!(offset + data.len() <= 8);
         self.reads.fetch_add(1, Ordering::SeqCst);
-        data.copy_from_slice(&VALUE.to_le_bytes());
+        data.copy_from_slice(&VALUE.to_le_bytes()[offset..offset + data.len()]);
+        self.mmio.lock().push((false, address, data.to_vec()));
     }
     async fn write_mmio(&self, _vp: VpIndex, address: u64, data: &[u8]) {
-        assert_eq!(address, DEVICE);
+        assert!(address >= DEVICE && address - DEVICE + data.len() as u64 <= 8);
         self.writes.fetch_add(1, Ordering::SeqCst);
-        self.value.store(
-            u64::from_le_bytes(data.try_into().unwrap()),
-            Ordering::SeqCst,
-        );
+        let mut bytes = [0; 8];
+        bytes[..data.len()].copy_from_slice(data);
+        self.value
+            .store(u64::from_le_bytes(bytes), Ordering::SeqCst);
+        self.mmio.lock().push((true, address, data.to_vec()));
         self.wait_for_release().await;
         self.writes_done.fetch_add(1, Ordering::SeqCst);
     }
@@ -1263,6 +1268,77 @@ async fn real_backend_guest_recovery_delayed_mmio_hlt_and_irq(driver: DefaultDri
     assert_eq!(devices.writes_done.load(Ordering::SeqCst), 1);
     assert_eq!(devices.value.load(Ordering::SeqCst), 0x1234_5678_89ab_cdef);
     assert!(devices.faults.lock().is_empty());
+}
+
+#[async_test]
+async fn decoded_mmio_preserves_exact_device_width_and_naturally_aligned_offsets(
+    driver: DefaultDriver,
+) {
+    for (store, load, size, offset) in [
+        (&[0x88, 0x07][..], &[0x8a, 0x07][..], 1usize, 3usize),
+        (&[0x66, 0x89, 0x07][..], &[0x66, 0x8b, 0x07][..], 2, 2),
+        (&[0x89, 0x07][..], &[0x8b, 0x07][..], 4, 4),
+        (&[0x48, 0x89, 0x07][..], &[0x48, 0x8b, 0x07][..], 8, 0),
+    ] {
+        let (mut bytes, owned) = fixture();
+        let program = [store, load].concat();
+        bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+        let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+        let mut vp = binder.bind().unwrap();
+        let mut initial = long_mode_registers(
+            owned.core.cpu,
+            super::shared_mmu_tests::config(),
+            owned.tables,
+            77,
+        );
+        initial.rdi = DEVICE + offset as u64;
+        initial.rax = 0xaabb_ccdd_1234_5678;
+        initial.rflags |= 0x10000;
+        vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+        vp.set_execution_checkpoint(Some(CODE + program.len() as u64))
+            .unwrap();
+        let devices = Devices::new();
+        devices.release();
+        let stop = StopVpSource::new();
+        assert!(matches!(
+            vp.run_vp(stop.checker(), &devices).await,
+            Err(VpHaltReason::PowerOff)
+        ));
+        assert_eq!(
+            &*devices.mmio.lock(),
+            &[
+                (
+                    true,
+                    DEVICE + offset as u64,
+                    initial.rax.to_le_bytes()[..size].to_vec()
+                ),
+                (
+                    false,
+                    DEVICE + offset as u64,
+                    VALUE.to_le_bytes()[offset..offset + size].to_vec()
+                ),
+            ]
+        );
+        let mask = ((1u128 << (size * 8)) - 1) as u64;
+        let value = (VALUE >> (offset * 8)) & mask;
+        let mut expected = initial;
+        expected.rip = CODE + program.len() as u64;
+        expected.rflags &= !0x10000;
+        expected.rax = if size < 4 {
+            initial.rax & !mask | value
+        } else {
+            value
+        };
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+        assert_eq!(vp.completed_batch_progress().retired, 2);
+        assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(devices.reads.load(Ordering::SeqCst), 1);
+        let mut original = [0; 8];
+        assert!(
+            memory.read_at(DEVICE, &mut original).is_err(),
+            "device access succeeded without RAM backing"
+        );
+    }
 }
 
 #[async_test]

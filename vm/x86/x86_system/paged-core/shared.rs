@@ -60,14 +60,14 @@ impl SharedMachine {
         requires self.invariant(),
         ensures out == spec::io_operand(self@),
     {
-        if matches!(self.phase, CpuPhase::Data { .. }) { self.mmu.operand() } else { None }
+        if matches!(self.phase, CpuPhase::Data { .. } | CpuPhase::Boundary) { self.mmu.operand() } else { None }
     }
 
     pub fn route_io(&mut self) -> (out: IoRoute)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, out) == spec::route_io(old(self)@),
     {
-        if matches!(self.phase, CpuPhase::Data { .. }) { self.mmu.route_io() } else { IoRoute::NotReady }
+        if matches!(self.phase, CpuPhase::Data { .. } | CpuPhase::Boundary) { self.mmu.route_io() } else { IoRoute::NotReady }
     }
 
     pub fn complete_io(&mut self, sequence: u64, reply: IoReply) -> (accepted: bool)
@@ -75,7 +75,7 @@ impl SharedMachine {
         ensures final(self).invariant(),
             (final(self)@, accepted) == spec::complete_io(old(self)@, sequence, reply),
     {
-        if matches!(self.phase, CpuPhase::Data { .. }) { self.mmu.complete_io(sequence, reply) } else { false }
+        if matches!(self.phase, CpuPhase::Data { .. } | CpuPhase::Boundary) { self.mmu.complete_io(sequence, reply) } else { false }
     }
 
     pub(crate) proof fn boundary_facts(&self)

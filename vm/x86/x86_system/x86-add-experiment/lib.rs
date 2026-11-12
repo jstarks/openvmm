@@ -32,24 +32,29 @@ impl View for Outcome {
     }
 }
 
+#[inline]
 pub fn parity(byte: u8) -> (even: bool)
     ensures even == (model::population(byte as int) % 2 == 0),
 {
-    let mut rest = byte;
-    let mut count: u8 = 0;
-    while rest != 0
-        invariant
-            count as int + model::population(rest as int)
-                == model::population(byte as int),
-            count as int + rest as int <= 255,
-        decreases rest,
-    {
-        proof { reveal(model::population); }
-        count = count + rest % 2;
-        rest = rest / 2;
+    let folded=byte^(byte>>4);
+    let folded=folded^(folded>>2);
+    let folded=folded^(folded>>1);
+    let even=folded&1==0;
+    proof {
+        let sum=((byte%2) as u16+((byte/2)%2) as u16+((byte/4)%2) as u16
+            +((byte/8)%2) as u16+((byte/16)%2) as u16+((byte/32)%2) as u16
+            +((byte/64)%2) as u16+(byte/128) as u16) as u16;
+        assert(even==(sum%2==0)) by(bit_vector)
+            requires folded==(byte^(byte>>4))^((byte^(byte>>4))>>2)
+                ^(((byte^(byte>>4))^((byte^(byte>>4))>>2))>>1),
+                even==(folded&1u8==0),
+                sum==((byte%2u8) as u16+((byte/2u8)%2u8) as u16+((byte/4u8)%2u8) as u16
+                    +((byte/8u8)%2u8) as u16+((byte/16u8)%2u8) as u16+((byte/32u8)%2u8) as u16
+                    +((byte/64u8)%2u8) as u16+(byte/128u8) as u16) as u16;
+        reveal_with_fuel(model::population,9);
+        assert(model::population(byte as int)==sum as int);
     }
-    proof { reveal(model::population); }
-    count % 2 == 0
+    even
 }
 
 pub fn add64(a: u64, b: u64) -> (out: Outcome)

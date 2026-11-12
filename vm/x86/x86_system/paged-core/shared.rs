@@ -113,6 +113,7 @@ impl SharedMachine {
         self.mmu.begin_word(address, request, false)
     }
 
+    #[inline(always)]
     pub(crate) fn boundary_commit(&mut self, cpu: State, release: bool) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, accepted) ==
@@ -234,6 +235,7 @@ impl SharedMachine {
         ensures request == mmu_core::shared_model::request(self@.mmu),
     { self.mmu.request() }
 
+    #[inline]
     pub fn respond(&mut self, reply: Reply) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), final(self)@ == (spec::State {

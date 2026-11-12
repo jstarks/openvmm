@@ -177,7 +177,14 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
     driver: DefaultDriver,
 ) {
     let iterations = 100_000u32;
-    for (apic, bypass) in [(false, true), (false, false), (true, false)] {
+    for (apic, bypass, batch) in [
+        (false, true, false),
+        (false, false, false),
+        (true, false, false),
+        (false, true, true),
+        (false, false, true),
+        (true, false, true),
+    ] {
         let (mut bytes, owned) = fixture();
         let mut code = vec![0xb9];
         code.extend_from_slice(&iterations.to_le_bytes());
@@ -188,6 +195,9 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         let mut vp = binder.bind().unwrap();
         if bypass {
             vp.bypass_decode_cache();
+        }
+        if !batch {
+            vp.bypass_decode_batch();
         }
         let mut initial = long_mode_registers(
             owned.core.cpu,
@@ -216,7 +226,7 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
         assert_eq!(vp.completed_batch_progress().retired, retired);
         println!(
-            "apic={apic} decode_cache={} instructions={retired} seconds={seconds:.6} mips={:.3}",
+            "apic={apic} decode_cache={} batch={batch} instructions={retired} seconds={seconds:.6} mips={:.3}",
             !bypass,
             retired as f64 / seconds / 1e6
         );
@@ -1644,89 +1654,94 @@ async fn backend_stop_during_device_completion_resumes_without_reissue(driver: D
 async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
     driver: DefaultDriver,
 ) {
-    let (mut bytes, mut oracle) = fixture();
-    let prefix = [
-        0x49, 0x89, 0xf7, 0x4c, 0x8d, 0x35, 0, 0, 0, 0, 0xba, 0x01, 0x01, 0, 0xc0, 0x41, 0xb4,
-        0x56, 0x66, 0x41, 0xbd, 0x9a, 0x78,
-    ];
-    let ordinary = [
-        0x48, 0x8b, 0x07, 0x48, 0x89, 0x03, 0x48, 0x8b, 0x13, 0xf4, 0xf4,
-    ];
-    bytes[CODE as usize..CODE as usize + prefix.len()].copy_from_slice(&prefix);
-    bytes[CODE as usize + prefix.len()..CODE as usize + prefix.len() + ordinary.len()]
-        .copy_from_slice(&ordinary);
-    oracle.core.cpu.gpr[3] = DEVICE;
-    oracle.core.cpu.gpr[2] = u64::MAX;
-    oracle.core.cpu.gpr[12] = 0x1122334455667788;
-    oracle.core.cpu.gpr[13] = 0x99aabbccddeeff00;
-    oracle.core.cpu.flags |= 0x10000;
-    let initial = long_mode_registers(
-        oracle.core.cpu,
-        super::shared_mmu_tests::config(),
-        oracle.tables,
-        oracle.core.mmu.cr2(),
-    );
-    let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
-    let mut vp = binder.bind().unwrap();
-    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
-    let devices = Devices::new();
-    let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
-    park(run.as_mut());
-    assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
-    assert_eq!(devices.reads.load(Ordering::SeqCst), 0);
-    stop.stop();
-    devices.release();
-    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
-    drop(run);
-    let suspended = vp.access_state(Vtl::Vtl0).registers().unwrap();
-    assert_eq!(suspended.rdx, 0xc0000101);
-    assert_eq!(suspended.r12, 0x1122334455667756);
-    assert_eq!(suspended.r13, 0x99aabbccddee789a);
-    let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
-    park(run.as_mut());
-    partition.inject_selected(64).unwrap();
-    park(run.as_mut());
-    stop.stop();
-    assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
-    drop(run);
-
-    oracle.core.cpu.gpr[15] = initial.rsi;
-    oracle.core.cpu.gpr[14] = CODE + 10;
-    oracle.core.cpu.gpr[2] = 0xc0000101;
-    oracle.core.cpu.gpr[12] = 0x1122334455667756;
-    oracle.core.cpu.gpr[13] = 0x99aabbccddee789a;
-    oracle.core.cpu.rip += prefix.len() as u64;
-    oracle.core.cpu.flags &= !0x10000;
-    let mut expected = bytes;
-    expected.resize(0x21000, 0);
-    let report = oracle.run(&mut expected, 0, 7);
-    assert_eq!((report.retired, report.delivered), (6, 1));
-    expected[DEVICE as usize..DEVICE as usize + 8].copy_from_slice(&VALUE.to_le_bytes());
-    assert_eq!(oracle.run(&mut expected, 0, 2).retired, 2);
-    assert_eq!(oracle.inject(64), x86_system::Injection::Queued);
-    let report = oracle.run(&mut expected, 0, 4);
-    assert_eq!((report.retired, report.delivered), (3, 1));
-    let actual = vp.access_state(Vtl::Vtl0).registers().unwrap();
-    assert_eq!(
-        actual,
-        long_mode_registers(
+    for batch in [false, true] {
+        let (mut bytes, mut oracle) = fixture();
+        let prefix = [
+            0x49, 0x89, 0xf7, 0x4c, 0x8d, 0x35, 0, 0, 0, 0, 0xba, 0x01, 0x01, 0, 0xc0, 0x41, 0xb4,
+            0x56, 0x66, 0x41, 0xbd, 0x9a, 0x78,
+        ];
+        let ordinary = [
+            0x48, 0x8b, 0x07, 0x48, 0x89, 0x03, 0x48, 0x8b, 0x13, 0xf4, 0xf4,
+        ];
+        bytes[CODE as usize..CODE as usize + prefix.len()].copy_from_slice(&prefix);
+        bytes[CODE as usize + prefix.len()..CODE as usize + prefix.len() + ordinary.len()]
+            .copy_from_slice(&ordinary);
+        oracle.core.cpu.gpr[3] = DEVICE;
+        oracle.core.cpu.gpr[2] = u64::MAX;
+        oracle.core.cpu.gpr[12] = 0x1122334455667788;
+        oracle.core.cpu.gpr[13] = 0x99aabbccddeeff00;
+        oracle.core.cpu.flags |= 0x10000;
+        let initial = long_mode_registers(
             oracle.core.cpu,
             super::shared_mmu_tests::config(),
             oracle.tables,
-            oracle.core.mmu.cr2()
-        )
-    );
-    assert_eq!(actual.r12, 0x1122334455667756);
-    assert_eq!(actual.r13, 0x99aabbccddee789a);
-    let mut actual_bytes = vec![0; 0x20000];
-    memory.read_at(0, &mut actual_bytes).unwrap();
-    assert_eq!(actual_bytes, expected[..0x20000]);
-    assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
-    assert_eq!(devices.writes_done.load(Ordering::SeqCst), 1);
-    assert_eq!(devices.reads.load(Ordering::SeqCst), 1);
-    assert!(devices.faults.lock().is_empty());
+            oracle.core.mmu.cr2(),
+        );
+        let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+        let mut vp = binder.bind().unwrap();
+        if !batch {
+            vp.bypass_decode_batch();
+        }
+        vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+        let devices = Devices::new();
+        let stop = StopVpSource::new();
+        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        park(run.as_mut());
+        assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(devices.reads.load(Ordering::SeqCst), 0);
+        stop.stop();
+        devices.release();
+        assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+        drop(run);
+        let suspended = vp.access_state(Vtl::Vtl0).registers().unwrap();
+        assert_eq!(suspended.rdx, 0xc0000101);
+        assert_eq!(suspended.r12, 0x1122334455667756);
+        assert_eq!(suspended.r13, 0x99aabbccddee789a);
+        let stop = StopVpSource::new();
+        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        park(run.as_mut());
+        partition.inject_selected(64).unwrap();
+        park(run.as_mut());
+        stop.stop();
+        assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
+        drop(run);
+
+        oracle.core.cpu.gpr[15] = initial.rsi;
+        oracle.core.cpu.gpr[14] = CODE + 10;
+        oracle.core.cpu.gpr[2] = 0xc0000101;
+        oracle.core.cpu.gpr[12] = 0x1122334455667756;
+        oracle.core.cpu.gpr[13] = 0x99aabbccddee789a;
+        oracle.core.cpu.rip += prefix.len() as u64;
+        oracle.core.cpu.flags &= !0x10000;
+        let mut expected = bytes;
+        expected.resize(0x21000, 0);
+        let report = oracle.run(&mut expected, 0, 7);
+        assert_eq!((report.retired, report.delivered), (6, 1));
+        expected[DEVICE as usize..DEVICE as usize + 8].copy_from_slice(&VALUE.to_le_bytes());
+        assert_eq!(oracle.run(&mut expected, 0, 2).retired, 2);
+        assert_eq!(oracle.inject(64), x86_system::Injection::Queued);
+        let report = oracle.run(&mut expected, 0, 4);
+        assert_eq!((report.retired, report.delivered), (3, 1));
+        let actual = vp.access_state(Vtl::Vtl0).registers().unwrap();
+        assert_eq!(
+            actual,
+            long_mode_registers(
+                oracle.core.cpu,
+                super::shared_mmu_tests::config(),
+                oracle.tables,
+                oracle.core.mmu.cr2()
+            )
+        );
+        assert_eq!(actual.r12, 0x1122334455667756);
+        assert_eq!(actual.r13, 0x99aabbccddee789a);
+        let mut actual_bytes = vec![0; 0x20000];
+        memory.read_at(0, &mut actual_bytes).unwrap();
+        assert_eq!(actual_bytes, expected[..0x20000]);
+        assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(devices.writes_done.load(Ordering::SeqCst), 1);
+        assert_eq!(devices.reads.load(Ordering::SeqCst), 1);
+        assert!(devices.faults.lock().is_empty());
+    }
 }
 
 #[async_test]

@@ -222,6 +222,8 @@ pub struct EmuPartition {
 
 struct VpState {
     decoder: decode_cache::DecodeCache,
+    #[cfg(test)]
+    decode_in_batch: bool,
     lapic: Option<LocalApic>,
     apic_offer: Option<u8>,
     apic_delivered: [u64; 256],
@@ -282,6 +284,10 @@ impl EmuProcessor<'_> {
     #[cfg(test)]
     pub(crate) fn bypass_decode_cache(&mut self) {
         self.state.decoder.bypass = true;
+    }
+    #[cfg(test)]
+    pub(crate) fn bypass_decode_batch(&mut self) {
+        self.state.decode_in_batch = false;
     }
     /// Captures the owned controller and delivery counters without changing them.
     pub fn apic_diagnostics(&self) -> Option<ApicDiagnostics> {
@@ -431,6 +437,8 @@ impl ProtoPartition for EmuProtoPartition {
             clock: self.clock.access("emu-tsc"),
             state: VpState {
                 decoder: decode_cache::DecodeCache::new(),
+                #[cfg(test)]
+                decode_in_batch: true,
                 lapic: if self.architectural_apic {
                     Some(LocalApic::new(self.apic_id, true, 0))
                 } else {
@@ -605,15 +613,30 @@ impl Processor for EmuProcessor<'_> {
                 })));
             }
             let retirements = if checkpoint.is_some() { 1 } else { 64 };
-            let batch = match core.run_with_mmio(&*self.ram, 64, retirements, |address, width| {
-                (0..u64::from(width)).all(|offset| {
-                    !self.ram.is_ram(address + offset)
-                        && (dev.is_mmio(address + offset)
-                            || local_window.is_some_and(|base| {
-                                address + offset >= base && address + offset - base < 4096
-                            }))
-                })
-            }) {
+            #[cfg(test)]
+            let decode_in_batch = self.state.decode_in_batch;
+            let decoder = &mut self.state.decoder;
+            let batch = match core.run_with_decoder(
+                &*self.ram,
+                64,
+                retirements,
+                |address, width| {
+                    (0..u64::from(width)).all(|offset| {
+                        !self.ram.is_ram(address + offset)
+                            && (dev.is_mmio(address + offset)
+                                || local_window.is_some_and(|base| {
+                                    address + offset >= base && address + offset - base < 4096
+                                }))
+                    })
+                },
+                |input| {
+                    #[cfg(test)]
+                    if !decode_in_batch {
+                        return None;
+                    }
+                    Some(decoder.decode(input))
+                },
+            ) {
                 Ok(batch) => batch,
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Memory(error)))),
             };

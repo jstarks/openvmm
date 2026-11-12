@@ -248,6 +248,7 @@ impl SharedEventMachine {
         ensures r == mmu_core::shared_model::request(self@.core.mmu),
     { self.core.request() }
 
+    #[inline]
     pub fn respond(&mut self, reply: Reply) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, accepted) == spec::respond(old(self)@, reply),
@@ -320,6 +321,7 @@ impl SharedEventMachine {
         Tick::Pending
     }
 
+    #[inline(always)]
     pub fn advance(&mut self) -> (tick: Tick)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, tick) == spec::advance(old(self)@),
@@ -725,7 +727,18 @@ impl SharedEventMachine {
         ram: &R,
         io_budget: u32,
         step_budget: u64,
+        is_mmio: impl FnMut(u64, u8) -> bool,
+    ) -> Result<Batch, RunError<R::Error>> {
+        self.run_with_decoder(ram, io_budget, step_budget, is_mmio, |_| None)
+    }
+
+    pub fn run_with_decoder<R: PhysicalRam>(
+        &mut self,
+        ram: &R,
+        io_budget: u32,
+        step_budget: u64,
         mut is_mmio: impl FnMut(u64, u8) -> bool,
+        mut decode: impl FnMut(DecodeInput) -> Option<DecodeDecision>,
     ) -> Result<Batch, RunError<R::Error>> {
         let (mut steps, mut effects, mut retired, mut delivered) = (0, 0, 0, 0);
         loop {
@@ -748,6 +761,12 @@ impl SharedEventMachine {
             }
             match self.advance() {
                 Tick::Decode(input) => {
+                    if let Some(decision) = decode(input) {
+                        if !self.complete_decode(input.sequence, decision) {
+                            return Err(RunError::DecodeCompletion(input.sequence));
+                        }
+                        continue;
+                    }
                     return Ok(Batch {
                         retired,
                         delivered,

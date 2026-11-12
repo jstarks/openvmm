@@ -50,6 +50,7 @@ impl SharedEventMachine {
         match self.phase { Phase::Decode { input } => Some(input), _ => None }
     }
 
+    #[inline(always)]
     pub fn complete_decode(&mut self, sequence: u64, decision: DecodeDecision) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
@@ -84,6 +85,7 @@ impl SharedEventMachine {
         Tick::Decode(input)
     }
 
+    #[inline(always)]
     pub(super) fn append_decode(&mut self, value: u8) -> (tick: Tick)
         requires old(self).invariant(), old(self).phase is DecodeFetch,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
@@ -110,6 +112,7 @@ impl SharedEventMachine {
         Tick::Decode(input)
     }
 
+    #[inline(always)]
     pub(super) fn advance_admitted(&mut self) -> (tick: Tick)
         requires old(self).invariant(), old(self).phase is Admitted,
         ensures final(self).invariant(),

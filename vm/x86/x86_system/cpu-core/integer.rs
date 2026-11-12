@@ -558,7 +558,7 @@ pub fn evaluate(operation: Operation, left: u64, right: u64, width: Width, flags
         }
         return Outcome { value, flags: next_flags, write: true };
     }
-    let c = (right % (if width == Width::Qword { 64u64 } else { 32u64 })) as u32;
+    let c = (right & (if width == Width::Qword { 63u64 } else { 31u64 })) as u32;
     assert(right % 64u64 == right & 63u64) by(bit_vector);
     assert(right % 32u64 == right & 31u64) by(bit_vector);
     assert(c == count(right, width));

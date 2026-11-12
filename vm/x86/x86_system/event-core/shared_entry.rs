@@ -141,6 +141,7 @@ pub(super) fn supported_access(address:u64,width:Width)->(out:bool)
 }
 
 impl SharedEventMachine {
+    #[inline(always)]
     pub(super) fn retire_entry(&mut self, mut cpu: State, length: u8, shadow: bool, serializing: bool) -> (tick: Tick)
         requires old(self).invariant(), old(self).core@.phase == CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),

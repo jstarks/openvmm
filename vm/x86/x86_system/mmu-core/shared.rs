@@ -257,6 +257,7 @@ impl SharedMmu {
     { self.inner.cache_count() }
 
     /// False means another access is pending; state is unchanged.
+    #[inline]
     pub fn begin(&mut self, va: u64, access: Access, user: bool) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
@@ -264,6 +265,7 @@ impl SharedMmu {
             final(self)@ == if accepted { spec::begin(old(self)@, va, access, user, None) } else { old(self)@ },
     { self.begin_access(va, access, user, None, 8) }
 
+    #[inline]
     fn begin_access(&mut self, va: u64, access: Access, user: bool, word: Option<WordAccess>, size: u8) -> (accepted: bool)
         requires old(self).invariant(),
             size == 1 || size == 2 || size == 4 || size == 8,
@@ -273,6 +275,7 @@ impl SharedMmu {
             final(self)@ == if accepted { spec::span_begin(old(self)@, va, access, user, word, size) } else { old(self)@ },
     { self.begin_access_mode(va, access, user, word, size, false) }
 
+    #[inline(always)]
     fn begin_access_mode(&mut self, va: u64, access: Access, user: bool,
         word: Option<WordAccess>, size: u8, allow_cross: bool) -> (accepted: bool)
         requires old(self).invariant(),
@@ -385,6 +388,7 @@ impl SharedMmu {
     }
 
     #[verifier::spinoff_prover]
+    #[inline(always)]
     pub fn request(&self) -> (out: Request)
         requires self.invariant(),
         ensures out == spec::request(self@),
@@ -446,6 +450,7 @@ impl SharedMmu {
     }
 
     /// False rejects a response of the wrong kind without advancing.
+    #[inline(always)]
     pub fn read(&mut self, word: u64) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
@@ -506,6 +511,7 @@ impl SharedMmu {
     }
 
     #[verifier::spinoff_prover]
+    #[inline(always)]
     pub fn exchanged(&mut self) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
@@ -619,6 +625,7 @@ impl SharedMmu {
 
     }
 
+    #[inline]
     pub fn respond(&mut self, reply: Reply) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
@@ -647,6 +654,7 @@ pub enum RunError<E> {
     Protocol(Request),
     InvalidBeat(BeatError),
     IoProfile(IoRoute),
+    DecodeCompletion(u64),
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for RunError<E> {
@@ -656,6 +664,9 @@ impl<E: core::fmt::Display> core::fmt::Display for RunError<E> {
             Self::Protocol(request) => write!(f, "invalid MMU response for {request:?}"),
             Self::InvalidBeat(error) => write!(f, "invalid MMU byte beat: {error:?}"),
             Self::IoProfile(route) => write!(f, "unsupported MMIO admission: {route:?}"),
+            Self::DecodeCompletion(sequence) => {
+                write!(f, "invalid decode completion for sequence {sequence}")
+            }
         }
     }
 }

@@ -105,6 +105,12 @@ impl SharedMachine {
     }
 
     #[inline]
+    pub(crate) fn fetched_word(&self)->(out:Option<(u64,u64)>)
+        requires self.invariant(),
+        ensures out==mmu_core::shared_model::fetched_word(self@.mmu),
+    {self.mmu.fetched_word()}
+
+    #[inline]
     pub(crate) fn boundary_fetch_next(&mut self,address:u64)->(accepted:bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),

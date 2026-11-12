@@ -12,6 +12,12 @@ use x86_system::shared::control_io::{ControlAccess, ControlReply};
 
 const TICKS_PER_100NS: u64 = 10;
 
+pub(super) fn deadline_time(value: u64) -> vmcore::vmtime::VmTime {
+    vmcore::vmtime::VmTime::from_100ns(
+        value / TICKS_PER_100NS + u64::from(!value.is_multiple_of(TICKS_PER_100NS)),
+    )
+}
+
 pub(super) fn ticks(time: vmcore::vmtime::VmTime) -> Result<u64, Error> {
     time.as_100ns()
         .checked_mul(TICKS_PER_100NS)
@@ -45,6 +51,8 @@ impl Control {
                 Err(current) => old = current,
             }
         }
+        self.incoming_banks
+            .fetch_or(1 << (vector / 32), Ordering::Release);
         self.waker.wake();
     }
 
@@ -80,9 +88,26 @@ impl Control {
     }
 
     pub(super) fn apic_work_pending(&self) -> bool {
-        self.incoming
-            .iter()
-            .any(|word| word.load(Ordering::Acquire) as u32 != 0)
+        self.incoming_banks.load(Ordering::Acquire) != 0
+    }
+
+    fn drain_apic(&self, apic: &mut LocalApic) -> Result<(), Error> {
+        // Clear before draining: concurrent publication must leave a notification.
+        let banks = self.incoming_banks.swap(0, Ordering::AcqRel);
+        for (bank, slot) in self.incoming.iter().enumerate() {
+            if banks & (1 << bank) == 0 {
+                continue;
+            }
+            let packet = slot.swap(0, Ordering::AcqRel);
+            let mut pending = packet as u32;
+            while pending != 0 {
+                let bit = pending.trailing_zeros();
+                let vector = (bank * 32 + bit as usize) as u8;
+                *apic = receive(*apic, vector, packet & (1u64 << (bit + 32)) != 0)?;
+                pending &= pending - 1;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -143,19 +168,7 @@ pub(super) fn poll(
     if matches!(apic.timer.deadline(),Deadline::At(deadline) if now>=deadline) {
         *apic = apic.advance(now).map_err(Error::Apic)?;
     }
-    for (bank, slot) in control.incoming.iter().enumerate() {
-        if slot.load(Ordering::Acquire) as u32 == 0 {
-            continue;
-        }
-        let packet = slot.swap(0, Ordering::AcqRel);
-        let mut pending = packet as u32;
-        while pending != 0 {
-            let bit = pending.trailing_zeros();
-            let vector = (bank * 32 + bit as usize) as u8;
-            *apic = receive(*apic, vector, packet & (1u64 << (bit + 32)) != 0)?;
-            pending &= pending - 1;
-        }
-    }
+    control.drain_apic(apic)?;
     control.publish_apic(apic);
     if core.pending().is_none() && core.cpu().flags & 0x200 != 0 && !core.shadow() {
         if apic.interrupts.irr.words.iter().any(|&word| word != 0) {
@@ -172,8 +185,7 @@ pub(super) fn poll(
         match apic.timer.deadline() {
             Deadline::Stopped => {}
             Deadline::At(value) => {
-                let time = value / TICKS_PER_100NS + u64::from(value % TICKS_PER_100NS != 0);
-                clock.set_timeout(vmcore::vmtime::VmTime::from_100ns(time));
+                clock.set_timeout(deadline_time(value));
             }
             Deadline::BeyondClock => return Err(Error::Profile("APIC deadline exceeds its clock")),
         }
@@ -234,5 +246,62 @@ pub(super) fn control(
         }
         Err(ApicError::GeneralProtection) => Ok(ControlReply::GeneralProtection),
         Err(error) => Err(Error::Apic(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn concurrent_mailbox_publication_and_drain_preserve_every_request() {
+        let control = Control::new(true);
+        let acknowledged = AtomicUsize::new(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut apic = LocalApic::new(0, true, 0);
+        apic.svr = 0x1ff;
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                for round in 0..10_000usize {
+                    control.post_apic((64 + round % 192) as u8, round % 2 == 0);
+                    while acknowledged.load(Ordering::Acquire) <= round {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "mailbox request was lost"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            for round in 0..10_000usize {
+                let vector = 64 + round % 192;
+                let bank = vector / 32;
+                let mask = 1u32 << (vector % 32);
+                loop {
+                    control.drain_apic(&mut apic).unwrap();
+                    if apic.interrupts.irr.words[bank] & mask != 0 {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "mailbox request was lost"
+                    );
+                    std::hint::spin_loop();
+                }
+                assert_eq!(apic.interrupts.tmr.words[bank] & mask != 0, round % 2 == 0);
+                apic.interrupts.irr.words[bank] &= !mask;
+                acknowledged.store(round + 1, Ordering::Release);
+            }
+            producer.join().unwrap();
+        });
+        control.drain_apic(&mut apic).unwrap();
+        assert!(!control.apic_work_pending());
+        assert!(
+            control
+                .incoming
+                .iter()
+                .all(|slot| slot.load(Ordering::Acquire) == 0)
+        );
     }
 }

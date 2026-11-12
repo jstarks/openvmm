@@ -347,6 +347,14 @@ impl SharedMmu {
         self.begin(va,Access::Fetch,user)
     }
 
+    #[inline]
+    pub fn fetched_word(&self)->(out:Option<(u64,u64)>)
+        requires self.invariant(),
+        ensures out==spec::fetched_word(self@),
+    {
+        match self.phase {Phase::FetchDone {word,..}=>Some((self.va,word)),_=>None}
+    }
+
     pub fn reload(&mut self, config: Config) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), accepted == !spec::active(old(self)@.phase),

@@ -30,6 +30,12 @@ const CODE: u64 = 0x10000;
 const DEVICE: u64 = 0x20000;
 const VALUE: u64 = 0xfedc_ba98_7654_3210;
 
+fn store_apic(code: &mut Vec<u8>, offset: u32, value: u32) {
+    code.extend_from_slice(&[0xc7, 0x87]);
+    code.extend_from_slice(&offset.to_le_bytes());
+    code.extend_from_slice(&value.to_le_bytes());
+}
+
 struct Devices {
     apic: bool,
     eois: Mutex<Vec<u32>>,
@@ -177,13 +183,15 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
     driver: DefaultDriver,
 ) {
     let iterations = 100_000u32;
-    for (apic, bypass, batch) in [
-        (false, true, false),
-        (false, false, false),
-        (true, false, false),
-        (false, true, true),
-        (false, false, true),
-        (true, false, true),
+    for (apic, bypass, batch, boundaries) in [
+        (false, true, false, true),
+        (false, false, false, true),
+        (true, false, false, true),
+        (false, true, true, true),
+        (false, false, true, true),
+        (true, false, true, true),
+        (false, false, true, false),
+        (true, false, true, false),
     ] {
         let (mut bytes, owned) = fixture();
         let mut code = vec![0xb9];
@@ -198,6 +206,9 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         }
         if !batch {
             vp.bypass_decode_batch();
+        }
+        if !boundaries {
+            vp.bypass_boundary_batch();
         }
         let mut initial = long_mode_registers(
             owned.core.cpu,
@@ -226,7 +237,7 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
         assert_eq!(vp.completed_batch_progress().retired, retired);
         println!(
-            "apic={apic} decode_cache={} batch={batch} instructions={retired} seconds={seconds:.6} mips={:.3}",
+            "apic={apic} decode_cache={} batch={batch} boundary_batch={boundaries} instructions={retired} seconds={seconds:.6} mips={:.3}",
             !bypass,
             retired as f64 / seconds / 1e6
         );
@@ -618,14 +629,68 @@ async fn build_profile(
 }
 
 #[async_test]
+async fn owned_lapic_timer_interrupts_an_if_enabled_batch_without_executor_wakeup(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
+    let target = 0x12000u64;
+    let gate = (target & 0xffff) | (8 << 16) | (0x8eu64 << 40) | ((target >> 16) << 48);
+    bytes[0xae00..0xae08].copy_from_slice(&gate.to_le_bytes());
+    bytes[0xae08..0xae10].fill(0);
+    let mut handler = vec![0x49, 0xff, 0xc2];
+    store_apic(&mut handler, 0xb0, 0);
+    handler.extend_from_slice(&[0x48, 0xcf]);
+    bytes[target as usize..target as usize + handler.len()].copy_from_slice(&handler);
+    let mut code = Vec::new();
+    store_apic(&mut code, 0xf0, 0x1ff);
+    store_apic(&mut code, 0x3e0, 11);
+    store_apic(&mut code, 0x320, 0xe0);
+    store_apic(&mut code, 0x380, 100_000);
+    code.push(0xb9);
+    code.extend_from_slice(&100_000u32.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xff, 0xc9, 0x75, 0xfb]);
+    bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+    let (_, mut binder, _, mut keeper) =
+        build_profile(&driver, &bytes, VmTime::from_100ns(0), true).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.rdi = DEVICE;
+    initial.r10 = 0;
+    initial.rflags |= 0x200;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + code.len() as u64))
+        .unwrap();
+    let mut devices = Devices::new();
+    devices.apic = true;
+    let stop = StopVpSource::new();
+    keeper.start().await;
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    keeper.stop().await;
+    let current = vp.access_state(Vtl::Vtl0).registers().unwrap();
+    assert_eq!(
+        (current.rip, current.rcx, current.r10),
+        (CODE + code.len() as u64, 0, 1)
+    );
+    assert_eq!(current.rflags & 0x200, 0x200);
+    let apic = vp.apic_diagnostics().unwrap();
+    assert_eq!(apic.delivered, [(224, 1)]);
+    assert!(apic.first_interrupt_retired.unwrap() < vp.completed_batch_progress().retired - 100);
+    assert!(devices.mmio.lock().is_empty());
+}
+
+#[async_test]
 async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real_eoi(
     driver: DefaultDriver,
 ) {
-    fn store(code: &mut Vec<u8>, offset: u32, value: u32) {
-        code.extend_from_slice(&[0xc7, 0x87]);
-        code.extend_from_slice(&offset.to_le_bytes());
-        code.extend_from_slice(&value.to_le_bytes());
-    }
     let (mut bytes, owned) = fixture();
     bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
     let target = 0x12000u64;
@@ -633,23 +698,23 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     bytes[0xae00..0xae08].copy_from_slice(&gate.to_le_bytes());
     bytes[0xae08..0xae10].fill(0);
     let mut handler = vec![0x4d, 0x01, 0xda];
-    store(&mut handler, 0xb0, 0);
+    store_apic(&mut handler, 0xb0, 0);
     handler.extend_from_slice(&[0x48, 0xcf]);
     bytes[target as usize..target as usize + handler.len()].copy_from_slice(&handler);
     let mut code = vec![
         0xb9, 0x1b, 0, 0, 0, 0x0f, 0x32, 0xb8, 5, 0, 0, 0, 0x44, 0x0f, 0x22, 0xc0, 0x44, 0x0f,
         0x20, 0xc3, 0x31, 0xc0, 0x44, 0x0f, 0x22, 0xc0,
     ];
-    store(&mut code, 0xf0, 0x1ff);
-    store(&mut code, 0x3e0, 11);
-    store(&mut code, 0x320, 0xe0);
-    store(&mut code, 0x380, 1_000_000);
+    store_apic(&mut code, 0xf0, 0x1ff);
+    store_apic(&mut code, 0x3e0, 11);
+    store_apic(&mut code, 0x320, 0xe0);
+    store_apic(&mut code, 0x380, 1_000_000);
     code.push(0xf4);
     code.push(0x90);
     let after_timer = CODE + code.len() as u64;
     code.push(0x90);
     code.push(0xfa);
-    store(&mut code, 0x380, 1_000_000);
+    store_apic(&mut code, 0x380, 1_000_000);
     let after_rearm = CODE + code.len() as u64;
     code.extend_from_slice(&[0x8b, 0x87, 0x70, 0x02, 0, 0]);
     let after_irr = CODE + code.len() as u64;

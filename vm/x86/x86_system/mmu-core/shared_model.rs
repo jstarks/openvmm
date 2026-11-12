@@ -40,6 +40,10 @@ pub open spec fn active(p: Phase) -> bool {
     !(p is Idle) && !(p is Done) && !(p is WordDone) && !(p is FetchDone)
 }
 
+pub open spec fn fetched_word(s:State)->Option<(u64,u64)> {
+    match s.phase {Phase::FetchDone {word,..}=>Some((s.va,word)),_=>None}
+}
+
 pub open spec fn begin_fetch_next(s:State,va:u64,user:bool)->(State,bool) {
     match s.phase {
         Phase::FetchDone {word,..} if s.va/8==va/8 && s.user==user

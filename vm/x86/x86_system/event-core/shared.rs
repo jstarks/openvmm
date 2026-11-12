@@ -737,8 +737,42 @@ impl SharedEventMachine {
         ram: &R,
         io_budget: u32,
         step_budget: u64,
-        mut is_mmio: impl FnMut(u64, u8) -> bool,
+        is_mmio: impl FnMut(u64, u8) -> bool,
+        decode: impl FnMut(DecodeInput) -> Option<DecodeDecision>,
+    ) -> Result<Batch, RunError<R::Error>> {
+        self.run_with_boundary(ram, io_budget, step_budget, is_mmio, decode, |core| {
+            core.apic_id.is_some()
+        })
+    }
+
+    /// Checks a read-only service predicate at subsequent instruction/REP boundaries.
+    pub fn run_with_boundary<R: PhysicalRam>(
+        &mut self,
+        ram: &R,
+        io_budget: u32,
+        step_budget: u64,
+        is_mmio: impl FnMut(u64, u8) -> bool,
         mut decode: impl FnMut(DecodeInput) -> Option<DecodeDecision>,
+        yield_at_boundary: impl FnMut(&Self) -> bool,
+    ) -> Result<Batch, RunError<R::Error>> {
+        self.run_with_window(
+            ram,
+            io_budget,
+            step_budget,
+            is_mmio,
+            |w| decode(w.input).map(|decision| (w.input.length, decision)),
+            yield_at_boundary,
+        )
+    }
+
+    pub fn run_with_window<R: PhysicalRam>(
+        &mut self,
+        ram: &R,
+        io_budget: u32,
+        step_budget: u64,
+        mut is_mmio: impl FnMut(u64, u8) -> bool,
+        mut decode: impl FnMut(decode::DecodeWindow) -> Option<(u8, DecodeDecision)>,
+        mut yield_at_boundary: impl FnMut(&Self) -> bool,
     ) -> Result<Batch, RunError<R::Error>> {
         let (mut steps, mut effects, mut retired, mut delivered) = (0, 0, 0, 0);
         loop {
@@ -749,9 +783,9 @@ impl SharedEventMachine {
                     stop: BatchStop::Budget,
                 });
             }
-            if self.apic_id.is_some()
-                && (steps != 0 || effects != 0)
+            if (steps != 0 || effects != 0)
                 && self.at_interrupt_boundary()
+                && yield_at_boundary(self)
             {
                 return Ok(Batch {
                     retired,
@@ -761,8 +795,16 @@ impl SharedEventMachine {
             }
             match self.advance() {
                 Tick::Decode(input) => {
-                    if let Some(decision) = decode(input) {
-                        if !self.complete_decode(input.sequence, decision) {
+                    let Some(window) = self.decode_window() else {
+                        return Err(RunError::DecodeCompletion(input.sequence));
+                    };
+                    if let Some((length, decision)) = decode(window) {
+                        let accepted = if length == input.length {
+                            self.complete_decode(input.sequence, decision)
+                        } else {
+                            self.complete_decode_window(input.sequence, length, decision)
+                        };
+                        if !accepted {
                             return Err(RunError::DecodeCompletion(input.sequence));
                         }
                         continue;

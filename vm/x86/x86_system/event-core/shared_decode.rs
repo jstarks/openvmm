@@ -17,6 +17,13 @@ pub struct DecodeInput {
     pub bytes: [u8; 15],
 }
 
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Structural)]
+pub struct DecodeWindow {
+    pub input:DecodeInput,
+    pub bytes:[u8;15],
+    pub available:u8,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeDecision {
     More,
@@ -48,6 +55,69 @@ impl SharedEventMachine {
         ensures out == spec::decode::request(self@),
     {
         match self.phase { Phase::Decode { input } => Some(input), _ => None }
+    }
+
+    #[inline(always)]
+    pub fn decode_window(&self)->(out:Option<DecodeWindow>)
+        requires self.invariant(),
+        ensures out==spec::decode::window(self@),
+            match out {
+                Some(w)=>w.input.length<=w.available<=15
+                    && w.input.rip as int+w.available as int-1<=u64::MAX,
+                _=>true,
+            },
+    {
+        let input=match self.phase {Phase::Decode {input}=>input,_=>return None};
+        let mut window=DecodeWindow {input,bytes:input.bytes,available:input.length};
+        if let Some((address,word))=self.core.fetched_word() {
+            if address==input.rip+(input.length as u64-1) {
+                let room=(7-address%8) as u8;
+                let available=if room>15-input.length {15} else {input.length+room};
+                window.available=available;
+                let mut i=input.length;
+                while i<available
+                    invariant input.length<=i<=available<=15,
+                        1<=input.length<=15,
+                        available as int<=input.length as int+7-address as int%8,
+                        window.input==input,window.available==available,
+                        forall|j:int|0<=j<15 ==> #[trigger] window.bytes[j]==
+                            spec::decode::window_byte(input,address,word,i,j),
+                    decreases available-i,
+                {
+                    let shift=((address%8+(i-input.length) as u64+1)*8) as u32;
+                    let value=(word>>shift)&255;
+                    assert(value<=255) by(bit_vector) requires value==(word>>shift)&255u64;
+                    window.bytes[i as usize]=value as u8;
+                    i+=1;
+                }
+            }
+        }
+        proof {
+            let expected=spec::decode::window(self@).unwrap();
+            assert(window.input==expected.input);
+            assert(window.available==expected.available);
+            assert(window.bytes@ =~=expected.bytes@);
+            assert(window.bytes==expected.bytes);
+            assert(window==expected);
+        }
+        Some(window)
+    }
+
+    #[inline]
+    pub fn complete_decode_window(&mut self,sequence:u64,length:u8,decision:DecodeDecision)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::decode::complete_window(old(self)@,sequence,length,decision),
+            final(self)@.core==old(self)@.core,
+    {
+        let window=match self.decode_window() {Some(w)=>w,None=>return false};
+        if window.input.sequence!=sequence || length<window.input.length || length>window.available {
+            return false;
+        }
+        let input=if length==window.input.length {window.input}
+            else {DecodeInput {bytes:window.bytes,length,..window.input}};
+        self.phase=Phase::Admitted {input,decision};
+        true
     }
 
     #[inline(always)]

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use x86_system::shared::decode::{DecodeDecision, DecodeInput};
+use x86_system::shared::decode::{DecodeDecision, DecodeInput, DecodeWindow};
 
 #[derive(Clone, Copy)]
 struct Receipt {
@@ -81,6 +81,46 @@ impl DecodeCache {
         }
         decision
     }
+
+    pub(super) fn decode_window(&mut self, window: DecodeWindow) -> (u8, DecodeDecision) {
+        let input = window.input;
+        if input.length == 0 || window.available < input.length || window.available > 15 {
+            return (input.length, DecodeDecision::Rejected);
+        }
+        #[cfg(test)]
+        let bypass = self.bypass;
+        #[cfg(not(test))]
+        let bypass = false;
+        if !bypass {
+            if let Some(receipt) = &self.slots[index(input.rip)] {
+                let length = window.available.min(receipt.length);
+                if receipt.rip == input.rip
+                    && input.length <= length
+                    && receipt.bytes[..usize::from(length)] == window.bytes[..usize::from(length)]
+                {
+                    return (
+                        length,
+                        if length == receipt.length {
+                            receipt.decision
+                        } else {
+                            DecodeDecision::More
+                        },
+                    );
+                }
+            }
+        }
+        for length in input.length..=window.available {
+            let decision = self.decode(DecodeInput {
+                bytes: window.bytes,
+                length,
+                ..input
+            });
+            if !matches!(decision, DecodeDecision::More) {
+                return (length, decision);
+            }
+        }
+        (window.available, DecodeDecision::More)
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +179,61 @@ mod tests {
     }
 
     #[test]
+    fn observed_windows_match_incremental_decoding_after_every_prefix_mutation() {
+        let mut cache = DecodeCache::new();
+        let mut longest = [0x66; 15];
+        longest[14] = 0x90;
+        for original in [
+            &[0x48, 0x83, 0xc0, 1][..],
+            &[0x48, 0x8b, 0x05, 1, 2, 3, 4][..],
+            &[0xf0, 0x48, 0x0f, 0xb1, 0x07][..],
+            &[0xe8, 1, 2, 3, 4][..],
+            &[0x75, 0xf7][..],
+            &[0x90][..],
+            &longest[..],
+            &[0x66; 15][..],
+        ] {
+            for byte in 0..original.len() {
+                for xor in [0, 1, 0x80, 0xff] {
+                    let cold = input(0x10000, original);
+                    assert_eq!(cache.decode(cold), x86_decode::admit(cold));
+                    let mut modified = original.to_vec();
+                    modified[byte] ^= xor;
+                    for available in 1..=modified.len() {
+                        for start in 1..=available {
+                            let base = input(0x10000, &modified[..start]);
+                            let mut bytes = [0xa5; 15];
+                            bytes[..available].copy_from_slice(&modified[..available]);
+                            let window = DecodeWindow {
+                                input: base,
+                                bytes,
+                                available: available as u8,
+                            };
+                            let mut expected = (available as u8, DecodeDecision::More);
+                            for length in start..=available {
+                                let decision = x86_decode::admit(DecodeInput {
+                                    bytes,
+                                    length: length as u8,
+                                    ..base
+                                });
+                                if !matches!(decision, DecodeDecision::More) {
+                                    expected = (length as u8, decision);
+                                    break;
+                                }
+                            }
+                            assert_eq!(
+                                cache.decode_window(window),
+                                expected,
+                                "{modified:02x?}/{start}/{available}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn same_slot_different_rip_never_reuses_a_relative_target() {
         let mut cache = DecodeCache::new();
         let first = input(0x10000, &[0x75, 0xf7]);
@@ -146,6 +241,18 @@ mod tests {
         assert_eq!(index(first.rip), index(second.rip));
         for current in [first, second, first] {
             assert_eq!(cache.decode(current), x86_decode::admit(current));
+            let window = DecodeWindow {
+                input: DecodeInput {
+                    length: 1,
+                    ..current
+                },
+                bytes: current.bytes,
+                available: current.length,
+            };
+            assert_eq!(
+                cache.decode_window(window),
+                (current.length, x86_decode::admit(current))
+            );
         }
         assert_ne!(x86_decode::admit(first), x86_decode::admit(second));
     }

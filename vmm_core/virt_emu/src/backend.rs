@@ -16,7 +16,7 @@ use memory_range::MemoryRange;
 use std::convert::Infallible;
 use std::future::poll_fn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::task::Poll;
 use virt::io::CpuIo;
 use virt::vp::{self, AccessVpState};
@@ -109,6 +109,7 @@ struct Control {
     has_apic: bool,
     routing: AtomicU64,
     incoming: [AtomicU64; 8],
+    incoming_banks: AtomicU8,
     pending: AtomicU16,
     unsupported: AtomicBool,
     waker: AtomicWaker,
@@ -121,6 +122,7 @@ impl Control {
             has_apic,
             routing: AtomicU64::new(0),
             incoming: std::array::from_fn(|_| AtomicU64::new(0)),
+            incoming_banks: AtomicU8::new(0),
             pending: AtomicU16::new(0),
             unsupported: AtomicBool::new(false),
             waker: AtomicWaker::new(),
@@ -224,6 +226,8 @@ struct VpState {
     decoder: decode_cache::DecodeCache,
     #[cfg(test)]
     decode_in_batch: bool,
+    #[cfg(test)]
+    boundary_in_batch: bool,
     lapic: Option<LocalApic>,
     apic_offer: Option<u8>,
     apic_delivered: [u64; 256],
@@ -288,6 +292,10 @@ impl EmuProcessor<'_> {
     #[cfg(test)]
     pub(crate) fn bypass_decode_batch(&mut self) {
         self.state.decode_in_batch = false;
+    }
+    #[cfg(test)]
+    pub(crate) fn bypass_boundary_batch(&mut self) {
+        self.state.boundary_in_batch = false;
     }
     /// Captures the owned controller and delivery counters without changing them.
     pub fn apic_diagnostics(&self) -> Option<ApicDiagnostics> {
@@ -439,6 +447,8 @@ impl ProtoPartition for EmuProtoPartition {
                 decoder: decode_cache::DecodeCache::new(),
                 #[cfg(test)]
                 decode_in_batch: true,
+                #[cfg(test)]
+                boundary_in_batch: true,
                 lapic: if self.architectural_apic {
                     Some(LocalApic::new(self.apic_id, true, 0))
                 } else {
@@ -612,14 +622,23 @@ impl Processor for EmuProcessor<'_> {
                     rip: core.cpu().rip,
                 })));
             }
-            let retirements = if checkpoint.is_some() { 1 } else { 64 };
+            let candidate = self.state.lapic.as_ref().and_then(|apic| apic.candidate());
+            let deadline = self
+                .state
+                .lapic
+                .as_ref()
+                .filter(|apic| apic.enabled() && apic.lvt[0] & 0x10000 == 0)
+                .map(|apic| apic.timer.deadline());
+            let offer = self.state.apic_offer;
             #[cfg(test)]
             let decode_in_batch = self.state.decode_in_batch;
+            #[cfg(test)]
+            let boundary_in_batch = self.state.boundary_in_batch;
             let decoder = &mut self.state.decoder;
-            let batch = match core.run_with_decoder(
+            let batch = match core.run_with_window(
                 &*self.ram,
                 64,
-                retirements,
+                64,
                 |address, width| {
                     (0..u64::from(width)).all(|offset| {
                         !self.ram.is_ram(address + offset)
@@ -629,12 +648,49 @@ impl Processor for EmuProcessor<'_> {
                                 }))
                     })
                 },
-                |input| {
+                |window| {
                     #[cfg(test)]
                     if !decode_in_batch {
                         return None;
                     }
-                    Some(decoder.decode(input))
+                    Some(decoder.decode_window(window))
+                },
+                |core| {
+                    #[cfg(test)]
+                    if !boundary_in_batch {
+                        return true;
+                    }
+                    if core.halted() {
+                        // Arm the timer timeout before registering the halt wait.
+                        return true;
+                    }
+                    if core.at_instruction_boundary() && checkpoint == Some(core.cpu().rip) {
+                        return true;
+                    }
+                    if self.control.unsupported.load(Ordering::Acquire)
+                        || self.control.apic_work_pending()
+                        || self.control.pending.load(Ordering::Acquire) != 0
+                    {
+                        return true;
+                    }
+                    if core.pending().is_some() {
+                        return false;
+                    }
+                    if offer.is_some() {
+                        return true;
+                    }
+                    if core.cpu().flags & 0x200 == 0 || core.shadow() {
+                        return false;
+                    }
+                    candidate.is_some() || match deadline {
+                        Some(x86_system::memory_core::cpu_core::apic::timer::Deadline::At(
+                            value,
+                        )) => self.clock.now().as_100ns() >= apic::deadline_time(value).as_100ns(),
+                        Some(
+                            x86_system::memory_core::cpu_core::apic::timer::Deadline::BeyondClock,
+                        ) => true,
+                        _ => false,
+                    }
                 },
             ) {
                 Ok(batch) => batch,

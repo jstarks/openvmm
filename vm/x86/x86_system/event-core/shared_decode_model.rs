@@ -6,7 +6,7 @@ use super::super::memory_core::cpu_core::operand::{self as scalar, ScalarStatus}
 #[cfg(verus_keep_ghost)]
 use super::super::memory_core::cpu_core::{gsbase, near_call, xor32};
 #[cfg(verus_keep_ghost)]
-use super::super::shared::decode::{DecodeDecision, DecodeInput};
+use super::super::shared::decode::{DecodeDecision, DecodeInput, DecodeWindow};
 use super::*;
 
 verus! {
@@ -18,6 +18,43 @@ pub open spec fn enable(s: State) -> (State, bool) {
 }
 pub open spec fn request(s: State) -> Option<DecodeInput> {
     match s.phase { Phase::Decode { input } => Some(input), _ => None }
+}
+pub open spec fn window_byte(input:DecodeInput,address:u64,word:u64,available:u8,j:int)->u8 {
+    if input.length<=j<available {
+        ((word>>(((address%8+(j-input.length)+1)*8) as u32))&255) as u8
+    } else {input.bytes[j]}
+}
+pub open spec fn window(s:State)->Option<DecodeWindow> {
+    match s.phase {
+        Phase::Decode {input}=>match super::super::mmu_core::shared_model::fetched_word(s.core.mmu) {
+            Some((address,word)) if address as int==input.rip as int+input.length as int-1=>{
+                let available=if input.length as int+7-address as int%8>15 {15u8}
+                    else {(input.length as int+7-address as int%8) as u8};
+                Some(DecodeWindow {input,available,bytes:[
+                    window_byte(input,address,word,available,0),window_byte(input,address,word,available,1),
+                    window_byte(input,address,word,available,2),window_byte(input,address,word,available,3),
+                    window_byte(input,address,word,available,4),window_byte(input,address,word,available,5),
+                    window_byte(input,address,word,available,6),window_byte(input,address,word,available,7),
+                    window_byte(input,address,word,available,8),window_byte(input,address,word,available,9),
+                    window_byte(input,address,word,available,10),window_byte(input,address,word,available,11),
+                    window_byte(input,address,word,available,12),window_byte(input,address,word,available,13),
+                    window_byte(input,address,word,available,14),
+                ]})
+            },
+            _=>Some(DecodeWindow {input,bytes:input.bytes,available:input.length}),
+        },
+        _=>None,
+    }
+}
+pub open spec fn complete_window(s:State,sequence:u64,length:u8,decision:DecodeDecision)->(State,bool) {
+    match window(s) {
+        Some(w) if w.input.sequence==sequence &&w.input.length<=length<=w.available=>{
+            let input=if length==w.input.length {w.input}
+                else {DecodeInput {bytes:w.bytes,length,..w.input}};
+            (State {phase:Phase::Admitted {input,decision},..s},true)
+        },
+        _=>(s,false),
+    }
 }
 pub open spec fn complete(s: State, sequence: u64, decision: DecodeDecision) -> (State, bool) {
     match s.phase {

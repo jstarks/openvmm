@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 use vstd::prelude::*;
 
+pub mod apic;
 #[path = "../x86-add-experiment/lib.rs"]
 pub mod arithmetic;
 pub mod compare;

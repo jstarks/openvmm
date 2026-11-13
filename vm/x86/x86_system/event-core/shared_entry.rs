@@ -26,6 +26,7 @@ pub enum Instruction {
     XmmStore {destination:Operand,source:u8,width:Width},
     XmmCopyLow {dst:u8,source:u8},
     XmmUnpack {dst:u8,source:u8,wide:bool,high:bool},
+    XmmLogic {dst:u8,source:u8,operation:system::XmmLogic},
     XmmCopy {dst:u8,source:u8},
     XmmMerge {dst:u8,source:u8,high:bool},
     XmmMemory {address:Address,index:u8,store:bool,kind:XmmMemoryKind},
@@ -253,6 +254,7 @@ impl SharedEventMachine {
         match instruction {
             Instruction::XmmLoad {..}|Instruction::XmmStore {..}
                 |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}
+                |Instruction::XmmLogic {..}
                 |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>{
                 reveal(spec::entry::execute);
                 self.execute_xmm(instruction,length)

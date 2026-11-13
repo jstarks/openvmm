@@ -84,7 +84,7 @@ pub open spec fn boundary_span(s: State, address: u64, word: WordAccess, size: u
     } else { (s, false) }
 }
 pub open spec fn boundary_pair_store(s:State,address:u64,low:u64,high:u64)->(State,bool) {
-    if s.phase is Boundary && !mm::active(s.mmu.phase) && address%16==0 {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::pair_admitted(address) {
         (State {mmu:mm::pair_begin(s.mmu,address,low,high,s.user),..s},true)
     } else {(s,false)}
 }

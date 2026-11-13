@@ -121,7 +121,7 @@ impl View for SharedMmu {
 
 impl SharedMmu {
     pub closed spec fn valid_pair(&self) -> bool {
-        self.pair_upper is Some ==> self.va % 16 == 0 && self.size == 8
+        self.pair_upper is Some ==> self.va % 8 == 0 && self.va % 4096 <= 4080 && self.size == 8
             && self.word is Some && self.access is Write
             && self.modifier is None && self.comparison is None && self.head is None
             && !(self.phase is IoDirty) && !(self.phase is IoReady)
@@ -197,6 +197,11 @@ impl SharedMmu {
                 | Phase::IoDirty { .. } | Phase::IoReady { .. } => self.word is Some,
             _ => true,
         }
+        && self.valid_request()
+    }
+
+    pub closed spec fn valid_request(&self) -> bool {
+        self.valid_size()
         && match self.phase {
             Phase::Walk { table, level, .. } =>
                 level < 4 && table < 0x1_0000_0000_0000u64 && table % 4096 == 0,
@@ -222,7 +227,7 @@ impl SharedMmu {
             Phase::WordStore { data, .. } => self.word is Some
                 && self.access is Write && spec::valid_data(data) && data.address % 8 == 0,
             Phase::PairHead { data, .. } => self.access is Write && self.size == 8
-                && spec::valid_data(data) && data.address % 16 == 0
+                && spec::valid_data(data) && data.address % 8 == 0
                 && data.address % 4096 <= 4080 && self.pair_upper is None,
             Phase::PairTail { address, .. } => self.access is Write && self.size == 8
                 && address < 0x1_0000_0000_0000u64 && address % 8 == 0
@@ -237,6 +242,7 @@ impl SharedMmu {
             Phase::PageDirtyHead { tail, span: data, .. } =>
                 self.access is Write && self.head is Some && spec::valid_leaf(tail)
                 && self.head.unwrap().leaf is Some
+                && spec::valid_leaf(self.head.unwrap().leaf.unwrap())
                 && spec::valid_page_data(data) && data.word.address == self.head.unwrap().address,
             Phase::PageDirtyTail { pte, span: data, .. } =>
                 self.access is Write && self.head is Some && spec::valid_leaf(pte)
@@ -435,10 +441,25 @@ impl SharedMmu {
         else { self.va }
     }
 
-    #[verifier::spinoff_prover]
     #[inline(always)]
     pub fn request(&self) -> (out: Request)
         requires self.invariant(),
+        ensures out == spec::request(self@),
+            match out {
+                Request::Read(address) => address < 0x1_0000_0000_0000u64 && address % 8 == 0,
+                Request::WriteWord { address, .. } | Request::DataCompare { address, .. } =>
+                    address < 0x1_0000_0000_0000u64 && address % 8 == 0,
+                Request::Compare { address, expected, replacement } =>
+                    address < 0x1_0000_0000_0000u64 && address % 8 == 0
+                        && expected & 1 == 1 && replacement & !0x60u64 == expected & !0x60u64,
+                _ => true,
+            },
+    { self.request_inner() }
+
+    #[verifier::spinoff_prover]
+    #[inline(always)]
+    fn request_inner(&self) -> (out: Request)
+        requires self.valid_request(),
         ensures out == spec::request(self@),
             match out {
                 Request::Read(address) => address < 0x1_0000_0000_0000u64 && address % 8 == 0,

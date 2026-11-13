@@ -388,6 +388,23 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     ) {
         return admit_xmm(&instruction, size);
     }
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Pand
+            | Mnemonic::Pandn
+            | Mnemonic::Por
+            | Mnemonic::Pxor
+            | Mnemonic::Andps
+            | Mnemonic::Andpd
+            | Mnemonic::Andnps
+            | Mnemonic::Andnpd
+            | Mnemonic::Orps
+            | Mnemonic::Orpd
+            | Mnemonic::Xorps
+            | Mnemonic::Xorpd
+    ) {
+        return admit_xmm(&instruction, size);
+    }
     if instruction.mnemonic() == Mnemonic::Cmpxchg {
         return admit_compare_exchange(&instruction, encoding, size);
     }
@@ -1197,18 +1214,38 @@ fn admit_xmm(instruction: &Instruction, size: AddressSize) -> Option<EntryInstru
             _ => None,
         };
     }
-    Some(EntryInstruction::XmmUnpack {
-        dst: dst?,
-        source: source?,
-        wide: matches!(
-            instruction.mnemonic(),
-            Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq
-        ),
-        high: matches!(
-            instruction.mnemonic(),
-            Mnemonic::Punpckhdq | Mnemonic::Punpckhqdq
-        ),
-    })
+    use x86_system::memory_core::cpu_core::system::XmmLogic;
+    let operation = match instruction.mnemonic() {
+        Mnemonic::Pand | Mnemonic::Andps | Mnemonic::Andpd => Some(XmmLogic::And),
+        Mnemonic::Pandn | Mnemonic::Andnps | Mnemonic::Andnpd => Some(XmmLogic::AndNot),
+        Mnemonic::Por | Mnemonic::Orps | Mnemonic::Orpd => Some(XmmLogic::Or),
+        Mnemonic::Pxor | Mnemonic::Xorps | Mnemonic::Xorpd => Some(XmmLogic::Xor),
+        _ => None,
+    };
+    if let Some(operation) = operation {
+        return Some(EntryInstruction::XmmLogic {
+            dst: dst?,
+            source: source?,
+            operation,
+        });
+    }
+    match instruction.mnemonic() {
+        Mnemonic::Punpckldq | Mnemonic::Punpckhdq | Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => {
+            Some(EntryInstruction::XmmUnpack {
+                dst: dst?,
+                source: source?,
+                wide: matches!(
+                    instruction.mnemonic(),
+                    Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq
+                ),
+                high: matches!(
+                    instruction.mnemonic(),
+                    Mnemonic::Punpckhdq | Mnemonic::Punpckhqdq
+                ),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn has_repeat_prefix(encoding: Encoding) -> bool {

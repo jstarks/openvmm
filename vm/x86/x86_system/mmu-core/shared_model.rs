@@ -144,6 +144,9 @@ pub open spec fn pair_begin(s:State,va:u64,low:u64,upper:u64,user:bool)->State {
     let t=begin(s,va,Access::Write(0),user,Some(WordAccess::Write(low)));
     State {pair_upper:Some(upper),..t}
 }
+pub open spec fn pair_admitted(va:u64)->bool {
+    va%8==0 && va%4096<=4080
+}
 pub open spec fn modify_size(width: Width) -> u8 {
     match width { Width::Byte => 1, Width::Word => 2, Width::Dword => 4, Width::Qword => 8 }
 }
@@ -537,7 +540,7 @@ pub open spec fn word_tail(s: State, word: u64) -> State {
 pub open spec fn ready_store(s:State,data:WordData,reads:u8)->State {
     match s.pair_upper {
         Some(upper)=>State {pair_upper:None,
-            phase:if data.address%16!=0 || data.address%4096>4080 {
+            phase:if data.address%8!=0 || data.address%4096>4080 {
                 Phase::WordDone {report:WordReport {result:WordResult::CrossPage,
                     table_reads:reads,virtual_address:s.va}}
             } else {Phase::PairHead {data,upper,reads}},..s},

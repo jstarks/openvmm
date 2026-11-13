@@ -38,6 +38,18 @@ pub const EMPTY_ENTRY_MSRS:EntryMsrs=EntryMsrs {
 pub enum X87Control { Initialize, ClearExceptions, EmptyMmx }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum XmmLogic {And,AndNot,Or,Xor}
+
+impl XmmLogic {
+    pub fn apply(self,left:u64,right:u64)->(out:u64)
+        ensures out==model::xmm_bits(self,left,right),
+    {
+        match self {Self::And=>left&right,Self::AndNot=>!left&right,
+            Self::Or=>left|right,Self::Xor=>left^right}
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
 pub struct LegacyFpState {
     pub control:u16,pub status:u16,pub tags:u16,pub opcode:u16,
     pub ip:u64,pub dp:u64,
@@ -51,6 +63,15 @@ pub const EMPTY_LEGACY_FP:LegacyFpState=LegacyFpState {
         [0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],
 };
 impl LegacyFpState {
+    pub fn xmm_logic(self,dst:u8,source:u8,operation:XmmLogic)->(out:Self)
+        requires dst<16,source<16,
+        ensures out==model::xmm_logic(self,dst,source,operation),
+    {
+        let a=self.xmm[dst as usize];
+        let b=self.xmm[source as usize];
+        self.xmm_pair(dst,operation.apply(a[0],b[0]),operation.apply(a[1],b[1]))
+    }
+
     pub fn xmm_pair(self,dst:u8,low:u64,high:u64)->(out:Self)
         requires dst<16,
         ensures out==model::xmm_pair(self,dst,low,high),
@@ -287,6 +308,15 @@ pub struct SystemState {
 pub mod model {
     #[cfg(verus_keep_ghost)]
     use super::*;
+
+    pub open spec fn xmm_bits(operation:XmmLogic,left:u64,right:u64)->u64 {
+        match operation {XmmLogic::And=>left&right,XmmLogic::AndNot=>!left&right,
+            XmmLogic::Or=>left|right,XmmLogic::Xor=>left^right}
+    }
+    pub open spec fn xmm_logic(s:LegacyFpState,dst:u8,source:u8,operation:XmmLogic)->LegacyFpState {
+        xmm_pair(s,dst,xmm_bits(operation,s.xmm[dst as int][0],s.xmm[source as int][0]),
+            xmm_bits(operation,s.xmm[dst as int][1],s.xmm[source as int][1]))
+    }
 
     pub open spec fn xmm_pair(s:LegacyFpState,dst:u8,low:u64,high:u64)->LegacyFpState {
         LegacyFpState {xmm:set16(s.xmm,dst as int,[low,high]),..s}

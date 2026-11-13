@@ -89,7 +89,7 @@ impl SharedEventMachine {
             return self.entry_memory(linear,Width::Qword,WordAccess::Read,length,
                 entry::MemoryTask::XmmLow {index});
         }
-        if linear%16!=0 {
+        if linear%8!=0 || linear%4096>4080 {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         let pair=system.fp.xmm[index as usize];
@@ -194,6 +194,12 @@ impl SharedEventMachine {
             Instruction::XmmUnpack {dst,source,wide,high}=>{
                 if dst>=16 || source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
                 system.fp=system.fp.xmm_unpack(dst,source,wide,high);
+                self.system=Some(system);
+                self.retire_entry(cpu,length,false,false)
+            },
+            Instruction::XmmLogic {dst,source,operation}=>{
+                if dst>=16 || source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+                system.fp=system.fp.xmm_logic(dst,source,operation);
                 self.system=Some(system);
                 self.retire_entry(cpu,length,false,false)
             },

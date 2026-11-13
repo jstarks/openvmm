@@ -7,15 +7,15 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
-    /// One aligned RAM translation, two non-atomic qword stores. Completion
+    /// One same-page RAM translation, two qword-aligned stores. Completion
     /// reports the low qword; backing-error retry never replays a committed head.
     pub fn begin_pair_store(&mut self,va:u64,low:u64,upper:u64,user:bool)->(accepted:bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
-            accepted==(!spec::active(old(self)@.phase) && va%16==0),
+            accepted==(!spec::active(old(self)@.phase) && spec::pair_admitted(va)),
             final(self)@==if accepted {spec::pair_begin(old(self)@,va,low,upper,user)} else {old(self)@},
     {
-        if va%16!=0 {return false;}
+        if va%8!=0 || va%4096>4080 {return false;}
         let accepted=self.begin_word(va,WordAccess::Write(low),user);
         if accepted {self.pair_upper=Some(upper);}
         accepted
@@ -367,7 +367,7 @@ impl SharedMmu {
     {
         if let Some(upper)=self.pair_upper {
             self.pair_upper=None;
-            if data.address%16!=0 || data.address%4096>4080 {
+            if data.address%8!=0 || data.address%4096>4080 {
                 self.phase=Phase::WordDone {report:WordReport {result:WordResult::CrossPage,
                     table_reads:reads,virtual_address:self.va}};
             } else {

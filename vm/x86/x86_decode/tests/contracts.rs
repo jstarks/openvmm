@@ -3491,3 +3491,50 @@ fn xmm_half_full_and_register_moves_keep_memory_shape_alignment_and_lanes() {
         DecodeDecision::InvalidOpcode
     );
 }
+
+#[test]
+fn xmm_register_logic_owns_the_operation_without_admitting_memory_or_vex_forms() {
+    use x86_system::memory_core::cpu_core::system::XmmLogic;
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for (prefix, opcode, operation) in [
+        (Some(0x66), 0xdb, XmmLogic::And),
+        (Some(0x66), 0xdf, XmmLogic::AndNot),
+        (Some(0x66), 0xeb, XmmLogic::Or),
+        (Some(0x66), 0xef, XmmLogic::Xor),
+        (None, 0x54, XmmLogic::And),
+        (None, 0x55, XmmLogic::AndNot),
+        (None, 0x56, XmmLogic::Or),
+        (None, 0x57, XmmLogic::Xor),
+        (Some(0x66), 0x54, XmmLogic::And),
+        (Some(0x66), 0x55, XmmLogic::AndNot),
+        (Some(0x66), 0x56, XmmLogic::Or),
+        (Some(0x66), 0x57, XmmLogic::Xor),
+    ] {
+        for (dst, source) in [(0, 0), (0, 1), (9, 15), (15, 8)] {
+            let mut bytes = Vec::new();
+            if let Some(prefix) = prefix {
+                bytes.push(prefix);
+            }
+            if dst >= 8 || source >= 8 {
+                bytes.push(0x40 | if dst >= 8 { 4 } else { 0 } | if source >= 8 { 1 } else { 0 });
+            }
+            bytes.extend([0x0f, opcode, 0xc0 | ((dst & 7) << 3) | (source & 7)]);
+            assert_eq!(
+                entry(&bytes),
+                Instruction::XmmLogic {
+                    dst,
+                    source,
+                    operation
+                }
+            );
+        }
+    }
+    for bytes in [&[0x66, 0x0f, 0xdb, 0x00][..], &[0xc5, 0xf9, 0xdb, 0xc1][..]] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+    assert_eq!(
+        admission(&[0xf0, 0x66, 0x0f, 0xdb, 0xc1]),
+        DecodeDecision::InvalidOpcode
+    );
+}

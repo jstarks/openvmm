@@ -60,7 +60,7 @@ pub open spec fn execute_xmm_memory(s:State,address:Address,index:u8,store:bool,
                 else {super::super::shared::entry::MemoryTask::XmmHalf {index,high}})
         } else if !store {entry::memory(s,linear,Width::Qword,WordAccess::Read,length,
             super::super::shared::entry::MemoryTask::XmmLow {index})}
-        else if linear%16!=0 {entry::unsupported(s)}
+        else if linear%8!=0 || linear%4096>4080 {entry::unsupported(s)}
         else {
             let pair=s.system.unwrap().fp.xmm[index as int];
             (State {core:c::boundary_pair_store(s.core,linear,pair[0],pair[1]).0,
@@ -145,6 +145,12 @@ pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,
                 if dst>=16 || source>=16 {entry::unsupported(s)}
                 else {entry::retire(State {system:Some(SystemState {
                     fp:system::model::xmm_unpack(system.fp,dst,source,wide,high),..system}),..s},
+                    cpu,length,false,false)}
+            },
+            Instruction::XmmLogic {dst,source,operation}=>{
+                if dst>=16 || source>=16 {entry::unsupported(s)}
+                else {entry::retire(State {system:Some(SystemState {
+                    fp:system::model::xmm_logic(system.fp,dst,source,operation),..system}),..s},
                     cpu,length,false,false)}
             },
             _=>entry::unsupported(s),

@@ -49,6 +49,15 @@ pub mod model {
         if selector == 0 { Some(system::NULL_SEGMENT) }
         else { descriptor::model::load_data(raw, selector) }
     }
+    pub open spec fn return_stack(raw:u64,selector:u16,cpl:u16)->Option<SegmentState> {
+        if selector==0 {
+            if cpl==0 {Some(system::NULL_SEGMENT)} else {None}
+        } else if (selector&3u16)!=cpl || ((raw>>45)&3u64)!=cpl as u64 {None}
+        else {match descriptor::model::load_data(raw&!(3u64<<45),selector&!3u16) {
+            None=>None,
+            Some(s)=>Some(SegmentState {selector,attributes:0xc093u16|(cpl<<5),..s}),
+        }}
+    }
 
     pub open spec fn frame_word(rip: u64, rsp: u64, flags: u64,
         selectors: Selectors, error: bool, external: bool, code: u8, index: u8) -> u64
@@ -123,6 +132,22 @@ pub fn stack(raw: u64, selector: u16) -> (out: Option<SegmentState>)
 {
     if selector == 0 { Some(system::NULL_SEGMENT) }
     else { descriptor::load_data(raw, selector) }
+}
+
+pub fn return_stack(raw:u64,selector:u16,cpl:u16)->(out:Option<SegmentState>)
+    requires cpl==0 || cpl==3,
+    ensures out==model::return_stack(raw,selector,cpl),
+        out.is_some() ==> system::model::execution_stack(out.unwrap()),
+{
+    if selector==0 {return if cpl==0 {Some(system::NULL_SEGMENT)} else {None};}
+    if selector&3!=cpl || ((raw>>45)&3)!=cpl as u64 {return None;}
+    let Some(s)=descriptor::load_data(raw&!(3u64<<45),selector&!3u16) else {return None;};
+    let attributes=0xc093|(cpl<<5);
+    proof {
+        assert(attributes==0xc093u16 || attributes==0xc0f3u16) by(bit_vector)
+            requires attributes==0xc093u16|(cpl<<5),cpl==0 || cpl==3;
+    }
+    Some(SegmentState {selector,attributes,..s})
 }
 
 /// Push order, not ascending memory order. APM Volume 2 §8.9.3 always saves

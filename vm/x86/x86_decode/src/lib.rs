@@ -279,9 +279,11 @@ pub fn admit(input: DecodeInput) -> DecodeDecision {
             // Iced validated the full packet; these exact forms have no scalar operand packet.
             match encoding.bytes() {
                 [0x0f, 0x30] => DecodeDecision::Wrmsr,
-                [0xe8, a, b, c, d] | [0x2e, 0xe8, a, b, c, d] => DecodeDecision::NearCall {
-                    displacement: i32::from_le_bytes([*a, *b, *c, *d]),
-                },
+                [0xe8, a, b, c, d] | [0x2e, 0xe8, a, b, c, d] | [0x67, 0xe8, a, b, c, d] => {
+                    DecodeDecision::NearCall {
+                        displacement: i32::from_le_bytes([*a, *b, *c, *d]),
+                    }
+                }
                 _ => {
                     admit_entry(encoding).map_or(DecodeDecision::Unsupported, DecodeDecision::Entry)
                 }
@@ -352,6 +354,27 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     let size = address_size(encoding.bytes());
     if instruction.mnemonic() == Mnemonic::Pause && encoding.bytes() == [0xf3, 0x90] {
         return Some(EntryInstruction::Nop);
+    }
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Endbr64 | Mnemonic::Endbr32
+    ) && matches!(
+        encoding.bytes(),
+        [0xf3, 0x0f, 0x1e, 0xfa] | [0xf3, 0x0f, 0x1e, 0xfb]
+    ) && profile::cpuid(7, 0)[3] & (1 << 20) == 0
+    {
+        return Some(EntryInstruction::Nop);
+    }
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Movd
+            | Mnemonic::Movq
+            | Mnemonic::Punpckldq
+            | Mnemonic::Punpckhdq
+            | Mnemonic::Punpcklqdq
+            | Mnemonic::Punpckhqdq
+    ) {
+        return admit_xmm(&instruction, size);
     }
     if instruction.mnemonic() == Mnemonic::Cmpxchg {
         return admit_compare_exchange(&instruction, encoding, size);
@@ -548,6 +571,10 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             },
         }),
         Mnemonic::Int3 if encoding.bytes() == [0xcc] => Some(EntryInstruction::Breakpoint),
+        Mnemonic::Syscall if encoding.bytes() == [0x0f, 0x05] => Some(EntryInstruction::Syscall),
+        Mnemonic::Sysret | Mnemonic::Sysretq if encoding.bytes() == [0x48, 0x0f, 0x07] => {
+            Some(EntryInstruction::Sysret)
+        }
         Mnemonic::Swapgs if encoding.bytes() == [0x0f, 0x01, 0xf8] => {
             Some(EntryInstruction::SwapGs)
         }
@@ -1052,6 +1079,78 @@ fn condition(mnemonic: Mnemonic) -> Option<Condition> {
         Mnemonic::Jle | Mnemonic::Cmovle | Mnemonic::Setle => Condition::LessEqual,
         Mnemonic::Jg | Mnemonic::Cmovg | Mnemonic::Setg => Condition::Greater,
         _ => return None,
+    })
+}
+
+fn xmm_index(register: IcedRegister) -> Option<u8> {
+    use IcedRegister::*;
+    match register {
+        XMM0 => Some(0),
+        XMM1 => Some(1),
+        XMM2 => Some(2),
+        XMM3 => Some(3),
+        XMM4 => Some(4),
+        XMM5 => Some(5),
+        XMM6 => Some(6),
+        XMM7 => Some(7),
+        XMM8 => Some(8),
+        XMM9 => Some(9),
+        XMM10 => Some(10),
+        XMM11 => Some(11),
+        XMM12 => Some(12),
+        XMM13 => Some(13),
+        XMM14 => Some(14),
+        XMM15 => Some(15),
+        _ => Option::None,
+    }
+}
+
+fn admit_xmm(instruction: &Instruction, size: AddressSize) -> Option<EntryInstruction> {
+    if instruction.op_count() != 2
+        || instruction.has_lock_prefix()
+        || profile::cpuid(1, 0)[3] & (1 << 26) == 0
+    {
+        return None;
+    }
+    let dst = xmm_index(instruction.op0_register());
+    let source = xmm_index(instruction.op1_register());
+    if matches!(instruction.mnemonic(), Mnemonic::Movd | Mnemonic::Movq) {
+        return match (dst, source) {
+            (Some(dst), Some(source)) if instruction.mnemonic() == Mnemonic::Movq => {
+                Some(EntryInstruction::XmmCopyLow { dst, source })
+            }
+            (Some(dst), None) => {
+                let source = operand(instruction, 1, Operation::Mov, size)?;
+                let width = operand_width(source)?;
+                matches!(width, Width::Dword | Width::Qword).then_some(EntryInstruction::XmmLoad {
+                    dst,
+                    source,
+                    width,
+                })
+            }
+            (None, Some(source)) => {
+                let destination = operand(instruction, 0, Operation::Mov, size)?;
+                let width = operand_width(destination)?;
+                matches!(width, Width::Dword | Width::Qword).then_some(EntryInstruction::XmmStore {
+                    destination,
+                    source,
+                    width,
+                })
+            }
+            _ => None,
+        };
+    }
+    Some(EntryInstruction::XmmUnpack {
+        dst: dst?,
+        source: source?,
+        wide: matches!(
+            instruction.mnemonic(),
+            Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq
+        ),
+        high: matches!(
+            instruction.mnemonic(),
+            Mnemonic::Punpckhdq | Mnemonic::Punpckhqdq
+        ),
     })
 }
 

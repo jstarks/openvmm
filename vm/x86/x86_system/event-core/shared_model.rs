@@ -44,9 +44,13 @@ pub struct State {
     pub fp_restore:Option<super::memory_core::cpu_core::system::LegacyFpState>,
     pub apic_id:Option<u32>,
 }
+pub open spec fn is_user(s:State)->bool {
+    match s.system {Some(system)=>system.cs.selector&3u16==3,None=>false}
+}
 pub open spec fn configure_system(s: State, system: SystemState) -> (State, bool) {
     if s.phase is Ready && super::memory_core::cpu_core::system::model::supported(system) {
-        (State { system: Some(system), ..s }, true)
+        (State {core:c::boundary_transfer(c::boundary(s.core).0,s.core.cpu,
+            system.cs.selector&3u16==3).0,system: Some(system), ..s }, true)
     } else { (s, false) }
 }
 pub open spec fn visible_cpu(s: State) -> model::State {
@@ -91,7 +95,10 @@ pub open spec fn respond(s: State, reply: super::mmu_core::shared::Reply) -> (St
     (State { core: c::State { mmu: response.0, ..s.core }, ..s }, response.1)
 }
 pub open spec fn word(s: State, address: u64, request: WordAccess, phase: Phase) -> State {
-    State { core: c::boundary_begin(s.core, address, Some(request)).0, phase, ..s }
+    let core=if phase is Pop || phase is NearCall {c::boundary_word_as(s.core,address,request,is_user(s)).0}
+        else if phase is PrivilegeStack {c::boundary_system_span(s.core,address,request,8).0}
+        else {c::boundary_begin(s.core,address,Some(request)).0};
+    State {core,phase,..s}
 }
 pub open spec fn fetch(s: State, address: u64, phase: Phase) -> State {
     State { core: c::boundary_begin(s.core, address, None).0, phase, ..s }
@@ -111,16 +118,24 @@ pub open spec fn descriptor_address(t: Tables, selector: u16) -> bool {
 pub open spec fn return_image(w: ReturnWords, t: Tables, system: Option<SystemState>) -> bool {
     (system is Some || (w.cs == 8 && w.ss == 16))
         && w.cs <= u16::MAX && w.ss <= u16::MAX
-        && descriptor_address(t, w.cs as u16)
-        && (w.ss == 0 || descriptor_address(t, w.ss as u16))
+        && return_descriptor_address(t,w.cs as u16)
+        && (w.cs&3u64==0 || w.cs&3u64==3)
+        && match system {Some(s)=>s.cs.selector&3u16!=3 || w.cs&3u64==3,None=>true}
+        && (w.ss == 0 || return_descriptor_address(t,w.ss as u16))
         && e::flags_supported(w.flags) && mmu_model::canonical(w.ip as int)
         && mmu_model::canonical(w.rsp as int)
+}
+pub open spec fn return_descriptor_address(t:Tables,selector:u16)->bool {
+    selector&!7u16!=0 && selector&4u16==0
+        && (selector&!7u16) as int+7<=t.gdt_limit as int
+        && t.gdt_base as int+(selector&!7u16) as int+7<=u64::MAX
 }
 pub open spec fn entry_profile(cpu: model::State, t: Tables, event: Event,
     system: Option<SystemState>) -> bool {
     e::flags_supported(cpu.flags) && tables_supported(t, system)
-        && mmu_model::canonical(cpu.rip) && mmu_model::canonical(cpu.gpr[4])
-        && cpu.gpr[4] / 16 * 16 >= if e::has_error_code(event) { 48int } else { 40int }
+        && (match system {Some(s)=>s.cs.selector&3u16==3,None=>false}
+            || (mmu_model::canonical(cpu.rip) && mmu_model::canonical(cpu.gpr[4])
+                && cpu.gpr[4] / 16 * 16 >= if e::has_error_code(event) {48int} else {40int}))
 }
 pub open spec fn entry(s: State, event: Event) -> (State, Tick) {
     if s.handler_pending {
@@ -153,13 +168,14 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
     match s.phase {
         Phase::First => {
             if value == 0xfa || value == 0xfb || value == 0xf4 {
+                if is_user(s) {entry(s,Event::GeneralProtection)} else {
                 let flags = (cpu.flags & !0x10000u64);
                 let next = model::State { flags: if value == 0xfa { flags & !0x200u64 }
                     else if value == 0xfb { flags | 0x200u64 } else { flags },
                     rip: (cpu.rip + 1) % 18446744073709551616int, ..cpu };
                 (State { core: c::boundary_commit(s.core, next, true).0, phase: Phase::Ready,
                     shadow: value == 0xfb && cpu.flags & 0x200u64 == 0,
-                    halted: value == 0xf4, handler_pending: false, ..s }, Tick::Retired(false))
+                    halted: value == 0xf4, handler_pending: false, ..s }, Tick::Retired(false))}
             } else if s.external_decode && value != 0x48 && value != 0x0f {
                 decode::offer(s, value, 0, 0, 1)
             } else if value != 0x0f && (value < 0x48 || value > 0x4f) {
@@ -186,7 +202,8 @@ pub open spec fn byte(s: State, value: u8) -> (State, Tick) {
             } else { (fetch_next(s, (cpu.rip + 2) as u64, Phase::Third), Tick::Pending) }
         },
         Phase::Third => {
-            if s.external_decode && value != 0x3f {
+            if is_user(s) && value==0x3f {entry(s,Event::GeneralProtection)}
+            else if s.external_decode && value != 0x3f {
                 decode::offer(s, 0x0f, 1, value, 3)
             } else if value != 0x3f || !mmu_model::canonical(cpu.gpr[7]) {
                 stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported))
@@ -211,11 +228,19 @@ pub open spec fn frame_word(cpu: model::State, system: Option<SystemState>, even
 pub open spec fn commit_return(s: State, words: ReturnWords, cs: SegmentState,
     ss: SegmentState) -> (State, Tick) {
     let cpu = model::State { gpr: s.core.cpu.gpr.update(4, words.rsp as int),
-        flags: words.flags, rip: words.ip as int };
-    (State { core: c::boundary_commit(s.core, cpu, true).0, phase: Phase::Ready,
+        flags:if is_user(s) {(words.flags&!0x200u64)|(s.core.cpu.flags&0x200u64)} else {words.flags},
+        rip: words.ip as int };
+    (State { core: c::boundary_transfer(s.core, cpu,cs.selector&3u16==3).0, phase: Phase::Ready,
         handler_pending: false, shadow: false,
         system: match s.system {
-            Some(system) => Some(SystemState { cs, ss, ..system }), None => None,
+            Some(system) => {
+                let outer=system.cs.selector&3u16!=3 && cs.selector&3u16==3;
+                Some(SystemState {cs,ss,
+                    ds:if outer {super::memory_core::cpu_core::system::model::outer_data(system.ds)} else {system.ds},
+                    es:if outer {super::memory_core::cpu_core::system::model::outer_data(system.es)} else {system.es},
+                    fs:if outer {super::memory_core::cpu_core::system::model::outer_data(system.fs)} else {system.fs},
+                    gs:if outer {super::memory_core::cpu_core::system::model::outer_data(system.gs)} else {system.gs},..system})
+            }, None => None,
         }, ..s }, Tick::Retired(true))
 }
 pub open spec fn word_location(s: State) -> (Stage, u64) {
@@ -223,8 +248,9 @@ pub open spec fn word_location(s: State) -> (Stage, u64) {
         Phase::GateLow { address, .. } => (Stage::Idt, address),
         Phase::GateHigh { event, .. } => (Stage::Idt, (s.tables.idt_base as int + e::vector(event) as int * 16 + 8) as u64),
         Phase::Code { selector, .. } => (Stage::Code, (s.tables.gdt_base as int + selector as int) as u64),
-        Phase::ReturnCode { words } => (Stage::Code, (s.tables.gdt_base as int + words.cs as int) as u64),
-        Phase::ReturnStack { words, .. } => (Stage::Stack, (s.tables.gdt_base as int + words.ss as int) as u64),
+        Phase::PrivilegeStack {address,..}=>(Stage::Stack,address),
+        Phase::ReturnCode { words } => (Stage::Code, (s.tables.gdt_base as int + (words.cs&!7u64) as int) as u64),
+        Phase::ReturnStack { words, .. } => (Stage::Stack, (s.tables.gdt_base as int + (words.ss&!7u64) as int) as u64),
         Phase::Push { event, stack, index, .. } => (Stage::Push,
             (stack as int - 8 * (index as int - if e::has_error_code(event) { 0int } else { 1int } + 1)) as u64),
         Phase::Pop { index, .. } => (Stage::Pop, (s.core.cpu.gpr[4] + index as int * 8) as u64),
@@ -267,7 +293,16 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
         Phase::Code { event, low, target, selector } => {
             match descriptor::model::load_code(value, selector) {
                 None => stop(s, EventDiagnostic::Descriptor(Stage::Code)),
-                Some(cs) => {
+                Some(cs) => if is_user(s) {
+                    let system=s.system.unwrap();
+                    if system.tr.selector==0 || system.tr.limit<11 || system.tr.base as int+11>u64::MAX
+                        || !mmu_model::canonical(system.tr.base as int+11) {
+                        stop(s,EventDiagnostic::Descriptor(Stage::Stack))
+                    } else {
+                        let address=(system.tr.base+4) as u64;
+                        (word(s,address,WordAccess::Read,Phase::PrivilegeStack {event,low,target,cs,address}),Tick::Pending)
+                    }
+                } else {
                     let index = if e::has_error_code(event) { 0u8 } else { 1u8 };
                     let stack = (cpu.gpr[4] / 16 * 16) as u64;
                     (word(s, (stack - 8) as u64, WordAccess::Write(frame_word(cpu, s.system, event, index)),
@@ -275,15 +310,29 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
                 },
             }
         },
+        Phase::PrivilegeStack {event,low,target,cs,..}=>{
+            let count=if e::has_error_code(event) {6int} else {5int};
+            let stack=(value as int/16*16) as u64;
+            if !mmu_model::canonical(value as int) || (stack as int)<count*8
+                || !mmu_model::canonical(stack as int-count*8) {
+                stop(s,EventDiagnostic::Descriptor(Stage::Stack))
+            } else {
+                let index=if e::has_error_code(event) {0u8} else {1u8};
+                (word(s,(stack-8) as u64,WordAccess::Write(frame_word(cpu,s.system,event,index)),
+                    Phase::Push {event,low,target,cs,stack,index}),Tick::Pending)
+            }
+        },
         Phase::Push { event, low, target, cs, stack, index } => {
             if index == 5 {
                 let count = if e::has_error_code(event) { 6int } else { 5int };
                 let next = model::State { gpr: cpu.gpr.update(4, stack as int - count * 8),
                     flags: e::live_flags(cpu.flags, low), rip: target as int };
-                (State { core: c::boundary_commit(s.core, next, true).0, phase: Phase::Ready,
+                (State { core: c::boundary_transfer(s.core, next, false).0, phase: Phase::Ready,
                     handler_pending: true, shadow: false, halted: false,
                     system: match s.system {
-                        Some(system) => Some(SystemState { cs, ..system }), None => None,
+                        Some(system) => Some(SystemState {cs,
+                            ss:if system.cs.selector&3u16==3 {super::memory_core::cpu_core::system::NULL_SEGMENT}
+                                else {system.ss},..system}), None => None,
                     },
                     pending: if event is External { None } else { s.pending }, ..s }, Tick::Delivered(e::vector(event)))
             } else {
@@ -302,20 +351,23 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
             } else if !return_image(w, s.tables, s.system) {
                 stop(s, EventDiagnostic::ReturnImage)
             } else {
-                (word(s, (s.tables.gdt_base as int + w.cs as int) as u64, WordAccess::Read,
+                (word(s, (s.tables.gdt_base as int + (w.cs&!7u64) as int) as u64, WordAccess::Read,
                     Phase::ReturnCode { words: w }), Tick::Pending)
             }
         },
-        Phase::ReturnCode { words } => match descriptor::model::load_code(value, words.cs as u16) {
+        Phase::ReturnCode { words } => match descriptor::model::load_return_code(value, words.cs as u16) {
             None => stop(s, EventDiagnostic::Descriptor(Stage::Code)),
             Some(cs) => if words.ss == 0 {
-                commit_return(s, words, cs, exception::model::stack(0, 0).unwrap())
+                match exception::model::return_stack(0,0,cs.selector&3u16) {
+                    Some(ss)=>commit_return(s,words,cs,ss),
+                    None=>stop(s,EventDiagnostic::Descriptor(Stage::Stack)),
+                }
             } else {
-                (word(s, (s.tables.gdt_base as int + words.ss as int) as u64, WordAccess::Read,
+                (word(s, (s.tables.gdt_base as int + (words.ss&!7u64) as int) as u64, WordAccess::Read,
                     Phase::ReturnStack { words, cs }), Tick::Pending)
             },
         },
-        Phase::ReturnStack { words, cs } => match exception::model::stack(value, words.ss as u16) {
+        Phase::ReturnStack { words, cs } => match exception::model::return_stack(value, words.ss as u16,cs.selector&3u16) {
             None => stop(s, EventDiagnostic::Descriptor(Stage::Stack)),
             Some(ss) => commit_return(s, words, cs, ss),
         },

@@ -51,6 +51,40 @@ pub const EMPTY_LEGACY_FP:LegacyFpState=LegacyFpState {
         [0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],
 };
 impl LegacyFpState {
+    pub fn xmm_scalar(self,dst:u8,value:u64,wide:bool)->(out:Self)
+        requires dst<16,
+        ensures out==model::xmm_scalar(self,dst,value,wide),
+    {
+        let value=if wide {value} else {value&0xffff_ffff};
+        let pair=[value,0u64];
+        let mut out=self;
+        out.xmm[dst as usize]=pair;
+        proof {
+            assert(out.xmm@ =~= model::set16(self.xmm,dst as int,pair)@);
+            assert(out.xmm==model::set16(self.xmm,dst as int,pair));
+        }
+        out
+    }
+
+    pub fn xmm_unpack(self,dst:u8,source:u8,wide:bool,high:bool)->(out:Self)
+        requires dst<16,source<16,
+        ensures out==model::xmm_unpack(self,dst,source,wide,high),
+    {
+        let at=if high {1usize} else {0usize};
+        let a=self.xmm[dst as usize][at];
+        let b=self.xmm[source as usize][at];
+        let pair=if wide {[a,b]} else {
+            [(a&0xffff_ffff)|((b&0xffff_ffff)<<32),(a>>32)|((b>>32)<<32)]
+        };
+        let mut out=self;
+        out.xmm[dst as usize]=pair;
+        proof {
+            assert(out.xmm@ =~= model::set16(self.xmm,dst as int,pair)@);
+            assert(out.xmm==model::set16(self.xmm,dst as int,pair));
+        }
+        out
+    }
+
     pub fn integer_ready(self)->(out:bool)
         ensures out==model::integer_ready(self),
     {
@@ -240,6 +274,18 @@ pub mod model {
     #[cfg(verus_keep_ghost)]
     use super::*;
 
+    pub open spec fn xmm_scalar(s:LegacyFpState,dst:u8,value:u64,wide:bool)->LegacyFpState {
+        LegacyFpState {xmm:set16(s.xmm,dst as int,[if wide {value} else {value&0xffff_ffffu64},0u64]),..s}
+    }
+    pub open spec fn xmm_unpack(s:LegacyFpState,dst:u8,source:u8,wide:bool,high:bool)->LegacyFpState {
+        let at=if high {1int} else {0int};
+        let a=s.xmm[dst as int][at];
+        let b=s.xmm[source as int][at];
+        let pair=if wide {[a,b]} else {
+            [(a&0xffff_ffffu64)|((b&0xffff_ffffu64)<<32),(a>>32)|((b>>32)<<32)]
+        };
+        LegacyFpState {xmm:set16(s.xmm,dst as int,pair),..s}
+    }
     pub open spec fn set2<T>(a:[T;2],i:int,v:T)->[T;2] {
         [if i==0 {v} else {a[0]},if i==1 {v} else {a[1]}]
     }
@@ -348,10 +394,24 @@ pub mod model {
     pub open spec fn supported_data_or_null(s: SegmentState) -> bool {
         s == NULL_SEGMENT || supported_data(s)
     }
+    pub open spec fn execution_code(s:SegmentState)->bool {
+        s.base==0 && s.limit==u32::MAX && s.attributes&!0x60u16==0xa09b
+            && (s.selector&3u16==0 || s.selector&3u16==3)
+            && s.selector&3u16==(s.attributes>>5)&3u16
+    }
+    pub open spec fn execution_stack(s:SegmentState)->bool {
+        s==NULL_SEGMENT || (s.base==0 && s.limit==u32::MAX
+            && (s.attributes==0xc093 || s.attributes==0xc0f3))
+    }
+    pub open spec fn outer_data(s:SegmentState)->SegmentState {
+        if s.selector<4 || (s.attributes>>5)&3u16<3 {
+            SegmentState {selector:0,attributes:0,..s}
+        } else {s}
+    }
     // APM Volume 2 §§4.5.3, 4.8.2: FS/GS bases can be set independently
     // by their MSRs. This validates retained metadata, not MOV Sreg effects.
     pub open spec fn data_or_null(s: SegmentState) -> bool {
-        (s.limit == 0 && s.selector < 4 && s.attributes == 0)
+        (s.selector < 4 && s.attributes == 0)
         || (s.limit == u32::MAX && s.selector >= 8 && s.selector & 4u16 == 0
             && s.attributes & !0x60u16 == 0xc093
             && s.selector & 3u16 <= (s.attributes >> 5) & 3u16)
@@ -373,8 +433,9 @@ pub mod model {
         && (forall|i: int| 0 <= i < 16 ==> #[trigger] variable[i] == 0)
     }
     pub open spec fn supported(s: SystemState) -> bool {
-        s.de_cfg&!2u64==0 && supported_code(s.cs) && supported_data_or_null(s.ss) && supported_data_or_null(s.ds)
-        && supported_data_or_null(s.es) && data_or_null(s.fs) && data_or_null(s.gs)
+        s.de_cfg&!2u64==0 && execution_code(s.cs) && execution_stack(s.ss)
+        && data_or_null(s.ds) && s.ds.base==0 && data_or_null(s.es) && s.es.base==0
+        && data_or_null(s.fs) && data_or_null(s.gs)
         && canonical(s.fs.base) && canonical(s.gs.base)
         && supported_task(s.tr) && unused(s.ldtr, 0x82)
         && s.pat == DEFAULT_PAT
@@ -396,6 +457,18 @@ pub proof fn lemma_replace_data(s: SystemState, ss: SegmentState, ds: SegmentSta
         model::supported_data_or_null(ds), model::supported_data_or_null(es),
     ensures model::supported(SystemState { ss, ds, es, ..s }),
 {
+    lemma_kernel_data(ss);lemma_kernel_data(ds);lemma_kernel_data(es);
+}
+pub proof fn lemma_kernel_data(s:SegmentState)
+    requires model::supported_data_or_null(s),
+    ensures model::execution_stack(s),model::data_or_null(s),s.base==0,
+{
+    if s!=NULL_SEGMENT {
+        let selector=s.selector;
+        assert(selector>=8 && selector&4u16==0 && selector&3u16==0) by(bit_vector)
+            requires selector!=0,selector&7u16==0;
+        assert(0xc093u16&!0x60u16==0xc093u16 && (0xc093u16>>5)&3u16==0) by(bit_vector);
+    }
 }
 
 pub proof fn lemma_replace_control(s: SystemState, cr0_extra: u64, cr4_extra: u64,
@@ -413,6 +486,19 @@ pub proof fn lemma_replace_control(s: SystemState, cr0_extra: u64, cr4_extra: u6
 pub proof fn lemma_replace_code(s: SystemState, cs: SegmentState)
     requires model::supported(s), model::supported_code(cs),
     ensures model::supported(SystemState { cs, ..s }),
+{
+    let selector=cs.selector;
+    assert(selector&3u16==0 && (0xa09bu16>>5)&3u16==0
+        && 0xa09bu16&!0x60u16==0xa09bu16) by(bit_vector) requires selector&7u16==0;
+}
+
+pub proof fn lemma_return_segments(s:SystemState,cs:SegmentState,ss:SegmentState,outer:bool)
+    requires model::supported(s),model::execution_code(cs),model::execution_stack(ss),
+    ensures model::supported(SystemState {cs,ss,
+        ds:if outer {model::outer_data(s.ds)} else {s.ds},
+        es:if outer {model::outer_data(s.es)} else {s.es},
+        fs:if outer {model::outer_data(s.fs)} else {s.fs},
+        gs:if outer {model::outer_data(s.gs)} else {s.gs},..s}),
 {
 }
 
@@ -443,30 +529,10 @@ pub fn mtrrs_supported(def: u64, fixed: &[u64; 11], variable: &[u64; 16]) -> (ou
     true
 }
 
-fn supported_code(s: SegmentState) -> (out: bool)
-    ensures out == model::supported_code(s),
-{
-    s.base == 0 && s.limit == u32::MAX && s.attributes == 0xa09b
-        && s.selector != 0 && s.selector & 7 == 0
-}
-
-fn supported_data(s: SegmentState) -> (out: bool)
-    ensures out == model::supported_data(s),
-{
-    s.base == 0 && s.limit == u32::MAX && s.attributes == 0xc093
-        && s.selector != 0 && s.selector & 7 == 0
-}
-
-fn supported_data_or_null(s: SegmentState) -> (out: bool)
-    ensures out == model::supported_data_or_null(s),
-{
-    s == NULL_SEGMENT || supported_data(s)
-}
-
 fn data_or_null(s: SegmentState) -> (out: bool)
     ensures out == model::data_or_null(s),
 {
-    (s.limit == 0 && s.selector < 4 && s.attributes == 0)
+    (s.selector < 4 && s.attributes == 0)
         || (s.limit == u32::MAX && s.selector >= 8 && s.selector & 4 == 0
             && s.attributes & !0x60 == 0xc093
             && s.selector & 3 <= (s.attributes >> 5) & 3)
@@ -488,6 +554,9 @@ pub fn supported_task(s:SegmentState)->(out:bool)
 }
 
 impl SystemState {
+    pub fn is_user(self)->(out:bool)
+        ensures out==(self.cs.selector&3u16==3),
+    {self.cs.selector&3==3}
     /// An incomplete import buffer, not an architectural reset CPU image.
     pub fn empty() -> (out: Self)
         ensures out == model::empty(),
@@ -508,8 +577,9 @@ impl SystemState {
     pub fn is_supported(self) -> (out: bool)
         ensures out == model::supported(self),
     {
-        self.de_cfg&!2==0 && supported_code(self.cs) && supported_data_or_null(self.ss) && supported_data_or_null(self.ds)
-            && supported_data_or_null(self.es) && data_or_null(self.fs) && data_or_null(self.gs)
+        self.de_cfg&!2==0 && execution_code(self.cs) && execution_stack(self.ss)
+            && data_or_null(self.ds) && self.ds.base==0 && data_or_null(self.es) && self.es.base==0
+            && data_or_null(self.fs) && data_or_null(self.gs)
             && (self.fs.base < 0x8000_0000_0000 || self.fs.base >= 0xffff_8000_0000_0000)
             && (self.gs.base < 0x8000_0000_0000 || self.gs.base >= 0xffff_8000_0000_0000)
             && supported_task(self.tr) && unused(self.ldtr, 0x82)
@@ -518,4 +588,28 @@ impl SystemState {
             && mtrrs_supported(self.mtrr_def, &self.mtrr_fixed, &self.mtrr_variable)
     }
 }
+    pub fn execution_code(s:SegmentState)->(out:bool)
+        ensures out==model::execution_code(s),
+    {
+        s.base==0 && s.limit==u32::MAX && s.attributes&!0x60u16==0xa09b
+            && (s.selector&3==0 || s.selector&3==3)
+            && s.selector&3==(s.attributes>>5)&3
+    }
+    pub fn execution_stack(s:SegmentState)->(out:bool)
+        ensures out==model::execution_stack(s),
+    {
+        s==NULL_SEGMENT || (s.base==0 && s.limit==u32::MAX
+            && (s.attributes==0xc093 || s.attributes==0xc0f3))
+    }
+
+    /// Outer privilege returns invalidate inaccessible data selectors without
+    /// exchanging GS bases. Retaining null base/limit is permitted by the
+    /// declared NullSelectorClearsBase=0 profile (APM Vol. 2 section 4.5.1).
+    pub fn outer_data(s:SegmentState)->(out:SegmentState)
+        ensures out==model::outer_data(s),
+    {
+        if s.selector<4 || (s.attributes>>5)&3<3 {
+            SegmentState {selector:0,attributes:0,..s}
+        } else {s}
+    }
 }

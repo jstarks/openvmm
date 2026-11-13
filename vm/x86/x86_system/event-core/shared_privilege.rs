@@ -10,6 +10,127 @@ use memory_core::cpu_core::{privilege, profile};
 
 verus! {
 impl SharedEventMachine {
+    pub(super) fn finish_xmm_load(&mut self,dst:u8,value:u64,wide:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::finish_xmm_load(old(self)@,dst,value,wide,length),
+    {
+        reveal(spec::privilege::finish_xmm_load);
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if dst>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+        system.fp=system.fp.xmm_scalar(dst,value,wide);
+        self.system=Some(system);
+        self.retire_entry(self.core.cpu(),length,false,false)
+    }
+
+    pub(super) fn execute_xmm(&mut self,instruction:Instruction,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::execute_xmm(old(self)@,instruction,length),
+    {
+        let mut cpu=self.core.cpu();
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if system.cr4_extra&0x200==0 {return self.start_entry(Event::InvalidOpcode);}
+        match instruction {
+            Instruction::XmmLoad {dst,source,width}=>{
+                if dst>=16 || (width!=Width::Dword && width!=Width::Qword) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                match source {
+                    memory_core::cpu_core::operand::Operand::Register(reg)=>{
+                        if !reg.is_valid() || reg.width()!=width {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        self.finish_xmm_load(dst,reg.read(&cpu.gpr),width==Width::Qword,length)
+                    },
+                    memory_core::cpu_core::operand::Operand::Memory {address,width:operand_width}=>{
+                        if !address.is_valid() || operand_width!=width {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+                        self.entry_memory(linear,width,WordAccess::Read,length,
+                            entry::MemoryTask::XmmLoad {index:dst,wide:width==Width::Qword})
+                    },
+                    _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
+            Instruction::XmmStore {destination,source,width}=>{
+                if source>=16 || (width!=Width::Dword && width!=Width::Qword) {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                let value=system.fp.xmm[source as usize][0];
+                match destination {
+                    memory_core::cpu_core::operand::Operand::Register(dst)=>{
+                        if !dst.is_valid() || dst.width()!=width {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
+                        let ghost registers=cpu.gpr@;
+                        dst.write(&mut cpu.gpr,value);
+                        assert(cpu@.gpr =~= operand::model::write(registers,dst,value)
+                            .map(|i:int,v:u64|v as int));
+                        self.retire_entry(cpu,length,false,false)
+                    },
+                    memory_core::cpu_core::operand::Operand::Memory {address,width:operand_width}=>{
+                        if !address.is_valid() || operand_width!=width {
+                            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                        }
+                        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+                        self.entry_memory(linear,width,WordAccess::Write(value),length,entry::MemoryTask::Store)
+                    },
+                    _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+                }
+            },
+            Instruction::XmmCopyLow {dst,source}=>{
+                if dst>=16 || source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+                self.finish_xmm_load(dst,system.fp.xmm[source as usize][0],true,length)
+            },
+            Instruction::XmmUnpack {dst,source,wide,high}=>{
+                if dst>=16 || source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+                system.fp=system.fp.xmm_unpack(dst,source,wide,high);
+                self.system=Some(system);
+                self.retire_entry(cpu,length,false,false)
+            },
+            _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+        }
+    }
+
+    pub(super) fn fast_entry(&mut self,returning:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::fast_entry(old(self)@,returning,length),
+    {
+        reveal(spec::privilege::fast_entry);
+        let mut cpu=self.core.cpu();
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if length<2 || length>15 || !flags_supported(cpu.flags) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let ghost flags=cpu.flags;
+        assert(flags&!0x3d7fd7u64==0) by(bit_vector)
+            requires flags&!0x210ed7u64==0;
+        let status=if returning {privilege::sysret64(&mut cpu,&mut system)}
+            else {privilege::syscall64(&mut cpu,&mut system,length)};
+        match status {
+            privilege::FastStatus::InvalidOpcode=>return self.start_entry(Event::InvalidOpcode),
+            privilege::FastStatus::GeneralProtection=>return self.start_entry(Event::GeneralProtection),
+            privilege::FastStatus::Advanced=>{},
+        }
+        if !system.is_supported() || !flags_supported(cpu.flags) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let _accepted=self.core.boundary_transfer(cpu,system.is_user());assert(_accepted);
+        self.system=Some(system);
+        self.phase=Phase::Ready;self.shadow=false;self.handler_pending=false;
+        Tick::Retired(false)
+    }
+
     pub(super) fn swap_gs(&mut self,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
@@ -17,6 +138,7 @@ impl SharedEventMachine {
     {
         reveal(spec::privilege::swap_gs);
         let cpu=self.core.cpu();
+        if self.is_user() {return self.start_entry(Event::GeneralProtection);}
         if length==0 || length>15 {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
@@ -438,7 +560,7 @@ impl SharedEventMachine {
         }
     }
 
-    pub(super) fn control_x87(&mut self,operation:memory_core::cpu_core::system::X87Control,length:u8)->(tick:Tick)
+    pub(super) fn control_x87(&mut self,operation:system::X87Control,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::control_x87(old(self)@,operation,length),
@@ -455,7 +577,7 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
         if system.cr0_extra&0xcu64!=0
-            || (operation==memory_core::cpu_core::system::X87Control::EmptyMmx
+            || (operation==system::X87Control::EmptyMmx
                 && ((system.fp.status&!system.fp.control)&0x3fu16)!=0) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }

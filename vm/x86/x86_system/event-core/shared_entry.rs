@@ -17,9 +17,15 @@ pub enum Instruction {
     Nop,
     Fence,
     InitializeX87,
-    ControlX87 {operation:memory_core::cpu_core::system::X87Control},
+    ControlX87 {operation:system::X87Control},
     Breakpoint,
     SwapGs,
+    Syscall,
+    Sysret,
+    XmmLoad {dst:u8,source:Operand,width:Width},
+    XmmStore {destination:Operand,source:u8,width:Width},
+    XmmCopyLow {dst:u8,source:u8},
+    XmmUnpack {dst:u8,source:u8,wide:bool,high:bool},
     SaveFp {address:Address,wide:bool},
     RestoreFp {address:Address,wide:bool},
     LoadX87Integer {address:Address,width:Width,opcode:u16},
@@ -96,6 +102,7 @@ pub enum MemoryTask {
     SaveFpHeader {wide:bool},
     RestoreFp {index:u8,wide:bool},
     LoadX87Integer {width:Width,opcode:u16},
+    XmmLoad {index:u8,wide:bool},
     TaskLow {selector:u16},
     TaskHigh {selector:u16,low:u64},
     TaskBusy {image:SegmentState,low:u64},
@@ -165,6 +172,12 @@ pub(super) fn supported_access(address:u64,width:Width)->(out:bool)
     address <= u64::MAX-(size as u64-1)
         && canonical(address) && canonical(address+(size as u64-1))
 }
+pub(super) fn system_memory_task(task:MemoryTask)->(out:bool)
+    ensures out==spec::entry::system_memory_task(task),
+{
+    matches!(task,MemoryTask::TaskLow {..}|MemoryTask::TaskHigh {..}|MemoryTask::TaskBusy {..}
+        |MemoryTask::Segment {..}|MemoryTask::FarCode {..})
+}
 
 impl SharedEventMachine {
     #[inline(always)]
@@ -193,7 +206,8 @@ impl SharedEventMachine {
         if !supported_access(address,width) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
-        let _accepted = self.core.boundary_span(address, request, size);
+        let _accepted = if system_memory_task(task) {self.core.boundary_system_span(address,request,size)}
+            else {self.core.boundary_span(address, request, size)};
         assert(_accepted);
         self.phase = Phase::EntryMemory { address, length, task };
         Tick::Pending
@@ -214,7 +228,28 @@ impl SharedEventMachine {
             reveal(spec::entry::execute);
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
         }
+        if self.is_user() {
+            if matches!(instruction,Instruction::ReadControl {..}|Instruction::WriteControl {..}
+                |Instruction::ReadDebug {..}|Instruction::WriteDebug {..}|Instruction::ReadMsr
+                |Instruction::Table {..}|Instruction::LoadTask {..}|Instruction::LoadLdt {..}) {
+                reveal(spec::entry::execute);
+                return self.start_entry(Event::GeneralProtection);
+            }
+            if matches!(instruction,Instruction::FarReturn|Instruction::PortIo {..}|Instruction::Breakpoint) {
+                reveal(spec::entry::execute);
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+        }
         match instruction {
+            Instruction::XmmLoad {..}|Instruction::XmmStore {..}
+                |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}=>{
+                reveal(spec::entry::execute);
+                self.execute_xmm(instruction,length)
+            },
+            Instruction::Syscall|Instruction::Sysret=>{
+                reveal(spec::entry::execute);
+                self.fast_entry(matches!(instruction,Instruction::Sysret),length)
+            },
             Instruction::Breakpoint=>{
                 reveal(spec::entry::execute);
                 self.breakpoint(length)
@@ -225,7 +260,7 @@ impl SharedEventMachine {
             },
             Instruction::InitializeX87=>{
                 reveal(spec::entry::execute);
-                self.control_x87(memory_core::cpu_core::system::X87Control::Initialize,length)
+                self.control_x87(system::X87Control::Initialize,length)
             },
             Instruction::ControlX87 {operation}=>{
                 reveal(spec::entry::execute);
@@ -717,6 +752,9 @@ impl SharedEventMachine {
                 }
                 let selector = (src.read(&cpu.gpr) & 0xffff) as u16;
                 let Some(mut system)=self.system else {assert(false);return Tick::Waiting;};
+                if self.is_user() && matches!(dst,Segment::Ss) && selector<4 {
+                    return self.start_entry(Event::GeneralProtection);
+                }
                 if selector==0 || (selector<4 && matches!(dst,Segment::Fs|Segment::Gs)) {
                     // This synthetic profile preserves null-loaded FS/GS bases where AMD leaves them undefined.
                     match dst {
@@ -730,7 +768,7 @@ impl SharedEventMachine {
                     return self.retire_entry(cpu,length,matches!(dst,Segment::Ss),false);
                 }
                 let offset = (selector & !7u16) as u64;
-                if (if matches!(dst,Segment::Fs|Segment::Gs) {selector&4!=0} else {selector%8!=0})
+                if (if matches!(dst,Segment::Fs|Segment::Gs) || self.is_user() {selector&4!=0} else {selector%8!=0})
                     || offset + 7 > self.tables.gdt_limit as u64
                     || self.tables.gdt_base > u64::MAX - offset {
                     return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
@@ -929,7 +967,10 @@ impl SharedEventMachine {
             (final(self)@,tick)==spec::entry::segment_value(old(self)@,dst,selector,value,length),
     {
         reveal(spec::entry::segment_value);
-        let loaded=if matches!(dst,Segment::Fs|Segment::Gs) {descriptor::load_thread_data(value,selector)}
+        if self.is_user() && (((value>>45)&3)!=3 || (matches!(dst,Segment::Ss) && selector&3!=3)) {
+            return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
+        }
+        let loaded=if matches!(dst,Segment::Fs|Segment::Gs) || self.is_user() {descriptor::load_thread_data(value,selector)}
             else {descriptor::load_data(value,selector)};
         let Some(segment)=loaded else {
             return self.stop(EventDiagnostic::Descriptor(Stage::Stack));
@@ -1001,6 +1042,7 @@ impl SharedEventMachine {
         assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
         let ghost before = cpu@;
         match task {
+            MemoryTask::XmmLoad {index,wide}=>return self.finish_xmm_load(index,value,wide,length),
             MemoryTask::Exchange {register}=>{
                 return self.exchange_value(register,value,length);
             },
@@ -1057,7 +1099,7 @@ impl SharedEventMachine {
                 let Some(mut system)=self.system else {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 };
-                if !memory_core::cpu_core::system::supported_task(image) {
+                if !system::supported_task(image) {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
                 system.tr=image;
@@ -1116,7 +1158,8 @@ impl SharedEventMachine {
                 if stack > u64::MAX - 8 {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
                 }
-                cpu.gpr[4] = stack + 8; cpu.flags = flags;
+                cpu.gpr[4] = stack + 8;
+                cpu.flags = if self.is_user() {(flags&!0x200)|(cpu.flags&0x200)} else {flags};
                 assert(cpu@.gpr =~= before.gpr.update(4, stack as int + 8));
             },
             MemoryTask::FarTarget { stack } => {

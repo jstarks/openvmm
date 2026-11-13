@@ -309,12 +309,14 @@ fn double_shift_register_forms_own_width_count_and_direction() {
 }
 
 #[test]
-fn cs_prefixed_relative_call_keeps_its_displacement_and_full_return_length() {
+fn ignored_relative_call_prefixes_keep_the_displacement_and_full_return_length() {
     use x86_system::shared::decode::DecodeDecision;
-    assert_eq!(
-        admission(&[0x2e, 0xe8, 0xfa, 0xff, 0xff, 0xff]),
-        DecodeDecision::NearCall { displacement: -6 }
-    );
+    for prefix in [0x2e, 0x67] {
+        assert_eq!(
+            admission(&[prefix, 0xe8, 0xfa, 0xff, 0xff, 0xff]),
+            DecodeDecision::NearCall { displacement: -6 }
+        );
+    }
 }
 
 #[test]
@@ -3274,5 +3276,106 @@ fn scalar_admission_rejects_unimplemented_effects_without_changing_state() {
         );
         assert_eq!(registers, [0x1234; 16]);
         assert_eq!(rip, ip);
+    }
+}
+#[test]
+fn fast_calls_admit_only_the_owned_long64_forms() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(entry(&[0x0f, 0x05]), Instruction::Syscall);
+    assert_eq!(entry(&[0x48, 0x0f, 0x07]), Instruction::Sysret);
+    for bytes in [&[0x0f, 0x07][..], &[0x66, 0x0f, 0x07], &[0x48, 0x0f, 0x05]] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+}
+
+#[test]
+fn endbr_is_a_bounded_nop_with_ibt_unexposed() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for bytes in [[0xf3, 0x0f, 0x1e, 0xfa], [0xf3, 0x0f, 0x1e, 0xfb]] {
+        for length in 1..4 {
+            assert_eq!(admission(&bytes[..length]), DecodeDecision::More);
+        }
+        assert_eq!(entry(&bytes), Instruction::Nop);
+    }
+    assert_eq!(
+        admission(&[0xf0, 0xf3, 0x0f, 0x1e, 0xfa]),
+        DecodeDecision::InvalidOpcode
+    );
+}
+#[test]
+fn xmm_scalar_transfers_and_register_unpacks_preserve_widths_and_indices() {
+    use x86_decode::Width;
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for dst in 0..16 {
+        let mut bytes = vec![0x66];
+        if dst >= 8 {
+            bytes.push(0x44);
+        }
+        bytes.extend([0x0f, 0x6e, 0xc0 | ((dst & 7) << 3)]);
+        let Instruction::XmmLoad {
+            dst: actual, width, ..
+        } = entry(&bytes)
+        else {
+            panic!()
+        };
+        assert_eq!((actual, width), (dst, Width::Dword));
+    }
+    assert!(matches!(
+        entry(&[0x66, 0x0f, 0x6e, 0x4d, 0x84]),
+        Instruction::XmmLoad {
+            dst: 1,
+            width: Width::Dword,
+            ..
+        }
+    ));
+    assert!(matches!(
+        entry(&[0x66, 0x4d, 0x0f, 0x6e, 0xcb]),
+        Instruction::XmmLoad {
+            dst: 9,
+            width: Width::Qword,
+            ..
+        }
+    ));
+    assert!(matches!(
+        entry(&[0x66, 0x0f, 0xd6, 0x05, 0, 0, 0, 0]),
+        Instruction::XmmStore {
+            source: 0,
+            width: Width::Qword,
+            ..
+        }
+    ));
+    assert!(matches!(
+        entry(&[0x66, 0x0f, 0x7e, 0xc8]),
+        Instruction::XmmStore {
+            source: 1,
+            width: Width::Dword,
+            ..
+        }
+    ));
+    assert_eq!(
+        entry(&[0xf3, 0x0f, 0x7e, 0xc8]),
+        Instruction::XmmCopyLow { dst: 1, source: 0 }
+    );
+    for (opcode, wide, high) in [
+        (0x62, false, false),
+        (0x6a, false, true),
+        (0x6c, true, false),
+        (0x6d, true, true),
+    ] {
+        assert_eq!(
+            entry(&[0x66, 0x0f, opcode, 0xc1]),
+            Instruction::XmmUnpack {
+                dst: 0,
+                source: 1,
+                wide,
+                high
+            }
+        );
+    }
+    for bytes in [&[0x0f, 0x6e, 0xc1][..], &[0x66, 0x0f, 0x62, 0x00]] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
     }
 }

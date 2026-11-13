@@ -142,7 +142,8 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
                 _ => stop(s, EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
             }
         },
-        DecodeDecision::Wrmsr => if s.apic_id is Some
+        DecodeDecision::Wrmsr => if is_user(s) {entry(s,Event::GeneralProtection)}
+        else if s.apic_id is Some
             && (((s.core.cpu.gpr[1] as u64)&0xffff_ffffu64)==0x1b
                 || 0x800<=((s.core.cpu.gpr[1] as u64)&0xffff_ffffu64)<=0x8ff) {
             control_io::start(s,super::super::shared::control_io::ControlAccess::WriteMsr {

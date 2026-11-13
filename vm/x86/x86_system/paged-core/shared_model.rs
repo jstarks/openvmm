@@ -42,13 +42,28 @@ pub open spec fn boundary(s: State) -> (State, bool) {
 pub open spec fn boundary_begin(s: State, address: u64, word: Option<WordAccess>) -> (State, bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) {
         let access = match word { Some(w) => word_model::request(w), None => Access::Fetch };
-        (State { mmu: mm::begin(s.mmu, address, access, false, word), ..s }, true)
+        (State { mmu: mm::begin(s.mmu, address, access, if word is None {s.user} else {false}, word), ..s }, true)
     } else { (s, false) }
 }
 pub open spec fn boundary_commit(s: State, cpu: model::State, release: bool) -> (State, bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) {
         (State { cpu, phase: if release { CpuPhase::Ready } else { CpuPhase::Boundary }, ..s }, true)
     } else { (s, false) }
+}
+pub open spec fn boundary_transfer(s:State,cpu:model::State,user:bool)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) {
+        (State {cpu,user,phase:CpuPhase::Ready,..s},true)
+    } else {(s,false)}
+}
+pub open spec fn boundary_word_as(s:State,address:u64,word:WordAccess,user:bool)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) {
+        (State {mmu:mm::begin(s.mmu,address,word_model::request(word),user,Some(word)),..s},true)
+    } else {(s,false)}
+}
+pub open spec fn boundary_system_span(s:State,address:u64,word:WordAccess,size:u8)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) {
+        (State {mmu:mm::access_begin(s.mmu,address,word_model::request(word),false,Some(word),size,true),..s},true)
+    } else {(s,false)}
 }
 pub open spec fn boundary_sized(s: State, address: u64, word: WordAccess, size: u8) -> (State, bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) {
@@ -59,20 +74,20 @@ pub open spec fn boundary_modify(s: State, address: u64,
     operation: super::memory_core::cpu_core::integer::Operation, source: u64, flags: u64,
     width: super::memory_core::cpu_core::operand::Width) -> (State, bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::modify_admitted(address, operation, width) {
-        (State { mmu: mm::modify_start(s.mmu, address, operation, source, flags, width, true), ..s }, true)
+        (State { mmu: mm::modify_as(s.mmu, address, operation, source, flags, width, true,s.user), ..s }, true)
     } else { (s, false) }
 }
 pub open spec fn boundary_span(s: State, address: u64, word: WordAccess, size: u8) -> (State, bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) {
         (State { mmu: mm::access_begin(s.mmu, address, word_model::request(word),
-            false, Some(word), size, true), ..s }, true)
+            s.user, Some(word), size, true), ..s }, true)
     } else { (s, false) }
 }
 pub open spec fn boundary_locked_modify(s:State,address:u64,
     operation:super::memory_core::cpu_core::integer::Operation,source:u64,flags:u64,
     width:super::memory_core::cpu_core::operand::Width)->(State,bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::locked_admitted(address,operation,width) {
-        (State {mmu:mm::locked_begin(s.mmu,address,operation,source,flags,width),..s},true)
+        (State {mmu:mm::locked_as(s.mmu,address,operation,source,flags,width,s.user),..s},true)
     } else {(s,false)}
 }
 pub open spec fn boundary_reload(s: State, config: super::Config) -> (State, bool) {
@@ -85,13 +100,13 @@ pub open spec fn boundary_reload(s: State, config: super::Config) -> (State, boo
 pub open spec fn boundary_exchange(s:State,address:u64,replacement:u64,
     width:super::memory_core::cpu_core::operand::Width)->(State,bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::compare_admitted(address,width) {
-        (State {mmu:mm::exchange_begin(s.mmu,address,replacement,width),..s},true)
+        (State {mmu:mm::exchange_as(s.mmu,address,replacement,width,s.user),..s},true)
     } else {(s,false)}
 }
 pub open spec fn boundary_compare_exchange(s:State,address:u64,expected:u64,replacement:u64,
     width:super::memory_core::cpu_core::operand::Width)->(State,bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) && mm::compare_admitted(address,width) {
-        (State {mmu:mm::compare_begin(s.mmu,address,expected,replacement,width),..s},true)
+        (State {mmu:mm::compare_as(s.mmu,address,expected,replacement,width,s.user),..s},true)
     } else {(s,false)}
 }
 pub open spec fn invalidate(s: State, va: u64) -> (State, bool) {
@@ -111,7 +126,7 @@ pub open spec fn fetch(s: State, offset: u64, phase: CpuPhase) -> (State, Tick) 
 }
 pub open spec fn boundary_fetch_next(s:State,address:u64)->(State,bool) {
     if s.phase is Boundary {
-        let next=mm::begin_fetch_next(s.mmu,address,false);
+        let next=mm::begin_fetch_next(s.mmu,address,s.user);
         (State {mmu:next.0,..s},next.1)
     } else {(s,false)}
 }

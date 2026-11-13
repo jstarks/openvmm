@@ -52,6 +52,14 @@ pub mod model {
     pub open spec fn load_code(word: u64, selector: u16) -> Option<SegmentState> {
         if admitted_code(word, selector) { Some(image(word, selector)) } else { None }
     }
+    pub open spec fn load_return_code(word:u64,selector:u16)->Option<SegmentState> {
+        let cpl=selector&3u16;
+        if (cpl!=0 && cpl!=3) || ((word>>45)&3u64)!=cpl as u64 {None}
+        else {match load_code(word&!(3u64<<45),selector&!3u16) {
+            None=>None,
+            Some(s)=>Some(SegmentState {selector,attributes:0xa09bu16|(cpl<<5),..s}),
+        }}
+    }
     pub open spec fn task_image(low:u64,high:u64,selector:u16)->SegmentState {
         SegmentState {base:base(low)|((high&0xffff_ffffu64)<<32),
             limit:limit(low),selector,attributes:0x8b}
@@ -155,6 +163,21 @@ pub fn load_code(word: u64, selector: u16) -> (out: Option<SegmentState>)
         return None;
     }
     Some(SegmentState { base: 0, limit: u32::MAX, selector, attributes: 0xa09b })
+}
+
+pub fn load_return_code(word:u64,selector:u16)->(out:Option<SegmentState>)
+    ensures out==model::load_return_code(word,selector),
+        out.is_some() ==> system::model::execution_code(out.unwrap()),
+{
+    let cpl=selector&3;
+    if (cpl!=0 && cpl!=3) || ((word>>45)&3)!=cpl as u64 {return None;}
+    let Some(s)=load_code(word&!(3u64<<45),selector&!3u16) else {return None;};
+    let attributes=0xa09b|(cpl<<5);
+    proof {
+        assert(attributes&!0x60u16==0xa09b && (attributes>>5)&3u16==cpl) by(bit_vector)
+            requires attributes==0xa09bu16|(cpl<<5),cpl==0 || cpl==3;
+    }
+    Some(SegmentState {selector,attributes,..s})
 }
 
 /// This profile requires a present DPL0 expand-up writable accessed data

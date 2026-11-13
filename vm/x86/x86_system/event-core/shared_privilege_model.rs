@@ -13,9 +13,100 @@ use super::*;
 
 verus! {
 #[verifier::opaque]
+pub open spec fn finish_xmm_load(s:State,dst:u8,value:u64,wide:bool,length:u8)->(State,Tick) {
+    if s.system is None || dst>=16 {entry::unsupported(s)}
+    else {
+        let system=s.system.unwrap();
+        entry::retire(State {system:Some(SystemState {
+            fp:system::model::xmm_scalar(system.fp,dst,value,wide),..system}),..s},
+            s.core.cpu,length,false,false)
+    }
+}
+pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,Tick) {
+    if s.system is None {entry::unsupported(s)}
+    else if s.system.unwrap().cr4_extra&0x200u64==0 {entry(s,Event::InvalidOpcode)}
+    else {
+        let system=s.system.unwrap();
+        let cpu=s.core.cpu;
+        match instruction {
+            Instruction::XmmLoad {dst,source,width}=>{
+                if dst>=16 || (width!=Width::Dword && width!=Width::Qword) {entry::unsupported(s)}
+                else {match source {
+                    operand::Operand::Register(reg)=>{
+                        if !reg.valid() || reg@.width!=width {entry::unsupported(s)}
+                        else {finish_xmm_load(s,dst,operand::model::read(entry::registers(cpu),reg),width==Width::Qword,length)}
+                    },
+                    operand::Operand::Memory {address,width:operand_width}=>{
+                        if !address.valid() || operand_width!=width {entry::unsupported(s)}
+                        else {entry::memory(s,entry::linear(s,address,length),width,WordAccess::Read,length,
+                            super::super::shared::entry::MemoryTask::XmmLoad {index:dst,wide:width==Width::Qword})}
+                    },
+                    _=>entry::unsupported(s),
+                }}
+            },
+            Instruction::XmmStore {destination,source,width}=>{
+                if source>=16 || (width!=Width::Dword && width!=Width::Qword) {entry::unsupported(s)}
+                else {
+                    let value=system.fp.xmm[source as int][0];
+                    match destination {
+                        operand::Operand::Register(dst)=>{
+                            if !dst.valid() || dst@.width!=width {entry::unsupported(s)}
+                            else {entry::retire(s,model::State {
+                                gpr:operand::model::write(entry::registers(cpu),dst,value)
+                                    .map(|i:int,v:u64|v as int),..cpu},length,false,false)}
+                        },
+                        operand::Operand::Memory {address,width:operand_width}=>{
+                            if !address.valid() || operand_width!=width {entry::unsupported(s)}
+                            else {entry::memory(s,entry::linear(s,address,length),width,WordAccess::Write(value),length,
+                                super::super::shared::entry::MemoryTask::Store)}
+                        },
+                        _=>entry::unsupported(s),
+                    }
+                }
+            },
+            Instruction::XmmCopyLow {dst,source}=>{
+                if dst>=16 || source>=16 {entry::unsupported(s)}
+                else {finish_xmm_load(s,dst,system.fp.xmm[source as int][0],true,length)}
+            },
+            Instruction::XmmUnpack {dst,source,wide,high}=>{
+                if dst>=16 || source>=16 {entry::unsupported(s)}
+                else {entry::retire(State {system:Some(SystemState {
+                    fp:system::model::xmm_unpack(system.fp,dst,source,wide,high),..system}),..s},
+                    cpu,length,false,false)}
+            },
+            _=>entry::unsupported(s),
+        }
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn fast_entry(s:State,returning:bool,length:u8)->(State,Tick) {
+    if s.system is None || length<2 || length>15 || !e::flags_supported(s.core.cpu.flags) {
+        entry::unsupported(s)
+    } else {
+        let system=s.system.unwrap();
+        let result=if returning {privilege::model::sysret64(s.core.cpu,system)}
+            else {privilege::model::syscall64(s.core.cpu,system,length)};
+        match result.2 {
+            privilege::FastStatus::InvalidOpcode=>entry(s,Event::InvalidOpcode),
+            privilege::FastStatus::GeneralProtection=>entry(s,Event::GeneralProtection),
+            privilege::FastStatus::Advanced=>{
+                if !system::model::supported(result.1) || !e::flags_supported(result.0.flags) {
+                    entry::unsupported(s)
+                } else {
+                    (State {core:c::boundary_transfer(s.core,result.0,result.1.cs.selector&3u16==3).0,
+                        system:Some(result.1),phase:Phase::Ready,shadow:false,handler_pending:false,..s},
+                        Tick::Retired(false))
+                }
+            },
+        }
+    }
+}
+#[verifier::opaque]
 pub open spec fn swap_gs(s:State,length:u8)->(State,Tick) {
     let cpu=s.core.cpu;
-    if length==0 || length>15 {entry::unsupported(s)}
+    if is_user(s) {entry(s,Event::GeneralProtection)}
+    else if length==0 || length>15 {entry::unsupported(s)}
     else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
     else {match s.system {
         None=>entry::unsupported(s),

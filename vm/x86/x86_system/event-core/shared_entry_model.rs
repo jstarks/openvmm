@@ -143,9 +143,13 @@ pub open spec fn memory(s: State, address: u64, width: Width, request: WordAcces
     let size = (operand::model::bits(width) / 8) as u8;
     if !supported_access(address,width) { unsupported(s) }
     else {
-        let core = c::boundary_span(s.core, address, request, size).0;
+        let core = if system_memory_task(task) {c::boundary_system_span(s.core,address,request,size).0}
+            else {c::boundary_span(s.core, address, request, size).0};
         (State { core, phase: Phase::EntryMemory { address, length, task }, ..s }, Tick::Pending)
     }
+}
+pub open spec fn system_memory_task(task:MemoryTask)->bool {
+    task is TaskLow || task is TaskHigh || task is TaskBusy || task is Segment || task is FarCode
 }
 pub open spec fn supported_access(address:u64,width:Width)->bool {
     let size=operand::model::bits(width)/8;
@@ -229,7 +233,16 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     if length == 0 || length > 15 { unsupported(s) }
     else if cpu.flags & 0x100u64 != 0 {
         stop(s, EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
-    } else { match instruction {
+    } else if is_user(s) && (instruction is ReadControl || instruction is WriteControl
+        || instruction is ReadDebug || instruction is WriteDebug || instruction is ReadMsr
+        || instruction is Table || instruction is LoadTask || instruction is LoadLdt) {
+        entry(s,Event::GeneralProtection)
+    } else if is_user(s) && (instruction is FarReturn || instruction is PortIo || instruction is Breakpoint) {unsupported(s)}
+    else { match instruction {
+        Instruction::Syscall=>privilege::fast_entry(s,false,length),
+        Instruction::Sysret=>privilege::fast_entry(s,true,length),
+        Instruction::XmmLoad {..}|Instruction::XmmStore {..}
+            |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}=>privilege::execute_xmm(s,instruction,length),
         Instruction::ByteSwap {dst}=>{
             if !dst.valid() || !(dst@.width is Dword || dst@.width is Qword) {unsupported(s)}
             else {retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,
@@ -458,7 +471,8 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                 let system=s.system.unwrap();
                 let selector = (operand::model::read(registers(cpu), src) & 0xffffu64) as u16;
                 let offset = (selector & !7u16) as u64;
-                if selector==0 || (selector<4 && (dst is Fs || dst is Gs)) {
+                if is_user(s) && dst is Ss && selector<4 {entry(s,Event::GeneralProtection)}
+                else if selector==0 || (selector<4 && (dst is Fs || dst is Gs)) {
                     let null=super::super::memory_core::cpu_core::system::NULL_SEGMENT;
                     let system=match dst {
                         Segment::Ds=>SystemState {ds:null,..system},Segment::Ss=>SystemState {ss:null,..system},
@@ -469,7 +483,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
                             base:system.gs.base,selector,..null},..system},_=>system,
                     };
                     retire(State {system:Some(system),..s},cpu,length,dst is Ss,false)
-                } else if (if dst is Fs || dst is Gs {selector&4u16!=0} else {selector%8!=0})
+                } else if (if dst is Fs || dst is Gs || is_user(s) {selector&4u16!=0} else {selector%8!=0})
                     || offset as int + 7 > s.tables.gdt_limit as int
                     || s.tables.gdt_base as int + offset as int > u64::MAX {
                     stop(s, EventDiagnostic::Descriptor(Stage::Stack))
@@ -519,7 +533,10 @@ pub open spec fn exchange_value(s:State,register:operand::Register,value:u64,len
 }
 #[verifier::opaque]
 pub open spec fn segment_value(s:State,dst:Segment,selector:u16,value:u64,length:u8)->(State,Tick) {
-    let loaded=if dst is Fs || dst is Gs {descriptor::model::load_thread_data(value,selector)}
+    if is_user(s) && (((value>>45)&3u64)!=3 || (dst is Ss && selector&3u16!=3)) {
+        stop(s,EventDiagnostic::Descriptor(Stage::Stack))
+    } else {
+    let loaded=if dst is Fs || dst is Gs || is_user(s) {descriptor::model::load_thread_data(value,selector)}
         else {descriptor::model::load_data(value,selector)};
     match loaded {
         None=>stop(s,EventDiagnostic::Descriptor(Stage::Stack)),
@@ -535,6 +552,7 @@ pub open spec fn segment_value(s:State,dst:Segment,selector:u16,value:u64,length
                 else {retire(State {system:Some(updated),..s},s.core.cpu,length,dst is Ss,false)}
             },
         },
+        }
     }
 }
 #[verifier::opaque]
@@ -555,6 +573,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     };
     let cpu = s.core.cpu;
     match task {
+        MemoryTask::XmmLoad {index,wide}=>privilege::finish_xmm_load(s,index,value,wide,length),
         MemoryTask::Exchange {register}=>exchange_value(s,register,value,length),
         MemoryTask::SaveFp {index,wide}=>privilege::save_fp_value(s,address,index,wide,length),
         MemoryTask::SaveFpHeader {wide}=>privilege::save_fp_header(s,address,wide,length),
@@ -632,7 +651,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
             Some(flags) => {
                 if stack as int + 8 > u64::MAX {unsupported(s)}
                 else {retire(s,model::State {gpr:cpu.gpr.update(4,stack as int+8),
-                    flags,..cpu},length,false,false)}
+                    flags:if is_user(s) {(flags&!0x200u64)|(cpu.flags&0x200u64)} else {flags},..cpu},length,false,false)}
             },
         },
         MemoryTask::FarTarget {stack} => {

@@ -49,7 +49,7 @@ impl SharedMachine {
     }
 
     pub fn new(cpu: State, config: Config, cr2: u64, user: bool) -> (s: Self)
-        ensures s.invariant(), s@.cpu == cpu@, s@.phase == CpuPhase::Ready,
+        ensures s.invariant(), s@.cpu == cpu@, s@.phase == CpuPhase::Ready,s@.user==user,
     { Self { cpu, mmu: SharedMmu::new(config, cr2), phase: CpuPhase::Ready, user } }
 
     #[inline]
@@ -101,7 +101,7 @@ impl SharedMachine {
             spec::boundary_begin(old(self)@, address, None),
     {
         if !matches!(self.phase, CpuPhase::Boundary) { return false; }
-        self.mmu.begin(address, Access::Fetch, false)
+        self.mmu.begin(address, Access::Fetch, self.user)
     }
 
     #[inline]
@@ -117,7 +117,7 @@ impl SharedMachine {
             (final(self)@,accepted)==spec::boundary_fetch_next(old(self)@,address),
     {
         if !matches!(self.phase,CpuPhase::Boundary) {return false;}
-        self.mmu.begin_fetch_next(address,false)
+        self.mmu.begin_fetch_next(address,self.user)
     }
 
     pub(crate) fn boundary_word(&mut self, address: u64, request: WordAccess) -> (accepted: bool)
@@ -125,8 +125,23 @@ impl SharedMachine {
         ensures final(self).invariant(), (final(self)@, accepted) ==
             spec::boundary_begin(old(self)@, address, Some(request)),
     {
-        if !matches!(self.phase, CpuPhase::Boundary) { return false; }
-        self.mmu.begin_word(address, request, false)
+        self.boundary_word_as(address,request,false)
+    }
+    pub(crate) fn boundary_word_as(&mut self,address:u64,request:WordAccess,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::boundary_word_as(old(self)@,address,request,user),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_word(address,request,user)
+    }
+    pub(crate) fn boundary_system_span(&mut self,address:u64,word:WordAccess,size:u8)->(accepted:bool)
+        requires old(self).invariant(),size==1 || size==2 || size==4 || size==8,
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::boundary_system_span(old(self)@,address,word,size),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_span(address,word,size,false)
     }
 
     #[inline(always)]
@@ -138,6 +153,16 @@ impl SharedMachine {
         if !matches!(self.phase, CpuPhase::Boundary) || self.mmu.active() { return false; }
         self.cpu = cpu;
         if release { self.phase = CpuPhase::Ready; }
+        true
+    }
+
+    pub(crate) fn boundary_transfer(&mut self,cpu:State,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::boundary_transfer(old(self)@,cpu@,user),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) || self.mmu.active() {return false;}
+        self.cpu=cpu;self.user=user;self.phase=CpuPhase::Ready;
         true
     }
 
@@ -157,7 +182,7 @@ impl SharedMachine {
             spec::boundary_span(old(self)@, address, word, size),
     {
         if !matches!(self.phase, CpuPhase::Boundary) { return false; }
-        self.mmu.begin_span(address, word, size,false)
+        self.mmu.begin_span(address, word, size,self.user)
     }
 
     pub(crate) fn boundary_modify(&mut self, address: u64,
@@ -168,7 +193,7 @@ impl SharedMachine {
             spec::boundary_modify(old(self)@, address, operation, source, flags, width),
     {
         if !matches!(self.phase, CpuPhase::Boundary) { return false; }
-        self.mmu.begin_modify_span(address, operation, source, flags, width)
+        self.mmu.begin_modify_span(address, operation, source, flags, width,self.user)
     }
 
     pub(crate) fn boundary_exchange(&mut self,address:u64,replacement:u64,
@@ -178,7 +203,7 @@ impl SharedMachine {
             spec::boundary_exchange(old(self)@,address,replacement,width),
     {
         if !matches!(self.phase,CpuPhase::Boundary) {return false;}
-        self.mmu.begin_exchange(address,replacement,width)
+        self.mmu.begin_exchange_as(address,replacement,width,self.user)
     }
 
     pub(crate) fn boundary_compare_exchange(&mut self,address:u64,expected:u64,replacement:u64,
@@ -188,7 +213,7 @@ impl SharedMachine {
             spec::boundary_compare_exchange(old(self)@,address,expected,replacement,width),
     {
         if !matches!(self.phase,CpuPhase::Boundary) {return false;}
-        self.mmu.begin_compare_exchange(address,expected,replacement,width)
+        self.mmu.begin_compare_exchange_as(address,expected,replacement,width,self.user)
     }
 
     pub(crate) fn boundary_locked_modify(&mut self,address:u64,
@@ -199,7 +224,7 @@ impl SharedMachine {
             spec::boundary_locked_modify(old(self)@,address,operation,source,flags,width),
     {
         if !matches!(self.phase,CpuPhase::Boundary) {return false;}
-        self.mmu.begin_locked_modify(address,operation,source,flags,width)
+        self.mmu.begin_locked_modify_as(address,operation,source,flags,width,self.user)
     }
 
     pub(crate) fn boundary_reload(&mut self, config: Config) -> (accepted: bool)

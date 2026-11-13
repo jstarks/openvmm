@@ -251,6 +251,7 @@ impl SharedEventMachine {
                 }
             },
             DecodeDecision::Wrmsr => {
+                if self.is_user() {return self.start_entry(Event::GeneralProtection);}
                 let cpu=self.core.cpu();
                 let ghost rcx=cpu.gpr[1];
                 let low=cpu.gpr[1]&0xffff_ffff;

@@ -13,7 +13,15 @@ impl SharedMmu {
             accepted==(!spec::active(old(self)@.phase) && spec::compare_admitted(va,width)),
             final(self)@==if accepted {spec::exchange_begin(old(self)@,va,replacement,width)} else {old(self)@},
     {
-        let accepted=self.begin_compare_exchange(va,0,replacement,width);
+        self.begin_exchange_as(va,replacement,width,false)
+    }
+    pub fn begin_exchange_as(&mut self,va:u64,replacement:u64,width:Width,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted==(!spec::active(old(self)@.phase) && spec::compare_admitted(va,width)),
+            final(self)@==if accepted {spec::exchange_as(old(self)@,va,replacement,width,user)} else {old(self)@},
+    {
+        let accepted=self.begin_compare_exchange_as(va,0,replacement,width,user);
         if accepted {
             self.comparison=Some(Comparison {operation:AtomicOperation::Exchange {replacement},width});
         }
@@ -33,13 +41,22 @@ impl SharedMmu {
                 spec::compare_begin(old(self)@, va, expected, replacement, width)
             } else { old(self)@ },
     {
+        self.begin_compare_exchange_as(va,expected,replacement,width,false)
+    }
+    pub fn begin_compare_exchange_as(&mut self,va:u64,expected:u64,replacement:u64,
+        width:Width,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted==(!spec::active(old(self)@.phase) && spec::compare_admitted(va,width)),
+            final(self)@==if accepted {spec::compare_as(old(self)@,va,expected,replacement,width,user)} else {old(self)@},
+    {
         let size = match width { Width::Byte => 1u8, Width::Word => 2,
             Width::Dword => 4, Width::Qword => 8 };
         if va % size as u64 != 0 || va % 8 + size as u64 > 8
             || va % 4096 + size as u64 > 4096 || va > u64::MAX - (size as u64 - 1) {
             return false;
         }
-        let accepted = self.begin_access(va, Access::Write(0), false, Some(WordAccess::Write(0)), size);
+        let accepted = self.begin_access(va, Access::Write(0), user, Some(WordAccess::Write(0)), size);
         if accepted { self.comparison = Some(Comparison {
             operation: AtomicOperation::CompareExchange { expected, replacement }, width }); }
         accepted
@@ -57,6 +74,15 @@ impl SharedMmu {
                 spec::locked_begin(old(self)@, va, operation, source, flags, width)
             } else { old(self)@ },
     {
+        self.begin_locked_modify_as(va,operation,source,flags,width,false)
+    }
+    pub fn begin_locked_modify_as(&mut self,va:u64,operation:integer::Operation,
+        source:u64,flags:u64,width:Width,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted==(!spec::active(old(self)@.phase) && spec::locked_admitted(va,operation,width)),
+            final(self)@==if accepted {spec::locked_as(old(self)@,va,operation,source,flags,width,user)} else {old(self)@},
+    {
         if !matches!(operation, integer::Operation::Add | integer::Operation::Adc
             | integer::Operation::Sub | integer::Operation::Sbb | integer::Operation::And
             | integer::Operation::Or | integer::Operation::Xor | integer::Operation::Inc
@@ -73,7 +99,7 @@ impl SharedMmu {
             || va % 4096 + size as u64 > 4096 || va > u64::MAX - (size as u64 - 1) {
             return false;
         }
-        let accepted = self.begin_access(va, Access::Write(0), false, Some(WordAccess::Write(0)), size);
+        let accepted = self.begin_access(va, Access::Write(0), user, Some(WordAccess::Write(0)), size);
         if accepted { self.comparison = Some(Comparison {
             operation: AtomicOperation::Integer { operation, source, flags }, width }); }
         accepted
@@ -117,33 +143,44 @@ impl SharedMmu {
             final(self)@ == if accepted {
                 spec::modify_begin(old(self)@, va, operation, source, flags, width)
             } else { old(self)@ },
-    { self.begin_modify_mode(va, operation, source, flags, width, false) }
+    { self.begin_modify_mode(va,Modifier {operation,source,flags,width,original:0},false,false) }
+
+    pub fn begin_modify_as(&mut self,va:u64,operation:integer::Operation,
+        source:u64,flags:u64,width:Width,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted==(!spec::active(old(self)@.phase) && spec::modify_admitted(va,operation,width)),
+            final(self)@==if accepted {spec::modify_as(old(self)@,va,operation,source,flags,width,false,user)} else {old(self)@},
+    {self.begin_modify_mode(va,Modifier {operation,source,flags,width,original:0},false,user)}
 
     pub(crate) fn begin_modify_span(&mut self, va: u64, operation: integer::Operation,
-        source: u64, flags: u64, width: Width) -> (accepted: bool)
+        source: u64, flags: u64, width: Width,user:bool) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
             accepted == (!spec::active(old(self)@.phase) && spec::modify_admitted(va, operation, width)),
             final(self)@ == if accepted {
-                spec::modify_start(old(self)@, va, operation, source, flags, width, true)
+                spec::modify_as(old(self)@, va, operation, source, flags, width, true,user)
             } else { old(self)@ },
-    { self.begin_modify_mode(va, operation, source, flags, width, true) }
+    { self.begin_modify_mode(va,Modifier {operation,source,flags,width,original:0},true,user) }
 
-    fn begin_modify_mode(&mut self, va: u64, operation: integer::Operation,
-        source: u64, flags: u64, width: Width, allow_cross: bool) -> (accepted: bool)
+    fn begin_modify_mode(&mut self,va:u64,modifier:Modifier,allow_cross:bool,user:bool)->(accepted:bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
-            accepted == (!spec::active(old(self)@.phase) && spec::modify_admitted(va, operation, width)),
+            accepted == (!spec::active(old(self)@.phase) && spec::modify_admitted(va,modifier.operation,modifier.width)),
             final(self)@ == if accepted {
-                spec::modify_start(old(self)@, va, operation, source, flags, width, allow_cross)
+                spec::modify_as(old(self)@,va,modifier.operation,modifier.source,modifier.flags,modifier.width,allow_cross,user)
             } else { old(self)@ },
     {
+        let operation=modifier.operation;
+        let source=modifier.source;
+        let flags=modifier.flags;
+        let width=modifier.width;
         let size = match width { Width::Byte => 1u8, Width::Word => 2,
             Width::Dword => 4, Width::Qword => 8 };
         if matches!(operation, integer::Operation::Cmp | integer::Operation::Test | integer::Operation::BitTest) {
             return false;
         }
-        let accepted = self.begin_access_mode(va, Access::Write(0), false,
+        let accepted = self.begin_access_mode(va, Access::Write(0), user,
             Some(WordAccess::Write(0)), size, allow_cross);
         if accepted {
             self.modifier = Some(Modifier { operation, source, flags, width, original: 0 });

@@ -147,8 +147,12 @@ pub open spec fn modify_begin(s: State, va: u64, operation: integer::Operation,
 }
 pub open spec fn modify_start(s: State, va: u64, operation: integer::Operation,
     source: u64, flags: u64, width: Width, allow_cross: bool) -> State {
+    modify_as(s,va,operation,source,flags,width,allow_cross,false)
+}
+pub open spec fn modify_as(s:State,va:u64,operation:integer::Operation,
+    source:u64,flags:u64,width:Width,allow_cross:bool,user:bool)->State {
     if !modify_admitted(va, operation, width) { s } else {
-        let t = access_begin(s, va, Access::Write(0), false,
+        let t = access_begin(s, va, Access::Write(0), user,
             Some(WordAccess::Write(0)), modify_size(width), allow_cross);
         State { modifier: Some(Modifier { operation, source, flags, width, original: 0 }), ..t }
     }
@@ -163,8 +167,11 @@ pub open spec fn compare_admitted(va: u64, width: Width) -> bool {
         && va as int + size as int - 1 <= u64::MAX
 }
 pub open spec fn compare_begin(s: State, va: u64, expected: u64, replacement: u64, width: Width) -> State {
+    compare_as(s,va,expected,replacement,width,false)
+}
+pub open spec fn compare_as(s:State,va:u64,expected:u64,replacement:u64,width:Width,user:bool)->State {
     if !compare_admitted(va, width) { s } else {
-        let t = span_begin(s, va, Access::Write(0), false,
+        let t = span_begin(s, va, Access::Write(0), user,
             Some(WordAccess::Write(0)), modify_size(width));
         State { comparison: Some(Comparison {
             operation: AtomicOperation::CompareExchange { expected, replacement }, width }), ..t }
@@ -183,17 +190,24 @@ pub open spec fn locked_admitted(va: u64, operation: integer::Operation, width: 
 }
 pub open spec fn locked_begin(s: State, va: u64, operation: integer::Operation,
     source: u64, flags: u64, width: Width) -> State {
+    locked_as(s,va,operation,source,flags,width,false)
+}
+pub open spec fn locked_as(s:State,va:u64,operation:integer::Operation,
+    source:u64,flags:u64,width:Width,user:bool)->State {
     if !locked_admitted(va, operation, width) { s } else {
-        let t = span_begin(s, va, Access::Write(0), false,
+        let t = span_begin(s, va, Access::Write(0), user,
             Some(WordAccess::Write(0)), modify_size(width));
         State { comparison: Some(Comparison {
             operation: AtomicOperation::Integer { operation, source, flags }, width }), ..t }
     }
 }
 pub open spec fn exchange_begin(s:State,va:u64,replacement:u64,width:Width)->State {
+    exchange_as(s,va,replacement,width,false)
+}
+pub open spec fn exchange_as(s:State,va:u64,replacement:u64,width:Width,user:bool)->State {
     if !compare_admitted(va,width) {s}
     else {State {comparison:Some(Comparison {operation:AtomicOperation::Exchange {replacement},width}),
-        ..compare_begin(s,va,0,replacement,width)}}
+        ..compare_as(s,va,0,replacement,width,user)}}
 }
 pub open spec fn atomic_observed(data: WordData, size: u8) -> u64 {
     (data.first >> ((data.address % 8 * 8) as u32)) & size_mask(size)

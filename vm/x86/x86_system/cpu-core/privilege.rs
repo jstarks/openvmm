@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::system::EntryMsrs;
+use super::State;
+use super::system::{CODE_SEGMENT, DATA_SEGMENT, EntryMsrs, SegmentState, SystemState};
 use vstd::prelude::*;
 
 verus! {
@@ -17,6 +18,9 @@ pub struct Efer {
     pub sce: bool,
     pub nxe: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum FastStatus { Advanced, InvalidOpcode, GeneralProtection }
 
 pub mod model {
     #[cfg(verus_keep_ghost)]
@@ -70,6 +74,144 @@ pub mod model {
             0xc0000102=>Some(EntryMsrs {kernel_gs_base:value,..s}),_=>None,
         }}
     }
+
+    pub open spec fn long64(s:SystemState)->bool {
+        s.cs.attributes&!0x60u16==0xa09b
+            && s.cs.selector&3u16==(s.cs.attributes>>5)&3u16
+    }
+    pub open spec fn flags64(flags:u64)->bool {
+        flags&!0x3d7fd7u64==0 && flags&2u64!=0
+    }
+    pub open spec fn syscall64(cpu:super::super::model::State,s:SystemState,length:u8)
+        ->(super::super::model::State,SystemState,FastStatus)
+    {
+        if !s.efer_sce {(cpu,s,FastStatus::InvalidOpcode)}
+        else {
+            let selector=((s.entry.star>>32)&0xffffu64) as u16;
+            (super::super::model::State {
+                gpr:cpu.gpr.update(1,(cpu.rip+length as int)%0x1_0000_0000_0000_0000int)
+                    .update(11,(cpu.flags&!0x10000u64) as int),
+                rip:s.entry.lstar as int,
+                flags:(cpu.flags&!s.entry.sfmask&!0x10000u64)|2u64,
+            },SystemState {
+                cs:SegmentState {selector:selector&!3u16,..CODE_SEGMENT},
+                ss:SegmentState {selector:((selector as int+8)%0x10000) as u16,..DATA_SEGMENT},
+                ..s
+            },FastStatus::Advanced)
+        }
+    }
+    pub open spec fn sysret64(cpu:super::super::model::State,s:SystemState)
+        ->(super::super::model::State,SystemState,FastStatus)
+    {
+        if !s.efer_sce {(cpu,s,FastStatus::InvalidOpcode)}
+        else if s.cs.selector&3u16!=0 {(cpu,s,FastStatus::GeneralProtection)}
+        else {
+            let selector=(s.entry.star>>48) as u16;
+            (super::super::model::State {
+                rip:cpu.gpr[1],flags:((cpu.gpr[11] as u64)&0x3c7fd5u64)|2u64,..cpu
+            },SystemState {
+                cs:SegmentState {selector:(((selector as int+16)%0x10000) as u16)|3u16,
+                    attributes:0xa0fb,..CODE_SEGMENT},
+                ss:SegmentState {selector:((selector as int+8)%0x10000) as u16,..s.ss},
+                ..s
+            },FastStatus::Advanced)
+        }
+    }
+}
+
+/// Long64 instruction-body proposal, not event/MMU publication. The caller
+/// owns decoding, CET exclusion and the atomic CPL/segment/MMU boundary.
+/// APM Vol. 3 pp. 488-490: no stack switch, GS exchange or descriptor read.
+pub fn syscall64(cpu:&mut State,s:&mut SystemState,length:u8)->(status:FastStatus)
+    requires model::long64(*old(s)),model::flags64(old(cpu).flags),2<=length<=15,
+    ensures
+        (final(cpu)@,*final(s),status)==model::syscall64(old(cpu)@,*old(s),length),
+        model::long64(*final(s)),model::flags64(final(cpu).flags),
+        final(cpu).gpr@[4]==old(cpu).gpr@[4],
+        final(s).gs==old(s).gs,final(s).entry==old(s).entry,
+        status!=FastStatus::Advanced ==> final(cpu)@==old(cpu)@ && *final(s)==*old(s),
+{
+    if !s.efer_sce {return FastStatus::InvalidOpcode;}
+    let ghost before=cpu@;
+    let flags=cpu.flags;
+    let mask=s.entry.sfmask;
+    let live=(flags&!mask&!0x10000u64)|2u64;
+    let next=cpu.rip.wrapping_add(length as u64);
+    cpu.gpr[1]=next;
+    cpu.gpr[11]=flags&!0x10000u64;
+    assert(cpu@.gpr =~= before.gpr.update(1,next as int).update(11,(flags&!0x10000u64) as int));
+    cpu.rip=s.entry.lstar;
+    cpu.flags=live;
+    let star=s.entry.star;
+    let raw=(star>>32)&0xffff;
+    assert(raw<=0xffffu64) by(bit_vector) requires raw==(star>>32)&0xffffu64;
+    let selector=raw as u16;
+    s.cs=SegmentState {selector:selector&!3u16,..CODE_SEGMENT};
+    s.ss=SegmentState {selector:selector.wrapping_add(8),..DATA_SEGMENT};
+    proof {
+        assert((selector&!3u16)&3u16==((0xa09bu16>>5)&3u16)
+            && 0xa09bu16&!0x60u16==0xa09bu16) by(bit_vector);
+        assert(live&!0x3d7fd7u64==0 && live&2u64!=0) by(bit_vector)
+            requires flags&!0x3d7fd7u64==0,
+                live==(flags&!mask&!0x10000u64)|2u64;
+    }
+    FastStatus::Advanced
+}
+
+/// APM Vol. 3 pp. 495-498: AMD preserves hidden SS metadata and its selector
+/// RPL, and does not check RCX canonicality here. A bad target faults on the
+/// subsequent user fetch, not at SYSRET with kernel privilege.
+pub fn sysret64(cpu:&mut State,s:&mut SystemState)->(status:FastStatus)
+    requires model::long64(*old(s)),model::flags64(old(cpu).flags),
+    ensures
+        (final(cpu)@,*final(s),status)==model::sysret64(old(cpu)@,*old(s)),
+        model::long64(*final(s)),model::flags64(final(cpu).flags),
+        final(cpu).gpr@==old(cpu).gpr@,
+        final(s).ss.base==old(s).ss.base,final(s).ss.limit==old(s).ss.limit,
+        final(s).ss.attributes==old(s).ss.attributes,
+        final(s).gs==old(s).gs,final(s).entry==old(s).entry,
+        status!=FastStatus::Advanced ==> final(cpu)@==old(cpu)@ && *final(s)==*old(s),
+{
+    if !s.efer_sce {return FastStatus::InvalidOpcode;}
+    if s.cs.selector&3!=0 {return FastStatus::GeneralProtection;}
+    cpu.rip=cpu.gpr[1];
+    let saved=cpu.gpr[11];
+    let flags=(saved&0x3c7fd5)|2;
+    cpu.flags=flags;
+    let selector=(s.entry.star>>48) as u16;
+    let index=selector.wrapping_add(16);
+    let cs=index|3;
+    s.cs=SegmentState {selector:cs,attributes:0xa0fb,..CODE_SEGMENT};
+    s.ss.selector=selector.wrapping_add(8);
+    proof {
+        assert(cs&3u16==((0xa0fbu16>>5)&3u16)
+            && 0xa0fbu16&!0x60u16==0xa09bu16) by(bit_vector)
+            requires cs==index|3u16;
+        assert(flags&!0x3d7fd7u64==0 && flags&2u64!=0) by(bit_vector)
+            requires flags==(saved&0x3c7fd5u64)|2u64;
+    }
+    FastStatus::Advanced
+}
+
+pub proof fn lemma_fast_round_trip(cpu:super::model::State,s:SystemState,length:u8)
+    requires cpu.gpr.len()==16,model::flags64(cpu.flags),model::long64(s),
+        s.efer_sce,2<=length<=15,
+    ensures ({
+        let entered=model::syscall64(cpu,s,length);
+        let returned=model::sysret64(entered.0,entered.1);
+        returned.2==FastStatus::Advanced
+            && returned.0.rip==(cpu.rip+length as int)%0x1_0000_0000_0000_0000int
+            && returned.0.flags==cpu.flags&!0x10000u64
+            && returned.0.gpr==entered.0.gpr
+            && returned.0.gpr[4]==cpu.gpr[4]
+            && returned.1.gs==s.gs && returned.1.entry==s.entry
+    }),
+{
+    let selector=((s.entry.star>>32)&0xffffu64) as u16;
+    let flags=cpu.flags;
+    assert((selector&!3u16)&3u16==0) by(bit_vector);
+    assert(((flags&!0x10000u64)&0x3c7fd5u64)|2u64==flags&!0x10000u64) by(bit_vector)
+        requires flags&!0x3d7fd7u64==0,flags&2u64!=0;
 }
 
 pub fn read_entry(s:EntryMsrs,number:u64)->(out:Option<u64>)

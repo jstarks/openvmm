@@ -37,6 +37,7 @@ fn store_apic(code: &mut Vec<u8>, offset: u32, value: u32) {
 }
 
 struct Devices {
+    advertise_mmio: bool,
     apic: bool,
     eois: Mutex<Vec<u32>>,
     ioapic: Option<Arc<Mutex<chipset::ioapic::IoApicDevice>>>,
@@ -56,6 +57,7 @@ struct Devices {
 impl Devices {
     fn new() -> Self {
         Self {
+            advertise_mmio: true,
             apic: false,
             eois: Mutex::new(Vec::new()),
             ioapic: None,
@@ -91,7 +93,7 @@ impl Devices {
 
 impl CpuIo for Devices {
     fn is_mmio(&self, address: u64) -> bool {
-        (DEVICE..DEVICE + 8).contains(&address)
+        self.advertise_mmio && (DEVICE..DEVICE + 8).contains(&address)
     }
     fn acknowledge_pic_interrupt(&self) -> Option<u8> {
         panic!("no PIC in this profile")
@@ -1635,7 +1637,8 @@ async fn decoded_mmio_preserves_exact_device_width_and_naturally_aligned_offsets
         vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
         vp.set_execution_checkpoint(Some(CODE + program.len() as u64))
             .unwrap();
-        let devices = Devices::new();
+        let mut devices = Devices::new();
+        devices.advertise_mmio = false;
         devices.release();
         let stop = StopVpSource::new();
         assert!(matches!(

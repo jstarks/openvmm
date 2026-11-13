@@ -651,13 +651,7 @@ impl Processor for EmuProcessor<'_> {
                 64,
                 64,
                 |address, width| {
-                    (0..u64::from(width)).all(|offset| {
-                        !self.ram.is_ram(address + offset)
-                            && (dev.is_mmio(address + offset)
-                                || local_window.is_some_and(|base| {
-                                    address + offset >= base && address + offset - base < 4096
-                                }))
-                    })
+                    (0..u64::from(width)).all(|offset| !self.ram.is_ram(address + offset))
                 },
                 |window| {
                     #[cfg(test)]

@@ -216,21 +216,17 @@ mod native {
             self.unexpected("EOI");
         }
         async fn read_mmio(&self, vp: VpIndex, address: u64, data: &mut [u8]) {
-            if self.is_mmio(address) {
-                if let Some(chipset) = &self.chipset {
-                    chipset.mmio_read(vp.index(), address, data).await;
-                    return;
-                }
+            if let Some(chipset) = &self.chipset {
+                chipset.mmio_read(vp.index(), address, data).await;
+                return;
             }
             self.unexpected("MMIO read");
             std::future::pending().await
         }
         async fn write_mmio(&self, vp: VpIndex, address: u64, data: &[u8]) {
-            if self.is_mmio(address) {
-                if let Some(chipset) = &self.chipset {
-                    chipset.mmio_write(vp.index(), address, data).await;
-                    return;
-                }
+            if let Some(chipset) = &self.chipset {
+                chipset.mmio_write(vp.index(), address, data).await;
+                return;
             }
             self.unexpected("MMIO write");
             std::future::pending().await
@@ -337,6 +333,13 @@ mod native {
                 }
             }
             let address = 0x8000_0800u32.to_le_bytes();
+            for address in [0xfed8_03c0, 0xdead_0000] {
+                assert!(!io.is_mmio(address));
+                let mut bytes = [0; 4];
+                complete(&io, io.read_mmio(vp, address, &mut bytes)).await;
+                assert_eq!(bytes, [0xff; 4]);
+                complete(&io, io.write_mmio(vp, address, &[0; 4])).await;
+            }
             complete(&io, io.write_io(vp, 0xcf8, &address)).await;
             let mut actual = [0; 4];
             complete(&io, io.read_io(vp, 0xcf8, &mut actual)).await;
@@ -1337,6 +1340,7 @@ mod native {
                             | Error::Apic(_)
                             | Error::ApicIngress(_)
                             | Error::UnsupportedInterrupt
+                            | Error::Memory(_)
                     )
                 ) || failure.is::<UnconfiguredPort>()
                     || failure.is::<UnsupportedIrq>()
@@ -1417,6 +1421,8 @@ mod native {
                 "{}",
                 serde_json::json!({
                     "probe":true,"acceptance":false,"stop":failure.to_string(),"target":probe_target,
+                    "stop_debug":format!("{failure:?}"),
+                    "transport_error":matches!(failure.downcast_ref::<Error>(),Some(Error::Memory(_))),
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
                     "clock_slowdown":clock_slowdown.get(),
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),

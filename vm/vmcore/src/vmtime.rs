@@ -149,7 +149,8 @@ impl WaiterState {
 #[derive(Copy, Clone, Debug, Protobuf)]
 struct Timestamp {
     vmtime: VmTime,
-    os_time: u64, // Instant::as_nanos()
+    os_time: u64,            // Instant::as_nanos()
+    slowdown_minus_one: u16, // Missing wire field preserves normal-rate clocks.
 }
 
 impl Timestamp {
@@ -157,7 +158,12 @@ impl Timestamp {
         Self {
             vmtime,
             os_time: os_time.as_nanos(),
+            slowdown_minus_one: 0,
         }
+    }
+
+    fn slowdown(&self) -> u32 {
+        u32::from(self.slowdown_minus_one) + 1
     }
 
     fn os_time(&self) -> Instant {
@@ -217,7 +223,11 @@ impl TimerState {
         let since = time
             .checked_sub(start_time.vmtime)
             .unwrap_or(Duration::ZERO);
-        Some(Timestamp::new(time, start_time.os_time() + since))
+        Some(Timestamp {
+            vmtime: time,
+            os_time: (start_time.os_time() + since * start_time.slowdown()).as_nanos(),
+            ..start_time
+        })
     }
 
     /// Returns the current guest time given a host time.
@@ -345,6 +355,8 @@ pub struct VmTimeKeeper {
     builder: VmTimeSourceBuilder,
     #[inspect(skip)]
     time: TimeState,
+    #[inspect(skip)]
+    slowdown: std::num::NonZeroU16,
 }
 
 // UNSAFETY: Needed to derive SavedStateRoot in the same crate it is declared
@@ -380,7 +392,8 @@ impl Inspect for TimeState {
         let state = match *self {
             TimeState::Stopped(_time) => "stopped",
             TimeState::Started(time) => {
-                resp.field("start_time", time.vmtime);
+                resp.field("start_time", time.vmtime)
+                    .field("slowdown", time.slowdown());
                 "started"
             }
         };
@@ -413,12 +426,17 @@ impl TimeState {
             TimeState::Stopped(time) => Timestamp::new(time, now_os),
             TimeState::Started(start_time) => {
                 if now_os >= start_time.os_time() {
-                    Timestamp::new(
-                        start_time
-                            .vmtime
-                            .wrapping_add(now_os - start_time.os_time()),
-                        now_os,
-                    )
+                    let elapsed = now_os - start_time.os_time();
+                    let elapsed = if start_time.slowdown_minus_one == 0 {
+                        elapsed
+                    } else {
+                        elapsed / start_time.slowdown()
+                    };
+                    Timestamp {
+                        vmtime: start_time.vmtime.wrapping_add(elapsed),
+                        os_time: now_os.as_nanos(),
+                        ..start_time
+                    }
                 } else {
                     // `now` can be before `running.start_host` if it was captured
                     // outside the lock and raced with the call to `start()`. Treat
@@ -446,6 +464,18 @@ impl TimeState {
 impl VmTimeKeeper {
     /// Creates a new time keeper with the specified current guest time.
     pub fn new(driver: &impl SpawnDriver, uptime: VmTime) -> Self {
+        Self::new_with_slowdown(driver, uptime, std::num::NonZeroU16::new(1).unwrap())
+    }
+
+    /// Creates a time keeper with a fixed host-to-guest clock slowdown.
+    ///
+    /// This is intended for emulator bring-up, not performance measurement.
+    /// Restore saved state into a keeper configured with the same slowdown.
+    pub fn new_with_slowdown(
+        driver: &impl SpawnDriver,
+        uptime: VmTime,
+        slowdown: std::num::NonZeroU16,
+    ) -> Self {
         let (new_send, new_recv) = mesh::mpsc_channel();
         let (req_send, req_recv) = mesh::channel();
         let time = TimeState::Stopped(uptime);
@@ -464,6 +494,7 @@ impl VmTimeKeeper {
             req_send,
             builder: VmTimeSourceBuilder { new_send },
             _task: task,
+            slowdown,
         }
     }
 
@@ -497,7 +528,10 @@ impl VmTimeKeeper {
     /// Starts the timer, so that the current time will increase.
     pub async fn start(&mut self) {
         let vmtime = self.time.stop_time().expect("should be stopped");
-        let timestamp = Timestamp::new(vmtime, Instant::now());
+        let timestamp = Timestamp {
+            slowdown_minus_one: self.slowdown.get() - 1,
+            ..Timestamp::new(vmtime, Instant::now())
+        };
         self.time = TimeState::Started(timestamp);
         self.req_send
             .call(KeeperRequest::Start, timestamp)
@@ -557,7 +591,10 @@ impl VmTimeSourceBuilder {
             let state = Arc::get_mut(&mut state).unwrap().get_mut();
             match time {
                 TimeState::Stopped(vmtime) => state.reset(vmtime),
-                TimeState::Started(timestamp) => state.start(timestamp),
+                TimeState::Started(timestamp) => {
+                    state.reset(timestamp.vmtime);
+                    state.start(timestamp);
+                }
             }
         }
         let mut keeper = SecondaryKeeper {
@@ -653,10 +690,8 @@ impl PrimaryKeeper {
                                 )
                                 .await;
 
-                                let start_time = self.time.start_time().expect("should be running");
-                                let now = start_time
-                                    .vmtime
-                                    .wrapping_add(Instant::now() - start_time.os_time());
+                                assert!(self.time.is_started(), "should be running");
+                                let now = self.time.now(Instant::now()).vmtime;
 
                                 // Compute the stop time as the max of all stop
                                 // times so that no keeper goes backwards next
@@ -964,11 +999,14 @@ impl VmTimerPeriodic {
 
 #[cfg(test)]
 mod tests {
+    use super::TimerState;
+    use super::Timestamp;
     use super::VmTime;
     use super::VmTimeKeeper;
     use futures::FutureExt;
     use pal_async::DefaultDriver;
     use pal_async::async_test;
+    use pal_async::timer::Instant;
     use pal_async::timer::PolledTimer;
     use std::future::poll_fn;
     use std::time::Duration;
@@ -979,6 +1017,85 @@ mod tests {
         for n in [0, 1, 9_999_999, 10_000_000, u64::MAX] {
             let duration = super::duration_from_100ns(n);
             assert_eq!(duration.as_nanos(), u128::from(n) * 100);
+        }
+    }
+
+    #[async_test]
+    async fn test_slow_time_conversions(driver: DefaultDriver) {
+        let origin = VmTime::from_100ns(u64::MAX - 1000);
+        let host = Instant::from_nanos(1_000_000_000);
+        let start = Timestamp {
+            slowdown_minus_one: 9,
+            ..Timestamp::new(origin, host)
+        };
+        let mut state = TimerState::new(&driver, origin);
+        state.start(start);
+        for nanos in [0, 100, 999, 1000, 1_234_567] {
+            let elapsed = Duration::from_nanos(nanos);
+            let now = state.now(host + elapsed);
+            assert_eq!(now.vmtime, origin.wrapping_add(elapsed / 10));
+            assert_eq!(now.slowdown(), 10);
+        }
+        let deadline = origin.wrapping_add(Duration::from_millis(10));
+        assert_eq!(
+            state.timestamp(deadline).unwrap().os_time(),
+            host + Duration::from_millis(100)
+        );
+        assert_eq!(
+            state
+                .timestamp(VmTime::from_100ns(origin.as_100ns() - 1))
+                .unwrap()
+                .os_time(),
+            host
+        );
+        assert_eq!(state.now(host - Duration::from_nanos(1)).vmtime, origin);
+    }
+
+    #[async_test]
+    async fn test_slow_time_stop_resume_restore(driver: DefaultDriver) {
+        let mut keeper = VmTimeKeeper::new_with_slowdown(
+            &driver,
+            VmTime::from_100ns(0),
+            std::num::NonZeroU16::new(10).unwrap(),
+        );
+        let source = keeper.builder().build(&driver).await.unwrap();
+        let mut access = source.access("slow");
+        let mut timer = PolledTimer::new(&driver);
+        for _ in 0..2 {
+            keeper.start().await;
+            let start = keeper.time.start_time().unwrap();
+            let late_source = source.builder().build(&driver).await.unwrap();
+            let late_access = late_source.access("late");
+            let deadline = start.vmtime.wrapping_add(Duration::from_millis(10));
+            assert_eq!(
+                late_access.host_time(deadline),
+                Some(start.os_time() + Duration::from_millis(100))
+            );
+            access.set_timeout(deadline);
+            futures::select! {
+                _ = timer.sleep(Duration::from_secs(2)).fuse() => panic!("slow timeout did not fire"),
+                now = poll_fn(|cx| access.poll_timeout(cx)).fuse() => {
+                    assert!(!now.is_before(deadline));
+                    assert!(Instant::now() >= start.os_time() + Duration::from_millis(100));
+                }
+            }
+            let running = access.now();
+            keeper.stop().await;
+            let stopped = access.now();
+            assert!(!stopped.is_before(running));
+            assert_eq!(stopped, late_access.now());
+            assert!(
+                !stopped.is_after(
+                    start
+                        .vmtime
+                        .wrapping_add((Instant::now() - start.os_time()) / 10)
+                )
+            );
+            timer.sleep(Duration::from_millis(20)).await;
+            assert_eq!(access.now(), stopped);
+            let saved = keeper.save();
+            keeper.restore(saved).await;
+            assert_eq!(access.now(), stopped);
         }
     }
 

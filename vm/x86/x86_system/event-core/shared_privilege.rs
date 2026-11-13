@@ -286,12 +286,12 @@ impl SharedEventMachine {
             entry::MemoryTask::SaveFp {index:next,wide})
     }
 
-    pub(super) fn initialize_x87(&mut self,length:u8)->(tick:Tick)
+    pub(super) fn control_x87(&mut self,operation:memory_core::cpu_core::system::X87Control,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
-        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::initialize_x87(old(self)@,length),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::control_x87(old(self)@,operation,length),
     {
-        reveal(spec::privilege::initialize_x87);
+        reveal(spec::privilege::control_x87);
         let cpu=self.core.cpu();
         if length==0 || length>15 {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
@@ -302,7 +302,12 @@ impl SharedEventMachine {
         let Some(mut system)=self.system else {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
-        system.fp=system.fp.initialize_x87();
+        if system.cr0_extra&0xcu64!=0
+            || (operation==memory_core::cpu_core::system::X87Control::EmptyMmx
+                && ((system.fp.status&!system.fp.control)&0x3fu16)!=0) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        system.fp=system.fp.control_x87(operation);
         self.system=Some(system);
         self.retire_entry(cpu,length,false,false)
     }

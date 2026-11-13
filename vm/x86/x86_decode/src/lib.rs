@@ -524,6 +524,13 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         Mnemonic::Nop => Some(EntryInstruction::Nop),
         Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => Some(EntryInstruction::Fence),
         Mnemonic::Fninit => Some(EntryInstruction::InitializeX87),
+        Mnemonic::Fnclex | Mnemonic::Emms => Some(EntryInstruction::ControlX87 {
+            operation: if instruction.mnemonic() == Mnemonic::Fnclex {
+                x86_system::memory_core::cpu_core::system::X87Control::ClearExceptions
+            } else {
+                x86_system::memory_core::cpu_core::system::X87Control::EmptyMmx
+            },
+        }),
         Mnemonic::Int3 if encoding.bytes() == [0xcc] => Some(EntryInstruction::Breakpoint),
         Mnemonic::Swapgs if encoding.bytes() == [0x0f, 0x01, 0xf8] => {
             Some(EntryInstruction::SwapGs)

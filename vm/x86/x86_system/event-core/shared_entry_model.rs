@@ -11,7 +11,7 @@ use super::super::memory_core::cpu_core::operand::{
 use super::super::memory_core::cpu_core::{compare, integer};
 #[cfg(verus_keep_ghost)]
 use super::super::memory_core::cpu_core::{
-    control, descriptor, operand, profile, scalar as operations,
+    control, descriptor, operand, profile, scalar as operations, system,
 };
 #[cfg(verus_keep_ghost)]
 use super::super::mmu_core::shared::io::IoReply;
@@ -423,7 +423,8 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::ReadControl {..} | Instruction::WriteControl {..} | Instruction::ReadMsr
             | Instruction::ReadDebug {..} | Instruction::WriteDebug {..} =>
             privilege::execute(s,instruction,length),
-        Instruction::InitializeX87=>privilege::initialize_x87(s,length),
+        Instruction::InitializeX87=>privilege::control_x87(s,system::X87Control::Initialize,length),
+        Instruction::ControlX87 {operation}=>privilege::control_x87(s,operation,length),
         Instruction::SaveFp {address,wide}=>privilege::save_fp(s,address,wide,length),
         Instruction::IndirectJump {source} | Instruction::IndirectCall {source}=>match source {
             Operand::Memory {address,width}=>{

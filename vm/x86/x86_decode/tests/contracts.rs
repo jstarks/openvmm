@@ -30,6 +30,20 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
 }
 
 #[test]
+fn x87_exception_clear_and_emms_are_owned_controls_not_nops() {
+    use x86_system::memory_core::cpu_core::system::X87Control;
+    use x86_system::shared::{decode::DecodeDecision, entry::Instruction};
+    for (bytes, operation) in [
+        (&[0xdb, 0xe2][..], X87Control::ClearExceptions),
+        (&[0x0f, 0x77][..], X87Control::EmptyMmx),
+    ] {
+        assert_eq!(entry(bytes), Instruction::ControlX87 { operation });
+        let locked = [&[0xf0][..], bytes].concat();
+        assert_eq!(admission(&locked), DecodeDecision::InvalidOpcode);
+    }
+}
+
+#[test]
 fn pause_hint_is_not_misclassified_as_rep_string_execution() {
     use x86_system::shared::entry::Instruction;
     assert_eq!(entry(&[0xf3, 0x90]), Instruction::Nop);

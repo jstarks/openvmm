@@ -172,15 +172,24 @@ pub open spec fn save_fp_value(s:State,address:u64,index:u8,wide:bool,length:u8)
         length,super::super::shared::entry::MemoryTask::SaveFp {index:(index+1) as u8,wide})}
 }
 #[verifier::opaque]
-pub open spec fn initialize_x87(s:State,length:u8)->(State,Tick) {
+pub open spec fn control_x87(s:State,operation:system::X87Control,length:u8)->(State,Tick) {
     let cpu=s.core.cpu;
     if length==0 || length>15 {entry::unsupported(s)}
     else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
     else {match s.system {
         None=>entry::unsupported(s),
-        Some(system)=>entry::retire(State {system:Some(SystemState {
-            fp:system::LegacyFpState {control:0x37f,status:0,tags:0xffff,opcode:0,ip:0,dp:0,..system.fp},
-            ..system}),..s},cpu,length,false,false),
+        Some(system)=>if system.cr0_extra&0xcu64!=0
+            || (operation==system::X87Control::EmptyMmx
+                && ((system.fp.status&!system.fp.control)&0x3fu16)!=0) {entry::unsupported(s)}
+            else {entry::retire(State {system:Some(SystemState {
+                fp:match operation {
+                    system::X87Control::Initialize=>system::LegacyFpState {
+                        control:0x37f,status:0,tags:0xffff,opcode:0,ip:0,dp:0,..system.fp},
+                    system::X87Control::ClearExceptions=>system::LegacyFpState {
+                        status:system.fp.status&0x7f00u16,..system.fp},
+                    system::X87Control::EmptyMmx=>system::LegacyFpState {
+                        status:system.fp.status&0xc7ffu16,tags:0xffff,..system.fp},
+                },..system}),..s},cpu,length,false,false)},
     }}
 }
 pub open spec fn write_entry_msr(s:State,length:u8)->(State,Tick) {

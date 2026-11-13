@@ -17,6 +17,7 @@ pub enum Instruction {
     Nop,
     Fence,
     InitializeX87,
+    ControlX87 {operation:memory_core::cpu_core::system::X87Control},
     Breakpoint,
     SwapGs,
     SaveFp {address:Address,wide:bool},
@@ -219,7 +220,11 @@ impl SharedEventMachine {
             },
             Instruction::InitializeX87=>{
                 reveal(spec::entry::execute);
-                self.initialize_x87(length)
+                self.control_x87(memory_core::cpu_core::system::X87Control::Initialize,length)
+            },
+            Instruction::ControlX87 {operation}=>{
+                reveal(spec::entry::execute);
+                self.control_x87(operation,length)
             },
             Instruction::SaveFp {address,wide}=>{
                 reveal(spec::entry::execute);

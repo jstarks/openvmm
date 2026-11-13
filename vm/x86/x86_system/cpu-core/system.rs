@@ -35,6 +35,9 @@ pub const EMPTY_ENTRY_MSRS:EntryMsrs=EntryMsrs {
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
+pub enum X87Control { Initialize, ClearExceptions, EmptyMmx }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
 pub struct LegacyFpState {
     pub control:u16,pub status:u16,pub tags:u16,pub opcode:u16,
     pub ip:u64,pub dp:u64,
@@ -48,6 +51,19 @@ pub const EMPTY_LEGACY_FP:LegacyFpState=LegacyFpState {
         [0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],
 };
 impl LegacyFpState {
+    pub fn control_x87(self,operation:X87Control)->(out:Self)
+        ensures out==match operation {
+            X87Control::Initialize=>LegacyFpState {control:0x37f,status:0,tags:0xffff,opcode:0,ip:0,dp:0,..self},
+            X87Control::ClearExceptions=>LegacyFpState {status:self.status&0x7f00u16,..self},
+            X87Control::EmptyMmx=>LegacyFpState {status:self.status&0xc7ffu16,tags:0xffff,..self},
+        },
+    {
+        match operation {
+            X87Control::Initialize=>self.initialize_x87(),
+            X87Control::ClearExceptions=>Self {status:self.status&0x7f00u16,..self},
+            X87Control::EmptyMmx=>Self {status:self.status&0xc7ffu16,tags:0xffff,..self},
+        }
+    }
     pub fn initialize_x87(self)->(out:Self)
         ensures out==(LegacyFpState {control:0x37f,status:0,tags:0xffff,opcode:0,ip:0,dp:0,..self}),
     {

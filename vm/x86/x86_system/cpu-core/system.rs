@@ -51,6 +51,20 @@ pub const EMPTY_LEGACY_FP:LegacyFpState=LegacyFpState {
         [0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],
 };
 impl LegacyFpState {
+    pub fn xmm_pair(self,dst:u8,low:u64,high:u64)->(out:Self)
+        requires dst<16,
+        ensures out==model::xmm_pair(self,dst,low,high),
+    {
+        let pair=[low,high];
+        let mut out=self;
+        out.xmm[dst as usize]=pair;
+        proof {
+            assert(out.xmm@ =~= model::set16(self.xmm,dst as int,pair)@);
+            assert(out.xmm==model::set16(self.xmm,dst as int,pair));
+        }
+        out
+    }
+
     pub fn xmm_scalar(self,dst:u8,value:u64,wide:bool)->(out:Self)
         requires dst<16,
         ensures out==model::xmm_scalar(self,dst,value,wide),
@@ -274,6 +288,9 @@ pub mod model {
     #[cfg(verus_keep_ghost)]
     use super::*;
 
+    pub open spec fn xmm_pair(s:LegacyFpState,dst:u8,low:u64,high:u64)->LegacyFpState {
+        LegacyFpState {xmm:set16(s.xmm,dst as int,[low,high]),..s}
+    }
     pub open spec fn xmm_scalar(s:LegacyFpState,dst:u8,value:u64,wide:bool)->LegacyFpState {
         LegacyFpState {xmm:set16(s.xmm,dst as int,[if wide {value} else {value&0xffff_ffffu64},0u64]),..s}
     }

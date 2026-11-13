@@ -26,6 +26,9 @@ pub enum Instruction {
     XmmStore {destination:Operand,source:u8,width:Width},
     XmmCopyLow {dst:u8,source:u8},
     XmmUnpack {dst:u8,source:u8,wide:bool,high:bool},
+    XmmCopy {dst:u8,source:u8},
+    XmmMerge {dst:u8,source:u8,high:bool},
+    XmmMemory {address:Address,index:u8,store:bool,kind:XmmMemoryKind},
     SaveFp {address:Address,wide:bool},
     RestoreFp {address:Address,wide:bool},
     LoadX87Integer {address:Address,width:Width,opcode:u16},
@@ -84,6 +87,9 @@ pub enum Instruction {
 pub enum Port { Dx, Immediate(u8) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XmmMemoryKind {Low,High,Aligned,Unaligned}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortRequest {
     pub sequence: u64,
     pub port: u16,
@@ -103,6 +109,10 @@ pub enum MemoryTask {
     RestoreFp {index:u8,wide:bool},
     LoadX87Integer {width:Width,opcode:u16},
     XmmLoad {index:u8,wide:bool},
+    XmmHalf {index:u8,high:bool},
+    XmmLow {index:u8},
+    XmmHigh {index:u8,low:u64},
+    XmmWideStore,
     TaskLow {selector:u16},
     TaskHigh {selector:u16,low:u64},
     TaskBusy {image:SegmentState,low:u64},
@@ -242,7 +252,8 @@ impl SharedEventMachine {
         }
         match instruction {
             Instruction::XmmLoad {..}|Instruction::XmmStore {..}
-                |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}=>{
+                |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}
+                |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>{
                 reveal(spec::entry::execute);
                 self.execute_xmm(instruction,length)
             },
@@ -1043,6 +1054,8 @@ impl SharedEventMachine {
         let ghost before = cpu@;
         match task {
             MemoryTask::XmmLoad {index,wide}=>return self.finish_xmm_load(index,value,wide,length),
+            MemoryTask::XmmHalf {..}|MemoryTask::XmmLow {..}|MemoryTask::XmmHigh {..}=>
+                return self.finish_xmm_memory(address,task,value,length),
             MemoryTask::Exchange {register}=>{
                 return self.exchange_value(register,value,length);
             },
@@ -1203,7 +1216,7 @@ impl SharedEventMachine {
                 assert(cpu@.gpr =~= operand::model::write(registers, dst, value)
                     .map(|i: int, v: u64| v as int));
             },
-            MemoryTask::Store => {},
+            MemoryTask::Store|MemoryTask::XmmWideStore => {},
             MemoryTask::TableLimit { idt } => {
                 if address > u64::MAX - 2 {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));

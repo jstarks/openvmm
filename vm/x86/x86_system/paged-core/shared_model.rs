@@ -83,6 +83,11 @@ pub open spec fn boundary_span(s: State, address: u64, word: WordAccess, size: u
             s.user, Some(word), size, true), ..s }, true)
     } else { (s, false) }
 }
+pub open spec fn boundary_pair_store(s:State,address:u64,low:u64,high:u64)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) && address%16==0 {
+        (State {mmu:mm::pair_begin(s.mmu,address,low,high,s.user),..s},true)
+    } else {(s,false)}
+}
 pub open spec fn boundary_locked_modify(s:State,address:u64,
     operation:super::memory_core::cpu_core::integer::Operation,source:u64,flags:u64,
     width:super::memory_core::cpu_core::operand::Width)->(State,bool) {

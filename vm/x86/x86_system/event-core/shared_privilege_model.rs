@@ -13,6 +13,64 @@ use super::*;
 
 verus! {
 #[verifier::opaque]
+pub open spec fn finish_xmm_pair(s:State,dst:u8,low:u64,high:u64,length:u8)->(State,Tick) {
+    if s.system is None || dst>=16 {entry::unsupported(s)}
+    else {
+        let system=s.system.unwrap();
+        entry::retire(State {system:Some(SystemState {
+            fp:system::model::xmm_pair(system.fp,dst,low,high),..system}),..s},
+            s.core.cpu,length,false,false)
+    }
+}
+#[verifier::opaque]
+pub open spec fn finish_xmm_memory(s:State,address:u64,task:super::super::shared::entry::MemoryTask,value:u64,length:u8)->(State,Tick) {
+    match task {
+        super::super::shared::entry::MemoryTask::XmmLow {index}=>
+            if address>u64::MAX-8 {entry::unsupported(s)}
+            else {entry::memory(s,(address+8) as u64,Width::Qword,WordAccess::Read,length,
+                super::super::shared::entry::MemoryTask::XmmHigh {index,low:value})},
+        super::super::shared::entry::MemoryTask::XmmHigh {index,low}=>
+            finish_xmm_pair(s,index,low,value,length),
+        super::super::shared::entry::MemoryTask::XmmHalf {index,high}=>
+            if s.system is None || index>=16 {entry::unsupported(s)}
+            else {
+                let pair=s.system.unwrap().fp.xmm[index as int];
+                finish_xmm_pair(s,index,if high {pair[0]} else {value},
+                    if high {value} else {pair[1]},length)
+            },
+        _=>entry::unsupported(s),
+    }
+}
+#[verifier::opaque]
+pub open spec fn execute_xmm_memory(s:State,address:Address,index:u8,store:bool,
+    kind:super::super::shared::entry::XmmMemoryKind,length:u8)->(State,Tick) {
+    if s.system is None || !address.valid() || index>=16 {entry::unsupported(s)}
+    else {
+        let linear=entry::linear(s,address,length);
+        let full=kind is Aligned || kind is Unaligned;
+        if !entry::supported_access(linear,Width::Qword)
+            || (full && (linear>u64::MAX-15 || !mmu_model::canonical(linear as int+15))) {entry::unsupported(s)}
+        else if kind is Aligned && linear%16!=0 {entry(s,Event::GeneralProtection)}
+        else if !full {
+            let high=kind is High;
+            entry::memory(s,linear,Width::Qword,
+                if store {WordAccess::Write(s.system.unwrap().fp.xmm[index as int][if high {1int} else {0int}])}
+                else {WordAccess::Read},length,
+                if store {super::super::shared::entry::MemoryTask::Store}
+                else {super::super::shared::entry::MemoryTask::XmmHalf {index,high}})
+        } else if !store {entry::memory(s,linear,Width::Qword,WordAccess::Read,length,
+            super::super::shared::entry::MemoryTask::XmmLow {index})}
+        else if linear%16!=0 {entry::unsupported(s)}
+        else {
+            let pair=s.system.unwrap().fp.xmm[index as int];
+            (State {core:c::boundary_pair_store(s.core,linear,pair[0],pair[1]).0,
+                phase:Phase::EntryMemory {address:linear,length,
+                    task:super::super::shared::entry::MemoryTask::XmmWideStore},..s},Tick::Pending)
+        }
+    }
+}
+
+#[verifier::opaque]
 pub open spec fn finish_xmm_load(s:State,dst:u8,value:u64,wide:bool,length:u8)->(State,Tick) {
     if s.system is None || dst>=16 {entry::unsupported(s)}
     else {
@@ -29,6 +87,21 @@ pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,
         let system=s.system.unwrap();
         let cpu=s.core.cpu;
         match instruction {
+            Instruction::XmmMemory {address,index,store,kind}=>
+                execute_xmm_memory(s,address,index,store,kind,length),
+            Instruction::XmmCopy {dst,source}|Instruction::XmmMerge {dst,source,..}=>
+                if dst>=16 || source>=16 {entry::unsupported(s)}
+                else {
+                    let pair=system.fp.xmm[source as int];
+                    match instruction {
+                        Instruction::XmmMerge {high,..}=>{
+                            let previous=system.fp.xmm[dst as int];
+                            finish_xmm_pair(s,dst,if high {previous[0]} else {pair[1]},
+                                if high {pair[0]} else {previous[1]},length)
+                        },
+                        _=>finish_xmm_pair(s,dst,pair[0],pair[1],length),
+                    }
+                },
             Instruction::XmmLoad {dst,source,width}=>{
                 if dst>=16 || (width!=Width::Dword && width!=Width::Qword) {entry::unsupported(s)}
                 else {match source {

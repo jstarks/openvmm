@@ -185,6 +185,15 @@ impl SharedMachine {
         self.mmu.begin_span(address, word, size,self.user)
     }
 
+    pub(crate) fn boundary_pair_store(&mut self,address:u64,low:u64,high:u64)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::boundary_pair_store(old(self)@,address,low,high),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_pair_store(address,low,high,self.user)
+    }
+
     pub(crate) fn boundary_modify(&mut self, address: u64,
         operation: memory_core::cpu_core::integer::Operation, source: u64, flags: u64,
         width: memory_core::cpu_core::operand::Width) -> (accepted: bool)

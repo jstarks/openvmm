@@ -10,6 +10,94 @@ use memory_core::cpu_core::{privilege, profile};
 
 verus! {
 impl SharedEventMachine {
+    pub(super) fn finish_xmm_pair(&mut self,dst:u8,low:u64,high:u64,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::finish_xmm_pair(old(self)@,dst,low,high,length),
+    {
+        reveal(spec::privilege::finish_xmm_pair);
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if dst>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+        system.fp=system.fp.xmm_pair(dst,low,high);
+        self.system=Some(system);
+        self.retire_entry(self.core.cpu(),length,false,false)
+    }
+
+    pub(super) fn finish_xmm_memory(&mut self,address:u64,task:entry::MemoryTask,value:u64,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==
+            spec::privilege::finish_xmm_memory(old(self)@,address,task,value,length),
+    {
+        reveal(spec::privilege::finish_xmm_memory);
+        match task {
+            entry::MemoryTask::XmmLow {index}=>{
+                if address>u64::MAX-8 {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                }
+                self.entry_memory(address+8,Width::Qword,WordAccess::Read,length,
+                    entry::MemoryTask::XmmHigh {index,low:value})
+            },
+            entry::MemoryTask::XmmHigh {index,low}=>self.finish_xmm_pair(index,low,value,length),
+            entry::MemoryTask::XmmHalf {index,high}=>{
+                let Some(system)=self.system else {
+                    return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+                };
+                if index>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+                let pair=system.fp.xmm[index as usize];
+                self.finish_xmm_pair(index,if high {pair[0]} else {value},
+                    if high {value} else {pair[1]},length)
+            },
+            _=>self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported)),
+        }
+    }
+
+    pub(super) fn execute_xmm_memory(&mut self,address:Address,index:u8,store:bool,
+        kind:entry::XmmMemoryKind,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==
+            spec::privilege::execute_xmm_memory(old(self)@,address,index,store,kind,length),
+    {
+        reveal(spec::privilege::execute_xmm_memory);
+        let Some(system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if !address.is_valid() || index>=16 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let cpu=self.core.cpu();
+        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        let full=matches!(kind,entry::XmmMemoryKind::Aligned|entry::XmmMemoryKind::Unaligned);
+        if !entry::supported_access(linear,Width::Qword)
+            || (full && (linear>u64::MAX-15 || !canonical(linear+15))) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if matches!(kind,entry::XmmMemoryKind::Aligned) && linear%16!=0 {
+            return self.start_entry(Event::GeneralProtection);
+        }
+        if !full {
+            let high=matches!(kind,entry::XmmMemoryKind::High);
+            return self.entry_memory(linear,Width::Qword,
+                if store {WordAccess::Write(system.fp.xmm[index as usize][if high {1usize} else {0usize}])}
+                else {WordAccess::Read},length,
+                if store {entry::MemoryTask::Store} else {entry::MemoryTask::XmmHalf {index,high}});
+        }
+        if !store {
+            return self.entry_memory(linear,Width::Qword,WordAccess::Read,length,
+                entry::MemoryTask::XmmLow {index});
+        }
+        if linear%16!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let pair=system.fp.xmm[index as usize];
+        let _accepted=self.core.boundary_pair_store(linear,pair[0],pair[1]);assert(_accepted);
+        self.phase=Phase::EntryMemory {address:linear,length,task:entry::MemoryTask::XmmWideStore};
+        Tick::Pending
+    }
+
     pub(super) fn finish_xmm_load(&mut self,dst:u8,value:u64,wide:bool,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
@@ -36,6 +124,20 @@ impl SharedEventMachine {
         };
         if system.cr4_extra&0x200==0 {return self.start_entry(Event::InvalidOpcode);}
         match instruction {
+            Instruction::XmmMemory {address,index,store,kind}=>
+                self.execute_xmm_memory(address,index,store,kind,length),
+            Instruction::XmmCopy {dst,source}|Instruction::XmmMerge {dst,source,..}=>{
+                if dst>=16 || source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+                let pair=system.fp.xmm[source as usize];
+                match instruction {
+                    Instruction::XmmMerge {high,..}=>{
+                        let previous=system.fp.xmm[dst as usize];
+                        self.finish_xmm_pair(dst,if high {previous[0]} else {pair[1]},
+                            if high {pair[0]} else {previous[1]},length)
+                    },
+                    _=>self.finish_xmm_pair(dst,pair[0],pair[1],length),
+                }
+            },
             Instruction::XmmLoad {dst,source,width}=>{
                 if dst>=16 || (width!=Width::Dword && width!=Width::Qword) {
                     return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));

@@ -373,6 +373,18 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             | Mnemonic::Punpckhdq
             | Mnemonic::Punpcklqdq
             | Mnemonic::Punpckhqdq
+            | Mnemonic::Movhps
+            | Mnemonic::Movlps
+            | Mnemonic::Movhpd
+            | Mnemonic::Movlpd
+            | Mnemonic::Movhlps
+            | Mnemonic::Movlhps
+            | Mnemonic::Movaps
+            | Mnemonic::Movapd
+            | Mnemonic::Movdqa
+            | Mnemonic::Movups
+            | Mnemonic::Movupd
+            | Mnemonic::Movdqu
     ) {
         return admit_xmm(&instruction, size);
     }
@@ -1114,6 +1126,51 @@ fn admit_xmm(instruction: &Instruction, size: AddressSize) -> Option<EntryInstru
     }
     let dst = xmm_index(instruction.op0_register());
     let source = xmm_index(instruction.op1_register());
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Movhlps | Mnemonic::Movlhps
+    ) {
+        return Some(EntryInstruction::XmmMerge {
+            dst: dst?,
+            source: source?,
+            high: instruction.mnemonic() == Mnemonic::Movlhps,
+        });
+    }
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Movhps
+            | Mnemonic::Movlps
+            | Mnemonic::Movhpd
+            | Mnemonic::Movlpd
+            | Mnemonic::Movaps
+            | Mnemonic::Movapd
+            | Mnemonic::Movdqa
+            | Mnemonic::Movups
+            | Mnemonic::Movupd
+            | Mnemonic::Movdqu
+    ) {
+        use x86_system::shared::entry::XmmMemoryKind;
+        if let (Some(dst), Some(source)) = (dst, source) {
+            return Some(EntryInstruction::XmmCopy { dst, source });
+        }
+        let (index, store) = match (dst, source) {
+            (Some(index), None) if instruction.op1_kind() == OpKind::Memory => (index, false),
+            (None, Some(index)) if instruction.op0_kind() == OpKind::Memory => (index, true),
+            _ => return None,
+        };
+        let kind = match instruction.mnemonic() {
+            Mnemonic::Movhps | Mnemonic::Movhpd => XmmMemoryKind::High,
+            Mnemonic::Movlps | Mnemonic::Movlpd => XmmMemoryKind::Low,
+            Mnemonic::Movaps | Mnemonic::Movapd | Mnemonic::Movdqa => XmmMemoryKind::Aligned,
+            _ => XmmMemoryKind::Unaligned,
+        };
+        return Some(EntryInstruction::XmmMemory {
+            address: address(instruction, size)?,
+            index,
+            store,
+            kind,
+        });
+    }
     if matches!(instruction.mnemonic(), Mnemonic::Movd | Mnemonic::Movq) {
         return match (dst, source) {
             (Some(dst), Some(source)) if instruction.mnemonic() == Mnemonic::Movq => {

@@ -3079,7 +3079,7 @@ fn conditional_forms_reject_repeat_lock_and_unrelated_operand_families() {
         );
     }
     for bytes in [
-        &[0x0f, 0x10, 0xc1][..],
+        &[0x0f, 0x58, 0xc1][..],
         &[0x0f, 0x50, 0xc1][..],
         &[0xf3, 0x0f, 0x10, 0xc1][..],
     ] {
@@ -3323,6 +3323,7 @@ fn xmm_scalar_transfers_and_register_unpacks_preserve_widths_and_indices() {
         };
         assert_eq!((actual, width), (dst, Width::Dword));
     }
+
     assert!(matches!(
         entry(&[0x66, 0x0f, 0x6e, 0x4d, 0x84]),
         Instruction::XmmLoad {
@@ -3378,4 +3379,115 @@ fn xmm_scalar_transfers_and_register_unpacks_preserve_widths_and_indices() {
     for bytes in [&[0x0f, 0x6e, 0xc1][..], &[0x66, 0x0f, 0x62, 0x00]] {
         assert_eq!(admission(bytes), DecodeDecision::Unsupported);
     }
+}
+
+#[test]
+fn xmm_half_full_and_register_moves_keep_memory_shape_alignment_and_lanes() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::{Instruction, XmmMemoryKind};
+    for prefix in [None, Some(0x66)] {
+        for high in [false, true] {
+            for store in [false, true] {
+                let mut bytes = Vec::new();
+                if let Some(prefix) = prefix {
+                    bytes.push(prefix);
+                }
+                bytes.extend([
+                    0x44,
+                    0x0f,
+                    (if high { 0x16 } else { 0x12 }) + u8::from(store),
+                    0x45,
+                    0x90,
+                ]);
+                let Instruction::XmmMemory {
+                    index,
+                    store: actual,
+                    kind,
+                    ..
+                } = entry(&bytes)
+                else {
+                    panic!()
+                };
+                assert_eq!(
+                    (index, actual, kind),
+                    (
+                        8,
+                        store,
+                        if high {
+                            XmmMemoryKind::High
+                        } else {
+                            XmmMemoryKind::Low
+                        }
+                    )
+                );
+            }
+        }
+    }
+    for (prefix, load, store_opcode, kind) in [
+        (None, 0x28, 0x29, XmmMemoryKind::Aligned),
+        (Some(0x66), 0x28, 0x29, XmmMemoryKind::Aligned),
+        (Some(0x66), 0x6f, 0x7f, XmmMemoryKind::Aligned),
+        (None, 0x10, 0x11, XmmMemoryKind::Unaligned),
+        (Some(0x66), 0x10, 0x11, XmmMemoryKind::Unaligned),
+        (Some(0xf3), 0x6f, 0x7f, XmmMemoryKind::Unaligned),
+    ] {
+        for store in [false, true] {
+            for register in [false, true] {
+                let mut bytes = Vec::new();
+                if let Some(prefix) = prefix {
+                    bytes.push(prefix);
+                }
+                bytes.extend([
+                    if register { 0x45 } else { 0x44 },
+                    0x0f,
+                    if store { store_opcode } else { load },
+                    if register { 0xca } else { 0x0f },
+                ]);
+                if register {
+                    assert_eq!(
+                        entry(&bytes),
+                        Instruction::XmmCopy {
+                            dst: if store { 10 } else { 9 },
+                            source: if store { 9 } else { 10 }
+                        }
+                    );
+                } else {
+                    let Instruction::XmmMemory {
+                        index,
+                        store: actual,
+                        kind: shape,
+                        ..
+                    } = entry(&bytes)
+                    else {
+                        panic!()
+                    };
+                    assert_eq!((index, actual, shape), (9, store, kind));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        entry(&[0x0f, 0x12, 0xc1]),
+        Instruction::XmmMerge {
+            dst: 0,
+            source: 1,
+            high: false
+        }
+    );
+    assert_eq!(
+        entry(&[0x0f, 0x16, 0xc1]),
+        Instruction::XmmMerge {
+            dst: 0,
+            source: 1,
+            high: true
+        }
+    );
+    assert_eq!(
+        admission(&[0xc5, 0xf8, 0x10, 0x00]),
+        DecodeDecision::Unsupported
+    );
+    assert_eq!(
+        admission(&[0xf0, 0x0f, 0x16, 0x00]),
+        DecodeDecision::InvalidOpcode
+    );
 }

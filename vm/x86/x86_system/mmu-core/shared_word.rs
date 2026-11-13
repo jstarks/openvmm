@@ -7,6 +7,20 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
+    /// One aligned RAM translation, two non-atomic qword stores. Completion
+    /// reports the low qword; backing-error retry never replays a committed head.
+    pub fn begin_pair_store(&mut self,va:u64,low:u64,upper:u64,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            accepted==(!spec::active(old(self)@.phase) && va%16==0),
+            final(self)@==if accepted {spec::pair_begin(old(self)@,va,low,upper,user)} else {old(self)@},
+    {
+        if va%16!=0 {return false;}
+        let accepted=self.begin_word(va,WordAccess::Write(low),user);
+        if accepted {self.pair_upper=Some(upper);}
+        accepted
+    }
+
     pub fn begin_exchange(&mut self,va:u64,replacement:u64,width:Width)->(accepted:bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
@@ -240,7 +254,7 @@ impl SharedMmu {
     pub(super) fn precheck_failure(&mut self, result: MmuResult)
         requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
             old(self).head is None,
-            old(self).valid_comparison(), !(result is Success),
+            old(self).valid_comparison(), old(self).valid_pair(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(),
             final(self)@ == (spec::State { phase: spec::terminal(old(self)@, result, 0), ..old(self)@ }),
@@ -305,14 +319,7 @@ impl SharedMmu {
                 match leaf {
                     Some(pte) => self.phase = Phase::WordDirty { pte,
                         data: WordData { address, first, tail, value }, reads },
-                    None => {
-                        let data = WordData { address, first, tail, value };
-                        self.phase = if self.comparison.is_some() { Phase::AtomicStore { data, reads } }
-                            else if self.size < 8 && address % 8 + self.size as u64 <= 8 {
-                                Phase::SizedStore { data, reads }
-                            } else if address % 8 == 0 { Phase::WordStore { data, reads } }
-                            else { Phase::WordHead { data, reads } };
-                    },
+                    None => self.ready_store(WordData { address, first, tail, value }, reads),
                 }
             },
             None => { proof { assert(false); } },
@@ -351,6 +358,29 @@ impl SharedMmu {
         }
     }
 
+    pub(super) fn ready_store(&mut self,data:WordData,reads:u8)
+        requires old(self).invariant(),old(self).word is Some,old(self).access is Write,
+            spec::active(old(self).phase),
+            spec::valid_span(data,old(self).size),
+            old(self).comparison is Some ==> data.address%8+old(self).size as int<=8,
+        ensures final(self).invariant(),final(self)@==spec::ready_store(old(self)@,data,reads),
+    {
+        if let Some(upper)=self.pair_upper {
+            self.pair_upper=None;
+            if data.address%16!=0 || data.address%4096>4080 {
+                self.phase=Phase::WordDone {report:WordReport {result:WordResult::CrossPage,
+                    table_reads:reads,virtual_address:self.va}};
+            } else {
+                self.phase=Phase::PairHead {data,upper,reads};
+            }
+        } else {
+            self.phase=if self.comparison.is_some() {Phase::AtomicStore {data,reads}}
+                else if self.size<8 && data.address%8+self.size as u64<=8 {Phase::SizedStore {data,reads}}
+                else if data.address%8==0 {Phase::WordStore {data,reads}}
+                else {Phase::WordHead {data,reads}};
+        }
+    }
+
     pub(super) fn word_store_done(&mut self, value: u64, reads: u8)
         requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
             old(self).valid_comparison(), old(self).word is Some,
@@ -358,10 +388,12 @@ impl SharedMmu {
         ensures final(self).invariant(), final(self)@ == spec::word_store_done(old(self)@, value, reads),
     {
         let ram_store = matches!(self.phase, Phase::WordStore {..} | Phase::WordLast {..}
-            | Phase::SizedStore {..} | Phase::AtomicStore {..} | Phase::PageStoreTail {..});
+            | Phase::SizedStore {..} | Phase::AtomicStore {..} | Phase::PageStoreTail {..}
+            | Phase::PairTail {..});
         if !ram_store { self.inner.cache = None; }
         self.cache_dirty = ram_store;
         self.head = None;
+        self.pair_upper = None;
         let original = match self.modifier { Some(m) => m.original, None => value };
         self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(original),
             table_reads: reads, virtual_address: self.va } };

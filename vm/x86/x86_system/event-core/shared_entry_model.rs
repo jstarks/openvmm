@@ -242,7 +242,9 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::Syscall=>privilege::fast_entry(s,false,length),
         Instruction::Sysret=>privilege::fast_entry(s,true,length),
         Instruction::XmmLoad {..}|Instruction::XmmStore {..}
-            |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}=>privilege::execute_xmm(s,instruction,length),
+            |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}
+            |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>
+                privilege::execute_xmm(s,instruction,length),
         Instruction::ByteSwap {dst}=>{
             if !dst.valid() || !(dst@.width is Dword || dst@.width is Qword) {unsupported(s)}
             else {retire(s,model::State {gpr:operand::model::write(registers(cpu),dst,
@@ -574,6 +576,8 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     let cpu = s.core.cpu;
     match task {
         MemoryTask::XmmLoad {index,wide}=>privilege::finish_xmm_load(s,index,value,wide,length),
+        MemoryTask::XmmHalf {..}|MemoryTask::XmmLow {..}|MemoryTask::XmmHigh {..}=>
+            privilege::finish_xmm_memory(s,address,task,value,length),
         MemoryTask::Exchange {register}=>exchange_value(s,register,value,length),
         MemoryTask::SaveFp {index,wide}=>privilege::save_fp_value(s,address,index,wide,length),
         MemoryTask::SaveFpHeader {wide}=>privilege::save_fp_header(s,address,wide,length),
@@ -686,7 +690,7 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
             else { retire(s, model::State { gpr: operand::model::write(registers(cpu), dst, value)
                 .map(|i: int, v: u64| v as int), ..cpu }, length, false, false) }
         },
-        MemoryTask::Store => retire(s, cpu, length, false, false),
+        MemoryTask::Store|MemoryTask::XmmWideStore => retire(s, cpu, length, false, false),
         MemoryTask::TableLimit { idt } => {
             if address as int + 2 > u64::MAX { unsupported(s) }
             else { memory(s, (address + 2) as u64, Width::Qword, WordAccess::Read, length,

@@ -373,6 +373,11 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             | Mnemonic::Punpckhdq
             | Mnemonic::Punpcklqdq
             | Mnemonic::Punpckhqdq
+            | Mnemonic::Punpcklbw
+            | Mnemonic::Punpcklwd
+            | Mnemonic::Punpckhbw
+            | Mnemonic::Punpckhwd
+            | Mnemonic::Pshufd
             | Mnemonic::Movhps
             | Mnemonic::Movlps
             | Mnemonic::Movhpd
@@ -402,6 +407,10 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             | Mnemonic::Orpd
             | Mnemonic::Xorps
             | Mnemonic::Xorpd
+            | Mnemonic::Pcmpeqb
+            | Mnemonic::Pcmpeqw
+            | Mnemonic::Pcmpeqd
+            | Mnemonic::Pmovmskb
     ) {
         return admit_xmm(&instruction, size);
     }
@@ -1135,14 +1144,61 @@ fn xmm_index(register: IcedRegister) -> Option<u8> {
 }
 
 fn admit_xmm(instruction: &Instruction, size: AddressSize) -> Option<EntryInstruction> {
-    if instruction.op_count() != 2
-        || instruction.has_lock_prefix()
-        || profile::cpuid(1, 0)[3] & (1 << 26) == 0
-    {
+    if instruction.has_lock_prefix() || profile::cpuid(1, 0)[3] & (1 << 26) == 0 {
         return None;
     }
     let dst = xmm_index(instruction.op0_register());
     let source = xmm_index(instruction.op1_register());
+    if instruction.mnemonic() == Mnemonic::Pshufd {
+        if instruction.op_count() != 3 || instruction.op2_kind() != OpKind::Immediate8 {
+            return None;
+        }
+        return Some(EntryInstruction::XmmShuffle {
+            dst: dst?,
+            source: source?,
+            control: instruction.immediate8(),
+        });
+    }
+    if instruction.op_count() != 2 {
+        return None;
+    }
+    if instruction.mnemonic() == Mnemonic::Pmovmskb {
+        let Operand::Register(dst) = operand(instruction, 0, Operation::Mov, size)? else {
+            return None;
+        };
+        return matches!(dst.width(), Width::Dword | Width::Qword).then_some(
+            EntryInstruction::XmmMask {
+                dst,
+                source: source?,
+            },
+        );
+    }
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd
+    ) {
+        let width = match instruction.mnemonic() {
+            Mnemonic::Pcmpeqb => Width::Byte,
+            Mnemonic::Pcmpeqw => Width::Word,
+            _ => Width::Dword,
+        };
+        let index = dst?;
+        return if let Some(source) = source {
+            Some(EntryInstruction::XmmEqual {
+                dst: index,
+                source,
+                width,
+            })
+        } else if instruction.op1_kind() == OpKind::Memory {
+            Some(EntryInstruction::XmmEqualMemory {
+                address: address(instruction, size)?,
+                index,
+                width,
+            })
+        } else {
+            None
+        };
+    }
     if matches!(
         instruction.mnemonic(),
         Mnemonic::Movhlps | Mnemonic::Movlhps
@@ -1230,6 +1286,20 @@ fn admit_xmm(instruction: &Instruction, size: AddressSize) -> Option<EntryInstru
         });
     }
     match instruction.mnemonic() {
+        Mnemonic::Punpcklbw | Mnemonic::Punpcklwd | Mnemonic::Punpckhbw | Mnemonic::Punpckhwd => {
+            Some(EntryInstruction::XmmUnpackNarrow {
+                dst: dst?,
+                source: source?,
+                word: matches!(
+                    instruction.mnemonic(),
+                    Mnemonic::Punpcklwd | Mnemonic::Punpckhwd
+                ),
+                high: matches!(
+                    instruction.mnemonic(),
+                    Mnemonic::Punpckhbw | Mnemonic::Punpckhwd
+                ),
+            })
+        }
         Mnemonic::Punpckldq | Mnemonic::Punpckhdq | Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => {
             Some(EntryInstruction::XmmUnpack {
                 dst: dst?,

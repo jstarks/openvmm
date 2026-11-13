@@ -62,7 +62,85 @@ pub const EMPTY_LEGACY_FP:LegacyFpState=LegacyFpState {
     xmm:[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],
         [0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],
 };
+fn packed_equal(left:u64,right:u64,width:super::operand::Width)->(out:u64)
+    ensures out==model::equal_prefix(left,right,width,(64u32/super::operand::model::bits(width)) as nat),
+{
+    let bits=width.bits();
+    let mask=width.mask();
+    let count=64/bits;
+    let mut index=0u32;
+    let mut value=0u64;
+    while index<count
+        invariant bits==super::operand::model::bits(width),bits>0,
+            count==64u32/bits,count*bits==64,mask==super::operand::model::mask(width),
+            index<=count,value==model::equal_prefix(left,right,width,index as nat),
+        decreases count-index,
+    {
+        assert(index*bits<64) by(nonlinear_arith)
+            requires index<count,bits>0,count*bits==64;
+        let shift=index*bits;
+        if (left>>shift)&mask==(right>>shift)&mask {value|=mask<<shift;}
+        proof {
+            reveal_with_fuel(model::equal_prefix,2);
+            assert(value|0u64==value) by(bit_vector);
+            assert(value==model::equal_prefix(left,right,width,(index+1) as nat));
+        }
+        index+=1;
+    }
+    value
+}
+
+fn byte_mask(word:u64)->(out:u64)
+    ensures out==model::mask_prefix(word,8),
+{
+    let mut index=0u32;
+    let mut value=0u64;
+    while index<8
+        invariant index<=8,value==model::mask_prefix(word,index as nat),
+        decreases 8-index,
+    {
+        value|=((word>>(index*8+7))&1)<<index;
+        index+=1;
+    }
+    value
+}
+
 impl LegacyFpState {
+    pub fn xmm_unpack_narrow(self,dst:u8,source:u8,word:bool,high:bool)->(out:Self)
+        requires dst<16,source<16,
+        ensures out==model::xmm_unpack_narrow(self,dst,source,word,high),
+    {
+        let at=if high {1usize} else {0usize};
+        let a=self.xmm[dst as usize][at];
+        let b=self.xmm[source as usize][at];
+        self.xmm_pair(dst,interleave_low(a,b,word),interleave_low(a>>32,b>>32,word))
+    }
+
+    pub fn xmm_shuffle(self,dst:u8,source:u8,control:u8)->(out:Self)
+        requires dst<16,source<16,
+        ensures out==model::xmm_shuffle(self,dst,source,control),
+    {
+        let pair=self.xmm[source as usize];
+        self.xmm_pair(dst,select_dword(pair,control)|(select_dword(pair,control>>2)<<32),
+            select_dword(pair,control>>4)|(select_dword(pair,control>>6)<<32))
+    }
+
+    pub fn xmm_equal(self,dst:u8,low:u64,high:u64,width:super::operand::Width)->(out:Self)
+        requires dst<16,
+        ensures out==model::xmm_equal(self,dst,low,high,width),
+    {
+        let pair=self.xmm[dst as usize];
+        self.xmm_pair(dst,packed_equal(pair[0],low,width),packed_equal(pair[1],high,width))
+    }
+
+    pub fn xmm_mask(self,index:u8)->(out:u64)
+        requires index<16,
+        ensures out==model::xmm_mask(self,index),
+    {
+        let pair=self.xmm[index as usize];
+        byte_mask(pair[0])|(byte_mask(pair[1])<<8)
+    }
+
     pub fn xmm_logic(self,dst:u8,source:u8,operation:XmmLogic)->(out:Self)
         requires dst<16,source<16,
         ensures out==model::xmm_logic(self,dst,source,operation),
@@ -305,9 +383,81 @@ pub struct SystemState {
     pub mtrr_variable: [u64; 16],
 }
 
+fn interleave_low(a:u64,b:u64,word:bool)->(out:u64)
+    ensures out==model::interleave_low(a,b,word),
+{
+    if word {
+        (a&0xffff)|((b&0xffff)<<16)|((a&0xffff_0000)<<16)|((b&0xffff_0000)<<32)
+    } else {
+        (a&0xff)|((b&0xff)<<8)|((a&0xff00)<<8)|((b&0xff00)<<16)
+            |((a&0xff_0000)<<16)|((b&0xff_0000)<<24)
+            |((a&0xff00_0000)<<24)|((b&0xff00_0000)<<32)
+    }
+}
+
+fn select_dword(pair:[u64;2],selector:u8)->(out:u64)
+    ensures out==model::select_dword(pair,selector),
+{
+    let bit=selector&1;
+    assert(bit<=1) by(bit_vector) requires bit==selector&1;
+    let value=if selector&2==0 {pair[0]} else {pair[1]};
+    (value>>((bit as u32)*32))&0xffff_ffff
+}
+
 pub mod model {
     #[cfg(verus_keep_ghost)]
     use super::*;
+
+    pub open spec fn interleave_low(a:u64,b:u64,word:bool)->u64 {
+        if word {
+            (a&0xffffu64)|((b&0xffffu64)<<16)|((a&0xffff_0000u64)<<16)|((b&0xffff_0000u64)<<32)
+        } else {
+            (a&0xffu64)|((b&0xffu64)<<8)|((a&0xff00u64)<<8)|((b&0xff00u64)<<16)
+                |((a&0xff_0000u64)<<16)|((b&0xff_0000u64)<<24)
+                |((a&0xff00_0000u64)<<24)|((b&0xff00_0000u64)<<32)
+        }
+    }
+    pub open spec fn select_dword(pair:[u64;2],selector:u8)->u64 {
+        ((if selector&2u8==0 {pair[0]} else {pair[1]})>>(((selector&1u8) as u32)*32))&0xffff_ffffu64
+    }
+    pub open spec fn xmm_unpack_narrow(s:LegacyFpState,dst:u8,source:u8,word:bool,high:bool)->LegacyFpState {
+        let at=if high {1int} else {0int};
+        let a=s.xmm[dst as int][at];
+        let b=s.xmm[source as int][at];
+        xmm_pair(s,dst,interleave_low(a,b,word),interleave_low(a>>32,b>>32,word))
+    }
+    pub open spec fn xmm_shuffle(s:LegacyFpState,dst:u8,source:u8,control:u8)->LegacyFpState {
+        let pair=s.xmm[source as int];
+        xmm_pair(s,dst,select_dword(pair,control)|(select_dword(pair,control>>2)<<32),
+            select_dword(pair,control>>4)|(select_dword(pair,control>>6)<<32))
+    }
+
+    pub open spec fn equal_prefix(left:u64,right:u64,width:super::super::operand::Width,count:nat)->u64
+        decreases count,
+    {
+        if count==0 {0u64} else {
+            let shift=((count-1)*super::super::operand::model::bits(width)) as u32;
+            let mask=super::super::operand::model::mask(width);
+            equal_prefix(left,right,width,(count-1) as nat) |
+                if (left>>shift)&mask==(right>>shift)&mask {mask<<shift} else {0u64}
+        }
+    }
+    pub open spec fn mask_prefix(word:u64,count:nat)->u64
+        decreases count,
+    {
+        if count==0 {0u64} else {
+            mask_prefix(word,(count-1) as nat) |
+                (((word>>(((count-1)*8+7) as u32))&1u64)<<((count-1) as u32))
+        }
+    }
+    pub open spec fn xmm_equal(s:LegacyFpState,dst:u8,low:u64,high:u64,width:super::super::operand::Width)->LegacyFpState {
+        let count=(64u32/super::super::operand::model::bits(width)) as nat;
+        xmm_pair(s,dst,equal_prefix(s.xmm[dst as int][0],low,width,count),
+            equal_prefix(s.xmm[dst as int][1],high,width,count))
+    }
+    pub open spec fn xmm_mask(s:LegacyFpState,index:u8)->u64 {
+        mask_prefix(s.xmm[index as int][0],8)|(mask_prefix(s.xmm[index as int][1],8)<<8)
+    }
 
     pub open spec fn xmm_bits(operation:XmmLogic,left:u64,right:u64)->u64 {
         match operation {XmmLogic::And=>left&right,XmmLogic::AndNot=>!left&right,

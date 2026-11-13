@@ -243,7 +243,9 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::Sysret=>privilege::fast_entry(s,true,length),
         Instruction::XmmLoad {..}|Instruction::XmmStore {..}
             |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}
+            |Instruction::XmmUnpackNarrow {..}|Instruction::XmmShuffle {..}
             |Instruction::XmmLogic {..}
+            |Instruction::XmmEqual {..}|Instruction::XmmEqualMemory {..}|Instruction::XmmMask {..}
             |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>
                 privilege::execute_xmm(s,instruction,length),
         Instruction::ByteSwap {dst}=>{

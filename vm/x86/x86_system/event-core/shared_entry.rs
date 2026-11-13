@@ -26,7 +26,12 @@ pub enum Instruction {
     XmmStore {destination:Operand,source:u8,width:Width},
     XmmCopyLow {dst:u8,source:u8},
     XmmUnpack {dst:u8,source:u8,wide:bool,high:bool},
+    XmmUnpackNarrow {dst:u8,source:u8,word:bool,high:bool},
+    XmmShuffle {dst:u8,source:u8,control:u8},
     XmmLogic {dst:u8,source:u8,operation:system::XmmLogic},
+    XmmEqual {dst:u8,source:u8,width:Width},
+    XmmEqualMemory {address:Address,index:u8,width:Width},
+    XmmMask {dst:Register,source:u8},
     XmmCopy {dst:u8,source:u8},
     XmmMerge {dst:u8,source:u8,high:bool},
     XmmMemory {address:Address,index:u8,store:bool,kind:XmmMemoryKind},
@@ -91,6 +96,9 @@ pub enum Port { Dx, Immediate(u8) }
 pub enum XmmMemoryKind {Low,High,Aligned,Unaligned}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XmmReadAction {Move,Equal(Width)}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortRequest {
     pub sequence: u64,
     pub port: u16,
@@ -111,8 +119,8 @@ pub enum MemoryTask {
     LoadX87Integer {width:Width,opcode:u16},
     XmmLoad {index:u8,wide:bool},
     XmmHalf {index:u8,high:bool},
-    XmmLow {index:u8},
-    XmmHigh {index:u8,low:u64},
+    XmmLow {index:u8,action:XmmReadAction},
+    XmmHigh {index:u8,low:u64,action:XmmReadAction},
     XmmWideStore,
     TaskLow {selector:u16},
     TaskHigh {selector:u16,low:u64},
@@ -254,7 +262,9 @@ impl SharedEventMachine {
         match instruction {
             Instruction::XmmLoad {..}|Instruction::XmmStore {..}
                 |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}
+                |Instruction::XmmUnpackNarrow {..}|Instruction::XmmShuffle {..}
                 |Instruction::XmmLogic {..}
+                |Instruction::XmmEqual {..}|Instruction::XmmEqualMemory {..}|Instruction::XmmMask {..}
                 |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>{
                 reveal(spec::entry::execute);
                 self.execute_xmm(instruction,length)

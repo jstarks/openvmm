@@ -3538,3 +3538,109 @@ fn xmm_register_logic_owns_the_operation_without_admitting_memory_or_vex_forms()
         DecodeDecision::InvalidOpcode
     );
 }
+
+#[test]
+fn xmm_equal_lanes_and_byte_masks_keep_width_registers_and_memory_shapes() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for (opcode, width) in [
+        (0x74, Width::Byte),
+        (0x75, Width::Word),
+        (0x76, Width::Dword),
+    ] {
+        assert_eq!(
+            entry(&[0x66, 0x45, 0x0f, opcode, 0xf8]),
+            Instruction::XmmEqual {
+                dst: 15,
+                source: 8,
+                width
+            }
+        );
+        let Instruction::XmmEqualMemory {
+            index,
+            width: actual,
+            ..
+        } = entry(&[0x66, 0x44, 0x0f, opcode, 0x38])
+        else {
+            panic!()
+        };
+        assert_eq!((index, actual), (15, width));
+    }
+    for wide in [false, true] {
+        for dst in [0, 7, 8, 15] {
+            let source = 15 - dst;
+            let rex = 0x40
+                | if wide { 8 } else { 0 }
+                | if dst >= 8 { 4 } else { 0 }
+                | if source >= 8 { 1 } else { 0 };
+            let Instruction::XmmMask {
+                dst: register,
+                source: actual,
+            } = entry(&[
+                0x66,
+                rex,
+                0x0f,
+                0xd7,
+                0xc0 | ((dst & 7) << 3) | (source & 7),
+            ])
+            else {
+                panic!()
+            };
+            assert_eq!((register.gpr().index(), actual), (dst as usize, source));
+            assert!(matches!(register.width(), Width::Dword | Width::Qword));
+        }
+    }
+    for bytes in [
+        &[0x0f, 0x74, 0xc1][..],
+        &[0x0f, 0xd7, 0xc1],
+        &[0x66, 0x0f, 0x38, 0x29, 0xc1],
+        &[0xc5, 0xf9, 0x74, 0xc1],
+    ] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+    assert_eq!(
+        admission(&[0xf0, 0x66, 0x0f, 0x74, 0xc1]),
+        DecodeDecision::InvalidOpcode
+    );
+}
+
+#[test]
+fn xmm_narrow_unpacks_and_shuffles_retain_lanes_and_all_immediate_controls() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for (opcode, word, high) in [
+        (0x60, false, false),
+        (0x61, true, false),
+        (0x68, false, true),
+        (0x69, true, true),
+    ] {
+        assert_eq!(
+            entry(&[0x66, 0x45, 0x0f, opcode, 0xf8]),
+            Instruction::XmmUnpackNarrow {
+                dst: 15,
+                source: 8,
+                word,
+                high
+            }
+        );
+    }
+    for control in 0..=255 {
+        assert_eq!(
+            entry(&[0x66, 0x45, 0x0f, 0x70, 0xcb, control]),
+            Instruction::XmmShuffle {
+                dst: 9,
+                source: 11,
+                control
+            }
+        );
+    }
+    for bytes in [
+        &[0x66, 0x0f, 0x70, 0x00, 0x00][..],
+        &[0xf2, 0x0f, 0x70, 0xc1, 0x00],
+        &[0xf3, 0x0f, 0x70, 0xc1, 0x00],
+        &[0x66, 0x0f, 0x60, 0x00],
+        &[0x0f, 0x60, 0xc1],
+    ] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+}

@@ -13,6 +13,31 @@ use super::*;
 
 verus! {
 #[verifier::opaque]
+pub open spec fn finish_xmm_equal(s:State,dst:u8,low:u64,high:u64,width:Width,length:u8)->(State,Tick) {
+    if s.system is None || dst>=16 || width==Width::Qword {entry::unsupported(s)}
+    else {
+        let system=s.system.unwrap();
+        entry::retire(State {system:Some(SystemState {
+            fp:system::model::xmm_equal(system.fp,dst,low,high,width),..system}),..s},
+            s.core.cpu,length,false,false)
+    }
+}
+#[verifier::opaque]
+pub open spec fn execute_xmm_equal_memory(s:State,address:Address,index:u8,width:Width,length:u8)->(State,Tick) {
+    if width==Width::Qword {entry::unsupported(s)}
+    else {
+        let result=execute_xmm_memory(s,address,index,false,super::super::shared::entry::XmmMemoryKind::Aligned,length);
+        match result.0.phase {
+            Phase::EntryMemory {address,length,task:super::super::shared::entry::MemoryTask::XmmLow {..}}=>
+                (State {phase:Phase::EntryMemory {address,length,
+                    task:super::super::shared::entry::MemoryTask::XmmLow {
+                        index,action:super::super::shared::entry::XmmReadAction::Equal(width)}},..result.0},result.1),
+            _=>result,
+        }
+    }
+}
+
+#[verifier::opaque]
 pub open spec fn finish_xmm_pair(s:State,dst:u8,low:u64,high:u64,length:u8)->(State,Tick) {
     if s.system is None || dst>=16 {entry::unsupported(s)}
     else {
@@ -25,12 +50,14 @@ pub open spec fn finish_xmm_pair(s:State,dst:u8,low:u64,high:u64,length:u8)->(St
 #[verifier::opaque]
 pub open spec fn finish_xmm_memory(s:State,address:u64,task:super::super::shared::entry::MemoryTask,value:u64,length:u8)->(State,Tick) {
     match task {
-        super::super::shared::entry::MemoryTask::XmmLow {index}=>
+        super::super::shared::entry::MemoryTask::XmmLow {index,action}=>
             if address>u64::MAX-8 {entry::unsupported(s)}
             else {entry::memory(s,(address+8) as u64,Width::Qword,WordAccess::Read,length,
-                super::super::shared::entry::MemoryTask::XmmHigh {index,low:value})},
-        super::super::shared::entry::MemoryTask::XmmHigh {index,low}=>
-            finish_xmm_pair(s,index,low,value,length),
+                super::super::shared::entry::MemoryTask::XmmHigh {index,low:value,action})},
+        super::super::shared::entry::MemoryTask::XmmHigh {index,low,action}=>match action {
+            super::super::shared::entry::XmmReadAction::Move=>finish_xmm_pair(s,index,low,value,length),
+            super::super::shared::entry::XmmReadAction::Equal(width)=>finish_xmm_equal(s,index,low,value,width,length),
+        },
         super::super::shared::entry::MemoryTask::XmmHalf {index,high}=>
             if s.system is None || index>=16 {entry::unsupported(s)}
             else {
@@ -59,7 +86,8 @@ pub open spec fn execute_xmm_memory(s:State,address:Address,index:u8,store:bool,
                 if store {super::super::shared::entry::MemoryTask::Store}
                 else {super::super::shared::entry::MemoryTask::XmmHalf {index,high}})
         } else if !store {entry::memory(s,linear,Width::Qword,WordAccess::Read,length,
-            super::super::shared::entry::MemoryTask::XmmLow {index})}
+            super::super::shared::entry::MemoryTask::XmmLow {
+                index,action:super::super::shared::entry::XmmReadAction::Move})}
         else if linear%8!=0 || linear%4096>4080 {entry::unsupported(s)}
         else {
             let pair=s.system.unwrap().fp.xmm[index as int];
@@ -87,6 +115,20 @@ pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,
         let system=s.system.unwrap();
         let cpu=s.core.cpu;
         match instruction {
+            Instruction::XmmEqualMemory {address,index,width}=>
+                execute_xmm_equal_memory(s,address,index,width,length),
+            Instruction::XmmEqual {dst,source,width}=>
+                if source>=16 {entry::unsupported(s)}
+                else {
+                    let pair=system.fp.xmm[source as int];
+                    finish_xmm_equal(s,dst,pair[0],pair[1],width,length)
+                },
+            Instruction::XmmMask {dst,source}=>
+                if source>=16 || !dst.valid() || (dst@.width!=Width::Dword && dst@.width!=Width::Qword) {
+                    entry::unsupported(s)
+                } else {entry::retire(s,model::State {
+                    gpr:operand::model::write(entry::registers(cpu),dst,system::model::xmm_mask(system.fp,source))
+                        .map(|i:int,v:u64|v as int),..cpu},length,false,false)},
             Instruction::XmmMemory {address,index,store,kind}=>
                 execute_xmm_memory(s,address,index,store,kind,length),
             Instruction::XmmCopy {dst,source}|Instruction::XmmMerge {dst,source,..}=>
@@ -145,6 +187,18 @@ pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,
                 if dst>=16 || source>=16 {entry::unsupported(s)}
                 else {entry::retire(State {system:Some(SystemState {
                     fp:system::model::xmm_unpack(system.fp,dst,source,wide,high),..system}),..s},
+                    cpu,length,false,false)}
+            },
+            Instruction::XmmUnpackNarrow {dst,source,word,high}=>{
+                if dst>=16 || source>=16 {entry::unsupported(s)}
+                else {entry::retire(State {system:Some(SystemState {
+                    fp:system::model::xmm_unpack_narrow(system.fp,dst,source,word,high),..system}),..s},
+                    cpu,length,false,false)}
+            },
+            Instruction::XmmShuffle {dst,source,control}=>{
+                if dst>=16 || source>=16 {entry::unsupported(s)}
+                else {entry::retire(State {system:Some(SystemState {
+                    fp:system::model::xmm_shuffle(system.fp,dst,source,control),..system}),..s},
                     cpu,length,false,false)}
             },
             Instruction::XmmLogic {dst,source,operation}=>{

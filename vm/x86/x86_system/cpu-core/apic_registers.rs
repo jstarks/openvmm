@@ -144,6 +144,8 @@ impl LocalApic {
     fn register_write(self,offset:u16,value:u32)->(out:Result<(Self,Effect),Error>)
         requires self.valid(),
         ensures out is Ok ==> out->Ok_0.0.valid(),
+            out is Ok && offset==0x320 ==> out->Ok_0.0.timer ==
+                (Timer {periodic:value & 0x20000!=0,..self.timer}),
     {
         let mut next=self;
         if offset>=0x320 && offset<=0x370 && offset & 15==0 {
@@ -152,9 +154,6 @@ impl LocalApic {
             if value & !allowed!=0 {return Err(Error::UnsupportedValue);}
             if index==0 {
                 let periodic=value & 0x20000!=0;
-                if self.timer.current!=0 && periodic!=self.timer.periodic {
-                    return Err(Error::Timer(TimerError::RunningReconfiguration));
-                }
                 next.timer.periodic=periodic;
             }
             next.lvt[index]=value | if self.svr & 0x100==0 {0x10000} else {0};

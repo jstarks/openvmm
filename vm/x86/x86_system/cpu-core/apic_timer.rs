@@ -42,15 +42,19 @@ impl Timer {
     pub fn configure(self,dcr:u32,periodic:bool)->(out:Result<Self,Error>)
         requires self.valid(),
         ensures out is Ok ==> out->Ok_0.valid(),
+            out is Ok && self.current!=0 ==> out->Ok_0==self,
     {
         if dcr & !0xbu32 != 0 {return Err(Error::InvalidDivisor);}
-        if self.current!=0 {return Err(Error::RunningReconfiguration);}
         let packed=(dcr & 3) | ((dcr >> 1) & 4);
         assert(packed<=7) by(bit_vector)
             requires packed==(dcr & 3u32) | ((dcr >> 1) & 4u32);
         let shift=if packed==7 {0} else {packed+1};
         let divisor=1u8 << shift;
         assert(1<=divisor<=128) by(bit_vector) requires shift<8u32,divisor==1u8 << shift;
+        if self.current!=0 {
+            if divisor==self.divisor && periodic==self.periodic {return Ok(self);}
+            return Err(Error::RunningReconfiguration);
+        }
         Ok(Self {divisor,phase:0,periodic,..self})
     }
 

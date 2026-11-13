@@ -707,8 +707,10 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     ];
     store_apic(&mut code, 0xf0, 0x1ff);
     store_apic(&mut code, 0x3e0, 11);
-    store_apic(&mut code, 0x320, 0xe0);
+    store_apic(&mut code, 0x320, 0x200e0);
     store_apic(&mut code, 0x380, 1_000_000);
+    store_apic(&mut code, 0x320, 0xe0);
+    store_apic(&mut code, 0x3e0, 11);
     code.push(0xf4);
     code.push(0x90);
     let after_timer = CODE + code.len() as u64;

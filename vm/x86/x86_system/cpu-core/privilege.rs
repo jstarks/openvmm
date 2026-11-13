@@ -158,8 +158,8 @@ pub fn syscall64(cpu:&mut State,s:&mut SystemState,length:u8)->(status:FastStatu
     FastStatus::Advanced
 }
 
-/// APM Vol. 3 pp. 495-498: AMD preserves hidden SS metadata and its selector
-/// RPL, and does not check RCX canonicality here. A bad target faults on the
+/// APM Vol. 3 pp. 495-498: AMD preserves hidden SS metadata, takes SS.RPL
+/// from STAR, and does not check RCX canonicality here. A bad target faults on the
 /// subsequent user fetch, not at SYSRET with kernel privilege.
 pub fn sysret64(cpu:&mut State,s:&mut SystemState)->(status:FastStatus)
     requires model::long64(*old(s)),model::flags64(old(cpu).flags),

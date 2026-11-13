@@ -954,7 +954,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
         program.extend([0x0f, 0x95, 0x04, 0x25]);
         program.extend(((data + 0x40) as u32).to_le_bytes());
         program.extend([0x41, 0x0f, 0x20, 0xd0, 0xb9]);
-        program.extend((if supported_msr { 0x8bu32 } else { 0x8c }).to_le_bytes());
+        program.extend((if supported_msr { 0x8bu32 } else { 0x10 }).to_le_bytes());
         let msr_rip = CODE + program.len() as u64;
         program.extend([0x0f, 0x32, 0xf4]);
         bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
@@ -993,7 +993,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
         let mut expected = initial;
         expected.rax = 0;
         expected.rbx = 0xcccc_dddd;
-        expected.rcx = if supported_msr { 0x8b } else { 0x8c };
+        expected.rcx = if supported_msr { 0x8b } else { 0x10 };
         expected.rdx = if supported_msr { 0 } else { initial.rdx };
         expected.rsi = data + 24;
         expected.rdi = data + 32;
@@ -2098,7 +2098,9 @@ async fn backend_state_profile_and_requested_yield_preserve_cpu(driver: DefaultD
     assert!(devices.faults.lock().is_empty());
 
     let (mut bytes, owned) = fixture();
-    let code = [0xba, 0x01, 0x01, 0, 0xc0].repeat(128);
+    let code = [
+        0xb9, 0x00, 0x20, 0, 0, 0xba, 0x01, 0x01, 0, 0xc0, 0xff, 0xc9, 0x75, 0xf7,
+    ];
     bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
     bytes[CODE as usize + code.len()] = 0xf4;
     let (_, mut binder, _memory, _keeper) = build(&driver, &bytes).await;
@@ -2122,11 +2124,11 @@ async fn backend_state_profile_and_requested_yield_preserve_cpu(driver: DefaultD
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
     drop(run);
     let partial = vp.access_state(Vtl::Vtl0).registers().unwrap();
-    assert_eq!(
-        partial.rip,
-        CODE + 12 * 5,
-        "decode work must yield before HLT"
+    assert!(
+        [CODE + 5, CODE + 10, CODE + 12].contains(&partial.rip),
+        "execution must yield in the loop"
     );
+    assert!(partial.rcx > 0 && partial.rcx < 8192);
     assert_eq!(partial.rdx, 0xc0000101);
 
     let stop = StopVpSource::new();

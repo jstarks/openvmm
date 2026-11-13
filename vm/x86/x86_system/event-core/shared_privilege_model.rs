@@ -154,22 +154,103 @@ pub open spec fn save_fp(s:State,address:Address,wide:bool,length:u8)->(State,Ti
             let at=entry::linear(s,address,length);
             if system.cr4_extra&0x200u64==0 || system.fp.mxcsr&!profile::MXCSR_MASK!=0
                 || system.fp.opcode>0x7ff
-                || (!wide && (system.fp.ip!=0 || system.fp.dp!=0)) {entry::unsupported(s)}
+                || (!wide && system.fp.status&0x80u16!=0 && (system.fp.ip!=0 || system.fp.dp!=0)) {entry::unsupported(s)}
+            else if !mmu_model::canonical(at as int) {entry::unsupported(s)}
             else if at%16!=0 {entry(s,Event::GeneralProtection)}
             else if at%4096>3584 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage))}
-            else {entry::memory(s,at,Width::Qword,WordAccess::Write(system::model::fp_word(system.fp,0,wide)),
-                length,super::super::shared::entry::MemoryTask::SaveFp {index:0,wide})}
+            else if system.fp.status&0x80u16!=0 {
+                entry::memory(s,at,Width::Qword,WordAccess::Write(system::model::fp_word(system.fp,0,wide)),
+                    length,super::super::shared::entry::MemoryTask::SaveFp {index:0,wide})
+            } else {entry::memory(s,at,Width::Dword,WordAccess::Write(
+                system::model::fp_word(system.fp,0,wide)&0xffff_ffffu64),
+                length,super::super::shared::entry::MemoryTask::SaveFpHeader {wide})}
         },
     }}
+}
+#[verifier::opaque]
+pub open spec fn save_fp_header(s:State,address:u64,wide:bool,length:u8)->(State,Tick) {
+    if s.system is None || address>u64::MAX-4 {entry::unsupported(s)}
+    else {entry::memory(s,(address+4) as u64,Width::Word,WordAccess::Write(
+        (system::model::fp_word(s.system.unwrap().fp,0,wide)>>32)&0xffffu64),
+        length,super::super::shared::entry::MemoryTask::SaveFp {index:0,wide})}
 }
 #[verifier::opaque]
 pub open spec fn save_fp_value(s:State,address:u64,index:u8,wide:bool,length:u8)->(State,Tick) {
     if index>=52 {entry::unsupported(s)}
     else if index==51 {entry::retire(s,s.core.cpu,length,false,false)}
     else if address>u64::MAX-8 || s.system is None {entry::unsupported(s)}
-    else {entry::memory(s,(address+8) as u64,Width::Qword,WordAccess::Write(
+    else if index==0 && s.system.unwrap().fp.status&0x80u16==0 {
+        if address>u64::MAX-20 {entry::unsupported(s)}
+        else {entry::memory(s,(address+20) as u64,Width::Qword,WordAccess::Write(
+            system::model::fp_word(s.system.unwrap().fp,3,wide)),
+            length,super::super::shared::entry::MemoryTask::SaveFp {index:3,wide})}
+    } else {entry::memory(s,(address+8) as u64,Width::Qword,WordAccess::Write(
         system::model::fp_word(s.system.unwrap().fp,index as int+1,wide)),
         length,super::super::shared::entry::MemoryTask::SaveFp {index:(index+1) as u8,wide})}
+}
+#[verifier::opaque]
+pub open spec fn load_x87_integer(s:State,address:Address,width:Width,opcode:u16,length:u8)->(State,Tick) {
+    let cpu=s.core.cpu;
+    if length==0 || length>15 || !address.valid() || width==Width::Byte || opcode>0x7ff {
+        entry::unsupported(s)
+    } else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {match s.system {
+        None=>entry::unsupported(s),
+        Some(system)=>if !system::model::integer_ready(system.fp)
+            || !mmu_model::canonical(entry::linear(s,address,length) as int) {entry::unsupported(s)}
+            else {entry::memory(s,entry::linear(s,address,length),width,WordAccess::Read,length,
+                super::super::shared::entry::MemoryTask::LoadX87Integer {width,opcode})},
+    }}
+}
+#[verifier::opaque]
+pub open spec fn load_x87_value(s:State,address:u64,value:u64,width:Width,opcode:u16,length:u8)->(State,Tick) {
+    match s.system {
+        None=>entry::unsupported(s),
+        Some(system)=>if width==Width::Byte || opcode>0x7ff || !system::model::integer_ready(system.fp) {
+            entry::unsupported(s)
+        } else {entry::retire(State {system:Some(SystemState {
+            fp:system::model::push_integer(system.fp,value,width,s.core.cpu.rip as u64,address,opcode),
+            ..system}),..s},s.core.cpu,length,false,false)},
+    }
+}
+#[verifier::opaque]
+pub open spec fn restore_fp(s:State,address:Address,wide:bool,length:u8)->(State,Tick) {
+    if length==0 || length>15 || !address.valid() {entry::unsupported(s)}
+    else if s.core.cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
+    else {match s.system {
+        None=>entry::unsupported(s),
+        Some(system)=>if system.cr4_extra&0x200u64==0 {entry::unsupported(s)}
+            else if !mmu_model::canonical(entry::linear(s,address,length) as int) {entry::unsupported(s)}
+            else if entry::linear(s,address,length)%16!=0 {entry(s,Event::GeneralProtection)}
+            else if entry::linear(s,address,length)%4096>3584 {
+                stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage))
+            } else {entry::memory(State {fp_restore:Some(system.fp),..s},entry::linear(s,address,length),
+                Width::Qword,WordAccess::Read,length,
+                super::super::shared::entry::MemoryTask::RestoreFp {index:0,wide})},
+    }}
+}
+#[verifier::opaque]
+pub open spec fn restore_fp_value(s:State,address:u64,index:u8,value:u64,wide:bool,length:u8)->(State,Tick) {
+    if index>=52 {entry::unsupported(s)}
+    else {match (s.fp_restore,s.system) {
+        (Some(fp),Some(system))=>{
+            if index==0 && ((value as u16)&0xe080u16!=0 || value&0x40u64==0) {entry::unsupported(s)}
+            else if !wide && (index==1 || index==2)
+                && ((fp.status&!fp.control)&0x3fu16)!=0 && value&0xffff_ffff_0000_0000u64!=0 {entry::unsupported(s)}
+            else if index==3 && (value as u32)&!profile::MXCSR_MASK!=0 {entry(s,Event::GeneralProtection)}
+            else {
+                let next=system::model::restore_word(fp,index as int,value,wide);
+                if index==51 {entry::retire(State {
+                    system:Some(SystemState {fp:system::model::finish_restore(next,system.fp),..system}),
+                    fp_restore:None,..s},s.core.cpu,length,false,false)}
+                else if address>u64::MAX-8 {entry::unsupported(s)}
+                else {entry::memory(State {fp_restore:Some(next),..s},(address+8) as u64,Width::Qword,
+                    WordAccess::Read,length,super::super::shared::entry::MemoryTask::RestoreFp {
+                        index:(index+1) as u8,wide})}
+            }
+        },
+        _=>entry::unsupported(s),
+    }}
 }
 #[verifier::opaque]
 pub open spec fn control_x87(s:State,operation:system::X87Control,length:u8)->(State,Tick) {

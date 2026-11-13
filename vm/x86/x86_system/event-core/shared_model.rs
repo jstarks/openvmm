@@ -41,6 +41,7 @@ pub struct State {
     pub pending: Option<u8>, pub shadow: bool, pub halted: bool, pub handler_pending: bool,
     pub external_decode: bool, pub decode_sequence: u64,
     pub system: Option<SystemState>,
+    pub fp_restore:Option<super::memory_core::cpu_core::system::LegacyFpState>,
     pub apic_id:Option<u32>,
 }
 pub open spec fn configure_system(s: State, system: SystemState) -> (State, bool) {

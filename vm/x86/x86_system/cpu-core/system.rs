@@ -51,6 +51,121 @@ pub const EMPTY_LEGACY_FP:LegacyFpState=LegacyFpState {
         [0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],
 };
 impl LegacyFpState {
+    pub fn integer_ready(self)->(out:bool)
+        ensures out==model::integer_ready(self),
+    {
+        let status=self.status;
+        let old_top=(status>>11)&7u16;
+        assert(old_top<=7) by(bit_vector) requires old_top==(status>>11)&7u16;
+        let top=(old_top+7)%8;
+        ((self.tags>>(top*2))&3)==3 && ((self.status&!self.control)&0x3f)==0
+    }
+
+    pub fn push_integer(self,value:u64,width:super::operand::Width,ip:u64,dp:u64,opcode:u16)->(out:Self)
+        ensures out==model::push_integer(self,value,width,ip,dp,opcode),
+    {
+        let raw=value&width.mask();
+        let negative=raw&(1u64<<(width.bits()-1))!=0;
+        let magnitude=if negative {0u64.wrapping_sub(raw)&width.mask()} else {raw};
+        let sign=if negative {0x8000u16} else {0u16};
+        let (significand,exponent)=match super::scalar::scan(magnitude,super::operand::Width::Qword,true) {
+            Some(index)=>(magnitude<<(63-index),((0x3fffu64+index) as u16)|sign),
+            None=>(0u64,0u16),
+        };
+        let status=self.status;
+        let old_top=(status>>11)&7u16;
+        assert(old_top<=7) by(bit_vector) requires old_top==(status>>11)&7u16;
+        let top=(old_top+7)%8;
+        let mut out=self;
+        out.status=(self.status&0xc5ffu16)|(top<<11);
+        out.tags=(self.tags&!(3u16<<(top*2)))|((if magnitude==0 {1u16} else {0u16})<<(top*2));
+        out.ip=ip;out.dp=dp;out.opcode=opcode;
+        out.significands[top as usize]=significand;
+        out.exponents[top as usize]=exponent;
+        proof {
+            assert(out.significands@ =~= model::set8(self.significands,top as int,significand)@);
+            assert(out.exponents@ =~= model::set8(self.exponents,top as int,exponent)@);
+            assert(out.significands == model::set8(self.significands,top as int,significand));
+            assert(out.exponents == model::set8(self.exponents,top as int,exponent));
+        }
+        out
+    }
+
+    pub fn restore_word(self,index:u8,value:u64,wide:bool)->(out:Self)
+        requires index<52,
+        ensures out==model::restore_word(self,index as int,value,wide),
+    {
+        let mut out=self;
+        if index==0 {
+            out.control=(value&0xffff) as u16;
+            out.status=((value>>16)&0xffff) as u16;
+            out.opcode=((value>>48)&0x7ff) as u16;
+            let byte=((value>>32)&0xff) as u16;
+            let pairs=(byte|(byte<<4))&0x0f0fu16;
+            let quads=(pairs|(pairs<<2))&0x3333u16;
+            let bits=(quads|(quads<<1))&0x5555u16;
+            out.tags=!(bits|(bits<<1));
+        } else if index==1 {
+            out.ip=if wide {value} else {value&0xffff_ffff};
+        } else if index==2 {
+            out.dp=if wide {value} else {value&0xffff_ffff};
+        } else if index==3 {
+            out.mxcsr=(value&0xffff_ffff) as u32;
+        } else if index<20 {
+            let status=self.status;
+            let top=(status>>11)&7u16;
+            assert(top<=7) by(bit_vector) requires top==(status>>11)&7u16;
+            let physical=(((index-4)/2+top as u8)%8) as usize;
+            if index%2==0 {
+                out.significands[physical]=value;
+                proof {
+                    assert(out.significands@ =~= model::set8(self.significands,physical as int,value)@);
+                    assert(out.significands == model::set8(self.significands,physical as int,value));
+                }
+            } else {
+                let exponent=(value&0xffff) as u16;
+                out.exponents[physical]=exponent;
+                if (self.tags>>(physical*2))&3!=3 {
+                    let tag=if exponent&0x7fff==0 && self.significands[physical]==0 {1u16}
+                        else if exponent&0x7fff==0 || exponent&0x7fff==0x7fff
+                            || self.significands[physical]&0x8000_0000_0000_0000==0 {2u16}
+                        else {0u16};
+                    out.tags=(self.tags&!(3u16<<(physical*2)))|(tag<<(physical*2));
+                }
+                proof {
+                    assert(out.exponents@ =~= model::set8(self.exponents,physical as int,exponent)@);
+                    assert(out.exponents == model::set8(self.exponents,physical as int,exponent));
+                }
+            }
+        } else {
+            let register=((index-20)/2) as usize;
+            let half=((index-20)%2) as usize;
+            let mut xmm=self.xmm[register];
+            xmm[half]=value;
+            out.xmm[register]=xmm;
+            proof {
+                assert(xmm@ =~= model::set2(self.xmm@[register as int],half as int,value)@);
+                assert(xmm == model::set2(self.xmm@[register as int],half as int,value));
+                assert(out.xmm@ =~= model::set16(self.xmm,register as int,xmm)@);
+                assert(out.xmm == model::set16(self.xmm,register as int,xmm));
+            }
+        }
+        out
+    }
+
+    pub fn finish_restore(self,previous:Self)->(out:Self)
+        ensures out==model::finish_restore(self,previous),
+    {
+        let pending=((self.status&!self.control)&0x3fu16)!=0;
+        Self {
+            status:(self.status&0x7f7fu16)|(if pending {0x8080u16} else {0u16}),
+            ip:if pending {self.ip} else {previous.ip},
+            dp:if pending {self.dp} else {previous.dp},
+            opcode:if pending {self.opcode} else {previous.opcode},
+            ..self
+        }
+    }
+
     pub fn control_x87(self,operation:X87Control)->(out:Self)
         ensures out==match operation {
             X87Control::Initialize=>LegacyFpState {control:0x37f,status:0,tags:0xffff,opcode:0,ip:0,dp:0,..self},
@@ -125,6 +240,83 @@ pub mod model {
     #[cfg(verus_keep_ghost)]
     use super::*;
 
+    pub open spec fn set2<T>(a:[T;2],i:int,v:T)->[T;2] {
+        [if i==0 {v} else {a[0]},if i==1 {v} else {a[1]}]
+    }
+    pub open spec fn set8<T>(a:[T;8],i:int,v:T)->[T;8] {
+        [if i==0 {v} else {a[0]},if i==1 {v} else {a[1]},
+         if i==2 {v} else {a[2]},if i==3 {v} else {a[3]},
+         if i==4 {v} else {a[4]},if i==5 {v} else {a[5]},
+         if i==6 {v} else {a[6]},if i==7 {v} else {a[7]}]
+    }
+    pub open spec fn set16<T>(a:[T;16],i:int,v:T)->[T;16] {
+        [if i==0 {v} else {a[0]},if i==1 {v} else {a[1]},
+         if i==2 {v} else {a[2]},if i==3 {v} else {a[3]},
+         if i==4 {v} else {a[4]},if i==5 {v} else {a[5]},
+         if i==6 {v} else {a[6]},if i==7 {v} else {a[7]},
+         if i==8 {v} else {a[8]},if i==9 {v} else {a[9]},
+         if i==10 {v} else {a[10]},if i==11 {v} else {a[11]},
+         if i==12 {v} else {a[12]},if i==13 {v} else {a[13]},
+         if i==14 {v} else {a[14]},if i==15 {v} else {a[15]}]
+    }
+    pub open spec fn integer_ready(s:LegacyFpState)->bool {
+        let top=(((((s.status>>11)&7u16) as int)+7)%8) as u16;
+        ((s.tags>>(top*2))&3)==3 && ((s.status&!s.control)&0x3fu16)==0
+    }
+    pub open spec fn push_integer(s:LegacyFpState,value:u64,width:super::super::operand::Width,
+        ip:u64,dp:u64,opcode:u16)->LegacyFpState {
+        let raw=value&super::super::operand::model::mask(width);
+        let negative=raw&(1u64<<(super::super::operand::model::bits(width)-1))!=0;
+        let magnitude=if negative {0u64.wrapping_sub(raw)&super::super::operand::model::mask(width)} else {raw};
+        let sign=if negative {0x8000u16} else {0u16};
+        let (significand,exponent)=match super::super::scalar::model::scan(
+            magnitude,super::super::operand::Width::Qword,true) {
+            Some(index)=>if index<64 {(magnitude<<(63-index),((0x3fffu64+index) as u16)|sign)}
+                else {(0u64,0u16)},
+            None=>(0u64,0u16),
+        };
+        let top=(((((s.status>>11)&7u16) as int)+7)%8) as u16;
+        LegacyFpState {
+            status:(s.status&0xc5ffu16)|(top<<11),
+            tags:(s.tags&!(3u16<<(top*2)))|((if magnitude==0 {1u16} else {0u16})<<(top*2)),
+            ip,dp,opcode,
+            significands:set8(s.significands,top as int,significand),
+            exponents:set8(s.exponents,top as int,exponent),..s
+        }
+    }
+    pub open spec fn restore_word(s:LegacyFpState,index:int,value:u64,wide:bool)->LegacyFpState {
+        if index==0 {
+            let byte=((value>>32)&0xffu64) as u16;
+            let pairs=(byte|(byte<<4))&0x0f0fu16;
+            let quads=(pairs|(pairs<<2))&0x3333u16;
+            let bits=(quads|(quads<<1))&0x5555u16;
+            LegacyFpState {control:(value&0xffffu64) as u16,status:((value>>16)&0xffffu64) as u16,
+                opcode:((value>>48)&0x7ffu64) as u16,tags:!(bits|(bits<<1)),..s}
+        } else if index==1 {LegacyFpState {ip:if wide {value} else {value&0xffff_ffffu64},..s}}
+        else if index==2 {LegacyFpState {dp:if wide {value} else {value&0xffff_ffffu64},..s}}
+        else if index==3 {LegacyFpState {mxcsr:(value&0xffff_ffffu64) as u32,..s}}
+        else if index<20 {
+            let physical=((index-4)/2+((s.status>>11)&7u16) as int)%8;
+            if index%2==0 {LegacyFpState {significands:set8(s.significands,physical,value),..s}}
+            else {
+                let exponent=(value&0xffffu64) as u16;
+                let tag=if exponent&0x7fffu16==0 && s.significands@[physical]==0 {1u16}
+                    else if exponent&0x7fffu16==0 || exponent&0x7fffu16==0x7fff
+                        || s.significands@[physical]&0x8000_0000_0000_0000u64==0 {2u16}
+                    else {0u16};
+                LegacyFpState {exponents:set8(s.exponents,physical,exponent),
+                    tags:if (s.tags>>(physical*2))&3u16==3 {s.tags}
+                        else {(s.tags&!(3u16<<(physical*2)))|(tag<<(physical*2))},..s}
+            }
+        } else {LegacyFpState {
+            xmm:set16(s.xmm,(index-20)/2,set2(s.xmm@[(index-20)/2],(index-20)%2,value)),..s}}
+    }
+    pub open spec fn finish_restore(s:LegacyFpState,previous:LegacyFpState)->LegacyFpState {
+        let pending=((s.status&!s.control)&0x3fu16)!=0;
+        LegacyFpState {status:(s.status&0x7f7fu16)|(if pending {0x8080u16} else {0u16}),
+            ip:if pending {s.ip} else {previous.ip},dp:if pending {s.dp} else {previous.dp},
+            opcode:if pending {s.opcode} else {previous.opcode},..s}
+    }
     pub open spec fn fp_word(s:LegacyFpState,index:int,wide:bool)->u64 {
         if index==0 {
             let present=!s.tags;

@@ -21,6 +21,8 @@ pub enum Instruction {
     Breakpoint,
     SwapGs,
     SaveFp {address:Address,wide:bool},
+    RestoreFp {address:Address,wide:bool},
+    LoadX87Integer {address:Address,width:Width,opcode:u16},
     Integer { operation: integer::Operation, dst: Register, source: Operand },
     Alu { operation: integer::Operation, destination: Operand, source: Operand },
     SignExtend { dst: Register, source: Operand, width: Width },
@@ -91,6 +93,9 @@ pub enum MemoryTask {
     TableBase { idt: bool, limit: u16 },
     StoreTableBase {base:u64},
     SaveFp {index:u8,wide:bool},
+    SaveFpHeader {wide:bool},
+    RestoreFp {index:u8,wide:bool},
+    LoadX87Integer {width:Width,opcode:u16},
     TaskLow {selector:u16},
     TaskHigh {selector:u16,low:u64},
     TaskBusy {image:SegmentState,low:u64},
@@ -229,6 +234,14 @@ impl SharedEventMachine {
             Instruction::SaveFp {address,wide}=>{
                 reveal(spec::entry::execute);
                 self.save_fp(address,wide,length)
+            },
+            Instruction::RestoreFp {address,wide}=>{
+                reveal(spec::entry::execute);
+                self.restore_fp(address,wide,length)
+            },
+            Instruction::LoadX87Integer {address,width,opcode}=>{
+                reveal(spec::entry::execute);
+                self.load_x87_integer(address,width,opcode,length)
             },
             Instruction::LoadTask {source}=>{
                 reveal(spec::entry::execute);
@@ -993,6 +1006,15 @@ impl SharedEventMachine {
             },
             MemoryTask::SaveFp {index,wide}=>{
                 return self.finish_fp_save(address,index,wide,length);
+            },
+            MemoryTask::SaveFpHeader {wide}=>{
+                return self.finish_fp_header(address,wide,length);
+            },
+            MemoryTask::RestoreFp {index,wide}=>{
+                return self.finish_fp_restore(address,index,value,wide,length);
+            },
+            MemoryTask::LoadX87Integer {width,opcode}=>{
+                return self.finish_x87_integer(address,value,width,opcode,length);
             },
             MemoryTask::ExchangeAdd {register:source,locked}=>{
                 if !source.is_valid() {

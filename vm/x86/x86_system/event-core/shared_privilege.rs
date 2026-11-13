@@ -245,10 +245,13 @@ impl SharedEventMachine {
         // Only reset pointers have a modeled selector image in the 32-bit format.
         if system.cr4_extra&0x200==0 || system.fp.mxcsr&!profile::MXCSR_MASK!=0
             || system.fp.opcode>0x7ff
-            || (!wide && (system.fp.ip!=0 || system.fp.dp!=0)) {
+            || (!wide && system.fp.status&0x80!=0 && (system.fp.ip!=0 || system.fp.dp!=0)) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        if !canonical(linear) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
         if linear%16!=0 {
             return self.start_entry(Event::GeneralProtection);
         }
@@ -256,7 +259,30 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage));
         }
         let word=system.fp.save_word(0,wide);
-        self.entry_memory(linear,Width::Qword,WordAccess::Write(word),length,
+        if system.fp.status&0x80!=0 {
+            self.entry_memory(linear,Width::Qword,WordAccess::Write(word),length,
+                entry::MemoryTask::SaveFp {index:0,wide})
+        } else {
+            self.entry_memory(linear,Width::Dword,WordAccess::Write(word&0xffff_ffff),length,
+                entry::MemoryTask::SaveFpHeader {wide})
+        }
+    }
+
+    pub(super) fn finish_fp_header(&mut self,address:u64,wide:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::privilege::save_fp_header(old(self)@,address,wide,length),
+    {
+        reveal(spec::privilege::save_fp_header);
+        let Some(system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if address>u64::MAX-4 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let word=(system.fp.save_word(0,wide)>>32)&0xffff;
+        self.entry_memory(address+4,Width::Word,WordAccess::Write(word),length,
             entry::MemoryTask::SaveFp {index:0,wide})
     }
 
@@ -280,10 +306,136 @@ impl SharedEventMachine {
         let Some(system)=self.system else {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
+        // AMD leaves the error pointers and opcode untouched when ES is clear.
+        if index==0 && system.fp.status&0x80==0 {
+            if address>u64::MAX-20 {
+                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            }
+            return self.entry_memory(address+20,Width::Qword,WordAccess::Write(system.fp.save_word(3,wide)),
+                length,entry::MemoryTask::SaveFp {index:3,wide});
+        }
         let next=index+1;
         let word=system.fp.save_word(next,wide);
         self.entry_memory(address+8,Width::Qword,WordAccess::Write(word),length,
             entry::MemoryTask::SaveFp {index:next,wide})
+    }
+
+    pub(super) fn load_x87_integer(&mut self,address:Address,width:Width,opcode:u16,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::privilege::load_x87_integer(old(self)@,address,width,opcode,length),
+    {
+        reveal(spec::privilege::load_x87_integer);
+        let cpu=self.core.cpu();
+        if length==0 || length>15 || !address.is_valid() || width==Width::Byte || opcode>0x7ff {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let Some(system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if !system.fp.integer_ready() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        if !canonical(linear) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        self.entry_memory(linear,width,WordAccess::Read,length,
+            entry::MemoryTask::LoadX87Integer {width,opcode})
+    }
+
+    pub(super) fn finish_x87_integer(&mut self,address:u64,value:u64,width:Width,opcode:u16,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::privilege::load_x87_value(old(self)@,address,value,width,opcode,length),
+    {
+        reveal(spec::privilege::load_x87_value);
+        let cpu=self.core.cpu();
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if width==Width::Byte || opcode>0x7ff || !system.fp.integer_ready() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        system.fp=system.fp.push_integer(value,width,cpu.rip,address,opcode);
+        self.system=Some(system);
+        self.retire_entry(cpu,length,false,false)
+    }
+
+    pub(super) fn restore_fp(&mut self,address:Address,wide:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==spec::privilege::restore_fp(old(self)@,address,wide,length),
+    {
+        reveal(spec::privilege::restore_fp);
+        let cpu=self.core.cpu();
+        if length==0 || length>15 || !address.is_valid() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if cpu.flags&0x100!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
+        }
+        let Some(system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if system.cr4_extra&0x200==0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let linear=address.linear(&cpu.gpr,cpu.rip.wrapping_add(length as u64),self.entry_bases());
+        if !canonical(linear) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if linear%16!=0 {return self.start_entry(Event::GeneralProtection);}
+        if linear%4096>3584 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage));
+        }
+        self.fp_restore=Some(system.fp);
+        self.entry_memory(linear,Width::Qword,WordAccess::Read,length,
+            entry::MemoryTask::RestoreFp {index:0,wide})
+    }
+
+    pub(super) fn finish_fp_restore(&mut self,address:u64,index:u8,value:u64,wide:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::privilege::restore_fp_value(old(self)@,address,index,value,wide,length),
+    {
+        reveal(spec::privilege::restore_fp_value);
+        if index>=52 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+        let Some(mut fp)=self.fp_restore else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if index==0 && ((value as u16)&0xe080!=0 || value&0x40==0) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if !wide && (index==1 || index==2)
+            && ((fp.status&!fp.control)&0x3f)!=0 && value&0xffff_ffff_0000_0000!=0 {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        if index==3 && (value as u32)&!profile::MXCSR_MASK!=0 {
+            return self.start_entry(Event::GeneralProtection);
+        }
+        fp=fp.restore_word(index,value,wide);
+        if index==51 {
+            system.fp=fp.finish_restore(system.fp);
+            self.system=Some(system);
+            self.fp_restore=None;
+            self.retire_entry(self.core.cpu(),length,false,false)
+        } else if address>u64::MAX-8 {
+            self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported))
+        } else {
+            self.fp_restore=Some(fp);
+            self.entry_memory(address+8,Width::Qword,WordAccess::Read,length,
+                entry::MemoryTask::RestoreFp {index:index+1,wide})
+        }
     }
 
     pub(super) fn control_x87(&mut self,operation:memory_core::cpu_core::system::X87Control,length:u8)->(tick:Tick)

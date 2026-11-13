@@ -30,6 +30,67 @@ fn decode(bytes: &[u8], rip: u64) -> Decoded {
 }
 
 #[test]
+fn fild_owns_integer_width_address_and_encoded_x87_opcode() {
+    use x86_system::shared::{decode::DecodeDecision, entry::Instruction};
+    for (bytes, width, opcode) in [
+        (&[0xdf, 0x07][..], Width::Word, 0x707),
+        (&[0xdb, 0x07][..], Width::Dword, 0x307),
+        (&[0xdf, 0x2f][..], Width::Qword, 0x72f),
+    ] {
+        for extended in [false, true] {
+            let encoding = if extended {
+                [&[0x41][..], bytes].concat()
+            } else {
+                bytes.to_vec()
+            };
+            assert_eq!(
+                entry(&encoding),
+                Instruction::LoadX87Integer {
+                    address: Address {
+                        size: AddressSize::Bits64,
+                        segment: Segment::Ds,
+                        base: Base::Register(Gpr::new(if extended { 15 } else { 7 }).unwrap()),
+                        index: None,
+                        scale: Scale::One,
+                        displacement: 0
+                    },
+                    width,
+                    opcode
+                }
+            );
+        }
+        let locked = [&[0xf0][..], bytes].concat();
+        assert_eq!(admission(&locked), DecodeDecision::InvalidOpcode);
+    }
+}
+
+#[test]
+fn fxrstor_retains_pointer_format_without_admitting_xrstor() {
+    use x86_system::shared::{decode::DecodeDecision, entry::Instruction};
+    for (prefix, wide) in [(&[][..], false), (&[0x48][..], true)] {
+        assert_eq!(
+            entry(&[prefix, &[0x0f, 0xae, 0x08]].concat()),
+            Instruction::RestoreFp {
+                address: Address {
+                    size: AddressSize::Bits64,
+                    segment: Segment::Ds,
+                    base: Base::Register(Gpr::new(0).unwrap()),
+                    index: None,
+                    scale: Scale::One,
+                    displacement: 0
+                },
+                wide
+            }
+        );
+    }
+    assert_eq!(admission(&[0x0f, 0xae, 0x28]), DecodeDecision::Unsupported);
+    assert_eq!(
+        admission(&[0xf0, 0x0f, 0xae, 0x08]),
+        DecodeDecision::InvalidOpcode
+    );
+}
+
+#[test]
 fn x87_exception_clear_and_emms_are_owned_controls_not_nops() {
     use x86_system::memory_core::cpu_core::system::X87Control;
     use x86_system::shared::{decode::DecodeDecision, entry::Instruction};
@@ -2214,11 +2275,12 @@ fn startup_admission_keeps_retained_length_and_token_contracts() {
 }
 
 #[test]
-fn nop_admission_ignores_operands_but_keeps_pause_and_forbidden_prefixes_distinct() {
+fn nop_and_pause_admission_ignores_operands_but_rejects_forbidden_prefixes() {
     use x86_system::shared::decode::DecodeDecision;
     use x86_system::shared::entry::Instruction;
     for bytes in [
         &[0x90][..],
+        &[0xf3, 0x90][..],
         &[0x66, 0x90][..],
         &[0x48, 0x90][..],
         &[0x67, 0x90][..],
@@ -2241,7 +2303,6 @@ fn nop_admission_ignores_operands_but_keeps_pause_and_forbidden_prefixes_distinc
     maximum[14] = 0x90;
     assert_eq!(entry(&maximum), Instruction::Nop);
     for bytes in [
-        &[0xf3, 0x90][..],
         &[0xf2, 0x90][..],
         &[0xf3, 0x0f, 0x1f, 0x00][..],
         &[0xf2, 0x0f, 0x1f, 0x00][..],

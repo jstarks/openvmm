@@ -524,6 +524,22 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         Mnemonic::Nop => Some(EntryInstruction::Nop),
         Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => Some(EntryInstruction::Fence),
         Mnemonic::Fninit => Some(EntryInstruction::InitializeX87),
+        Mnemonic::Fild => {
+            let Operand::Memory { address, width } = get(0)? else {
+                return None;
+            };
+            if width == Width::Byte {
+                return None;
+            }
+            let bytes = encoding.bytes();
+            let at = bytes.iter().position(|byte| matches!(byte, 0xdb | 0xdf))?;
+            let opcode = (u16::from(bytes[at] & 7) << 8) | u16::from(*bytes.get(at + 1)?);
+            Some(EntryInstruction::LoadX87Integer {
+                address,
+                width,
+                opcode,
+            })
+        }
         Mnemonic::Fnclex | Mnemonic::Emms => Some(EntryInstruction::ControlX87 {
             operation: if instruction.mnemonic() == Mnemonic::Fnclex {
                 x86_system::memory_core::cpu_core::system::X87Control::ClearExceptions
@@ -538,6 +554,10 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         Mnemonic::Fxsave | Mnemonic::Fxsave64 => Some(EntryInstruction::SaveFp {
             address: address(&instruction, size)?,
             wide: instruction.mnemonic() == Mnemonic::Fxsave64,
+        }),
+        Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => Some(EntryInstruction::RestoreFp {
+            address: address(&instruction, size)?,
+            wide: instruction.mnemonic() == Mnemonic::Fxrstor64,
         }),
         Mnemonic::Shld | Mnemonic::Shrd => {
             let Operand::Register(dst) = get(0)? else {

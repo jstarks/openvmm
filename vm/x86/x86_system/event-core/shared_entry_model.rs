@@ -426,6 +426,8 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::InitializeX87=>privilege::control_x87(s,system::X87Control::Initialize,length),
         Instruction::ControlX87 {operation}=>privilege::control_x87(s,operation,length),
         Instruction::SaveFp {address,wide}=>privilege::save_fp(s,address,wide,length),
+        Instruction::RestoreFp {address,wide}=>privilege::restore_fp(s,address,wide,length),
+        Instruction::LoadX87Integer {address,width,opcode}=>privilege::load_x87_integer(s,address,width,opcode,length),
         Instruction::IndirectJump {source} | Instruction::IndirectCall {source}=>match source {
             Operand::Memory {address,width}=>{
                 if !address.valid() || width!=Width::Qword {unsupported(s)}
@@ -555,6 +557,9 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
     match task {
         MemoryTask::Exchange {register}=>exchange_value(s,register,value,length),
         MemoryTask::SaveFp {index,wide}=>privilege::save_fp_value(s,address,index,wide,length),
+        MemoryTask::SaveFpHeader {wide}=>privilege::save_fp_header(s,address,wide,length),
+        MemoryTask::RestoreFp {index,wide}=>privilege::restore_fp_value(s,address,index,value,wide,length),
+        MemoryTask::LoadX87Integer {width,opcode}=>privilege::load_x87_value(s,address,value,width,opcode,length),
         MemoryTask::ExchangeAdd {register:source,locked}=>{
             if !source.valid() {unsupported(s)} else {
                 let result=integer::model::evaluate(integer::Operation::Add,value,

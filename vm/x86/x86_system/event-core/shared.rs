@@ -6,7 +6,7 @@ use super::shared_model as spec;
 use super::*;
 #[cfg(verus_keep_ghost)]
 use memory_core::cpu_core::system;
-use memory_core::cpu_core::system::{SegmentState, SystemState};
+use memory_core::cpu_core::system::{LegacyFpState, SegmentState, SystemState};
 use memory_core::cpu_core::{descriptor, exception};
 use memory_core::shared::PhysicalRam;
 use mmu_core::shared::io::{IoReply, IoRequest, IoRoute, Operand};
@@ -65,6 +65,8 @@ pub struct SharedEventMachine {
     pending: Option<u8>, shadow: bool, halted: bool, handler_pending: bool,
     external_decode: bool, decode_sequence: u64,
     system: Option<SystemState>,
+    // Uncommitted FXRSTOR data; system.fp remains the architectural owner.
+    fp_restore:Option<LegacyFpState>,
     apic_id:Option<u32>,
 }
 impl View for SharedEventMachine {
@@ -73,7 +75,8 @@ impl View for SharedEventMachine {
         spec::State { core: self.core@, tables: self.tables, phase: self.phase,
             pending: self.pending, shadow: self.shadow, halted: self.halted,
             handler_pending: self.handler_pending, external_decode: self.external_decode,
-            decode_sequence: self.decode_sequence, system: self.system,apic_id:self.apic_id }
+            decode_sequence: self.decode_sequence, system: self.system,apic_id:self.apic_id,
+            fp_restore:self.fp_restore }
     }
 }
 impl SharedEventMachine {
@@ -159,7 +162,7 @@ impl SharedEventMachine {
         proof { core.boundary_facts(); }
         Self { core, tables, phase: Phase::Ready,
             pending: None, shadow: false, halted: false, handler_pending: false,
-            external_decode: false, decode_sequence: 0, system: None,apic_id:None }
+            external_decode: false, decode_sequence: 0, system: None,apic_id:None,fp_restore:None }
     }
 
     pub fn system(&self) -> (out: Option<SystemState>)

@@ -120,7 +120,7 @@ pub open spec fn execute(s:State,instruction:Instruction,length:u8)->(State,Tick
                 || 0x800<=((cpu.gpr[1] as u64)&0xffff_ffffu64)<=0x8ff) {
             control_io::start(s,super::super::shared::control_io::ControlAccess::ReadMsr((cpu.gpr[1] as u64) as u32),length)
         } else if (cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64
-            || profile::absent_core_pmu((cpu.gpr[1] as u64)&0xffff_ffffu64) {
+            || !profile::declared_msr((cpu.gpr[1] as u64)&0xffff_ffffu64,s.apic_id is Some) {
             entry(s,Event::GeneralProtection)
         } else {match s.system {
             None=>entry::unsupported(s),

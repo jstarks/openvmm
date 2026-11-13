@@ -149,10 +149,8 @@ pub open spec fn admitted(s: State) -> (State, Tick) {
                 number:(s.core.cpu.gpr[1] as u64) as u32,
                 value:((s.core.cpu.gpr[0] as u64)&0xffff_ffffu64)|(((s.core.cpu.gpr[2] as u64)&0xffff_ffffu64)<<32),
             },input.length)
-        } else if ((s.core.cpu.gpr[1] as u64)&0xffff_ffffu64==0x49u64
-            && !super::super::memory_core::cpu_core::profile::PRED_CMD_AVAILABLE)
-            || super::super::memory_core::cpu_core::profile::absent_core_pmu(
-                (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64) {
+        } else if !super::super::memory_core::cpu_core::profile::declared_msr(
+            (s.core.cpu.gpr[1] as u64)&0xffff_ffffu64,s.apic_id is Some) {
             if s.core.cpu.flags&0x100u64!=0 {
                 stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))
             } else {entry(s,Event::GeneralProtection)}

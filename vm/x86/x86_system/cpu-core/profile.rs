@@ -26,6 +26,29 @@ pub fn core_pmu_absent(number:u64)->(out:bool)
         || (number>=0xc0010200 && number<=0xc001020b))
 }
 
+// MSRs outside this closed synthetic inventory are architecturally absent.
+// Presence is separate from whether every access has an execution model.
+pub open spec fn declared_msr(number:u64,apic:bool)->bool {
+    matches!(number,0x10 | 0x8b | 0x174 | 0x175 | 0x176
+        | 0xc0000080 | 0xc0000081 | 0xc0000082 | 0xc0000083 | 0xc0000084
+        | 0xc0000100 | 0xc0000101 | 0xc0000102 | 0xc001001f | 0xc0011029)
+        || (apic && (number==0x1b || 0x800<=number<=0x8ff))
+        || (PRED_CMD_AVAILABLE && number==0x49)
+        || (CORE_PMU_AVAILABLE && ((0xc0010000<=number<=0xc0010007)
+            || (0xc0010200<=number<=0xc001020b)))
+}
+pub fn msr_declared(number:u64,apic:bool)->(out:bool)
+    ensures out==declared_msr(number,apic),
+{
+    matches!(number,0x10 | 0x8b | 0x174 | 0x175 | 0x176
+        | 0xc0000080 | 0xc0000081 | 0xc0000082 | 0xc0000083 | 0xc0000084
+        | 0xc0000100 | 0xc0000101 | 0xc0000102 | 0xc001001f | 0xc0011029)
+        || (apic && (number==0x1b || (number>=0x800 && number<=0x8ff)))
+        || (PRED_CMD_AVAILABLE && number==0x49)
+        || (CORE_PMU_AVAILABLE && ((number>=0xc0010000 && number<=0xc0010007)
+            || (number>=0xc0010200 && number<=0xc001020b)))
+}
+
 pub const TSC_HZ:u64=1_000_000_000;
 
 // The initial AMD platform keeps extended CF8 configuration permanently enabled.

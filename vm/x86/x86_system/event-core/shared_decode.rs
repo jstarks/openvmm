@@ -262,8 +262,7 @@ impl SharedEventMachine {
                     let value=(cpu.gpr[0]&0xffff_ffff)|((cpu.gpr[2]&0xffff_ffff)<<32);
                     return self.start_control(ControlAccess::WriteMsr {number,value},input.length);
                 }
-                if (self.core.cpu().gpr[1]&0xffff_ffff==0x49 && !profile::PRED_CMD_AVAILABLE)
-                    || profile::core_pmu_absent(self.core.cpu().gpr[1]&0xffff_ffff) {
+                if !profile::msr_declared(number as u64,self.apic_id.is_some()) {
                     if self.core.cpu().flags&0x100!=0 {
                         return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired));
                     }

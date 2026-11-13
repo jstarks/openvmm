@@ -198,7 +198,7 @@ impl SharedEventMachine {
                 if self.apic_id.is_some() && control_io::apic_msr(number) {
                     return self.start_control(ControlAccess::ReadMsr(number),length);
                 }
-                if cpu.gpr[1]&0xffff_ffff==0x49 || profile::core_pmu_absent(cpu.gpr[1]&0xffff_ffff) {
+                if number==0x49 || !profile::msr_declared(number as u64,self.apic_id.is_some()) {
                     return self.start_entry(Event::GeneralProtection);
                 }
                 let Some(system)=self.system else {

@@ -179,20 +179,6 @@ mod native {
     }
 
     impl WitnessIo {
-        fn configured_port(port: u16, size: usize) -> bool {
-            (size == 1
-                && ((0x20..=0x21).contains(&port)
-                    || (0xa0..=0xa1).contains(&port)
-                    || (0x4d0..=0x4d1).contains(&port)
-                    || (0x40..=0x43).contains(&port)
-                    || (0x70..=0x71).contains(&port)
-                    || port == 0x61
-                    || port == 0x80))
-                || (port >= PM_BASE && usize::from(port - PM_BASE) + size <= 0x37)
-                || (port >= 0xc000 && usize::from(port - 0xc000) + size <= 0x1000)
-                || (((0xcf8..=0xcff).contains(&port) || (0x3f8..=0x3ff).contains(&port))
-                    && usize::from(port & 7) + size <= 8)
-        }
         fn unexpected(&self, operation: &str) {
             self.fatal_error(Box::new(std::io::Error::other(format!(
                 "unexpected {operation} before the declared entry frontier"
@@ -251,18 +237,16 @@ mod native {
         }
         async fn read_io(&self, vp: VpIndex, port: u16, data: &mut [u8]) {
             if let Some(chipset) = &self.chipset {
-                if Self::configured_port(port, data.len()) {
-                    if port == PM_BASE + 8 {
-                        let read = self.pm_reads.fetch_add(1, Ordering::Relaxed) + 1;
-                        if self.pm_stalls && read.is_multiple_of(7) {
-                            // Deschedule the VP's host thread without pausing guest time.
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            self.pm_stalls_injected.fetch_add(1, Ordering::Relaxed);
-                        }
+                if port == PM_BASE + 8 {
+                    let read = self.pm_reads.fetch_add(1, Ordering::Relaxed) + 1;
+                    if self.pm_stalls && read.is_multiple_of(7) {
+                        // Deschedule the VP's host thread without pausing guest time.
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        self.pm_stalls_injected.fetch_add(1, Ordering::Relaxed);
                     }
-                    chipset.io_read(vp.index(), port, data).await;
-                    return;
                 }
+                chipset.io_read(vp.index(), port, data).await;
+                return;
             }
             self.fatal_error(Box::new(UnconfiguredPort {
                 operation: "input",
@@ -273,10 +257,8 @@ mod native {
         }
         async fn write_io(&self, vp: VpIndex, port: u16, data: &[u8]) {
             if let Some(chipset) = &self.chipset {
-                if Self::configured_port(port, data.len()) {
-                    chipset.io_write(vp.index(), port, data).await;
-                    return;
-                }
+                chipset.io_write(vp.index(), port, data).await;
+                return;
             }
             self.fatal_error(Box::new(UnconfiguredPort {
                 operation: "output",
@@ -293,6 +275,75 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[pal_async::async_test]
+        async fn unclaimed_ports_rowi_while_claimed_ports_reach_the_chipset(driver: DefaultDriver) {
+            async fn complete(io: &WitnessIo, operation: impl Future<Output = ()>) {
+                match select(Box::pin(operation), Box::pin(io.failed())).await {
+                    Either::Left(((), _)) => {}
+                    Either::Right(_) => panic!("harness rejected chipset I/O"),
+                }
+            }
+
+            let mut io = WitnessIo::default();
+            let memory = GuestMemory::allocate(4096);
+            let keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+            let time = keeper.builder().build(&driver).await.unwrap();
+            let units = state_unit::StateUnits::new();
+            let time_unit = units
+                .add("vmtime")
+                .spawn(driver.clone(), move |recv| async move {
+                    let mut keeper = keeper;
+                    vmm_core::vmtime_unit::run_vmtime(&mut keeper, recv).await;
+                    keeper
+                })
+                .unwrap();
+            let drivers = VmTaskDriverSource::new(ThreadDriverBackend::new(driver));
+            let mut config = vmotherboard::options::BaseChipsetDevices::empty();
+            config.deps_generic_pci_bus = Some(vmotherboard::options::dev::GenericPciBusDeps {
+                bus_id: vmotherboard::BusIdPci::new("pci"),
+                pio_addr: 0xcf8,
+                pio_data: 0xcfc,
+                amd_extended_config: false,
+            });
+            let output = vmotherboard::BaseChipsetBuilder::new(
+                vmotherboard::options::BaseChipsetFoundation {
+                    is_restoring: false,
+                    untrusted_dma_memory: memory.clone(),
+                    trusted_vtl0_dma_memory: memory,
+                    power_event_handler: io.events.clone(),
+                    debug_event_handler: io.events.clone(),
+                    vmtime: &time,
+                    vmtime_unit: time_unit.handle(),
+                    doorbell_registration: None,
+                },
+                config,
+            )
+            .build(&drivers, &units, &vm_resource::ResourceResolver::new())
+            .await
+            .unwrap();
+            let (chipset, _devices) = output.chipset_builder.build().unwrap();
+            io.chipset = Some(chipset);
+            let vp = VpIndex::new(0);
+            for port in [0x87, 0x2f9, 0x4321] {
+                for size in [1, 2, 4] {
+                    let mut bytes = [0x5a; 6];
+                    complete(&io, io.read_io(vp, port, &mut bytes[1..size + 1])).await;
+                    assert_eq!(&bytes[1..size + 1], &[0xff; 4][..size]);
+                    assert_eq!((bytes[0], bytes[size + 1]), (0x5a, 0x5a));
+                    complete(&io, io.write_io(vp, port, &[0; 4][..size])).await;
+                    complete(&io, io.read_io(vp, port, &mut bytes[1..size + 1])).await;
+                    assert_eq!(&bytes[1..size + 1], &[0xff; 4][..size]);
+                }
+            }
+            let address = 0x8000_0800u32.to_le_bytes();
+            complete(&io, io.write_io(vp, 0xcf8, &address)).await;
+            let mut actual = [0; 4];
+            complete(&io, io.read_io(vp, 0xcf8, &mut actual)).await;
+            assert_eq!(actual, address);
+            assert!(io.events.error.lock().is_none());
+        }
+
         #[test]
         fn asserted_unimplemented_irq_is_explicit_and_preserves_the_first_stop() {
             for existing in [false, true] {
@@ -756,7 +807,10 @@ mod native {
             .next()
             .context("missing pre-reset mapping projection")?;
         let option = args.next();
-        let probe_apic = option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic"));
+        let slow_time = option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic-slow"));
+        let probe_apic =
+            slow_time || option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic"));
+        let clock_slowdown = std::num::NonZeroU16::new(if slow_time { 10 } else { 1 }).unwrap();
         let pm_stalls = option.as_deref() == Some(std::ffi::OsStr::new("--probe-pm-stalls"));
         let loader_inputs = option.as_deref() == Some(std::ffi::OsStr::new("--loader-inputs"));
         let probe = match option {
@@ -809,7 +863,8 @@ mod native {
             .build(1)?;
         let layout = MemoryLayout::new(RAM, &[], &[], &[], None)?;
         let memory = GuestMemory::allocate(usize::try_from(RAM)?);
-        let keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+        let keeper =
+            VmTimeKeeper::new_with_slowdown(&driver, VmTime::from_100ns(0), clock_slowdown);
         let time = keeper.builder().build(&driver).await?;
         let mut hypervisor = EmuHypervisor;
         let config = ProtoPartitionConfig {
@@ -1363,6 +1418,7 @@ mod native {
                 serde_json::json!({
                     "probe":true,"acceptance":false,"stop":failure.to_string(),"target":probe_target,
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
+                    "clock_slowdown":clock_slowdown.get(),
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
                     "kernel_image_bytes":encoding,
                     "instruction_walk":walk_trace(&memory,registers.cr3,registers.rip)?,

@@ -2308,7 +2308,6 @@ fn nop_and_pause_admission_ignores_operands_but_rejects_forbidden_prefixes() {
         &[0xf2, 0x90][..],
         &[0xf3, 0x0f, 0x1f, 0x00][..],
         &[0xf2, 0x0f, 0x1f, 0x00][..],
-        &[0x41, 0x90][..],
     ] {
         assert_eq!(
             admission(bytes),
@@ -3643,4 +3642,153 @@ fn xmm_narrow_unpacks_and_shuffles_retain_lanes_and_all_immediate_controls() {
     ] {
         assert_eq!(admission(bytes), DecodeDecision::Unsupported);
     }
+}
+
+#[test]
+fn xmm_packed_arithmetic_retains_lane_width_direction_and_full_memory_sources() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for (opcode, width, subtract) in [
+        (0xfc, Width::Byte, false),
+        (0xfd, Width::Word, false),
+        (0xfe, Width::Dword, false),
+        (0xd4, Width::Qword, false),
+        (0xf8, Width::Byte, true),
+        (0xf9, Width::Word, true),
+        (0xfa, Width::Dword, true),
+        (0xfb, Width::Qword, true),
+    ] {
+        assert_eq!(
+            entry(&[0x66, 0x45, 0x0f, opcode, 0xf8]),
+            Instruction::XmmArithmetic {
+                dst: 15,
+                source: 8,
+                width,
+                subtract
+            }
+        );
+        let Instruction::XmmArithmeticMemory {
+            index,
+            width: actual,
+            subtract: sub,
+            ..
+        } = entry(&[0x66, 0x44, 0x0f, opcode, 0x38])
+        else {
+            panic!()
+        };
+        assert_eq!((index, actual, sub), (15, width, subtract));
+    }
+    for bytes in [
+        &[0x66, 0x0f, 0xdc, 0xc1][..],
+        &[0x66, 0x0f, 0xd8, 0xc1],
+        &[0x0f, 0xfc, 0xc1],
+        &[0xc5, 0xf9, 0xfc, 0xc1],
+    ] {
+        assert_eq!(admission(bytes), DecodeDecision::Unsupported);
+    }
+    assert_eq!(
+        admission(&[0xf0, 0x66, 0x0f, 0xf8, 0xc1]),
+        DecodeDecision::InvalidOpcode
+    );
+}
+
+#[test]
+fn xmm_double_quadword_shifts_retain_byte_counts_direction_and_extended_registers() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for count in 0..=255 {
+        for left in [false, true] {
+            for index in [0, 8, 15] {
+                let bytes = [
+                    0x66,
+                    if index >= 8 { 0x41 } else { 0x40 },
+                    0x0f,
+                    0x73,
+                    (if left { 0xf8 } else { 0xd8 }) | (index & 7),
+                    count,
+                ];
+                assert_eq!(
+                    entry(&bytes),
+                    Instruction::XmmByteShift { index, count, left }
+                );
+            }
+        }
+    }
+    assert_eq!(
+        admission(&[0xc5, 0xf9, 0x73, 0xf8, 0x01]),
+        DecodeDecision::Unsupported
+    );
+    assert_eq!(
+        admission(&[0xf0, 0x66, 0x0f, 0x73, 0xf8, 0x01]),
+        DecodeDecision::InvalidOpcode
+    );
+}
+
+#[test]
+fn register_exchange_admits_accumulator_modrm_extensions_and_byte_aliases_but_not_lock() {
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    for (prefix, width) in [
+        (&[][..], Width::Dword),
+        (&[0x66][..], Width::Word),
+        (&[0x48][..], Width::Qword),
+    ] {
+        let Instruction::ExchangeRegisters { left, right } = entry(&[prefix, &[0x91]].concat())
+        else {
+            panic!()
+        };
+        assert_eq!(left.width(), width);
+        assert_eq!(right.width(), width);
+        let mut indices = [left.gpr().index(), right.gpr().index()];
+        indices.sort();
+        assert_eq!(indices, [0, 1]);
+    }
+    for bytes in [
+        &[0x41, 0x90][..],
+        &[0x49, 0x90],
+        &[0x4d, 0x87, 0xc7],
+        &[0x66, 0x45, 0x87, 0xc7],
+    ] {
+        assert!(matches!(
+            entry(bytes),
+            Instruction::ExchangeRegisters { .. }
+        ));
+    }
+    let Instruction::ExchangeRegisters { left, right } = entry(&[0x86, 0xe0]) else {
+        panic!()
+    };
+    assert_eq!((left.gpr().index(), right.gpr().index()), (0, 0));
+    assert_ne!(left.high_byte(), right.high_byte());
+    assert!(matches!(
+        entry(&[0x87, 0xc0]),
+        Instruction::ExchangeRegisters { .. }
+    ));
+    assert_eq!(entry(&[0x90]), Instruction::Nop);
+    assert_eq!(
+        admission(&[0xf0, 0x87, 0xc1]),
+        DecodeDecision::InvalidOpcode
+    );
+    assert_eq!(admission(&[0xf3, 0x87, 0xc1]), DecodeDecision::Unsupported);
+}
+
+#[test]
+fn disabled_cet_shadow_stack_reads_are_nops_not_zero_returning_register_loads() {
+    use x86_system::memory_core::cpu_core::profile;
+    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::shared::entry::Instruction;
+    assert_eq!(profile::cpuid(7, 0)[2] & (1 << 7), 0);
+    for wide in [false, true] {
+        for index in 0..16 {
+            let mut bytes = vec![0xf3];
+            if wide || index >= 8 {
+                bytes.push(0x40 | if wide { 8 } else { 0 } | if index >= 8 { 1 } else { 0 });
+            }
+            bytes.extend([0x0f, 0x1e, 0xc8 | (index & 7)]);
+            assert_eq!(entry(&bytes), Instruction::Nop);
+        }
+    }
+    assert_eq!(
+        admission(&[0xf0, 0xf3, 0x48, 0x0f, 0x1e, 0xc8]),
+        DecodeDecision::InvalidOpcode
+    );
 }

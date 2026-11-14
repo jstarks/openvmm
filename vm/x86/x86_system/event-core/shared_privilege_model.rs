@@ -13,6 +13,29 @@ use super::*;
 
 verus! {
 #[verifier::opaque]
+pub open spec fn finish_xmm_byte_shift(s:State,index:u8,count:u8,left:bool,length:u8)->(State,Tick) {
+    if s.system is None || index>=16 {entry::unsupported(s)}
+    else {
+        let system=s.system.unwrap();
+        entry::retire(State {system:Some(SystemState {
+            fp:system::model::xmm_byte_shift(system.fp,index,count,left),..system}),..s},
+            s.core.cpu,length,false,false)
+    }
+}
+
+#[verifier::opaque]
+pub open spec fn finish_xmm_arithmetic(s:State,dst:u8,low:u64,high:u64,width:Width,subtract:bool,length:u8)->(State,Tick) {
+    if s.system is None || dst>=16 {entry::unsupported(s)}
+    else {
+        let system=s.system.unwrap();
+        entry::retire(State {system:Some(SystemState {
+            fp:system::model::xmm_packed(system.fp,dst,low,high,width,
+                if subtract {system::PackedOperation::Subtract} else {system::PackedOperation::Add}),..system}),..s},
+            s.core.cpu,length,false,false)
+    }
+}
+
+#[verifier::opaque]
 pub open spec fn finish_xmm_equal(s:State,dst:u8,low:u64,high:u64,width:Width,length:u8)->(State,Tick) {
     if s.system is None || dst>=16 || width==Width::Qword {entry::unsupported(s)}
     else {
@@ -25,15 +48,17 @@ pub open spec fn finish_xmm_equal(s:State,dst:u8,low:u64,high:u64,width:Width,le
 #[verifier::opaque]
 pub open spec fn execute_xmm_equal_memory(s:State,address:Address,index:u8,width:Width,length:u8)->(State,Tick) {
     if width==Width::Qword {entry::unsupported(s)}
-    else {
-        let result=execute_xmm_memory(s,address,index,false,super::super::shared::entry::XmmMemoryKind::Aligned,length);
-        match result.0.phase {
-            Phase::EntryMemory {address,length,task:super::super::shared::entry::MemoryTask::XmmLow {..}}=>
-                (State {phase:Phase::EntryMemory {address,length,
-                    task:super::super::shared::entry::MemoryTask::XmmLow {
-                        index,action:super::super::shared::entry::XmmReadAction::Equal(width)}},..result.0},result.1),
-            _=>result,
-        }
+    else {execute_xmm_read(s,address,index,super::super::shared::entry::XmmReadAction::Equal(width),length)}
+}
+#[verifier::opaque]
+pub open spec fn execute_xmm_read(s:State,address:Address,index:u8,action:super::super::shared::entry::XmmReadAction,length:u8)->(State,Tick) {
+    let result=execute_xmm_memory(s,address,index,false,super::super::shared::entry::XmmMemoryKind::Aligned,length);
+    match result.0.phase {
+        Phase::EntryMemory {address,length,task:super::super::shared::entry::MemoryTask::XmmLow {..}}=>
+            (State {phase:Phase::EntryMemory {address,length,
+                task:super::super::shared::entry::MemoryTask::XmmLow {
+                    index,action}},..result.0},result.1),
+        _=>result,
     }
 }
 
@@ -57,6 +82,8 @@ pub open spec fn finish_xmm_memory(s:State,address:u64,task:super::super::shared
         super::super::shared::entry::MemoryTask::XmmHigh {index,low,action}=>match action {
             super::super::shared::entry::XmmReadAction::Move=>finish_xmm_pair(s,index,low,value,length),
             super::super::shared::entry::XmmReadAction::Equal(width)=>finish_xmm_equal(s,index,low,value,width,length),
+            super::super::shared::entry::XmmReadAction::Arithmetic {width,subtract}=>
+                finish_xmm_arithmetic(s,index,low,value,width,subtract,length),
         },
         super::super::shared::entry::MemoryTask::XmmHalf {index,high}=>
             if s.system is None || index>=16 {entry::unsupported(s)}
@@ -115,6 +142,15 @@ pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,
         let system=s.system.unwrap();
         let cpu=s.core.cpu;
         match instruction {
+            Instruction::XmmArithmeticMemory {address,index,width,subtract}=>
+                execute_xmm_read(s,address,index,
+                    super::super::shared::entry::XmmReadAction::Arithmetic {width,subtract},length),
+            Instruction::XmmArithmetic {dst,source,width,subtract}=>
+                if source>=16 {entry::unsupported(s)}
+                else {
+                    let pair=system.fp.xmm[source as int];
+                    finish_xmm_arithmetic(s,dst,pair[0],pair[1],width,subtract,length)
+                },
             Instruction::XmmEqualMemory {address,index,width}=>
                 execute_xmm_equal_memory(s,address,index,width,length),
             Instruction::XmmEqual {dst,source,width}=>
@@ -201,6 +237,7 @@ pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,
                     fp:system::model::xmm_shuffle(system.fp,dst,source,control),..system}),..s},
                     cpu,length,false,false)}
             },
+            Instruction::XmmByteShift {index,count,left}=>finish_xmm_byte_shift(s,index,count,left,length),
             Instruction::XmmLogic {dst,source,operation}=>{
                 if dst>=16 || source>=16 {entry::unsupported(s)}
                 else {entry::retire(State {system:Some(SystemState {

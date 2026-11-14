@@ -244,8 +244,10 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         Instruction::XmmLoad {..}|Instruction::XmmStore {..}
             |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}
             |Instruction::XmmUnpackNarrow {..}|Instruction::XmmShuffle {..}
+            |Instruction::XmmByteShift {..}
             |Instruction::XmmLogic {..}
             |Instruction::XmmEqual {..}|Instruction::XmmEqualMemory {..}|Instruction::XmmMask {..}
+            |Instruction::XmmArithmetic {..}|Instruction::XmmArithmeticMemory {..}
             |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>
                 privilege::execute_xmm(s,instruction,length),
         Instruction::ByteSwap {dst}=>{
@@ -256,6 +258,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
         },
         Instruction::ReadTimestamp=>timestamp(s,length),
         Instruction::ExchangeMemory {address,source}=>exchange_memory(s,address,source,length),
+        Instruction::ExchangeRegisters {left,right}=>exchange_registers(s,left,right,length),
         Instruction::Breakpoint=>privilege::breakpoint(s,length),
         Instruction::SwapGs=>privilege::swap_gs(s,length),
         Instruction::LoadTask {source}=>load_task(s,source,length),
@@ -531,6 +534,17 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
     } }
 }
 #[verifier::opaque]
+#[verifier::opaque]
+pub open spec fn exchange_registers(s:State,left:operand::Register,right:operand::Register,length:u8)->(State,Tick) {
+    if !left.valid() || !right.valid() || left@.width!=right@.width {unsupported(s)}
+    else {
+        let registers=registers(s.core.cpu);
+        let a=operand::model::read(registers,left);
+        let b=operand::model::read(registers,right);
+        retire(s,model::State {gpr:operand::model::write(operand::model::write(registers,left,b),right,a)
+            .map(|i:int,v:u64|v as int),..s.core.cpu},length,false,false)
+    }
+}
 pub open spec fn exchange_value(s:State,register:operand::Register,value:u64,length:u8)->(State,Tick) {
     if !register.valid() {unsupported(s)}
     else {retire(s,model::State {gpr:operand::model::write(registers(s.core.cpu),register,value)

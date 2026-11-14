@@ -365,6 +365,12 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
     {
         return Some(EntryInstruction::Nop);
     }
+    // The supported system profile excludes CR4.CET.
+    if matches!(instruction.mnemonic(), Mnemonic::Rdsspd | Mnemonic::Rdsspq)
+        && profile::cpuid(7, 0)[2] & (1 << 7) == 0
+    {
+        return Some(EntryInstruction::Nop);
+    }
     if matches!(
         instruction.mnemonic(),
         Mnemonic::Movd
@@ -378,6 +384,8 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             | Mnemonic::Punpckhbw
             | Mnemonic::Punpckhwd
             | Mnemonic::Pshufd
+            | Mnemonic::Pslldq
+            | Mnemonic::Psrldq
             | Mnemonic::Movhps
             | Mnemonic::Movlps
             | Mnemonic::Movhpd
@@ -411,6 +419,14 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             | Mnemonic::Pcmpeqw
             | Mnemonic::Pcmpeqd
             | Mnemonic::Pmovmskb
+            | Mnemonic::Paddb
+            | Mnemonic::Paddw
+            | Mnemonic::Paddd
+            | Mnemonic::Paddq
+            | Mnemonic::Psubb
+            | Mnemonic::Psubw
+            | Mnemonic::Psubd
+            | Mnemonic::Psubq
     ) {
         return admit_xmm(&instruction, size);
     }
@@ -421,15 +437,24 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
             return None;
         }
-        let Operand::Memory { address, width } = operand(&instruction, 0, Operation::Mov, size)?
-        else {
-            return None;
-        };
+        let destination = operand(&instruction, 0, Operation::Mov, size)?;
         let Operand::Register(source) = operand(&instruction, 1, Operation::Mov, size)? else {
             return None;
         };
-        return (width == source.width())
-            .then_some(EntryInstruction::ExchangeMemory { address, source });
+        return match destination {
+            Operand::Memory { address, width } if width == source.width() => {
+                Some(EntryInstruction::ExchangeMemory { address, source })
+            }
+            Operand::Register(left)
+                if left.width() == source.width() && !instruction.has_lock_prefix() =>
+            {
+                Some(EntryInstruction::ExchangeRegisters {
+                    left,
+                    right: source,
+                })
+            }
+            _ => None,
+        };
     }
     if instruction.mnemonic() == Mnemonic::Xadd {
         if instruction.has_rep_prefix() || instruction.has_repne_prefix() {
@@ -1161,6 +1186,56 @@ fn admit_xmm(instruction: &Instruction, size: AddressSize) -> Option<EntryInstru
     }
     if instruction.op_count() != 2 {
         return None;
+    }
+    if matches!(instruction.mnemonic(), Mnemonic::Pslldq | Mnemonic::Psrldq) {
+        if instruction.op1_kind() != OpKind::Immediate8 {
+            return None;
+        }
+        return Some(EntryInstruction::XmmByteShift {
+            index: dst?,
+            count: instruction.immediate8(),
+            left: instruction.mnemonic() == Mnemonic::Pslldq,
+        });
+    }
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Paddb
+            | Mnemonic::Paddw
+            | Mnemonic::Paddd
+            | Mnemonic::Paddq
+            | Mnemonic::Psubb
+            | Mnemonic::Psubw
+            | Mnemonic::Psubd
+            | Mnemonic::Psubq
+    ) {
+        let width = match instruction.mnemonic() {
+            Mnemonic::Paddb | Mnemonic::Psubb => Width::Byte,
+            Mnemonic::Paddw | Mnemonic::Psubw => Width::Word,
+            Mnemonic::Paddd | Mnemonic::Psubd => Width::Dword,
+            _ => Width::Qword,
+        };
+        let subtract = matches!(
+            instruction.mnemonic(),
+            Mnemonic::Psubb | Mnemonic::Psubw | Mnemonic::Psubd | Mnemonic::Psubq
+        );
+        let index = dst?;
+        return if let Some(source) = source {
+            Some(EntryInstruction::XmmArithmetic {
+                dst: index,
+                source,
+                width,
+                subtract,
+            })
+        } else if instruction.op1_kind() == OpKind::Memory {
+            Some(EntryInstruction::XmmArithmeticMemory {
+                address: address(instruction, size)?,
+                index,
+                width,
+                subtract,
+            })
+        } else {
+            None
+        };
     }
     if instruction.mnemonic() == Mnemonic::Pmovmskb {
         let Operand::Register(dst) = operand(instruction, 0, Operation::Mov, size)? else {

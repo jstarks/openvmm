@@ -10,6 +10,39 @@ use memory_core::cpu_core::{privilege, profile};
 
 verus! {
 impl SharedEventMachine {
+    pub(super) fn finish_xmm_byte_shift(&mut self,index:u8,count:u8,left:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==
+            spec::privilege::finish_xmm_byte_shift(old(self)@,index,count,left,length),
+    {
+        reveal(spec::privilege::finish_xmm_byte_shift);
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if index>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+        system.fp=system.fp.xmm_byte_shift(index,count,left);
+        self.system=Some(system);
+        self.retire_entry(self.core.cpu(),length,false,false)
+    }
+
+    pub(super) fn finish_xmm_arithmetic(&mut self,dst:u8,low:u64,high:u64,width:Width,subtract:bool,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==
+            spec::privilege::finish_xmm_arithmetic(old(self)@,dst,low,high,width,subtract,length),
+    {
+        reveal(spec::privilege::finish_xmm_arithmetic);
+        let Some(mut system)=self.system else {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        };
+        if dst>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+        system.fp=system.fp.xmm_packed(dst,low,high,width,
+            if subtract {system::PackedOperation::Subtract} else {system::PackedOperation::Add});
+        self.system=Some(system);
+        self.retire_entry(self.core.cpu(),length,false,false)
+    }
+
     pub(super) fn finish_xmm_equal(&mut self,dst:u8,low:u64,high:u64,width:Width,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
@@ -36,10 +69,20 @@ impl SharedEventMachine {
     {
         reveal(spec::privilege::execute_xmm_equal_memory);
         if width==Width::Qword {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+        self.execute_xmm_read(address,index,entry::XmmReadAction::Equal(width),length)
+    }
+
+    pub(super) fn execute_xmm_read(&mut self,address:Address,index:u8,action:entry::XmmReadAction,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),(final(self)@,tick)==
+            spec::privilege::execute_xmm_read(old(self)@,address,index,action,length),
+    {
+        reveal(spec::privilege::execute_xmm_read);
         let tick=self.execute_xmm_memory(address,index,false,entry::XmmMemoryKind::Aligned,length);
         if let Phase::EntryMemory {address,length,task:entry::MemoryTask::XmmLow {..}}=self.phase {
             self.phase=Phase::EntryMemory {address,length,
-                task:entry::MemoryTask::XmmLow {index,action:entry::XmmReadAction::Equal(width)}};
+                task:entry::MemoryTask::XmmLow {index,action}};
         }
         tick
     }
@@ -77,6 +120,8 @@ impl SharedEventMachine {
             entry::MemoryTask::XmmHigh {index,low,action}=>match action {
                 entry::XmmReadAction::Move=>self.finish_xmm_pair(index,low,value,length),
                 entry::XmmReadAction::Equal(width)=>self.finish_xmm_equal(index,low,value,width,length),
+                entry::XmmReadAction::Arithmetic {width,subtract}=>
+                    self.finish_xmm_arithmetic(index,low,value,width,subtract,length),
             },
             entry::MemoryTask::XmmHalf {index,high}=>{
                 let Some(system)=self.system else {
@@ -162,6 +207,13 @@ impl SharedEventMachine {
         };
         if system.cr4_extra&0x200==0 {return self.start_entry(Event::InvalidOpcode);}
         match instruction {
+            Instruction::XmmArithmeticMemory {address,index,width,subtract}=>
+                self.execute_xmm_read(address,index,entry::XmmReadAction::Arithmetic {width,subtract},length),
+            Instruction::XmmArithmetic {dst,source,width,subtract}=>{
+                if source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
+                let pair=system.fp.xmm[source as usize];
+                self.finish_xmm_arithmetic(dst,pair[0],pair[1],width,subtract,length)
+            },
             Instruction::XmmEqualMemory {address,index,width}=>
                 self.execute_xmm_equal_memory(address,index,width,length),
             Instruction::XmmEqual {dst,source,width}=>{
@@ -265,6 +317,7 @@ impl SharedEventMachine {
                 self.system=Some(system);
                 self.retire_entry(cpu,length,false,false)
             },
+            Instruction::XmmByteShift {index,count,left}=>self.finish_xmm_byte_shift(index,count,left,length),
             Instruction::XmmLogic {dst,source,operation}=>{
                 if dst>=16 || source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
                 system.fp=system.fp.xmm_logic(dst,source,operation);

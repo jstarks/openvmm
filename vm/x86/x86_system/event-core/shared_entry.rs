@@ -28,9 +28,12 @@ pub enum Instruction {
     XmmUnpack {dst:u8,source:u8,wide:bool,high:bool},
     XmmUnpackNarrow {dst:u8,source:u8,word:bool,high:bool},
     XmmShuffle {dst:u8,source:u8,control:u8},
+    XmmByteShift {index:u8,count:u8,left:bool},
     XmmLogic {dst:u8,source:u8,operation:system::XmmLogic},
     XmmEqual {dst:u8,source:u8,width:Width},
     XmmEqualMemory {address:Address,index:u8,width:Width},
+    XmmArithmetic {dst:u8,source:u8,width:Width,subtract:bool},
+    XmmArithmeticMemory {address:Address,index:u8,width:Width,subtract:bool},
     XmmMask {dst:Register,source:u8},
     XmmCopy {dst:u8,source:u8},
     XmmMerge {dst:u8,source:u8,high:bool},
@@ -64,6 +67,7 @@ pub enum Instruction {
     LockedAlu { operation:integer::Operation,destination:Operand,source:Operand },
     ExchangeAdd {destination:Operand,source:Register,locked:bool},
     ExchangeMemory {address:Address,source:Register},
+    ExchangeRegisters {left:Register,right:Register},
     ReadMsr,
     ReadTimestamp,
     PortIo { port: Port, width: Width, write: bool },
@@ -96,7 +100,7 @@ pub enum Port { Dx, Immediate(u8) }
 pub enum XmmMemoryKind {Low,High,Aligned,Unaligned}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum XmmReadAction {Move,Equal(Width)}
+pub enum XmmReadAction {Move,Equal(Width),Arithmetic {width:Width,subtract:bool}}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortRequest {
@@ -263,8 +267,10 @@ impl SharedEventMachine {
             Instruction::XmmLoad {..}|Instruction::XmmStore {..}
                 |Instruction::XmmCopyLow {..}|Instruction::XmmUnpack {..}
                 |Instruction::XmmUnpackNarrow {..}|Instruction::XmmShuffle {..}
+                |Instruction::XmmByteShift {..}
                 |Instruction::XmmLogic {..}
                 |Instruction::XmmEqual {..}|Instruction::XmmEqualMemory {..}|Instruction::XmmMask {..}
+                |Instruction::XmmArithmetic {..}|Instruction::XmmArithmeticMemory {..}
                 |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>{
                 reveal(spec::entry::execute);
                 self.execute_xmm(instruction,length)
@@ -341,6 +347,10 @@ impl SharedEventMachine {
             Instruction::ExchangeMemory {address,source}=>{
                 reveal(spec::entry::execute);
                 self.execute_exchange_memory(address,source,length)
+            },
+            Instruction::ExchangeRegisters {left,right}=>{
+                reveal(spec::entry::execute);
+                self.exchange_registers(left,right,length)
             },
             Instruction::MultiplyWide {source,width,signed}=>{
                 reveal(spec::entry::execute);
@@ -962,6 +972,29 @@ impl SharedEventMachine {
         self.phase=Phase::EntryMemory {address:linear,length,
             task:MemoryTask::LockedAlu {operation,source:value,width}};
         Tick::Pending
+    }
+
+    pub(super) fn exchange_registers(&mut self,left:Register,right:Register,length:u8)->(tick:Tick)
+        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
+            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
+        ensures final(self).invariant(),
+            (final(self)@,tick)==spec::entry::exchange_registers(old(self)@,left,right,length),
+    {
+        reveal(spec::entry::exchange_registers);
+        if !left.is_valid() || !right.is_valid() || left.width()!=right.width() {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+        }
+        let mut cpu=self.core.cpu();
+        let a=left.read(&cpu.gpr);
+        let b=right.read(&cpu.gpr);
+        assert(cpu.gpr@ =~= spec::entry::registers(cpu@));
+        let ghost registers=cpu.gpr@;
+        left.write(&mut cpu.gpr,b);
+        assert(cpu.gpr@ =~= operand::model::write(registers,left,b));
+        right.write(&mut cpu.gpr,a);
+        assert(cpu@.gpr =~= operand::model::write(operand::model::write(registers,left,b),right,a)
+            .map(|i:int,v:u64|v as int));
+        self.retire_entry(cpu,length,false,false)
     }
 
     pub(super) fn exchange_value(&mut self,register:Register,value:u64,length:u8)->(tick:Tick)

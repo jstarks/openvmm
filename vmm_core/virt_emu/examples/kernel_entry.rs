@@ -17,7 +17,7 @@ mod native {
     use pal_async::{DefaultDriver, DefaultPool};
     use parking_lot::Mutex;
     use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::ffi::CString;
     use std::fs::File;
     use std::pin::Pin;
@@ -91,17 +91,55 @@ mod native {
     #[error("bounded kernel probe reached its {0}-second deadline")]
     struct ProbeDeadline(u32);
 
-    struct ConsoleCapture(Arc<Mutex<Vec<u8>>>);
+    #[derive(Default)]
+    struct ConsoleState {
+        output: Vec<u8>,
+        command: Option<Vec<u8>>,
+        input: VecDeque<u8>,
+        reader: Option<std::task::Waker>,
+        command_sent: bool,
+        consumed: usize,
+    }
+
+    impl ConsoleState {
+        fn new(command: Option<String>) -> Self {
+            Self {
+                command: command.map(|command| {
+                    let mut bytes = command.into_bytes();
+                    if !bytes.ends_with(b"\n") {
+                        bytes.push(b'\n');
+                    }
+                    bytes
+                }),
+                ..Self::default()
+            }
+        }
+    }
+
+    struct ConsoleCapture(Arc<Mutex<ConsoleState>>);
     impl futures::AsyncRead for ConsoleCapture {
         fn poll_read(
             self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
+            cx: &mut TaskContext<'_>,
             data: &mut [u8],
         ) -> Poll<std::io::Result<usize>> {
             if data.is_empty() {
                 Poll::Ready(Ok(0))
             } else {
-                Poll::Pending
+                let mut state = self.0.lock();
+                let count = data.len().min(state.input.len());
+                if count != 0 {
+                    for byte in &mut data[..count] {
+                        *byte = state.input.pop_front().unwrap();
+                    }
+                    state.consumed += count;
+                    Poll::Ready(Ok(count))
+                } else {
+                    if state.command.is_some() {
+                        state.reader = Some(cx.waker().clone());
+                    }
+                    Poll::Pending
+                }
             }
         }
     }
@@ -111,7 +149,20 @@ mod native {
             _cx: &mut TaskContext<'_>,
             data: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            self.0.lock().extend_from_slice(data);
+            let mut state = self.0.lock();
+            state.output.extend_from_slice(data);
+            let wake = if state.command.is_some() && state.output.ends_with(b"~ # ") {
+                let command = state.command.take().unwrap();
+                state.input.extend(command);
+                state.command_sent = true;
+                state.reader.take()
+            } else {
+                None
+            };
+            drop(state);
+            if let Some(wake) = wake {
+                wake.wake();
+            }
             Poll::Ready(Ok(data.len()))
         }
         fn poll_flush(
@@ -271,6 +322,91 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn console_command_waits_for_fragmented_prompt_and_wakes_one_reader_once() {
+            use futures::{AsyncRead, AsyncWrite};
+            use std::sync::atomic::AtomicUsize;
+
+            struct WakeCount(AtomicUsize);
+            impl std::task::Wake for WakeCount {
+                fn wake(self: Arc<Self>) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(count.clone());
+            let mut cx = TaskContext::from_waker(&waker);
+            let state = Arc::new(Mutex::new(ConsoleState::new(Some("echo one".to_owned()))));
+            let mut console = ConsoleCapture(state.clone());
+            let mut data = [0; 3];
+            assert!(
+                Pin::new(&mut console)
+                    .poll_read(&mut cx, &mut data)
+                    .is_pending()
+            );
+            assert!(matches!(
+                Pin::new(&mut console).poll_write(&mut cx, b"boot\n~ "),
+                Poll::Ready(Ok(7))
+            ));
+            assert_eq!(count.0.load(Ordering::SeqCst), 0);
+            assert!(
+                Pin::new(&mut console)
+                    .poll_read(&mut cx, &mut data)
+                    .is_pending()
+            );
+            assert!(matches!(
+                Pin::new(&mut console).poll_write(&mut cx, b"# "),
+                Poll::Ready(Ok(2))
+            ));
+            assert_eq!(count.0.load(Ordering::SeqCst), 1);
+            let mut received = Vec::new();
+            while let Poll::Ready(Ok(n)) = Pin::new(&mut console).poll_read(&mut cx, &mut data) {
+                assert_ne!(n, 0);
+                received.extend_from_slice(&data[..n]);
+            }
+            assert_eq!(received, b"echo one\n");
+            assert_eq!(state.lock().consumed, received.len());
+            assert!(state.lock().command_sent);
+            assert_eq!(state.lock().output, b"boot\n~ # ");
+            assert!(matches!(
+                Pin::new(&mut console).poll_write(&mut cx, b"~ # "),
+                Poll::Ready(Ok(4))
+            ));
+            assert!(
+                Pin::new(&mut console)
+                    .poll_read(&mut cx, &mut data)
+                    .is_pending()
+            );
+            assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn console_without_command_keeps_reads_pending_and_captures_output_verbatim() {
+            use futures::{AsyncRead, AsyncWrite};
+            let state = Arc::new(Mutex::new(ConsoleState::new(None)));
+            let mut console = ConsoleCapture(state.clone());
+            let waker = futures::task::noop_waker();
+            let mut cx = TaskContext::from_waker(&waker);
+            assert!(matches!(
+                Pin::new(&mut console).poll_read(&mut cx, &mut []),
+                Poll::Ready(Ok(0))
+            ));
+            assert!(matches!(
+                Pin::new(&mut console).poll_write(&mut cx, b"~ # "),
+                Poll::Ready(Ok(4))
+            ));
+            assert!(
+                Pin::new(&mut console)
+                    .poll_read(&mut cx, &mut [0])
+                    .is_pending()
+            );
+            let state = state.lock();
+            assert_eq!(state.output, b"~ # ");
+            assert!(!state.command_sent);
+            assert!(state.input.is_empty());
+            assert!(state.reader.is_none());
+        }
 
         #[pal_async::async_test]
         async fn unclaimed_ports_rowi_while_claimed_ports_reach_the_chipset(driver: DefaultDriver) {
@@ -856,6 +992,20 @@ mod native {
             120
         };
         ensure!(probe_seconds > 0, "probe deadline must be positive");
+        let shell_command = match args.next() {
+            None => None,
+            Some(flag) => {
+                ensure!(flag == "--shell-command", "unexpected witness argument");
+                ensure!(probe_apic, "shell command requires the APIC/chipset probe");
+                Some(
+                    args.next()
+                        .context("missing shell command")?
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("non-UTF8 shell command"))?,
+                )
+            }
+        };
+        let command_configured = shell_command.is_some();
         ensure!(args.next().is_none(), "unexpected witness arguments");
         let topology = TopologyBuilder::new_x86()
             .x2apic(if probe_apic {
@@ -1135,7 +1285,7 @@ mod native {
             pm_stalls,
             ..WitnessIo::default()
         };
-        let console = Arc::new(Mutex::new(Vec::new()));
+        let console = Arc::new(Mutex::new(ConsoleState::new(shell_command)));
         let mut units = state_unit::StateUnits::new();
         let time_unit = units
             .add("vmtime")
@@ -1415,7 +1565,18 @@ mod native {
                 memory.read_at(stopped_rip - 0xffff_ffff_8000_0000, &mut bytes)?;
                 encoding = Some(bytes);
             }
-            let serial_bytes = console.lock().clone();
+            let (serial_bytes, serial_input) = {
+                let console = console.lock();
+                (
+                    console.output.clone(),
+                    serde_json::json!({
+                        "configured":command_configured,
+                        "queued_after_prompt":console.command_sent,
+                        "consumed":console.consumed,
+                        "remaining":console.input.len(),
+                    }),
+                )
+            };
             let serial_output = String::from_utf8_lossy(&serial_bytes).into_owned();
             println!(
                 "{}",
@@ -1434,6 +1595,7 @@ mod native {
                     "current_stack_words":current_stack_words,
                     "serial_bytes":serial_bytes,
                     "serial_output":serial_output,
+                    "serial_input":serial_input,
                     "calibration":{
                         "cpu_khz":memory.read_plain::<u32>(0x28b95f8)?,
                         "tsc_khz":memory.read_plain::<u32>(0x28b95f4)?,

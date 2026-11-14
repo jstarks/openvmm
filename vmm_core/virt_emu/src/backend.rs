@@ -40,6 +40,9 @@ use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
 mod apic;
 #[path = "backend_decode_cache.rs"]
 mod decode_cache;
+#[cfg(feature = "perf")]
+#[path = "backend_perf.rs"]
+pub mod perf;
 
 /// Unsupported profile, invalid lifecycle operation, or execution failure.
 #[derive(Debug, thiserror::Error)]
@@ -242,6 +245,8 @@ struct VpState {
     checkpoint: Option<u64>,
     io_active: bool,
     fault: Option<Error>,
+    #[cfg(feature = "perf")]
+    profile: Option<perf::Sampler>,
 }
 
 /// Owns the sole CPU context across bindings.
@@ -287,6 +292,22 @@ pub struct ApicDiagnostics {
 }
 
 impl EmuProcessor<'_> {
+    /// Enables bounded guest-PC sampling before execution, without changing guest state.
+    #[cfg(feature = "perf")]
+    pub fn enable_execution_profile(&mut self) -> Result<(), Error> {
+        if self.state.started {
+            return Err(Error::Profile("profiling must be enabled before execution"));
+        }
+        self.state.profile = Some(perf::Sampler::new());
+        Ok(())
+    }
+
+    /// Takes the optional host-only samples after execution has stopped.
+    #[cfg(feature = "perf")]
+    pub fn take_execution_profile(&mut self) -> Option<perf::ExecutionProfile> {
+        self.state.profile.take().map(|sampler| sampler.finish())
+    }
+
     /// Returns current decoder counters and their first-interrupt baseline.
     pub fn decode_diagnostics(&self) -> (DecodeDiagnostics, Option<DecodeDiagnostics>) {
         (
@@ -473,6 +494,8 @@ impl ProtoPartition for EmuProtoPartition {
                 initial_system: Some(SystemState::empty()),
                 started: false,
                 progress: CompletedBatchProgress::default(),
+                #[cfg(feature = "perf")]
+                profile: None,
                 checkpoint: None,
                 io_active: false,
                 fault: None,
@@ -711,6 +734,10 @@ impl Processor for EmuProcessor<'_> {
                 return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
             };
             self.state.progress = CompletedBatchProgress { retired, delivered };
+            #[cfg(feature = "perf")]
+            if let Some(profile) = &mut self.state.profile {
+                profile.record(retired, delivered, || core.cpu().rip);
+            }
             // Frequent controller/checkpoint returns are not executor-yield requests.
             batch_work += 1;
             if batch_work == 64 {

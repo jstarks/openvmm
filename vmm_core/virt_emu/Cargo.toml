@@ -6,6 +6,13 @@ name = "virt_emu"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+perf = []
+
+[[example]]
+name = "fast_path"
+required-features = ["perf"]
+
 [dependencies]
 guestmem.workspace = true
 memory_range.workspace = true

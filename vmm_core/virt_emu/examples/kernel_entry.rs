@@ -992,19 +992,27 @@ mod native {
             120
         };
         ensure!(probe_seconds > 0, "probe deadline must be positive");
-        let shell_command = match args.next() {
-            None => None,
-            Some(flag) => {
-                ensure!(flag == "--shell-command", "unexpected witness argument");
+        let mut shell_command = None;
+        let mut profile_enabled = false;
+        while let Some(flag) = args.next() {
+            if flag == "--shell-command" {
                 ensure!(probe_apic, "shell command requires the APIC/chipset probe");
-                Some(
+                ensure!(shell_command.is_none(), "duplicate shell command");
+                shell_command = Some(
                     args.next()
                         .context("missing shell command")?
                         .into_string()
                         .map_err(|_| anyhow::anyhow!("non-UTF8 shell command"))?,
-                )
+                );
+            } else if flag == "--profile" {
+                ensure!(probe, "profiling requires a diagnostic probe");
+                ensure!(cfg!(feature = "perf"), "profiling requires --features perf");
+                ensure!(!profile_enabled, "duplicate profiling flag");
+                profile_enabled = true;
+            } else {
+                bail!("unexpected witness argument: {flag:?}");
             }
-        };
+        }
         let command_configured = shell_command.is_some();
         ensure!(args.next().is_none(), "unexpected witness arguments");
         let topology = TopologyBuilder::new_x86()
@@ -1266,12 +1274,21 @@ mod native {
         let first_css_alloc = memory.read_plain::<u64>(first_subsystem - 0xffff_ffff_8000_0000)?;
         let first_css_free =
             memory.read_plain::<u64>(first_subsystem - 0xffff_ffff_8000_0000 + 0x20)?;
-        let before = memory_digest(&memory, &BTreeMap::new())?;
+        // Diagnostic probes return before the post-run digest comparison.
+        let before = if probe {
+            None
+        } else {
+            Some(memory_digest(&memory, &BTreeMap::new())?)
+        };
         let mut initial_stack_task = vec![0; 65536];
         memory.read_at(0x2600000, &mut initial_stack_task)?;
         let mut binder = binders.pop().context("missing VP binder")?;
         ensure!(binders.is_empty(), "unexpected additional VP");
         let mut vp = binder.bind()?;
+        #[cfg(feature = "perf")]
+        if profile_enabled {
+            vp.enable_execution_profile()?;
+        }
         vp.set_execution_checkpoint(Some(if probe { probe_target } else { CHECKPOINT }))?;
         {
             let mut state = vp.access_state(Vtl::Vtl0);
@@ -1499,6 +1516,19 @@ mod native {
             );
             let registers = vp.access_state(Vtl::Vtl0).registers()?;
             let progress = vp.completed_batch_progress();
+            #[cfg(feature = "perf")]
+            let execution_profile = vp.take_execution_profile().map(|profile| {
+                serde_json::json!({
+                    "sample_every_batches":profile.sample_every_batches,
+                    "truncated":profile.truncated,
+                    "samples":profile.samples.into_iter().map(|sample| serde_json::json!({
+                        "seconds":sample.seconds,"retired":sample.retired,
+                        "delivered":sample.delivered,"rip":sample.rip,
+                    })).collect::<Vec<_>>(),
+                })
+            });
+            #[cfg(not(feature = "perf"))]
+            let execution_profile: Option<serde_json::Value> = None;
             let final_jiffies = memory.read_plain::<u64>(0x2609980)?;
             let (decode, first_decode) = vp.decode_diagnostics();
             let decode_json = |d: virt_emu::backend::DecodeDiagnostics| {
@@ -1585,6 +1615,7 @@ mod native {
                     "stop_debug":format!("{failure:?}"),
                     "transport_error":matches!(failure.downcast_ref::<Error>(),Some(Error::Memory(_))),
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
+                    "execution_profile":execution_profile,
                     "clock_slowdown":clock_slowdown.get(),
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
                     "kernel_image_bytes":encoding,
@@ -1674,6 +1705,7 @@ mod native {
             "changed clearing bounds"
         );
         let after = memory_digest(&memory, &changes)?;
+        let before = before.context("missing strict whole-RAM baseline")?;
         let mismatched_chunks: Vec<_> = before
             .chunks
             .iter()

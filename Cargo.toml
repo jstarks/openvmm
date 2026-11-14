@@ -468,8 +468,8 @@ state_unit = { path = "vmm_core/state_unit" }
 virt = { path = "vmm_core/virt" }
 virt_hvf = { path = "vmm_core/virt_hvf" }
 virt_kvm = { path = "vmm_core/virt_kvm" }
-x86_system = { path = "vm/x86/x86_system" }
-x86_decode = { path = "vm/x86/x86_decode" }
+x86_system = { package = "event_core", path = "../strudel/event-core" }
+x86_decode = { path = "../strudel/decode-core" }
 virt_mshv = { path = "vmm_core/virt_mshv" }
 virt_support_aarch64emu = { path = "vmm_core/virt_support_aarch64emu" }
 virt_support_apic = { path = "vmm_core/virt_support_apic" }
@@ -520,7 +520,6 @@ async-trait = "0.1"
 blocking = "1.2"
 event-listener = "5.3"
 futures = "0.3.31"
-vstd = { git = "https://github.com/verus-lang/verus", rev = "8bf68ee741df833ea5d0fe6a2255126fdea87e47" }
 futures-concurrency = "7.6.3"
 stackfuture = "0.3"
 unicycle = "0.10.2"
@@ -799,7 +798,7 @@ unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "forbid"
 
 # TODO: Needed for xshell compatibility, fixed in v0.2.7
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trick_rust_analyzer_into_highlighting_interpolated_bits)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trick_rust_analyzer_into_highlighting_interpolated_bits)'] }
 
 [workspace.lints.clippy]
 allow_attributes = "warn"

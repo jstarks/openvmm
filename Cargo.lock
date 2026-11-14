@@ -2161,6 +2161,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "event_core"
+version = "0.1.0"
+dependencies = [
+ "vstd",
+]
+
+[[package]]
 name = "eventheader"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10451,6 +10458,7 @@ dependencies = [
  "chipset_device",
  "chipset_device_resources",
  "chipset_resources",
+ "event_core",
  "futures",
  "guestmem",
  "hvdef",
@@ -10477,7 +10485,6 @@ dependencies = [
  "vmm_core",
  "vmotherboard",
  "x86_decode",
- "x86_system",
 ]
 
 [[package]]
@@ -12900,17 +12907,10 @@ dependencies = [
 
 [[package]]
 name = "x86_decode"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
+ "event_core",
  "iced-x86",
- "x86_system",
-]
-
-[[package]]
-name = "x86_system"
-version = "0.0.0"
-dependencies = [
- "vstd",
 ]
 
 [[package]]

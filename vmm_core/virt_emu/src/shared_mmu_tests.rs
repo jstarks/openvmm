@@ -92,7 +92,10 @@ fn shared_atomic_operations_recompute_after_dma_and_linearize_through_cas() {
         for _ in 0..128 {
             if matches!(
                 mmu.request(),
-                Request::DataCompare {
+                Request::Atomic {
+                    address: 0x5000,
+                    ..
+                } | Request::AtomicInteger {
                     address: 0x5000,
                     ..
                 }
@@ -164,6 +167,12 @@ fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
             {
                 if !raced && expected & mask == 0 && replacement & mask != 0 {
                     memory.write_plain(0x3008, &(expected & !2)).unwrap();
+                    raced = true;
+                }
+            }
+            if let Request::Qualify(pte) = shared.request() {
+                if !raced && mask == 64 && pte.address == 0x3008 && pte.word & 64 == 0 {
+                    memory.write_plain(0x3008, &(pte.word & !2)).unwrap();
                     raced = true;
                 }
             }
@@ -262,6 +271,7 @@ fn shared_mmu_revalidates_replaced_and_revoked_ptes() {
         for _ in 0..32 {
             if matches!(mmu.request(), Request::Compare { address: 0x4000, expected, .. }
                 if expected == expected_word)
+                || matches!(mmu.request(),Request::Qualify(pte) if pte.address==0x4000 && pte.word==expected_word)
             {
                 reached = true;
                 break;
@@ -412,10 +422,17 @@ fn shared_mmu_self_pte_alias_and_backing_error_order() {
     let (memory, ram) = fixture(&bytes()[..0x5000]);
     let mut mmu = SharedMmu::new(config(), 0x77);
     assert!(mmu.begin(0, Access::Write(0xcc), false));
-    assert!(matches!(mmu.run(&ram, 32), Err(RunError::Memory { .. })));
+    assert!(matches!(mmu.run(&ram, 32), Err(RunError::Copy { .. })));
     assert_eq!(mmu.cr2(), 0x77);
-    assert_eq!(memory.read_plain::<u64>(0x4000).unwrap(), 0x5027);
-    assert!(matches!(mmu.request(), Request::Read(0x5000)));
+    assert_eq!(memory.read_plain::<u64>(0x4000).unwrap(), 0x5067);
+    assert!(matches!(
+        mmu.request(),
+        Request::WriteBytes {
+            address: 0x5000,
+            end: 1,
+            ..
+        }
+    ));
 }
 
 fn finish_word(mmu: &mut SharedMmu, ram: &NativeRam) -> x86_system::mmu_core::word::WordReport {
@@ -480,12 +497,15 @@ fn shared_aligned_qword_stores_are_native_and_do_not_tear() {
                 for _ in 0..2000 {
                     assert!(mmu.begin_word(0, WordAccess::Write(value), false));
                     loop {
-                        if let Request::WriteWord {
+                        if let Request::WriteBytes {
                             address,
-                            word_value,
+                            bytes,
+                            end: 8,
+                            ..
                         } = mmu.request()
                         {
-                            assert_eq!((address, word_value), (0x5000, value));
+                            assert_eq!(address, 0x5000);
+                            assert_eq!(&bytes[..8], &value.to_le_bytes());
                         }
                         if let Progress::CompleteWord(_) = mmu.run(ram, 1).unwrap() {
                             break;
@@ -543,8 +563,9 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
     for _ in 0..64 {
         if matches!(
             mmu.request(),
-            Request::DataCompare {
-                address: 0x5008,
+            Request::WriteBytes {
+                address: 0x5001,
+                end: 8,
                 ..
             }
         ) {
@@ -554,16 +575,23 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
         assert_eq!(mmu.run(&ram, 1).unwrap(), Progress::Yield);
     }
     assert!(reached);
-    memory.write_plain(0x5000, &0xefu8).unwrap();
-    memory.write_plain(0x5002, &0xddu8).unwrap();
-    memory.write_plain(0x5009, &0xeeu8).unwrap();
     let fault = TailFault {
         ram: ram.clone(),
         fail: true.into(),
     };
-    let pending = mmu.request();
-    assert!(matches!(mmu.run(&fault, 1), Err(RunError::Memory { .. })));
-    assert_eq!(mmu.request(), pending);
+    assert!(matches!(mmu.run(&fault, 1), Err(RunError::Copy {source,..}) if source.completed==7));
+    assert!(matches!(
+        mmu.request(),
+        Request::WriteBytes {
+            address: 0x5008,
+            offset: 7,
+            end: 8,
+            ..
+        }
+    ));
+    memory.write_plain(0x5000, &0xefu8).unwrap();
+    memory.write_plain(0x5002, &0xddu8).unwrap();
+    memory.write_plain(0x5009, &0xeeu8).unwrap();
     assert_eq!(
         finish_word(&mut mmu, &ram).result,
         WordResult::Success(value)
@@ -599,11 +627,7 @@ fn qword_aliases_and_revocation_keep_dirty_order_precise() {
     for _ in 0..64 {
         if matches!(
             mmu.request(),
-            Request::Compare {
-                address: 0x4000,
-                expected: 0x5027,
-                ..
-            }
+            Request::Qualify(pte) if pte.address==0x4000 && pte.word==0x5027
         ) {
             reached = true;
             break;

@@ -167,12 +167,14 @@ fn decoded_faults_frame_ud_and_gp_without_fetching_past_the_page() {
         let mut stores = Vec::new();
         let mut completed = None;
         for _ in 0..4096 {
-            if let Request::WriteWord {
+            if let Request::WriteBytes {
                 address,
-                word_value,
+                bytes,
+                end: 8,
+                ..
             } = cpu.request()
             {
-                stores.push((address, word_value));
+                stores.push((address, u64::from_le_bytes(bytes[..8].try_into().unwrap())));
             }
             let batch = cpu.run(&ram, 1, 1).unwrap();
             match batch.stop {
@@ -566,8 +568,8 @@ fn shared_frame_host_error_and_dma_never_replay_committed_prefix() {
     let error = cpu.run(&ram, 256, 1).unwrap_err();
     assert!(matches!(
         error,
-        RunError::Memory {
-            request: Request::WriteWord {
+        RunError::Copy {
+            request: Request::WriteBytes {
                 address: 0x17ff0,
                 ..
             },

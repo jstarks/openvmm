@@ -10,14 +10,17 @@
 use guestmem::{GuestMemory, GuestMemoryError};
 use memory_range::MemoryRange;
 use std::sync::atomic::{Ordering, compiler_fence, fence};
-use x86_system::memory_core::shared::{self, Beat, BeatError, Exchange, PhysicalRam};
+use x86_system::memory_core::cpu_core::{integer, operand::Width};
+use x86_system::memory_core::shared::{
+    self, AtomicOperation, Beat, BeatError, CopyError, CopyErrorKind, Exchange, PhysicalRam,
+};
 
 const MASKED_WRITE_ATTEMPTS: usize = 64;
 
 /// Failure of the physical RAM interface, not an architectural guest exception.
 #[derive(Debug, thiserror::Error)]
 pub enum RamError {
-    /// A RAM bank must be nonempty and quadword-aligned.
+    /// A RAM bank must be nonempty.
     #[error("invalid native RAM bank")]
     Region,
     /// The operation crosses the bank's declared RAM boundary.
@@ -64,7 +67,7 @@ pub struct NativeRam {
 impl NativeRam {
     /// Creates a native RAM view; the caller classifies this bank as coherent WB.
     pub fn new(memory: GuestMemory, bank: MemoryRange) -> Result<Self, RamError> {
-        if bank.is_empty() || !bank.start().is_multiple_of(8) || !bank.end().is_multiple_of(8) {
+        if bank.is_empty() {
             return Err(RamError::Region);
         }
         Ok(Self { memory, bank })
@@ -84,11 +87,17 @@ impl NativeRam {
         Ok(beat)
     }
 
-    fn load_word(&self, address: u64) -> Result<u64, RamError> {
-        compiler_fence(Ordering::SeqCst);
-        let result = self.memory.read_plain::<u64>(address);
-        compiler_fence(Ordering::SeqCst);
-        Ok(result?)
+    fn range(&self, address: u64, length: usize) -> Result<(), RamError> {
+        if length == 0 {
+            return Ok(());
+        }
+        if address < self.bank.start()
+            || address >= self.bank.end()
+            || u64::try_from(length).map_or(true, |length| length > self.bank.end() - address)
+        {
+            return Err(RamError::OutsideBank { address });
+        }
+        Ok(())
     }
 
     fn compare_word(
@@ -103,34 +112,34 @@ impl NativeRam {
         Ok(result?)
     }
 
-    /// Reads one atomic RAM beat, including subword accesses inside a quadword.
+    /// Reads exactly the requested bytes. Naturally aligned accesses do not tear.
     pub fn read(&self, address: u64, width: u8) -> Result<u64, RamError> {
-        let beat = self.beat(address, width)?;
-        Ok(beat.extract(self.load_word(beat.address())?))
+        self.range(address, usize::from(width))?;
+        compiler_fence(Ordering::SeqCst);
+        let value = match width {
+            1 => u64::from(self.memory.read_plain::<u8>(address)?),
+            2 => u64::from(self.memory.read_plain::<u16>(address)?),
+            4 => u64::from(self.memory.read_plain::<u32>(address)?),
+            8 => self.memory.read_plain::<u64>(address)?,
+            _ => return Err(RamError::Width),
+        };
+        compiler_fence(Ordering::SeqCst);
+        Ok(value)
     }
 
-    /// Writes one RAM beat without losing concurrent updates to adjacent bytes.
-    ///
-    /// Naturally aligned qword stores use native stores. Narrow stores use
-    /// compare-exchange; their additional ordering is permitted, not simulated
-    /// store-buffer behavior. Contention returns without committing this store.
+    /// Writes exactly the requested bytes without reading adjacent data.
     pub fn write(&self, address: u64, width: u8, value: u64) -> Result<(), RamError> {
-        let beat = self.beat(address, width)?;
-        if beat.whole() {
-            compiler_fence(Ordering::SeqCst);
-            let result = self.memory.write_plain(beat.address(), &value);
-            compiler_fence(Ordering::SeqCst);
-            return Ok(result?);
+        self.range(address, usize::from(width))?;
+        compiler_fence(Ordering::SeqCst);
+        match width {
+            1 => self.memory.write_plain(address, &(value as u8))?,
+            2 => self.memory.write_plain(address, &(value as u16))?,
+            4 => self.memory.write_plain(address, &(value as u32))?,
+            8 => self.memory.write_plain(address, &value)?,
+            _ => return Err(RamError::Width),
         }
-        let mut observed = self.load_word(beat.address())?;
-        for _ in 0..MASKED_WRITE_ATTEMPTS {
-            let replacement = beat.replace(observed, value);
-            match self.compare_word(beat.address(), observed, replacement)? {
-                Ok(_) => return Ok(()),
-                Err(current) => observed = current,
-            }
-        }
-        Err(RamError::Contended)
+        compiler_fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Marks A and optionally D only if the PTE still equals the observation.
@@ -169,6 +178,24 @@ impl PhysicalRam for NativeRam {
         self.read(address, 8)
     }
 
+    fn read_value(&self, address: u64, size: u8) -> Result<u64, CopyError<RamError>> {
+        if matches!(size, 1 | 2 | 4 | 8) {
+            return self.read(address, size).map_err(|source| CopyError {
+                completed: 0,
+                kind: CopyErrorKind::Memory(source),
+            });
+        }
+        if size == 0 || size > 8 {
+            return Err(CopyError {
+                completed: 0,
+                kind: CopyErrorKind::InvalidAccess,
+            });
+        }
+        let mut bytes = [0; 8];
+        self.read_bytes(address, &mut bytes[..usize::from(size)])?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
     fn write_word(&self, address: u64, value: u64) -> Result<(), Self::Error> {
         self.write(address, 8, value)
     }
@@ -186,8 +213,154 @@ impl PhysicalRam for NativeRam {
         }
     }
 
+    fn read_bytes(&self, address: u64, destination: &mut [u8]) -> Result<(), CopyError<RamError>> {
+        self.range(address, destination.len())
+            .map_err(|source| CopyError {
+                completed: 0,
+                kind: CopyErrorKind::Memory(source),
+            })?;
+        let mut completed = 0;
+        while completed < destination.len() {
+            let current = address + completed as u64;
+            let width = copy_width(current, destination.len() - completed);
+            let value = self.read(current, width).map_err(|source| CopyError {
+                completed,
+                kind: CopyErrorKind::Memory(source),
+            })?;
+            let end = completed + usize::from(width);
+            destination[completed..end].copy_from_slice(&value.to_le_bytes()[..usize::from(width)]);
+            completed = end;
+        }
+        Ok(())
+    }
+
+    fn write_bytes(&self, address: u64, source: &[u8]) -> Result<(), CopyError<RamError>> {
+        if address.is_multiple_of(8) {
+            if let &[a, b, c, d, e, f, g, h] = source {
+                return self
+                    .write(address, 8, u64::from_le_bytes([a, b, c, d, e, f, g, h]))
+                    .map_err(|source| CopyError {
+                        completed: 0,
+                        kind: CopyErrorKind::Memory(source),
+                    });
+            }
+        }
+        self.range(address, source.len())
+            .map_err(|source| CopyError {
+                completed: 0,
+                kind: CopyErrorKind::Memory(source),
+            })?;
+        let mut completed = 0;
+        while completed < source.len() {
+            let current = address + completed as u64;
+            let width = copy_width(current, source.len() - completed);
+            let end = completed + usize::from(width);
+            let mut bytes = [0; 8];
+            bytes[..usize::from(width)].copy_from_slice(&source[completed..end]);
+            self.write(current, width, u64::from_le_bytes(bytes))
+                .map_err(|source| CopyError {
+                    completed,
+                    kind: CopyErrorKind::Memory(source),
+                })?;
+            completed = end;
+        }
+        Ok(())
+    }
+
+    fn atomic(
+        &self,
+        address: u64,
+        width: u8,
+        operation: AtomicOperation,
+    ) -> Result<u64, CopyError<RamError>> {
+        let failure = |source| CopyError {
+            completed: 0,
+            kind: CopyErrorKind::Memory(source),
+        };
+        self.range(address, usize::from(width)).map_err(failure)?;
+        if !matches!(width, 1 | 2 | 4 | 8) || !address.is_multiple_of(u64::from(width)) {
+            return Err(CopyError {
+                completed: 0,
+                kind: CopyErrorKind::InvalidAccess,
+            });
+        }
+        macro_rules! atomic {
+            ($ty:ty, $width:expr) => {{
+                let exchange = |expected: u64, replacement: u64| {
+                    compiler_fence(Ordering::SeqCst);
+                    let result =
+                        self.memory
+                            .compare_exchange(address, expected as $ty, replacement as $ty);
+                    compiler_fence(Ordering::SeqCst);
+                    result
+                        .map(|result| match result {
+                            Ok(_) => Ok(expected as $ty as u64),
+                            Err(current) => Err(u64::from(current)),
+                        })
+                        .map_err(RamError::from)
+                };
+                if let AtomicOperation::CompareExchange {
+                    expected,
+                    replacement,
+                } = operation
+                {
+                    return exchange(expected, replacement)
+                        .map(|result| result.unwrap_or_else(|observed| observed))
+                        .map_err(failure);
+                }
+                let mut observed = self.read(address, width).map_err(failure)?;
+                for _ in 0..MASKED_WRITE_ATTEMPTS {
+                    let replacement = match operation {
+                        AtomicOperation::Exchange { replacement } => replacement,
+                        AtomicOperation::Integer {
+                            operation,
+                            source,
+                            flags,
+                        } => integer::evaluate(operation, observed, source, $width, flags).value,
+                        AtomicOperation::CompareExchange { .. } => {
+                            return Err(CopyError {
+                                completed: 0,
+                                kind: CopyErrorKind::InvalidAccess,
+                            });
+                        }
+                    };
+                    match exchange(observed, replacement).map_err(failure)? {
+                        Ok(_) => return Ok(observed),
+                        Err(current) => observed = current,
+                    }
+                }
+                Err(CopyError {
+                    completed: 0,
+                    kind: CopyErrorKind::Contended,
+                })
+            }};
+        }
+        match width {
+            1 => atomic!(u8, Width::Byte),
+            2 => atomic!(u16, Width::Word),
+            4 => atomic!(u32, Width::Dword),
+            8 => atomic!(u64, Width::Qword),
+            _ => Err(CopyError {
+                completed: 0,
+                kind: CopyErrorKind::InvalidAccess,
+            }),
+        }
+    }
+
     fn barrier(&self) {
         NativeRam::barrier(self);
+    }
+}
+
+fn copy_width(address: u64, remaining: usize) -> u8 {
+    if remaining >= 8 && address.is_multiple_of(8) {
+        8
+    } else if remaining >= 4 && address.is_multiple_of(4) {
+        4
+    } else if remaining >= 2 && address.is_multiple_of(2) {
+        2
+    } else {
+        1
     }
 }
 
@@ -237,7 +410,8 @@ mod tests {
                 );
             }
         }
-        assert!(matches!(ram.write(7, 2, 1), Err(RamError::Split)));
+        ram.write(7, 2, 0x1234).unwrap();
+        assert_eq!(ram.read(7, 2).unwrap(), 0x1234);
         assert!(matches!(ram.read(0, 3), Err(RamError::Width)));
         assert!(matches!(
             ram.write(4096, 8, 1),
@@ -267,11 +441,100 @@ mod tests {
         assert_eq!(error.completed, 11);
         assert!(matches!(
             error.kind,
-            shared::CopyErrorKind::Memory(RamError::Memory(_))
+            CopyErrorKind::Memory(RamError::Memory(_))
         ));
         let mut prefix = [0; 11];
         memory.read_at(4085, &mut prefix).unwrap();
         assert_eq!(prefix, [0x33; 11]);
+    }
+
+    #[test]
+    fn exact_byte_ranges_and_unaligned_values_preserve_neighbors() {
+        let memory = GuestMemory::allocate(4096);
+        memory.write_at(0, &[0xa5; 16]).unwrap();
+        let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..4096)).unwrap();
+        let value = 0x1122_3344_5566_7788u64;
+        ram.write_bytes(3, &value.to_le_bytes()).unwrap();
+        assert_eq!(ram.read_value(3, 8).unwrap(), value);
+        assert_eq!(ram.read_value(4, 3).unwrap(), 0x556677);
+        let mut bytes = [0; 5];
+        ram.read_bytes(6, &mut bytes).unwrap();
+        assert_eq!(bytes, value.to_le_bytes()[3..]);
+        ram.write(10, 1, 0x99).unwrap();
+        assert_eq!(ram.read(10, 1).unwrap(), 0x99);
+        ram.write(4095, 1, 0x33).unwrap();
+        assert_eq!(ram.read(4095, 1).unwrap(), 0x33);
+        assert!(ram.read(4096, 1).is_err());
+        assert!(ram.read_value(4095, 2).is_err());
+        assert_eq!(memory.read_plain::<u8>(2).unwrap(), 0xa5);
+        assert_eq!(memory.read_plain::<u8>(11).unwrap(), 0xa5);
+    }
+
+    #[test]
+    fn exact_width_atomics_return_the_linearized_operand_and_frame_neighbors() {
+        for width in [1u8, 2, 4, 8] {
+            let mask = u64::MAX >> ((8 - width) * 8);
+            for address in [0, 8 - u64::from(width), 4096 - u64::from(width)] {
+                for (operation, expected) in [
+                    (
+                        AtomicOperation::CompareExchange {
+                            expected: 0x5a,
+                            replacement: 0x33,
+                        },
+                        0x33,
+                    ),
+                    (
+                        AtomicOperation::CompareExchange {
+                            expected: 0x5b,
+                            replacement: 0x33,
+                        },
+                        0x5a,
+                    ),
+                    (
+                        AtomicOperation::Exchange {
+                            replacement: u64::MAX,
+                        },
+                        mask,
+                    ),
+                    (
+                        AtomicOperation::Integer {
+                            operation: integer::Operation::Add,
+                            source: 7,
+                            flags: 0,
+                        },
+                        0x61,
+                    ),
+                    (
+                        AtomicOperation::Integer {
+                            operation: integer::Operation::Adc,
+                            source: 0,
+                            flags: 1,
+                        },
+                        0x5b,
+                    ),
+                    (
+                        AtomicOperation::Integer {
+                            operation: integer::Operation::Neg,
+                            source: 0,
+                            flags: 0,
+                        },
+                        0u64.wrapping_sub(0x5a) & mask,
+                    ),
+                ] {
+                    let (memory, ram) = fixture();
+                    memory.write_at(0, &[0xa5; 4096]).unwrap();
+                    ram.write(address, width, 0x5a).unwrap();
+                    let mut before = [0; 4096];
+                    memory.read_at(0, &mut before).unwrap();
+                    assert_eq!(ram.atomic(address, width, operation).unwrap(), 0x5a);
+                    before[address as usize..address as usize + usize::from(width)]
+                        .copy_from_slice(&expected.to_le_bytes()[..usize::from(width)]);
+                    let mut after = [0; 4096];
+                    memory.read_at(0, &mut after).unwrap();
+                    assert_eq!(after, before, "{width}/{address}/{operation:?}");
+                }
+            }
+        }
     }
 
     #[test]

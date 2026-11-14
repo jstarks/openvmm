@@ -195,7 +195,7 @@ fn tlb<const KIND: u8>(
     black_box(mmu.run(&ram, 32)?);
     for _ in 0..1024 {
         ensure!(access::<KIND>(&mut mmu), "warm-up access rejected");
-        completed_hit(mmu.run(&ram, if KIND == 2 { 2 } else { 1 })?)?;
+        completed_hit(mmu.run(&ram, 1)?)?;
     }
     control(true)?;
     let start = Instant::now();
@@ -205,7 +205,7 @@ fn tlb<const KIND: u8>(
             access::<KIND>(black_box(&mut mmu)),
             "measured access rejected"
         );
-        last = black_box(mmu.run(&ram, if KIND == 2 { 2 } else { 1 })?);
+        last = black_box(mmu.run(&ram, 1)?);
     }
     let seconds = start.elapsed().as_secs_f64();
     control(false)?;

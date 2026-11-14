@@ -29,6 +29,8 @@ pub mod control_io;
 pub mod decode;
 #[path = "shared_entry_model.rs"]
 pub mod entry;
+#[path = "shared_fp_model.rs"]
+pub mod fp;
 #[path = "shared_privilege_model.rs"]
 pub mod privilege;
 #[path = "shared_repeat_model.rs"]
@@ -91,8 +93,13 @@ pub open spec fn inject(s: State, vector: u8) -> (State, Injection) {
     }
 }
 pub open spec fn respond(s: State, reply: super::mmu_core::shared::Reply) -> (State, bool) {
-    let response = m::respond(s.core.mmu, reply);
-    (State { core: c::State { mmu: response.0, ..s.core }, ..s }, response.1)
+    if s.phase is FpSave {fp::respond(s,reply)} else {
+        let response = m::respond(s.core.mmu, reply);
+        (State { core: c::State { mmu: response.0, ..s.core }, ..s }, response.1)
+    }
+}
+pub open spec fn request(s:State)->Request {
+    match s.phase {Phase::FpSave {target}=>fp::request(s,target),_=>m::request(s.core.mmu)}
 }
 pub open spec fn word(s: State, address: u64, request: WordAccess, phase: Phase) -> State {
     let core=if phase is Pop || phase is NearCall {c::boundary_word_as(s.core,address,request,is_user(s)).0}
@@ -376,6 +383,8 @@ pub open spec fn word_value(s: State, value: u64) -> (State, Tick) {
 }
 pub open spec fn advance(s: State) -> (State, Tick) {
     match s.phase {
+        Phase::FpSave {..}=>(s,Tick::Waiting),
+        Phase::FpSaveDone {length}=>entry::retire(s,s.core.cpu,length,false,false),
         Phase::Repeat {width,length}=>repeat::execute(s,width,length),
         Phase::RepeatMove {width,length}=>repeat::execute_move(s,width,length),
         Phase::Decode { input } => (s, Tick::Decode(input)),

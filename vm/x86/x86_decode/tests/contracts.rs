@@ -97,6 +97,7 @@ fn x87_exception_clear_and_emms_are_owned_controls_not_nops() {
     for (bytes, operation) in [
         (&[0xdb, 0xe2][..], X87Control::ClearExceptions),
         (&[0x0f, 0x77][..], X87Control::EmptyMmx),
+        (&[0x9b][..], X87Control::Wait),
     ] {
         assert_eq!(entry(bytes), Instruction::ControlX87 { operation });
         let locked = [&[0xf0][..], bytes].concat();
@@ -3539,31 +3540,47 @@ fn xmm_register_logic_owns_the_operation_without_admitting_memory_or_vex_forms()
 }
 
 #[test]
-fn xmm_equal_lanes_and_byte_masks_keep_width_registers_and_memory_shapes() {
+fn xmm_compare_lanes_and_byte_masks_keep_width_registers_and_memory_shapes() {
     use x86_system::shared::decode::DecodeDecision;
     use x86_system::shared::entry::Instruction;
-    for (opcode, width) in [
-        (0x74, Width::Byte),
-        (0x75, Width::Word),
-        (0x76, Width::Dword),
-    ] {
-        assert_eq!(
-            entry(&[0x66, 0x45, 0x0f, opcode, 0xf8]),
-            Instruction::XmmEqual {
-                dst: 15,
-                source: 8,
-                width
+    for greater in [false, true] {
+        for (opcode, width) in [
+            (0x74, Width::Byte),
+            (0x75, Width::Word),
+            (0x76, Width::Dword),
+        ] {
+            let opcode = if greater { opcode - 0x10 } else { opcode };
+            for dst in [0, 7, 8, 15] {
+                for source in [0, 7, 8, 15] {
+                    let rex = 0x40 | if dst >= 8 { 4 } else { 0 } | if source >= 8 { 1 } else { 0 };
+                    assert_eq!(
+                        entry(&[
+                            0x66,
+                            rex,
+                            0x0f,
+                            opcode,
+                            0xc0 | ((dst & 7) << 3) | (source & 7)
+                        ]),
+                        Instruction::XmmCompare {
+                            dst,
+                            source,
+                            width,
+                            greater
+                        }
+                    );
+                }
             }
-        );
-        let Instruction::XmmEqualMemory {
-            index,
-            width: actual,
-            ..
-        } = entry(&[0x66, 0x44, 0x0f, opcode, 0x38])
-        else {
-            panic!()
-        };
-        assert_eq!((index, actual), (15, width));
+            let Instruction::XmmCompareMemory {
+                index,
+                width: actual,
+                greater: comparison,
+                ..
+            } = entry(&[0x66, 0x44, 0x0f, opcode, 0x38])
+            else {
+                panic!()
+            };
+            assert_eq!((index, actual, comparison), (15, width, greater));
+        }
     }
     for wide in [false, true] {
         for dst in [0, 7, 8, 15] {
@@ -3594,11 +3611,18 @@ fn xmm_equal_lanes_and_byte_masks_keep_width_registers_and_memory_shapes() {
         &[0x0f, 0xd7, 0xc1],
         &[0x66, 0x0f, 0x38, 0x29, 0xc1],
         &[0xc5, 0xf9, 0x74, 0xc1],
+        &[0x0f, 0x64, 0xc1],
+        &[0x66, 0x0f, 0x38, 0x37, 0xc1],
+        &[0xc5, 0xf9, 0x64, 0xc1],
     ] {
         assert_eq!(admission(bytes), DecodeDecision::Unsupported);
     }
     assert_eq!(
         admission(&[0xf0, 0x66, 0x0f, 0x74, 0xc1]),
+        DecodeDecision::InvalidOpcode
+    );
+    assert_eq!(
+        admission(&[0xf0, 0x66, 0x0f, 0x64, 0xc1]),
         DecodeDecision::InvalidOpcode
     );
 }

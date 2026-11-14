@@ -35,13 +35,13 @@ pub const EMPTY_ENTRY_MSRS:EntryMsrs=EntryMsrs {
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
-pub enum X87Control { Initialize, ClearExceptions, EmptyMmx }
+pub enum X87Control { Initialize, ClearExceptions, EmptyMmx, Wait }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
 pub enum XmmLogic {And,AndNot,Or,Xor}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Structural)]
-pub enum PackedOperation {Equal,Add,Subtract}
+pub enum PackedOperation {Equal,GreaterSigned,Add,Subtract}
 
 fn packed_lane(left:u64,right:u64,width:super::operand::Width,operation:PackedOperation)->(out:u64)
     ensures out==model::packed_lane(left,right,width,operation),
@@ -51,6 +51,15 @@ fn packed_lane(left:u64,right:u64,width:super::operand::Width,operation:PackedOp
     let b=right&mask;
     match operation {
         PackedOperation::Equal=>if a==b {mask} else {0},
+        PackedOperation::GreaterSigned=>{
+            let greater=match width {
+                super::operand::Width::Byte=>(a as i8)>(b as i8),
+                super::operand::Width::Word=>(a as i16)>(b as i16),
+                super::operand::Width::Dword=>(a as i32)>(b as i32),
+                super::operand::Width::Qword=>(a as i64)>(b as i64),
+            };
+            if greater {mask} else {0}
+        },
         PackedOperation::Add=>a.wrapping_add(b)&mask,
         PackedOperation::Subtract=>a.wrapping_sub(b)&mask,
     }
@@ -350,12 +359,14 @@ impl LegacyFpState {
             X87Control::Initialize=>LegacyFpState {control:0x37f,status:0,tags:0xffff,opcode:0,ip:0,dp:0,..self},
             X87Control::ClearExceptions=>LegacyFpState {status:self.status&0x7f00u16,..self},
             X87Control::EmptyMmx=>LegacyFpState {status:self.status&0xc7ffu16,tags:0xffff,..self},
+            X87Control::Wait=>self,
         },
     {
         match operation {
             X87Control::Initialize=>self.initialize_x87(),
             X87Control::ClearExceptions=>Self {status:self.status&0x7f00u16,..self},
             X87Control::EmptyMmx=>Self {status:self.status&0xc7ffu16,tags:0xffff,..self},
+            X87Control::Wait=>self,
         }
     }
     pub fn initialize_x87(self)->(out:Self)
@@ -478,6 +489,15 @@ pub mod model {
         let b=right&mask;
         match operation {
             PackedOperation::Equal=>if a==b {mask} else {0u64},
+            PackedOperation::GreaterSigned=>{
+                let greater=match width {
+                    super::super::operand::Width::Byte=>(a as i8)>(b as i8),
+                    super::super::operand::Width::Word=>(a as i16)>(b as i16),
+                    super::super::operand::Width::Dword=>(a as i32)>(b as i32),
+                    super::super::operand::Width::Qword=>(a as i64)>(b as i64),
+                };
+                if greater {mask} else {0u64}
+            },
             PackedOperation::Add=>(((a as int+b as int)%0x1_0000_0000_0000_0000int) as u64)&mask,
             PackedOperation::Subtract=>(((a as int-b as int)%0x1_0000_0000_0000_0000int) as u64)&mask,
         }

@@ -36,19 +36,20 @@ pub open spec fn finish_xmm_arithmetic(s:State,dst:u8,low:u64,high:u64,width:Wid
 }
 
 #[verifier::opaque]
-pub open spec fn finish_xmm_equal(s:State,dst:u8,low:u64,high:u64,width:Width,length:u8)->(State,Tick) {
+pub open spec fn finish_xmm_compare(s:State,dst:u8,low:u64,high:u64,width:Width,greater:bool,length:u8)->(State,Tick) {
     if s.system is None || dst>=16 || width==Width::Qword {entry::unsupported(s)}
     else {
         let system=s.system.unwrap();
         entry::retire(State {system:Some(SystemState {
-            fp:system::model::xmm_equal(system.fp,dst,low,high,width),..system}),..s},
+            fp:system::model::xmm_packed(system.fp,dst,low,high,width,
+                if greater {system::PackedOperation::GreaterSigned} else {system::PackedOperation::Equal}),..system}),..s},
             s.core.cpu,length,false,false)
     }
 }
 #[verifier::opaque]
-pub open spec fn execute_xmm_equal_memory(s:State,address:Address,index:u8,width:Width,length:u8)->(State,Tick) {
+pub open spec fn execute_xmm_compare_memory(s:State,address:Address,index:u8,width:Width,greater:bool,length:u8)->(State,Tick) {
     if width==Width::Qword {entry::unsupported(s)}
-    else {execute_xmm_read(s,address,index,super::super::shared::entry::XmmReadAction::Equal(width),length)}
+    else {execute_xmm_read(s,address,index,super::super::shared::entry::XmmReadAction::Compare {width,greater},length)}
 }
 #[verifier::opaque]
 pub open spec fn execute_xmm_read(s:State,address:Address,index:u8,action:super::super::shared::entry::XmmReadAction,length:u8)->(State,Tick) {
@@ -81,7 +82,7 @@ pub open spec fn finish_xmm_memory(s:State,address:u64,task:super::super::shared
                 super::super::shared::entry::MemoryTask::XmmHigh {index,low:value,action})},
         super::super::shared::entry::MemoryTask::XmmHigh {index,low,action}=>match action {
             super::super::shared::entry::XmmReadAction::Move=>finish_xmm_pair(s,index,low,value,length),
-            super::super::shared::entry::XmmReadAction::Equal(width)=>finish_xmm_equal(s,index,low,value,width,length),
+            super::super::shared::entry::XmmReadAction::Compare {width,greater}=>finish_xmm_compare(s,index,low,value,width,greater,length),
             super::super::shared::entry::XmmReadAction::Arithmetic {width,subtract}=>
                 finish_xmm_arithmetic(s,index,low,value,width,subtract,length),
         },
@@ -115,7 +116,11 @@ pub open spec fn execute_xmm_memory(s:State,address:Address,index:u8,store:bool,
         } else if !store {entry::memory(s,linear,Width::Qword,WordAccess::Read,length,
             super::super::shared::entry::MemoryTask::XmmLow {
                 index,action:super::super::shared::entry::XmmReadAction::Move})}
-        else if linear%4096>4080 {entry::unsupported(s)}
+        else if linear%4096>4080 {
+            let pair=s.system.unwrap().fp.xmm[index as int];
+            fp::start_probe(s,linear,super::super::shared::SaveSource::Vector {low:pair[0],high:pair[1]},
+                None,linear,length)
+        }
         else {
             let pair=s.system.unwrap().fp.xmm[index as int];
             (State {core:c::boundary_pair_store(s.core,linear,pair[0],pair[1]).0,
@@ -151,13 +156,13 @@ pub open spec fn execute_xmm(s:State,instruction:Instruction,length:u8)->(State,
                     let pair=system.fp.xmm[source as int];
                     finish_xmm_arithmetic(s,dst,pair[0],pair[1],width,subtract,length)
                 },
-            Instruction::XmmEqualMemory {address,index,width}=>
-                execute_xmm_equal_memory(s,address,index,width,length),
-            Instruction::XmmEqual {dst,source,width}=>
+            Instruction::XmmCompareMemory {address,index,width,greater}=>
+                execute_xmm_compare_memory(s,address,index,width,greater,length),
+            Instruction::XmmCompare {dst,source,width,greater}=>
                 if source>=16 {entry::unsupported(s)}
                 else {
                     let pair=system.fp.xmm[source as int];
-                    finish_xmm_equal(s,dst,pair[0],pair[1],width,length)
+                    finish_xmm_compare(s,dst,pair[0],pair[1],width,greater,length)
                 },
             Instruction::XmmMask {dst,source}=>
                 if source>=16 || !dst.valid() || (dst@.width!=Width::Dword && dst@.width!=Width::Qword) {
@@ -418,36 +423,11 @@ pub open spec fn save_fp(s:State,address:Address,wide:bool,length:u8)->(State,Ti
                 || (!wide && system.fp.status&0x80u16!=0 && (system.fp.ip!=0 || system.fp.dp!=0)) {entry::unsupported(s)}
             else if !mmu_model::canonical(at as int) {entry::unsupported(s)}
             else if at%16!=0 {entry(s,Event::GeneralProtection)}
-            else if at%4096>3584 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage))}
-            else if system.fp.status&0x80u16!=0 {
-                entry::memory(s,at,Width::Qword,WordAccess::Write(system::model::fp_word(system.fp,0,wide)),
-                    length,super::super::shared::entry::MemoryTask::SaveFp {index:0,wide})
-            } else {entry::memory(s,at,Width::Dword,WordAccess::Write(
-                system::model::fp_word(system.fp,0,wide)&0xffff_ffffu64),
-                length,super::super::shared::entry::MemoryTask::SaveFpHeader {wide})}
+            else if at>u64::MAX-511 || !mmu_model::canonical(at as int+511) {entry::unsupported(s)}
+            else {fp::start_probe(s,at,super::super::shared::SaveSource::Legacy {
+                wide,preserve_pointers:system.fp.status&0x80u16==0},None,at,length)}
         },
     }}
-}
-#[verifier::opaque]
-pub open spec fn save_fp_header(s:State,address:u64,wide:bool,length:u8)->(State,Tick) {
-    if s.system is None || address>u64::MAX-4 {entry::unsupported(s)}
-    else {entry::memory(s,(address+4) as u64,Width::Word,WordAccess::Write(
-        (system::model::fp_word(s.system.unwrap().fp,0,wide)>>32)&0xffffu64),
-        length,super::super::shared::entry::MemoryTask::SaveFp {index:0,wide})}
-}
-#[verifier::opaque]
-pub open spec fn save_fp_value(s:State,address:u64,index:u8,wide:bool,length:u8)->(State,Tick) {
-    if index>=52 {entry::unsupported(s)}
-    else if index==51 {entry::retire(s,s.core.cpu,length,false,false)}
-    else if address>u64::MAX-8 || s.system is None {entry::unsupported(s)}
-    else if index==0 && s.system.unwrap().fp.status&0x80u16==0 {
-        if address>u64::MAX-20 {entry::unsupported(s)}
-        else {entry::memory(s,(address+20) as u64,Width::Qword,WordAccess::Write(
-            system::model::fp_word(s.system.unwrap().fp,3,wide)),
-            length,super::super::shared::entry::MemoryTask::SaveFp {index:3,wide})}
-    } else {entry::memory(s,(address+8) as u64,Width::Qword,WordAccess::Write(
-        system::model::fp_word(s.system.unwrap().fp,index as int+1,wide)),
-        length,super::super::shared::entry::MemoryTask::SaveFp {index:(index+1) as u8,wide})}
 }
 #[verifier::opaque]
 pub open spec fn load_x87_integer(s:State,address:Address,width:Width,opcode:u16,length:u8)->(State,Tick) {
@@ -483,11 +463,11 @@ pub open spec fn restore_fp(s:State,address:Address,wide:bool,length:u8)->(State
         Some(system)=>if system.cr4_extra&0x200u64==0 {entry::unsupported(s)}
             else if !mmu_model::canonical(entry::linear(s,address,length) as int) {entry::unsupported(s)}
             else if entry::linear(s,address,length)%16!=0 {entry(s,Event::GeneralProtection)}
-            else if entry::linear(s,address,length)%4096>3584 {
-                stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage))
-            } else {entry::memory(State {fp_restore:Some(system.fp),..s},entry::linear(s,address,length),
-                Width::Qword,WordAccess::Read,length,
-                super::super::shared::entry::MemoryTask::RestoreFp {index:0,wide})},
+            else if entry::linear(s,address,length)>u64::MAX-511
+                || !mmu_model::canonical(entry::linear(s,address,length) as int+511) {
+                entry::unsupported(s)
+            } else {fp::start_restore_probe(s,entry::linear(s,address,length),wide,false,
+                entry::linear(s,address,length),length)},
     }}
 }
 #[verifier::opaque]
@@ -520,8 +500,9 @@ pub open spec fn control_x87(s:State,operation:system::X87Control,length:u8)->(S
     else if cpu.flags&0x100u64!=0 {stop(s,EventDiagnostic::Instruction(PagedDiagnostic::DebugRequired))}
     else {match s.system {
         None=>entry::unsupported(s),
-        Some(system)=>if system.cr0_extra&0xcu64!=0
-            || (operation==system::X87Control::EmptyMmx
+        Some(system)=>if (if operation==system::X87Control::Wait {
+                system.cr0_extra&0xau64==0xa} else {system.cr0_extra&0xcu64!=0})
+            || ((operation==system::X87Control::EmptyMmx || operation==system::X87Control::Wait)
                 && ((system.fp.status&!system.fp.control)&0x3fu16)!=0) {entry::unsupported(s)}
             else {entry::retire(State {system:Some(SystemState {
                 fp:match operation {
@@ -531,6 +512,7 @@ pub open spec fn control_x87(s:State,operation:system::X87Control,length:u8)->(S
                         status:system.fp.status&0x7f00u16,..system.fp},
                     system::X87Control::EmptyMmx=>system::LegacyFpState {
                         status:system.fp.status&0xc7ffu16,tags:0xffff,..system.fp},
+                    system::X87Control::Wait=>system.fp,
                 },..system}),..s},cpu,length,false,false)},
     }}
 }

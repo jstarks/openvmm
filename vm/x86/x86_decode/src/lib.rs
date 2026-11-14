@@ -419,6 +419,9 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
             | Mnemonic::Pcmpeqw
             | Mnemonic::Pcmpeqd
             | Mnemonic::Pmovmskb
+            | Mnemonic::Pcmpgtb
+            | Mnemonic::Pcmpgtw
+            | Mnemonic::Pcmpgtd
             | Mnemonic::Paddb
             | Mnemonic::Paddw
             | Mnemonic::Paddd
@@ -610,6 +613,9 @@ fn admit_entry(encoding: Encoding) -> Option<EntryInstruction> {
         Mnemonic::Nop => Some(EntryInstruction::Nop),
         Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence => Some(EntryInstruction::Fence),
         Mnemonic::Fninit => Some(EntryInstruction::InitializeX87),
+        Mnemonic::Wait => Some(EntryInstruction::ControlX87 {
+            operation: x86_system::memory_core::cpu_core::system::X87Control::Wait,
+        }),
         Mnemonic::Fild => {
             let Operand::Memory { address, width } = get(0)? else {
                 return None;
@@ -1250,25 +1256,36 @@ fn admit_xmm(instruction: &Instruction, size: AddressSize) -> Option<EntryInstru
     }
     if matches!(
         instruction.mnemonic(),
-        Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd
+        Mnemonic::Pcmpeqb
+            | Mnemonic::Pcmpeqw
+            | Mnemonic::Pcmpeqd
+            | Mnemonic::Pcmpgtb
+            | Mnemonic::Pcmpgtw
+            | Mnemonic::Pcmpgtd
     ) {
         let width = match instruction.mnemonic() {
-            Mnemonic::Pcmpeqb => Width::Byte,
-            Mnemonic::Pcmpeqw => Width::Word,
+            Mnemonic::Pcmpeqb | Mnemonic::Pcmpgtb => Width::Byte,
+            Mnemonic::Pcmpeqw | Mnemonic::Pcmpgtw => Width::Word,
             _ => Width::Dword,
         };
+        let greater = matches!(
+            instruction.mnemonic(),
+            Mnemonic::Pcmpgtb | Mnemonic::Pcmpgtw | Mnemonic::Pcmpgtd
+        );
         let index = dst?;
         return if let Some(source) = source {
-            Some(EntryInstruction::XmmEqual {
+            Some(EntryInstruction::XmmCompare {
                 dst: index,
                 source,
                 width,
+                greater,
             })
         } else if instruction.op1_kind() == OpKind::Memory {
-            Some(EntryInstruction::XmmEqualMemory {
+            Some(EntryInstruction::XmmCompareMemory {
                 address: address(instruction, size)?,
                 index,
                 width,
+                greater,
             })
         } else {
             None

@@ -21,6 +21,8 @@ pub mod control_io;
 pub mod decode;
 #[path = "shared_entry.rs"]
 pub mod entry;
+#[path = "shared_fp.rs"]
+mod fp;
 #[path = "shared_privilege.rs"]
 pub mod privilege;
 #[path = "shared_repeat.rs"]
@@ -42,6 +44,8 @@ pub enum Phase {
     Admitted { input: DecodeInput, decision: DecodeDecision },
     NearCall { target: u64, stack: u64 },
     EntryMemory { address: u64, length: u8, task: entry::MemoryTask },
+    FpSave {target:SaveTarget},
+    FpSaveDone {length:u8},
     PortIo { request: entry::PortRequest, length: u8, reply: Option<IoReply> },
     Timestamp {sequence:u64,length:u8,value:Option<u64>},
     ControlIo {sequence:u64,length:u8,access:ControlAccess,reply:Option<ControlReply>},
@@ -55,6 +59,16 @@ pub enum Phase {
     Pop { index: u8, words: ReturnWords },
     ReturnCode { words: ReturnWords }, ReturnStack { words: ReturnWords, cs: SegmentState },
     Stopped { reason: EventDiagnostic },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveTarget {
+    pub linear:u64,pub first:u64,pub second:u64,
+    pub offset:u16,pub length:u8,pub source:SaveSource,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveSource {
+    Legacy {wide:bool,preserve_pointers:bool},
+    Vector {low:u64,high:u64},
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tick { Pending, Waiting, Retired(bool), Delivered(u8), Halted, Stopped(EventDiagnostic),
@@ -90,6 +104,14 @@ impl SharedEventMachine {
     pub closed spec fn invariant(&self) -> bool {
         self.core.invariant()
         && self.system_supported()
+        && match self.phase {
+            Phase::FpSave {target}=>spec::fp::valid_target(target) && self.system is Some
+                && spec::fp::valid_offset(target)
+                && !mmu_core::shared_model::active(self.core@.mmu.phase),
+            Phase::FpSaveDone {length}=>1<=length<=15 && self.system is Some
+                && !mmu_core::shared_model::active(self.core@.mmu.phase),
+            _=>true,
+        }
         && match self.phase {
             Phase::PortIo {request,length,reply} =>
                 request.width != memory_core::cpu_core::operand::Width::Qword
@@ -260,14 +282,20 @@ impl SharedEventMachine {
     #[inline]
     pub fn request(&self) -> (r: Request)
         requires self.invariant(),
-        ensures r == mmu_core::shared_model::request(self@.core.mmu),
-    { self.core.request() }
+        ensures r == spec::request(self@),
+    {
+        if let Phase::FpSave {target}=self.phase {self.fp_save_request(target)}
+        else {self.core.request()}
+    }
 
     #[inline]
     pub fn respond(&mut self, reply: Reply) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(), (final(self)@, accepted) == spec::respond(old(self)@, reply),
-    { self.core.respond(reply) }
+    {
+        if matches!(self.phase,Phase::FpSave {..}) {self.fp_save_response(reply)}
+        else {self.core.respond(reply)}
+    }
 
     fn stop(&mut self, reason: EventDiagnostic) -> (tick: Tick)
         requires old(self).core.invariant(), old(self).system_supported(),
@@ -347,6 +375,8 @@ impl SharedEventMachine {
         ensures final(self).invariant(), (final(self)@, tick) == spec::advance(old(self)@),
     {
         match self.phase {
+            Phase::FpSave {..}=>Tick::Waiting,
+            Phase::FpSaveDone {length}=>self.retire_entry(self.core.cpu(),length,false,false),
             Phase::Repeat {width,length} => self.execute_repeat(width,length),
             Phase::RepeatMove {width,length} => self.execute_move(width,length),
             Phase::Decode { input } => Tick::Decode(input),
@@ -515,7 +545,8 @@ impl SharedEventMachine {
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
                 | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
-                | Phase::Timestamp {..} | Phase::ControlIo {..}),
+                | Phase::Timestamp {..} | Phase::ControlIo {..}
+                | Phase::FpSave {..} | Phase::FpSaveDone {..}),
         ensures out == spec::word_location(self@),
     {
         let cpu = self.core.cpu();
@@ -543,7 +574,8 @@ impl SharedEventMachine {
                 | Phase::Third | Phase::Ordinary { .. } | Phase::Stopped { .. }
                 | Phase::Decode { .. } | Phase::DecodeFetch { .. } | Phase::Admitted { .. }
                 | Phase::Repeat { .. } | Phase::RepeatMove { .. } | Phase::PortIo { .. }
-                | Phase::Timestamp {..} | Phase::ControlIo {..}),
+                | Phase::Timestamp {..} | Phase::ControlIo {..}
+                | Phase::FpSave {..} | Phase::FpSaveDone {..}),
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(), (final(self)@, tick) == spec::word_value(old(self)@, value),
     {

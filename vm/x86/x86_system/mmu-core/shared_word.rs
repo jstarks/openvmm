@@ -7,6 +7,52 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
+    pub(crate) fn begin_read_probe(&mut self,va:u64,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),accepted==!spec::active(old(self)@.phase),
+            final(self)@==if accepted {spec::read_probe_begin(old(self)@,va,user)} else {old(self)@},
+    {
+        let accepted=self.begin_access(va,Access::Read,user,Some(WordAccess::Read),1);
+        if accepted {self.probe=true;self.prepare_probe();}
+        accepted
+    }
+
+    /// Captures a WRITE-checked physical page without accessing its data.
+    /// Completion returns its page base, for a retained multi-page instruction.
+    pub(crate) fn begin_write_probe(&mut self,va:u64,user:bool)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),accepted==!spec::active(old(self)@.phase),
+            final(self)@==if accepted {spec::probe_begin(old(self)@,va,user)} else {old(self)@},
+    {
+        let accepted=self.begin_access(va,Access::Write(0),user,Some(WordAccess::Write(0)),1);
+        if accepted {self.probe=true;self.prepare_probe();}
+        accepted
+    }
+
+    pub(super) fn prepare_probe(&mut self)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),final(self)@==spec::prepare_probe(old(self)@),
+    {
+        if !self.probe {return;}
+        if let Phase::Data {frame,leaf,reads,..}=self.phase {
+            self.remember_data();
+            if !matches!(self.access,Access::Write(_)) {self.probe_done(frame,reads);return;}
+            match leaf {
+                Some(pte)=>self.phase=Phase::ProbeDirty {pte,frame,reads},
+                None=>self.probe_done(frame,reads),
+            }
+        }
+    }
+
+    pub(super) fn probe_done(&mut self,frame:u64,reads:u8)
+        requires old(self).invariant(),old(self).probe,
+        ensures final(self).invariant(),final(self)@==spec::probe_done(old(self)@,frame,reads),
+    {
+        if matches!(self.access,Access::Write(_)) {self.cache_dirty=true;}
+        self.phase=Phase::WordDone {report:WordReport {result:WordResult::Success(frame),
+            table_reads:reads,virtual_address:self.va}};
+    }
+
     /// One same-page RAM translation and ordinary byte-buffer copy. Completion
     /// reports the low qword; backing-error retry resumes after committed bytes.
     pub fn begin_pair_store(&mut self,va:u64,low:u64,upper:u64,user:bool)->(accepted:bool)
@@ -254,7 +300,7 @@ impl SharedMmu {
     pub(super) fn precheck_failure(&mut self, result: MmuResult)
         requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
             old(self).head is None,
-            old(self).valid_comparison(), old(self).valid_pair(), !(result is Success),
+            old(self).valid_comparison(), old(self).valid_pair(), old(self).valid_probe(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self).invariant(),
             final(self)@ == (spec::State { phase: spec::terminal(old(self)@, result, 0), ..old(self)@ }),
@@ -437,6 +483,7 @@ impl SharedMmu {
         self.cache_dirty = ram_store;
         self.head = None;
         self.pair_upper = None;
+        self.probe = false;
         let original = match self.modifier { Some(m) => m.original, None => value };
         self.phase = Phase::WordDone { report: WordReport { result: WordResult::Success(original),
             table_reads: reads, virtual_address: self.va } };

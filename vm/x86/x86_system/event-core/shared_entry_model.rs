@@ -246,7 +246,7 @@ pub open spec fn execute(s: State, instruction: Instruction, length: u8) -> (Sta
             |Instruction::XmmUnpackNarrow {..}|Instruction::XmmShuffle {..}
             |Instruction::XmmByteShift {..}
             |Instruction::XmmLogic {..}
-            |Instruction::XmmEqual {..}|Instruction::XmmEqualMemory {..}|Instruction::XmmMask {..}
+            |Instruction::XmmCompare {..}|Instruction::XmmCompareMemory {..}|Instruction::XmmMask {..}
             |Instruction::XmmArithmetic {..}|Instruction::XmmArithmeticMemory {..}
             |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>
                 privilege::execute_xmm(s,instruction,length),
@@ -596,8 +596,8 @@ pub open spec fn value(s: State, value: u64) -> (State, Tick) {
         MemoryTask::XmmHalf {..}|MemoryTask::XmmLow {..}|MemoryTask::XmmHigh {..}=>
             privilege::finish_xmm_memory(s,address,task,value,length),
         MemoryTask::Exchange {register}=>exchange_value(s,register,value,length),
-        MemoryTask::SaveFp {index,wide}=>privilege::save_fp_value(s,address,index,wide,length),
-        MemoryTask::SaveFpHeader {wide}=>privilege::save_fp_header(s,address,wide,length),
+        MemoryTask::FpSaveProbe {base,save,first}=>fp::finish_probe(s,base,save,first,value,length),
+        MemoryTask::FpRestoreProbe {base,wide,tail}=>fp::finish_restore_probe(s,base,wide,tail,length),
         MemoryTask::RestoreFp {index,wide}=>privilege::restore_fp_value(s,address,index,value,wide,length),
         MemoryTask::LoadX87Integer {width,opcode}=>privilege::load_x87_value(s,address,value,width,opcode,length),
         MemoryTask::ExchangeAdd {register:source,locked}=>{

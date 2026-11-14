@@ -60,6 +60,16 @@ pub open spec fn boundary_word_as(s:State,address:u64,word:WordAccess,user:bool)
         (State {mmu:mm::begin(s.mmu,address,word_model::request(word),user,Some(word)),..s},true)
     } else {(s,false)}
 }
+pub open spec fn boundary_write_probe(s:State,address:u64)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) {
+        (State {mmu:mm::probe_begin(s.mmu,address,s.user),..s},true)
+    } else {(s,false)}
+}
+pub open spec fn boundary_read_probe(s:State,address:u64)->(State,bool) {
+    if s.phase is Boundary && !mm::active(s.mmu.phase) {
+        (State {mmu:mm::read_probe_begin(s.mmu,address,s.user),..s},true)
+    } else {(s,false)}
+}
 pub open spec fn boundary_system_span(s:State,address:u64,word:WordAccess,size:u8)->(State,bool) {
     if s.phase is Boundary && !mm::active(s.mmu.phase) {
         (State {mmu:mm::access_begin(s.mmu,address,word_model::request(word),false,Some(word),size,true),..s},true)

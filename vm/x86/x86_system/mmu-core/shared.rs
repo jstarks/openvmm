@@ -62,6 +62,7 @@ pub enum Phase {
     WordDirty { pte: Leaf, data: WordData, reads: u8 },
     WordStore { data: WordData, reads: u8 },
     CopyStore { address: u64, bytes: [u8; 16], completed: u8, reads: u8 },
+    ProbeDirty { pte: Leaf, frame: u64, reads: u8 },
     WordHead { data: WordData, reads: u8 },
     WordLast { data: WordData, reads: u8 },
     SizedStore { data: WordData, reads: u8 },
@@ -84,7 +85,7 @@ pub enum Request {
     Complete(Report),
     DataCompare { address: u64, expected: u64, replacement: u64 },
     WriteWord { address: u64, word_value: u64 },
-    WriteBytes { address: u64, bytes: [u8; 16], offset: u8 },
+    WriteBytes { address: u64, bytes: [u8; 16], offset: u8, end: u8 },
     CompleteWord { report: WordReport },
     Io(IoRequest),
 }
@@ -107,6 +108,7 @@ pub struct SharedMmu {
     comparison: Option<Comparison>,
     head: Option<PageHead>,
     pair_upper: Option<u64>,
+    probe: bool,
 }
 
 impl View for SharedMmu {
@@ -115,11 +117,19 @@ impl View for SharedMmu {
         spec::State { inner: self.inner@, cache_dirty: self.cache_dirty, phase: self.phase,
             va: self.va, access: self.access, user: self.user, word: self.word,
             sequence: self.sequence, size: self.size, modifier: self.modifier,
-            comparison: self.comparison, head: self.head, pair_upper: self.pair_upper }
+            comparison: self.comparison, head: self.head, pair_upper: self.pair_upper, probe: self.probe }
     }
 }
 
 impl SharedMmu {
+    pub closed spec fn valid_probe(&self) -> bool {
+        self.probe ==> ((self.word == Some(WordAccess::Write(0)) && self.access == Access::Write(0))
+                || (self.word == Some(WordAccess::Read) && self.access == Access::Read))
+            && self.size == 1 && self.modifier is None && self.comparison is None
+            && self.head is None && self.pair_upper is None
+            && !(self.phase is IoDirty) && !(self.phase is IoReady)
+    }
+
     pub closed spec fn valid_pair(&self) -> bool {
         self.pair_upper is Some ==> self.va % 4096 <= 4080 && self.size == 8
             && self.word is Some && self.access is Write
@@ -181,6 +191,7 @@ impl SharedMmu {
         && self.valid_comparison()
         && self.valid_head()
         && self.valid_pair()
+        && self.valid_probe()
         && (spec::active(self.phase) ==> mmu_model::valid_config(self.inner.config))
         && (spec::active(self.phase) && self.word is Some ==>
             self.va as int + self.size as int - 1 <= u64::MAX)
@@ -189,7 +200,7 @@ impl SharedMmu {
             Phase::Done(_) | Phase::Dirty { .. } | Phase::Store { .. } => self.word is None,
             Phase::FetchDone {..}=>self.word is None && self.access==Access::Fetch,
             Phase::WordTail { .. } | Phase::WordDirty { .. } | Phase::WordStore { .. }
-                | Phase::CopyStore { .. }
+                | Phase::CopyStore { .. } | Phase::ProbeDirty { .. }
                 | Phase::WordHead { .. } | Phase::WordLast { .. } | Phase::WordDone { .. }
                 | Phase::SizedStore { .. } | Phase::AtomicStore { .. }
                 | Phase::PageDirtyHead { .. } | Phase::PageDirtyTail { .. }
@@ -224,6 +235,8 @@ impl SharedMmu {
                 && match leaf { Some(l) => spec::valid_leaf(l), None => true },
             Phase::WordDirty { pte, data, .. } => self.word is Some
                 && self.access is Write && spec::valid_leaf(pte) && spec::valid_span(data, self.size),
+            Phase::ProbeDirty {pte,frame,..}=>self.probe && self.access is Write && spec::valid_leaf(pte)
+                && frame < 0x1_0000_0000_0000u64 && frame%4096==0,
             Phase::WordStore { data, .. } => self.word is Some
                 && self.access is Write && spec::valid_data(data) && data.address % 8 == 0,
             Phase::CopyStore { address, completed, .. } => self.access is Write
@@ -265,7 +278,7 @@ impl SharedMmu {
     {
         Self { inner: Mmu::new(config, cr2), cache_dirty: false, phase: Phase::Idle,
             va: 0, access: Access::Read, user: false, word: None,
-            sequence: 0, size: 8, modifier: None, comparison: None, head: None, pair_upper: None }
+            sequence: 0, size: 8, modifier: None, comparison: None, head: None, pair_upper: None, probe: false }
     }
 
     pub fn cr2(&self) -> (v: u64)
@@ -319,6 +332,7 @@ impl SharedMmu {
         self.comparison = None;
         self.head = None;
         self.pair_upper = None;
+        self.probe = false;
         if word.is_some() {
             if va > u64::MAX - (size as u64 - 1) {
                 self.phase = Phase::WordDone { report: WordReport { result: WordResult::Wrap,
@@ -410,7 +424,7 @@ impl SharedMmu {
 
     fn restart(&mut self)
         requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
-            old(self).valid_comparison(), old(self).valid_pair(),
+            old(self).valid_comparison(), old(self).valid_pair(), old(self).valid_probe(),
             mmu_model::valid_config(old(self).inner.config),
             old(self).word is Some ==> old(self).va as int + old(self).size as int - 1 <= u64::MAX,
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
@@ -423,7 +437,7 @@ impl SharedMmu {
 
     fn fail(&mut self, result: MmuResult, reads: u8)
         requires old(self).inner.invariant(), old(self).valid_size(), old(self).valid_modifier(),
-            old(self).valid_comparison(), old(self).valid_pair(), !(result is Success),
+            old(self).valid_comparison(), old(self).valid_pair(), old(self).valid_probe(), !(result is Success),
             old(self).word is Some ==> old(self).access == word_model::request(old(self).word.unwrap()),
         ensures final(self)@ == spec::fault(old(self)@, result, reads), final(self).invariant(),
     {
@@ -498,7 +512,7 @@ impl SharedMmu {
                     value: match self.access { Access::Write(v) => v, _ => 0 } },
             Phase::WordDone { report } => Request::CompleteWord { report },
             Phase::WordTail { frame, .. } => Request::Read((frame + self.va % 4096) / 8 * 8 + 8),
-            Phase::WordDirty { pte, .. } | Phase::IoDirty { pte, .. } => {
+            Phase::WordDirty { pte, .. } | Phase::IoDirty { pte, .. } | Phase::ProbeDirty {pte,..} => {
                 let word = pte.word;
                 let replacement = dirty(word);
                 proof { assert((word | 64u64) == word + if word / 64u64 % 2u64 == 1u64 { 0u64 } else { 64u64 }) by(bit_vector); }
@@ -508,7 +522,7 @@ impl SharedMmu {
             },
             Phase::WordStore { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
             Phase::CopyStore {address,bytes,completed,..}=>
-                Request::WriteBytes {address:address+completed as u64,bytes,offset:completed},
+                Request::WriteBytes {address:address+completed as u64,bytes,offset:completed,end:16},
             Phase::WordHead { data, .. } => self.word_head_request(data),
             Phase::WordLast { data, .. } => self.word_last_request(data),
             Phase::SizedStore { data, .. } => self.sized_store_request(data),
@@ -608,6 +622,7 @@ impl SharedMmu {
                     self.phase = Phase::Data { frame, permissions, reads: level + 1, large: level == 2,
                         leaf: Some(Leaf { address, word: accessed(word) }) };
                     self.prepare_pair();
+                    self.prepare_probe();
                 }
                 true
             },
@@ -626,6 +641,7 @@ impl SharedMmu {
                 self.ready_store(data, reads);
                 true
             },
+            Phase::ProbeDirty {frame,reads,..}=>{self.probe_done(frame,reads);true},
             Phase::WordHead { data, reads } => {
                 self.phase = Phase::WordLast { data, reads };
                 true
@@ -670,7 +686,7 @@ impl SharedMmu {
     {
         match self.phase {
             Phase::Mark { .. } | Phase::Dirty { .. } => { self.restart(); true },
-            Phase::WordDirty { .. } | Phase::IoDirty { .. } => { self.restart(); true },
+            Phase::WordDirty { .. } | Phase::IoDirty { .. } | Phase::ProbeDirty {..} => { self.restart(); true },
             Phase::PageDirtyHead { .. } | Phase::PageDirtyTail { .. } => { self.restart(); true },
             Phase::Store { address, reads, .. } => {
                 self.phase = Phase::Store { address, word: current, reads };
@@ -771,11 +787,12 @@ impl<E> RunError<E> {
     pub fn progress(&self) -> Option<Reply> {
         match self {
             Self::Copy {
-                request: Request::WriteBytes { offset, .. },
+                request: Request::WriteBytes { offset, end, .. },
                 source,
-            } if *offset < 16
+            } if offset < end
+                && *end <= 16
                 && source.completed > 0
-                && source.completed <= usize::from(16 - offset) =>
+                && source.completed <= usize::from(end - offset) =>
             {
                 Some(Reply::Copied(source.completed as u8))
             }
@@ -847,13 +864,14 @@ pub fn perform<R: PhysicalRam>(ram: &R, request: Request) -> Result<Reply, RunEr
             address,
             bytes,
             offset,
+            end,
         } => {
-            if offset >= 16 {
+            if offset >= end || end > 16 {
                 return Err(RunError::Protocol(request));
             }
-            ram.write_bytes(address, &bytes[usize::from(offset)..])
+            ram.write_bytes(address, &bytes[usize::from(offset)..usize::from(end)])
                 .map_err(|source| RunError::Copy { request, source })?;
-            return Ok(Reply::Copied(16 - offset));
+            return Ok(Reply::Copied(end - offset));
         }
         Request::Compare {
             address,

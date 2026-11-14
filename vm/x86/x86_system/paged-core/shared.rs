@@ -127,6 +127,20 @@ impl SharedMachine {
     {
         self.boundary_word_as(address,request,false)
     }
+    pub(crate) fn boundary_write_probe(&mut self,address:u64)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),(final(self)@,accepted)==spec::boundary_write_probe(old(self)@,address),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_write_probe(address,self.user)
+    }
+    pub(crate) fn boundary_read_probe(&mut self,address:u64)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),(final(self)@,accepted)==spec::boundary_read_probe(old(self)@,address),
+    {
+        if !matches!(self.phase,CpuPhase::Boundary) {return false;}
+        self.mmu.begin_read_probe(address,self.user)
+    }
     pub(crate) fn boundary_word_as(&mut self,address:u64,request:WordAccess,user:bool)->(accepted:bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),

@@ -30,8 +30,8 @@ pub enum Instruction {
     XmmShuffle {dst:u8,source:u8,control:u8},
     XmmByteShift {index:u8,count:u8,left:bool},
     XmmLogic {dst:u8,source:u8,operation:system::XmmLogic},
-    XmmEqual {dst:u8,source:u8,width:Width},
-    XmmEqualMemory {address:Address,index:u8,width:Width},
+    XmmCompare {dst:u8,source:u8,width:Width,greater:bool},
+    XmmCompareMemory {address:Address,index:u8,width:Width,greater:bool},
     XmmArithmetic {dst:u8,source:u8,width:Width,subtract:bool},
     XmmArithmeticMemory {address:Address,index:u8,width:Width,subtract:bool},
     XmmMask {dst:Register,source:u8},
@@ -100,7 +100,7 @@ pub enum Port { Dx, Immediate(u8) }
 pub enum XmmMemoryKind {Low,High,Aligned,Unaligned}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum XmmReadAction {Move,Equal(Width),Arithmetic {width:Width,subtract:bool}}
+pub enum XmmReadAction {Move,Compare {width:Width,greater:bool},Arithmetic {width:Width,subtract:bool}}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortRequest {
@@ -117,8 +117,8 @@ pub enum MemoryTask {
     TableLimit { idt: bool },
     TableBase { idt: bool, limit: u16 },
     StoreTableBase {base:u64},
-    SaveFp {index:u8,wide:bool},
-    SaveFpHeader {wide:bool},
+    FpSaveProbe {base:u64,save:SaveSource,first:Option<u64>},
+    FpRestoreProbe {base:u64,wide:bool,tail:bool},
     RestoreFp {index:u8,wide:bool},
     LoadX87Integer {width:Width,opcode:u16},
     XmmLoad {index:u8,wide:bool},
@@ -269,7 +269,7 @@ impl SharedEventMachine {
                 |Instruction::XmmUnpackNarrow {..}|Instruction::XmmShuffle {..}
                 |Instruction::XmmByteShift {..}
                 |Instruction::XmmLogic {..}
-                |Instruction::XmmEqual {..}|Instruction::XmmEqualMemory {..}|Instruction::XmmMask {..}
+                |Instruction::XmmCompare {..}|Instruction::XmmCompareMemory {..}|Instruction::XmmMask {..}
                 |Instruction::XmmArithmetic {..}|Instruction::XmmArithmeticMemory {..}
                 |Instruction::XmmCopy {..}|Instruction::XmmMerge {..}|Instruction::XmmMemory {..}=>{
                 reveal(spec::entry::execute);
@@ -1104,12 +1104,8 @@ impl SharedEventMachine {
             MemoryTask::Exchange {register}=>{
                 return self.exchange_value(register,value,length);
             },
-            MemoryTask::SaveFp {index,wide}=>{
-                return self.finish_fp_save(address,index,wide,length);
-            },
-            MemoryTask::SaveFpHeader {wide}=>{
-                return self.finish_fp_header(address,wide,length);
-            },
+            MemoryTask::FpSaveProbe {base,save,first}=>return self.finish_fp_probe(base,save,first,value,length),
+            MemoryTask::FpRestoreProbe {base,wide,tail}=>return self.finish_restore_probe(base,wide,tail,length),
             MemoryTask::RestoreFp {index,wide}=>{
                 return self.finish_fp_restore(address,index,value,wide,length);
             },

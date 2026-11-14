@@ -43,33 +43,34 @@ impl SharedEventMachine {
         self.retire_entry(self.core.cpu(),length,false,false)
     }
 
-    pub(super) fn finish_xmm_equal(&mut self,dst:u8,low:u64,high:u64,width:Width,length:u8)->(tick:Tick)
+    pub(super) fn finish_xmm_compare(&mut self,dst:u8,low:u64,high:u64,width:Width,greater:bool,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(),(final(self)@,tick)==
-            spec::privilege::finish_xmm_equal(old(self)@,dst,low,high,width,length),
+            spec::privilege::finish_xmm_compare(old(self)@,dst,low,high,width,greater,length),
     {
-        reveal(spec::privilege::finish_xmm_equal);
+        reveal(spec::privilege::finish_xmm_compare);
         let Some(mut system)=self.system else {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
         if dst>=16 || width==Width::Qword {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
-        system.fp=system.fp.xmm_equal(dst,low,high,width);
+        system.fp=system.fp.xmm_packed(dst,low,high,width,
+            if greater {system::PackedOperation::GreaterSigned} else {system::PackedOperation::Equal});
         self.system=Some(system);
         self.retire_entry(self.core.cpu(),length,false,false)
     }
 
-    pub(super) fn execute_xmm_equal_memory(&mut self,address:Address,index:u8,width:Width,length:u8)->(tick:Tick)
+    pub(super) fn execute_xmm_compare_memory(&mut self,address:Address,index:u8,width:Width,greater:bool,length:u8)->(tick:Tick)
         requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
             !mmu_core::shared_model::active(old(self).core@.mmu.phase),
         ensures final(self).invariant(),(final(self)@,tick)==
-            spec::privilege::execute_xmm_equal_memory(old(self)@,address,index,width,length),
+            spec::privilege::execute_xmm_compare_memory(old(self)@,address,index,width,greater,length),
     {
-        reveal(spec::privilege::execute_xmm_equal_memory);
+        reveal(spec::privilege::execute_xmm_compare_memory);
         if width==Width::Qword {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
-        self.execute_xmm_read(address,index,entry::XmmReadAction::Equal(width),length)
+        self.execute_xmm_read(address,index,entry::XmmReadAction::Compare {width,greater},length)
     }
 
     pub(super) fn execute_xmm_read(&mut self,address:Address,index:u8,action:entry::XmmReadAction,length:u8)->(tick:Tick)
@@ -119,7 +120,7 @@ impl SharedEventMachine {
             },
             entry::MemoryTask::XmmHigh {index,low,action}=>match action {
                 entry::XmmReadAction::Move=>self.finish_xmm_pair(index,low,value,length),
-                entry::XmmReadAction::Equal(width)=>self.finish_xmm_equal(index,low,value,width,length),
+                entry::XmmReadAction::Compare {width,greater}=>self.finish_xmm_compare(index,low,value,width,greater,length),
                 entry::XmmReadAction::Arithmetic {width,subtract}=>
                     self.finish_xmm_arithmetic(index,low,value,width,subtract,length),
             },
@@ -172,7 +173,8 @@ impl SharedEventMachine {
                 entry::MemoryTask::XmmLow {index,action:entry::XmmReadAction::Move});
         }
         if linear%4096>4080 {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
+            let pair=system.fp.xmm[index as usize];
+            return self.start_fp_probe(linear,SaveSource::Vector {low:pair[0],high:pair[1]},None,linear,length);
         }
         let pair=system.fp.xmm[index as usize];
         let _accepted=self.core.boundary_pair_store(linear,pair[0],pair[1]);assert(_accepted);
@@ -214,12 +216,12 @@ impl SharedEventMachine {
                 let pair=system.fp.xmm[source as usize];
                 self.finish_xmm_arithmetic(dst,pair[0],pair[1],width,subtract,length)
             },
-            Instruction::XmmEqualMemory {address,index,width}=>
-                self.execute_xmm_equal_memory(address,index,width,length),
-            Instruction::XmmEqual {dst,source,width}=>{
+            Instruction::XmmCompareMemory {address,index,width,greater}=>
+                self.execute_xmm_compare_memory(address,index,width,greater,length),
+            Instruction::XmmCompare {dst,source,width,greater}=>{
                 if source>=16 {return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));}
                 let pair=system.fp.xmm[source as usize];
-                self.finish_xmm_equal(dst,pair[0],pair[1],width,length)
+                self.finish_xmm_compare(dst,pair[0],pair[1],width,greater,length)
             },
             Instruction::XmmMask {dst,source}=>{
                 if source>=16 || !dst.is_valid() || (dst.width()!=Width::Dword && dst.width()!=Width::Qword) {
@@ -606,69 +608,11 @@ impl SharedEventMachine {
         if linear%16!=0 {
             return self.start_entry(Event::GeneralProtection);
         }
-        if linear%4096>3584 {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage));
-        }
-        let word=system.fp.save_word(0,wide);
-        if system.fp.status&0x80!=0 {
-            self.entry_memory(linear,Width::Qword,WordAccess::Write(word),length,
-                entry::MemoryTask::SaveFp {index:0,wide})
-        } else {
-            self.entry_memory(linear,Width::Dword,WordAccess::Write(word&0xffff_ffff),length,
-                entry::MemoryTask::SaveFpHeader {wide})
-        }
-    }
-
-    pub(super) fn finish_fp_header(&mut self,address:u64,wide:bool,length:u8)->(tick:Tick)
-        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
-            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
-        ensures final(self).invariant(),
-            (final(self)@,tick)==spec::privilege::save_fp_header(old(self)@,address,wide,length),
-    {
-        reveal(spec::privilege::save_fp_header);
-        let Some(system)=self.system else {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-        };
-        if address>u64::MAX-4 {
+        if linear>u64::MAX-511 || !canonical(linear+511) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
-        let word=(system.fp.save_word(0,wide)>>32)&0xffff;
-        self.entry_memory(address+4,Width::Word,WordAccess::Write(word),length,
-            entry::MemoryTask::SaveFp {index:0,wide})
-    }
-
-    pub(super) fn finish_fp_save(&mut self,address:u64,index:u8,wide:bool,length:u8)->(tick:Tick)
-        requires old(self).invariant(),old(self).core@.phase==CpuPhase::Boundary,
-            !mmu_core::shared_model::active(old(self).core@.mmu.phase),
-        ensures final(self).invariant(),
-            (final(self)@,tick)==spec::privilege::save_fp_value(old(self)@,address,index,wide,length),
-    {
-        reveal(spec::privilege::save_fp_value);
-        if index>=52 {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-        }
-        let cpu=self.core.cpu();
-        if index==51 {
-            return self.retire_entry(cpu,length,false,false);
-        }
-        if address>u64::MAX-8 {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-        }
-        let Some(system)=self.system else {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-        };
-        // AMD leaves the error pointers and opcode untouched when ES is clear.
-        if index==0 && system.fp.status&0x80==0 {
-            if address>u64::MAX-20 {
-                return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
-            }
-            return self.entry_memory(address+20,Width::Qword,WordAccess::Write(system.fp.save_word(3,wide)),
-                length,entry::MemoryTask::SaveFp {index:3,wide});
-        }
-        let next=index+1;
-        let word=system.fp.save_word(next,wide);
-        self.entry_memory(address+8,Width::Qword,WordAccess::Write(word),length,
-            entry::MemoryTask::SaveFp {index:next,wide})
+        self.start_fp_probe(linear,SaveSource::Legacy {wide,preserve_pointers:system.fp.status&0x80==0},
+            None,linear,length)
     }
 
     pub(super) fn load_x87_integer(&mut self,address:Address,width:Width,opcode:u16,length:u8)->(tick:Tick)
@@ -742,12 +686,10 @@ impl SharedEventMachine {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         if linear%16!=0 {return self.start_entry(Event::GeneralProtection);}
-        if linear%4096>3584 {
-            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::DataCrossPage));
+        if linear>u64::MAX-511 || !canonical(linear+511) {
+            return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
-        self.fp_restore=Some(system.fp);
-        self.entry_memory(linear,Width::Qword,WordAccess::Read,length,
-            entry::MemoryTask::RestoreFp {index:0,wide})
+        self.start_restore_probe(linear,wide,false,linear,length)
     }
 
     pub(super) fn finish_fp_restore(&mut self,address:u64,index:u8,value:u64,wide:bool,length:u8)->(tick:Tick)
@@ -805,8 +747,9 @@ impl SharedEventMachine {
         let Some(mut system)=self.system else {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         };
-        if system.cr0_extra&0xcu64!=0
-            || (operation==system::X87Control::EmptyMmx
+        let wait=operation==system::X87Control::Wait;
+        if (if wait {system.cr0_extra&0xau64==0xa} else {system.cr0_extra&0xcu64!=0})
+            || ((operation==system::X87Control::EmptyMmx || wait)
                 && ((system.fp.status&!system.fp.control)&0x3fu16)!=0) {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }

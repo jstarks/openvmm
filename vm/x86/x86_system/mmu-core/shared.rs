@@ -5,7 +5,7 @@
 use super::word::{WordAccess, WordReport, WordResult};
 use super::{shared_model as spec, *};
 use memory_core::cpu_core::{integer, operand::Width};
-use memory_core::shared::{BeatError, Exchange, PhysicalRam};
+use memory_core::shared::{BeatError, CopyError, Exchange, PhysicalRam};
 #[path = "shared_io.rs"]
 pub mod io;
 #[path = "shared_word.rs"]
@@ -61,8 +61,7 @@ pub enum Phase {
     WordTail { frame: u64, permissions: Permissions, leaf: Option<Leaf>, first: u64, reads: u8, large: bool },
     WordDirty { pte: Leaf, data: WordData, reads: u8 },
     WordStore { data: WordData, reads: u8 },
-    PairHead { data: WordData, upper: u64, reads: u8 },
-    PairTail { address: u64, value: u64, low: u64, reads: u8 },
+    CopyStore { address: u64, bytes: [u8; 16], completed: u8, reads: u8 },
     WordHead { data: WordData, reads: u8 },
     WordLast { data: WordData, reads: u8 },
     SizedStore { data: WordData, reads: u8 },
@@ -85,12 +84,13 @@ pub enum Request {
     Complete(Report),
     DataCompare { address: u64, expected: u64, replacement: u64 },
     WriteWord { address: u64, word_value: u64 },
+    WriteBytes { address: u64, bytes: [u8; 16], offset: u8 },
     CompleteWord { report: WordReport },
     Io(IoRequest),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reply { Read(u64), Committed, Changed(u64) }
+pub enum Reply { Read(u64), Committed, Changed(u64), Copied(u8) }
 
 pub struct SharedMmu {
     inner: Mmu,
@@ -121,7 +121,7 @@ impl View for SharedMmu {
 
 impl SharedMmu {
     pub closed spec fn valid_pair(&self) -> bool {
-        self.pair_upper is Some ==> self.va % 8 == 0 && self.va % 4096 <= 4080 && self.size == 8
+        self.pair_upper is Some ==> self.va % 4096 <= 4080 && self.size == 8
             && self.word is Some && self.access is Write
             && self.modifier is None && self.comparison is None && self.head is None
             && !(self.phase is IoDirty) && !(self.phase is IoReady)
@@ -189,7 +189,7 @@ impl SharedMmu {
             Phase::Done(_) | Phase::Dirty { .. } | Phase::Store { .. } => self.word is None,
             Phase::FetchDone {..}=>self.word is None && self.access==Access::Fetch,
             Phase::WordTail { .. } | Phase::WordDirty { .. } | Phase::WordStore { .. }
-                | Phase::PairHead { .. } | Phase::PairTail { .. }
+                | Phase::CopyStore { .. }
                 | Phase::WordHead { .. } | Phase::WordLast { .. } | Phase::WordDone { .. }
                 | Phase::SizedStore { .. } | Phase::AtomicStore { .. }
                 | Phase::PageDirtyHead { .. } | Phase::PageDirtyTail { .. }
@@ -226,12 +226,10 @@ impl SharedMmu {
                 && self.access is Write && spec::valid_leaf(pte) && spec::valid_span(data, self.size),
             Phase::WordStore { data, .. } => self.word is Some
                 && self.access is Write && spec::valid_data(data) && data.address % 8 == 0,
-            Phase::PairHead { data, .. } => self.access is Write && self.size == 8
-                && spec::valid_data(data) && data.address % 8 == 0
-                && data.address % 4096 <= 4080 && self.pair_upper is None,
-            Phase::PairTail { address, .. } => self.access is Write && self.size == 8
-                && address < 0x1_0000_0000_0000u64 && address % 8 == 0
-                && self.pair_upper is None,
+            Phase::CopyStore { address, completed, .. } => self.access is Write
+                && self.word is Some && self.size == 8 && completed < 16
+                && address < 0x1_0000_0000_0000u64 && address % 4096 <= 4080
+                && self.pair_upper is None && self.modifier is None && self.comparison is None,
             Phase::WordHead { data, .. } | Phase::WordLast { data, .. } => self.word is Some
                 && self.access is Write && spec::valid_data(data) && data.address % 8 != 0,
             Phase::SizedStore { data, .. } => self.word is Some
@@ -509,8 +507,8 @@ impl SharedMmu {
                 Request::Compare { address: pte.address, expected: word, replacement }
             },
             Phase::WordStore { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
-            Phase::PairHead { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
-            Phase::PairTail { address, value, .. } => Request::WriteWord { address, word_value: value },
+            Phase::CopyStore {address,bytes,completed,..}=>
+                Request::WriteBytes {address:address+completed as u64,bytes,offset:completed},
             Phase::WordHead { data, .. } => self.word_head_request(data),
             Phase::WordLast { data, .. } => self.word_last_request(data),
             Phase::SizedStore { data, .. } => self.sized_store_request(data),
@@ -529,7 +527,8 @@ impl SharedMmu {
     pub fn read(&mut self, word: u64) -> (accepted: bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
-            accepted == (old(self)@.phase is Walk || old(self)@.phase is Data || old(self)@.phase is WordTail),
+            accepted == (old(self)@.phase is Walk || old(self)@.phase is Data
+                || old(self)@.phase is WordTail),
             final(self)@ == spec::read(old(self)@, word),
     {
         match self.phase {
@@ -608,6 +607,7 @@ impl SharedMmu {
                 } else {
                     self.phase = Phase::Data { frame, permissions, reads: level + 1, large: level == 2,
                         leaf: Some(Leaf { address, word: accessed(word) }) };
+                    self.prepare_pair();
                 }
                 true
             },
@@ -624,15 +624,6 @@ impl SharedMmu {
             },
             Phase::WordDirty { data, reads, .. } => {
                 self.ready_store(data, reads);
-                true
-            },
-            Phase::PairHead { data, upper, reads } => {
-                self.phase = Phase::PairTail { address: data.address + 8,
-                    value: upper, low: data.value, reads };
-                true
-            },
-            Phase::PairTail { low, reads, .. } => {
-                self.word_store_done(low, reads);
                 true
             },
             Phase::WordHead { data, reads } => {
@@ -720,12 +711,13 @@ impl SharedMmu {
             Reply::Read(word) => self.read(word),
             Reply::Committed => self.exchanged(),
             Reply::Changed(current) => self.changed(current),
+            Reply::Copied(count) => self.copied(count),
         }
     }
 }
 }
 
-/// A bounded batch either finishes or retains the exact pending request.
+/// A bounded batch either finishes or retains the pending uncommitted suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
     Complete(Report),
@@ -735,7 +727,14 @@ pub enum Progress {
 
 #[derive(Debug)]
 pub enum RunError<E> {
-    Memory { request: Request, source: E },
+    Memory {
+        request: Request,
+        source: E,
+    },
+    Copy {
+        request: Request,
+        source: CopyError<E>,
+    },
     Protocol(Request),
     InvalidBeat(BeatError),
     IoProfile(IoRoute),
@@ -746,6 +745,7 @@ impl<E: core::fmt::Display> core::fmt::Display for RunError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Memory { request, source } => write!(f, "MMU RAM request {request:?}: {source}"),
+            Self::Copy { request, source } => write!(f, "MMU RAM request {request:?}: {source}"),
             Self::Protocol(request) => write!(f, "invalid MMU response for {request:?}"),
             Self::InvalidBeat(error) => write!(f, "invalid MMU byte beat: {error:?}"),
             Self::IoProfile(route) => write!(f, "unsupported MMIO admission: {route:?}"),
@@ -760,14 +760,33 @@ impl<E: core::error::Error + 'static> core::error::Error for RunError<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Memory { source, .. } => Some(source),
+            Self::Copy { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl<E> RunError<E> {
+    /// Acknowledge this prefix before returning the error to the host.
+    pub fn progress(&self) -> Option<Reply> {
+        match self {
+            Self::Copy {
+                request: Request::WriteBytes { offset, .. },
+                source,
+            } if *offset < 16
+                && source.completed > 0
+                && source.completed <= usize::from(16 - offset) =>
+            {
+                Some(Reply::Copied(source.completed as u8))
+            }
             _ => None,
         }
     }
 }
 
 impl SharedMmu {
-    /// Dispatches atomic effects; provider/compiler correctness remains trusted.
-    /// Memory failure retains the request and is not an architectural exception.
+    /// Dispatches RAM effects; provider/compiler correctness remains trusted.
+    /// Copy failures acknowledge their prefix before returning the host error.
     pub fn run<R: PhysicalRam>(
         &mut self,
         ram: &R,
@@ -780,7 +799,18 @@ impl SharedMmu {
                 Request::CompleteWord { report } => return Ok(Progress::CompleteWord(report)),
                 _ => {}
             }
-            let accepted = self.respond(perform(ram, request)?);
+            let reply = match perform(ram, request) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    if let Some(reply) = error.progress() {
+                        if !self.respond(reply) {
+                            return Err(RunError::Protocol(request));
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            let accepted = self.respond(reply);
             if !accepted {
                 return Err(RunError::Protocol(request));
             }
@@ -794,7 +824,8 @@ impl SharedMmu {
     }
 }
 
-/// Performs exactly one requested physical effect; never advances a CPU/MMU.
+/// Performs one logical request, potentially copying multiple physical chunks.
+/// Never advances a CPU/MMU; callers must acknowledge error.progress().
 #[inline(always)]
 pub fn perform<R: PhysicalRam>(ram: &R, request: Request) -> Result<Reply, RunError<R::Error>> {
     let exchange = match request {
@@ -811,6 +842,18 @@ pub fn perform<R: PhysicalRam>(ram: &R, request: Request) -> Result<Reply, RunEr
             ram.write_word(address, word_value)
                 .map_err(|source| RunError::Memory { request, source })?;
             return Ok(Reply::Committed);
+        }
+        Request::WriteBytes {
+            address,
+            bytes,
+            offset,
+        } => {
+            if offset >= 16 {
+                return Err(RunError::Protocol(request));
+            }
+            ram.write_bytes(address, &bytes[usize::from(offset)..])
+                .map_err(|source| RunError::Copy { request, source })?;
+            return Ok(Reply::Copied(16 - offset));
         }
         Request::Compare {
             address,

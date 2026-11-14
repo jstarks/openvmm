@@ -115,7 +115,7 @@ pub open spec fn execute_xmm_memory(s:State,address:Address,index:u8,store:bool,
         } else if !store {entry::memory(s,linear,Width::Qword,WordAccess::Read,length,
             super::super::shared::entry::MemoryTask::XmmLow {
                 index,action:super::super::shared::entry::XmmReadAction::Move})}
-        else if linear%8!=0 || linear%4096>4080 {entry::unsupported(s)}
+        else if linear%4096>4080 {entry::unsupported(s)}
         else {
             let pair=s.system.unwrap().fp.xmm[index as int];
             (State {core:c::boundary_pair_store(s.core,linear,pair[0],pair[1]).0,

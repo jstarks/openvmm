@@ -7,17 +7,17 @@ use memory_core::shared::Beat;
 verus! {
 
 impl SharedMmu {
-    /// One same-page RAM translation, two qword-aligned stores. Completion
-    /// reports the low qword; backing-error retry never replays a committed head.
+    /// One same-page RAM translation and ordinary byte-buffer copy. Completion
+    /// reports the low qword; backing-error retry resumes after committed bytes.
     pub fn begin_pair_store(&mut self,va:u64,low:u64,upper:u64,user:bool)->(accepted:bool)
         requires old(self).invariant(),
         ensures final(self).invariant(),
             accepted==(!spec::active(old(self)@.phase) && spec::pair_admitted(va)),
             final(self)@==if accepted {spec::pair_begin(old(self)@,va,low,upper,user)} else {old(self)@},
     {
-        if va%8!=0 || va%4096>4080 {return false;}
+        if va%4096>4080 {return false;}
         let accepted=self.begin_word(va,WordAccess::Write(low),user);
-        if accepted {self.pair_upper=Some(upper);}
+        if accepted {self.pair_upper=Some(upper);self.prepare_pair();}
         accepted
     }
 
@@ -358,6 +358,48 @@ impl SharedMmu {
         }
     }
 
+    pub(super) fn prepare_pair(&mut self)
+        requires old(self).invariant(),
+        ensures final(self).invariant(), final(self)@ == spec::prepare_pair(old(self)@),
+    {
+        if self.pair_upper.is_none() { return; }
+        if let Phase::Data {frame,leaf,reads,..}=self.phase {
+            self.remember_data();
+            let value=match self.word {Some(WordAccess::Write(value))=>value,_=>{assert(false);0}};
+            let data=WordData {address:frame+self.va%4096,first:0,tail:0,value};
+            match leaf {
+                Some(pte)=>self.phase=Phase::WordDirty {pte,data,reads},
+                None=>self.ready_store(data,reads),
+            }
+        }
+    }
+
+    pub fn copied(&mut self,count:u8)->(accepted:bool)
+        requires old(self).invariant(),
+        ensures final(self).invariant(),
+            (final(self)@,accepted)==spec::copied(old(self)@,count),
+    {
+        if let Phase::CopyStore {address,bytes,completed,reads}=self.phase {
+            if count==0 || count>16-completed {return false;}
+            if count==16-completed {
+                let low=match self.word {Some(WordAccess::Write(value))=>value,_=>{assert(false);0}};
+                self.word_store_done(low,reads);
+            } else {
+                self.phase=Phase::CopyStore {address,bytes,completed:completed+count,reads};
+            }
+            true
+        } else {false}
+    }
+
+    fn pair_bytes(low:u64,high:u64)->(bytes:[u8;16])
+        ensures bytes==spec::pair_bytes(low,high),
+    {
+        [low as u8,(low>>8) as u8,(low>>16) as u8,(low>>24) as u8,
+            (low>>32) as u8,(low>>40) as u8,(low>>48) as u8,(low>>56) as u8,
+            high as u8,(high>>8) as u8,(high>>16) as u8,(high>>24) as u8,
+            (high>>32) as u8,(high>>40) as u8,(high>>48) as u8,(high>>56) as u8]
+    }
+
     pub(super) fn ready_store(&mut self,data:WordData,reads:u8)
         requires old(self).invariant(),old(self).word is Some,old(self).access is Write,
             spec::active(old(self).phase),
@@ -367,11 +409,12 @@ impl SharedMmu {
     {
         if let Some(upper)=self.pair_upper {
             self.pair_upper=None;
-            if data.address%8!=0 || data.address%4096>4080 {
+            if data.address%4096>4080 {
                 self.phase=Phase::WordDone {report:WordReport {result:WordResult::CrossPage,
                     table_reads:reads,virtual_address:self.va}};
             } else {
-                self.phase=Phase::PairHead {data,upper,reads};
+                self.phase=Phase::CopyStore {address:data.address,bytes:Self::pair_bytes(data.value,upper),
+                    completed:0,reads};
             }
         } else {
             self.phase=if self.comparison.is_some() {Phase::AtomicStore {data,reads}}
@@ -389,7 +432,7 @@ impl SharedMmu {
     {
         let ram_store = matches!(self.phase, Phase::WordStore {..} | Phase::WordLast {..}
             | Phase::SizedStore {..} | Phase::AtomicStore {..} | Phase::PageStoreTail {..}
-            | Phase::PairTail {..});
+            | Phase::CopyStore {..});
         if !ram_store { self.inner.cache = None; }
         self.cache_dirty = ram_store;
         self.head = None;

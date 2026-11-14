@@ -246,6 +246,35 @@ mod tests {
     }
 
     #[test]
+    fn byte_copies_share_existing_backing_and_report_partial_failures() {
+        let (memory, ram) = fixture();
+        let source: Vec<_> = (0..37).map(|i| (i * 17 + 3) as u8).collect();
+        for offset in 0..8 {
+            memory.write_at(0, &[0xa5; 64]).unwrap();
+            ram.write_bytes(offset, &source).unwrap();
+            let mut actual = [0; 64];
+            memory.read_at(0, &mut actual).unwrap();
+            let mut expected = [0xa5; 64];
+            expected[offset as usize..offset as usize + source.len()].copy_from_slice(&source);
+            assert_eq!(actual, expected);
+            memory.write_at(offset, &[0x77; 37]).unwrap();
+            let mut copied = [0; 37];
+            ram.read_bytes(offset, &mut copied).unwrap();
+            assert_eq!(copied, [0x77; 37]);
+        }
+        let missing_backing = NativeRam::new(memory.clone(), MemoryRange::new(0..8192)).unwrap();
+        let error = missing_backing.write_bytes(4085, &[0x33; 19]).unwrap_err();
+        assert_eq!(error.completed, 11);
+        assert!(matches!(
+            error.kind,
+            shared::CopyErrorKind::Memory(RamError::Memory(_))
+        ));
+        let mut prefix = [0; 11];
+        memory.read_at(4085, &mut prefix).unwrap();
+        assert_eq!(prefix, [0x33; 11]);
+    }
+
+    #[test]
     fn cpu_and_dma_workers_do_not_lose_disjoint_byte_writes() {
         let (memory, ram) = fixture();
         let start = Arc::new(Barrier::new(3));

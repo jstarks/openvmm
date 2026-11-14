@@ -171,7 +171,7 @@ impl SharedEventMachine {
             return self.entry_memory(linear,Width::Qword,WordAccess::Read,length,
                 entry::MemoryTask::XmmLow {index,action:entry::XmmReadAction::Move});
         }
-        if linear%8!=0 || linear%4096>4080 {
+        if linear%4096>4080 {
             return self.stop(EventDiagnostic::Instruction(PagedDiagnostic::Unsupported));
         }
         let pair=system.fp.xmm[index as usize];

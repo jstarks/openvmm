@@ -58,17 +58,21 @@ pub open spec fn can_commit(p: Phase) -> bool {
     p is Mark || p is Dirty || p is Store || p is WordDirty
         || p is WordStore || p is WordHead || p is WordLast || p is SizedStore
         || p is AtomicStore || p is IoDirty
-        || p is PairHead || p is PairTail
         || p is PageDirtyHead || p is PageDirtyTail || p is PageStoreHead || p is PageStoreTail
 }
 pub open spec fn can_change(p: Phase) -> bool {
-    can_commit(p) && !(p is WordStore) && !(p is PairHead) && !(p is PairTail)
+    match p {
+        Phase::WordStore {..}=>false,
+        _=>can_commit(p),
+    }
 }
 pub open spec fn respond(s: State, reply: Reply) -> (State, bool) {
     match reply {
-        Reply::Read(word) => (read(s, word), s.phase is Walk || s.phase is Data || s.phase is WordTail),
+        Reply::Read(word) => (read(s, word), s.phase is Walk || s.phase is Data
+            || s.phase is WordTail),
         Reply::Committed => (exchanged(s), can_commit(s.phase)),
         Reply::Changed(current) => (changed(s, current), can_change(s.phase)),
+        Reply::Copied(count) => copied(s,count),
     }
 }
 pub open spec fn valid_leaf(l: Leaf) -> bool {
@@ -142,10 +146,10 @@ pub open spec fn sized(s: State, va: u64, word: WordAccess, size: u8) -> State {
 }
 pub open spec fn pair_begin(s:State,va:u64,low:u64,upper:u64,user:bool)->State {
     let t=begin(s,va,Access::Write(0),user,Some(WordAccess::Write(low)));
-    State {pair_upper:Some(upper),..t}
+    prepare_pair(State {pair_upper:Some(upper),..t})
 }
 pub open spec fn pair_admitted(va:u64)->bool {
-    va%8==0 && va%4096<=4080
+    va%4096<=4080
 }
 pub open spec fn modify_size(width: Width) -> u8 {
     match width { Width::Byte => 1, Width::Word => 2, Width::Dword => 4, Width::Qword => 8 }
@@ -306,8 +310,8 @@ pub open spec fn request(s: State) -> Request {
         Phase::WordTail { frame, .. } => Request::Read((((frame as int + s.va % 4096) / 8 * 8) + 8) as u64),
         Phase::WordDirty { pte, .. } | Phase::IoDirty { pte, .. } =>dirty_request(pte),
         Phase::WordStore { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
-        Phase::PairHead { data, .. } => Request::WriteWord { address: data.address, word_value: data.value },
-        Phase::PairTail { address, value, .. } => Request::WriteWord { address, word_value: value },
+        Phase::CopyStore {address,bytes,completed,..}=>
+            Request::WriteBytes {address:(address+completed as int) as u64,bytes,offset:completed},
         Phase::WordHead { data, .. } => head_request(data, s.size),
         Phase::WordLast { data, .. } => last_request(data, s.size),
         Phase::SizedStore { data, .. } => sized_request(data, s.size),
@@ -377,8 +381,8 @@ pub open spec fn exchanged(s: State) -> State {
                 fault(s, MmuResult::PageFault(m::pfec(
                     s.inner.config, s.access, s.user, true, false)), (level + 1) as u8)
             } else {
-                State { phase: Phase::Data { frame, permissions, reads: (level + 1) as u8, large: level == 2,
-                    leaf: Some(Leaf { address, word: m::accessed(word as int) as u64 }) }, ..s }
+                prepare_pair(State { phase: Phase::Data { frame, permissions, reads: (level + 1) as u8, large: level == 2,
+                    leaf: Some(Leaf { address, word: m::accessed(word as int) as u64 }) }, ..s })
             }
         },
         Phase::Dirty { address, word, reads, .. } =>
@@ -388,9 +392,6 @@ pub open spec fn exchanged(s: State) -> State {
                 match s.access { Access::Write(v) => v, _ => 0 }),
                 table_reads: reads, virtual_address: s.va }), ..s },
         Phase::WordDirty { data, reads, .. } => ready_store(s,data,reads),
-        Phase::PairHead {data,upper,reads}=>State {
-            phase:Phase::PairTail {address:(data.address+8) as u64,value:upper,low:data.value,reads},..s},
-        Phase::PairTail {low,reads,..}=>word_store_done(s,low,reads),
         Phase::WordHead { data, reads } => State { phase: Phase::WordLast { data, reads }, ..s },
         Phase::IoDirty { address, value, reads, .. } => State {
             phase: Phase::IoReady { address, access: WordAccess::Write(value), reads }, ..s },
@@ -537,13 +538,43 @@ pub open spec fn word_tail(s: State, word: u64) -> State {
         _ => s,
     }
 }
+pub open spec fn pair_bytes(low:u64,high:u64)->[u8;16] {
+    [low as u8,(low>>8) as u8,(low>>16) as u8,(low>>24) as u8,
+        (low>>32) as u8,(low>>40) as u8,(low>>48) as u8,(low>>56) as u8,
+        high as u8,(high>>8) as u8,(high>>16) as u8,(high>>24) as u8,
+        (high>>32) as u8,(high>>40) as u8,(high>>48) as u8,(high>>56) as u8]
+}
+pub open spec fn prepare_pair(s:State)->State {
+    if s.pair_upper is None {s} else {match s.phase {
+        Phase::Data {frame,leaf,reads,..}=>{
+            let t=remember_data(s);
+            let data=WordData {address:(frame+s.va%4096) as u64,first:0,tail:0,
+                value:match s.word {Some(WordAccess::Write(value))=>value,_=>0}};
+            match leaf {
+                Some(pte)=>State {phase:Phase::WordDirty {pte,data,reads},..t},
+                None=>ready_store(t,data,reads),
+            }
+        },
+        _=>s,
+    }}
+}
+pub open spec fn copied(s:State,count:u8)->(State,bool) {
+    match s.phase {
+        Phase::CopyStore {address,bytes,completed,reads} if count>0 && completed+count as int<=16=>
+            (if completed+count as int==16 {
+                word_store_done(s,match s.word {Some(WordAccess::Write(low))=>low,_=>0},reads)
+            } else {State {phase:Phase::CopyStore {address,bytes,completed:(completed+count) as u8,reads},..s}},true),
+        _=>(s,false),
+    }
+}
 pub open spec fn ready_store(s:State,data:WordData,reads:u8)->State {
     match s.pair_upper {
         Some(upper)=>State {pair_upper:None,
-            phase:if data.address%8!=0 || data.address%4096>4080 {
+            phase:if data.address%4096>4080 {
                 Phase::WordDone {report:WordReport {result:WordResult::CrossPage,
                     table_reads:reads,virtual_address:s.va}}
-            } else {Phase::PairHead {data,upper,reads}},..s},
+            } else {Phase::CopyStore {address:data.address,bytes:pair_bytes(data.value,upper),
+                completed:0,reads}},..s},
         None=>State {phase:if s.comparison is Some {Phase::AtomicStore {data,reads}}
             else if s.size<8 && data.address%8+s.size as int<=8 {Phase::SizedStore {data,reads}}
             else if data.address%8==0 {Phase::WordStore {data,reads}}
@@ -552,7 +583,7 @@ pub open spec fn ready_store(s:State,data:WordData,reads:u8)->State {
 }
 pub open spec fn word_store_done(s: State, value: u64, reads: u8) -> State {
     let ram_store = s.phase is WordStore || s.phase is WordLast || s.phase is SizedStore
-        || s.phase is AtomicStore || s.phase is PageStoreTail || s.phase is PairTail;
+        || s.phase is AtomicStore || s.phase is PageStoreTail || s.phase is CopyStore;
     State { head: None, pair_upper:None, cache_dirty: ram_store,
         inner: if ram_store { s.inner } else { m::State { cache: None, ..s.inner } },
         phase: Phase::WordDone { report: WordReport { result: WordResult::Success(

@@ -985,7 +985,18 @@ impl SharedEventMachine {
                             stop: BatchStop::Yield,
                         });
                     }
-                    if !self.respond(memory::perform(ram, request)?) {
+                    let reply = match memory::perform(ram, request) {
+                        Ok(reply) => reply,
+                        Err(error) => {
+                            if let Some(reply) = error.progress() {
+                                if !self.respond(reply) {
+                                    return Err(RunError::Protocol(request));
+                                }
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if !self.respond(reply) {
                         return Err(RunError::Protocol(request));
                     }
                     effects += 1;

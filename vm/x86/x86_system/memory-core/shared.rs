@@ -3,6 +3,9 @@
 
 use super::shared_model;
 use vstd::prelude::*;
+#[path = "shared_copy.rs"]
+mod copy;
+pub use copy::{CopyError, CopyErrorKind};
 
 verus! {
 
@@ -119,18 +122,37 @@ pub trait PhysicalRam: Send + Sync {
     /// Reads one naturally aligned, non-tearing little-endian quadword.
     fn read_word(&self, address: u64) -> Result<u64, Self::Error>;
 
-    /// Writes one naturally aligned quadword atomically.
+    /// Writes one naturally aligned quadword atomically. An error commits nothing.
     fn write_word(&self, address: u64, value: u64) -> Result<(), Self::Error>;
 
     /// Atomically compares and replaces one naturally aligned quadword with
     /// full memory-barrier ordering.
     /// Failure returns the observed value, not a stale earlier load.
+    /// A platform error performs no replacement.
     fn compare_exchange_word(
         &self,
         address: u64,
         expected: u64,
         replacement: u64,
     ) -> Result<Exchange, Self::Error>;
+
+    /// Copies coherent WB RAM into caller-owned storage. On failure, only the
+    /// reported prefix of `destination` has changed. This is not a snapshot.
+    fn read_bytes(
+        &self,
+        address: u64,
+        destination: &mut [u8],
+    ) -> Result<(), CopyError<Self::Error>> {
+        copy::read(self, address, destination)
+    }
+
+    /// Copies caller-owned bytes into coherent WB RAM. On failure, exactly the
+    /// reported prefix was committed; retry only the suffix. Bytes outside the
+    /// range are preserved under concurrent writers. The copy may tear between
+    /// chunks and is not an atomic128 or locked instruction primitive.
+    fn write_bytes(&self, address: u64, source: &[u8]) -> Result<(), CopyError<Self::Error>> {
+        copy::write(self, address, source)
+    }
 
     /// Orders preceding RAM accesses before following RAM accesses. Translation
     /// invalidation and device-I/O completion are separate responsibilities.

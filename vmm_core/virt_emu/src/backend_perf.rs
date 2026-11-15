@@ -11,9 +11,9 @@ use memory_range::MemoryRange;
 use std::hint::black_box;
 use std::time::Instant;
 use x86_system::WordAccess;
-use x86_system::mmu_core::shared::{Progress, SharedMmu};
-use x86_system::mmu_core::{Access, Config};
-use x86_system::shared::decode::{DecodeInput, DecodeWindow};
+use x86_system::execute::decode::{DecodeInput, DecodeWindow};
+use x86_system::mmu::translate::{Progress, Translator};
+use x86_system::mmu::{Access, Config};
 
 const SAMPLE_BATCHES: u64 = 4093;
 const MAX_SAMPLES: usize = 65_536;
@@ -105,7 +105,7 @@ fn completed_hit(progress: Progress) -> Result<()> {
     Ok(())
 }
 
-fn access<const KIND: u8>(mmu: &mut SharedMmu) -> bool {
+fn access<const KIND: u8>(mmu: &mut Translator) -> bool {
     match KIND {
         0 => mmu.begin(black_box(0x10000), Access::Fetch, false),
         1 => mmu.begin_word(black_box(0x10000), WordAccess::Read, false),
@@ -183,7 +183,7 @@ fn tlb<const KIND: u8>(
         memory.write_plain(address, &value)?;
     }
     let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..0x20000))?;
-    let mut mmu = SharedMmu::new(
+    let mut mmu = Translator::new(
         Config {
             root: 0x1000,
             wp: true,

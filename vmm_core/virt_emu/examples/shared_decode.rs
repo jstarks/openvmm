@@ -11,7 +11,7 @@ mod native {
     use std::io;
     use std::time::Instant;
     use virt_emu::native_memory::NativeRam;
-    use x86_system::shared::{BatchStop, SharedEventMachine};
+    use x86_system::execute::{BatchStop, Machine};
     use x86_system::{Config, State, Tables};
 
     type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -39,7 +39,7 @@ mod native {
             };
             initial.gpr[6] = 0x40d0;
             initial.gpr[4] = 0x70000;
-            let mut cpu = SharedEventMachine::new(
+            let mut cpu = Machine::new(
                 initial,
                 Config {
                     root: 0x1000,
@@ -54,9 +54,6 @@ mod native {
                     idt_limit: 4095,
                 },
             );
-            if !cpu.enable_decode() {
-                return Err(io::Error::other("decoder initialization rejected").into());
-            }
             let (mut retired, mut requests) = (0, 0u64);
             let target = LOOPS as u64 * 3;
             let start = Instant::now();

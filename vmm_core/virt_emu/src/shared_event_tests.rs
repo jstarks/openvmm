@@ -7,12 +7,12 @@ use memory_range::MemoryRange;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use test_with_tracing::test;
-use x86_system::memory_core::shared::{Exchange, PhysicalRam};
-use x86_system::mmu_core::shared::{Request, RunError};
-use x86_system::shared::{Batch, BatchStop, SharedEventMachine};
-use x86_system::{
-    EventDiagnostic, EventMachine, EventOutcome, Injection, Machine, Mmu, State, Tables,
-};
+use x86_system::events::EventOutcome;
+use x86_system::execute::{Batch, BatchStop, Machine};
+use x86_system::memory::physical::{Exchange, PhysicalRam};
+use x86_system::mmu::translate::{Request, RunError};
+use x86_system::reference::{ReferenceCpu, ReferenceMachine, ReferenceMmu};
+use x86_system::{EventDiagnostic, Injection, State, Tables};
 
 const CODE: u64 = 0x10000;
 const HANDLER: u64 = 0x11000;
@@ -39,7 +39,7 @@ fn gate(ram: &mut [u8], vector: u8, target: u64, attr: u8) {
     put(ram, 0xa008 + vector as u64 * 16, target >> 32);
 }
 
-pub(super) fn fixture() -> (Vec<u8>, EventMachine) {
+pub(super) fn fixture() -> (Vec<u8>, ReferenceMachine) {
     let mut ram = vec![0; 0x20000];
     for (table, next) in [(0x1000, 0x2000), (0x2000, 0x3000), (0x3000, 0x4000)] {
         put(&mut ram, table, next | 7);
@@ -66,14 +66,14 @@ pub(super) fn fixture() -> (Vec<u8>, EventMachine) {
     gpr[7] = DATA;
     gpr[8] = 8;
     gpr[11] = 1;
-    let owned = EventMachine {
-        core: Machine {
+    let owned = ReferenceMachine {
+        core: ReferenceCpu {
             cpu: State {
                 gpr,
                 flags: 0x20_0603,
                 rip: CODE,
             },
-            mmu: Mmu::new(super::shared_mmu_tests::config(), 0xdead_beef),
+            mmu: ReferenceMmu::new(super::shared_mmu_tests::config(), 0xdead_beef),
         },
         tables: Tables {
             idt_base: 0xa000,
@@ -97,8 +97,8 @@ pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, NativeRam) {
     (memory, ram)
 }
 
-fn shared(owned: &EventMachine) -> SharedEventMachine {
-    SharedEventMachine::new(
+fn shared(owned: &ReferenceMachine) -> Machine {
+    x86_system::reference::machine(
         owned.core.cpu,
         super::shared_mmu_tests::config(),
         owned.core.mmu.cr2(),
@@ -106,7 +106,7 @@ fn shared(owned: &EventMachine) -> SharedEventMachine {
     )
 }
 
-fn decoded_one(cpu: &mut SharedEventMachine, ram: &NativeRam) -> Batch {
+fn decoded_one(cpu: &mut Machine, ram: &NativeRam) -> Batch {
     let before = cpu.cpu();
     for _ in 0..4096 {
         let batch = cpu.run(ram, 1, 1).unwrap();
@@ -263,7 +263,7 @@ fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code()
             };
             let decision = x86_decode::admit(input);
             assert!(cpu.complete_decode(input.sequence, decision));
-            if !matches!(decision, x86_system::shared::decode::DecodeDecision::More) {
+            if !matches!(decision, x86_system::execute::decode::DecodeDecision::More) {
                 break;
             }
         }
@@ -280,7 +280,7 @@ fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code()
 
 #[test]
 fn decoded_fetch_fault_discards_prefix_and_rejects_reply_after_guest_repair() {
-    use x86_system::shared::decode::DecodeDecision;
+    use x86_system::execute::decode::DecodeDecision;
     let (mut bytes, mut owned) = fixture();
     let start = 0x15ffeusize;
     bytes[start..start + 5].copy_from_slice(&[0xb8, 0x11, 0x22, 0x33, 0x44]);
@@ -328,7 +328,7 @@ fn decoded_fetch_fault_discards_prefix_and_rejects_reply_after_guest_repair() {
         current.bytes[0], 0xb9,
         "restart must refetch the changed opcode"
     );
-    assert!(!cpu.complete_decode(stale.sequence, DecodeDecision::Legacy));
+    assert!(!cpu.complete_decode(stale.sequence, x86_decode::admit(stale)));
     assert!(cpu.complete_decode(current.sequence, x86_decode::admit(current)));
     let done = decoded_one(&mut cpu, &ram);
     assert_eq!(
@@ -380,7 +380,7 @@ fn decoded_instruction_keeps_sti_shadow_until_retirement_then_delivers_irq() {
     assert_eq!(cpu.pending(), None);
 }
 
-fn one<R: PhysicalRam>(cpu: &mut SharedEventMachine, ram: &R) -> Batch
+fn one<R: PhysicalRam>(cpu: &mut Machine, ram: &R) -> Batch
 where
     R::Error: std::fmt::Debug,
 {
@@ -402,8 +402,8 @@ where
 
 fn compare_one(
     bytes: &mut Vec<u8>,
-    owned: &mut EventMachine,
-    cpu: &mut SharedEventMachine,
+    owned: &mut ReferenceMachine,
+    cpu: &mut Machine,
     memory: &GuestMemory,
     ram: &NativeRam,
 ) -> Batch {

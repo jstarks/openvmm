@@ -68,7 +68,7 @@ mod native {
                 "ns_per_operation":result.seconds * 1e9 / result.operations as f64,
                 "warm":true,"setup_included":false,
                 "scope":if case=="decode" {"cached decoder lookup"} else {"TLB hit plus native qword transport"},
-                "physical_effects_per_operation":match case.as_str() {"decode"=>0,"write"=>2,_=>1},
+                "physical_effects_per_operation":if case=="decode" {0} else {1},
             })
         );
         Ok(())

@@ -2161,13 +2161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "event_core"
-version = "0.1.0"
-dependencies = [
- "vstd",
-]
-
-[[package]]
 name = "eventheader"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8817,6 +8810,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "strudel-core"
+version = "0.1.0"
+dependencies = [
+ "vstd",
+]
+
+[[package]]
+name = "strudel-decode"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "strudel-core",
+]
+
+[[package]]
 name = "symcrypt"
 version = "0.6.0"
 source = "git+https://github.com/microsoft/rust-symcrypt.git?rev=2d83888206139cb8cc522ea3617a1870674ac8a0#2d83888206139cb8cc522ea3617a1870674ac8a0"
@@ -10458,7 +10466,6 @@ dependencies = [
  "chipset_device",
  "chipset_device_resources",
  "chipset_resources",
- "event_core",
  "futures",
  "guestmem",
  "hvdef",
@@ -10475,6 +10482,8 @@ dependencies = [
  "serial_core",
  "sha2 0.11.0",
  "state_unit",
+ "strudel-core",
+ "strudel-decode",
  "test_with_tracing",
  "thiserror 2.0.16",
  "virt",
@@ -10484,7 +10493,6 @@ dependencies = [
  "vmcore",
  "vmm_core",
  "vmotherboard",
- "x86_decode",
 ]
 
 [[package]]
@@ -12903,14 +12911,6 @@ dependencies = [
  "bitflags 2.13.2",
  "rustversion",
  "volatile",
-]
-
-[[package]]
-name = "x86_decode"
-version = "0.1.0"
-dependencies = [
- "event_core",
- "iced-x86",
 ]
 
 [[package]]

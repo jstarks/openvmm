@@ -28,6 +28,7 @@ vmcore.workspace = true
 vm_topology.workspace = true
 
 [dev-dependencies]
+x86_system = { workspace = true, features = ["reference"] }
 loader.workspace = true
 vm_loader.workspace = true
 vmm_core.workspace = true

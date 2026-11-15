@@ -12,7 +12,7 @@ mod native {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use virt_emu::native_memory::NativeRam;
-    use x86_system::paged_core::shared::{BatchStop, SharedMachine};
+    use x86_system::paging::runtime::{BatchStop, ExecutionState};
     use x86_system::{Config, State, StepOutcome};
 
     type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -50,7 +50,7 @@ mod native {
         let instruction = [0x48, 0x8b, 0x07, 0x48, 0x01, 0xc8, 0x48, 0x89, 0x07];
         memory.write_at(0x5000, &instruction.repeat(LOOPS))?;
         let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..0x8000))?;
-        let mut retry = SharedMachine::new(initial(0), config(), 0, false);
+        let mut retry = ExecutionState::new(initial(0), config(), 0, false);
         let fault = retry.run(&ram, 64, 3)?;
         if fault.retired != 0
             || fault.stop
@@ -82,7 +82,7 @@ mod native {
                 let start = start.clone();
                 let ram = &ram;
                 workers.push(scope.spawn(move || -> Result<u64, Error> {
-                    let mut cpu = SharedMachine::new(initial(lane), config(), 0, false);
+                    let mut cpu = ExecutionState::new(initial(lane), config(), 0, false);
                     let mut retired = 0;
                     start.wait();
                     while retired < INSTRUCTIONS {

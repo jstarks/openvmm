@@ -7,9 +7,9 @@ use memory_range::MemoryRange;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use test_with_tracing::test;
-use x86_system::memory_core::shared::{Exchange, PhysicalRam};
-use x86_system::mmu_core::shared::{Progress, Request, RunError, SharedMmu};
-use x86_system::mmu_core::{Access, Config, Mmu, MmuResult, Report};
+use x86_system::memory::physical::{Exchange, PhysicalRam};
+use x86_system::mmu::translate::{Progress, Request, RunError, Translator};
+use x86_system::mmu::{Access, Config, MmuResult, ReferenceMmu, Report};
 
 const SIZE: usize = 0x8000;
 
@@ -43,7 +43,7 @@ pub(super) fn fixture(data: &[u8]) -> (GuestMemory, NativeRam) {
     (memory, ram)
 }
 
-fn finish(mmu: &mut SharedMmu, ram: &NativeRam) -> Report {
+fn finish(mmu: &mut Translator, ram: &NativeRam) -> Report {
     for _ in 0..128 {
         if let Progress::Complete(report) = mmu.run(ram, 1).unwrap() {
             return report;
@@ -54,9 +54,9 @@ fn finish(mmu: &mut SharedMmu, ram: &NativeRam) -> Report {
 
 fn compare(mut data: Vec<u8>, c: Config, va: u64, access: Access, user: bool) {
     let (memory, ram) = fixture(&data);
-    let mut owned = Mmu::new(c, 0x77);
+    let mut owned = ReferenceMmu::new(c, 0x77);
     let expected = owned.access(&mut data, 0, va, access, user);
-    let mut shared = SharedMmu::new(c, 0x77);
+    let mut shared = Translator::new(c, 0x77);
     assert!(shared.begin(va, access, user));
     assert_eq!(finish(&mut shared, &ram), expected);
     assert_eq!(shared.cr2(), owned.cr2());
@@ -76,11 +76,11 @@ fn compare(mut data: Vec<u8>, c: Config, va: u64, access: Access, user: bool) {
 #[test]
 fn shared_atomic_operations_recompute_after_dma_and_linearize_through_cas() {
     use x86_system::WordResult;
-    use x86_system::memory_core::cpu_core::{integer::Operation, operand::Width};
+    use x86_system::arch::{integer::Operation, operand::Width};
     for arithmetic in [false, true] {
         let data = bytes();
         let (memory, ram) = fixture(&data);
-        let mut mmu = SharedMmu::new(config(), 0x77);
+        let mut mmu = Translator::new(config(), 0x77);
         let accepted = if arithmetic {
             mmu.begin_locked_modify(0, Operation::Inc, 0, 1, Width::Byte)
         } else {
@@ -132,8 +132,8 @@ fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
     let memory = GuestMemory::allocate(data.len());
     memory.write_at(0, &data).unwrap();
     let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..data.len() as u64)).unwrap();
-    let mut owned = Mmu::new(config(), 77);
-    let mut shared = SharedMmu::new(config(), 77);
+    let mut owned = ReferenceMmu::new(config(), 77);
+    let mut shared = Translator::new(config(), 77);
     for va in [0x200000, 0x20f123, 0x3fffff] {
         let expected = owned.access(&mut data, 0, va, Access::Read, false);
         assert!(shared.begin(va, Access::Read, false));
@@ -154,7 +154,7 @@ fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
     assert_eq!(actual, data);
     for mask in [32, 64] {
         memory.write_plain(0x3008, &(0x201087u64)).unwrap();
-        let mut shared = SharedMmu::new(config(), 77);
+        let mut shared = Translator::new(config(), 77);
         assert!(shared.begin(0x20f123, Access::Write(0x93), false));
         let mut raced = false;
         let mut result = None;
@@ -265,7 +265,7 @@ fn shared_mmu_revalidates_replaced_and_revoked_ptes() {
         (Access::Write(0xcc), 0x5027, 0x5025, MmuResult::PageFault(3)),
     ] {
         let (memory, ram) = fixture(&bytes());
-        let mut mmu = SharedMmu::new(config(), 0x77);
+        let mut mmu = Translator::new(config(), 0x77);
         assert!(mmu.begin(0, access, false));
         let mut reached = false;
         for _ in 0..32 {
@@ -330,7 +330,7 @@ fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
         }
     }
     let (memory, ram) = fixture(&bytes());
-    let mut mmu = SharedMmu::new(config(), 0x77);
+    let mut mmu = Translator::new(config(), 0x77);
     assert!(mmu.begin(0, Access::Read, false));
     let request = mmu.request();
     assert_eq!(mmu.run(&ram, 0).unwrap(), Progress::Yield);
@@ -360,7 +360,7 @@ fn shared_mmu_parallel_cpu_contexts_and_direct_dma_preserve_neighbors() {
             let ram = &ram;
             let start = start.clone();
             scope.spawn(move || {
-                let mut mmu = SharedMmu::new(config(), 0);
+                let mut mmu = Translator::new(config(), 0);
                 start.wait();
                 for value in 0..1000 {
                     assert!(mmu.begin(lane, Access::Write((value + lane) as u8), false));
@@ -389,8 +389,8 @@ fn shared_mmu_parallel_cpu_contexts_and_direct_dma_preserve_neighbors() {
 #[test]
 fn shared_mmu_tlbs_are_per_cpu_stale_until_explicit_invalidation() {
     let (memory, ram) = fixture(&bytes());
-    let mut first = SharedMmu::new(config(), 0);
-    let mut second = SharedMmu::new(config(), 0);
+    let mut first = Translator::new(config(), 0);
+    let mut second = Translator::new(config(), 0);
     assert!(first.begin(0, Access::Read, false));
     assert_eq!(finish(&mut first, &ram).result, MmuResult::Success(0xa1));
     memory.write_plain(0x4000, &0x6007u64).unwrap();
@@ -420,7 +420,7 @@ fn shared_mmu_self_pte_alias_and_backing_error_order() {
     data[0x4000..0x4008].copy_from_slice(&0x4007u64.to_le_bytes());
     compare(data, config(), 0, Access::Write(1), false);
     let (memory, ram) = fixture(&bytes()[..0x5000]);
-    let mut mmu = SharedMmu::new(config(), 0x77);
+    let mut mmu = Translator::new(config(), 0x77);
     assert!(mmu.begin(0, Access::Write(0xcc), false));
     assert!(matches!(mmu.run(&ram, 32), Err(RunError::Copy { .. })));
     assert_eq!(mmu.cr2(), 0x77);
@@ -435,7 +435,7 @@ fn shared_mmu_self_pte_alias_and_backing_error_order() {
     ));
 }
 
-fn finish_word(mmu: &mut SharedMmu, ram: &NativeRam) -> x86_system::mmu_core::word::WordReport {
+fn finish_word(mmu: &mut Translator, ram: &NativeRam) -> x86_system::mmu::word::WordReport {
     for _ in 0..128 {
         match mmu.run(ram, 1).unwrap() {
             Progress::CompleteWord(report) => return report,
@@ -448,7 +448,7 @@ fn finish_word(mmu: &mut SharedMmu, ram: &NativeRam) -> x86_system::mmu_core::wo
 
 #[test]
 fn shared_qwords_match_owned_ram_at_every_supported_offset() {
-    use x86_system::mmu_core::word::WordAccess;
+    use x86_system::mmu::word::WordAccess;
     for offset in 0..=4088 {
         for access in [WordAccess::Read, WordAccess::Write(0x1122334455667788)] {
             let mut expected = bytes();
@@ -456,9 +456,9 @@ fn shared_qwords_match_owned_ram_at_every_supported_offset() {
                 *byte = i as u8;
             }
             let (memory, ram) = fixture(&expected);
-            let mut owned = Mmu::new(config(), 0x77);
+            let mut owned = ReferenceMmu::new(config(), 0x77);
             let report = owned.access_word(&mut expected, 0, offset, access, false);
-            let mut shared = SharedMmu::new(config(), 0x77);
+            let mut shared = Translator::new(config(), 0x77);
             assert!(shared.begin_word(offset, access, false));
             assert_eq!(finish_word(&mut shared, &ram), report);
             assert_eq!(shared.cr2(), owned.cr2());
@@ -470,8 +470,8 @@ fn shared_qwords_match_owned_ram_at_every_supported_offset() {
     for va in [4089, 4095, u64::MAX, u64::MAX - 7, 0x8000_0000_0000] {
         let mut data = bytes();
         let (_, ram) = fixture(&data);
-        let mut owned = Mmu::new(config(), 0x77);
-        let mut shared = SharedMmu::new(config(), 0x77);
+        let mut owned = ReferenceMmu::new(config(), 0x77);
+        let mut shared = Translator::new(config(), 0x77);
         assert!(shared.begin_word(va, WordAccess::Read, false));
         assert_eq!(
             finish_word(&mut shared, &ram),
@@ -482,7 +482,7 @@ fn shared_qwords_match_owned_ram_at_every_supported_offset() {
 
 #[test]
 fn shared_aligned_qword_stores_are_native_and_do_not_tear() {
-    use x86_system::mmu_core::word::WordAccess;
+    use x86_system::mmu::word::WordAccess;
     let (memory, ram) = fixture(&bytes());
     memory.write_plain(0x5000, &0u64).unwrap();
     let values = [0x5555aaaa5555aaaa, 0xaaaa5555aaaa5555];
@@ -492,7 +492,7 @@ fn shared_aligned_qword_stores_are_native_and_do_not_tear() {
             let start = start.clone();
             let ram = &ram;
             scope.spawn(move || {
-                let mut mmu = SharedMmu::new(config(), 0);
+                let mut mmu = Translator::new(config(), 0);
                 start.wait();
                 for _ in 0..2000 {
                     assert!(mmu.begin_word(0, WordAccess::Write(value), false));
@@ -525,7 +525,7 @@ fn shared_aligned_qword_stores_are_native_and_do_not_tear() {
 #[test]
 fn split_qword_yield_and_error_never_replay_committed_head() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use x86_system::mmu_core::word::{WordAccess, WordResult};
+    use x86_system::mmu::word::{WordAccess, WordResult};
     struct TailFault {
         ram: NativeRam,
         fail: AtomicBool,
@@ -557,7 +557,7 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
     }
     let (memory, ram) = fixture(&bytes());
     let value = 0x1122334455667788;
-    let mut mmu = SharedMmu::new(config(), 0);
+    let mut mmu = Translator::new(config(), 0);
     assert!(mmu.begin_word(1, WordAccess::Write(value), false));
     let mut reached = false;
     for _ in 0..64 {
@@ -605,15 +605,15 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
 
 #[test]
 fn qword_aliases_and_revocation_keep_dirty_order_precise() {
-    use x86_system::mmu_core::word::{WordAccess, WordResult};
+    use x86_system::mmu::word::{WordAccess, WordResult};
     for offset in 0..8 {
         let mut data = bytes();
         data[0x4000..0x4008].copy_from_slice(&0x4007u64.to_le_bytes());
         let (memory, ram) = fixture(&data);
-        let mut owned = Mmu::new(config(), 0);
+        let mut owned = ReferenceMmu::new(config(), 0);
         let access = WordAccess::Write(0x1122334455667788);
         let expected = owned.access_word(&mut data, 0, offset, access, false);
-        let mut shared = SharedMmu::new(config(), 0);
+        let mut shared = Translator::new(config(), 0);
         assert!(shared.begin_word(offset, access, false));
         assert_eq!(finish_word(&mut shared, &ram), expected);
         let mut actual = vec![0; SIZE];
@@ -621,7 +621,7 @@ fn qword_aliases_and_revocation_keep_dirty_order_precise() {
         assert_eq!(actual, data);
     }
     let (memory, ram) = fixture(&bytes());
-    let mut mmu = SharedMmu::new(config(), 0);
+    let mut mmu = Translator::new(config(), 0);
     assert!(mmu.begin_word(1, WordAccess::Write(u64::MAX), false));
     let mut reached = false;
     for _ in 0..64 {

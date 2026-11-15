@@ -10,9 +10,10 @@
 use guestmem::{GuestMemory, GuestMemoryError};
 use memory_range::MemoryRange;
 use std::sync::atomic::{Ordering, compiler_fence, fence};
-use x86_system::memory_core::cpu_core::{integer, operand::Width};
-use x86_system::memory_core::shared::{
-    self, AtomicOperation, Beat, BeatError, CopyError, CopyErrorKind, Exchange, PhysicalRam,
+use x86_system::arch::{integer, operand::Width};
+use x86_system::memory::physical::{
+    self as shared, AtomicOperation, Beat, BeatError, CopyError, CopyErrorKind, Exchange,
+    PhysicalRam,
 };
 
 const MASKED_WRITE_ATTEMPTS: usize = 64;

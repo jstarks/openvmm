@@ -5,9 +5,10 @@ use super::shared_mmu_tests::{bytes, config, fixture};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use test_with_tracing::test;
-use x86_system::paged_core::shared::{BatchStop, SharedMachine};
-use x86_system::paged_core::{Machine, PagedDiagnostic, StepOutcome};
-use x86_system::{Mmu, State};
+use x86_system::State;
+use x86_system::paging::runtime::{BatchStop, ExecutionState};
+use x86_system::paging::{PagedDiagnostic, ReferenceCpu, StepOutcome};
+use x86_system::reference::ReferenceMmu;
 
 fn state() -> State {
     State {
@@ -31,12 +32,12 @@ fn shared_cpu_matches_owned_registers_and_full_ram() {
                 let mut expected = program(&[rex, opcode, modrm]);
                 let (memory, ram) = fixture(&expected);
                 let initial = state();
-                let mut owned = Machine {
+                let mut owned = ReferenceCpu {
                     cpu: initial,
-                    mmu: Mmu::new(config(), 0x77),
+                    mmu: ReferenceMmu::new(config(), 0x77),
                 };
                 let report = owned.run(&mut expected, 0, false, 1);
-                let mut shared = SharedMachine::new(initial, config(), 0x77, false);
+                let mut shared = ExecutionState::new(initial, config(), 0x77, false);
                 let mut retired = 0;
                 let mut final_stop = None;
                 for _ in 0..128 {
@@ -74,7 +75,7 @@ fn shared_cpu_fault_retry_and_incremental_fetch_keep_precise_state() {
     let mut initial = state();
     initial.gpr[7] = 0x1000;
     initial.gpr[1] = 1;
-    let mut machine = SharedMachine::new(initial, config(), 0x77, false);
+    let mut machine = ExecutionState::new(initial, config(), 0x77, false);
     let failed = machine.run(&ram, 64, 3).unwrap();
     assert_eq!(failed.retired, 0);
     assert_eq!(
@@ -101,7 +102,7 @@ fn shared_cpu_fault_retry_and_incremental_fetch_keep_precise_state() {
             rip: 4095,
             ..state()
         };
-        let mut machine = SharedMachine::new(initial, config(), 0, false);
+        let mut machine = ExecutionState::new(initial, config(), 0, false);
         let stop = machine.run(&ram, 64, 1).unwrap();
         let expected = if first == 0x90 {
             StepOutcome::Diagnostic(PagedDiagnostic::Unsupported)
@@ -134,7 +135,7 @@ fn two_instruction_streams_and_direct_dma_share_existing_backing() {
                 let mut initial = state();
                 initial.gpr[7] = 0x1000 + lane * 8;
                 initial.gpr[1] = 1;
-                let mut cpu = SharedMachine::new(initial, config(), 0, false);
+                let mut cpu = ExecutionState::new(initial, config(), 0, false);
                 let mut retired = 0;
                 start.wait();
                 while retired < (LOOPS * 3) as u64 {

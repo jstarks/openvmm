@@ -1422,7 +1422,7 @@ async fn entry_forms_retire_through_real_vp_and_preserve_the_call_push(driver: D
 #[async_test]
 async fn loader_system_import_orders_roundtrip_and_lock_after_run(driver: DefaultDriver) {
     use virt::vp::{Mtrrs, Pat};
-    use x86_system::memory_core::cpu_core::system::{DEFAULT_PAT, FIXED_WB};
+    use x86_system::arch::system::{DEFAULT_PAT, FIXED_WB};
 
     for order in [
         [0, 1, 2],
@@ -1514,7 +1514,7 @@ async fn rejected_initial_system_import_keeps_staging_and_allows_corrected_image
     driver: DefaultDriver,
 ) {
     use virt::vp::Mtrrs;
-    use x86_system::memory_core::cpu_core::system::FIXED_WB;
+    use x86_system::arch::system::FIXED_WB;
 
     let (bytes, owned) = fixture();
     let (_, mut binder, _memory, _keeper) = build(&driver, &bytes).await;

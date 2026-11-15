@@ -13,7 +13,7 @@
 
 use guestmem::{GuestMemory, GuestMemoryError};
 use virt::vp::Registers;
-use x86_system::{Diagnostic, Profile, State, decoder};
+use x86_system::arch::{Diagnostic, Profile, State, decoder};
 
 // xtask-fmt allow-target-arch cpu-intrinsic -- Depends on host x86 WB ordering.
 #[cfg(target_arch = "x86_64")]

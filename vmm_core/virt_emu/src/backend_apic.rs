@@ -2,13 +2,13 @@
 // Licensed under the MIT License.
 
 use super::*;
-use x86_system::memory_core::cpu_core::apic::{
+use x86_system::arch::apic::{
     Rejection,
     registers::{Effect, Error as ApicError},
     route::{FixedIpi, Interface},
     timer::{Deadline, Error as TimerError},
 };
-use x86_system::shared::control_io::{ControlAccess, ControlReply};
+use x86_system::execute::control_io::{ControlAccess, ControlReply};
 
 const TICKS_PER_100NS: u64 = 10;
 
@@ -196,7 +196,7 @@ pub(super) fn poll(
 pub(super) fn acknowledge(
     apic: &mut Option<LocalApic>,
     offer: &mut Option<u8>,
-    core: &SharedEventMachine,
+    core: &Machine,
 ) -> Result<Option<u8>, Error> {
     if let Some(vector) = *offer {
         // The core clears pending only after completing this external event's frame.

@@ -1318,8 +1318,7 @@ mod native {
                 bus_id: vmotherboard::BusIdPci::new("pci"),
                 pio_addr: 0xcf8,
                 pio_data: 0xcfc,
-                amd_extended_config: x86_system::memory_core::cpu_core::profile::NB_CFG & (1 << 46)
-                    != 0,
+                amd_extended_config: x86_system::arch::profile::NB_CFG & (1 << 46) != 0,
             });
             let foundation = vmotherboard::options::BaseChipsetFoundation {
                 is_restoring: false,
@@ -1550,11 +1549,11 @@ mod native {
                     "first_interrupt_time_100ns":snapshot.first_interrupt_time_100ns,
                     "decode":decode_json(decode),"decode_at_first_interrupt":first_decode.map(decode_json),
                     "layout":{
-                        "event_phase":size_of::<x86_system::shared::Phase>(),
-                        "decode_decision":size_of::<x86_system::shared::decode::DecodeDecision>(),
-                        "request":size_of::<x86_system::mmu_core::shared::Request>(),
-                        "reply":size_of::<x86_system::mmu_core::shared::Reply>(),
-                        "effect_result":size_of::<Result<x86_system::mmu_core::shared::Reply,x86_system::mmu_core::shared::RunError<virt_emu::native_memory::RamError>>>(),
+                        "event_phase":size_of::<x86_system::execute::Phase>(),
+                        "decode_decision":size_of::<x86_system::execute::decode::DecodeDecision>(),
+                        "request":size_of::<x86_system::mmu::translate::Request>(),
+                        "reply":size_of::<x86_system::mmu::translate::Reply>(),
+                        "effect_result":size_of::<Result<x86_system::mmu::translate::Reply,x86_system::mmu::translate::RunError<virt_emu::native_memory::RamError>>>(),
                     },
                     "jiffies_initial":initial_jiffies,"jiffies_final":final_jiffies,
                     "jiffies_delta":final_jiffies.wrapping_sub(initial_jiffies),
@@ -1633,7 +1632,7 @@ mod native {
                         "pm_reads":devices.pm_reads.load(Ordering::Relaxed),
                         "pm_stalls":devices.pm_stalls,
                         "pm_stalls_injected":devices.pm_stalls_injected.load(Ordering::Relaxed),
-                        "tsc_hz":x86_system::memory_core::cpu_core::profile::TSC_HZ,
+                        "tsc_hz":x86_system::arch::profile::TSC_HZ,
                     },
                     "apic":apic,
                 })
@@ -1748,7 +1747,7 @@ mod native {
             .map(|function| {
                 serde_json::json!({
                     "function": function, "subleaf": 0,
-                    "registers": x86_system::memory_core::cpu_core::profile::cpuid(function, 0),
+                    "registers": x86_system::arch::profile::cpuid(function, 0),
                 })
             })
             .collect();

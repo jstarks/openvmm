@@ -28,16 +28,19 @@ use virt::{
     ProtoPartitionIsolation, StopVp, VpHaltReason, VpIndex,
 };
 use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
-use x86_system::memory_core::cpu_core::apic::registers::LocalApic;
-use x86_system::memory_core::cpu_core::system::{self, SegmentState, SystemState};
-use x86_system::memory_core::shared::{Exchange, PhysicalRam};
-use x86_system::mmu_core::shared::RunError;
-use x86_system::mmu_core::shared::io::IoReply;
-use x86_system::shared::{BatchStop, SharedEventMachine};
+use x86_system::arch::apic::registers::LocalApic;
+use x86_system::arch::system::{self, SegmentState, SystemState};
+use x86_system::execute::{BatchStop, Machine};
+use x86_system::memory::physical::{Exchange, PhysicalRam};
+use x86_system::mmu::translate::RunError;
+use x86_system::mmu::translate::io::IoReply;
 use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
 
 #[path = "backend_apic.rs"]
 mod apic;
+#[cfg(not(test))]
+use x86_decode::cache as decode_cache;
+#[cfg(test)]
 #[path = "backend_decode_cache.rs"]
 mod decode_cache;
 #[cfg(feature = "perf")]
@@ -103,10 +106,10 @@ pub enum Error {
     Capabilities(#[from] virt::PartitionCapabilitiesError),
     /// The owned controller rejected an unimplemented device profile.
     #[error("owned APIC stopped: {0:?}")]
-    Apic(x86_system::memory_core::cpu_core::apic::registers::Error),
+    Apic(x86_system::arch::apic::registers::Error),
     /// A controller message could not enter its architectural image.
     #[error("owned APIC ingress rejected: {0:?}")]
-    ApicIngress(x86_system::memory_core::cpu_core::apic::Rejection),
+    ApicIngress(x86_system::arch::apic::Rejection),
 }
 
 struct Control {
@@ -134,7 +137,7 @@ impl Control {
         }
     }
 
-    fn flush(&self, core: &mut SharedEventMachine) -> Result<(), Error> {
+    fn flush(&self, core: &mut Machine) -> Result<(), Error> {
         if self.unsupported.load(Ordering::Acquire) {
             return Err(Error::UnsupportedInterrupt);
         }
@@ -238,7 +241,7 @@ struct VpState {
     first_apic_retired: Option<u64>,
     first_apic_time: Option<u64>,
     first_apic_decode: Option<DecodeDiagnostics>,
-    core: Option<SharedEventMachine>,
+    core: Option<Machine>,
     initial_system: Option<SystemState>,
     started: bool,
     progress: CompletedBatchProgress,
@@ -414,8 +417,7 @@ impl EmuHypervisor {
         let caps = PartitionCapabilities::from_cpuid(
             config.processor_topology,
             &mut |function, subleaf| {
-                let mut values =
-                    x86_system::memory_core::cpu_core::profile::cpuid(function, subleaf);
+                let mut values = x86_system::arch::profile::cpuid(function, subleaf);
                 if architectural_apic && function == 1 {
                     values[1] = (values[1] & 0x00ff_ffff) | (apic_id << 24);
                     values[2] |= 1 << 21;
@@ -710,15 +712,14 @@ impl Processor for EmuProcessor<'_> {
                     if core.cpu().flags & 0x200 == 0 || core.shadow() {
                         return false;
                     }
-                    candidate.is_some() || match deadline {
-                        Some(x86_system::memory_core::cpu_core::apic::timer::Deadline::At(
-                            value,
-                        )) => self.clock.now().as_100ns() >= apic::deadline_time(value).as_100ns(),
-                        Some(
-                            x86_system::memory_core::cpu_core::apic::timer::Deadline::BeyondClock,
-                        ) => true,
-                        _ => false,
-                    }
+                    candidate.is_some()
+                        || match deadline {
+                            Some(x86_system::arch::apic::timer::Deadline::At(value)) => {
+                                self.clock.now().as_100ns() >= apic::deadline_time(value).as_100ns()
+                            }
+                            Some(x86_system::arch::apic::timer::Deadline::BeyondClock) => true,
+                            _ => false,
+                        }
                 },
             ) {
                 Ok(batch) => batch,
@@ -778,9 +779,11 @@ impl Processor for EmuProcessor<'_> {
                     }
                 }
                 BatchStop::Timestamp { sequence } => {
-                    let ticks = self.clock.now().as_100ns().wrapping_mul(
-                        x86_system::memory_core::cpu_core::profile::TSC_HZ / 10_000_000,
-                    );
+                    let ticks = self
+                        .clock
+                        .now()
+                        .as_100ns()
+                        .wrapping_mul(x86_system::arch::profile::TSC_HZ / 10_000_000);
                     if !core.complete_timestamp(sequence, ticks) {
                         return Err(dev.fatal_error(Box::new(Error::Completion)));
                     }
@@ -948,7 +951,7 @@ pub struct EmuStateAccess<'a> {
 }
 
 impl EmuStateAccess<'_> {
-    fn core(&self) -> Result<&SharedEventMachine, Error> {
+    fn core(&self) -> Result<&Machine, Error> {
         if self.vtl != Vtl::Vtl0 {
             return Err(Error::Profile("VTL"));
         }
@@ -1134,14 +1137,14 @@ impl AccessVpState for EmuStateAccess<'_> {
         {
             return Err(Error::Profile("initial long-mode register image"));
         }
-        let mut core = SharedEventMachine::new(cpu, config, regs.cr2, tables);
+        let mut core = Machine::new(cpu, config, regs.cr2, tables);
         if let Some(apic) = &mut self.state.lapic {
             if !core.configure_apic(apic.id) {
                 return Err(Error::Profile("initial APIC metadata"));
             }
             *apic = apic.write_cr8(regs.cr8).map_err(Error::Apic)?;
         }
-        if !core.configure_system(system) || !core.enable_decode() {
+        if !core.configure_system(system) {
             return Err(Error::Profile("initial system/decoder state"));
         }
         self.state.core = Some(core);

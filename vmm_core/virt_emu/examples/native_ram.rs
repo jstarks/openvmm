@@ -12,10 +12,10 @@ mod native {
     use std::time::Instant;
     use virt_emu::native_memory::{AdUpdate, NativeRam};
     use x86_system::State;
-    use x86_system::mmu_core::shared::{Progress, SharedMmu};
-    use x86_system::mmu_core::word::WordAccess;
-    use x86_system::mmu_core::{Access, Config};
-    use x86_system::paged_core::shared::{BatchStop, SharedMachine};
+    use x86_system::mmu::translate::{Progress, Translator};
+    use x86_system::mmu::word::WordAccess;
+    use x86_system::mmu::{Access, Config};
+    use x86_system::paging::runtime::{BatchStop, ExecutionState};
 
     fn measure(name: &str, mut operation: impl FnMut(u64)) {
         const ITERATIONS: u64 = 200_000;
@@ -72,7 +72,7 @@ mod native {
             memory.write_plain(address, &value)?;
         }
         let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..0x8000))?;
-        let mut mmu = SharedMmu::new(
+        let mut mmu = Translator::new(
             Config {
                 root: 0x1000,
                 wp: true,
@@ -121,7 +121,7 @@ mod native {
         initial.gpr[7] = 0x1000;
         initial.gpr[1] = 1;
         measure("shared-cpu-fresh-load-add-store", |_| {
-            let mut cpu = SharedMachine::new(
+            let mut cpu = ExecutionState::new(
                 initial,
                 Config {
                     root: 0x1000,

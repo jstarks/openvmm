@@ -1529,7 +1529,7 @@ mod native {
             #[cfg(not(feature = "perf"))]
             let execution_profile: Option<serde_json::Value> = None;
             let final_jiffies = memory.read_plain::<u64>(0x2609980)?;
-            let (decode, first_decode) = vp.decode_diagnostics();
+            let (decode, first_decode) = vp.decode_diagnostics()?;
             let decode_json = |d: virt_emu::backend::DecodeDiagnostics| {
                 serde_json::json!({
                     "entries":d.entries,"bytes":d.bytes,
@@ -1550,7 +1550,7 @@ mod native {
                     "decode":decode_json(decode),"decode_at_first_interrupt":first_decode.map(decode_json),
                     "layout":{
                         "event_phase":size_of::<x86_system::execute::Phase>(),
-                        "decode_decision":size_of::<x86_system::execute::decode::DecodeDecision>(),
+                        "decode_decision":size_of::<x86_system::execute::decode::DecodeOutcome>(),
                         "request":size_of::<x86_system::mmu::translate::Request>(),
                         "reply":size_of::<x86_system::mmu::translate::Reply>(),
                         "effect_result":size_of::<Result<x86_system::mmu::translate::Reply,x86_system::mmu::translate::RunError<virt_emu::native_memory::RamError>>>(),

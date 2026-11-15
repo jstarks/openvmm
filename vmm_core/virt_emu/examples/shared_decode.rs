@@ -10,8 +10,8 @@ mod native {
     use memory_range::MemoryRange;
     use std::io;
     use std::time::Instant;
+    use strudel::{Machine, RunBudget, Stop as BatchStop};
     use virt_emu::native_memory::NativeRam;
-    use x86_system::execute::{BatchStop, Machine};
     use x86_system::{Config, State, Tables};
 
     type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -54,19 +54,21 @@ mod native {
                     idt_limit: 4095,
                 },
             );
-            let (mut retired, mut requests) = (0, 0u64);
+            let mut retired = 0;
             let target = LOOPS as u64 * 3;
             let start = Instant::now();
             while retired < target {
-                let batch = cpu.run(&ram, 64, target - retired)?;
+                let batch = cpu.run(
+                    &ram,
+                    RunBudget {
+                        memory_effects: 64,
+                        steps: target - retired,
+                    },
+                    |_, _| false,
+                    |_| false,
+                )?;
                 retired += batch.retired;
                 match batch.stop {
-                    BatchStop::Decode(input) => {
-                        requests += 1;
-                        if !cpu.complete_decode(input.sequence, x86_decode::admit(input)) {
-                            return Err(io::Error::other("decoder completion rejected").into());
-                        }
-                    }
                     BatchStop::Budget | BatchStop::Yield => {}
                     other => {
                         return Err(
@@ -82,12 +84,11 @@ mod native {
                 || actual.gpr[15] != 0x40d0
                 || actual.gpr[14] != end - 5
                 || actual.gpr[2] != 0xc0000101
-                || requests != (LOOPS * instructions.len()) as u64
             {
                 return Err(io::Error::other("decoded stream final state mismatch").into());
             }
             println!(
-                "{{\"mode\":\"shared_decode\",\"trial\":{trial},\"instructions\":{retired},\"decode_requests\":{requests},\"seconds\":{seconds},\"instructions_per_second\":{}}}",
+                "{{\"mode\":\"self_contained\",\"trial\":{trial},\"instructions\":{retired},\"seconds\":{seconds},\"instructions_per_second\":{}}}",
                 retired as f64 / seconds
             );
         }

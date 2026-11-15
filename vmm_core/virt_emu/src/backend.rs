@@ -10,7 +10,6 @@
 
 use crate::native_memory::{NativeRam, RamError};
 use crate::{state_from_registers, update_registers};
-pub use decode_cache::DecodeDiagnostics;
 use futures::task::AtomicWaker;
 use hvdef::Vtl;
 use memory_range::MemoryRange;
@@ -19,6 +18,8 @@ use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::task::Poll;
+pub use strudel::DecodeDiagnostics;
+use strudel::{Machine, RunBudget, Stop as BatchStop};
 use virt::io::CpuIo;
 use virt::vp::{self, AccessVpState};
 use virt::x86::{SegmentRegister, TableRegister};
@@ -30,7 +31,6 @@ use virt::{
 use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
 use x86_system::arch::apic::registers::LocalApic;
 use x86_system::arch::system::{self, SegmentState, SystemState};
-use x86_system::execute::{BatchStop, Machine};
 use x86_system::memory::physical::{Exchange, PhysicalRam};
 use x86_system::mmu::translate::RunError;
 use x86_system::mmu::translate::io::IoReply;
@@ -38,11 +38,6 @@ use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
 
 #[path = "backend_apic.rs"]
 mod apic;
-#[cfg(not(test))]
-use x86_decode::cache as decode_cache;
-#[cfg(test)]
-#[path = "backend_decode_cache.rs"]
-mod decode_cache;
 #[cfg(feature = "perf")]
 #[path = "backend_perf.rs"]
 pub mod perf;
@@ -230,9 +225,10 @@ pub struct EmuPartition {
 }
 
 struct VpState {
-    decoder: decode_cache::DecodeCache,
     #[cfg(test)]
-    decode_in_batch: bool,
+    decode_cache_enabled: bool,
+    #[cfg(test)]
+    decode_windows: bool,
     #[cfg(test)]
     boundary_in_batch: bool,
     lapic: Option<LocalApic>,
@@ -312,20 +308,26 @@ impl EmuProcessor<'_> {
     }
 
     /// Returns current decoder counters and their first-interrupt baseline.
-    pub fn decode_diagnostics(&self) -> (DecodeDiagnostics, Option<DecodeDiagnostics>) {
-        (
-            self.state.decoder.diagnostics(),
+    pub fn decode_diagnostics(
+        &self,
+    ) -> Result<(DecodeDiagnostics, Option<DecodeDiagnostics>), Error> {
+        Ok((
+            self.state
+                .core
+                .as_ref()
+                .ok_or(Error::Uninitialized)?
+                .decode_diagnostics(),
             self.state.first_apic_decode,
-        )
+        ))
     }
 
     #[cfg(test)]
     pub(crate) fn bypass_decode_cache(&mut self) {
-        self.state.decoder.bypass = true;
+        self.state.decode_cache_enabled = false;
     }
     #[cfg(test)]
-    pub(crate) fn bypass_decode_batch(&mut self) {
-        self.state.decode_in_batch = false;
+    pub(crate) fn bypass_decode_windows(&mut self) {
+        self.state.decode_windows = false;
     }
     #[cfg(test)]
     pub(crate) fn bypass_boundary_batch(&mut self) {
@@ -477,9 +479,10 @@ impl ProtoPartition for EmuProtoPartition {
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
             state: VpState {
-                decoder: decode_cache::DecodeCache::new(),
                 #[cfg(test)]
-                decode_in_batch: true,
+                decode_cache_enabled: true,
+                #[cfg(test)]
+                decode_windows: true,
                 #[cfg(test)]
                 boundary_in_batch: true,
                 lapic: if self.architectural_apic {
@@ -667,23 +670,15 @@ impl Processor for EmuProcessor<'_> {
                 .map(|apic| apic.timer.deadline());
             let offer = self.state.apic_offer;
             #[cfg(test)]
-            let decode_in_batch = self.state.decode_in_batch;
-            #[cfg(test)]
             let boundary_in_batch = self.state.boundary_in_batch;
-            let decoder = &mut self.state.decoder;
-            let batch = match core.run_with_window(
+            let batch = match core.run(
                 &*self.ram,
-                64,
-                64,
+                RunBudget {
+                    memory_effects: 64,
+                    steps: 64,
+                },
                 |address, width| {
                     (0..u64::from(width)).all(|offset| !self.ram.is_ram(address + offset))
-                },
-                |window| {
-                    #[cfg(test)]
-                    if !decode_in_batch {
-                        return None;
-                    }
-                    Some(decoder.decode_window(window))
                 },
                 |core| {
                     #[cfg(test)]
@@ -755,7 +750,7 @@ impl Processor for EmuProcessor<'_> {
                     self.state.first_apic_retired.get_or_insert(retired);
                     if self.state.first_apic_time.is_none() {
                         self.state.first_apic_time = Some(self.clock.now().as_100ns());
-                        self.state.first_apic_decode = Some(self.state.decoder.diagnostics());
+                        self.state.first_apic_decode = Some(core.decode_diagnostics());
                     }
                 }
                 Ok(None) => {}
@@ -786,11 +781,6 @@ impl Processor for EmuProcessor<'_> {
                         .wrapping_mul(x86_system::arch::profile::TSC_HZ / 10_000_000);
                     if !core.complete_timestamp(sequence, ticks) {
                         return Err(dev.fatal_error(Box::new(Error::Completion)));
-                    }
-                }
-                BatchStop::Decode(input) => {
-                    if !core.complete_decode(input.sequence, self.state.decoder.decode(input)) {
-                        return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));
                     }
                 }
                 BatchStop::PortIo(request) => {
@@ -1138,6 +1128,11 @@ impl AccessVpState for EmuStateAccess<'_> {
             return Err(Error::Profile("initial long-mode register image"));
         }
         let mut core = Machine::new(cpu, config, regs.cr2, tables);
+        #[cfg(test)]
+        core.set_test_options(strudel::TestOptions {
+            cache: self.state.decode_cache_enabled,
+            windows: self.state.decode_windows,
+        });
         if let Some(apic) = &mut self.state.lapic {
             if !core.configure_apic(apic.id) {
                 return Err(Error::Profile("initial APIC metadata"));

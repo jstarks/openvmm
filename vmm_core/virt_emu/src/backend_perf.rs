@@ -3,7 +3,6 @@
 
 //! Opt-in measurement of production fast paths, with no hooks in default builds.
 
-use super::decode_cache::DecodeCache;
 use crate::native_memory::NativeRam;
 use anyhow::{Result, bail, ensure};
 use guestmem::GuestMemory;
@@ -11,7 +10,6 @@ use memory_range::MemoryRange;
 use std::hint::black_box;
 use std::time::Instant;
 use x86_system::WordAccess;
-use x86_system::execute::decode::{DecodeInput, DecodeWindow};
 use x86_system::mmu::translate::{Progress, Translator};
 use x86_system::mmu::{Access, Config};
 
@@ -121,40 +119,11 @@ fn access<const KIND: u8>(mmu: &mut Translator) -> bool {
 pub fn fast_path(
     case: &str,
     operations: u64,
-    mut control: impl FnMut(bool) -> Result<()>,
+    control: impl FnMut(bool) -> Result<()>,
 ) -> Result<FastPathResult> {
     ensure!(operations > 0, "operation count must be positive");
     if case == "decode" {
-        let mut bytes = [0; 15];
-        bytes[..4].copy_from_slice(&[0x48, 0x83, 0xc0, 1]);
-        let window = DecodeWindow {
-            input: DecodeInput {
-                rip: 0x10000,
-                sequence: 1,
-                bytes,
-                length: 1,
-            },
-            bytes,
-            available: 8,
-        };
-        let mut cache = DecodeCache::new();
-        for _ in 0..1024 {
-            black_box(cache.decode_window(black_box(window)));
-        }
-        let before = cache.diagnostics();
-        control(true)?;
-        let start = Instant::now();
-        for _ in 0..operations {
-            black_box(cache.decode_window(black_box(window)));
-        }
-        let seconds = start.elapsed().as_secs_f64();
-        control(false)?;
-        let after = cache.diagnostics();
-        ensure!(after.hits - before.hits == operations, "decoder cache miss");
-        ensure!(
-            after.admissions == before.admissions,
-            "unexpected cold admission"
-        );
+        let seconds = strudel::perf::decode_hits(operations, control)?;
         return Ok(FastPathResult {
             operations,
             seconds,

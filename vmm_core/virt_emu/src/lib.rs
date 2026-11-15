@@ -5,15 +5,18 @@
 //!
 //! The host-x86 `backend` implements a restricted long-mode VP lifecycle with
 //! shared paging, events and device continuation. It is not a selectable
-//! Linux-capable machine backend. The pretranslated instruction-window helper
-//! below remains an independent, narrower packaging test.
+//! Linux-capable machine backend. Pretranslated instruction-window experiments
+//! are test-only; the backend uses Strudel's self-contained machine.
 
 #![forbid(unsafe_code)]
 #![cfg(guest_arch = "x86_64")]
 
+#[cfg(test)]
 use guestmem::{GuestMemory, GuestMemoryError};
 use virt::vp::Registers;
-use x86_system::arch::{Diagnostic, Profile, State, decoder};
+use x86_system::State;
+#[cfg(test)]
+use x86_system::arch::{Diagnostic, Profile, decoder};
 
 // xtask-fmt allow-target-arch cpu-intrinsic -- Depends on host x86 WB ordering.
 #[cfg(target_arch = "x86_64")]
@@ -45,6 +48,7 @@ mod backend_tests;
 
 /// Failure to read or execute a supported instruction window.
 #[derive(Debug, thiserror::Error)]
+#[cfg(test)]
 pub enum Error {
     /// The supplied physical instruction window could not be read.
     #[error("reading pretranslated instruction window")]
@@ -60,7 +64,8 @@ pub enum Error {
 /// RIP. This does not walk page tables, inject architectural fetch faults, or
 /// establish that the supplied GPA is the correct translation.
 /// Only GPRs, RFLAGS and RIP are changed, and only on successful execution.
-pub fn execute_pretranslated(
+#[cfg(test)]
+fn execute_pretranslated(
     registers: &mut Registers,
     memory: &GuestMemory,
     instruction_gpa: u64,

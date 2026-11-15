@@ -7,7 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-perf = []
+perf = ["strudel/perf"]
 
 [[example]]
 name = "fast_path"
@@ -18,7 +18,7 @@ guestmem.workspace = true
 memory_range.workspace = true
 virt.workspace = true
 x86_system.workspace = true
-x86_decode.workspace = true
+strudel.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 futures.workspace = true
@@ -28,6 +28,8 @@ vmcore.workspace = true
 vm_topology.workspace = true
 
 [dev-dependencies]
+strudel = { workspace = true, features = ["test-support"] }
+x86_decode.workspace = true
 x86_system = { workspace = true, features = ["reference"] }
 loader.workspace = true
 vm_loader.workspace = true

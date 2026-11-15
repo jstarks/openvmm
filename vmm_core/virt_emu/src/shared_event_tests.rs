@@ -263,7 +263,7 @@ fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code()
             };
             let decision = x86_decode::admit(input);
             assert!(cpu.complete_decode(input.sequence, decision));
-            if !matches!(decision, x86_system::execute::decode::DecodeDecision::More) {
+            if !matches!(decision, x86_system::execute::decode::DecodeOutcome::More) {
                 break;
             }
         }
@@ -280,7 +280,7 @@ fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code()
 
 #[test]
 fn decoded_fetch_fault_discards_prefix_and_rejects_reply_after_guest_repair() {
-    use x86_system::execute::decode::DecodeDecision;
+    use x86_system::execute::decode::DecodeOutcome;
     let (mut bytes, mut owned) = fixture();
     let start = 0x15ffeusize;
     bytes[start..start + 5].copy_from_slice(&[0xb8, 0x11, 0x22, 0x33, 0x44]);
@@ -310,7 +310,7 @@ fn decoded_fetch_fault_discards_prefix_and_rejects_reply_after_guest_repair() {
         (0, 1, BatchStop::Budget)
     );
     assert_eq!(cpu.cr2(), 0x16000);
-    assert!(!cpu.complete_decode(stale.sequence, DecodeDecision::Rejected));
+    assert!(!cpu.complete_decode(stale.sequence, DecodeOutcome::Rejected));
     memory
         .write_at(start as u64, &[0xb9, 0x78, 0x56, 0x34, 0x12])
         .unwrap();

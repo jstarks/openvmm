@@ -207,7 +207,7 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
             vp.bypass_decode_cache();
         }
         if !batch {
-            vp.bypass_decode_batch();
+            vp.bypass_decode_windows();
         }
         if !boundaries {
             vp.bypass_boundary_batch();
@@ -1750,7 +1750,7 @@ async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
         let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
         let mut vp = binder.bind().unwrap();
         if !batch {
-            vp.bypass_decode_batch();
+            vp.bypass_decode_windows();
         }
         vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
         let devices = Devices::new();

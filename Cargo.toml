@@ -470,6 +470,7 @@ virt_hvf = { path = "vmm_core/virt_hvf" }
 virt_kvm = { path = "vmm_core/virt_kvm" }
 x86_system = { package = "strudel-core", path = "../strudel-consolidation/crates/strudel-core" }
 x86_decode = { package = "strudel-decode", path = "../strudel-consolidation/crates/strudel-decode" }
+strudel = { path = "../strudel-consolidation/crates/strudel" }
 virt_mshv = { path = "vmm_core/virt_mshv" }
 virt_support_aarch64emu = { path = "vmm_core/virt_support_aarch64emu" }
 virt_support_apic = { path = "vmm_core/virt_support_apic" }

@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use super::test_support::{RunDecoded, run_fixture};
 use crate::native_memory::NativeRam;
 use guestmem::GuestMemory;
 use memory_range::MemoryRange;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use test_with_tracing::test;
-use x86_system::events::EventOutcome;
 use x86_system::execute::{Batch, BatchStop, Machine};
 use x86_system::memory::physical::{Exchange, PhysicalRam};
 use x86_system::mmu::translate::{Request, RunError};
@@ -98,7 +98,7 @@ pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, NativeRam) {
 }
 
 fn shared(owned: &ReferenceMachine) -> Machine {
-    x86_system::reference::machine(
+    Machine::new(
         owned.core.cpu,
         super::shared_mmu_tests::config(),
         owned.core.mmu.cr2(),
@@ -132,7 +132,6 @@ fn decoded_page_edge_retires_without_touching_the_missing_next_page() {
     owned.core.cpu.flags |= RF;
     let (memory, ram) = backing(&bytes);
     let mut cpu = shared(&owned);
-    assert!(cpu.enable_decode());
     let batch = decoded_one(&mut cpu, &ram);
     assert_eq!(
         (batch.retired, batch.delivered, batch.stop),
@@ -162,7 +161,6 @@ fn decoded_faults_frame_ud_and_gp_without_fetching_past_the_page() {
         let initial = owned.core.cpu;
         let (memory, ram) = backing(&bytes);
         let mut cpu = shared(&owned);
-        assert!(cpu.enable_decode());
         let stack = initial.gpr[4] & !15;
         let mut stores = Vec::new();
         let mut completed = None;
@@ -233,7 +231,6 @@ fn truncated_decode_fetch_fault_wins_before_opcode_classification() {
     let initial = owned.core.cpu;
     let (memory, ram) = backing(&bytes);
     let mut cpu = shared(&owned);
-    assert!(cpu.enable_decode());
     let batch = decoded_one(&mut cpu, &ram);
     assert_eq!((batch.retired, batch.delivered), (0, 1));
     assert_eq!(cpu.cr2(), 0x11000);
@@ -255,7 +252,6 @@ fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code()
         put(&mut bytes, 0x8000, 0xabcdef0123456789);
         let (memory, ram) = backing(&bytes);
         let mut cpu = shared(&owned);
-        assert!(cpu.enable_decode());
         loop {
             let batch = cpu.run(&ram, 1024, 1).unwrap();
             let BatchStop::Decode(input) = batch.stop else {
@@ -293,7 +289,6 @@ fn decoded_fetch_fault_discards_prefix_and_rejects_reply_after_guest_repair() {
     owned.core.cpu.gpr[7] = 0x16000;
     let (memory, ram) = backing(&bytes);
     let mut cpu = shared(&owned);
-    assert!(cpu.enable_decode());
     let stale = loop {
         let batch = cpu.run(&ram, 1024, 1).unwrap();
         let BatchStop::Decode(input) = batch.stop else {
@@ -349,7 +344,6 @@ fn decoded_instruction_keeps_sti_shadow_until_retirement_then_delivers_irq() {
     owned.core.cpu.flags &= !IF;
     let (memory, ram) = backing(&bytes);
     let mut cpu = shared(&owned);
-    assert!(cpu.enable_decode());
     assert_eq!(decoded_one(&mut cpu, &ram).retired, 1);
     assert!(cpu.shadow());
     assert_eq!(cpu.inject(64), Injection::Queued);
@@ -386,7 +380,7 @@ where
 {
     let before = cpu.cpu();
     for _ in 0..1024 {
-        let batch = cpu.run(ram, 1, 1).unwrap();
+        let batch = cpu.run_decoded(ram, 1, 1).unwrap();
         if batch.stop != BatchStop::Yield {
             return batch;
         }
@@ -407,21 +401,13 @@ fn compare_one(
     memory: &GuestMemory,
     ram: &NativeRam,
 ) -> Batch {
-    let expected = owned.run(bytes, 0, 1);
+    let expected = run_fixture(owned, bytes, 1);
     let actual = one(cpu, ram);
     assert_eq!(
         (actual.retired, actual.delivered),
         (expected.retired, expected.delivered)
     );
-    assert_eq!(
-        actual.stop,
-        match expected.outcome {
-            EventOutcome::Budget => BatchStop::Budget,
-            EventOutcome::Waiting => BatchStop::Waiting,
-            EventOutcome::Stopped(reason) => BatchStop::Stopped(reason),
-            other => panic!("unexpected one-step oracle outcome: {other:?}"),
-        }
-    );
+    assert_eq!(actual.stop, expected.stop);
     assert_eq!(cpu.cpu(), owned.core.cpu);
     assert_eq!(cpu.cr2(), owned.core.mmu.cr2());
     assert_eq!(cpu.pending(), owned.pending);
@@ -430,7 +416,10 @@ fn compare_one(
     assert_eq!(cpu.handler_pending(), owned.handler_pending);
     let mut actual_bytes = vec![0; bytes.len()];
     memory.read_at(0, &mut actual_bytes).unwrap();
-    assert_eq!(actual_bytes, *bytes, "complete RAM oracle");
+    assert_eq!(
+        actual_bytes, *bytes,
+        "complete vector/native RAM comparison"
+    );
     actual
 }
 

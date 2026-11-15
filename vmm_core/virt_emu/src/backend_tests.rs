@@ -1580,12 +1580,15 @@ async fn real_backend_guest_recovery_delayed_mmio_hlt_and_irq(driver: DefaultDri
 
     let mut expected = bytes;
     expected.resize(0x21000, 0);
-    let report = oracle.run(&mut expected, 0, 7);
+    let report = super::test_support::run_fixture(&mut oracle, &mut expected, 7);
     assert_eq!((report.retired, report.delivered), (6, 1));
     expected[DEVICE as usize..DEVICE as usize + 8].copy_from_slice(&VALUE.to_le_bytes());
-    assert_eq!(oracle.run(&mut expected, 0, 2).retired, 2);
+    assert_eq!(
+        super::test_support::run_fixture(&mut oracle, &mut expected, 2).retired,
+        2
+    );
     assert_eq!(oracle.inject(64), x86_system::Injection::Queued);
-    let report = oracle.run(&mut expected, 0, 4);
+    let report = super::test_support::run_fixture(&mut oracle, &mut expected, 4);
     assert_eq!((report.retired, report.delivered), (3, 1));
     let actual = vp.access_state(Vtl::Vtl0).registers().unwrap();
     assert_eq!(
@@ -1785,12 +1788,15 @@ async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
         oracle.core.cpu.flags &= !0x10000;
         let mut expected = bytes;
         expected.resize(0x21000, 0);
-        let report = oracle.run(&mut expected, 0, 7);
+        let report = super::test_support::run_fixture(&mut oracle, &mut expected, 7);
         assert_eq!((report.retired, report.delivered), (6, 1));
         expected[DEVICE as usize..DEVICE as usize + 8].copy_from_slice(&VALUE.to_le_bytes());
-        assert_eq!(oracle.run(&mut expected, 0, 2).retired, 2);
+        assert_eq!(
+            super::test_support::run_fixture(&mut oracle, &mut expected, 2).retired,
+            2
+        );
         assert_eq!(oracle.inject(64), x86_system::Injection::Queued);
-        let report = oracle.run(&mut expected, 0, 4);
+        let report = super::test_support::run_fixture(&mut oracle, &mut expected, 4);
         assert_eq!((report.retired, report.delivered), (3, 1));
         let actual = vp.access_state(Vtl::Vtl0).registers().unwrap();
         assert_eq!(

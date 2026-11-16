@@ -185,8 +185,6 @@ struct VpState {
     #[cfg(test)]
     decode_cache_enabled: bool,
     #[cfg(test)]
-    decode_windows: bool,
-    #[cfg(test)]
     boundary_in_batch: bool,
     lapic: Option<LocalApic>,
     apic_offer: Option<u8>,
@@ -278,10 +276,6 @@ impl EmuProcessor<'_> {
     #[cfg(test)]
     pub(crate) fn bypass_decode_cache(&mut self) {
         self.state.decode_cache_enabled = false;
-    }
-    #[cfg(test)]
-    pub(crate) fn bypass_decode_windows(&mut self) {
-        self.state.decode_windows = false;
     }
     #[cfg(test)]
     pub(crate) fn bypass_boundary_batch(&mut self) {
@@ -432,8 +426,6 @@ impl ProtoPartition for EmuProtoPartition {
             state: VpState {
                 #[cfg(test)]
                 decode_cache_enabled: true,
-                #[cfg(test)]
-                decode_windows: true,
                 #[cfg(test)]
                 boundary_in_batch: true,
                 lapic: if self.architectural_apic {
@@ -1098,7 +1090,6 @@ impl AccessVpState for EmuStateAccess<'_> {
         #[cfg(test)]
         core.set_test_options(strudel::TestOptions {
             cache: self.state.decode_cache_enabled,
-            windows: self.state.decode_windows,
         });
         if let Some(apic) = &mut self.state.lapic {
             if !core.configure_apic(apic.id) {

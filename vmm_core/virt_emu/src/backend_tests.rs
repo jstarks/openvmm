@@ -185,15 +185,12 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
     driver: DefaultDriver,
 ) {
     let iterations = 100_000u32;
-    for (apic, bypass, batch, boundaries) in [
-        (false, true, false, true),
-        (false, false, false, true),
-        (true, false, false, true),
-        (false, true, true, true),
-        (false, false, true, true),
-        (true, false, true, true),
-        (false, false, true, false),
-        (true, false, true, false),
+    for (apic, bypass, boundaries) in [
+        (false, true, true),
+        (false, false, true),
+        (true, false, true),
+        (false, false, false),
+        (true, false, false),
     ] {
         let (mut bytes, owned) = fixture();
         let mut code = vec![0xb9];
@@ -205,9 +202,6 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         let mut vp = binder.bind().unwrap();
         if bypass {
             vp.bypass_decode_cache();
-        }
-        if !batch {
-            vp.bypass_decode_windows();
         }
         if !boundaries {
             vp.bypass_boundary_batch();
@@ -239,7 +233,7 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
         assert_eq!(vp.completed_batch_progress().retired, retired);
         println!(
-            "apic={apic} decode_cache={} batch={batch} boundary_batch={boundaries} instructions={retired} seconds={seconds:.6} mips={:.3}",
+            "apic={apic} decode_cache={} boundary_batch={boundaries} instructions={retired} seconds={seconds:.6} mips={:.3}",
             !bypass,
             retired as f64 / seconds / 1e6
         );
@@ -1739,7 +1733,7 @@ async fn backend_stop_during_device_completion_resumes_without_reissue(driver: D
 async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
     driver: DefaultDriver,
 ) {
-    for batch in [false, true] {
+    for cache in [false, true] {
         let (mut bytes, mut oracle) = fixture();
         let prefix = [
             0x49, 0x89, 0xf7, 0x4c, 0x8d, 0x35, 0, 0, 0, 0, 0xba, 0x01, 0x01, 0, 0xc0, 0x41, 0xb4,
@@ -1764,8 +1758,8 @@ async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
         );
         let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
         let mut vp = binder.bind().unwrap();
-        if !batch {
-            vp.bypass_decode_windows();
+        if !cache {
+            vp.bypass_decode_cache();
         }
         vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
         let devices = Devices::new();

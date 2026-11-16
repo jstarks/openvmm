@@ -253,12 +253,12 @@ impl RunDecoded for Machine {
         steps: u64,
         classify: impl FnMut(u64, u8) -> bool,
     ) -> Result<Batch, RunError<R::Error>> {
-        self.run_with_window(
+        self.run_with_decoder(
             ram,
             effects,
             steps,
             classify,
-            |window| Some((window.input.length, x86_decode::admit(window.input))),
+            |input| Some(x86_decode::admit(input)),
             |_| false,
         )
     }

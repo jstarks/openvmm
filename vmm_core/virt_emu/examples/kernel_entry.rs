@@ -1534,7 +1534,7 @@ mod native {
                 serde_json::json!({
                     "entries":d.entries,"bytes":d.bytes,
                     "windows":d.windows,"hits":d.hits,"empty":d.empty,"collisions":d.collisions,
-                    "changed":d.changed,"admissions":d.admissions,"prefix_checks":d.prefix_checks,
+                    "changed":d.changed,"admissions":d.admissions,
                 })
             };
             let apic=vp.apic_diagnostics().map(|snapshot| {

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::task::Poll;
 pub use strudel::DecodeDiagnostics;
-use strudel::{Machine, RunBudget, Stop as BatchStop};
+use strudel::{CpuState, Machine, RunBudget, Stop as BatchStop};
 use virt::io::CpuIo;
 use virt::vp::{self, AccessVpState};
 use virt::x86::{SegmentRegister, TableRegister};
@@ -47,6 +47,9 @@ pub enum Error {
     /// A requested state or feature is outside the restricted profile.
     #[error("unsupported emulator profile: {0}")]
     Profile(&'static str),
+    /// The complete architectural image was rejected before CPU publication.
+    #[error("unsupported initial CPU state")]
+    State(#[from] strudel::StateError),
     /// Execution/state access requires initial register import.
     #[error("VP registers have not been initialized")]
     Uninitialized,
@@ -173,6 +176,11 @@ pub struct EmuPartition {
     control: Arc<Control>,
 }
 
+enum CpuLifecycle {
+    Importing(Box<SystemState>),
+    Ready(Box<Machine>),
+}
+
 struct VpState {
     #[cfg(test)]
     decode_cache_enabled: bool,
@@ -186,8 +194,7 @@ struct VpState {
     first_apic_retired: Option<u64>,
     first_apic_time: Option<u64>,
     first_apic_decode: Option<DecodeDiagnostics>,
-    core: Option<Machine>,
-    initial_system: Option<SystemState>,
+    cpu: CpuLifecycle,
     started: bool,
     progress: CompletedBatchProgress,
     checkpoint: Option<u64>,
@@ -262,14 +269,10 @@ impl EmuProcessor<'_> {
     pub fn decode_diagnostics(
         &self,
     ) -> Result<(DecodeDiagnostics, Option<DecodeDiagnostics>), Error> {
-        Ok((
-            self.state
-                .core
-                .as_ref()
-                .ok_or(Error::Uninitialized)?
-                .decode_diagnostics(),
-            self.state.first_apic_decode,
-        ))
+        let CpuLifecycle::Ready(core) = &self.state.cpu else {
+            return Err(Error::Uninitialized);
+        };
+        Ok((core.decode_diagnostics(), self.state.first_apic_decode))
     }
 
     #[cfg(test)]
@@ -443,8 +446,7 @@ impl ProtoPartition for EmuProtoPartition {
                 first_apic_retired: None,
                 first_apic_time: None,
                 first_apic_decode: None,
-                core: None,
-                initial_system: Some(SystemState::empty()),
+                cpu: CpuLifecycle::Importing(Box::new(SystemState::empty())),
                 started: false,
                 progress: CompletedBatchProgress::default(),
                 #[cfg(feature = "perf")]
@@ -554,7 +556,10 @@ impl BindProcessor for EmuProcessorBinder {
 impl inspect::InspectMut for EmuProcessor<'_> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
-            .field("initialized", self.state.core.is_some())
+            .field(
+                "initialized",
+                matches!(self.state.cpu, CpuLifecycle::Ready(_)),
+            )
             .field("io_active", self.state.io_active);
     }
 }
@@ -598,7 +603,7 @@ impl Processor for EmuProcessor<'_> {
             if let Some(error) = self.state.fault.take() {
                 return Err(dev.fatal_error(Box::new(error)));
             }
-            let Some(core) = self.state.core.as_mut() else {
+            let CpuLifecycle::Ready(core) = &mut self.state.cpu else {
                 return Err(dev.fatal_error(Box::new(Error::Uninitialized)));
             };
             if let Err(error) = self.control.flush(core) {
@@ -863,7 +868,7 @@ impl Processor for EmuProcessor<'_> {
     }
 
     fn flush_async_requests(&mut self) {
-        if let Some(core) = self.state.core.as_mut() {
+        if let CpuLifecycle::Ready(core) = &mut self.state.cpu {
             if let Err(error) = self.control.flush(core) {
                 self.state.fault = Some(error);
             }
@@ -899,19 +904,20 @@ impl EmuStateAccess<'_> {
         if self.vtl != Vtl::Vtl0 {
             return Err(Error::Profile("VTL"));
         }
-        self.state.core.as_ref().ok_or(Error::Uninitialized)
+        match &self.state.cpu {
+            CpuLifecycle::Ready(core) => Ok(core),
+            CpuLifecycle::Importing(_) => Err(Error::Uninitialized),
+        }
     }
 
     fn system(&self) -> Result<SystemState, Error> {
         if self.vtl != Vtl::Vtl0 {
             return Err(Error::Profile("VTL"));
         }
-        if let Some(core) = &self.state.core {
-            core.system()
-                .ok_or(Error::Profile("missing core system state"))
-        } else {
-            self.state.initial_system.ok_or(Error::Uninitialized)
-        }
+        Ok(match &self.state.cpu {
+            CpuLifecycle::Ready(core) => core.system(),
+            CpuLifecycle::Importing(system) => **system,
+        })
     }
 
     fn set_system(&mut self, system: SystemState) -> Result<(), Error> {
@@ -921,12 +927,13 @@ impl EmuStateAccess<'_> {
         if self.state.started {
             return Err(Error::AlreadyInitialized);
         }
-        if let Some(core) = &mut self.state.core {
-            if !core.configure_system(system) {
-                return Err(Error::Profile("initial system state"));
+        match &mut self.state.cpu {
+            CpuLifecycle::Ready(core) => {
+                if !core.set_system(system) {
+                    return Err(Error::Profile("initial system state"));
+                }
             }
-        } else {
-            self.state.initial_system = Some(system);
+            CpuLifecycle::Importing(initial) => **initial = system,
         }
         Ok(())
     }
@@ -1018,10 +1025,10 @@ impl AccessVpState for EmuStateAccess<'_> {
         self.core().map(|_| ())
     }
     fn registers(&mut self) -> Result<vp::Registers, Error> {
-        let core = self.core()?;
+        let state = self.core()?.state();
         let mut registers = with_system(
-            long_mode_registers(core.cpu(), core.config(), core.tables(), core.cr2()),
-            self.system()?,
+            long_mode_registers(state.registers, state.config, state.tables, state.cr2),
+            state.system,
         );
         if let Some(apic) = &self.state.lapic {
             registers.cr8 = u64::from(apic.tpr >> 4);
@@ -1032,7 +1039,7 @@ impl AccessVpState for EmuStateAccess<'_> {
         if self.vtl != Vtl::Vtl0 {
             return Err(Error::Profile("VTL"));
         }
-        if self.state.core.is_some() || self.state.started {
+        if matches!(self.state.cpu, CpuLifecycle::Ready(_)) || self.state.started {
             return Err(Error::AlreadyInitialized);
         }
         let config = Config {
@@ -1081,7 +1088,13 @@ impl AccessVpState for EmuStateAccess<'_> {
         {
             return Err(Error::Profile("initial long-mode register image"));
         }
-        let mut core = Machine::new(cpu, config, regs.cr2, tables);
+        let mut core = Machine::new(CpuState {
+            registers: cpu,
+            config,
+            cr2: regs.cr2,
+            tables,
+            system,
+        })?;
         #[cfg(test)]
         core.set_test_options(strudel::TestOptions {
             cache: self.state.decode_cache_enabled,
@@ -1093,11 +1106,7 @@ impl AccessVpState for EmuStateAccess<'_> {
             }
             *apic = apic.write_cr8(regs.cr8).map_err(Error::Apic)?;
         }
-        if !core.configure_system(system) {
-            return Err(Error::Profile("initial system/decoder state"));
-        }
-        self.state.core = Some(core);
-        self.state.initial_system = None;
+        self.state.cpu = CpuLifecycle::Ready(Box::new(core));
         Ok(())
     }
     fn pat(&mut self) -> Result<vp::Pat, Error> {

@@ -148,7 +148,7 @@ pub(super) fn poll(
     control: &Control,
     clock: &mut VmTimeAccess,
 ) -> Result<(), Error> {
-    let (Some(apic), Some(core)) = (&mut state.lapic, &mut state.core) else {
+    let (Some(apic), CpuLifecycle::Ready(core)) = (&mut state.lapic, &mut state.cpu) else {
         return Ok(());
     };
     if state.apic_offer.is_some() || !core.at_interrupt_boundary() {

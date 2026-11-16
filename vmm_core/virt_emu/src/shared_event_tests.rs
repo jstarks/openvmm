@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::test_support::{RunDecoded, run_fixture};
+use super::test_support::{EventFixture, RunDecoded, long64_system, run_fixture};
 use crate::native_memory::NativeRam;
 use guestmem::GuestMemory;
 use std::io;
@@ -11,7 +11,7 @@ use x86_system::execute::{Batch, BatchStop, Machine};
 use x86_system::memory::physical::{self as physical, PhysicalRam};
 use x86_system::mmu::translate::{Request, RunError};
 use x86_system::reference::{ReferenceCpu, ReferenceMachine, ReferenceMmu};
-use x86_system::{EventDiagnostic, Injection, State, Tables};
+use x86_system::{CpuState, EventDiagnostic, Injection, State, Tables};
 
 const CODE: u64 = 0x10000;
 const HANDLER: u64 = 0x11000;
@@ -38,7 +38,7 @@ fn gate(ram: &mut [u8], vector: u8, target: u64, attr: u8) {
     put(ram, 0xa008 + vector as u64 * 16, target >> 32);
 }
 
-pub(super) fn fixture() -> (Vec<u8>, ReferenceMachine) {
+pub(super) fn fixture() -> (Vec<u8>, EventFixture) {
     let mut ram = vec![0; 0x20000];
     for (table, next) in [(0x1000, 0x2000), (0x2000, 0x3000), (0x3000, 0x4000)] {
         put(&mut ram, table, next | 7);
@@ -86,7 +86,13 @@ pub(super) fn fixture() -> (Vec<u8>, ReferenceMachine) {
         shadow: false,
         halted: false,
     };
-    (ram, owned)
+    (
+        ram,
+        EventFixture {
+            snapshot: owned,
+            system: long64_system(),
+        },
+    )
 }
 
 pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, NativeRam) {
@@ -96,13 +102,15 @@ pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, NativeRam) {
     (memory, ram)
 }
 
-fn shared(owned: &ReferenceMachine) -> Machine {
-    Machine::new(
-        owned.core.cpu,
-        super::shared_mmu_tests::config(),
-        owned.core.mmu.cr2(),
-        owned.tables,
-    )
+fn shared(owned: &EventFixture) -> Machine {
+    Machine::new(CpuState {
+        registers: owned.core.cpu,
+        config: super::shared_mmu_tests::config(),
+        cr2: owned.core.mmu.cr2(),
+        tables: owned.tables,
+        system: owned.system,
+    })
+    .unwrap()
 }
 
 fn decoded_one(cpu: &mut Machine, ram: &NativeRam) -> Batch {
@@ -395,7 +403,7 @@ where
 
 fn compare_one(
     bytes: &mut Vec<u8>,
-    owned: &mut ReferenceMachine,
+    owned: &mut EventFixture,
     cpu: &mut Machine,
     memory: &GuestMemory,
     ram: &NativeRam,
@@ -413,6 +421,7 @@ fn compare_one(
     assert_eq!(cpu.shadow(), owned.shadow);
     assert_eq!(cpu.halted(), owned.halted);
     assert_eq!(cpu.handler_pending(), owned.handler_pending);
+    assert_eq!(cpu.state().system, owned.system);
     let mut actual_bytes = vec![0; bytes.len()];
     memory.read_at(0, &mut actual_bytes).unwrap();
     assert_eq!(
@@ -630,7 +639,10 @@ fn shared_iret_rejects_bad_images_without_early_cpu_commit() {
             assert_eq!(batch.retired, 1);
             assert_eq!(cpu.cpu().gpr[4], 0x1b007);
         } else {
-            assert!(matches!(batch.stop, BatchStop::Stopped(_)));
+            assert!(
+                matches!(batch.stop, BatchStop::Stopped(_)),
+                "kind {kind}: {batch:?}"
+            );
             assert_eq!(cpu.cpu(), initial);
         }
     }

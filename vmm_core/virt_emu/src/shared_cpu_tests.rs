@@ -2,26 +2,28 @@
 // Licensed under the MIT License.
 
 use super::shared_mmu_tests::{bytes, config, fixture};
-use super::test_support::{RunDecoded, run_fixture};
+use super::test_support::{EventFixture, RunDecoded, long64_system, run_fixture};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use test_with_tracing::test;
 use x86_system::execute::{BatchStop, Machine};
 use x86_system::reference::{ReferenceCpu, ReferenceMachine, ReferenceMmu};
-use x86_system::{State, Tables};
+use x86_system::{CpuState, State, Tables};
 
 fn machine(initial: State, cr2: u64) -> Machine {
-    Machine::new(
-        initial,
-        config(),
+    Machine::new(CpuState {
+        registers: initial,
+        config: config(),
         cr2,
-        Tables {
+        tables: Tables {
             idt_base: 0,
             idt_limit: 0,
             gdt_base: 0,
             gdt_limit: 0,
         },
-    )
+        system: long64_system(),
+    })
+    .unwrap()
 }
 
 fn state() -> State {
@@ -46,22 +48,25 @@ fn shared_cpu_native_and_vector_transports_agree_on_registers_and_full_ram() {
                 let mut expected = program(&[rex, opcode, modrm]);
                 let (memory, ram) = fixture(&expected);
                 let initial = state();
-                let mut owned = ReferenceMachine {
-                    core: ReferenceCpu {
-                        cpu: initial,
-                        mmu: ReferenceMmu::new(config(), 0x77),
+                let mut owned = EventFixture {
+                    system: long64_system(),
+                    snapshot: ReferenceMachine {
+                        core: ReferenceCpu {
+                            cpu: initial,
+                            mmu: ReferenceMmu::new(config(), 0x77),
+                        },
+                        tables: Tables {
+                            idt_base: 0,
+                            idt_limit: 0,
+                            gdt_base: 0,
+                            gdt_limit: 0,
+                        },
+                        stopped: None,
+                        handler_pending: false,
+                        pending: None,
+                        shadow: false,
+                        halted: false,
                     },
-                    tables: Tables {
-                        idt_base: 0,
-                        idt_limit: 0,
-                        gdt_base: 0,
-                        gdt_limit: 0,
-                    },
-                    stopped: None,
-                    handler_pending: false,
-                    pending: None,
-                    shadow: false,
-                    halted: false,
                 };
                 let report = run_fixture(&mut owned, &mut expected, 1);
                 let mut shared = machine(initial, 0x77);

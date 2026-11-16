@@ -11,7 +11,8 @@ mod native {
     use std::time::Instant;
     use strudel::{Machine, RunBudget, Stop as BatchStop};
     use virt_emu::native_memory::NativeRam;
-    use x86_system::{Config, State, Tables};
+    use x86_system::arch::system::{SegmentState, SystemState};
+    use x86_system::{Config, CpuState, State, Tables};
 
     type Error = Box<dyn std::error::Error + Send + Sync>;
     const CODE: u64 = 0x10000;
@@ -38,21 +39,39 @@ mod native {
             };
             initial.gpr[6] = 0x40d0;
             initial.gpr[4] = 0x70000;
-            let mut cpu = Machine::new(
-                initial,
-                Config {
+            let data = SegmentState {
+                base: 0,
+                limit: u32::MAX,
+                selector: 16,
+                attributes: 0xc093,
+            };
+            let mut cpu = Machine::new(CpuState {
+                registers: initial,
+                config: Config {
                     root: 0x1000,
                     wp: true,
                     nxe: true,
                 },
-                0,
-                Tables {
+                cr2: 0,
+                tables: Tables {
                     gdt_base: 0x9000,
                     gdt_limit: 23,
                     idt_base: 0xa000,
                     idt_limit: 4095,
                 },
-            );
+                system: SystemState {
+                    cs: SegmentState {
+                        base: 0,
+                        limit: u32::MAX,
+                        selector: 8,
+                        attributes: 0xa09b,
+                    },
+                    ss: data,
+                    ds: data,
+                    es: data,
+                    ..SystemState::empty()
+                },
+            })?;
             let mut retired = 0;
             let target = LOOPS as u64 * 3;
             let start = Instant::now();

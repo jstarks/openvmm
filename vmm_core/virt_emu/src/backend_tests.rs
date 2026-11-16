@@ -1525,6 +1525,10 @@ async fn rejected_initial_system_import_keeps_staging_and_allows_corrected_image
     };
     mtrrs.fixed[..2].fill(FIXED_WB);
     vp.access_state(Vtl::Vtl0).set_mtrrs(&mtrrs).unwrap();
+    assert!(matches!(
+        vp.access_state(Vtl::Vtl0).commit(),
+        Err(super::backend::Error::Uninitialized)
+    ));
     let mut regs = long_mode_registers(
         owned.core.cpu,
         super::shared_mmu_tests::config(),
@@ -1533,10 +1537,18 @@ async fn rejected_initial_system_import_keeps_staging_and_allows_corrected_image
     );
     regs.gs.base = 0x8000_0000_0000;
     assert!(vp.access_state(Vtl::Vtl0).set_registers(&regs).is_err());
-    assert!(vp.access_state(Vtl::Vtl0).registers().is_err());
+    assert!(matches!(
+        vp.access_state(Vtl::Vtl0).registers(),
+        Err(super::backend::Error::Uninitialized)
+    ));
+    assert!(matches!(
+        vp.access_state(Vtl::Vtl0).activity(),
+        Err(super::backend::Error::Uninitialized)
+    ));
     assert_eq!(vp.access_state(Vtl::Vtl0).mtrrs().unwrap(), mtrrs);
     regs.gs.base = 0xffff_8000_0000_0000;
     vp.access_state(Vtl::Vtl0).set_registers(&regs).unwrap();
+    vp.access_state(Vtl::Vtl0).commit().unwrap();
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), regs);
     assert_eq!(vp.access_state(Vtl::Vtl0).mtrrs().unwrap(), mtrrs);
 }

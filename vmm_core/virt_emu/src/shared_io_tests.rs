@@ -4,10 +4,10 @@
 use super::shared_event_tests::{backing, fixture};
 use super::test_support::RunDecoded;
 use test_with_tracing::test;
-use x86_system::WordAccess;
 use x86_system::execute::{BatchStop, Machine, Tick};
 use x86_system::mmu::translate::io::{IoReply, IoRoute};
 use x86_system::mmu::translate::{Reply, RunError, perform};
+use x86_system::{CpuState, WordAccess};
 
 const CODE: u64 = 0x10000;
 const DEVICE: u64 = 0x20000;
@@ -22,7 +22,14 @@ fn shared_mmio_typed_completion_never_reads_a_store_target_or_replays() {
     let mut initial = owned.core.cpu;
     initial.gpr[7] = DEVICE;
     initial.gpr[0] = 0xabcdef;
-    let mut cpu = Machine::new(initial, super::shared_mmu_tests::config(), 77, owned.tables);
+    let mut cpu = Machine::new(CpuState {
+        registers: initial,
+        config: super::shared_mmu_tests::config(),
+        cr2: 77,
+        tables: owned.tables,
+        system: owned.system,
+    })
+    .unwrap();
     let batch = cpu
         .run_mmio_decoded(&ram, 256, 1, |address, _| address == DEVICE)
         .unwrap();
@@ -63,7 +70,14 @@ fn shared_mmio_store_revalidates_revoked_pte_before_offering_device_io() {
     let (memory, ram) = backing(&bytes);
     let mut initial = owned.core.cpu;
     initial.gpr[7] = DEVICE;
-    let mut cpu = Machine::new(initial, super::shared_mmu_tests::config(), 77, owned.tables);
+    let mut cpu = Machine::new(CpuState {
+        registers: initial,
+        config: super::shared_mmu_tests::config(),
+        cr2: 77,
+        tables: owned.tables,
+        system: owned.system,
+    })
+    .unwrap();
     let mut ready = false;
     for _ in 0..256 {
         if cpu.io_operand().is_some() {
@@ -104,7 +118,14 @@ fn shared_mmio_alignment_permissions_and_fetch_are_explicit_boundaries() {
     let (_, ram) = backing(&bytes);
     let mut initial = owned.core.cpu;
     initial.gpr[7] = DEVICE + 1;
-    let mut cpu = Machine::new(initial, super::shared_mmu_tests::config(), 77, owned.tables);
+    let mut cpu = Machine::new(CpuState {
+        registers: initial,
+        config: super::shared_mmu_tests::config(),
+        cr2: 77,
+        tables: owned.tables,
+        system: owned.system,
+    })
+    .unwrap();
     assert!(matches!(
         cpu.run_mmio_decoded(&ram, 256, 1, |_, _| true),
         Err(RunError::IoProfile(IoRoute::Unaligned))
@@ -116,7 +137,14 @@ fn shared_mmio_alignment_permissions_and_fetch_are_explicit_boundaries() {
     bytes[PTE as usize..PTE as usize + 8].copy_from_slice(&(DEVICE | 5).to_le_bytes());
     let (memory, ram) = backing(&bytes);
     initial.gpr[7] = DEVICE;
-    let mut cpu = Machine::new(initial, super::shared_mmu_tests::config(), 77, owned.tables);
+    let mut cpu = Machine::new(CpuState {
+        registers: initial,
+        config: super::shared_mmu_tests::config(),
+        cr2: 77,
+        tables: owned.tables,
+        system: owned.system,
+    })
+    .unwrap();
     let mut classifications = 0;
     let batch = cpu
         .run_mmio_decoded(&ram, 256, 1, |_, _| {
@@ -129,7 +157,14 @@ fn shared_mmio_alignment_permissions_and_fetch_are_explicit_boundaries() {
     assert_eq!(memory.read_plain::<u64>(PTE).unwrap() & 64, 0);
 
     initial.rip = DEVICE;
-    let mut cpu = Machine::new(initial, super::shared_mmu_tests::config(), 77, owned.tables);
+    let mut cpu = Machine::new(CpuState {
+        registers: initial,
+        config: super::shared_mmu_tests::config(),
+        cr2: 77,
+        tables: owned.tables,
+        system: owned.system,
+    })
+    .unwrap();
     assert!(matches!(
         cpu.run_mmio_decoded(&ram, 256, 1, |_, _| panic!("fetch is not an MMIO operand")),
         Err(RunError::Memory { .. })

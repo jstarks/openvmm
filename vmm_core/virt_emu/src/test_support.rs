@@ -7,6 +7,7 @@
 
 use parking_lot::Mutex;
 use std::io;
+use x86_system::arch::system::{SegmentState, SystemState};
 use x86_system::arch::{integer, operand::Width};
 use x86_system::execute::{Batch, Machine};
 use x86_system::memory::physical::{
@@ -14,6 +15,47 @@ use x86_system::memory::physical::{
 };
 use x86_system::mmu::translate::RunError;
 use x86_system::reference::ReferenceMachine;
+
+pub(super) fn long64_system() -> SystemState {
+    let data = SegmentState {
+        base: 0,
+        limit: u32::MAX,
+        selector: 16,
+        attributes: 0xc093,
+    };
+    SystemState {
+        cs: SegmentState {
+            base: 0,
+            limit: u32::MAX,
+            selector: 8,
+            attributes: 0xa09b,
+        },
+        ss: data,
+        ds: data,
+        es: data,
+        ..SystemState::empty()
+    }
+}
+
+/// Carries the explicit system image alongside the bounded ring-zero event snapshot.
+pub(super) struct EventFixture {
+    pub snapshot: ReferenceMachine,
+    pub system: SystemState,
+}
+
+impl std::ops::Deref for EventFixture {
+    type Target = ReferenceMachine;
+
+    fn deref(&self) -> &ReferenceMachine {
+        &self.snapshot
+    }
+}
+
+impl std::ops::DerefMut for EventFixture {
+    fn deref_mut(&mut self) -> &mut ReferenceMachine {
+        &mut self.snapshot
+    }
+}
 
 struct VectorRam<'a>(Mutex<&'a mut Vec<u8>>);
 
@@ -166,18 +208,15 @@ pub(super) fn map_copy_error<E: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-pub(super) fn run_fixture(
-    snapshot: &mut ReferenceMachine,
-    bytes: &mut Vec<u8>,
-    steps: u64,
-) -> Batch {
-    let mut cpu = Machine::from_event_fixture(*snapshot);
+pub(super) fn run_fixture(fixture: &mut EventFixture, bytes: &mut Vec<u8>, steps: u64) -> Batch {
+    let mut cpu = Machine::from_event_fixture(fixture.snapshot, fixture.system).unwrap();
     let batch = cpu
         .run_decoded(&VectorRam(Mutex::new(bytes)), u32::MAX, steps)
         .unwrap();
-    *snapshot = cpu
+    fixture.snapshot = cpu
         .event_fixture()
         .expect("fixture did not reach a CPU boundary");
+    fixture.system = cpu.state().system;
     batch
 }
 

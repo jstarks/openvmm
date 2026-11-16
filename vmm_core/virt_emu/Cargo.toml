@@ -8,6 +8,11 @@ rust-version.workspace = true
 
 [features]
 perf = ["strudel/perf"]
+test-support = ["guestmem/bitmap"]
+
+[[test]]
+name = "native_backend"
+required-features = ["test-support"]
 
 [[example]]
 name = "fast_path"

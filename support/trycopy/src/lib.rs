@@ -81,8 +81,16 @@
 #![expect(unsafe_code)]
 
 mod aarch64;
+mod atomic;
 mod memcpy;
 mod x86_64;
+
+pub use atomic::AtomicError;
+pub use atomic::AtomicOperation;
+pub use atomic::AtomicResult;
+// xtask-fmt allow-target-arch cpu-intrinsic
+#[cfg(target_arch = "x86_64")]
+pub use atomic::try_atomic;
 
 #[cfg(target_arch = "aarch64")]
 use aarch64::*;
@@ -1012,6 +1020,31 @@ mod tests {
             assert_eq!(error.offset(), 1, "{error:?}");
             assert!(!error.is_write);
             assert_eq!(error.to_string(), "failed to read memory");
+        }
+    }
+
+    // xtask-fmt allow-target-arch cpu-intrinsic
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn native_atomic_fault_reports_write() {
+        let mapping = GuardedMapping::new();
+        for width in [1, 2, 4, 8] {
+            for operation in [
+                crate::AtomicOperation::Exchange,
+                crate::AtomicOperation::FetchAdd,
+                crate::AtomicOperation::Add,
+            ] {
+                // SAFETY: the inaccessible operand lies in a reserved page.
+                let error = unsafe {
+                    crate::try_atomic(mapping.ptr.add(mapping.page_size), width, operation, 1, 0)
+                }
+                .unwrap_err();
+                let crate::AtomicError::Memory(error) = error else {
+                    panic!("expected an access fault, not operand validation");
+                };
+                assert_eq!(error.offset(), 0);
+                assert!(error.is_write);
+            }
         }
     }
 

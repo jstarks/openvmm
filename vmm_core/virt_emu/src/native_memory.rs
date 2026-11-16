@@ -3,42 +3,20 @@
 
 //! Native x86-64 lowering for coherent WB RAM, not an MMIO implementation.
 //!
-//! Data caching and buffering belong to the host CPU. Compiler barriers preserve
-//! access order; guest barriers/serializing events must explicitly call `barrier`.
+//! Data caching and buffering belong to the host CPU. Accesses use side-effecting
+//! native transport; guest barriers/serializing events explicitly call `barrier`.
 //! This host-ISA-specific implementation does not apply to weaker host ISAs.
 
 use guestmem::{GuestMemory, GuestMemoryError};
-use memory_range::MemoryRange;
-use std::sync::atomic::{Ordering, compiler_fence, fence};
-use x86_system::arch::{integer, operand::Width};
+use std::sync::atomic::{Ordering, fence};
+use x86_system::arch::integer;
 use x86_system::memory::physical::{
-    self as shared, AtomicOperation, Beat, BeatError, CopyError, CopyErrorKind, Exchange,
-    PhysicalRam,
+    self as physical, AtomicOperation, AtomicResult, CopyError, CopyErrorKind, PhysicalRam,
 };
-
-const MASKED_WRITE_ATTEMPTS: usize = 64;
 
 /// Failure of the physical RAM interface, not an architectural guest exception.
 #[derive(Debug, thiserror::Error)]
 pub enum RamError {
-    /// A RAM bank must be nonempty.
-    #[error("invalid native RAM bank")]
-    Region,
-    /// The operation crosses the bank's declared RAM boundary.
-    #[error("physical RAM access outside bank: {address:#x}")]
-    OutsideBank {
-        /// Physical address supplied by the caller.
-        address: u64,
-    },
-    /// The access width is outside the current byte/word/dword/qword profile.
-    #[error("unsupported RAM access width")]
-    Width,
-    /// The caller must decompose this operation into separate RAM beats.
-    #[error("RAM access requires multiple quadword beats")]
-    Split,
-    /// No masked store committed within this bounded attempt.
-    #[error("masked RAM store contended; yield and retry without retiring")]
-    Contended,
     /// OpenVMM could not access the backing.
     #[error("accessing physical RAM")]
     Memory(#[from] GuestMemoryError),
@@ -55,92 +33,19 @@ pub enum AdUpdate {
     NotPresent,
 }
 
-/// Shared view of a host-declared coherent WB RAM bank.
+/// Shared coherent WB view of existing OpenVMM backing.
 ///
-/// Clones retain the same OpenVMM backing. No exclusive Rust slice or RAM
-/// snapshot is created. Callers must route MMIO and other memory types elsewhere.
+/// GuestMemory owns backing resolution and bounds. Callers independently classify
+/// RAM versus MMIO; transport failures are not device classification.
 #[derive(Clone, Debug)]
 pub struct NativeRam {
     memory: GuestMemory,
-    bank: MemoryRange,
 }
 
 impl NativeRam {
-    /// Creates a native RAM view; the caller classifies this bank as coherent WB.
-    pub fn new(memory: GuestMemory, bank: MemoryRange) -> Result<Self, RamError> {
-        if bank.is_empty() {
-            return Err(RamError::Region);
-        }
-        Ok(Self { memory, bank })
-    }
-
-    fn beat(&self, address: u64, width: u8) -> Result<Beat, RamError> {
-        let beat = shared::plan(address, width).map_err(|error| match error {
-            BeatError::Width => RamError::Width,
-            BeatError::Split => RamError::Split,
-        })?;
-        if beat.address() < self.bank.start()
-            || beat.address() >= self.bank.end()
-            || self.bank.end() - beat.address() < 8
-        {
-            return Err(RamError::OutsideBank { address });
-        }
-        Ok(beat)
-    }
-
-    fn range(&self, address: u64, length: usize) -> Result<(), RamError> {
-        if length == 0 {
-            return Ok(());
-        }
-        if address < self.bank.start()
-            || address >= self.bank.end()
-            || u64::try_from(length).map_or(true, |length| length > self.bank.end() - address)
-        {
-            return Err(RamError::OutsideBank { address });
-        }
-        Ok(())
-    }
-
-    fn compare_word(
-        &self,
-        address: u64,
-        expected: u64,
-        replacement: u64,
-    ) -> Result<Result<u64, u64>, RamError> {
-        compiler_fence(Ordering::SeqCst);
-        let result = self.memory.compare_exchange(address, expected, replacement);
-        compiler_fence(Ordering::SeqCst);
-        Ok(result?)
-    }
-
-    /// Reads exactly the requested bytes. Naturally aligned accesses do not tear.
-    pub fn read(&self, address: u64, width: u8) -> Result<u64, RamError> {
-        self.range(address, usize::from(width))?;
-        compiler_fence(Ordering::SeqCst);
-        let value = match width {
-            1 => u64::from(self.memory.read_plain::<u8>(address)?),
-            2 => u64::from(self.memory.read_plain::<u16>(address)?),
-            4 => u64::from(self.memory.read_plain::<u32>(address)?),
-            8 => self.memory.read_plain::<u64>(address)?,
-            _ => return Err(RamError::Width),
-        };
-        compiler_fence(Ordering::SeqCst);
-        Ok(value)
-    }
-
-    /// Writes exactly the requested bytes without reading adjacent data.
-    pub fn write(&self, address: u64, width: u8, value: u64) -> Result<(), RamError> {
-        self.range(address, usize::from(width))?;
-        compiler_fence(Ordering::SeqCst);
-        match width {
-            1 => self.memory.write_plain(address, &(value as u8))?,
-            2 => self.memory.write_plain(address, &(value as u16))?,
-            4 => self.memory.write_plain(address, &(value as u32))?,
-            8 => self.memory.write_plain(address, &value)?,
-            _ => return Err(RamError::Width),
-        }
-        compiler_fence(Ordering::SeqCst);
-        Ok(())
+    /// Creates a native view without duplicating GuestMemory's backing metadata.
+    pub fn new(memory: GuestMemory) -> Self {
+        Self { memory }
     }
 
     /// Marks A and optionally D only if the PTE still equals the observation.
@@ -152,21 +57,25 @@ impl NativeRam {
         address: u64,
         observed: u64,
         dirty: bool,
-    ) -> Result<AdUpdate, RamError> {
-        let beat = self.beat(address, 8)?;
-        let Some(replacement) = shared::ad_value(observed, dirty) else {
+    ) -> Result<AdUpdate, CopyError<RamError>> {
+        let Some(replacement) = physical::ad_value(observed, dirty) else {
             return Ok(AdUpdate::NotPresent);
         };
-        match self.compare_word(beat.address(), observed, replacement)? {
-            Ok(_) => Ok(AdUpdate::Marked),
-            Err(current) => Ok(AdUpdate::Changed(current)),
+        match self.atomic(
+            address,
+            8,
+            AtomicOperation::CompareExchange {
+                expected: observed,
+                replacement,
+            },
+        )? {
+            AtomicResult::Value(value) if value == observed => Ok(AdUpdate::Marked),
+            AtomicResult::Value(value) => Ok(AdUpdate::Changed(value)),
+            AtomicResult::Flags(_) => unreachable!("compare-exchange returns an operand"),
         }
     }
 
-    /// Orders native RAM accesses for a guest barrier or serializing event.
-    ///
-    /// This does not implement instruction/TLB/code-cache invalidation or MMIO
-    /// completion. Callers must perform those distinct architectural effects.
+    /// Orders RAM, not translation invalidation or device-I/O completion.
     pub fn barrier(&self) {
         fence(Ordering::SeqCst);
     }
@@ -175,97 +84,24 @@ impl NativeRam {
 impl PhysicalRam for NativeRam {
     type Error = RamError;
 
-    fn read_word(&self, address: u64) -> Result<u64, Self::Error> {
-        self.read(address, 8)
+    fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], RamError> {
+        const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
+        let result = self.memory.read_plain::<[u8; N]>(address);
+        Ok(result?)
     }
 
-    fn read_value(&self, address: u64, size: u8) -> Result<u64, CopyError<RamError>> {
-        if matches!(size, 1 | 2 | 4 | 8) {
-            return self.read(address, size).map_err(|source| CopyError {
-                completed: 0,
-                kind: CopyErrorKind::Memory(source),
-            });
-        }
-        if size == 0 || size > 8 {
-            return Err(CopyError {
-                completed: 0,
-                kind: CopyErrorKind::InvalidAccess,
-            });
-        }
-        let mut bytes = [0; 8];
-        self.read_bytes(address, &mut bytes[..usize::from(size)])?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    fn write_word(&self, address: u64, value: u64) -> Result<(), Self::Error> {
-        self.write(address, 8, value)
-    }
-
-    fn compare_exchange_word(
-        &self,
-        address: u64,
-        expected: u64,
-        replacement: u64,
-    ) -> Result<Exchange, Self::Error> {
-        let beat = self.beat(address, 8)?;
-        match self.compare_word(beat.address(), expected, replacement)? {
-            Ok(_) => Ok(Exchange::Exchanged),
-            Err(current) => Ok(Exchange::Changed(current)),
-        }
+    fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), RamError> {
+        const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
+        let result = self.memory.write_plain(address, &value);
+        Ok(result?)
     }
 
     fn read_bytes(&self, address: u64, destination: &mut [u8]) -> Result<(), CopyError<RamError>> {
-        self.range(address, destination.len())
-            .map_err(|source| CopyError {
-                completed: 0,
-                kind: CopyErrorKind::Memory(source),
-            })?;
-        let mut completed = 0;
-        while completed < destination.len() {
-            let current = address + completed as u64;
-            let width = copy_width(current, destination.len() - completed);
-            let value = self.read(current, width).map_err(|source| CopyError {
-                completed,
-                kind: CopyErrorKind::Memory(source),
-            })?;
-            let end = completed + usize::from(width);
-            destination[completed..end].copy_from_slice(&value.to_le_bytes()[..usize::from(width)]);
-            completed = end;
-        }
-        Ok(())
+        physical::read_bytes(self, address, destination)
     }
 
     fn write_bytes(&self, address: u64, source: &[u8]) -> Result<(), CopyError<RamError>> {
-        if address.is_multiple_of(8) {
-            if let &[a, b, c, d, e, f, g, h] = source {
-                return self
-                    .write(address, 8, u64::from_le_bytes([a, b, c, d, e, f, g, h]))
-                    .map_err(|source| CopyError {
-                        completed: 0,
-                        kind: CopyErrorKind::Memory(source),
-                    });
-            }
-        }
-        self.range(address, source.len())
-            .map_err(|source| CopyError {
-                completed: 0,
-                kind: CopyErrorKind::Memory(source),
-            })?;
-        let mut completed = 0;
-        while completed < source.len() {
-            let current = address + completed as u64;
-            let width = copy_width(current, source.len() - completed);
-            let end = completed + usize::from(width);
-            let mut bytes = [0; 8];
-            bytes[..usize::from(width)].copy_from_slice(&source[completed..end]);
-            self.write(current, width, u64::from_le_bytes(bytes))
-                .map_err(|source| CopyError {
-                    completed,
-                    kind: CopyErrorKind::Memory(source),
-                })?;
-            completed = end;
-        }
-        Ok(())
+        physical::write_bytes(self, address, source)
     }
 
     fn atomic(
@@ -273,95 +109,96 @@ impl PhysicalRam for NativeRam {
         address: u64,
         width: u8,
         operation: AtomicOperation,
-    ) -> Result<u64, CopyError<RamError>> {
-        let failure = |source| CopyError {
+    ) -> Result<AtomicResult, CopyError<RamError>> {
+        let invalid = || CopyError {
             completed: 0,
-            kind: CopyErrorKind::Memory(source),
+            kind: CopyErrorKind::InvalidAccess,
         };
-        self.range(address, usize::from(width)).map_err(failure)?;
         if !matches!(width, 1 | 2 | 4 | 8) || !address.is_multiple_of(u64::from(width)) {
-            return Err(CopyError {
-                completed: 0,
-                kind: CopyErrorKind::InvalidAccess,
-            });
+            return Err(invalid());
         }
-        macro_rules! atomic {
-            ($ty:ty, $width:expr) => {{
-                let exchange = |expected: u64, replacement: u64| {
-                    compiler_fence(Ordering::SeqCst);
+        let failure = |error| CopyError {
+            completed: 0,
+            kind: CopyErrorKind::Memory(RamError::Memory(error)),
+        };
+        if let AtomicOperation::CompareExchange {
+            expected,
+            replacement,
+        } = operation
+        {
+            macro_rules! exchange {
+                ($ty:ty) => {{
                     let result =
                         self.memory
                             .compare_exchange(address, expected as $ty, replacement as $ty);
-                    compiler_fence(Ordering::SeqCst);
-                    result
-                        .map(|result| match result {
-                            Ok(_) => Ok(expected as $ty as u64),
-                            Err(current) => Err(u64::from(current)),
-                        })
-                        .map_err(RamError::from)
-                };
-                if let AtomicOperation::CompareExchange {
-                    expected,
-                    replacement,
-                } = operation
+                    result.map(|value| {
+                        AtomicResult::Value(u64::from(match value {
+                            Ok(_) => expected as $ty,
+                            Err(observed) => observed,
+                        }))
+                    })
+                }};
+            }
+            return match width {
+                1 => exchange!(u8),
+                2 => exchange!(u16),
+                4 => exchange!(u32),
+                8 => exchange!(u64),
+                _ => return Err(invalid()),
+            }
+            .map_err(failure);
+        }
+        use guestmem::AtomicOperation as Native;
+        let (operation, source, flags) = match operation {
+            AtomicOperation::Exchange { replacement } => (Native::Exchange, replacement, 0),
+            AtomicOperation::FetchAdd { source } => (Native::FetchAdd, source, 0),
+            AtomicOperation::Integer {
+                operation,
+                source,
+                flags,
+            } => {
+                if width == 1
+                    && matches!(
+                        operation,
+                        integer::Operation::BitSet
+                            | integer::Operation::BitReset
+                            | integer::Operation::BitComplement
+                    )
                 {
-                    return exchange(expected, replacement)
-                        .map(|result| result.unwrap_or_else(|observed| observed))
-                        .map_err(failure);
+                    return Err(invalid());
                 }
-                let mut observed = self.read(address, width).map_err(failure)?;
-                for _ in 0..MASKED_WRITE_ATTEMPTS {
-                    let replacement = match operation {
-                        AtomicOperation::Exchange { replacement } => replacement,
-                        AtomicOperation::Integer {
-                            operation,
-                            source,
-                            flags,
-                        } => integer::evaluate(operation, observed, source, $width, flags).value,
-                        AtomicOperation::CompareExchange { .. } => {
-                            return Err(CopyError {
-                                completed: 0,
-                                kind: CopyErrorKind::InvalidAccess,
-                            });
-                        }
-                    };
-                    match exchange(observed, replacement).map_err(failure)? {
-                        Ok(_) => return Ok(observed),
-                        Err(current) => observed = current,
-                    }
-                }
-                Err(CopyError {
-                    completed: 0,
-                    kind: CopyErrorKind::Contended,
-                })
-            }};
-        }
-        match width {
-            1 => atomic!(u8, Width::Byte),
-            2 => atomic!(u16, Width::Word),
-            4 => atomic!(u32, Width::Dword),
-            8 => atomic!(u64, Width::Qword),
-            _ => Err(CopyError {
-                completed: 0,
-                kind: CopyErrorKind::InvalidAccess,
-            }),
-        }
+                let operation = match operation {
+                    integer::Operation::Add => Native::Add,
+                    integer::Operation::Adc => Native::Adc,
+                    integer::Operation::Sub => Native::Sub,
+                    integer::Operation::Sbb => Native::Sbb,
+                    integer::Operation::And => Native::And,
+                    integer::Operation::Or => Native::Or,
+                    integer::Operation::Xor => Native::Xor,
+                    integer::Operation::Inc => Native::Inc,
+                    integer::Operation::Dec => Native::Dec,
+                    integer::Operation::Neg => Native::Neg,
+                    integer::Operation::Not => Native::Not,
+                    integer::Operation::BitSet => Native::BitSet,
+                    integer::Operation::BitReset => Native::BitReset,
+                    integer::Operation::BitComplement => Native::BitComplement,
+                    _ => return Err(invalid()),
+                };
+                (operation, source, flags)
+            }
+            AtomicOperation::CompareExchange { .. } => return Err(invalid()),
+        };
+        let result = self.memory.atomic(address, width, operation, source, flags);
+        result
+            .map(|result| match result {
+                guestmem::AtomicResult::Value(value) => AtomicResult::Value(value),
+                guestmem::AtomicResult::Flags(flags) => AtomicResult::Flags(flags),
+            })
+            .map_err(failure)
     }
 
     fn barrier(&self) {
         NativeRam::barrier(self);
-    }
-}
-
-fn copy_width(address: u64, remaining: usize) -> u8 {
-    if remaining >= 8 && address.is_multiple_of(8) {
-        8
-    } else if remaining >= 4 && address.is_multiple_of(4) {
-        4
-    } else if remaining >= 2 && address.is_multiple_of(2) {
-        2
-    } else {
-        1
     }
 }
 
@@ -371,21 +208,33 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use test_with_tracing::test;
+    use x86_system::arch::operand::Width;
 
     fn fixture() -> (GuestMemory, NativeRam) {
         let memory = GuestMemory::allocate(4096);
-        let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..4096)).unwrap();
+        let ram = NativeRam::new(memory.clone());
         (memory, ram)
     }
 
-    fn write_retry(ram: &NativeRam, address: u64, width: u8, value: u64) {
-        loop {
-            match ram.write(address, width, value) {
-                Ok(()) => return,
-                Err(RamError::Contended) => thread::yield_now(),
-                Err(error) => panic!("{error}"),
-            }
+    fn read(ram: &NativeRam, address: u64, width: u8) -> u64 {
+        match width {
+            1 => u64::from(u8::from_le_bytes(ram.read(address).unwrap())),
+            2 => u64::from(u16::from_le_bytes(ram.read(address).unwrap())),
+            4 => u64::from(u32::from_le_bytes(ram.read(address).unwrap())),
+            8 => u64::from_le_bytes(ram.read(address).unwrap()),
+            _ => panic!("invalid test width"),
         }
+    }
+
+    fn write(ram: &NativeRam, address: u64, width: u8, value: u64) {
+        match width {
+            1 => ram.write(address, (value as u8).to_le_bytes()),
+            2 => ram.write(address, (value as u16).to_le_bytes()),
+            4 => ram.write(address, (value as u32).to_le_bytes()),
+            8 => ram.write(address, value.to_le_bytes()),
+            _ => panic!("invalid test width"),
+        }
+        .unwrap();
     }
 
     #[test]
@@ -395,29 +244,22 @@ mod tests {
             for offset in 0..=8 - width {
                 let original = [0xa5; 8];
                 memory.write_at(0, &original).unwrap();
-                ram.write(offset.into(), width, 0x1122334455667788).unwrap();
+                write(&ram, offset.into(), width, 0x1122334455667788);
                 let mut expected = original;
                 expected[offset as usize..(offset + width) as usize]
                     .copy_from_slice(&0x1122334455667788u64.to_le_bytes()[..width as usize]);
                 let mut actual = [0; 8];
                 memory.read_at(0, &mut actual).unwrap();
                 assert_eq!(actual, expected);
-                let mut data = [0; 8];
-                data[..width as usize]
-                    .copy_from_slice(&expected[offset as usize..(offset + width) as usize]);
                 assert_eq!(
-                    ram.read(offset.into(), width).unwrap(),
-                    u64::from_le_bytes(data)
+                    read(&ram, offset.into(), width),
+                    0x1122334455667788 & (u64::MAX >> ((8 - width) * 8))
                 );
             }
         }
-        ram.write(7, 2, 0x1234).unwrap();
-        assert_eq!(ram.read(7, 2).unwrap(), 0x1234);
-        assert!(matches!(ram.read(0, 3), Err(RamError::Width)));
-        assert!(matches!(
-            ram.write(4096, 8, 1),
-            Err(RamError::OutsideBank { .. })
-        ));
+        ram.write(7, 0x1234u16.to_le_bytes()).unwrap();
+        assert_eq!(read(&ram, 7, 2), 0x1234);
+        assert!(matches!(ram.write(4096, [1; 8]), Err(RamError::Memory(_))));
     }
 
     #[test]
@@ -437,8 +279,7 @@ mod tests {
             ram.read_bytes(offset, &mut copied).unwrap();
             assert_eq!(copied, [0x77; 37]);
         }
-        let missing_backing = NativeRam::new(memory.clone(), MemoryRange::new(0..8192)).unwrap();
-        let error = missing_backing.write_bytes(4085, &[0x33; 19]).unwrap_err();
+        let error = ram.write_bytes(4085, &[0x33; 19]).unwrap_err();
         assert_eq!(error.completed, 11);
         assert!(matches!(
             error.kind,
@@ -447,87 +288,123 @@ mod tests {
         let mut prefix = [0; 11];
         memory.read_at(4085, &mut prefix).unwrap();
         assert_eq!(prefix, [0x33; 11]);
+        let mut destination = [0xa5; 19];
+        let error = ram.read_bytes(4085, &mut destination).unwrap_err();
+        assert_eq!(error.completed, 11);
+        assert_eq!(destination[..11], [0x33; 11]);
+        assert_eq!(destination[11..], [0xa5; 8]);
     }
 
     #[test]
     fn exact_byte_ranges_and_unaligned_values_preserve_neighbors() {
-        let memory = GuestMemory::allocate(4096);
+        let (memory, ram) = fixture();
         memory.write_at(0, &[0xa5; 16]).unwrap();
-        let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..4096)).unwrap();
         let value = 0x1122_3344_5566_7788u64;
         ram.write_bytes(3, &value.to_le_bytes()).unwrap();
-        assert_eq!(ram.read_value(3, 8).unwrap(), value);
-        assert_eq!(ram.read_value(4, 3).unwrap(), 0x556677);
+        assert_eq!(read(&ram, 3, 8), value);
         let mut bytes = [0; 5];
         ram.read_bytes(6, &mut bytes).unwrap();
         assert_eq!(bytes, value.to_le_bytes()[3..]);
-        ram.write(10, 1, 0x99).unwrap();
-        assert_eq!(ram.read(10, 1).unwrap(), 0x99);
-        ram.write(4095, 1, 0x33).unwrap();
-        assert_eq!(ram.read(4095, 1).unwrap(), 0x33);
-        assert!(ram.read(4096, 1).is_err());
-        assert!(ram.read_value(4095, 2).is_err());
+        ram.write(10, [0x99]).unwrap();
+        assert_eq!(read(&ram, 10, 1), 0x99);
+        ram.write(4095, [0x33]).unwrap();
+        assert_eq!(read(&ram, 4095, 1), 0x33);
+        assert!(ram.read::<1>(4096).is_err());
+        assert!(ram.read::<2>(4095).is_err());
         assert_eq!(memory.read_plain::<u8>(2).unwrap(), 0xa5);
         assert_eq!(memory.read_plain::<u8>(11).unwrap(), 0xa5);
     }
 
     #[test]
-    fn exact_width_atomics_return_the_linearized_operand_and_frame_neighbors() {
-        for width in [1u8, 2, 4, 8] {
-            let mask = u64::MAX >> ((8 - width) * 8);
+    fn exact_width_atomics_return_operand_or_flags_and_frame_neighbors() {
+        for (width, operand_width) in [
+            (1u8, Width::Byte),
+            (2, Width::Word),
+            (4, Width::Dword),
+            (8, Width::Qword),
+        ] {
             for address in [0, 8 - u64::from(width), 4096 - u64::from(width)] {
-                for (operation, expected) in [
-                    (
-                        AtomicOperation::CompareExchange {
-                            expected: 0x5a,
-                            replacement: 0x33,
-                        },
-                        0x33,
-                    ),
-                    (
-                        AtomicOperation::CompareExchange {
-                            expected: 0x5b,
-                            replacement: 0x33,
-                        },
-                        0x5a,
-                    ),
-                    (
-                        AtomicOperation::Exchange {
-                            replacement: u64::MAX,
-                        },
-                        mask,
-                    ),
-                    (
-                        AtomicOperation::Integer {
-                            operation: integer::Operation::Add,
-                            source: 7,
-                            flags: 0,
-                        },
-                        0x61,
-                    ),
-                    (
-                        AtomicOperation::Integer {
-                            operation: integer::Operation::Adc,
-                            source: 0,
-                            flags: 1,
-                        },
-                        0x5b,
-                    ),
-                    (
-                        AtomicOperation::Integer {
-                            operation: integer::Operation::Neg,
-                            source: 0,
-                            flags: 0,
-                        },
-                        0u64.wrapping_sub(0x5a) & mask,
-                    ),
+                let mut operations = vec![
+                    AtomicOperation::CompareExchange {
+                        expected: 0x5a,
+                        replacement: 0x33,
+                    },
+                    AtomicOperation::CompareExchange {
+                        expected: 0x5b,
+                        replacement: 0x33,
+                    },
+                    AtomicOperation::Exchange {
+                        replacement: u64::MAX,
+                    },
+                    AtomicOperation::FetchAdd { source: 7 },
+                ];
+                for operation in [
+                    integer::Operation::Add,
+                    integer::Operation::Adc,
+                    integer::Operation::Sub,
+                    integer::Operation::Sbb,
+                    integer::Operation::And,
+                    integer::Operation::Or,
+                    integer::Operation::Xor,
+                    integer::Operation::Inc,
+                    integer::Operation::Dec,
+                    integer::Operation::Neg,
+                    integer::Operation::Not,
+                    integer::Operation::BitSet,
+                    integer::Operation::BitReset,
+                    integer::Operation::BitComplement,
                 ] {
+                    if width == 1
+                        && matches!(
+                            operation,
+                            integer::Operation::BitSet
+                                | integer::Operation::BitReset
+                                | integer::Operation::BitComplement
+                        )
+                    {
+                        continue;
+                    }
+                    operations.push(AtomicOperation::Integer {
+                        operation,
+                        source: 7,
+                        flags: 0x202003,
+                    });
+                }
+                for operation in operations {
                     let (memory, ram) = fixture();
                     memory.write_at(0, &[0xa5; 4096]).unwrap();
-                    ram.write(address, width, 0x5a).unwrap();
+                    write(&ram, address, width, 0x5a);
                     let mut before = [0; 4096];
                     memory.read_at(0, &mut before).unwrap();
-                    assert_eq!(ram.atomic(address, width, operation).unwrap(), 0x5a);
+                    let (expected, result) = match operation {
+                        AtomicOperation::CompareExchange {
+                            expected,
+                            replacement,
+                        } => (
+                            if expected == 0x5a { replacement } else { 0x5a },
+                            AtomicResult::Value(0x5a),
+                        ),
+                        AtomicOperation::Exchange { replacement } => {
+                            (replacement, AtomicResult::Value(0x5a))
+                        }
+                        AtomicOperation::FetchAdd { source } => {
+                            (0x5a + source, AtomicResult::Value(0x5a))
+                        }
+                        AtomicOperation::Integer {
+                            operation,
+                            source,
+                            flags,
+                        } => {
+                            let outcome =
+                                integer::evaluate(operation, 0x5a, source, operand_width, flags);
+                            (outcome.value, AtomicResult::Flags(outcome.flags))
+                        }
+                    };
+                    assert_eq!(
+                        ram.atomic(address, width, operation).unwrap(),
+                        result,
+                        "{width}/{address}/{operation:?}"
+                    );
                     before[address as usize..address as usize + usize::from(width)]
                         .copy_from_slice(&expected.to_le_bytes()[..usize::from(width)]);
                     let mut after = [0; 4096];
@@ -536,6 +413,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn invalid_atomic_profiles_never_modify_ram() {
+        let (memory, ram) = fixture();
+        memory.write_at(0, &[0x5a; 32]).unwrap();
+        let exchange = AtomicOperation::Exchange { replacement: 0 };
+        for (address, width, operation) in [
+            (0, 0, exchange),
+            (0, 3, exchange),
+            (1, 2, exchange),
+            (2, 4, exchange),
+            (4, 8, exchange),
+            (
+                0,
+                8,
+                AtomicOperation::Integer {
+                    operation: integer::Operation::Cmp,
+                    source: 0,
+                    flags: 0,
+                },
+            ),
+            (
+                0,
+                1,
+                AtomicOperation::Integer {
+                    operation: integer::Operation::BitSet,
+                    source: 0,
+                    flags: 0,
+                },
+            ),
+        ] {
+            let error = ram.atomic(address, width, operation).unwrap_err();
+            assert_eq!(error.completed, 0);
+            assert!(matches!(error.kind, CopyErrorKind::InvalidAccess));
+        }
+        assert!(ram.atomic(4096, 8, exchange).is_err());
+        assert_eq!(memory.read_plain::<[u8; 32]>(0).unwrap(), [0x5a; 32]);
     }
 
     #[test]
@@ -553,7 +468,7 @@ mod tests {
                         if lane == 2 {
                             memory.write_plain(lane, &((value + lane) as u8)).unwrap();
                         } else {
-                            write_retry(ram, lane, 1, value + lane);
+                            ram.write(lane, [(value + lane) as u8]).unwrap();
                         }
                     }
                 });
@@ -566,7 +481,7 @@ mod tests {
     fn concurrent_native_qword_accesses_do_not_tear() {
         let (_, ram) = fixture();
         let start = Arc::new(Barrier::new(3));
-        let values = [0x5555aaaa5555aaaa, 0xaaaa5555aaaa5555];
+        let values = [0x5555aaaa5555aaaau64, 0xaaaa5555aaaa5555];
         thread::scope(|scope| {
             for value in values {
                 let start = start.clone();
@@ -574,7 +489,7 @@ mod tests {
                 scope.spawn(move || {
                     start.wait();
                     for _ in 0..50_000 {
-                        ram.write(0, 8, value).unwrap();
+                        ram.write(0, value.to_le_bytes()).unwrap();
                     }
                 });
             }
@@ -583,7 +498,7 @@ mod tests {
             scope.spawn(move || {
                 start.wait();
                 for _ in 0..50_000 {
-                    let value = ram.read(0, 8).unwrap();
+                    let value = read(ram, 0, 8);
                     assert!(value == 0 || values.contains(&value));
                 }
             });
@@ -602,7 +517,7 @@ mod tests {
                 let seen_cpu = seen.clone();
                 let changed_cpu = changed.clone();
                 scope.spawn(move || {
-                    let observed = ram.read(0, 8).unwrap();
+                    let observed = read(ram, 0, 8);
                     seen_cpu.wait();
                     changed_cpu.wait();
                     assert_eq!(
@@ -622,7 +537,7 @@ mod tests {
     #[test]
     fn ad_updates_race_with_dma_without_losing_pte_payload() {
         let (memory, ram) = fixture();
-        ram.write(0, 8, 0x2007).unwrap();
+        write(&ram, 0, 8, 0x2007);
         let start = Arc::new(Barrier::new(2));
         thread::scope(|scope| {
             let start_dma = start.clone();
@@ -637,14 +552,14 @@ mod tests {
             start.wait();
             for _ in 0..2000 {
                 loop {
-                    let observed = ram.read(0, 8).unwrap();
+                    let observed = read(ram, 0, 8);
                     if ram.try_mark_ad(0, observed, true).unwrap() == AdUpdate::Marked {
                         break;
                     }
                 }
             }
         });
-        assert_eq!(ram.read(0, 8).unwrap(), (1999u64 << 32) | 0x2067);
+        assert_eq!(read(&ram, 0, 8), (1999u64 << 32) | 0x2067);
     }
 
     #[test]
@@ -653,29 +568,15 @@ mod tests {
         thread::scope(|scope| {
             let ram = &ram;
             scope.spawn(move || {
-                ram.write(0, 8, 0xabcdef0123456789).unwrap();
-                ram.write(8, 8, 1).unwrap();
+                write(ram, 0, 8, 0xabcdef0123456789);
+                write(ram, 8, 8, 1);
             });
-            while ram.read(8, 8).unwrap() == 0 {
+            while read(ram, 8, 8) == 0 {
                 thread::yield_now();
             }
-            assert_eq!(ram.read(0, 8).unwrap(), 0xabcdef0123456789);
+            assert_eq!(read(ram, 0, 8), 0xabcdef0123456789);
             ram.barrier();
         });
-    }
-
-    #[test]
-    fn invalid_banks_are_explicit_errors() {
-        let memory = GuestMemory::allocate(4096);
-        assert!(matches!(
-            NativeRam::new(memory.clone(), MemoryRange::EMPTY),
-            Err(RamError::Region)
-        ));
-        let declared_bank = NativeRam::new(memory, MemoryRange::new(0..8192)).unwrap();
-        assert!(matches!(
-            declared_bank.read(4096, 8),
-            Err(RamError::Memory(_))
-        ));
     }
 
     #[test]
@@ -691,34 +592,34 @@ mod tests {
         )
         .unwrap();
         assert!(memory.full_mapping().is_none());
-        let first = NativeRam::new(memory.clone(), MemoryRange::new(0..4096)).unwrap();
-        let second = NativeRam::new(memory.clone(), MemoryRange::new(8192..12288)).unwrap();
+        let ram = NativeRam::new(memory.clone());
         memory.write_plain(8192, &0x1122334455667788u64).unwrap();
-        assert_eq!(second.read(8192, 8).unwrap(), 0x1122334455667788);
-        first.write(16, 8, 0xabcdef).unwrap();
+        assert_eq!(read(&ram, 8192, 8), 0x1122334455667788);
+        write(&ram, 16, 8, 0xabcdef);
         assert_eq!(memory.read_plain::<u64>(16).unwrap(), 0xabcdef);
-        assert!(matches!(
-            first.read(8192, 8),
-            Err(RamError::OutsideBank { .. })
-        ));
-        let with_hole = NativeRam::new(memory, MemoryRange::new(0..12288)).unwrap();
-        assert!(matches!(with_hole.read(4096, 8), Err(RamError::Memory(_))));
+        assert!(matches!(ram.read::<8>(4096), Err(RamError::Memory(_))));
     }
 
     #[test]
     fn neutral_core_interface_observes_direct_backing_mutations() {
         fn exercise<M: PhysicalRam<Error = RamError>>(ram: &M, memory: &GuestMemory) {
-            ram.write_word(0, 7).unwrap();
+            ram.write(0, 7u64.to_le_bytes()).unwrap();
             memory.write_plain(0, &9u64).unwrap();
-            assert_eq!(ram.read_word(0).unwrap(), 9);
-            assert_eq!(
-                ram.compare_exchange_word(0, 7, 11).unwrap(),
-                Exchange::Changed(9)
-            );
-            assert_eq!(
-                ram.compare_exchange_word(0, 9, 11).unwrap(),
-                Exchange::Exchanged
-            );
+            assert_eq!(u64::from_le_bytes(ram.read(0).unwrap()), 9);
+            for expected in [7, 9] {
+                assert_eq!(
+                    ram.atomic(
+                        0,
+                        8,
+                        AtomicOperation::CompareExchange {
+                            expected,
+                            replacement: 11,
+                        }
+                    )
+                    .unwrap(),
+                    AtomicResult::Value(9)
+                );
+            }
             ram.barrier();
             assert_eq!(memory.read_plain::<u64>(0).unwrap(), 11);
         }

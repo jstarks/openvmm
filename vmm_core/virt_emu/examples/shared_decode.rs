@@ -7,7 +7,6 @@
 #[cfg(all(guest_arch = "x86_64", target_arch = "x86_64"))]
 mod native {
     use guestmem::GuestMemory;
-    use memory_range::MemoryRange;
     use std::io;
     use std::time::Instant;
     use strudel::{Machine, RunBudget, Stop as BatchStop};
@@ -24,7 +23,7 @@ mod native {
             0x49, 0x89, 0xf7, 0x4c, 0x8d, 0x35, 0, 0, 0, 0, 0xba, 0x01, 0x01, 0, 0xc0,
         ];
         memory.write_at(CODE, &instructions.repeat(LOOPS))?;
-        let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..0x80000))?;
+        let ram = NativeRam::new(memory.clone());
         for trial in 0..3 {
             for (address, value) in [(0x1000, 0x2007u64), (0x2000, 0x3007), (0x3000, 0x4007)] {
                 memory.write_plain(address, &value)?;

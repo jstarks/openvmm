@@ -3,11 +3,10 @@
 
 use crate::native_memory::NativeRam;
 use guestmem::GuestMemory;
-use memory_range::MemoryRange;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use test_with_tracing::test;
-use x86_system::memory::physical::{Exchange, PhysicalRam};
+use x86_system::memory::physical::{self as physical, PhysicalRam};
 use x86_system::mmu::translate::{Progress, Request, RunError, Translator};
 use x86_system::mmu::{Access, Config, MmuResult, ReferenceMmu, Report};
 
@@ -39,7 +38,7 @@ pub(super) fn bytes() -> Vec<u8> {
 pub(super) fn fixture(data: &[u8]) -> (GuestMemory, NativeRam) {
     let memory = GuestMemory::allocate(data.len());
     memory.write_at(0, data).unwrap();
-    let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..SIZE as u64)).unwrap();
+    let ram = NativeRam::new(memory.clone());
     (memory, ram)
 }
 
@@ -74,7 +73,7 @@ fn compare(mut data: Vec<u8>, c: Config, va: u64, access: Access, user: bool) {
 }
 
 #[test]
-fn shared_atomic_operations_recompute_after_dma_and_linearize_through_cas() {
+fn shared_atomic_operations_observe_dma_at_the_locked_operation() {
     use x86_system::WordResult;
     use x86_system::arch::{integer::Operation, operand::Width};
     for arithmetic in [false, true] {
@@ -111,7 +110,14 @@ fn shared_atomic_operations_recompute_after_dma_and_linearize_through_cas() {
             }
         }
         assert!(raced);
-        assert_eq!(completed, Some(WordResult::Success(0xa5)));
+        assert_eq!(
+            completed,
+            Some(WordResult::Success(if arithmetic {
+                x86_system::arch::integer::evaluate(Operation::Inc, 0xa5, 0, Width::Byte, 1).flags
+            } else {
+                0xa5
+            }))
+        );
         assert_eq!(
             memory.read_plain::<u64>(0x5000).unwrap(),
             if arithmetic { 0xa6 } else { 0xa5 }
@@ -131,7 +137,7 @@ fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
     data[0x3fffff] = 0x73;
     let memory = GuestMemory::allocate(data.len());
     memory.write_at(0, &data).unwrap();
-    let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..data.len() as u64)).unwrap();
+    let ram = NativeRam::new(memory.clone());
     let mut owned = ReferenceMmu::new(config(), 77);
     let mut shared = Translator::new(config(), 77);
     for va in [0x200000, 0x20f123, 0x3fffff] {
@@ -304,26 +310,40 @@ fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
     }
     impl PhysicalRam for FailOnce {
         type Error = std::io::Error;
-        fn read_word(&self, address: u64) -> Result<u64, Self::Error> {
+        fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], Self::Error> {
             if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return Err(std::io::Error::other("scheduled backing failure"));
             }
-            self.ram.read_word(address).map_err(std::io::Error::other)
+            self.ram.read(address).map_err(std::io::Error::other)
         }
-        fn write_word(&self, address: u64, value: u64) -> Result<(), Self::Error> {
+        fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), Self::Error> {
             self.ram
-                .write_word(address, value)
+                .write(address, value)
                 .map_err(std::io::Error::other)
         }
-        fn compare_exchange_word(
+        fn read_bytes(
             &self,
             address: u64,
-            old: u64,
-            new: u64,
-        ) -> Result<Exchange, Self::Error> {
+            destination: &mut [u8],
+        ) -> Result<(), physical::CopyError<Self::Error>> {
+            physical::read_bytes(self, address, destination)
+        }
+        fn write_bytes(
+            &self,
+            address: u64,
+            source: &[u8],
+        ) -> Result<(), physical::CopyError<Self::Error>> {
+            physical::write_bytes(self, address, source)
+        }
+        fn atomic(
+            &self,
+            address: u64,
+            width: u8,
+            operation: physical::AtomicOperation,
+        ) -> Result<physical::AtomicResult, physical::CopyError<Self::Error>> {
             self.ram
-                .compare_exchange_word(address, old, new)
-                .map_err(std::io::Error::other)
+                .atomic(address, width, operation)
+                .map_err(super::test_support::map_copy_error)
         }
         fn barrier(&self) {
             self.ram.barrier();
@@ -532,24 +552,38 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
     }
     impl PhysicalRam for TailFault {
         type Error = std::io::Error;
-        fn read_word(&self, a: u64) -> Result<u64, Self::Error> {
-            self.ram.read_word(a).map_err(std::io::Error::other)
+        fn read<const N: usize>(&self, a: u64) -> Result<[u8; N], Self::Error> {
+            self.ram.read(a).map_err(std::io::Error::other)
         }
-        fn write_word(&self, a: u64, v: u64) -> Result<(), Self::Error> {
-            self.ram.write_word(a, v).map_err(std::io::Error::other)
-        }
-        fn compare_exchange_word(
-            &self,
-            a: u64,
-            old: u64,
-            new: u64,
-        ) -> Result<Exchange, Self::Error> {
+        fn write<const N: usize>(&self, a: u64, v: [u8; N]) -> Result<(), Self::Error> {
             if a == 0x5008 && self.fail.swap(false, Ordering::SeqCst) {
                 return Err(std::io::Error::other("scheduled tail failure"));
             }
+            self.ram.write(a, v).map_err(std::io::Error::other)
+        }
+        fn read_bytes(
+            &self,
+            address: u64,
+            destination: &mut [u8],
+        ) -> Result<(), physical::CopyError<Self::Error>> {
+            physical::read_bytes(self, address, destination)
+        }
+        fn write_bytes(
+            &self,
+            address: u64,
+            source: &[u8],
+        ) -> Result<(), physical::CopyError<Self::Error>> {
+            physical::write_bytes(self, address, source)
+        }
+        fn atomic(
+            &self,
+            a: u64,
+            width: u8,
+            operation: physical::AtomicOperation,
+        ) -> Result<physical::AtomicResult, physical::CopyError<Self::Error>> {
             self.ram
-                .compare_exchange_word(a, old, new)
-                .map_err(std::io::Error::other)
+                .atomic(a, width, operation)
+                .map_err(super::test_support::map_copy_error)
         }
         fn barrier(&self) {
             self.ram.barrier();

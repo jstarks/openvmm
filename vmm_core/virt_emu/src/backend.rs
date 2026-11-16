@@ -31,7 +31,6 @@ use virt::{
 use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
 use x86_system::arch::apic::registers::LocalApic;
 use x86_system::arch::system::{self, SegmentState, SystemState};
-use x86_system::memory::physical::{Exchange, PhysicalRam};
 use x86_system::mmu::translate::RunError;
 use x86_system::mmu::translate::io::IoReply;
 use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
@@ -156,56 +155,6 @@ impl Control {
     }
 }
 
-struct RamBank {
-    range: MemoryRange,
-    ram: NativeRam,
-}
-
-struct Ram {
-    banks: Vec<RamBank>,
-}
-
-impl Ram {
-    fn bank(&self, address: u64) -> Result<&NativeRam, RamError> {
-        self.banks
-            .iter()
-            .find(|bank| {
-                address >= bank.range.start()
-                    && address < bank.range.end()
-                    && bank.range.end() - address >= 8
-            })
-            .map(|bank| &bank.ram)
-            .ok_or(RamError::OutsideBank { address })
-    }
-
-    fn is_ram(&self, address: u64) -> bool {
-        self.banks
-            .iter()
-            .any(|bank| address >= bank.range.start() && address < bank.range.end())
-    }
-}
-
-impl PhysicalRam for Ram {
-    type Error = RamError;
-    fn read_word(&self, address: u64) -> Result<u64, RamError> {
-        self.bank(address)?.read_word(address)
-    }
-    fn write_word(&self, address: u64, value: u64) -> Result<(), RamError> {
-        self.bank(address)?.write_word(address, value)
-    }
-    fn compare_exchange_word(
-        &self,
-        address: u64,
-        old: u64,
-        new: u64,
-    ) -> Result<Exchange, RamError> {
-        self.bank(address)?.compare_exchange_word(address, old, new)
-    }
-    fn barrier(&self) {
-        std::sync::atomic::fence(Ordering::SeqCst);
-    }
-}
-
 /// Long-mode component backend with no native-hypervisor execution dependency.
 #[derive(Default)]
 pub struct EmuHypervisor;
@@ -251,7 +200,8 @@ struct VpState {
 /// Owns the sole CPU context across bindings.
 pub struct EmuProcessorBinder {
     state: VpState,
-    ram: Arc<Ram>,
+    ram: Arc<NativeRam>,
+    ram_ranges: Arc<[MemoryRange]>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
     clock: VmTimeAccess,
@@ -260,7 +210,8 @@ pub struct EmuProcessorBinder {
 /// Bound access to that CPU context and the real VP run loop.
 pub struct EmuProcessor<'a> {
     state: &'a mut VpState,
-    ram: Arc<Ram>,
+    ram: Arc<NativeRam>,
+    ram_ranges: Arc<[MemoryRange]>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
     clock: &'a mut VmTimeAccess,
@@ -458,17 +409,14 @@ impl ProtoPartition for EmuProtoPartition {
                 "CPUID override, alias, fault resolver or VTL2",
             ));
         }
-        let mut banks = Vec::new();
+        let mut ram_ranges = Vec::new();
         for region in config.mem_layout.ram() {
             if region.range.end() > (1u64 << 48) {
                 return Err(Error::Profile("RAM exceeds MAXPHYADDR"));
             }
-            banks.push(RamBank {
-                range: region.range,
-                ram: NativeRam::new(config.guest_memory.clone(), region.range)?,
-            });
+            ram_ranges.push(region.range);
         }
-        if banks.is_empty() {
+        if ram_ranges.is_empty() {
             return Err(Error::Profile("no RAM"));
         }
         let control = Arc::new(Control::new(self.architectural_apic));
@@ -505,7 +453,8 @@ impl ProtoPartition for EmuProtoPartition {
                 io_active: false,
                 fault: None,
             },
-            ram: Arc::new(Ram { banks }),
+            ram: Arc::new(NativeRam::new(config.guest_memory.clone())),
+            ram_ranges: ram_ranges.into(),
             caps: self.caps,
             control,
         };
@@ -595,6 +544,7 @@ impl BindProcessor for EmuProcessorBinder {
             clock: &mut self.clock,
             state: &mut self.state,
             ram: self.ram.clone(),
+            ram_ranges: self.ram_ranges.clone(),
             caps: self.caps.clone(),
             control: self.control.clone(),
         })
@@ -678,7 +628,11 @@ impl Processor for EmuProcessor<'_> {
                     steps: 64,
                 },
                 |address, width| {
-                    (0..u64::from(width)).all(|offset| !self.ram.is_ram(address + offset))
+                    (0..u64::from(width)).all(|offset| {
+                        !self.ram_ranges.iter().any(|range| {
+                            address + offset >= range.start() && address + offset < range.end()
+                        })
+                    })
                 },
                 |core| {
                     #[cfg(test)]

@@ -4,12 +4,11 @@
 use super::test_support::{RunDecoded, run_fixture};
 use crate::native_memory::NativeRam;
 use guestmem::GuestMemory;
-use memory_range::MemoryRange;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use test_with_tracing::test;
 use x86_system::execute::{Batch, BatchStop, Machine};
-use x86_system::memory::physical::{Exchange, PhysicalRam};
+use x86_system::memory::physical::{self as physical, PhysicalRam};
 use x86_system::mmu::translate::{Request, RunError};
 use x86_system::reference::{ReferenceCpu, ReferenceMachine, ReferenceMmu};
 use x86_system::{EventDiagnostic, Injection, State, Tables};
@@ -93,7 +92,7 @@ pub(super) fn fixture() -> (Vec<u8>, ReferenceMachine) {
 pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, NativeRam) {
     let memory = GuestMemory::allocate(bytes.len());
     memory.write_at(0, bytes).unwrap();
-    let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..bytes.len() as u64)).unwrap();
+    let ram = NativeRam::new(memory.clone());
     (memory, ram)
 }
 
@@ -521,21 +520,38 @@ struct FailOnce {
 
 impl PhysicalRam for FailOnce {
     type Error = io::Error;
-    fn read_word(&self, address: u64) -> io::Result<u64> {
-        self.ram.read_word(address).map_err(io::Error::other)
+    fn read<const N: usize>(&self, address: u64) -> io::Result<[u8; N]> {
+        self.ram.read(address).map_err(io::Error::other)
     }
-    fn write_word(&self, address: u64, value: u64) -> io::Result<()> {
+    fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> io::Result<()> {
         if address == self.address && self.fail.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("scheduled frame transport error"));
         }
-        self.ram
-            .write_word(address, value)
-            .map_err(io::Error::other)
+        self.ram.write(address, value).map_err(io::Error::other)
     }
-    fn compare_exchange_word(&self, address: u64, old: u64, new: u64) -> io::Result<Exchange> {
+    fn read_bytes(
+        &self,
+        address: u64,
+        destination: &mut [u8],
+    ) -> Result<(), physical::CopyError<Self::Error>> {
+        physical::read_bytes(self, address, destination)
+    }
+    fn write_bytes(
+        &self,
+        address: u64,
+        source: &[u8],
+    ) -> Result<(), physical::CopyError<Self::Error>> {
+        physical::write_bytes(self, address, source)
+    }
+    fn atomic(
+        &self,
+        address: u64,
+        width: u8,
+        operation: physical::AtomicOperation,
+    ) -> Result<physical::AtomicResult, physical::CopyError<Self::Error>> {
         self.ram
-            .compare_exchange_word(address, old, new)
-            .map_err(io::Error::other)
+            .atomic(address, width, operation)
+            .map_err(super::test_support::map_copy_error)
     }
     fn barrier(&self) {
         self.ram.barrier();

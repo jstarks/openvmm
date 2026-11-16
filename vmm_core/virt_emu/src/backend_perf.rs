@@ -6,7 +6,6 @@
 use crate::native_memory::NativeRam;
 use anyhow::{Result, bail, ensure};
 use guestmem::GuestMemory;
-use memory_range::MemoryRange;
 use std::hint::black_box;
 use std::time::Instant;
 use x86_system::WordAccess;
@@ -151,7 +150,7 @@ fn tlb<const KIND: u8>(
     ] {
         memory.write_plain(address, &value)?;
     }
-    let ram = NativeRam::new(memory.clone(), MemoryRange::new(0..0x20000))?;
+    let ram = NativeRam::new(memory.clone());
     let mut mmu = Translator::new(
         Config {
             root: 0x1000,

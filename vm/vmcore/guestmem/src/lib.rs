@@ -41,6 +41,8 @@ pub use guestmem_core::MemoryWrite;
 pub use guestmem_core::PAGE_SIZE;
 pub use guestmem_core::Page;
 pub use guestmem_core::PageFaultError;
+pub use trycopy::AtomicOperation;
+pub use trycopy::AtomicResult;
 
 use guestmem_core::gpn_to_gpa;
 
@@ -1920,6 +1922,54 @@ impl GuestMemory {
         )
     }
 
+    /// Performs one native x86 atomic operation on a naturally aligned operand.
+    ///
+    /// `width` is 1, 2, 4, or 8 bytes (bit operations require at least 2).
+    /// Exchange and fetch-add return the old value; other operations return
+    /// guest flags with the instruction's defined flags replaced. ADC/SBB take
+    /// their carry input from `flags`. Bit indices are reduced modulo the
+    /// operand's bit width.
+    ///
+    /// This requires writable directly mapped memory. Backings requesting
+    /// fallback access are unsupported; no operation is synthesized with CAS.
+    // xtask-fmt allow-target-arch cpu-intrinsic
+    #[cfg(target_arch = "x86_64")]
+    pub fn atomic(
+        &self,
+        address: u64,
+        width: u8,
+        operation: AtomicOperation,
+        source: u64,
+        flags: u64,
+    ) -> Result<AtomicResult, GuestMemoryError> {
+        self.with_op(
+            Some((address, u64::from(width))),
+            GuestMemoryOperation::Write,
+            || {
+                operation
+                    .validate(address, width)
+                    .map_err(|err| GuestMemoryBackingError::other(address, err))?;
+                self.run_on_mapping(
+                    AccessType::Write,
+                    address,
+                    usize::from(width),
+                    (),
+                    |(), dest| {
+                        // SAFETY: run_on_mapping guards a reserved operand and
+                        // write permission throughout this closure.
+                        match unsafe { trycopy::try_atomic(dest, width, operation, source, flags) }
+                        {
+                            Err(trycopy::AtomicError::Memory(err)) => Err(err),
+                            result => Ok(result),
+                        }
+                    },
+                    |()| Err(GuestMemoryBackingError::other(address, NoFallback)),
+                )?
+                .map_err(|err| GuestMemoryBackingError::other(address, err))
+            },
+        )
+    }
+
     /// Reads an object from guest memory at address `gpa`.
     ///
     /// If the object is 1, 2, 4, or 8 bytes and the address is naturally
@@ -2970,6 +3020,207 @@ mod tests {
         gm.read_plain::<u16>(PAGE_SIZE64 * 3 - 1).unwrap_err();
         gm.read_plain::<u8>(PAGE_SIZE64 * 3 - 1).unwrap();
         gm.write_plain::<u8>(PAGE_SIZE64 * 3 - 1, &0).unwrap_err();
+    }
+
+    // xtask-fmt allow-target-arch cpu-intrinsic
+    #[cfg(target_arch = "x86_64")]
+    mod native_atomic {
+        use super::*;
+        use crate::AtomicOperation;
+        use crate::AtomicOperation::*;
+        use crate::AtomicResult;
+        use test_with_tracing::test;
+
+        const OPERATIONS: [AtomicOperation; 16] = [
+            Exchange,
+            FetchAdd,
+            Add,
+            Adc,
+            Sub,
+            Sbb,
+            And,
+            Or,
+            Xor,
+            Inc,
+            Dec,
+            Neg,
+            Not,
+            BitSet,
+            BitReset,
+            BitComplement,
+        ];
+
+        #[test]
+        fn atomic_mapping_faults_and_read_only_operands() {
+            let gm = GuestMemory::new("atomic", FaultingMapping::new(PAGE_SIZE * 4));
+            for width in [1, 2, 4, 8] {
+                for operation in OPERATIONS {
+                    if width == 1 && matches!(operation, BitSet | BitReset | BitComplement) {
+                        continue;
+                    }
+                    // This page cannot be resolved.
+                    assert!(gm.atomic(0, width, operation, 1, 1).is_err());
+                    // Resolve a read-only page, then verify every RMW faults
+                    // without changing even an already-zero operand.
+                    assert_eq!(gm.read_plain::<u64>(2 * PAGE_SIZE64).unwrap(), 0);
+                    assert!(gm.atomic(2 * PAGE_SIZE64, width, operation, 1, 1).is_err());
+                    assert_eq!(gm.read_plain::<u64>(2 * PAGE_SIZE64).unwrap(), 0);
+                }
+            }
+            // A write fault can resolve and retry the single instruction.
+            assert_eq!(
+                gm.atomic(PAGE_SIZE64, 8, FetchAdd, 9, 0).unwrap(),
+                AtomicResult::Value(0)
+            );
+            assert_eq!(gm.read_plain::<u64>(PAGE_SIZE64).unwrap(), 9);
+            assert!(gm.atomic(4 * PAGE_SIZE64, 8, Add, 1, 0).is_err());
+            assert!(gm.atomic(u64::MAX - 7, 8, Add, 1, 0).is_err());
+        }
+
+        #[test]
+        fn atomic_invalid_inputs_and_fallback_are_nonmutating() {
+            struct FallbackOnly {
+                mapping: Option<SparseMapping>,
+            }
+            // SAFETY: this backing exposes no pointers, and fallback is never
+            // allowed to perform an atomic operation.
+            unsafe impl GuestMemoryAccess for FallbackOnly {
+                fn mapping(&self) -> Option<NonNull<u8>> {
+                    self.mapping
+                        .as_ref()
+                        .and_then(|mapping| NonNull::new(mapping.as_ptr().cast()))
+                }
+
+                fn max_address(&self) -> u64 {
+                    PAGE_SIZE64
+                }
+
+                fn page_fault(
+                    &self,
+                    _address: u64,
+                    _len: usize,
+                    write: bool,
+                    _bitmap_failure: bool,
+                ) -> PageFaultAction {
+                    assert!(write);
+                    PageFaultAction::Fallback
+                }
+
+                fn compare_exchange_fallback(
+                    &self,
+                    _address: u64,
+                    _current: &mut [u8],
+                    _new: &[u8],
+                ) -> Result<bool, GuestMemoryBackingError> {
+                    panic!("native atomic must not fall back to compare-exchange");
+                }
+            }
+
+            for mapping in [None, Some(SparseMapping::new(PAGE_SIZE).unwrap())] {
+                let fallback = GuestMemory::new("fallback", FallbackOnly { mapping });
+                for operation in OPERATIONS {
+                    let error = fallback.atomic(0, 8, operation, 1, 0).unwrap_err();
+                    assert!(
+                        std::error::Error::source(&error)
+                            .unwrap()
+                            .to_string()
+                            .contains("no fallback")
+                    );
+                }
+            }
+
+            let gm = GuestMemory::allocate(PAGE_SIZE);
+            gm.write_plain(0, &0x1234_5678_9abc_def0u64).unwrap();
+            for width in [0, 3, 5, 16, 255] {
+                assert!(gm.atomic(0, width, Add, 1, 0).is_err());
+            }
+            for width in [2, 4, 8] {
+                assert!(gm.atomic(1, width, Exchange, 0, 0).is_err());
+            }
+            for operation in [BitSet, BitReset, BitComplement] {
+                assert!(gm.atomic(0, 1, operation, 0, 0).is_err());
+            }
+            assert_eq!(gm.read_plain::<u64>(0).unwrap(), 0x1234_5678_9abc_def0);
+        }
+
+        #[test]
+        fn atomic_concurrent_add_and_fetch_add() {
+            let gm = GuestMemory::allocate(PAGE_SIZE);
+            let tickets = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..4)
+                    .map(|_| {
+                        let gm = &gm;
+                        scope.spawn(move || {
+                            let mut tickets = Vec::new();
+                            for _ in 0..1000 {
+                                assert!(matches!(
+                                    gm.atomic(0, 8, Add, 1, 0).unwrap(),
+                                    AtomicResult::Flags(_)
+                                ));
+                                let AtomicResult::Value(old) =
+                                    gm.atomic(0, 8, FetchAdd, 1, 0).unwrap()
+                                else {
+                                    panic!("fetch-add must return the old value");
+                                };
+                                tickets.push(old);
+                            }
+                            tickets
+                        })
+                    })
+                    .collect();
+                threads
+                    .into_iter()
+                    .flat_map(|thread| thread.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let mut sorted = tickets;
+            sorted.sort_unstable();
+            assert!(sorted.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(sorted.iter().all(|&ticket| ticket < 8000));
+            assert_eq!(gm.read_plain::<u64>(0).unwrap(), 8000);
+        }
+
+        #[cfg(feature = "bitmap")]
+        #[test]
+        fn atomic_checks_write_bitmap() {
+            struct WriteDeniedMapping {
+                mapping: SparseMapping,
+                bitmap: Box<[u8; 2]>,
+            }
+
+            // SAFETY: the mapping and both permission bytes live for the
+            // backing's lifetime.
+            unsafe impl GuestMemoryAccess for WriteDeniedMapping {
+                fn mapping(&self) -> Option<NonNull<u8>> {
+                    NonNull::new(self.mapping.as_ptr().cast())
+                }
+
+                fn max_address(&self) -> u64 {
+                    PAGE_SIZE64
+                }
+
+                fn access_bitmap(&self) -> Option<crate::BitmapInfo> {
+                    Some(crate::BitmapInfo {
+                        read_bitmap: NonNull::from(&self.bitmap[0]),
+                        write_bitmap: NonNull::from(&self.bitmap[1]),
+                        bit_offset: 0,
+                    })
+                }
+            }
+
+            let mapping = SparseMapping::new(PAGE_SIZE).unwrap();
+            mapping.alloc(0, PAGE_SIZE).unwrap();
+            let gm = GuestMemory::new(
+                "bitmap",
+                WriteDeniedMapping {
+                    mapping,
+                    bitmap: Box::new([1, 0]),
+                },
+            );
+            assert_eq!(gm.read_plain::<u64>(0).unwrap(), 0);
+            assert!(gm.atomic(0, 8, Exchange, 1, 0).is_err());
+            assert_eq!(gm.read_plain::<u64>(0).unwrap(), 0);
+        }
     }
 
     #[cfg(feature = "bitmap")]

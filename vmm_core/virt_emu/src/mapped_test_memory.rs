@@ -116,6 +116,14 @@ impl TestRam {
 impl PhysicalRam for TestRam {
     type Error = RamError;
 
+    fn code_token(
+        &self,
+        _address: u64,
+        _length: u8,
+    ) -> Option<&x86_system::memory::physical::CodeToken> {
+        None
+    }
+
     fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], Self::Error> {
         self.0.map.access().ram().read(address)
     }

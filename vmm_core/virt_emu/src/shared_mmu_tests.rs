@@ -307,6 +307,9 @@ fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
     }
     impl PhysicalRam for FailOnce {
         type Error = std::io::Error;
+        fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
+            None
+        }
         fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], Self::Error> {
             if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return Err(std::io::Error::other("scheduled backing failure"));
@@ -549,6 +552,9 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
     }
     impl PhysicalRam for TailFault {
         type Error = std::io::Error;
+        fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
+            None
+        }
         fn read<const N: usize>(&self, a: u64) -> Result<[u8; N], Self::Error> {
             self.ram.read(a).map_err(std::io::Error::other)
         }

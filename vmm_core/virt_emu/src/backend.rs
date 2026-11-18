@@ -200,6 +200,7 @@ struct VpState {
     cpu: CpuLifecycle,
     started: bool,
     progress: CompletedBatchProgress,
+    code_preparation: CodePreparationDiagnostics,
     checkpoint: Option<u64>,
     io_active: bool,
     fault: Option<Error>,
@@ -211,6 +212,7 @@ struct VpState {
 pub struct EmuProcessorBinder {
     state: VpState,
     ram: Arc<PartitionMemory>,
+    writes: WriteWatch,
     ram_ranges: Arc<[MemoryRange]>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
@@ -221,6 +223,7 @@ pub struct EmuProcessorBinder {
 pub struct EmuProcessor<'a> {
     state: &'a mut VpState,
     ram: Arc<PartitionMemory>,
+    writes: WriteWatch,
     ram_ranges: Arc<[MemoryRange]>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
@@ -234,6 +237,15 @@ pub struct CompletedBatchProgress {
     pub retired: u64,
     /// Events delivered in completed batches.
     pub delivered: u64,
+}
+
+/// Cold code-page registration, never permission to bypass guest fetch checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodePreparationDiagnostics {
+    /// Cold page requests satisfied with a current watched identity.
+    pub prepared: u64,
+    /// Requests whose backing was unavailable by the preparation point.
+    pub unavailable: u64,
 }
 
 /// Read-only interrupt telemetry, not a restartable migration snapshot.
@@ -276,6 +288,11 @@ impl EmuProcessor<'_> {
             return Err(Error::Uninitialized);
         };
         Ok((core.decode_diagnostics(), self.state.first_apic_decode))
+    }
+
+    /// Reports cold registration separately from guest execution progress.
+    pub fn code_preparation_diagnostics(&self) -> CodePreparationDiagnostics {
+        self.state.code_preparation
     }
 
     #[cfg(test)]
@@ -432,7 +449,7 @@ impl ProtoPartition for EmuProtoPartition {
             caps: self.caps.clone(),
             control: control.clone(),
             ram: ram.clone(),
-            writes: self.writes,
+            writes: self.writes.clone(),
         };
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
@@ -454,6 +471,7 @@ impl ProtoPartition for EmuProtoPartition {
                 cpu: CpuLifecycle::Importing(Box::new(SystemState::empty())),
                 started: false,
                 progress: CompletedBatchProgress::default(),
+                code_preparation: CodePreparationDiagnostics::default(),
                 #[cfg(feature = "perf")]
                 profile: None,
                 checkpoint: None,
@@ -461,6 +479,7 @@ impl ProtoPartition for EmuProtoPartition {
                 fault: None,
             },
             ram,
+            writes: self.writes,
             ram_ranges: ram_ranges.into(),
             caps: self.caps,
             control,
@@ -619,6 +638,7 @@ impl BindProcessor for EmuProcessorBinder {
             clock: &mut self.clock,
             state: &mut self.state,
             ram: self.ram.clone(),
+            writes: self.writes.clone(),
             ram_ranges: self.ram_ranges.clone(),
             caps: self.caps.clone(),
             control: self.control.clone(),
@@ -768,6 +788,30 @@ impl Processor for EmuProcessor<'_> {
                 return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
             };
             self.state.progress = CompletedBatchProgress { retired, delivered };
+            let preparation = match self.ram.prepare_code_pages(&self.writes) {
+                Ok(preparation) => preparation,
+                Err(error) => return Err(dev.fatal_error(Box::new(Error::Ram(error)))),
+            };
+            let Some(prepared) = self
+                .state
+                .code_preparation
+                .prepared
+                .checked_add(preparation.prepared as u64)
+            else {
+                return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+            };
+            let Some(unavailable) = self
+                .state
+                .code_preparation
+                .unavailable
+                .checked_add(preparation.unavailable as u64)
+            else {
+                return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+            };
+            self.state.code_preparation = CodePreparationDiagnostics {
+                prepared,
+                unavailable,
+            };
             #[cfg(feature = "perf")]
             if let Some(profile) = &mut self.state.profile {
                 profile.record(retired, delivered, || core.cpu().rip);

@@ -79,6 +79,11 @@ impl WriteTracker {
         })
     }
 
+    /// Whether descriptors share their registration gate, callback and origin.
+    pub fn same_domain(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) && self.offset == other.offset
+    }
+
     /// Notifies after a mapping change, under the shared registration gate.
     ///
     /// Empty ranges do not notify. Overflow is rejected without a callback.

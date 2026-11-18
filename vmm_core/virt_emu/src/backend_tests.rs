@@ -374,12 +374,83 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         expected.rflags = (initial.rflags & !0x108d5) | 0x44;
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
         assert_eq!(vp.completed_batch_progress().retired, retired);
+        let decode = vp.decode_diagnostics().unwrap().0;
+        if bypass {
+            assert_eq!(decode.fetch_hits, 0);
+        } else {
+            assert!(decode.fetch_hits > 0);
+            assert!(vp.code_preparation_diagnostics().prepared > 0);
+        }
         println!(
             "apic={apic} decode_cache={} boundary_batch={boundaries} instructions={retired} seconds={seconds:.6} mips={:.3}",
             !bypass,
             retired as f64 / seconds / 1e6
         );
     }
+}
+
+#[async_test]
+async fn warmed_no_refetch_execution_observes_external_code_replacement(driver: DefaultDriver) {
+    let iterations = 256u32;
+    let (mut bytes, owned) = fixture();
+    let mut code = vec![0xb9];
+    code.extend_from_slice(&iterations.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x83, 0xc0, 1, 0x48, 0xff, 0xc9, 0x75, 0xf7]);
+    bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+    let end = CODE + code.len() as u64;
+    let (_, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        owned.core.mmu.cr2(),
+    );
+    initial.rax = 0;
+    let mut vp = binder.bind().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(end)).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let mut expected = initial;
+    expected.rax = u64::from(iterations);
+    expected.rcx = 0;
+    expected.rip = end;
+    expected.rflags = (initial.rflags & !0x108d5) | 0x44;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    let before = vp.decode_diagnostics().unwrap().0;
+    assert!(before.fetch_hits > 0);
+
+    let displacement = (CODE as i64 - (end + 5) as i64) as i32;
+    let mut jump = vec![0xe9];
+    jump.extend_from_slice(&displacement.to_le_bytes());
+    memory.write_at(end, &jump).unwrap();
+    vp.set_execution_checkpoint(Some(CODE)).unwrap();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap().rip, CODE);
+
+    memory.write_at(CODE + 8, &[2]).unwrap();
+    vp.set_execution_checkpoint(Some(end)).unwrap();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    expected.rax = u64::from(iterations) * 3;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(
+        vp.completed_batch_progress().retired,
+        2 * (u64::from(iterations) * 3 + 1) + 1
+    );
+    let after = vp.decode_diagnostics().unwrap().0;
+    assert!(after.fetch_hits > before.fetch_hits);
+    assert!(after.admissions > before.admissions);
+    assert_eq!(vp.code_preparation_diagnostics().unavailable, 0);
 }
 
 #[async_test]

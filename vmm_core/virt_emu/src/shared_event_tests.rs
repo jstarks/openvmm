@@ -537,6 +537,9 @@ struct FailOnce {
 
 impl PhysicalRam for FailOnce {
     type Error = io::Error;
+    fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
+        None
+    }
     fn read<const N: usize>(&self, address: u64) -> io::Result<[u8; N]> {
         self.ram.read(address).map_err(io::Error::other)
     }

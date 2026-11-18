@@ -15,13 +15,15 @@
 #![allow(unsafe_code)]
 
 use guestmem::{WriteTracker, WriteTrackerError};
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::{Ordering, fence};
 use virt::PartitionMemoryMap;
 use x86_system::arch::integer;
 use x86_system::memory::physical::{
-    self as physical, AtomicOperation, AtomicResult, CopyError, CopyErrorKind, PhysicalRam,
+    self as physical, AtomicOperation, AtomicResult, CodeToken, CopyError, CopyErrorKind,
+    PhysicalRam,
 };
 
 /// Failure of the physical RAM interface, not an architectural guest exception.
@@ -42,6 +44,9 @@ pub enum RamError {
     /// This mapping table was constructed without write observation.
     #[error("code watching requires a write tracker")]
     Untracked,
+    /// Preparation must use this table's canonical write tracker.
+    #[error("code preparation uses a different write tracker")]
+    TrackerMismatch,
     /// The observer's translated address range cannot be represented.
     #[error("notifying a physical RAM write")]
     WriteTracker(#[from] WriteTrackerError),
@@ -115,6 +120,17 @@ unsafe impl Sync for Mapping {}
 pub struct PartitionMemory {
     mappings: RwLock<Vec<Mapping>>,
     tracker: Option<WriteTracker>,
+    code_tokens: RwLock<BTreeMap<u64, CodeToken>>,
+    pending_code_pages: Mutex<BTreeSet<u64>>,
+}
+
+/// Outcome of preparing the physical code pages requested by previous batches.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CodePreparation {
+    /// Pages with a current watched identity after preparation.
+    pub(crate) prepared: usize,
+    /// Pages whose complete backing disappeared or is not representable.
+    pub(crate) unavailable: usize,
 }
 
 impl PartitionMemory {
@@ -128,7 +144,52 @@ impl PartitionMemory {
         Self {
             mappings: RwLock::new(Vec::new()),
             tracker: Some(tracker),
+            ..Self::default()
         }
+    }
+
+    /// Prepares identities between CPU batches without fetching code bytes.
+    ///
+    /// Pending requests are drained before waiting for a mapping write lease:
+    /// active batches may still enqueue requests while that lease is waiting.
+    pub(crate) fn prepare_code_pages(
+        &self,
+        watches: &crate::write_watch::WriteWatch,
+    ) -> Result<CodePreparation, RamError> {
+        let tracker = self.tracker.as_ref().ok_or(RamError::Untracked)?;
+        if !tracker.same_domain(&watches.tracker()) {
+            return Err(RamError::TrackerMismatch);
+        }
+        let pending = std::mem::take(&mut *self.pending_code_pages.lock());
+        let mut result = CodePreparation::default();
+        for page in pending {
+            let end = page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
+            let available = self.with_code_watch(page..end, |ram| {
+                match ram.pointer(page, 4096, false) {
+                    Ok(_) => {}
+                    Err(RamError::Unmapped(_) | RamError::SplitAccess(_)) => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+                if self
+                    .code_tokens
+                    .read()
+                    .get(&page)
+                    .is_some_and(CodeToken::is_valid)
+                {
+                    return Ok(true);
+                }
+                watches.capture_page(page, |token| {
+                    self.code_tokens.write().insert(page, token);
+                })?;
+                Ok(true)
+            })??;
+            if available {
+                result.prepared += 1;
+            } else {
+                result.unavailable += 1;
+            }
+        }
+        Ok(result)
     }
 
     /// Revokes old CPU batches, marks physical pages, and captures code.
@@ -194,6 +255,8 @@ impl PartitionMemory {
         Ok(f(NativeRam {
             mappings: &mappings,
             tracker: Some(tracker),
+            code_tokens: None,
+            pending_code_pages: None,
         }))
     }
 
@@ -214,9 +277,12 @@ impl PartitionMemory {
     pub fn access(&self) -> NativeAccess<'_> {
         // Default construction must initialize recovery too.
         trycopy::initialize_try_copy();
+        let mappings = self.mappings.read();
         NativeAccess {
-            mappings: self.mappings.read(),
+            mappings,
             tracker: self.tracker.as_ref(),
+            code_tokens: self.code_tokens.read(),
+            pending_code_pages: &self.pending_code_pages,
         }
     }
 
@@ -284,6 +350,9 @@ impl PartitionMemoryMap for PartitionMemory {
                 original_end: end,
             },
         );
+        self.code_tokens
+            .write()
+            .retain(|page, _| !(*page < end && addr < page.saturating_add(4096)));
         Ok(())
     }
 
@@ -301,6 +370,9 @@ impl PartitionMemoryMap for PartitionMemory {
             return Err(MapError::PartialUnmap.into());
         }
         mappings.retain(|mapping| !(addr <= mapping.start && mapping.end <= end));
+        self.code_tokens
+            .write()
+            .retain(|page, _| !(*page < end && addr < page.saturating_add(4096)));
         Ok(())
     }
 
@@ -339,6 +411,8 @@ pub enum AdUpdate {
 pub struct NativeAccess<'a> {
     mappings: RwLockReadGuard<'a, Vec<Mapping>>,
     tracker: Option<&'a WriteTracker>,
+    code_tokens: RwLockReadGuard<'a, BTreeMap<u64, CodeToken>>,
+    pending_code_pages: &'a Mutex<BTreeSet<u64>>,
 }
 
 impl NativeAccess<'_> {
@@ -347,6 +421,8 @@ impl NativeAccess<'_> {
         NativeRam {
             mappings: &self.mappings,
             tracker: self.tracker,
+            code_tokens: Some(&self.code_tokens),
+            pending_code_pages: Some(self.pending_code_pages),
         }
     }
 }
@@ -370,6 +446,8 @@ impl NativeAccess<'_> {
 pub struct NativeRam<'a> {
     mappings: &'a [Mapping],
     tracker: Option<&'a WriteTracker>,
+    code_tokens: Option<&'a BTreeMap<u64, CodeToken>>,
+    pending_code_pages: Option<&'a Mutex<BTreeSet<u64>>>,
 }
 
 impl NativeRam<'_> {
@@ -499,6 +577,28 @@ impl NativeRam<'_> {
 
 impl PhysicalRam for NativeRam<'_> {
     type Error = RamError;
+
+    fn code_token(&self, address: u64, length: u8) -> Option<&CodeToken> {
+        self.tracker?;
+        if !(1..=15).contains(&length) {
+            return None;
+        }
+        let page = address & !4095;
+        let page_end = page.checked_add(4096)?;
+        if address.checked_add(u64::from(length))? > page_end {
+            return None;
+        }
+        let tokens = self.code_tokens?;
+        // Publication qualifies the entire page; mapping changes remove its
+        // identity under the exclusive mapping lease. This lease therefore
+        // needs no second mapping lookup for a current identity.
+        if let Some(token) = tokens.get(&page).filter(|token| token.is_valid()) {
+            return Some(token);
+        }
+        self.pointer(address, usize::from(length), false).ok()?;
+        self.pending_code_pages?.lock().insert(page);
+        None
+    }
 
     fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
@@ -677,6 +777,9 @@ impl PhysicalRam for NativeRam<'_> {
 
 #[cfg(test)]
 mod watch_tests;
+
+#[cfg(test)]
+mod code_tests;
 
 #[cfg(test)]
 mod tests {

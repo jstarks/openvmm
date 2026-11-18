@@ -62,6 +62,10 @@ struct VectorRam<'a>(Mutex<&'a mut Vec<u8>>);
 impl PhysicalRam for VectorRam<'_> {
     type Error = io::Error;
 
+    fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
+        None
+    }
+
     fn read<const N: usize>(&self, address: u64) -> io::Result<[u8; N]> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
         let memory = self.0.lock();
@@ -258,7 +262,12 @@ impl RunDecoded for Machine {
             effects,
             steps,
             classify,
-            |input| Some(x86_decode::admit(input)),
+            |request| match request {
+                x86_system::execute::decode::DecodeRequest::Fetch(_) => None,
+                x86_system::execute::decode::DecodeRequest::Bytes(input) => {
+                    Some(x86_decode::admit(input))
+                }
+            },
             |_| false,
         )
     }

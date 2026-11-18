@@ -1582,8 +1582,11 @@ mod native {
                     "entries":d.entries,"bytes":d.bytes,
                     "windows":d.windows,"hits":d.hits,"empty":d.empty,"collisions":d.collisions,
                     "changed":d.changed,"admissions":d.admissions,
+                    "fetch_lookups":d.fetch_lookups,"fetch_hits":d.fetch_hits,
+                    "fetch_misses":d.fetch_misses,
                 })
             };
+            let preparation = vp.code_preparation_diagnostics();
             let apic=vp.apic_diagnostics().map(|snapshot| {
                 let apic=snapshot.registers;
                 serde_json::json!({
@@ -1595,6 +1598,8 @@ mod native {
                     "delivered":snapshot.delivered,"first_interrupt_retired":snapshot.first_interrupt_retired,
                     "first_interrupt_time_100ns":snapshot.first_interrupt_time_100ns,
                     "decode":decode_json(decode),"decode_at_first_interrupt":first_decode.map(decode_json),
+                    "code_pages_prepared":preparation.prepared,
+                    "code_pages_unavailable":preparation.unavailable,
                     "layout":{
                         "event_phase":size_of::<x86_system::execute::Phase>(),
                         "decode_decision":size_of::<x86_system::execute::decode::DecodeOutcome>(),
@@ -1798,10 +1803,19 @@ mod native {
                 })
             })
             .collect();
+        let decode = vp.decode_diagnostics()?.0;
+        ensure!(
+            decode.fetch_hits > 0,
+            "watched instruction-cache path was not exercised"
+        );
+        let preparation = vp.code_preparation_diagnostics();
         println!(
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
+                "no_refetch_hits":decode.fetch_hits,
+                "code_pages_prepared":preparation.prepared,
+                "code_pages_unavailable":preparation.unavailable,
                 "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "75065de9df5d00",
                 "stop_kind":"host_checkpoint","initial_memory_cleared":true,
                 "kernel_c_entry":true,"identity_mappings_removed":true,"zero_bytes":zero_bytes,

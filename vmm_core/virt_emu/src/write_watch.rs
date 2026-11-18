@@ -4,7 +4,8 @@
 //! CPU/external write observations, not guest fetch authorization.
 //!
 //! The partition drains CPU leases before acquiring the external capture gate.
-//! Observations do not qualify guest execution permissions or replace fetches.
+//! Observations do not qualify guest execution permissions. A qualified fetch
+//! may reuse a decoded receipt while its physical code observation is valid.
 
 use crate::native_memory::RamError;
 use guestmem::{WriteObserver, WriteTracker};
@@ -12,11 +13,17 @@ use parking_lot::Mutex;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use x86_system::memory::physical::CopyError;
+use x86_system::memory::physical::{CodeToken, CodeValidity, CopyError};
 
 struct Watch {
     range: Range<u64>,
     valid: AtomicBool,
+}
+
+impl CodeValidity for Watch {
+    fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Default)]
@@ -107,6 +114,36 @@ impl WriteWatch {
         self.tracker.clone()
     }
 
+    /// Registers a whole physical page without accessing its backing bytes.
+    ///
+    /// The caller holds the exclusive mapping lease. Publication remains under
+    /// the external write gate, after all old CPU leases have been revoked.
+    pub(crate) fn capture_page(
+        &self,
+        page: u64,
+        publish: impl FnOnce(CodeToken),
+    ) -> Result<(), RamError> {
+        if !page.is_multiple_of(4096) {
+            return Err(RamError::InvalidWatchRange);
+        }
+        let end = page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
+        self.tracker.synchronize(|| {
+            publish(CodeToken::new(self.register_watch(page..end)));
+        });
+        Ok(())
+    }
+
+    fn register_watch(&self, range: Range<u64>) -> Arc<Watch> {
+        let watch = Arc::new(Watch {
+            range,
+            valid: AtomicBool::new(true),
+        });
+        let mut watches = self.watches.0.lock();
+        watches.retain(|entry| entry.strong_count() != 0);
+        watches.push(Arc::downgrade(&watch));
+        watch
+    }
+
     /// Captures under the external gate after CPU watch qualification.
     ///
     /// `read` must only read the specified range and must not write, register
@@ -122,13 +159,7 @@ impl WriteWatch {
         }
         self.tracker.synchronize(|| {
             let value = read().map_err(CaptureError::Read)?;
-            let watch = Arc::new(Watch {
-                range,
-                valid: AtomicBool::new(true),
-            });
-            let mut watches = self.watches.0.lock();
-            watches.retain(|entry| entry.strong_count() != 0);
-            watches.push(Arc::downgrade(&watch));
+            let watch = self.register_watch(range);
             Ok(Watched { value, watch })
         })
     }
@@ -140,9 +171,58 @@ mod tests {
     use crate::mapped_test_memory::MappedTestMemory;
     use crate::native_memory::PartitionMemory;
     use test_with_tracing::test;
+    use virt::PartitionMemoryMap;
     use x86_system::WordAccess;
     use x86_system::memory::physical::PhysicalRam;
     use x86_system::mmu::translate::{Progress, Request, Translator};
+
+    #[test]
+    fn borrowed_code_hits_never_clone_the_watch_arc() {
+        let watches = WriteWatch::default();
+        let mappings = PartitionMemory::with_write_tracker(watches.tracker());
+        let backing = sparse_mmap::SparseMapping::new(4096).unwrap();
+        // SAFETY: this test unmaps before dropping the reserved backing.
+        // UNSAFETY: installs the test-owned reservation for metadata-only queries.
+        #[expect(unsafe_code)]
+        unsafe { mappings.map_range(backing.as_ptr().cast(), 4096, 0, true, true) }.unwrap();
+        {
+            let access = mappings.access();
+            assert!(access.ram().code_token(0, 1).is_none());
+        }
+        mappings.prepare_code_pages(&watches).unwrap();
+        {
+            let access = mappings.access();
+            let ram = access.ram();
+            let first = ram.code_token(0, 1).unwrap();
+            for _ in 0..64 {
+                assert!(first.same_observation(ram.code_token(64, 15).unwrap()));
+                assert_eq!(watches.watches.0.lock()[0].strong_count(), 1);
+            }
+        }
+        mappings.unmap_range(0, 4096).unwrap();
+    }
+
+    #[test]
+    fn observed_guest_memory_write_invalidates_a_native_page_identity() {
+        let watches = WriteWatch::default();
+        let mappings = Arc::new(PartitionMemory::with_write_tracker(watches.tracker()));
+        let memory = MappedTestMemory::observed(mappings.clone(), &[0; 8192], watches.tracker());
+        {
+            let access = mappings.access();
+            assert!(access.ram().code_token(0, 1).is_none());
+        }
+        mappings.prepare_code_pages(&watches).unwrap();
+        let token = {
+            let access = mappings.access();
+            access.ram().code_token(0, 1).unwrap().clone()
+        };
+        memory.write_at(4096, &[0x90]).unwrap();
+        assert!(token.is_valid());
+        memory.write_at(4095, &[0x90]).unwrap();
+        assert!(!token.is_valid());
+        let access = mappings.access();
+        assert!(access.ram().code_token(0, 1).is_none());
+    }
 
     #[test]
     fn overlapping_notifications_invalidate_without_changing_captured_values() {

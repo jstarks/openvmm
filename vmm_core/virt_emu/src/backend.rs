@@ -9,6 +9,7 @@
 //! that VP rather than reissuing a possibly side-effecting operation.
 
 use crate::native_memory::{PartitionMemory, RamError};
+use crate::write_watch::ExternalWriteWatch;
 use crate::{state_from_registers, update_registers};
 use futures::task::AtomicWaker;
 use hvdef::Vtl;
@@ -168,6 +169,7 @@ pub struct EmuProtoPartition {
     clock: VmTimeSource,
     architectural_apic: bool,
     apic_id: u32,
+    writes: ExternalWriteWatch,
 }
 
 /// Partition control and bounded external event ingress.
@@ -175,6 +177,7 @@ pub struct EmuPartition {
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
     ram: Arc<PartitionMemory>,
+    writes: ExternalWriteWatch,
 }
 
 enum CpuLifecycle {
@@ -382,6 +385,7 @@ impl EmuHypervisor {
             clock: config.vmtime.clone(),
             architectural_apic,
             apic_id,
+            writes: ExternalWriteWatch::default(),
         })
     }
 }
@@ -392,6 +396,10 @@ impl ProtoPartition for EmuProtoPartition {
     type Error = Error;
     fn max_physical_address_size(&self) -> u8 {
         48
+    }
+
+    fn memory_write_tracker(&self) -> Option<guestmem::WriteTracker> {
+        Some(self.writes.tracker())
     }
 
     fn build(
@@ -423,6 +431,7 @@ impl ProtoPartition for EmuProtoPartition {
             caps: self.caps.clone(),
             control: control.clone(),
             ram: ram.clone(),
+            writes: self.writes,
         };
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
@@ -460,6 +469,11 @@ impl ProtoPartition for EmuProtoPartition {
 }
 
 impl EmuPartition {
+    /// External-write capture/registration, not a CPU fetch-coherence guarantee.
+    pub fn external_write_watch(&self) -> &ExternalWriteWatch {
+        &self.writes
+    }
+
     /// Offers an already-selected vector, not an APIC/PIC arbitration interface.
     pub fn inject_selected(&self, vector: u8) -> Result<(), Error> {
         if self.control.has_apic {
@@ -545,11 +559,15 @@ impl PartitionMemoryMap for EmuPartition {
         exec: bool,
     ) -> anyhow::Result<()> {
         // SAFETY: the caller keeps the backing valid until unmap completes.
-        unsafe { self.ram.map_range(data, size, addr, writable, exec) }
+        unsafe { self.ram.map_range(data, size, addr, writable, exec) }?;
+        self.writes.tracker().notify_write(addr, size)?;
+        Ok(())
     }
 
     fn unmap_range(&self, addr: u64, size: u64) -> anyhow::Result<()> {
-        self.ram.unmap_range(addr, size)
+        self.ram.unmap_range(addr, size)?;
+        self.writes.tracker().notify_write(addr, size as usize)?;
+        Ok(())
     }
 
     #[cfg(windows)]

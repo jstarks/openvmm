@@ -182,6 +182,36 @@ impl chipset_resources::ioapic::IoApicRouting for TestIoApicRoutes {
 }
 
 #[async_test]
+async fn prototype_tracker_observes_device_views_and_translated_subranges(driver: DefaultDriver) {
+    let (bytes, _) = fixture();
+    let (partition, _binder, memory, _keeper) = build(&driver, &bytes).await;
+    let watches = partition.external_write_watch();
+    let first = watches
+        .capture(CODE..CODE + 8, || memory.read_plain::<u64>(CODE))
+        .unwrap();
+    let next = watches
+        .capture(CODE + 8..CODE + 16, || memory.read_plain::<u64>(CODE + 8))
+        .unwrap();
+    let original = *first.value();
+    memory.write_plain(CODE, &0x1234u64).unwrap();
+    assert!(!first.is_valid());
+    assert_eq!(*first.value(), original);
+    assert!(next.is_valid());
+    let subrange = memory.subrange(CODE, 16, false).unwrap();
+    assert!(!memory.supports_user_lock());
+    assert!(!memory.supports_kernel_lock());
+    assert!(!subrange.supports_user_lock());
+    assert!(!subrange.supports_kernel_lock());
+    subrange.write_plain(8, &0x5678u64).unwrap();
+    assert!(!next.is_valid());
+    let fresh = watches
+        .capture(CODE + 8..CODE + 16, || memory.read_plain::<u64>(CODE + 8))
+        .unwrap();
+    assert!(fresh.is_valid());
+    assert_eq!(*fresh.value(), 0x5678);
+}
+
+#[async_test]
 async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
     driver: DefaultDriver,
 ) {
@@ -626,6 +656,7 @@ async fn build_profile(
     }
     .unwrap();
     assert_eq!(proto.max_physical_address_size(), 48);
+    let tracker = proto.memory_write_tracker().unwrap();
     let (partition, mut binders) = proto
         .build(PartitionConfig {
             mem_layout: &memory_layout,
@@ -637,7 +668,7 @@ async fn build_profile(
         .unwrap();
     assert_eq!(binders.len(), 1);
     let partition = Arc::new(partition);
-    let memory = MappedTestMemory::new(partition.clone(), bytes);
+    let memory = MappedTestMemory::observed(partition.clone(), bytes, tracker);
     (partition, binders.pop().unwrap(), memory, keeper)
 }
 
@@ -2015,9 +2046,19 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
 
     memory.read_at(0, &mut bytes).unwrap();
     let old_memory = memory.guest_memory();
+    let old_observation = partition
+        .external_write_watch()
+        .capture(0x16000..0x16008, || memory.read_plain::<u64>(0x16000))
+        .unwrap();
     drop(memory);
+    assert!(!old_observation.is_valid());
+    assert_eq!(*old_observation.value(), 0x1111);
     bytes[0x16000..0x16008].copy_from_slice(&0x2222u64.to_le_bytes());
-    let replacement = MappedTestMemory::new(partition.clone(), &bytes);
+    let replacement = MappedTestMemory::observed(
+        partition.clone(),
+        &bytes,
+        partition.external_write_watch().tracker(),
+    );
     vp.set_execution_checkpoint(Some(CODE + program.len() as u64))
         .unwrap();
     devices.faults.lock().clear();

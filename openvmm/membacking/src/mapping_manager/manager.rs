@@ -11,12 +11,14 @@ use super::object_cache::ObjectId;
 use super::va_mapper::MapperRole;
 use super::va_mapper::VaMapper;
 use super::va_mapper::VaMapperError;
+use crate::MemoryObservationError;
 use crate::RemoteProcess;
 use crate::region_manager::MappingType;
 use futures::StreamExt;
 use futures::future::join_all;
 use guestmem::ProvideShareableRegions;
 use guestmem::ShareableRegion;
+use guestmem::WriteTracker;
 use inspect::Inspect;
 use inspect::InspectMut;
 use memory_range::MemoryRange;
@@ -62,7 +64,33 @@ impl MappingManager {
         minimum_va_alignment: Option<usize>,
         supports_memory_fault_resolution: bool,
     ) -> Result<(Self, Arc<VaMapper>), VaMapperError> {
-        let this = Self::new_bare(spawn, max_addr, minimum_va_alignment);
+        Self::new_with_write_tracker(
+            spawn,
+            max_addr,
+            minimum_va_alignment,
+            supports_memory_fault_resolution,
+            None,
+        )
+        .await
+    }
+
+    /// Installs observation before the primary mapper can receive mappings.
+    pub(crate) async fn new_with_write_tracker(
+        spawn: impl Spawn,
+        max_addr: u64,
+        minimum_va_alignment: Option<usize>,
+        supports_memory_fault_resolution: bool,
+        write_tracker: Option<WriteTracker>,
+    ) -> Result<(Self, Arc<VaMapper>), VaMapperError> {
+        if write_tracker.is_some() && supports_memory_fault_resolution {
+            return Err(MemoryObservationError::FaultResolution.into());
+        }
+        let this = Self::new_bare(
+            spawn,
+            max_addr,
+            minimum_va_alignment,
+            write_tracker.is_some(),
+        );
         // Create the primary mapper as part of construction. Being first, it is
         // the instance the shared cache hands to every later `new_mapper` in
         // this process.
@@ -73,6 +101,7 @@ impl MappingManager {
                 MapperRole::Primary {
                     supports_memory_fault_resolution,
                 },
+                write_tracker,
             )
             .await?;
         Ok((this, primary))
@@ -80,7 +109,12 @@ impl MappingManager {
 
     /// Spawns the manager task and builds the client, without creating a primary
     /// mapper.
-    fn new_bare(spawn: impl Spawn, max_addr: u64, minimum_va_alignment: Option<usize>) -> Self {
+    fn new_bare(
+        spawn: impl Spawn,
+        max_addr: u64,
+        minimum_va_alignment: Option<usize>,
+        observed: bool,
+    ) -> Self {
         let (req_send, mut req_recv) = mesh::mpsc_channel();
         spawn
             .spawn("mapping_manager", {
@@ -96,6 +130,7 @@ impl MappingManager {
                 req_send,
                 max_addr,
                 minimum_va_alignment,
+                observed,
             },
         }
     }
@@ -109,7 +144,7 @@ impl MappingManager {
         max_addr: u64,
         minimum_va_alignment: Option<usize>,
     ) -> Self {
-        Self::new_bare(spawn, max_addr, minimum_va_alignment)
+        Self::new_bare(spawn, max_addr, minimum_va_alignment, false)
     }
 
     /// Returns an object used to access the mapping manager, potentially from a
@@ -126,6 +161,9 @@ pub struct MappingManagerClient {
     id: ObjectId,
     max_addr: u64,
     minimum_va_alignment: Option<usize>,
+    // Serialize the restriction, never the callback. A cache miss must fail
+    // closed even after this client has crossed a mesh process boundary.
+    observed: bool,
 }
 
 static MAPPER_CACHE: ObjectCache<VaMapper> = ObjectCache::new();
@@ -162,17 +200,25 @@ impl MappingManagerClient {
     /// in other processes (device/DMA workers) this creates a fresh secondary
     /// mapper.
     pub async fn new_mapper(&self, eager: bool) -> Result<Arc<VaMapper>, VaMapperError> {
-        self.get_or_create_mapper(eager, MapperRole::Secondary)
+        self.get_or_create_mapper(eager, MapperRole::Secondary, None)
             .await
+    }
+
+    pub(crate) fn is_observed(&self) -> bool {
+        self.observed
     }
 
     async fn get_or_create_mapper(
         &self,
         eager: bool,
         role: MapperRole,
+        write_tracker: Option<WriteTracker>,
     ) -> Result<Arc<VaMapper>, VaMapperError> {
         let mapper = MAPPER_CACHE
             .get_or_insert_with(&self.id, async {
+                if self.observed && write_tracker.is_none() {
+                    return Err(MemoryObservationError::SecondaryMapper.into());
+                }
                 VaMapper::new(
                     self.req_send.clone(),
                     self.max_addr,
@@ -180,6 +226,7 @@ impl MappingManagerClient {
                     self.minimum_va_alignment,
                     eager,
                     role,
+                    write_tracker,
                 )
                 .await
             })
@@ -210,6 +257,9 @@ impl MappingManagerClient {
         &self,
         process: RemoteProcess,
     ) -> Result<Arc<VaMapper>, VaMapperError> {
+        if self.observed {
+            return Err(MemoryObservationError::SecondaryMapper.into());
+        }
         Ok(Arc::new(
             VaMapper::new(
                 self.req_send.clone(),
@@ -223,6 +273,7 @@ impl MappingManagerClient {
                 // in the owning process. This mapper shares the same section
                 // pages, so it just maps them plain read-write 4 KB.
                 MapperRole::Secondary,
+                None,
             )
             .await?,
         ))
@@ -857,6 +908,109 @@ mod tests {
     use guestmem::GuestMemoryAccess;
     use guestmem::ProvideShareableRegions;
     use memory_range::MemoryRange;
+    use test_with_tracing::test;
+
+    #[pal_async::async_test]
+    async fn test_observed_mapper_client_stays_local_after_serialization(spawn: impl Spawn) {
+        struct Observer;
+        impl guestmem::WriteObserver for Observer {
+            fn notify_write(&self, _: std::ops::Range<u64>) {}
+        }
+
+        let (manager, primary) = MappingManager::new_with_write_tracker(
+            &spawn,
+            0x10000,
+            None,
+            false,
+            Some(WriteTracker::new(Arc::new(Observer))),
+        )
+        .await
+        .unwrap();
+        let client: MappingManagerClient =
+            mesh::payload::SerializedMessage::from_message(manager.client().clone())
+                .into_message()
+                .unwrap();
+        assert!(client.observed);
+        for eager in [false, true] {
+            let cached = client.new_mapper(eager).await.unwrap();
+            assert!(Arc::ptr_eq(&cached, &primary));
+            assert!(cached.is_eager());
+            assert!(cached.write_tracker().is_some());
+            assert!(cached.sharing().is_none());
+        }
+
+        // A remote process has no entry in this process-local cache. Give the
+        // deserialized client a fresh ID to exercise that exact miss path.
+        let mut uncached = client.clone();
+        uncached.id = ObjectId::new();
+        for eager in [false, true] {
+            assert!(matches!(
+                uncached.new_mapper(eager).await,
+                Err(VaMapperError::WriteObservation(
+                    MemoryObservationError::SecondaryMapper
+                ))
+            ));
+        }
+        drop(primary);
+        assert!(matches!(
+            client.new_mapper(false).await,
+            Err(VaMapperError::WriteObservation(
+                MemoryObservationError::SecondaryMapper
+            ))
+        ));
+    }
+
+    #[pal_async::async_test]
+    async fn test_observed_backing_replacement_invalidates_before_ack(spawn: impl Spawn) {
+        #[derive(Default)]
+        struct Observer(parking_lot::Mutex<Vec<std::ops::Range<u64>>>);
+        impl guestmem::WriteObserver for Observer {
+            fn notify_write(&self, range: std::ops::Range<u64>) {
+                self.0.lock().push(range);
+            }
+        }
+        let page = sparse_mmap::SparseMapping::page_size() as u64;
+        let range = MemoryRange::new(page..2 * page);
+        let observer = Arc::new(Observer::default());
+        let (manager, primary) = MappingManager::new_with_write_tracker(
+            &spawn,
+            range.end(),
+            None,
+            false,
+            Some(WriteTracker::new(observer.clone())),
+        )
+        .await
+        .unwrap();
+        let memory = guestmem::GuestMemory::new("observed-test", primary);
+        for value in [11, 22] {
+            let mappable =
+                sparse_mmap::alloc_shared_memory(page as usize, "observed-test").unwrap();
+            manager
+                .client()
+                .add_mapping(MappingParams {
+                    range,
+                    backing: MappingBacking::File {
+                        mappable: mappable.into(),
+                        file_offset: 0,
+                    },
+                    writable: true,
+                    mapping_type: MappingType::Ram,
+                    policy: MemoryPolicy::none(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(*observer.0.lock(), [std::ops::Range::from(range)]);
+            observer.0.lock().clear();
+            let mut initial = [255];
+            memory.read_at(page, &mut initial).unwrap();
+            assert_eq!(initial, [0], "replacement backing must not reuse old bytes");
+            memory.write_at(page, &[value]).unwrap();
+            observer.0.lock().clear();
+            manager.client().remove_mappings(range).await;
+            assert_eq!(*observer.0.lock(), [std::ops::Range::from(range)]);
+            observer.0.lock().clear();
+        }
+    }
 
     #[pal_async::async_test]
     async fn test_dma_target_regions_returned(spawn: impl Spawn) {
@@ -1491,6 +1645,7 @@ mod tests {
             MapperRole::Primary {
                 supports_memory_fault_resolution: false,
             },
+            None,
         );
         let (mapper, _) = futures::join!(mapper_future, async {
             let msg = req_recv.recv().await.unwrap();
@@ -1531,6 +1686,7 @@ mod tests {
             MapperRole::Primary {
                 supports_memory_fault_resolution: false,
             },
+            None,
         );
         let (mapper, mapper_req_send) = futures::join!(mapper_future, async {
             let msg = req_recv.recv().await.unwrap();

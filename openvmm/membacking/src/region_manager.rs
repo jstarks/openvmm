@@ -410,6 +410,9 @@ impl RegionManagerTask {
         target: Arc<dyn DmaTarget>,
         needs_fd: bool,
     ) -> anyhow::Result<DmaMapperId> {
+        if self.inner.mapping_manager.is_observed() {
+            return Err(crate::MemoryObservationError::Dma.into());
+        }
         // A host VA is always available and free to hand out, so always
         // maintain an eager VaMapper for this target.
         let va_mapper = self.inner.mapping_manager.new_mapper(true).await?;
@@ -1152,6 +1155,35 @@ mod tests {
     use parking_lot::Mutex;
     use std::ops::Range;
     use std::sync::Arc;
+    use test_with_tracing::test;
+
+    #[async_test]
+    async fn test_observed_memory_rejects_dma_targets(spawn: impl Spawn) {
+        struct Observer;
+        impl guestmem::WriteObserver for Observer {
+            fn notify_write(&self, _: Range<u64>) {}
+        }
+        let (mapping_manager, _primary) = MappingManager::new_with_write_tracker(
+            &spawn,
+            0x10000,
+            None,
+            false,
+            Some(guestmem::WriteTracker::new(Arc::new(Observer))),
+        )
+        .await
+        .unwrap();
+        let region_manager = super::RegionManager::new(&spawn, mapping_manager.client().clone());
+        let target = Arc::new(RecordingDmaTarget::default());
+        let result = super::DmaMapperClient::new(region_manager.client())
+            .add_dma_mapper(target.clone(), false)
+            .await;
+        let error = result.err().expect("observed backing must reject DMA");
+        assert!(matches!(
+            error.downcast_ref::<crate::MemoryObservationError>(),
+            Some(crate::MemoryObservationError::Dma)
+        ));
+        assert!(target.take_events().is_empty());
+    }
 
     /// Records map/unmap calls for test assertions.
     #[derive(Default)]

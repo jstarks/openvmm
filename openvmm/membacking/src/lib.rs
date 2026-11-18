@@ -88,6 +88,32 @@ mod sys {
 /// On Unix, this is an empty (uninhabitable) enum.
 pub type RemoteProcess = sys::RemoteProcess;
 
+/// Unsupported configurations for local, eagerly mapped write observation.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryObservationError {
+    /// Alias addresses are not translated into canonical observed addresses.
+    #[error("write observation does not support VTL0 alias mappings")]
+    AliasMap,
+    /// Fault-driven mapping work can deadlock a synchronized capture.
+    #[error("write observation does not support memory fault resolution")]
+    FaultResolution,
+    /// Existing backing may have writers outside the observer.
+    #[error("write observation does not support existing memory backing")]
+    ExistingBacking,
+    /// Device backing can be modified through the original mapping.
+    #[error("write observation does not support externally backed device memory")]
+    DeviceMemory,
+    /// DMA writers cannot notify the local observer.
+    #[error("write observation does not support DMA targets")]
+    Dma,
+    /// Fault-driven host access is not supported.
+    #[error("write observation does not support fault-driven host access")]
+    HostAccess,
+    /// The callback cannot be serialized or installed in a secondary mapper.
+    #[error("write observation requires the original cached local mapper")]
+    SecondaryMapper,
+}
+
 pub use mapping_manager::Mappable;
 pub use memory_manager::DeviceMemoryMapper;
 pub use memory_manager::GuestMemoryBuilder;

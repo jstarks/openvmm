@@ -7,6 +7,7 @@ mod device_memory;
 
 pub use device_memory::DeviceMemoryMapper;
 
+use crate::MemoryObservationError;
 use crate::RemoteProcess;
 use crate::mapping_manager::Mappable;
 use crate::mapping_manager::MappingBacking;
@@ -86,6 +87,9 @@ struct RamRegion {
 /// Errors when attaching a partition to a [`GuestMemoryManager`].
 #[derive(Error, Debug)]
 pub enum PartitionAttachError {
+    /// The attachment would permit writes outside the observer.
+    #[error(transparent)]
+    WriteObservation(#[from] MemoryObservationError),
     /// Failure to allocate a VA mapper.
     #[error("failed to reserve VA range for partition mapping")]
     VaMapper(#[source] VaMapperError),
@@ -97,6 +101,9 @@ pub enum PartitionAttachError {
 /// Errors creating a [`GuestMemoryManager`].
 #[derive(Error, Debug)]
 pub enum MemoryBuildError {
+    /// The configuration cannot provide complete local write observation.
+    #[error(transparent)]
+    WriteObservation(#[from] MemoryObservationError),
     /// RAM too large.
     #[error("ram size {0} is too large")]
     RamTooLarge(MemorySize),
@@ -349,6 +356,7 @@ pub struct GuestMemoryBuilder {
     x86_legacy_support: bool,
     supports_memory_fault_resolution: bool,
     backing_requests: Vec<RamBackingRequest>,
+    write_tracker: Option<guestmem::WriteTracker>,
 }
 
 impl GuestMemoryBuilder {
@@ -360,6 +368,7 @@ impl GuestMemoryBuilder {
             x86_legacy_support: false,
             supports_memory_fault_resolution: false,
             backing_requests: Vec::new(),
+            write_tracker: None,
         }
     }
 
@@ -404,6 +413,20 @@ impl GuestMemoryBuilder {
         self
     }
 
+    /// Observes writes through every guest-memory view of this backing.
+    ///
+    /// Observation is local-only and eager: the original cached mapper must
+    /// remain alive. Clones and subranges preserve canonical GPA observation;
+    /// alternate backing aliases, VTL0 aliases, existing backing, device-memory
+    /// mappings, DMA targets and fault-driven access are unsupported. Shared
+    /// backing export, raw guest-memory access and page locking are disabled.
+    /// Mesh clients retain this restriction, not the callback: a client in
+    /// another process fails instead of creating an unobserved mapper.
+    pub fn write_tracker(mut self, tracker: Option<guestmem::WriteTracker>) -> Self {
+        self.write_tracker = tracker;
+        self
+    }
+
     /// Adds a RAM backing request. Call once per backing (one per NUMA node,
     /// or once for a non-NUMA VM).
     pub fn add_backing(mut self, request: RamBackingRequest) -> Self {
@@ -419,6 +442,21 @@ impl GuestMemoryBuilder {
     /// private requests use anonymous pages.
     pub async fn build(self, max_addr: u64) -> Result<GuestMemoryManager, MemoryBuildError> {
         let backing_requests = self.backing_requests;
+
+        if self.write_tracker.is_some() {
+            if self.vtl0_alias_map.is_some() {
+                return Err(MemoryObservationError::AliasMap.into());
+            }
+            if self.supports_memory_fault_resolution {
+                return Err(MemoryObservationError::FaultResolution.into());
+            }
+            if backing_requests
+                .iter()
+                .any(|req| req.existing_mappable.is_some())
+            {
+                return Err(MemoryObservationError::ExistingBacking.into());
+            }
+        }
 
         // Validate per-request constraints.
         for req in &backing_requests {
@@ -570,13 +608,27 @@ impl GuestMemoryBuilder {
 
         // The primary mapper is created as part of `MappingManager::new`: it is
         // the loader's target and the partition's fault resolver.
-        let (mapping_manager, va_mapper) = MappingManager::new(
-            &spawner,
-            max_addr,
-            max_hugepage_size,
-            self.supports_memory_fault_resolution,
-        )
-        .await
+        let (mapping_manager, va_mapper) = match self.write_tracker {
+            Some(tracker) => {
+                MappingManager::new_with_write_tracker(
+                    &spawner,
+                    max_addr,
+                    max_hugepage_size,
+                    self.supports_memory_fault_resolution,
+                    Some(tracker),
+                )
+                .await
+            }
+            None => {
+                MappingManager::new(
+                    &spawner,
+                    max_addr,
+                    max_hugepage_size,
+                    self.supports_memory_fault_resolution,
+                )
+                .await
+            }
+        }
         .map_err(MemoryBuildError::VaMapper)?;
 
         let region_manager = RegionManager::new(&spawner, mapping_manager.client().clone());
@@ -749,7 +801,10 @@ impl GuestMemoryManager {
 
     /// Returns an object to map device memory into the VM.
     pub fn device_memory_mapper(&self) -> DeviceMemoryMapper {
-        DeviceMemoryMapper::new(self.region_manager.client().clone())
+        DeviceMemoryMapper::new(
+            self.region_manager.client().clone(),
+            self.mapping_manager.client().is_observed(),
+        )
     }
 
     /// Returns a client for registering DMA mappers (VFIO, iommufd).
@@ -776,8 +831,12 @@ impl GuestMemoryManager {
     ///
     /// Returns `None` unless there is exactly one backing and it is
     /// file-backed. This currently means multi-backing and private-memory
-    /// configurations cannot be restarted.
+    /// configurations cannot be restarted. Observed backing is never exported,
+    /// since the exported handle would allow writes outside the observer.
     pub fn shared_memory_backing(&self) -> Option<SharedMemoryBacking> {
+        if self.mapping_manager.client().is_observed() {
+            return None;
+        }
         // Require exactly one backing, and it must be file-backed.
         if self.guest_ram.len() != 1 {
             return None;
@@ -807,6 +866,9 @@ impl GuestMemoryManager {
         process: Option<RemoteProcess>,
         host_access: Option<Arc<dyn virt::PartitionHostAccess>>,
     ) -> Result<(), PartitionAttachError> {
+        if self.mapping_manager.client().is_observed() && host_access.is_some() {
+            return Err(MemoryObservationError::HostAccess.into());
+        }
         if let Some(host_access) = host_access {
             assert_eq!(
                 vtl,
@@ -924,8 +986,171 @@ impl RamVisibilityControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guestmem::AccessType;
+    use guestmem::MemoryMapper;
+    use guestmem::WriteObserver;
+    use guestmem::WriteTracker;
     use pal_async::async_test;
+    use parking_lot::Mutex;
     use std::error::Error as _;
+    use std::ops::Range;
+    use test_with_tracing::test;
+
+    #[derive(Default)]
+    struct ObservedWrites(Mutex<Vec<Range<u64>>>);
+
+    impl WriteObserver for ObservedWrites {
+        fn notify_write(&self, range: Range<u64>) {
+            self.0.lock().push(range);
+        }
+    }
+
+    #[async_test]
+    async fn test_observed_views_and_mapping_changes() {
+        let page = SparseMapping::page_size() as u64;
+        let range = MemoryRange::new(0..4 * page);
+        let observer = Arc::new(ObservedWrites::default());
+        let tracker = WriteTracker::new(observer.clone());
+        let mgr = GuestMemoryBuilder::new()
+            .write_tracker(Some(tracker))
+            .add_backing(RamBackingRequest::new(vec![range]))
+            .build(range.end())
+            .await
+            .unwrap();
+
+        // The initial mapping is observed before the first GuestMemory exists.
+        assert_eq!(*observer.0.lock(), [Range::from(range)]);
+        observer.0.lock().clear();
+        let first = mgr.client().guest_memory().await.unwrap();
+        let client: GuestMemoryClient =
+            mesh::payload::SerializedMessage::from_message(mgr.client())
+                .into_message()
+                .unwrap();
+        let second = client.guest_memory().await.unwrap();
+        let nested = second
+            .clone()
+            .subrange(page, 2 * page, true)
+            .unwrap()
+            .subrange(8, 16, true)
+            .unwrap();
+        for view in [&first, &second, &nested] {
+            assert!(!view.supports_kernel_lock());
+            assert!(!view.supports_user_lock());
+            assert!(view.lock_kernel_gpns(AccessType::Write, &[0]).is_err());
+            assert!(view.lock_user_gpns(AccessType::Write, &[0]).is_err());
+            assert!(view.full_mapping().is_none());
+            assert!(view.sharing().is_none());
+        }
+        assert!(mgr.shared_memory_backing().is_none());
+        assert!(
+            mgr.device_memory_mapper()
+                .new_region(page as usize, "test".into())
+                .is_err()
+        );
+
+        first.write_at(4, &[1, 2]).unwrap();
+        second.write_at(6, &[3]).unwrap();
+        nested.write_at(2, &[4, 5]).unwrap();
+        let mut bytes = [0; 2];
+        first.read_at(page + 10, &mut bytes).unwrap();
+        assert_eq!(bytes, [4, 5]);
+        assert_eq!(*observer.0.lock(), [4..6, 6..7, page + 10..page + 12]);
+        observer.0.lock().clear();
+
+        let control = mgr.ram_visibility_control();
+        control
+            .set_ram_visibility(range, RamVisibility::Unmapped)
+            .await
+            .unwrap();
+        assert_eq!(*observer.0.lock(), [Range::from(range)]);
+        assert!(first.read_at(4, &mut bytes).is_err());
+        observer.0.lock().clear();
+        control
+            .set_ram_visibility(range, RamVisibility::ReadWrite)
+            .await
+            .unwrap();
+        assert_eq!(*observer.0.lock(), [Range::from(range)]);
+        first.read_at(4, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2]);
+    }
+
+    #[async_test]
+    async fn test_observed_client_views_share_registration_gate() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let page = SparseMapping::page_size() as u64;
+        let observer = Arc::new(ObservedWrites::default());
+        let tracker = WriteTracker::new(observer.clone());
+        let mgr = GuestMemoryBuilder::new()
+            .write_tracker(Some(tracker.clone()))
+            .add_backing(RamBackingRequest::new(vec![MemoryRange::new(0..page)]))
+            .build(page)
+            .await
+            .unwrap();
+        let first = mgr.client().guest_memory().await.unwrap();
+        let second = mgr.client().guest_memory().await.unwrap();
+        observer.0.lock().clear();
+        let (started_send, started_recv) = mpsc::channel();
+        let (done_send, done_recv) = mpsc::channel();
+        let writer = tracker.synchronize(|| {
+            let writer = std::thread::spawn(move || {
+                started_send.send(()).unwrap();
+                second.write_at(0, &[42]).unwrap();
+                done_send.send(()).unwrap();
+            });
+            started_recv.recv().unwrap();
+            assert!(matches!(
+                done_recv.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            first.read_at(0, &mut [0]).unwrap();
+            assert!(observer.0.lock().is_empty());
+            writer
+        });
+        done_recv.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.join().unwrap();
+        assert_eq!(*observer.0.lock(), [0..1]);
+    }
+
+    #[async_test]
+    async fn test_observed_builder_rejects_untracked_modes() {
+        let tracker = WriteTracker::new(Arc::new(ObservedWrites::default()));
+        for (alias, faults, expected) in [(true, false, "alias"), (false, true, "fault")] {
+            let error = GuestMemoryBuilder::new()
+                .write_tracker(Some(tracker.clone()))
+                .vtl0_alias_map(alias.then_some(0x10000))
+                .supports_memory_fault_resolution(faults)
+                .build(0x1000)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                (&error, expected),
+                (
+                    MemoryBuildError::WriteObservation(MemoryObservationError::AliasMap),
+                    "alias"
+                ) | (
+                    MemoryBuildError::WriteObservation(MemoryObservationError::FaultResolution),
+                    "fault"
+                )
+            ));
+        }
+        let page = SparseMapping::page_size();
+        let mappable = sparse_mmap::alloc_shared_memory(page, "observed-test").unwrap();
+        let error = GuestMemoryBuilder::new()
+            .write_tracker(Some(tracker))
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(0..page as u64)])
+                    .existing_mappable(mappable.into()),
+            )
+            .build(page as u64)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MemoryBuildError::WriteObservation(MemoryObservationError::ExistingBacking)
+        ));
+    }
 
     /// Build a GuestMemoryManager with the given backing range groups,
     /// and return a GuestMemory handle for read/write testing.
@@ -1193,9 +1418,7 @@ mod tests {
         const SIZE: u64 = 2 * 1024 * 1024;
         let (_mgr, gm) = build_thp_primary_memory(SIZE).await;
 
-        let locked = gm
-            .lock_user_gpns(guestmem::AccessType::Write, &[0])
-            .unwrap();
+        let locked = gm.lock_user_gpns(AccessType::Write, &[0]).unwrap();
         // Store directly through the locked pointer (not via `write_at`, which
         // would fault the page in on its own).
         locked.pages()[0][0].store(0xAB, Ordering::SeqCst);
@@ -1216,7 +1439,7 @@ mod tests {
         const SIZE: u64 = 2 * 1024 * 1024;
         let (_mgr, gm) = build_thp_primary_memory(SIZE).await;
 
-        let locked = gm.lock_user_gpns(guestmem::AccessType::Read, &[0]).unwrap();
+        let locked = gm.lock_user_gpns(AccessType::Read, &[0]).unwrap();
         assert_eq!(locked.pages()[0][0].load(Ordering::SeqCst), 0);
         drop(locked);
     }

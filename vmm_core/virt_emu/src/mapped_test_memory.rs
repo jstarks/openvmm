@@ -2,10 +2,33 @@
 // Licensed under the MIT License.
 
 use crate::native_memory::{PartitionMemory, RamError};
-use guestmem::{AlignedHeapMemory, GuestMemory, GuestMemoryAccess};
+use guestmem::{AlignedHeapMemory, GuestMemory, GuestMemoryAccess, WriteTracker};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use virt::PartitionMemoryMap;
 use x86_system::memory::physical::{AtomicOperation, AtomicResult, CopyError, PhysicalRam};
+
+struct ObservedAllocation {
+    allocation: Arc<AlignedHeapMemory>,
+    tracker: WriteTracker,
+}
+
+// SAFETY: the shared allocation remains stable for the backing's lifetime.
+// UNSAFETY: Exposes the fixture-owned mapping for guarded GuestMemory operations.
+#[expect(unsafe_code)]
+unsafe impl GuestMemoryAccess for ObservedAllocation {
+    fn mapping(&self) -> Option<NonNull<u8>> {
+        self.allocation.mapping()
+    }
+
+    fn max_address(&self) -> u64 {
+        self.allocation.len() as u64
+    }
+
+    fn write_tracker(&self) -> Option<WriteTracker> {
+        Some(self.tracker.clone())
+    }
+}
 
 /// Keeps direct CPU backing alive until synchronous unmap has drained its users.
 pub(crate) struct MappedTestMemory<M: PartitionMemoryMap> {
@@ -16,14 +39,32 @@ pub(crate) struct MappedTestMemory<M: PartitionMemoryMap> {
 
 impl<M: PartitionMemoryMap> MappedTestMemory<M> {
     pub fn new(map: Arc<M>, bytes: &[u8]) -> Self {
+        Self::build(map, bytes, None)
+    }
+
+    pub fn observed(map: Arc<M>, bytes: &[u8], tracker: WriteTracker) -> Self {
+        Self::build(map, bytes, Some(tracker))
+    }
+
+    fn build(map: Arc<M>, bytes: &[u8], tracker: Option<WriteTracker>) -> Self {
         let mut allocation = AlignedHeapMemory::new(bytes.len());
         allocation.as_mut_bytes()[..bytes.len()].copy_from_slice(bytes);
         let size = allocation.len();
         let allocation = Arc::new(allocation);
         let data = allocation.mapping().unwrap().as_ptr();
+        let memory = match tracker {
+            Some(tracker) => GuestMemory::new(
+                "observed-test-memory",
+                ObservedAllocation {
+                    allocation,
+                    tracker,
+                },
+            ),
+            None => GuestMemory::new("mapped-test-memory", allocation),
+        };
         let fixture = Self {
             map,
-            memory: GuestMemory::new("mapped-test-memory", allocation),
+            memory,
             size: size as u64,
         };
         // SAFETY: GuestMemory retains this stable shared allocation until after

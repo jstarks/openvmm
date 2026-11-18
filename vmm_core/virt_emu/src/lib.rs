@@ -17,6 +17,10 @@ use x86_system::State;
 #[cfg(target_arch = "x86_64")]
 pub mod native_memory;
 
+// xtask-fmt allow-target-arch cpu-intrinsic -- Native partition coherence foundation.
+#[cfg(target_arch = "x86_64")]
+pub mod write_watch;
+
 // xtask-fmt allow-target-arch cpu-intrinsic -- Uses the native x86 WB RAM transport.
 #[cfg(target_arch = "x86_64")]
 pub mod backend;

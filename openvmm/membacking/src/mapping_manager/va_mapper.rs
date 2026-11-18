@@ -56,6 +56,7 @@ use super::manager::MappingError;
 use super::manager::MappingParams;
 use super::manager::MappingRequest;
 use super::manager::MemoryPolicy;
+use crate::MemoryObservationError;
 use crate::RemoteProcess;
 use futures::executor::block_on;
 use guestmem::GuestMemoryAccess;
@@ -64,6 +65,7 @@ use guestmem::GuestMemoryErrorKind;
 use guestmem::GuestMemorySharing;
 use guestmem::PageFaultAction;
 use guestmem::PageFaultError;
+use guestmem::WriteTracker;
 use inspect::Inspect;
 use inspect_counters::SharedCounter;
 use memory_range::MemoryRange;
@@ -220,6 +222,7 @@ impl Inspect for VaMapper {
 #[derive(Debug)]
 struct MapperInner {
     mapping: SparseMapping,
+    write_tracker: Option<WriteTracker>,
     /// Waiters for lazy mapping requests. `None` after the mapper task exits.
     waiters: Mutex<Option<Vec<MapWaiter>>>,
     /// Index of active mappings recorded as they are established, keyed by GPA.
@@ -307,17 +310,18 @@ impl MapperTask {
                         .unmap(range.start() as usize, range.len() as usize)
                         .expect("invalidate request should be valid");
                     self.inner.remove_mapping(range);
+                    self.inner.notify_mapping_change(range);
                 }),
                 MapperRequest::MapEager(rpc) => {
                     rpc.handle_failable_sync(|params| {
                         tracing::debug!(range = %params.range, "eager mapping received");
-                        self.map(params)
+                        self.map_and_notify(params)
                     });
                 }
                 MapperRequest::MapLazy(params) => {
                     tracing::debug!(range = %params.range, "lazy mapping received");
                     let (range, writable) = (params.range, params.writable);
-                    match self.map(params) {
+                    match self.map_and_notify(params) {
                         Ok(()) => self.wake_waiters(range, Some(writable)),
                         Err(e) => {
                             tracing::error!(
@@ -345,6 +349,17 @@ impl MapperTask {
         *self.inner.waiters.lock() = None;
         // Invalidate everything.
         let _ = self.inner.mapping.unmap(0, self.inner.mapping.len());
+        self.inner
+            .notify_mapping_change(MemoryRange::new(0..self.inner.mapping.len() as u64));
+    }
+
+    fn map_and_notify(&self, params: MappingParams) -> Result<(), MappingError> {
+        let range = params.range;
+        let result = self.map(params);
+        // Even a failed operation may have replaced backing (for example if
+        // applying NUMA policy failed after mmap succeeded).
+        self.inner.notify_mapping_change(range);
+        result
     }
 
     /// Establishes a mapping in the VA space, dispatching on how it is backed.
@@ -601,6 +616,8 @@ impl MapperTask {
 
 #[derive(Debug, Error)]
 pub enum VaMapperError {
+    #[error(transparent)]
+    WriteObservation(#[from] MemoryObservationError),
     #[error("failed to communicate with the memory manager")]
     MemoryManagerGone(#[source] RpcError),
     #[error("failed to register mapper")]
@@ -615,6 +632,16 @@ pub enum VaMapperError {
 pub struct NoMapping(MemoryRange);
 
 impl MapperInner {
+    fn notify_mapping_change(&self, range: MemoryRange) {
+        // Never acquire the tracker gate while holding the mapping-index lock:
+        // synchronized code capture can read that index on an access fault.
+        if let Some(tracker) = &self.write_tracker {
+            tracker
+                .notify_write(range.start(), range.len() as usize)
+                .expect("mapper ranges fit in the canonical guest address space");
+        }
+    }
+
     /// Records an established mapping in the index, replacing any stale entry
     /// for the same range.
     fn record_mapping(&self, range: MemoryRange, props: MappingProps) {
@@ -728,7 +755,18 @@ impl VaMapper {
         minimum_alignment: Option<usize>,
         eager: bool,
         role: MapperRole,
+        write_tracker: Option<WriteTracker>,
     ) -> Result<Self, VaMapperError> {
+        if write_tracker.is_some()
+            && (!eager
+                || remote_process.is_some()
+                || role
+                    != (MapperRole::Primary {
+                        supports_memory_fault_resolution: false,
+                    }))
+        {
+            return Err(MemoryObservationError::SecondaryMapper.into());
+        }
         // Soft large pages apply only to the primary mapper, and only when the
         // partition resolves faults; `supports_memory_fault_resolution` rides on
         // the `Primary` variant.
@@ -764,6 +802,7 @@ impl VaMapper {
 
         let inner = Arc::new(MapperInner {
             mapping,
+            write_tracker,
             waiters: Mutex::new(Some(Vec::new())),
             mappings: RwLock::new(RangeMap::new()),
             eager: AtomicBool::new(eager),
@@ -860,6 +899,10 @@ impl VaMapper {
 /// SAFETY: the underlying VA mapping is guaranteed to be valid for the lifetime
 /// of this object.
 unsafe impl GuestMemoryAccess for VaMapper {
+    fn write_tracker(&self) -> Option<WriteTracker> {
+        self.inner.write_tracker.clone()
+    }
+
     fn mapping(&self) -> Option<NonNull<u8>> {
         // No one should be using this as a GuestMemoryAccess for remote
         // mappings, but it's convenient to have the same type for both local
@@ -959,6 +1002,9 @@ unsafe impl GuestMemoryAccess for VaMapper {
     }
 
     fn sharing(&self) -> Option<GuestMemorySharing> {
+        if self.inner.write_tracker.is_some() {
+            return None;
+        }
         // Private anonymous memory is committed on fault in the local process
         // and cannot be shared to a remote DMA process, so disable DMA sharing
         // whenever any recorded mapping is private. Derived from the mapping

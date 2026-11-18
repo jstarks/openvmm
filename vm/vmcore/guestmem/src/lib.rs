@@ -8,6 +8,11 @@
 #![expect(missing_docs)]
 
 pub mod ranges;
+mod write_tracker;
+
+pub use write_tracker::WriteObserver;
+pub use write_tracker::WriteTracker;
+pub use write_tracker::WriteTrackerError;
 
 use guestmem_core::ranges::PagedRange;
 use inspect::Inspect;
@@ -310,6 +315,16 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
     /// The maximum address that can be passed to the `*_fallback` methods, as
     /// well as the maximum offset into the VA range described by `mapping`.
     fn max_address(&self) -> u64;
+
+    /// Returns the external-write tracker, captured when a GuestMemory is built.
+    ///
+    /// Attach observation before exposing any writable pointers or sharing
+    /// handles. This descriptor must remain stable; it cannot enable tracking
+    /// retroactively for pointers already exposed by an unobserved view.
+    /// Addresses are relative to this backing, with translation in the tracker.
+    fn write_tracker(&self) -> Option<WriteTracker> {
+        None
+    }
 
     /// The bitmaps to check for validity, one bit per page. If a bit is set,
     /// then the page is valid to access via the mapping; if it is clear, then
@@ -665,6 +680,10 @@ pub struct BitmapInfo {
 
 // SAFETY: passing through guarantees from `T`.
 unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for Arc<T> {
+    fn write_tracker(&self) -> Option<WriteTracker> {
+        self.as_ref().write_tracker()
+    }
+
     fn mapping(&self) -> Option<NonNull<u8>> {
         self.as_ref().mapping()
     }
@@ -778,6 +797,7 @@ unsafe impl GuestMemoryAccess for sparse_mmap::SparseMapping {
 /// Default guest memory range type, enforcing access boundaries.
 struct GuestMemoryAccessRange {
     base: Arc<GuestMemoryInner>,
+    write_tracker: Option<WriteTracker>,
     offset: u64,
     len: u64,
     region: usize,
@@ -816,6 +836,10 @@ impl GuestMemoryAccessRange {
 
 // SAFETY: `mapping()` is guaranteed to be valid for the lifetime of the object.
 unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
+    fn write_tracker(&self) -> Option<WriteTracker> {
+        self.write_tracker.clone()
+    }
+
     // A mapped subrange must not regain locking denied by its parent.
     fn supports_kernel_lock(&self) -> bool {
         self.lockable && self.base.supports_kernel_lock
@@ -872,6 +896,12 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
             self.base.debug_name.clone(),
             GuestMemoryAccessRange {
                 base: self.base.clone(),
+                write_tracker: self
+                    .write_tracker
+                    .as_ref()
+                    .map(|tracker| tracker.with_offset(offset))
+                    .transpose()
+                    .map_err(|err| GuestMemoryBackingError::other(offset, err))?,
                 offset: address,
                 len,
                 region: self.region,
@@ -975,11 +1005,18 @@ fn create_memory_subrange(
     len: u64,
     _allow_preemptive_locking: bool,
 ) -> Result<GuestMemory, GuestMemoryBackingError> {
-    let (_, _, region) = base.region(offset, len)?;
+    let (memory_region, offset_in_region, region) = base.region(offset, len)?;
+    let write_tracker = memory_region
+        .write_tracker
+        .as_ref()
+        .map(|tracker| tracker.with_offset(offset_in_region))
+        .transpose()
+        .map_err(|err| GuestMemoryBackingError::other(offset, err))?;
     Ok(GuestMemory::new(
         base.debug_name.clone(),
         GuestMemoryAccessRange {
             base,
+            write_tracker,
             offset,
             len,
             region,
@@ -1114,6 +1151,11 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
 
 /// A wrapper around a `GuestMemoryAccess` that provides methods for safely
 /// reading and writing guest memory.
+///
+/// Backings with a [`WriteTracker`] notify after every nonempty mediated write
+/// attempt, including failures that may have modified memory. Such views and
+/// their subranges disallow page locks, sharing, and raw mapping/IOVA exposure,
+/// since stores through those interfaces would bypass observation.
 // NOTE: this type uses `inspect(skip)`, as it end up being a dependency of
 // _many_ objects, and littering the inspect graph with references to the same
 // node would be silly.
@@ -1131,6 +1173,7 @@ struct GuestMemoryInner<T: ?Sized = dyn DynGuestMemoryAccess> {
     /// Cached backing capabilities for hot zero-copy paths.
     supports_kernel_lock: bool,
     supports_user_lock: bool,
+    observed: bool,
     imp: T,
 }
 
@@ -1143,8 +1186,9 @@ impl<T: ?Sized> Debug for GuestMemoryInner<T> {
     }
 }
 
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 struct MemoryRegion {
+    write_tracker: Option<WriteTracker>,
     mapping: Option<SendPtrU8>,
     #[cfg(feature = "bitmap")]
     bitmaps: Option<[SendPtrU8; 2]>,
@@ -1197,6 +1241,7 @@ impl MemoryRegion {
             (bitmaps, bitmap_start)
         };
         Self {
+            write_tracker: imp.write_tracker(),
             mapping: imp.mapping().map(SendPtrU8),
             #[cfg(feature = "bitmap")]
             bitmaps,
@@ -1333,8 +1378,9 @@ impl GuestMemory {
 
     fn new_inner(debug_name: Arc<str>, imp: impl GuestMemoryAccess, allocated: bool) -> Self {
         let regions = vec![MemoryRegion::new(&imp)];
-        let supports_kernel_lock = imp.supports_kernel_lock();
-        let supports_user_lock = imp.supports_user_lock();
+        let observed = regions[0].write_tracker.is_some();
+        let supports_kernel_lock = !observed && imp.supports_kernel_lock();
+        let supports_user_lock = !observed && imp.supports_user_lock();
         Self {
             inner: Arc::new(GuestMemoryInner {
                 imp,
@@ -1348,6 +1394,7 @@ impl GuestMemory {
                 allocated,
                 supports_kernel_lock,
                 supports_user_lock,
+                observed,
             }),
         }
     }
@@ -1418,14 +1465,17 @@ impl GuestMemory {
         };
 
         imps.resize_with(region_count, || None);
-        let supports_kernel_lock = imps
-            .iter()
-            .flatten()
-            .all(GuestMemoryAccess::supports_kernel_lock);
-        let supports_user_lock = imps
-            .iter()
-            .flatten()
-            .all(GuestMemoryAccess::supports_user_lock);
+        let observed = regions.iter().any(|region| region.write_tracker.is_some());
+        let supports_kernel_lock = !observed
+            && imps
+                .iter()
+                .flatten()
+                .all(GuestMemoryAccess::supports_kernel_lock);
+        let supports_user_lock = !observed
+            && imps
+                .iter()
+                .flatten()
+                .all(GuestMemoryAccess::supports_user_lock);
         let imp = MultiRegionGuestMemoryAccess { imps, region_def };
 
         let inner = GuestMemoryInner {
@@ -1436,6 +1486,7 @@ impl GuestMemory {
             allocated: false,
             supports_kernel_lock,
             supports_user_lock,
+            observed,
         };
 
         Ok(Self {
@@ -1462,7 +1513,7 @@ impl GuestMemory {
     /// Returns `Err(self)` if there are other references to this memory (via
     /// `clone()`).
     pub fn into_inner_buf(self) -> Result<AlignedHeapMemory, Self> {
-        if !self.inner.allocated {
+        if !self.inner.allocated || self.inner.observed {
             return Err(self);
         }
         // FUTURE: consider using `Any` and `Arc::downcast` once trait upcasting is stable.
@@ -1477,7 +1528,7 @@ impl GuestMemory {
     /// If this memory was created via [`GuestMemory::allocate`], returns a slice to
     /// the allocated buffer.
     pub fn inner_buf(&self) -> Option<&[AtomicU8]> {
-        if !self.inner.allocated {
+        if !self.inner.allocated || self.inner.observed {
             return None;
         }
         // FUTURE: consider using `<dyn Any>::downcast` once trait upcasting is stable.
@@ -1490,7 +1541,7 @@ impl GuestMemory {
     /// no other references to it, returns a mutable slice to the backing
     /// buffer.
     pub fn inner_buf_mut(&mut self) -> Option<&mut [u8]> {
-        if !self.inner.allocated {
+        if !self.inner.allocated || self.inner.observed {
             return None;
         }
         let inner = Arc::get_mut(&mut self.inner)?;
@@ -1535,6 +1586,10 @@ impl GuestMemory {
         allow_preemptive_locking: bool,
     ) -> Result<GuestMemory, GuestMemoryError> {
         self.with_op(Some((offset, len)), GuestMemoryOperation::Subrange, || {
+            // A custom view could lock or expose memory without observation.
+            if self.inner.observed {
+                return create_memory_subrange(self.inner.clone(), offset, len, false);
+            }
             if let Some(guest_memory) =
                 self.inner
                     .imp
@@ -1560,8 +1615,11 @@ impl GuestMemory {
     /// Returns the mapping for all of guest memory.
     ///
     /// Returns `None` if there is more than one region or if the memory is not
-    /// mapped.
+    /// mapped, or if external writes are observed.
     pub fn full_mapping(&self) -> Option<(*mut u8, usize)> {
+        if self.inner.observed {
+            return None;
+        }
         if let [region] = self.inner.regions.as_slice() {
             #[cfg(feature = "bitmap")]
             if region.bitmaps.is_some() {
@@ -1578,6 +1636,9 @@ impl GuestMemory {
     /// Gets the IO address for DMAing to `gpa` from a user-mode driver not
     /// going through an IOMMU.
     pub fn iova(&self, gpa: u64) -> Option<u64> {
+        if self.inner.observed {
+            return None;
+        }
         let (region, offset, _) = self.inner.region(gpa, 1).ok()?;
         Some(region.base_iova? + offset)
     }
@@ -1585,6 +1646,9 @@ impl GuestMemory {
     /// Returns a sharing object if this memory supports
     /// file-based sharing. See [`GuestMemorySharing`].
     pub fn sharing(&self) -> Option<GuestMemorySharing> {
+        if self.inner.observed {
+            return None;
+        }
         self.inner.imp.sharing()
     }
 
@@ -1596,6 +1660,7 @@ impl GuestMemory {
     /// copying path when it returns `false`. This is authoritative: when it
     /// returns `false`, [`lock_kernel_gpns`](Self::lock_kernel_gpns) and
     /// [`lock_range`](Self::lock_range) fail with a `NotLockable` error.
+    /// Observed memory also rejects locks, even if its backing supports them.
     pub fn supports_kernel_lock(&self) -> bool {
         self.inner.supports_kernel_lock
     }
@@ -1663,6 +1728,19 @@ impl GuestMemory {
         mut f: impl FnMut(&mut P, *mut u8) -> Result<T, trycopy::MemoryError>,
         fallback: impl FnOnce(&mut P) -> Result<T, GuestMemoryBackingError>,
     ) -> Result<T, GuestMemoryBackingError> {
+        let attempt = if self.inner.observed && access_type == AccessType::Write && len != 0 {
+            let (region, offset, _) = self.inner.region(gpa, len as u64)?;
+            region
+                .write_tracker
+                .as_ref()
+                .map(|tracker| tracker.begin_write(offset, len))
+                .transpose()
+                .map_err(|err| {
+                    GuestMemoryBackingError::new(GuestMemoryErrorKind::OutOfRange, gpa, err)
+                })?
+        } else {
+            None
+        };
         let op = || {
             let Some(mapping) = self.mapping_range(access_type, gpa, len)? else {
                 return fallback(&mut param);
@@ -1697,9 +1775,11 @@ impl GuestMemory {
         // critical section. This will allow callers to flush concurrent
         // accesses after bitmap updates.
         #[cfg(feature = "bitmap")]
-        return rcu().run(op);
+        let result = rcu().run(op);
         #[cfg(not(feature = "bitmap"))]
-        op()
+        let result = op();
+        drop(attempt);
+        result
     }
 
     /// # Safety

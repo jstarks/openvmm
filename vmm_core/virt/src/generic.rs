@@ -441,6 +441,14 @@ pub trait ProtoPartition {
         false
     }
 
+    /// Optional construction-time tracking for writes made through guest memory.
+    ///
+    /// The memory builder must install this before exposing device/loader views.
+    /// CPU accesses through partition mappings have their own coherence protocol.
+    fn memory_write_tracker(&self) -> Option<guestmem::WriteTracker> {
+        None
+    }
+
     /// Constructs the full partition.
     fn build(
         self,

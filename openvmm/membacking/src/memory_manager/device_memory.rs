@@ -5,6 +5,7 @@
 //! [`GuestMemoryManager`](super::GuestMemoryManager).
 
 use super::DEVICE_PRIORITY;
+use crate::MemoryObservationError;
 use crate::mapping_manager::Mappable;
 use crate::mapping_manager::MappingBacking;
 use crate::mapping_manager::MemoryPolicy;
@@ -25,11 +26,15 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct DeviceMemoryMapper {
     region_manager: RegionManagerClient,
+    observed: bool,
 }
 
 impl DeviceMemoryMapper {
-    pub(super) fn new(region_manager: RegionManagerClient) -> Self {
-        Self { region_manager }
+    pub(super) fn new(region_manager: RegionManagerClient, observed: bool) -> Self {
+        Self {
+            region_manager,
+            observed,
+        }
     }
 }
 
@@ -39,6 +44,12 @@ impl MemoryMapper for DeviceMemoryMapper {
         len: usize,
         debug_name: String,
     ) -> io::Result<(Box<dyn MappableGuestMemory>, Arc<dyn MappedMemoryRegion>)> {
+        if self.observed {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                MemoryObservationError::DeviceMemory,
+            ));
+        }
         let region = Arc::new(DeviceMemoryRegion {
             len,
             debug_name,

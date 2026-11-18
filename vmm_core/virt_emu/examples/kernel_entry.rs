@@ -9,7 +9,7 @@ mod native {
     use anyhow::{Context, bail, ensure};
     use futures::future::{Either, select};
     use futures::task::AtomicWaker;
-    use guestmem::GuestMemory;
+    use guestmem::{GuestMemory, GuestMemoryAccess, WriteTracker};
     use hvdef::Vtl;
     use loader::linux::{AcpiTables, InitrdAddressType, InitrdConfig};
 
@@ -21,6 +21,7 @@ mod native {
     use std::ffi::CString;
     use std::fs::File;
     use std::pin::Pin;
+    use std::ptr::NonNull;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context as TaskContext, Poll};
@@ -41,6 +42,29 @@ mod native {
     use vmm_core::acpi_builder::{AcpiArchConfig, AcpiTablesBuilder};
 
     const RAM: u64 = 512 * 1024 * 1024;
+
+    struct DeviceBacking {
+        mapping: Arc<sparse_mmap::SparseMapping>,
+        tracker: WriteTracker,
+    }
+
+    // SAFETY: the owned reservation remains stable throughout this view's lifetime.
+    // UNSAFETY: Provides mapped, observed loader/device access to harness RAM.
+    #[expect(unsafe_code)]
+    unsafe impl GuestMemoryAccess for DeviceBacking {
+        fn mapping(&self) -> Option<NonNull<u8>> {
+            NonNull::new(self.mapping.as_ptr().cast())
+        }
+
+        fn max_address(&self) -> u64 {
+            self.mapping.len() as u64
+        }
+
+        fn write_tracker(&self) -> Option<WriteTracker> {
+            Some(self.tracker.clone())
+        }
+    }
+
     const ENTRY: u64 = 0x2d98100;
     const CHECKPOINT: u64 = 0xffff_ffff_81ed_6589;
     const PROBE_TARGET: u64 = 0xffff_ffff_82d9_8800;
@@ -1026,7 +1050,6 @@ mod native {
         let layout = MemoryLayout::new(RAM, &[], &[], &[], None)?;
         let backing = Arc::new(sparse_mmap::SparseMapping::new(usize::try_from(RAM)?)?);
         backing.alloc(0, usize::try_from(RAM)?)?;
-        let memory = GuestMemory::new("kernel-device-view", backing.clone());
         let keeper =
             VmTimeKeeper::new_with_slowdown(&driver, VmTime::from_100ns(0), clock_slowdown);
         let time = keeper.builder().build(&driver).await?;
@@ -1043,6 +1066,15 @@ mod native {
         } else {
             hypervisor.new_legacy_fixture(config)?
         };
+        let memory = GuestMemory::new(
+            "kernel-device-view",
+            DeviceBacking {
+                mapping: backing.clone(),
+                tracker: proto
+                    .memory_write_tracker()
+                    .context("missing emulator write tracker")?,
+            },
+        );
         let (partition, mut binders) = proto.build(PartitionConfig {
             mem_layout: &layout,
             guest_memory: &memory,

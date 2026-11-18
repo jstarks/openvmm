@@ -263,10 +263,11 @@ impl RunDecoded for Machine {
             steps,
             classify,
             |request| match request {
-                x86_system::execute::decode::DecodeRequest::Fetch(_) => None,
-                x86_system::execute::decode::DecodeRequest::Bytes(input) => {
-                    Some(x86_decode::admit(input))
-                }
+                x86_system::execute::decode::DecodeRequest::Execution(_)
+                | x86_system::execute::decode::DecodeRequest::Fetch(_) => None,
+                x86_system::execute::decode::DecodeRequest::Bytes(input) => Some(
+                    x86_system::execute::decode::DecodeResponse::Decoded(x86_decode::admit(input)),
+                ),
             },
             |_| false,
         )

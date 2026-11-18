@@ -377,8 +377,9 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         let decode = vp.decode_diagnostics().unwrap().0;
         if bypass {
             assert_eq!(decode.fetch_hits, 0);
+            assert_eq!(decode.execution_hits, 0);
         } else {
-            assert!(decode.fetch_hits > 0);
+            assert!(decode.execution_hits > 0);
             assert!(vp.code_preparation_diagnostics().prepared > 0);
         }
         println!(
@@ -422,7 +423,7 @@ async fn warmed_no_refetch_execution_observes_external_code_replacement(driver: 
     expected.rflags = (initial.rflags & !0x108d5) | 0x44;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
     let before = vp.decode_diagnostics().unwrap().0;
-    assert!(before.fetch_hits > 0);
+    assert!(before.execution_hits > 0);
 
     let displacement = (CODE as i64 - (end + 5) as i64) as i32;
     let mut jump = vec![0xe9];
@@ -448,7 +449,7 @@ async fn warmed_no_refetch_execution_observes_external_code_replacement(driver: 
         2 * (u64::from(iterations) * 3 + 1) + 1
     );
     let after = vp.decode_diagnostics().unwrap().0;
-    assert!(after.fetch_hits > before.fetch_hits);
+    assert!(after.execution_hits > before.execution_hits);
     assert!(after.admissions > before.admissions);
     assert_eq!(vp.code_preparation_diagnostics().unavailable, 0);
 }

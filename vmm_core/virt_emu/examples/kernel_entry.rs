@@ -1584,6 +1584,8 @@ mod native {
                     "changed":d.changed,"admissions":d.admissions,
                     "fetch_lookups":d.fetch_lookups,"fetch_hits":d.fetch_hits,
                     "fetch_misses":d.fetch_misses,
+                    "execution_lookups":d.execution_lookups,
+                    "execution_hits":d.execution_hits,"execution_misses":d.execution_misses,
                 })
             };
             let preparation = vp.code_preparation_diagnostics();
@@ -1804,16 +1806,22 @@ mod native {
             })
             .collect();
         let decode = vp.decode_diagnostics()?.0;
+        let no_refetch_hits = decode.fetch_hits.wrapping_add(decode.execution_hits);
         ensure!(
-            decode.fetch_hits > 0,
+            no_refetch_hits > 0,
             "watched instruction-cache path was not exercised"
+        );
+        ensure!(
+            decode.execution_hits > 0,
+            "VA execution-cache path was not exercised"
         );
         let preparation = vp.code_preparation_diagnostics();
         println!(
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
-                "no_refetch_hits":decode.fetch_hits,
+                "no_refetch_hits":no_refetch_hits,
+                "execution_cache_hits":decode.execution_hits,
                 "code_pages_prepared":preparation.prepared,
                 "code_pages_unavailable":preparation.unavailable,
                 "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "75065de9df5d00",

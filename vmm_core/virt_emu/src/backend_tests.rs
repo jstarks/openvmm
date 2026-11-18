@@ -185,13 +185,8 @@ impl chipset_resources::ioapic::IoApicRouting for TestIoApicRoutes {
 async fn prototype_tracker_observes_device_views_and_translated_subranges(driver: DefaultDriver) {
     let (bytes, _) = fixture();
     let (partition, _binder, memory, _keeper) = build(&driver, &bytes).await;
-    let watches = partition.external_write_watch();
-    let first = watches
-        .capture(CODE..CODE + 8, || memory.read_plain::<u64>(CODE))
-        .unwrap();
-    let next = watches
-        .capture(CODE + 8..CODE + 16, || memory.read_plain::<u64>(CODE + 8))
-        .unwrap();
+    let first = partition.capture_code::<8>(CODE).unwrap();
+    let next = partition.capture_code::<8>(CODE + 8).unwrap();
     let original = *first.value();
     memory.write_plain(CODE, &0x1234u64).unwrap();
     assert!(!first.is_valid());
@@ -204,11 +199,127 @@ async fn prototype_tracker_observes_device_views_and_translated_subranges(driver
     assert!(!subrange.supports_kernel_lock());
     subrange.write_plain(8, &0x5678u64).unwrap();
     assert!(!next.is_valid());
-    let fresh = watches
-        .capture(CODE + 8..CODE + 16, || memory.read_plain::<u64>(CODE + 8))
-        .unwrap();
+    let fresh = partition.capture_code::<8>(CODE + 8).unwrap();
     assert!(fresh.is_valid());
-    assert_eq!(*fresh.value(), 0x5678);
+    assert_eq!(*fresh.value(), 0x5678u64.to_le_bytes());
+}
+
+#[async_test]
+async fn cpu_stores_and_atomics_invalidate_physical_watches_through_virtual_aliases(
+    driver: DefaultDriver,
+) {
+    let target = CODE + 0x100;
+    for (program, accumulator, result, final_accumulator, flags) in [
+        (&[0x48, 0x89, 0x07][..], 3, 3, 3, 2), // mov [rdi],rax
+        (&[0x48, 0x87, 0x07][..], 3, 3, 7, 2), // xchg [rdi],rax
+        (&[0xf0, 0x48, 0x0f, 0xc1, 0x07][..], 3, 10, 7, 6), // lock xadd
+        (&[0xf0, 0x48, 0x83, 0x07, 1][..], 3, 8, 3, 2), // lock add
+        (&[0xf0, 0x48, 0x0f, 0xb1, 0x0f][..], 7, 11, 7, 0x46), // cmpxchg match
+        (&[0xf0, 0x48, 0x0f, 0xb1, 0x0f][..], 3, 7, 7, 0x97), // cmpxchg mismatch
+    ] {
+        for alias in [false, true] {
+            let (mut bytes, owned) = fixture();
+            bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(program);
+            bytes[target as usize - 4..target as usize + 12].fill(0xa5);
+            bytes[target as usize..target as usize + 8].copy_from_slice(&7u64.to_le_bytes());
+            if alias {
+                let pte = 0x4000 + (0x17000 / 4096) * 8;
+                bytes[pte..pte + 8].copy_from_slice(&(CODE | 0x67).to_le_bytes());
+            }
+            let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+            let token = partition.capture_code::<8>(target).unwrap();
+            let neighbor = partition.capture_code::<4>(target + 8).unwrap();
+            let mut initial = long_mode_registers(
+                owned.core.cpu,
+                super::shared_mmu_tests::config(),
+                owned.tables,
+                owned.core.mmu.cr2(),
+            );
+            initial.rax = accumulator;
+            initial.rcx = 11;
+            initial.rdi = if alias { 0x17100 } else { target };
+            initial.rflags = 2;
+            let mut vp = binder.bind().unwrap();
+            vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+            vp.set_execution_checkpoint(Some(CODE + program.len() as u64))
+                .unwrap();
+            let devices = Devices::new();
+            let stop = StopVpSource::new();
+            assert!(matches!(
+                vp.run_vp(stop.checker(), &devices).await,
+                Err(VpHaltReason::PowerOff)
+            ));
+            let mut expected = initial;
+            expected.rax = final_accumulator;
+            expected.rflags = flags;
+            expected.rip = CODE + program.len() as u64;
+            assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+            assert_eq!(vp.completed_batch_progress().retired, 1);
+            assert!(!token.is_valid());
+            assert_eq!(*token.value(), 7u64.to_le_bytes());
+            assert!(neighbor.is_valid());
+            assert_eq!(*neighbor.value(), [0xa5; 4]);
+            let mut actual = [0; 16];
+            memory.read_at(target - 4, &mut actual).unwrap();
+            let mut expected = [0xa5; 16];
+            expected[4..12].copy_from_slice(&(result as u64).to_le_bytes());
+            assert_eq!(actual, expected);
+            assert_eq!(
+                &*devices.faults.lock(),
+                &[format!(
+                    "host execution checkpoint at {:#x}",
+                    CODE + program.len() as u64
+                )]
+            );
+        }
+    }
+}
+
+#[async_test]
+async fn self_modifying_code_invalidates_receipts_without_restarting_the_store(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    let program = [
+        0xc6, 0x07, 0x90, // mov byte [rdi],90h
+        0xf4, // replaced with NOP before this instruction is fetched
+        0xb8, 42, 0, 0, 0, // mov eax,42
+    ];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let token = partition.capture_code::<4>(CODE).unwrap();
+    let next = partition.capture_code::<5>(CODE + 4).unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        owned.core.mmu.cr2(),
+    );
+    initial.rdi = CODE + 3;
+    initial.rflags = 2;
+    let mut vp = binder.bind().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + program.len() as u64))
+        .unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let mut expected = initial;
+    expected.rax = 42;
+    expected.rip = CODE + program.len() as u64;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(vp.completed_batch_progress().retired, 3);
+    assert!(!token.is_valid());
+    assert_eq!(token.value()[3], 0xf4);
+    assert!(next.is_valid());
+    let mut actual = [0; 9];
+    memory.read_at(CODE, &mut actual).unwrap();
+    let mut expected = program;
+    expected[3] = 0x90;
+    assert_eq!(actual, expected);
 }
 
 #[async_test]
@@ -2046,19 +2157,13 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
 
     memory.read_at(0, &mut bytes).unwrap();
     let old_memory = memory.guest_memory();
-    let old_observation = partition
-        .external_write_watch()
-        .capture(0x16000..0x16008, || memory.read_plain::<u64>(0x16000))
-        .unwrap();
+    let old_observation = partition.capture_code::<8>(0x16000).unwrap();
     drop(memory);
     assert!(!old_observation.is_valid());
-    assert_eq!(*old_observation.value(), 0x1111);
+    assert_eq!(*old_observation.value(), 0x1111u64.to_le_bytes());
     bytes[0x16000..0x16008].copy_from_slice(&0x2222u64.to_le_bytes());
-    let replacement = MappedTestMemory::observed(
-        partition.clone(),
-        &bytes,
-        partition.external_write_watch().tracker(),
-    );
+    let replacement =
+        MappedTestMemory::observed(partition.clone(), &bytes, partition.write_tracker());
     vp.set_execution_checkpoint(Some(CODE + program.len() as u64))
         .unwrap();
     devices.faults.lock().clear();

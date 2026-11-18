@@ -4,6 +4,7 @@
 //! Opt-in measurement of production fast paths, with no hooks in default builds.
 
 use crate::native_memory::PartitionMemory;
+use crate::write_watch::WriteWatch;
 use anyhow::{Result, bail, ensure};
 use guestmem::GuestMemory;
 use std::hint::black_box;
@@ -154,7 +155,7 @@ fn tlb<const KIND: u8>(
     ] {
         memory.write_plain(address, &value)?;
     }
-    let mappings = PartitionMemory::new();
+    let mappings = PartitionMemory::with_write_tracker(WriteWatch::default().tracker());
     // SAFETY: backing remains allocated until the mappings and access lease drop.
     // UNSAFETY: Installs the benchmark's owned memory in the CPU partition view.
     #[expect(unsafe_code)]

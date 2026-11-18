@@ -7,12 +7,16 @@
 //! returned. Each synchronous CPU batch holds one shared mapping lease, never
 //! across an await. Concurrent CPU batches and external DMA share the backing;
 //! mapping changes wait for all leases, not for individual memory operations.
+//! Optional code watches revoke old batches before capture. Only writes touching
+//! marked physical spans notify the tracker; untouched RAM remains ungated.
 
 // UNSAFETY: partition-owned reservations are accessed only under a mapping lease
 // through fault-recoverable trycopy primitives, without creating Rust references.
 #![allow(unsafe_code)]
 
+use guestmem::{WriteTracker, WriteTrackerError};
 use parking_lot::{RwLock, RwLockReadGuard};
+use std::ops::Range;
 use std::sync::atomic::{Ordering, fence};
 use virt::PartitionMemoryMap;
 use x86_system::arch::integer;
@@ -32,6 +36,15 @@ pub enum RamError {
     /// The requested range wraps the address space.
     #[error("physical address range overflow")]
     AddressOverflow,
+    /// Code watches need a nonempty, ordered physical range.
+    #[error("empty or reversed code watch range")]
+    InvalidWatchRange,
+    /// This mapping table was constructed without write observation.
+    #[error("code watching requires a write tracker")]
+    Untracked,
+    /// The observer's translated address range cannot be represented.
+    #[error("notifying a physical RAM write")]
+    WriteTracker(#[from] WriteTrackerError),
     /// A scalar cannot be lowered to one host memory instruction.
     #[error("scalar access crosses noncontiguous host mappings at {0:#x}")]
     SplitAccess(u64),
@@ -49,12 +62,18 @@ pub enum MapError {
     /// The physical or host range wraps, or the host pointer is null.
     #[error("invalid physical or host mapping range")]
     InvalidRange,
+    /// The tracker cannot represent the mapping's translated exclusive end.
+    #[error("physical mapping exceeds the write observer address space")]
+    InvalidObserverRange,
     /// Host and guest natural scalar alignment must agree.
     #[error("host and guest mapping alignment differ modulo eight")]
     Misaligned,
     /// Mappings must not overlap.
     #[error("physical mapping overlaps an existing range")]
     Overlap,
+    /// Tracked mappings must not give one host range multiple physical names.
+    #[error("host mapping overlaps an existing tracked range")]
+    HostAlias,
     /// The unmap request must completely contain every intersecting mapping.
     #[error("unmap range only partially contains an existing mapping")]
     PartialUnmap,
@@ -63,12 +82,15 @@ pub enum MapError {
     NonExecutable,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Mapping {
     start: u64,
     end: u64,
     data: *mut u8,
     writable: bool,
+    watched: bool,
+    original_start: u64,
+    original_end: u64,
 }
 
 // SAFETY: map_range's caller keeps the reservation alive and permits shared
@@ -85,15 +107,94 @@ unsafe impl Sync for Mapping {}
 /// `PhysicalRam` has no execute access tag, so non-executable mappings are
 /// rejected rather than silently permitting instruction fetch. Guest execute
 /// permission never changes host executable permissions.
+///
+/// Tracked tables reject overlapping host virtual ranges. The trusted partition
+/// mapper must also avoid distinct virtual aliases of the same backing: raw
+/// pointers cannot identify those aliases.
 #[derive(Debug, Default)]
 pub struct PartitionMemory {
     mappings: RwLock<Vec<Mapping>>,
+    tracker: Option<WriteTracker>,
 }
 
 impl PartitionMemory {
     /// Creates an empty partition mapping table.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty table sharing external write observation.
+    pub fn with_write_tracker(tracker: WriteTracker) -> Self {
+        Self {
+            mappings: RwLock::new(Vec::new()),
+            tracker: Some(tracker),
+        }
+    }
+
+    /// Revokes old CPU batches, marks physical pages, and captures code.
+    ///
+    /// Lock order is mapping lease, external tracker, then observer state.
+    /// The callback may acquire `WriteTracker::synchronize` to read/register
+    /// immutable code, but must not write, reenter this table, or await. It
+    /// runs with the exclusive mapping lease, after all old CPU writes and
+    /// their notifications have finished. Marks persist until unmap.
+    pub(crate) fn with_code_watch<T>(
+        &self,
+        range: Range<u64>,
+        f: impl FnOnce(NativeRam<'_>) -> T,
+    ) -> Result<T, RamError> {
+        if range.start >= range.end {
+            return Err(RamError::InvalidWatchRange);
+        }
+        let tracker = self.tracker.as_ref().ok_or(RamError::Untracked)?;
+        let start = range.start & !4095;
+        let end = range.end.checked_add(4095).map_or(u64::MAX, |v| v & !4095);
+        let mut mappings = self.mappings.write();
+        for boundary in [start, end] {
+            let index = mappings.partition_point(|mapping| mapping.end <= boundary);
+            if let Some(mapping) = mappings.get(index).copied()
+                && mapping.start < boundary
+                && boundary < mapping.end
+            {
+                mappings[index].end = boundary;
+                mappings.insert(
+                    index + 1,
+                    Mapping {
+                        start: boundary,
+                        data: mapping
+                            .data
+                            .wrapping_add((boundary - mapping.start) as usize),
+                        ..mapping
+                    },
+                );
+            }
+        }
+        for mapping in mappings.iter_mut() {
+            if mapping.start < end && start < mapping.end {
+                mapping.watched = true;
+            }
+        }
+        // Only boundaries of changed watch permissions need survive.
+        let mut index = 1;
+        while index < mappings.len() {
+            let previous = &mappings[index - 1];
+            let next = &mappings[index];
+            if previous.end == next.start
+                && previous.original_start == next.original_start
+                && previous.original_end == next.original_end
+                && previous.watched == next.watched
+            {
+                mappings[index - 1].end = next.end;
+                mappings.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        trycopy::initialize_try_copy();
+        Ok(f(NativeRam {
+            mappings: &mappings,
+            tracker: Some(tracker),
+        }))
     }
 
     /// Leases the mappings for one synchronous CPU batch.
@@ -115,6 +216,7 @@ impl PartitionMemory {
         trycopy::initialize_try_copy();
         NativeAccess {
             mappings: self.mappings.read(),
+            tracker: self.tracker.as_ref(),
         }
     }
 
@@ -148,12 +250,27 @@ impl PartitionMemoryMap for PartitionMemory {
         if (data as usize & 7) != (addr as usize & 7) {
             return Err(MapError::Misaligned.into());
         }
+        if let Some(tracker) = &self.tracker {
+            // Validate once before insertion so notification cannot fail after
+            // a committed scalar or exact-prefix copy due to address overflow.
+            tracker
+                .with_offset(end)
+                .map_err(|_| MapError::InvalidObserverRange)?;
+        }
         let mut mappings = self.mappings.write();
         let index = mappings.partition_point(|mapping| mapping.start < addr);
         if index != 0 && mappings[index - 1].end > addr
             || index < mappings.len() && mappings[index].start < end
         {
             return Err(MapError::Overlap.into());
+        }
+        if self.tracker.is_some()
+            && mappings.iter().any(|mapping| {
+                (data as usize) < mapping.data as usize + (mapping.end - mapping.start) as usize
+                    && (mapping.data as usize) < data as usize + size
+            })
+        {
+            return Err(MapError::HostAlias.into());
         }
         mappings.insert(
             index,
@@ -162,6 +279,9 @@ impl PartitionMemoryMap for PartitionMemory {
                 end,
                 data,
                 writable,
+                watched: false,
+                original_start: addr,
+                original_end: end,
             },
         );
         Ok(())
@@ -174,7 +294,9 @@ impl PartitionMemoryMap for PartitionMemory {
             return Ok(());
         }
         if mappings.iter().any(|mapping| {
-            mapping.start < end && addr < mapping.end && (mapping.start < addr || end < mapping.end)
+            mapping.start < end
+                && addr < mapping.end
+                && (mapping.original_start < addr || end < mapping.original_end)
         }) {
             return Err(MapError::PartialUnmap.into());
         }
@@ -216,6 +338,7 @@ pub enum AdUpdate {
 #[must_use]
 pub struct NativeAccess<'a> {
     mappings: RwLockReadGuard<'a, Vec<Mapping>>,
+    tracker: Option<&'a WriteTracker>,
 }
 
 impl NativeAccess<'_> {
@@ -223,6 +346,7 @@ impl NativeAccess<'_> {
     pub fn ram(&self) -> NativeRam<'_> {
         NativeRam {
             mappings: &self.mappings,
+            tracker: self.tracker,
         }
     }
 }
@@ -245,6 +369,7 @@ impl NativeAccess<'_> {
 #[derive(Debug)]
 pub struct NativeRam<'a> {
     mappings: &'a [Mapping],
+    tracker: Option<&'a WriteTracker>,
 }
 
 impl NativeRam<'_> {
@@ -263,21 +388,32 @@ impl NativeRam<'_> {
         Ok(mapping)
     }
 
-    fn pointer(&self, address: u64, size: usize, write: bool) -> Result<*mut u8, RamError> {
+    fn pointer(&self, address: u64, size: usize, write: bool) -> Result<(*mut u8, bool), RamError> {
         let end = address
             .checked_add(size as u64)
             .ok_or(RamError::AddressOverflow)?;
         let first = self.mapping(address, write)?;
         let pointer = first.data.wrapping_add((address - first.start) as usize);
         let mut current = first.end;
+        let mut watched = first.watched;
         while current < end {
             let next = self.mapping(current, write)?;
             if next.data != pointer.wrapping_add((current - address) as usize) {
                 return Err(RamError::SplitAccess(current));
             }
+            watched |= next.watched;
             current = next.end;
         }
-        Ok(pointer)
+        Ok((pointer, watched))
+    }
+
+    fn notify_write(&self, address: u64, size: usize, watched: bool) -> Result<(), RamError> {
+        if watched {
+            self.tracker
+                .ok_or(RamError::Untracked)?
+                .notify_write(address, size)?;
+        }
+        Ok(())
     }
 
     fn copy_width(&self, address: u64, remaining: usize, write: bool) -> Result<usize, RamError> {
@@ -366,7 +502,7 @@ impl PhysicalRam for NativeRam<'_> {
 
     fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
-        let pointer = self.pointer(address, N, false)?;
+        let (pointer, _) = self.pointer(address, N, false)?;
         // SAFETY: the lease reserves the complete range. Byte arrays have no
         // validity or alignment restriction; trycopy uses one exact-width load.
         Ok(unsafe { trycopy::try_read_volatile(pointer.cast::<[u8; N]>()) }?)
@@ -374,10 +510,12 @@ impl PhysicalRam for NativeRam<'_> {
 
     fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
-        let pointer = self.pointer(address, N, true)?;
+        let (pointer, watched) = self.pointer(address, N, true)?;
         // SAFETY: the lease reserves writable shared backing for the complete
         // scalar. One exact-width store performs no destination read.
-        Ok(unsafe { trycopy::try_write_volatile(pointer.cast(), &value) }?)
+        let result = unsafe { trycopy::try_write_volatile(pointer.cast(), &value) };
+        self.notify_write(address, N, watched)?;
+        Ok(result?)
     }
 
     fn read_bytes(&self, address: u64, destination: &mut [u8]) -> Result<(), CopyError<RamError>> {
@@ -437,7 +575,7 @@ impl PhysicalRam for NativeRam<'_> {
             completed: 0,
             kind: CopyErrorKind::Memory(error),
         };
-        let pointer = self
+        let (pointer, watched) = self
             .pointer(address, usize::from(width), true)
             .map_err(failure)?;
         if let AtomicOperation::CompareExchange {
@@ -464,7 +602,7 @@ impl PhysicalRam for NativeRam<'_> {
                     })
                 }};
             }
-            return match width {
+            let result = match width {
                 1 => exchange!(u8),
                 2 => exchange!(u16),
                 4 => exchange!(u32),
@@ -472,6 +610,9 @@ impl PhysicalRam for NativeRam<'_> {
                 _ => return Err(invalid()),
             }
             .map_err(|error| failure(error.into()));
+            self.notify_write(address, usize::from(width), watched)
+                .map_err(failure)?;
+            return result;
         }
         use trycopy::AtomicOperation as Native;
         let (operation, source, flags) = match operation {
@@ -516,6 +657,8 @@ impl PhysicalRam for NativeRam<'_> {
         // SAFETY: the validated operand is naturally aligned and completely
         // reserved and writable for this lease. There is no preliminary read.
         let result = unsafe { trycopy::try_atomic(pointer, width, operation, source, flags) };
+        self.notify_write(address, usize::from(width), watched)
+            .map_err(failure)?;
         result
             .map(|result| match result {
                 trycopy::AtomicResult::Value(value) => AtomicResult::Value(value),
@@ -531,6 +674,9 @@ impl PhysicalRam for NativeRam<'_> {
         NativeRam::barrier(self);
     }
 }
+
+#[cfg(test)]
+mod watch_tests;
 
 #[cfg(test)]
 mod tests {

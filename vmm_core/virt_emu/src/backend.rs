@@ -9,7 +9,7 @@
 //! that VP rather than reissuing a possibly side-effecting operation.
 
 use crate::native_memory::{PartitionMemory, RamError};
-use crate::write_watch::ExternalWriteWatch;
+use crate::write_watch::{CaptureError, CodeCaptureError, Watched, WriteWatch};
 use crate::{state_from_registers, update_registers};
 use futures::task::AtomicWaker;
 use hvdef::Vtl;
@@ -32,6 +32,7 @@ use virt::{
 use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
 use x86_system::arch::apic::registers::LocalApic;
 use x86_system::arch::system::{self, SegmentState, SystemState};
+use x86_system::memory::physical::PhysicalRam;
 use x86_system::mmu::translate::RunError;
 use x86_system::mmu::translate::io::IoReply;
 use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
@@ -169,7 +170,7 @@ pub struct EmuProtoPartition {
     clock: VmTimeSource,
     architectural_apic: bool,
     apic_id: u32,
-    writes: ExternalWriteWatch,
+    writes: WriteWatch,
 }
 
 /// Partition control and bounded external event ingress.
@@ -177,7 +178,7 @@ pub struct EmuPartition {
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
     ram: Arc<PartitionMemory>,
-    writes: ExternalWriteWatch,
+    writes: WriteWatch,
 }
 
 enum CpuLifecycle {
@@ -385,7 +386,7 @@ impl EmuHypervisor {
             clock: config.vmtime.clone(),
             architectural_apic,
             apic_id,
-            writes: ExternalWriteWatch::default(),
+            writes: WriteWatch::default(),
         })
     }
 }
@@ -426,7 +427,7 @@ impl ProtoPartition for EmuProtoPartition {
             return Err(Error::Profile("no RAM"));
         }
         let control = Arc::new(Control::new(self.architectural_apic));
-        let ram = Arc::new(PartitionMemory::new());
+        let ram = Arc::new(PartitionMemory::with_write_tracker(self.writes.tracker()));
         let partition = EmuPartition {
             caps: self.caps.clone(),
             control: control.clone(),
@@ -469,9 +470,35 @@ impl ProtoPartition for EmuProtoPartition {
 }
 
 impl EmuPartition {
-    /// External-write capture/registration, not a CPU fetch-coherence guarantee.
-    pub fn external_write_watch(&self) -> &ExternalWriteWatch {
-        &self.writes
+    #[cfg(test)]
+    pub(crate) fn write_tracker(&self) -> guestmem::WriteTracker {
+        self.writes.tracker()
+    }
+
+    /// Captures physical code after revoking CPU writes and excluding DMA writes.
+    ///
+    /// Every external writer must use this prototype's observed memory backing.
+    /// The result is a backing observation, not guest execute authorization;
+    /// instruction fetch permissions and current translation remain separate.
+    /// This may wait for bounded CPU batches. Do not call from inside such a
+    /// batch or while holding the external write-registration gate.
+    pub fn capture_code<const N: usize>(
+        &self,
+        address: u64,
+    ) -> Result<Watched<[u8; N]>, CodeCaptureError> {
+        let end = address
+            .checked_add(N as u64)
+            .filter(|&end| address < end)
+            .ok_or(CaptureError::InvalidRange)?;
+        self.ram
+            .with_code_watch(address..end, |ram| {
+                self.writes.capture(address..end, || {
+                    let mut bytes = [0; N];
+                    ram.read_bytes(address, &mut bytes)?;
+                    Ok(bytes)
+                })
+            })?
+            .map_err(CodeCaptureError::Capture)
     }
 
     /// Offers an already-selected vector, not an APIC/PIC arbitration interface.

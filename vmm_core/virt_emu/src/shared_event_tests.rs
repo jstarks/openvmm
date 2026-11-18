@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use super::test_support::{EventFixture, RunDecoded, long64_system, run_fixture};
-use crate::native_memory::NativeRam;
+use crate::mapped_test_memory::TestRam;
 use guestmem::GuestMemory;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,10 +95,9 @@ pub(super) fn fixture() -> (Vec<u8>, EventFixture) {
     )
 }
 
-pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, NativeRam) {
-    let memory = GuestMemory::allocate(bytes.len());
-    memory.write_at(0, bytes).unwrap();
-    let ram = NativeRam::new(memory.clone());
+pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, TestRam) {
+    let ram = TestRam::new(bytes);
+    let memory = ram.guest_memory();
     (memory, ram)
 }
 
@@ -113,7 +112,7 @@ fn shared(owned: &EventFixture) -> Machine {
     .unwrap()
 }
 
-fn decoded_one(cpu: &mut Machine, ram: &NativeRam) -> Batch {
+fn decoded_one(cpu: &mut Machine, ram: &TestRam) -> Batch {
     let before = cpu.cpu();
     for _ in 0..4096 {
         let batch = cpu.run(ram, 1, 1).unwrap();
@@ -415,7 +414,7 @@ fn compare_one(
     owned: &mut EventFixture,
     cpu: &mut Machine,
     memory: &GuestMemory,
-    ram: &NativeRam,
+    ram: &TestRam,
 ) -> Batch {
     let expected = run_fixture(owned, bytes, 1);
     let actual = one(cpu, ram);
@@ -531,7 +530,7 @@ fn shared_event_partial_frames_preserve_cpu_pending_and_prefix() {
 }
 
 struct FailOnce {
-    ram: NativeRam,
+    ram: TestRam,
     address: u64,
     fail: AtomicBool,
 }

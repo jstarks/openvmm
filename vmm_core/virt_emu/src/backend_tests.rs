@@ -3,6 +3,7 @@
 
 use super::backend::{EmuHypervisor, EmuPartition, EmuProcessorBinder, long_mode_registers};
 use super::shared_event_tests::fixture;
+use crate::mapped_test_memory::MappedTestMemory;
 use futures::task::{ArcWake, AtomicWaker, waker};
 use guestmem::GuestMemory;
 use hvdef::Vtl;
@@ -357,7 +358,7 @@ async fn rdtsc_and_existing_pm_timer_use_the_same_stopped_clock(driver: DefaultD
             0x89, 0xc6, 0x0f, 0x31,
         ];
         bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
-        let (_, mut binder, _, keeper) =
+        let (_, mut binder, _memory, keeper) =
             build_at_time(&driver, &bytes, VmTime::from_100ns(now)).await;
         let time = keeper.builder().build(&driver).await.unwrap();
         let pm = chipset::pm::PowerManagementDevice::new(
@@ -558,7 +559,12 @@ fn ready_after_yields<F: Future>(mut future: Pin<&mut F>) -> F::Output {
 async fn build(
     driver: &DefaultDriver,
     bytes: &[u8],
-) -> (EmuPartition, EmuProcessorBinder, GuestMemory, VmTimeKeeper) {
+) -> (
+    Arc<EmuPartition>,
+    EmuProcessorBinder,
+    MappedTestMemory<EmuPartition>,
+    VmTimeKeeper,
+) {
     build_at_time(driver, bytes, VmTime::from_100ns(0)).await
 }
 
@@ -566,7 +572,12 @@ async fn build_at_time(
     driver: &DefaultDriver,
     bytes: &[u8],
     now: VmTime,
-) -> (EmuPartition, EmuProcessorBinder, GuestMemory, VmTimeKeeper) {
+) -> (
+    Arc<EmuPartition>,
+    EmuProcessorBinder,
+    MappedTestMemory<EmuPartition>,
+    VmTimeKeeper,
+) {
     build_profile(driver, bytes, now, false).await
 }
 
@@ -575,7 +586,12 @@ async fn build_profile(
     bytes: &[u8],
     now: VmTime,
     apic: bool,
-) -> (EmuPartition, EmuProcessorBinder, GuestMemory, VmTimeKeeper) {
+) -> (
+    Arc<EmuPartition>,
+    EmuProcessorBinder,
+    MappedTestMemory<EmuPartition>,
+    VmTimeKeeper,
+) {
     let topology = TopologyBuilder::new_x86()
         .x2apic(if apic {
             X2ApicState::Supported
@@ -592,8 +608,7 @@ async fn build_profile(
         None,
     )
     .unwrap();
-    let memory = GuestMemory::allocate(bytes.len());
-    memory.write_at(0, bytes).unwrap();
+    let memory = GuestMemory::empty();
     let keeper = VmTimeKeeper::new(driver, now);
     let time = keeper.builder().build(driver).await.unwrap();
     let mut hv = EmuHypervisor;
@@ -621,6 +636,8 @@ async fn build_profile(
         })
         .unwrap();
     assert_eq!(binders.len(), 1);
+    let partition = Arc::new(partition);
+    let memory = MappedTestMemory::new(partition.clone(), bytes);
     (partition, binders.pop().unwrap(), memory, keeper)
 }
 
@@ -647,7 +664,7 @@ async fn owned_lapic_timer_interrupts_an_if_enabled_batch_without_executor_wakeu
     code.extend_from_slice(&100_000u32.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xff, 0xc9, 0x75, 0xfb]);
     bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
-    let (_, mut binder, _, mut keeper) =
+    let (_, mut binder, _memory, mut keeper) =
         build_profile(&driver, &bytes, VmTime::from_100ns(0), true).await;
     let mut vp = binder.bind().unwrap();
     let mut initial = long_mode_registers(
@@ -775,7 +792,7 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     let ioapic = Arc::new(Mutex::new(chipset::ioapic::IoApicDevice::new(
         24,
         Box::new(TestIoApicRoutes {
-            partition: Arc::new(partition),
+            partition,
             routes: Mutex::new([None; 24]),
         }),
     )));
@@ -1957,6 +1974,70 @@ async fn bootstrap_control_and_null_segments_use_the_actual_vp_image(driver: Def
     let mut actual = vec![0; bytes.len()];
     memory.read_at(0, &mut actual).unwrap();
     assert_eq!(actual, bytes);
+}
+
+#[async_test]
+async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    let program = [
+        0x48, 0x8b, 0x07, // mov rax,[rdi]
+        0x48, 0x8b, 0x1f, // mov rbx,[rdi]
+    ];
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
+    bytes[0x16000..0x16008].copy_from_slice(&0x1111u64.to_le_bytes());
+    let mut cpu = owned.core.cpu;
+    cpu.gpr[7] = 0x16000;
+    let initial = long_mode_registers(
+        cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        owned.core.mmu.cr2(),
+    );
+    let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    let mut vp = binder.bind().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + 3)).unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let mut expected = initial;
+    expected.rax = 0x1111;
+    expected.rip = CODE + 3;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(vp.completed_batch_progress().retired, 1);
+    assert_eq!(
+        &*devices.faults.lock(),
+        &[format!("host execution checkpoint at {:#x}", CODE + 3)]
+    );
+
+    memory.read_at(0, &mut bytes).unwrap();
+    let old_memory = memory.guest_memory();
+    drop(memory);
+    bytes[0x16000..0x16008].copy_from_slice(&0x2222u64.to_le_bytes());
+    let replacement = MappedTestMemory::new(partition.clone(), &bytes);
+    vp.set_execution_checkpoint(Some(CODE + program.len() as u64))
+        .unwrap();
+    devices.faults.lock().clear();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    expected.rbx = 0x2222;
+    expected.rip = CODE + program.len() as u64;
+    assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
+    assert_eq!(vp.completed_batch_progress().retired, 2);
+    assert_eq!(old_memory.read_plain::<u64>(0x16000).unwrap(), 0x1111);
+    assert_eq!(replacement.read_plain::<u64>(0x16000).unwrap(), 0x2222);
+    assert_eq!(
+        &*devices.faults.lock(),
+        &[format!(
+            "host execution checkpoint at {:#x}",
+            CODE + program.len() as u64
+        )]
+    );
 }
 
 #[async_test]

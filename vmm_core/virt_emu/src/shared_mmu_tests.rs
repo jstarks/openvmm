@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::native_memory::NativeRam;
+use crate::mapped_test_memory::TestRam;
 use guestmem::GuestMemory;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -35,14 +35,13 @@ pub(super) fn bytes() -> Vec<u8> {
     ram
 }
 
-pub(super) fn fixture(data: &[u8]) -> (GuestMemory, NativeRam) {
-    let memory = GuestMemory::allocate(data.len());
-    memory.write_at(0, data).unwrap();
-    let ram = NativeRam::new(memory.clone());
+pub(super) fn fixture(data: &[u8]) -> (GuestMemory, TestRam) {
+    let ram = TestRam::new(data);
+    let memory = ram.guest_memory();
     (memory, ram)
 }
 
-fn finish(mmu: &mut Translator, ram: &NativeRam) -> Report {
+fn finish(mmu: &mut Translator, ram: &TestRam) -> Report {
     for _ in 0..128 {
         if let Progress::Complete(report) = mmu.run(ram, 1).unwrap() {
             return report;
@@ -135,9 +134,7 @@ fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
     data[0x200000] = 0x71;
     data[0x20f123] = 0x72;
     data[0x3fffff] = 0x73;
-    let memory = GuestMemory::allocate(data.len());
-    memory.write_at(0, &data).unwrap();
-    let ram = NativeRam::new(memory.clone());
+    let (memory, ram) = fixture(&data);
     let mut owned = ReferenceMmu::new(config(), 77);
     let mut shared = Translator::new(config(), 77);
     for va in [0x200000, 0x20f123, 0x3fffff] {
@@ -305,7 +302,7 @@ fn shared_mmu_revalidates_replaced_and_revoked_ptes() {
 #[test]
 fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
     struct FailOnce {
-        ram: NativeRam,
+        ram: TestRam,
         fail: std::sync::atomic::AtomicBool,
     }
     impl PhysicalRam for FailOnce {
@@ -455,7 +452,7 @@ fn shared_mmu_self_pte_alias_and_backing_error_order() {
     ));
 }
 
-fn finish_word(mmu: &mut Translator, ram: &NativeRam) -> x86_system::mmu::word::WordReport {
+fn finish_word(mmu: &mut Translator, ram: &TestRam) -> x86_system::mmu::word::WordReport {
     for _ in 0..128 {
         match mmu.run(ram, 1).unwrap() {
             Progress::CompleteWord(report) => return report,
@@ -547,7 +544,7 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use x86_system::mmu::word::{WordAccess, WordResult};
     struct TailFault {
-        ram: NativeRam,
+        ram: TestRam,
         fail: AtomicBool,
     }
     impl PhysicalRam for TailFault {

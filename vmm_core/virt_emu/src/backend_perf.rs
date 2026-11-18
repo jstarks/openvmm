@@ -3,11 +3,13 @@
 
 //! Opt-in measurement of production fast paths, with no hooks in default builds.
 
-use crate::native_memory::NativeRam;
+use crate::native_memory::PartitionMemory;
 use anyhow::{Result, bail, ensure};
 use guestmem::GuestMemory;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Instant;
+use virt::PartitionMemoryMap;
 use x86_system::WordAccess;
 use x86_system::mmu::translate::{Progress, Translator};
 use x86_system::mmu::{Access, Config};
@@ -140,7 +142,9 @@ fn tlb<const KIND: u8>(
     operations: u64,
     mut control: impl FnMut(bool) -> Result<()>,
 ) -> Result<FastPathResult> {
-    let memory = GuestMemory::allocate(0x20000);
+    let backing = Arc::new(sparse_mmap::SparseMapping::new(0x20000)?);
+    backing.alloc(0, 0x20000)?;
+    let memory = GuestMemory::new("perf-device-view", backing.clone());
     for (address, value) in [
         (0x1000, 0x2067u64),
         (0x2000, 0x3067),
@@ -150,7 +154,15 @@ fn tlb<const KIND: u8>(
     ] {
         memory.write_plain(address, &value)?;
     }
-    let ram = NativeRam::new(memory.clone());
+    let mappings = PartitionMemory::new();
+    // SAFETY: backing remains allocated until the mappings and access lease drop.
+    // UNSAFETY: Installs the benchmark's owned memory in the CPU partition view.
+    #[expect(unsafe_code)]
+    unsafe {
+        mappings.map_range(backing.as_ptr().cast(), 0x20000, 0, true, true)?;
+    }
+    let lease = mappings.access();
+    let ram = lease.ram();
     let mut mmu = Translator::new(
         Config {
             root: 0x1000,

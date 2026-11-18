@@ -7,7 +7,7 @@
 //! shared paging, events and device continuation. It is not a selectable
 //! Linux-capable machine backend. The backend uses Strudel's self-contained machine.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg(guest_arch = "x86_64")]
 
 use virt::vp::Registers;
@@ -44,6 +44,10 @@ mod backend_tests;
 // xtask-fmt allow-target-arch cpu-intrinsic -- Native transport comparison drivers.
 #[cfg(all(test, target_arch = "x86_64"))]
 mod test_support;
+
+// xtask-fmt allow-target-arch cpu-intrinsic -- Native partition-mapping fixtures.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod mapped_test_memory;
 
 fn state_from_registers(registers: &Registers) -> State {
     State {

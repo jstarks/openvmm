@@ -28,8 +28,9 @@ mod native {
     use virt::io::CpuIo;
     use virt::vp::AccessVpState;
     use virt::{
-        BindProcessor, Hypervisor, Partition, PartitionConfig, Processor, ProtoPartition,
-        ProtoPartitionConfig, ProtoPartitionIsolation, StopVpSource, VpHaltReason, VpIndex,
+        BindProcessor, Hypervisor, Partition, PartitionConfig, PartitionMemoryMap, Processor,
+        ProtoPartition, ProtoPartitionConfig, ProtoPartitionIsolation, StopVpSource, VpHaltReason,
+        VpIndex,
     };
     use virt_emu::backend::{EmuHypervisor, EmuPartition, Error};
     use vm_topology::memory::MemoryLayout;
@@ -1023,7 +1024,9 @@ mod native {
             })
             .build(1)?;
         let layout = MemoryLayout::new(RAM, &[], &[], &[], None)?;
-        let memory = GuestMemory::allocate(usize::try_from(RAM)?);
+        let backing = Arc::new(sparse_mmap::SparseMapping::new(usize::try_from(RAM)?)?);
+        backing.alloc(0, usize::try_from(RAM)?)?;
+        let memory = GuestMemory::new("kernel-device-view", backing.clone());
         let keeper =
             VmTimeKeeper::new_with_slowdown(&driver, VmTime::from_100ns(0), clock_slowdown);
         let time = keeper.builder().build(&driver).await?;
@@ -1047,6 +1050,18 @@ mod native {
             vtl0_alias_map: None,
             fault_resolver: None,
         })?;
+        // SAFETY: backing outlives both the partition and its VP binders.
+        // UNSAFETY: Installs the owned harness backing just as membacking would.
+        #[expect(unsafe_code)]
+        unsafe {
+            partition.map_range(
+                backing.as_ptr().cast(),
+                usize::try_from(RAM)?,
+                0,
+                true,
+                true,
+            )?;
+        }
         let mut kernel = File::open(kernel_path)?;
         let mut initrd = File::open(initrd_path)?;
         let initrd_size = initrd.metadata()?.len();

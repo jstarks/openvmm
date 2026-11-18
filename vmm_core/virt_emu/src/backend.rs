@@ -8,7 +8,7 @@
 //! already-started device operation completes. Cancelling its run future poisons
 //! that VP rather than reissuing a possibly side-effecting operation.
 
-use crate::native_memory::{NativeRam, RamError};
+use crate::native_memory::{PartitionMemory, RamError};
 use crate::{state_from_registers, update_registers};
 use futures::task::AtomicWaker;
 use hvdef::Vtl;
@@ -25,8 +25,8 @@ use virt::vp::{self, AccessVpState};
 use virt::x86::{SegmentRegister, TableRegister};
 use virt::{
     BindProcessor, Hypervisor, InitialVpStateSource, NeedsYield, Partition, PartitionCapabilities,
-    PartitionConfig, PlatformInfo, Processor, ProtoPartition, ProtoPartitionConfig,
-    ProtoPartitionIsolation, StopVp, VpHaltReason, VpIndex,
+    PartitionConfig, PartitionMemoryMap, PlatformInfo, Processor, ProtoPartition,
+    ProtoPartitionConfig, ProtoPartitionIsolation, StopVp, VpHaltReason, VpIndex,
 };
 use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
 use x86_system::arch::apic::registers::LocalApic;
@@ -174,6 +174,7 @@ pub struct EmuProtoPartition {
 pub struct EmuPartition {
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
+    ram: Arc<PartitionMemory>,
 }
 
 enum CpuLifecycle {
@@ -205,7 +206,7 @@ struct VpState {
 /// Owns the sole CPU context across bindings.
 pub struct EmuProcessorBinder {
     state: VpState,
-    ram: Arc<NativeRam>,
+    ram: Arc<PartitionMemory>,
     ram_ranges: Arc<[MemoryRange]>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
@@ -215,7 +216,7 @@ pub struct EmuProcessorBinder {
 /// Bound access to that CPU context and the real VP run loop.
 pub struct EmuProcessor<'a> {
     state: &'a mut VpState,
-    ram: Arc<NativeRam>,
+    ram: Arc<PartitionMemory>,
     ram_ranges: Arc<[MemoryRange]>,
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
@@ -417,9 +418,11 @@ impl ProtoPartition for EmuProtoPartition {
             return Err(Error::Profile("no RAM"));
         }
         let control = Arc::new(Control::new(self.architectural_apic));
+        let ram = Arc::new(PartitionMemory::new());
         let partition = EmuPartition {
             caps: self.caps.clone(),
             control: control.clone(),
+            ram: ram.clone(),
         };
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
@@ -447,7 +450,7 @@ impl ProtoPartition for EmuProtoPartition {
                 io_active: false,
                 fault: None,
             },
-            ram: Arc::new(NativeRam::new(config.guest_memory.clone())),
+            ram,
             ram_ranges: ram_ranges.into(),
             caps: self.caps,
             control,
@@ -527,6 +530,39 @@ impl Partition for EmuPartition {
         }
         self.control.yield_requested.request_yield();
         self.control.waker.wake();
+    }
+}
+
+// UNSAFETY: Forwards the caller's mapping lifetime contract to the owned map.
+#[expect(unsafe_code)]
+impl PartitionMemoryMap for EmuPartition {
+    unsafe fn map_range(
+        &self,
+        data: *mut u8,
+        size: usize,
+        addr: u64,
+        writable: bool,
+        exec: bool,
+    ) -> anyhow::Result<()> {
+        // SAFETY: the caller keeps the backing valid until unmap completes.
+        unsafe { self.ram.map_range(data, size, addr, writable, exec) }
+    }
+
+    fn unmap_range(&self, addr: u64, size: u64) -> anyhow::Result<()> {
+        self.ram.unmap_range(addr, size)
+    }
+
+    #[cfg(windows)]
+    unsafe fn map_remote_range(
+        &self,
+        _process: std::os::windows::io::BorrowedHandle<'_>,
+        _data: *mut u8,
+        _size: usize,
+        _addr: u64,
+        _writable: bool,
+        _exec: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("emulator requires local process memory mappings")
     }
 }
 
@@ -618,56 +654,62 @@ impl Processor for EmuProcessor<'_> {
             let offer = self.state.apic_offer;
             #[cfg(test)]
             let boundary_in_batch = self.state.boundary_in_batch;
-            let batch = match core.run(
-                &*self.ram,
-                RunBudget {
-                    memory_effects: 64,
-                    steps: 64,
-                },
-                |address, width| {
-                    (0..u64::from(width)).all(|offset| {
-                        !self.ram_ranges.iter().any(|range| {
-                            address + offset >= range.start() && address + offset < range.end()
+            let result = {
+                let access = self.ram.access();
+                let ram = access.ram();
+                core.run(
+                    &ram,
+                    RunBudget {
+                        memory_effects: 64,
+                        steps: 64,
+                    },
+                    |address, width| {
+                        (0..u64::from(width)).all(|offset| {
+                            !self.ram_ranges.iter().any(|range| {
+                                address + offset >= range.start() && address + offset < range.end()
+                            })
                         })
-                    })
-                },
-                |core| {
-                    #[cfg(test)]
-                    if !boundary_in_batch {
-                        return true;
-                    }
-                    if core.halted() {
-                        // Arm the timer timeout before registering the halt wait.
-                        return true;
-                    }
-                    if core.at_instruction_boundary() && checkpoint == Some(core.cpu().rip) {
-                        return true;
-                    }
-                    if self.control.unsupported.load(Ordering::Acquire)
-                        || self.control.apic_work_pending()
-                        || self.control.pending.load(Ordering::Acquire) != 0
-                    {
-                        return true;
-                    }
-                    if core.pending().is_some() {
-                        return false;
-                    }
-                    if offer.is_some() {
-                        return true;
-                    }
-                    if core.cpu().flags & 0x200 == 0 || core.shadow() {
-                        return false;
-                    }
-                    candidate.is_some()
-                        || match deadline {
-                            Some(x86_system::arch::apic::timer::Deadline::At(value)) => {
-                                self.clock.now().as_100ns() >= apic::deadline_time(value).as_100ns()
-                            }
-                            Some(x86_system::arch::apic::timer::Deadline::BeyondClock) => true,
-                            _ => false,
+                    },
+                    |core| {
+                        #[cfg(test)]
+                        if !boundary_in_batch {
+                            return true;
                         }
-                },
-            ) {
+                        if core.halted() {
+                            // Arm the timer timeout before registering the halt wait.
+                            return true;
+                        }
+                        if core.at_instruction_boundary() && checkpoint == Some(core.cpu().rip) {
+                            return true;
+                        }
+                        if self.control.unsupported.load(Ordering::Acquire)
+                            || self.control.apic_work_pending()
+                            || self.control.pending.load(Ordering::Acquire) != 0
+                        {
+                            return true;
+                        }
+                        if core.pending().is_some() {
+                            return false;
+                        }
+                        if offer.is_some() {
+                            return true;
+                        }
+                        if core.cpu().flags & 0x200 == 0 || core.shadow() {
+                            return false;
+                        }
+                        candidate.is_some()
+                            || match deadline {
+                                Some(x86_system::arch::apic::timer::Deadline::At(value)) => {
+                                    self.clock.now().as_100ns()
+                                        >= apic::deadline_time(value).as_100ns()
+                                }
+                                Some(x86_system::arch::apic::timer::Deadline::BeyondClock) => true,
+                                _ => false,
+                            }
+                    },
+                )
+            };
+            let batch = match result {
                 Ok(batch) => batch,
                 Err(RunError::DecodeCompletion(_)) => {
                     return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));

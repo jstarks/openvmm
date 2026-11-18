@@ -8,9 +8,11 @@
 mod native {
     use guestmem::GuestMemory;
     use std::io;
+    use std::sync::Arc;
     use std::time::Instant;
     use strudel::{Machine, RunBudget, Stop as BatchStop};
-    use virt_emu::native_memory::NativeRam;
+    use virt::PartitionMemoryMap;
+    use virt_emu::native_memory::PartitionMemory;
     use x86_system::arch::system::{SegmentState, SystemState};
     use x86_system::{Config, CpuState, State, Tables};
 
@@ -19,12 +21,22 @@ mod native {
     const LOOPS: usize = 20_000;
 
     pub fn run() -> Result<(), Error> {
-        let memory = GuestMemory::allocate(0x80000);
+        let backing = Arc::new(sparse_mmap::SparseMapping::new(0x80000)?);
+        backing.alloc(0, 0x80000)?;
+        let memory = GuestMemory::new("decode-device-view", backing.clone());
         let instructions = [
             0x49, 0x89, 0xf7, 0x4c, 0x8d, 0x35, 0, 0, 0, 0, 0xba, 0x01, 0x01, 0, 0xc0,
         ];
         memory.write_at(CODE, &instructions.repeat(LOOPS))?;
-        let ram = NativeRam::new(memory.clone());
+        let mappings = PartitionMemory::new();
+        // SAFETY: backing outlives the mapping table and synchronous access lease.
+        // UNSAFETY: Installs this example's owned backing in the partition view.
+        #[expect(unsafe_code)]
+        unsafe {
+            mappings.map_range(backing.as_ptr().cast(), 0x80000, 0, true, true)?;
+        }
+        let access = mappings.access();
+        let ram = access.ram();
         for trial in 0..3 {
             for (address, value) in [(0x1000, 0x2007u64), (0x2000, 0x3007), (0x3000, 0x4007)] {
                 memory.write_plain(address, &value)?;

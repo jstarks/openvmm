@@ -1,14 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Native x86-64 lowering for coherent WB RAM, not an MMIO implementation.
+//! Scoped native x86-64 access to partition-provided coherent WB mappings.
 //!
-//! Data caching and buffering belong to the host CPU. Accesses use side-effecting
-//! native transport; guest barriers/serializing events explicitly call `barrier`.
-//! This host-ISA-specific implementation does not apply to weaker host ISAs.
+//! The partition's mapping owner reserves backing until synchronous unmap has
+//! returned. Each synchronous CPU batch holds one shared mapping lease, never
+//! across an await. Concurrent CPU batches and external DMA share the backing;
+//! mapping changes wait for all leases, not for individual memory operations.
 
-use guestmem::{GuestMemory, GuestMemoryError};
+// UNSAFETY: partition-owned reservations are accessed only under a mapping lease
+// through fault-recoverable trycopy primitives, without creating Rust references.
+#![allow(unsafe_code)]
+
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::sync::atomic::{Ordering, fence};
+use virt::PartitionMemoryMap;
 use x86_system::arch::integer;
 use x86_system::memory::physical::{
     self as physical, AtomicOperation, AtomicResult, CopyError, CopyErrorKind, PhysicalRam,
@@ -17,9 +23,177 @@ use x86_system::memory::physical::{
 /// Failure of the physical RAM interface, not an architectural guest exception.
 #[derive(Debug, thiserror::Error)]
 pub enum RamError {
-    /// OpenVMM could not access the backing.
+    /// There is no mapping covering the requested address.
+    #[error("unmapped physical address {0:#x}")]
+    Unmapped(u64),
+    /// The mapping does not permit writes.
+    #[error("physical mapping at {0:#x} is read-only")]
+    ReadOnly(u64),
+    /// The requested range wraps the address space.
+    #[error("physical address range overflow")]
+    AddressOverflow,
+    /// A scalar cannot be lowered to one host memory instruction.
+    #[error("scalar access crosses noncontiguous host mappings at {0:#x}")]
+    SplitAccess(u64),
+    /// The reserved backing could not be accessed. No recovery is invented.
     #[error("accessing physical RAM")]
-    Memory(#[from] GuestMemoryError),
+    Memory(#[from] trycopy::MemoryError),
+}
+
+/// Invalid partition mapping metadata.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MapError {
+    /// A mapping must reserve at least one byte.
+    #[error("empty physical mapping")]
+    Empty,
+    /// The physical or host range wraps, or the host pointer is null.
+    #[error("invalid physical or host mapping range")]
+    InvalidRange,
+    /// Host and guest natural scalar alignment must agree.
+    #[error("host and guest mapping alignment differ modulo eight")]
+    Misaligned,
+    /// Mappings must not overlap.
+    #[error("physical mapping overlaps an existing range")]
+    Overlap,
+    /// The unmap request must completely contain every intersecting mapping.
+    #[error("unmap range only partially contains an existing mapping")]
+    PartialUnmap,
+    /// Fetch permissions cannot yet be distinguished from data permissions.
+    #[error("non-executable mappings require fetch-qualified RAM access")]
+    NonExecutable,
+}
+
+#[derive(Debug)]
+struct Mapping {
+    start: u64,
+    end: u64,
+    data: *mut u8,
+    writable: bool,
+}
+
+// SAFETY: map_range's caller keeps the reservation alive and permits shared
+// native access until unmap returns. No Rust references to its bytes are made.
+unsafe impl Send for Mapping {}
+// SAFETY: shared access uses trycopy's concurrent native-memory primitives.
+unsafe impl Sync for Mapping {}
+
+/// Partition mapping metadata, not an owner of the underlying allocation.
+///
+/// The unsafe mapping API requires the caller to reserve shared WB backing
+/// until `unmap_range` returns (or this object is destroyed). Unmap drains all
+/// active leases before returning, so the owner can then reclaim the backing.
+/// `PhysicalRam` has no execute access tag, so non-executable mappings are
+/// rejected rather than silently permitting instruction fetch. Guest execute
+/// permission never changes host executable permissions.
+#[derive(Debug, Default)]
+pub struct PartitionMemory {
+    mappings: RwLock<Vec<Mapping>>,
+}
+
+impl PartitionMemory {
+    /// Creates an empty partition mapping table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Leases the mappings for one synchronous CPU batch.
+    ///
+    /// Drop the lease before awaiting or calling map/unmap on this table.
+    /// Readers may coexist; no exclusive CPU execution lock is acquired.
+    ///
+    /// ```
+    /// let memory = virt_emu::native_memory::PartitionMemory::new();
+    /// {
+    ///     let access = memory.access();
+    ///     let ram = access.ram();
+    ///     // Pass &ram to synchronous CPU execution here.
+    /// }
+    /// // Mapping changes or asynchronous work may now proceed.
+    /// ```
+    pub fn access(&self) -> NativeAccess<'_> {
+        // Default construction must initialize recovery too.
+        trycopy::initialize_try_copy();
+        NativeAccess {
+            mappings: self.mappings.read(),
+        }
+    }
+
+    /// Orders RAM, not translation invalidation or device-I/O completion.
+    pub fn barrier(&self) {
+        fence(Ordering::SeqCst);
+    }
+}
+
+impl PartitionMemoryMap for PartitionMemory {
+    unsafe fn map_range(
+        &self,
+        data: *mut u8,
+        size: usize,
+        addr: u64,
+        writable: bool,
+        exec: bool,
+    ) -> anyhow::Result<()> {
+        if !exec {
+            return Err(MapError::NonExecutable.into());
+        }
+        if size == 0 {
+            return Err(MapError::Empty.into());
+        }
+        let end = addr
+            .checked_add(u64::try_from(size).map_err(|_| MapError::InvalidRange)?)
+            .ok_or(MapError::InvalidRange)?;
+        if data.is_null() || (data as usize).checked_add(size).is_none() {
+            return Err(MapError::InvalidRange.into());
+        }
+        if (data as usize & 7) != (addr as usize & 7) {
+            return Err(MapError::Misaligned.into());
+        }
+        let mut mappings = self.mappings.write();
+        let index = mappings.partition_point(|mapping| mapping.start < addr);
+        if index != 0 && mappings[index - 1].end > addr
+            || index < mappings.len() && mappings[index].start < end
+        {
+            return Err(MapError::Overlap.into());
+        }
+        mappings.insert(
+            index,
+            Mapping {
+                start: addr,
+                end,
+                data,
+                writable,
+            },
+        );
+        Ok(())
+    }
+
+    fn unmap_range(&self, addr: u64, size: u64) -> anyhow::Result<()> {
+        let end = addr.checked_add(size).ok_or(MapError::InvalidRange)?;
+        let mut mappings = self.mappings.write();
+        if size == 0 {
+            return Ok(());
+        }
+        if mappings.iter().any(|mapping| {
+            mapping.start < end && addr < mapping.end && (mapping.start < addr || end < mapping.end)
+        }) {
+            return Err(MapError::PartialUnmap.into());
+        }
+        mappings.retain(|mapping| !(addr <= mapping.start && mapping.end <= end));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    unsafe fn map_remote_range(
+        &self,
+        _process: std::os::windows::io::BorrowedHandle<'_>,
+        _data: *mut u8,
+        _size: usize,
+        _addr: u64,
+        _writable: bool,
+        _exec: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("native RAM requires mappings in the current process")
+    }
 }
 
 /// Result of conditionally marking the exact PTE a walker observed.
@@ -33,19 +207,125 @@ pub enum AdUpdate {
     NotPresent,
 }
 
-/// Shared coherent WB view of existing OpenVMM backing.
+/// Read-side mapping lease for a synchronous CPU batch.
 ///
-/// GuestMemory owns backing resolution and bounds. Callers independently classify
-/// RAM versus MMIO; transport failures are not device classification.
-#[derive(Clone, Debug)]
-pub struct NativeRam {
-    memory: GuestMemory,
+/// This guard is not Send. Drop it before awaiting, even on a local executor,
+/// and before changing this partition's mappings. Borrow its native RAM view
+/// with `ram()` for the duration of synchronous execution.
+#[derive(Debug)]
+#[must_use]
+pub struct NativeAccess<'a> {
+    mappings: RwLockReadGuard<'a, Vec<Mapping>>,
 }
 
-impl NativeRam {
-    /// Creates a native view without duplicating GuestMemory's backing metadata.
-    pub fn new(memory: GuestMemory) -> Self {
-        Self { memory }
+impl NativeAccess<'_> {
+    /// Borrows a concurrent-capable view without acquiring another lock.
+    pub fn ram(&self) -> NativeRam<'_> {
+        NativeRam {
+            mappings: &self.mappings,
+        }
+    }
+}
+
+/// Native RAM view borrowing a live mapping lease.
+///
+/// No host pointer escapes this view. Callers classify RAM versus MMIO
+/// independently of transport failures.
+/// A scalar spanning adjacent mappings requires contiguous host backing;
+/// discontiguous ranges must use the prefix-reporting bulk interface.
+///
+/// ```compile_fail
+/// let memory = virt_emu::native_memory::PartitionMemory::new();
+/// let ram = {
+///     let access = memory.access();
+///     access.ram()
+/// };
+/// drop(ram); // A view cannot outlive its mapping lease.
+/// ```
+#[derive(Debug)]
+pub struct NativeRam<'a> {
+    mappings: &'a [Mapping],
+}
+
+impl NativeRam<'_> {
+    fn mapping(&self, address: u64, write: bool) -> Result<&Mapping, RamError> {
+        let index = self
+            .mappings
+            .partition_point(|mapping| mapping.start <= address);
+        let mapping = index
+            .checked_sub(1)
+            .and_then(|index| self.mappings.get(index))
+            .filter(|mapping| address < mapping.end)
+            .ok_or(RamError::Unmapped(address))?;
+        if write && !mapping.writable {
+            return Err(RamError::ReadOnly(address));
+        }
+        Ok(mapping)
+    }
+
+    fn pointer(&self, address: u64, size: usize, write: bool) -> Result<*mut u8, RamError> {
+        let end = address
+            .checked_add(size as u64)
+            .ok_or(RamError::AddressOverflow)?;
+        let first = self.mapping(address, write)?;
+        let pointer = first.data.wrapping_add((address - first.start) as usize);
+        let mut current = first.end;
+        while current < end {
+            let next = self.mapping(current, write)?;
+            if next.data != pointer.wrapping_add((current - address) as usize) {
+                return Err(RamError::SplitAccess(current));
+            }
+            current = next.end;
+        }
+        Ok(pointer)
+    }
+
+    fn copy_width(&self, address: u64, remaining: usize, write: bool) -> Result<usize, RamError> {
+        let mapping = self.mapping(address, write)?;
+        let remaining = remaining.min((mapping.end - address) as usize);
+        Ok(if remaining >= 8 && address.is_multiple_of(8) {
+            8
+        } else if remaining >= 4 && address.is_multiple_of(4) {
+            4
+        } else if remaining >= 2 && address.is_multiple_of(2) {
+            2
+        } else {
+            1
+        })
+    }
+
+    fn copy_bytes(
+        &self,
+        address: u64,
+        length: usize,
+        write: bool,
+        mut copy: impl FnMut(u64, usize, usize) -> Result<(), RamError>,
+    ) -> Result<(), CopyError<RamError>> {
+        if length != 0 && address.checked_add((length - 1) as u64).is_none() {
+            return Err(CopyError {
+                completed: 0,
+                kind: CopyErrorKind::AddressOverflow,
+            });
+        }
+        let mut completed = 0;
+        // Naturally aligned scalar chunks cannot cross a host page boundary.
+        // Unlike a general memmove, each failure therefore leaves an exact
+        // known prefix; never retry a committed store or a faulting chunk.
+        while completed < length {
+            let current = address + completed as u64;
+            let width = self
+                .copy_width(current, length - completed, write)
+                .map_err(|error| CopyError {
+                    completed,
+                    kind: CopyErrorKind::Memory(error),
+                })?;
+            copy(current, completed, width).map_err(|error| CopyError {
+                completed,
+                kind: CopyErrorKind::Memory(error),
+            })?;
+            completed += width;
+        }
+        Ok(())
     }
 
     /// Marks A and optionally D only if the PTE still equals the observation.
@@ -81,27 +361,63 @@ impl NativeRam {
     }
 }
 
-impl PhysicalRam for NativeRam {
+impl PhysicalRam for NativeRam<'_> {
     type Error = RamError;
 
     fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
-        let result = self.memory.read_plain::<[u8; N]>(address);
-        Ok(result?)
+        let pointer = self.pointer(address, N, false)?;
+        // SAFETY: the lease reserves the complete range. Byte arrays have no
+        // validity or alignment restriction; trycopy uses one exact-width load.
+        Ok(unsafe { trycopy::try_read_volatile(pointer.cast::<[u8; N]>()) }?)
     }
 
     fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
-        let result = self.memory.write_plain(address, &value);
-        Ok(result?)
+        let pointer = self.pointer(address, N, true)?;
+        // SAFETY: the lease reserves writable shared backing for the complete
+        // scalar. One exact-width store performs no destination read.
+        Ok(unsafe { trycopy::try_write_volatile(pointer.cast(), &value) }?)
     }
 
     fn read_bytes(&self, address: u64, destination: &mut [u8]) -> Result<(), CopyError<RamError>> {
-        physical::read_bytes(self, address, destination)
+        self.copy_bytes(
+            address,
+            destination.len(),
+            false,
+            |current, offset, width| {
+                macro_rules! read {
+                    ($n:literal) => {
+                        self.read::<$n>(current)
+                            .map(|value| destination[offset..offset + $n].copy_from_slice(&value))
+                    };
+                }
+                match width {
+                    8 => read!(8),
+                    4 => read!(4),
+                    2 => read!(2),
+                    _ => read!(1),
+                }
+            },
+        )
     }
 
     fn write_bytes(&self, address: u64, source: &[u8]) -> Result<(), CopyError<RamError>> {
-        physical::write_bytes(self, address, source)
+        self.copy_bytes(address, source.len(), true, |current, offset, width| {
+            macro_rules! write {
+                ($n:literal) => {{
+                    let mut value = [0; $n];
+                    value.copy_from_slice(&source[offset..offset + $n]);
+                    self.write(current, value)
+                }};
+            }
+            match width {
+                8 => write!(8),
+                4 => write!(4),
+                2 => write!(2),
+                _ => write!(1),
+            }
+        })
     }
 
     fn atomic(
@@ -119,8 +435,11 @@ impl PhysicalRam for NativeRam {
         }
         let failure = |error| CopyError {
             completed: 0,
-            kind: CopyErrorKind::Memory(RamError::Memory(error)),
+            kind: CopyErrorKind::Memory(error),
         };
+        let pointer = self
+            .pointer(address, usize::from(width), true)
+            .map_err(failure)?;
         if let AtomicOperation::CompareExchange {
             expected,
             replacement,
@@ -128,9 +447,15 @@ impl PhysicalRam for NativeRam {
         {
             macro_rules! exchange {
                 ($ty:ty) => {{
-                    let result =
-                        self.memory
-                            .compare_exchange(address, expected as $ty, replacement as $ty);
+                    // SAFETY: the lease reserves writable backing; mapping
+                    // alignment preserves the validated natural alignment.
+                    let result = unsafe {
+                        trycopy::try_compare_exchange(
+                            pointer.cast::<$ty>(),
+                            expected as $ty,
+                            replacement as $ty,
+                        )
+                    };
                     result.map(|value| {
                         AtomicResult::Value(u64::from(match value {
                             Ok(_) => expected as $ty,
@@ -146,9 +471,9 @@ impl PhysicalRam for NativeRam {
                 8 => exchange!(u64),
                 _ => return Err(invalid()),
             }
-            .map_err(failure);
+            .map_err(|error| failure(error.into()));
         }
-        use guestmem::AtomicOperation as Native;
+        use trycopy::AtomicOperation as Native;
         let (operation, source, flags) = match operation {
             AtomicOperation::Exchange { replacement } => (Native::Exchange, replacement, 0),
             AtomicOperation::FetchAdd { source } => (Native::FetchAdd, source, 0),
@@ -188,13 +513,18 @@ impl PhysicalRam for NativeRam {
             }
             AtomicOperation::CompareExchange { .. } => return Err(invalid()),
         };
-        let result = self.memory.atomic(address, width, operation, source, flags);
+        // SAFETY: the validated operand is naturally aligned and completely
+        // reserved and writable for this lease. There is no preliminary read.
+        let result = unsafe { trycopy::try_atomic(pointer, width, operation, source, flags) };
         result
             .map(|result| match result {
-                guestmem::AtomicResult::Value(value) => AtomicResult::Value(value),
-                guestmem::AtomicResult::Flags(flags) => AtomicResult::Flags(flags),
+                trycopy::AtomicResult::Value(value) => AtomicResult::Value(value),
+                trycopy::AtomicResult::Flags(flags) => AtomicResult::Flags(flags),
             })
-            .map_err(failure)
+            .map_err(|error| match error {
+                trycopy::AtomicError::Memory(error) => failure(error.into()),
+                _ => invalid(),
+            })
     }
 
     fn barrier(&self) {
@@ -205,18 +535,38 @@ impl PhysicalRam for NativeRam {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparse_mmap::SparseMapping;
+    use std::ops::Deref;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use test_with_tracing::test;
     use x86_system::arch::operand::Width;
 
-    fn fixture() -> (GuestMemory, NativeRam) {
-        let memory = GuestMemory::allocate(4096);
-        let ram = NativeRam::new(memory.clone());
-        (memory, ram)
+    struct TestMemory {
+        // The metadata must be destroyed before the backing reservation.
+        partition: PartitionMemory,
+        backing: SparseMapping,
     }
 
-    fn read(ram: &NativeRam, address: u64, width: u8) -> u64 {
+    impl Deref for TestMemory {
+        type Target = SparseMapping;
+
+        fn deref(&self) -> &SparseMapping {
+            &self.backing
+        }
+    }
+
+    fn fixture() -> TestMemory {
+        let backing = SparseMapping::new(4096).unwrap();
+        backing.alloc(0, 4096).unwrap();
+        let partition = PartitionMemory::new();
+        // SAFETY: TestMemory owns both objects, destroying the table before the
+        // allocation. All byte access uses concurrent-capable native primitives.
+        unsafe { partition.map_range(backing.as_ptr().cast(), 4096, 0, true, true) }.unwrap();
+        TestMemory { partition, backing }
+    }
+
+    fn read(ram: &NativeRam<'_>, address: u64, width: u8) -> u64 {
         match width {
             1 => u64::from(u8::from_le_bytes(ram.read(address).unwrap())),
             2 => u64::from(u16::from_le_bytes(ram.read(address).unwrap())),
@@ -226,7 +576,7 @@ mod tests {
         }
     }
 
-    fn write(ram: &NativeRam, address: u64, width: u8, value: u64) {
+    fn write(ram: &NativeRam<'_>, address: u64, width: u8, value: u64) {
         match width {
             1 => ram.write(address, (value as u8).to_le_bytes()),
             2 => ram.write(address, (value as u16).to_le_bytes()),
@@ -239,7 +589,9 @@ mod tests {
 
     #[test]
     fn all_contained_widths_preserve_neighbor_bytes() {
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         for width in [1u8, 2, 4, 8] {
             for offset in 0..=8 - width {
                 let original = [0xa5; 8];
@@ -259,12 +611,17 @@ mod tests {
         }
         ram.write(7, 0x1234u16.to_le_bytes()).unwrap();
         assert_eq!(read(&ram, 7, 2), 0x1234);
-        assert!(matches!(ram.write(4096, [1; 8]), Err(RamError::Memory(_))));
+        assert!(matches!(
+            ram.write(4096, [1; 8]),
+            Err(RamError::Unmapped(4096))
+        ));
     }
 
     #[test]
     fn byte_copies_share_existing_backing_and_report_partial_failures() {
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         let source: Vec<_> = (0..37).map(|i| (i * 17 + 3) as u8).collect();
         for offset in 0..8 {
             memory.write_at(0, &[0xa5; 64]).unwrap();
@@ -274,7 +631,7 @@ mod tests {
             let mut expected = [0xa5; 64];
             expected[offset as usize..offset as usize + source.len()].copy_from_slice(&source);
             assert_eq!(actual, expected);
-            memory.write_at(offset, &[0x77; 37]).unwrap();
+            memory.write_at(offset as usize, &[0x77; 37]).unwrap();
             let mut copied = [0; 37];
             ram.read_bytes(offset, &mut copied).unwrap();
             assert_eq!(copied, [0x77; 37]);
@@ -283,7 +640,7 @@ mod tests {
         assert_eq!(error.completed, 11);
         assert!(matches!(
             error.kind,
-            CopyErrorKind::Memory(RamError::Memory(_))
+            CopyErrorKind::Memory(RamError::Unmapped(4096))
         ));
         let mut prefix = [0; 11];
         memory.read_at(4085, &mut prefix).unwrap();
@@ -297,7 +654,9 @@ mod tests {
 
     #[test]
     fn exact_byte_ranges_and_unaligned_values_preserve_neighbors() {
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         memory.write_at(0, &[0xa5; 16]).unwrap();
         let value = 0x1122_3344_5566_7788u64;
         ram.write_bytes(3, &value.to_le_bytes()).unwrap();
@@ -371,7 +730,9 @@ mod tests {
                     });
                 }
                 for operation in operations {
-                    let (memory, ram) = fixture();
+                    let memory = fixture();
+                    let access = memory.partition.access();
+                    let ram = access.ram();
                     memory.write_at(0, &[0xa5; 4096]).unwrap();
                     write(&ram, address, width, 0x5a);
                     let mut before = [0; 4096];
@@ -417,7 +778,9 @@ mod tests {
 
     #[test]
     fn invalid_atomic_profiles_never_modify_ram() {
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         memory.write_at(0, &[0x5a; 32]).unwrap();
         let exchange = AtomicOperation::Exchange { replacement: 0 };
         for (address, width, operation) in [
@@ -455,7 +818,9 @@ mod tests {
 
     #[test]
     fn cpu_and_dma_workers_do_not_lose_disjoint_byte_writes() {
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         let start = Arc::new(Barrier::new(3));
         thread::scope(|scope| {
             for lane in 0..3 {
@@ -466,7 +831,9 @@ mod tests {
                     start.wait();
                     for value in 0..2000 {
                         if lane == 2 {
-                            memory.write_plain(lane, &((value + lane) as u8)).unwrap();
+                            memory
+                                .write_volatile(lane as usize, &((value + lane) as u8))
+                                .unwrap();
                         } else {
                             ram.write(lane, [(value + lane) as u8]).unwrap();
                         }
@@ -479,7 +846,9 @@ mod tests {
 
     #[test]
     fn concurrent_native_qword_accesses_do_not_tear() {
-        let (_, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         let start = Arc::new(Barrier::new(3));
         let values = [0x5555aaaa5555aaaau64, 0xaaaa5555aaaa5555];
         thread::scope(|scope| {
@@ -507,9 +876,11 @@ mod tests {
 
     #[test]
     fn pte_replacement_between_read_and_ad_update_is_not_overwritten() {
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         for replacement in [0x3007, 0x3006] {
-            memory.write_plain(0, &0x2007u64).unwrap();
+            memory.write_volatile(0, &0x2007u64).unwrap();
             let seen = Arc::new(Barrier::new(2));
             let changed = Arc::new(Barrier::new(2));
             thread::scope(|scope| {
@@ -526,7 +897,7 @@ mod tests {
                     );
                 });
                 seen.wait();
-                memory.write_plain(0, &replacement).unwrap();
+                memory.write_volatile(0, &replacement).unwrap();
                 changed.wait();
             });
             assert_eq!(memory.read_plain::<u64>(0).unwrap(), replacement);
@@ -536,7 +907,9 @@ mod tests {
 
     #[test]
     fn ad_updates_race_with_dma_without_losing_pte_payload() {
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         write(&ram, 0, 8, 0x2007);
         let start = Arc::new(Barrier::new(2));
         thread::scope(|scope| {
@@ -546,7 +919,7 @@ mod tests {
             scope.spawn(move || {
                 start_dma.wait();
                 for value in 1..2000 {
-                    memory.write_plain(4, &(value as u32)).unwrap();
+                    memory.write_volatile(4, &(value as u32)).unwrap();
                 }
             });
             start.wait();
@@ -564,7 +937,9 @@ mod tests {
 
     #[test]
     fn native_wb_message_passing_preserves_store_order() {
-        let (_, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         thread::scope(|scope| {
             let ram = &ram;
             scope.spawn(move || {
@@ -581,30 +956,32 @@ mod tests {
 
     #[test]
     fn existing_multi_region_backing_and_direct_writers_are_shared() {
-        let memory = GuestMemory::new_multi_region(
-            "native-ram-multi",
-            4096,
-            vec![
-                Some(guestmem::AlignedHeapMemory::new(4096)),
-                None,
-                Some(guestmem::AlignedHeapMemory::new(4096)),
-            ],
-        )
+        let memory = fixture();
+        let second = SparseMapping::new(4096).unwrap();
+        second.alloc(0, 4096).unwrap();
+        // SAFETY: second stays reserved until its mapping is explicitly removed.
+        unsafe {
+            memory
+                .partition
+                .map_range(second.as_ptr().cast(), 4096, 8192, true, true)
+        }
         .unwrap();
-        assert!(memory.full_mapping().is_none());
-        let ram = NativeRam::new(memory.clone());
-        memory.write_plain(8192, &0x1122334455667788u64).unwrap();
+        let access = memory.partition.access();
+        let ram = access.ram();
+        second.write_volatile(0, &0x1122334455667788u64).unwrap();
         assert_eq!(read(&ram, 8192, 8), 0x1122334455667788);
         write(&ram, 16, 8, 0xabcdef);
         assert_eq!(memory.read_plain::<u64>(16).unwrap(), 0xabcdef);
-        assert!(matches!(ram.read::<8>(4096), Err(RamError::Memory(_))));
+        assert!(matches!(ram.read::<8>(4096), Err(RamError::Unmapped(4096))));
+        drop(access);
+        memory.partition.unmap_range(8192, 4096).unwrap();
     }
 
     #[test]
     fn neutral_core_interface_observes_direct_backing_mutations() {
-        fn exercise<M: PhysicalRam<Error = RamError>>(ram: &M, memory: &GuestMemory) {
+        fn exercise<M: PhysicalRam<Error = RamError>>(ram: &M, memory: &SparseMapping) {
             ram.write(0, 7u64.to_le_bytes()).unwrap();
-            memory.write_plain(0, &9u64).unwrap();
+            memory.write_volatile(0, &9u64).unwrap();
             assert_eq!(u64::from_le_bytes(ram.read(0).unwrap()), 9);
             for expected in [7, 9] {
                 assert_eq!(
@@ -623,7 +1000,288 @@ mod tests {
             ram.barrier();
             assert_eq!(memory.read_plain::<u64>(0).unwrap(), 11);
         }
-        let (memory, ram) = fixture();
+        let memory = fixture();
+        let access = memory.partition.access();
+        let ram = access.ram();
         exercise(&ram, &memory);
+    }
+
+    #[test]
+    fn mapping_metadata_and_permissions_are_validated_without_mutation() {
+        let memory = fixture();
+        let pointer = memory.as_ptr().cast::<u8>();
+        for (size, address, writable, exec, expected) in [
+            (0, 0, true, true, MapError::Empty),
+            (8, u64::MAX - 7, true, true, MapError::InvalidRange),
+            (8, 4097, true, true, MapError::Misaligned),
+            (8, 0, true, true, MapError::Overlap),
+            (4096, 2048, true, true, MapError::Overlap),
+            (8, 8192, true, false, MapError::NonExecutable),
+        ] {
+            // SAFETY: all requests are rejected; the backing remains reserved
+            // for the table's entire lifetime even if an overlap is encountered.
+            let error = unsafe {
+                memory
+                    .partition
+                    .map_range(pointer, size, address, writable, exec)
+            }
+            .unwrap_err();
+            assert_eq!(error.downcast_ref::<MapError>(), Some(&expected));
+        }
+        for pointer in [std::ptr::null_mut(), (usize::MAX - 7) as *mut u8] {
+            // SAFETY: invalid pointer metadata is rejected before recording a
+            // mapping or accessing the host address.
+            let error =
+                unsafe { memory.partition.map_range(pointer, 8, 8192, true, true) }.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<MapError>(),
+                Some(&MapError::InvalidRange)
+            );
+        }
+        assert_eq!(
+            memory
+                .partition
+                .unmap_range(1, 4095)
+                .unwrap_err()
+                .downcast_ref::<MapError>(),
+            Some(&MapError::PartialUnmap)
+        );
+        assert!(memory.partition.unmap_range(u64::MAX, 1).is_err());
+        memory.partition.unmap_range(1, 0).unwrap();
+        memory.partition.unmap_range(0, 4096).unwrap();
+        // SAFETY: the owner retains the same reservation until its table drops.
+        unsafe { memory.partition.map_range(pointer, 4096, 0, false, true) }.unwrap();
+        let access = memory.partition.access();
+        let ram = access.ram();
+        assert_eq!(ram.read::<8>(0).unwrap(), [0; 8]);
+        assert!(matches!(ram.write(0, [1; 8]), Err(RamError::ReadOnly(0))));
+        let error = ram
+            .atomic(
+                0,
+                8,
+                AtomicOperation::CompareExchange {
+                    expected: 1,
+                    replacement: 2,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            CopyErrorKind::Memory(RamError::ReadOnly(0))
+        ));
+        assert_eq!(memory.read_plain::<u64>(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn bulk_copies_cross_split_mappings_and_stop_at_permission_boundary() {
+        let memory = fixture();
+        memory.partition.unmap_range(0, 4096).unwrap();
+        let pointer = memory.as_ptr().cast::<u8>();
+        // SAFETY: both ranges borrow TestMemory's live reservation, and their
+        // guest/host offsets agree even at a non-scalar-aligned split.
+        unsafe {
+            memory
+                .partition
+                .map_range(pointer, 3, 0, true, true)
+                .unwrap();
+            memory
+                .partition
+                .map_range(pointer.add(3), 13, 3, true, true)
+                .unwrap();
+        }
+        {
+            let access = memory.partition.access();
+            let ram = access.ram();
+            ram.write(0, 0x1122334455667788u64.to_le_bytes()).unwrap();
+            assert_eq!(read(&ram, 0, 8), 0x1122334455667788);
+            ram.write_bytes(0, &[0x33; 16]).unwrap();
+            let mut output = [0; 16];
+            ram.read_bytes(0, &mut output).unwrap();
+            assert_eq!(output, [0x33; 16]);
+        }
+        memory.partition.unmap_range(3, 13).unwrap();
+        // SAFETY: same reservation; the second range is now read-only.
+        unsafe {
+            memory
+                .partition
+                .map_range(pointer.add(3), 13, 3, false, true)
+        }
+        .unwrap();
+        let access = memory.partition.access();
+        let ram = access.ram();
+        assert!(matches!(
+            ram.write(0, [0xff; 8]),
+            Err(RamError::ReadOnly(3))
+        ));
+        assert_eq!(memory.read_plain::<u64>(0).unwrap(), 0x3333333333333333);
+        let error = ram.write_bytes(0, &[0x44; 16]).unwrap_err();
+        assert_eq!(error.completed, 3);
+        assert!(matches!(
+            error.kind,
+            CopyErrorKind::Memory(RamError::ReadOnly(3))
+        ));
+        let mut output = [0; 16];
+        memory.read_at(0, &mut output).unwrap();
+        assert_eq!(&output[..3], &[0x44; 3]);
+        assert_eq!(&output[3..], &[0x33; 13]);
+    }
+
+    #[test]
+    fn discontiguous_scalar_is_rejected_but_bulk_preserves_exact_prefix() {
+        let memory = fixture();
+        memory.partition.unmap_range(0, 4096).unwrap();
+        let pointer = memory.as_ptr().cast::<u8>();
+        // SAFETY: two discontiguous subranges of the owner's live reservation.
+        unsafe {
+            memory
+                .partition
+                .map_range(pointer, 3, 0, true, true)
+                .unwrap();
+            memory
+                .partition
+                .map_range(pointer.add(19), 13, 3, true, true)
+                .unwrap();
+        }
+        let access = memory.partition.access();
+        let ram = access.ram();
+        assert!(matches!(
+            ram.write(0, [0x55; 8]),
+            Err(RamError::SplitAccess(3))
+        ));
+        assert_eq!(memory.read_plain::<u64>(0).unwrap(), 0);
+        let error = ram.write_bytes(0, &[0x77; 19]).unwrap_err();
+        assert_eq!(error.completed, 16);
+        assert!(matches!(
+            error.kind,
+            CopyErrorKind::Memory(RamError::Unmapped(16))
+        ));
+        let mut output = [0xa5; 19];
+        let error = ram.read_bytes(0, &mut output).unwrap_err();
+        assert_eq!(error.completed, 16);
+        assert_eq!(output[..16], [0x77; 16]);
+        assert_eq!(output[16..], [0xa5; 3]);
+        assert_eq!(memory.read_plain::<u8>(3).unwrap(), 0);
+        assert_eq!(memory.read_plain::<u8>(18).unwrap(), 0);
+        assert_eq!(memory.read_plain::<u8>(32).unwrap(), 0);
+    }
+
+    #[test]
+    fn inaccessible_reservation_reports_fault_and_exact_copy_prefix() {
+        let backing = SparseMapping::new(8192).unwrap();
+        backing.alloc(0, 4096).unwrap();
+        let partition = PartitionMemory::new();
+        // SAFETY: the whole VA range is reserved, although its second page is
+        // deliberately inaccessible. The table drops before the reservation.
+        unsafe { partition.map_range(backing.as_ptr().cast(), 8192, 0, true, true) }.unwrap();
+        let access = partition.access();
+        let ram = access.ram();
+        let error = ram.write_bytes(4085, &[0x33; 19]).unwrap_err();
+        assert_eq!(error.completed, 11);
+        assert!(matches!(
+            error.kind,
+            CopyErrorKind::Memory(RamError::Memory(_))
+        ));
+        let mut output = [0xa5; 19];
+        let error = ram.read_bytes(4085, &mut output).unwrap_err();
+        assert_eq!(error.completed, 11);
+        assert_eq!(output[..11], [0x33; 11]);
+        assert_eq!(output[11..], [0xa5; 8]);
+        assert!(matches!(
+            ram.write(4093, [0xff; 8]),
+            Err(RamError::Memory(_))
+        ));
+        let mut tail = [0; 3];
+        backing.read_at(4093, &mut tail).unwrap();
+        assert_eq!(tail, [0x33; 3]);
+        let error = ram
+            .atomic(4096, 8, AtomicOperation::FetchAdd { source: 1 })
+            .unwrap_err();
+        assert_eq!(error.completed, 0);
+        assert!(matches!(
+            error.kind,
+            CopyErrorKind::Memory(RamError::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn overflow_copies_commit_nothing_and_empty_copies_need_no_mapping() {
+        let partition = PartitionMemory::default();
+        let access = partition.access();
+        let ram = access.ram();
+        ram.write_bytes(u64::MAX, &[]).unwrap();
+        ram.read_bytes(u64::MAX, &mut []).unwrap();
+        let mut output = [0xa5; 8];
+        let error = ram.read_bytes(u64::MAX - 3, &mut output).unwrap_err();
+        assert_eq!(error.completed, 0);
+        assert!(matches!(error.kind, CopyErrorKind::AddressOverflow));
+        assert_eq!(output, [0xa5; 8]);
+        let error = ram.write_bytes(u64::MAX - 3, &[0; 8]).unwrap_err();
+        assert_eq!(error.completed, 0);
+        assert!(matches!(error.kind, CopyErrorKind::AddressOverflow));
+        assert!(matches!(
+            ram.read::<8>(u64::MAX - 3),
+            Err(RamError::AddressOverflow)
+        ));
+    }
+
+    #[test]
+    fn unmap_drains_active_leases_and_remap_observes_only_new_backing() {
+        use std::sync::mpsc;
+
+        let memory = fixture();
+        let replacement = SparseMapping::new(4096).unwrap();
+        replacement.alloc(0, 4096).unwrap();
+        memory.write_volatile(0, &11u64).unwrap();
+        replacement.write_volatile(0, &22u64).unwrap();
+        thread::scope(|scope| {
+            let access = memory.partition.access();
+            let ram = access.ram();
+            let (read_done, read_result) = mpsc::channel();
+            let partition = &memory.partition;
+            scope.spawn(move || {
+                let concurrent = partition.access();
+                read_done.send(read(&concurrent.ram(), 0, 8)).unwrap();
+            });
+            // A second batch must finish while the first lease is still live.
+            assert_eq!(read_result.recv().unwrap(), 11);
+            let (started, starting) = mpsc::channel();
+            let (finished, completion) = mpsc::channel();
+            scope.spawn(move || {
+                started.send(()).unwrap();
+                partition.unmap_range(0, 4096).unwrap();
+                finished.send(()).unwrap();
+            });
+            starting.recv().unwrap();
+            // Deterministically establish the held shared lease excludes any
+            // mapping writer; completion cannot depend on a scheduling delay.
+            assert!(partition.mappings.try_write().is_none());
+            assert!(matches!(
+                completion.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(read(&ram, 0, 8), 11);
+            drop(access);
+            completion.recv().unwrap();
+        });
+        assert!(matches!(
+            memory.partition.access().ram().read::<8>(0),
+            Err(RamError::Unmapped(0))
+        ));
+        // SAFETY: explicitly unmapped below before replacement is destroyed.
+        unsafe {
+            memory
+                .partition
+                .map_range(replacement.as_ptr().cast(), 4096, 0, true, true)
+        }
+        .unwrap();
+        {
+            let access = memory.partition.access();
+            let ram = access.ram();
+            assert_eq!(read(&ram, 0, 8), 22);
+            ram.write(0, 33u64.to_le_bytes()).unwrap();
+            assert_eq!(memory.read_plain::<u64>(0).unwrap(), 11);
+            assert_eq!(replacement.read_plain::<u64>(0).unwrap(), 33);
+        }
+        memory.partition.unmap_range(0, 4096).unwrap();
     }
 }

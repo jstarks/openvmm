@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Real-VP transport regression with destination reads forbidden.
+//! Real-VP direct mappings are independent of GuestMemory access permissions.
 
 // xtask-fmt allow-target-arch cpu-intrinsic -- Exercises the host x86 RAM provider.
 #![cfg(all(guest_arch = "x86_64", target_arch = "x86_64"))]
@@ -19,10 +19,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use virt::io::CpuIo;
 use virt::vp::AccessVpState;
 use virt::{
-    BindProcessor, PartitionConfig, Processor, ProtoPartition, ProtoPartitionConfig,
-    ProtoPartitionIsolation, StopVpSource, VpHaltReason, VpIndex,
+    BindProcessor, PartitionConfig, PartitionMemoryMap, Processor, ProtoPartition,
+    ProtoPartitionConfig, ProtoPartitionIsolation, StopVpSource, VpHaltReason, VpIndex,
 };
-use virt_emu::backend::{EmuHypervisor, long_mode_registers};
+use virt_emu::backend::{EmuHypervisor, EmuPartition, long_mode_registers};
 use vm_topology::memory::MemoryLayout;
 use vm_topology::processor::TopologyBuilder;
 use vm_topology::processor::x86::X2ApicState;
@@ -33,19 +33,19 @@ const SIZE: usize = 0x10000;
 const CODE: u64 = 0x6000;
 const DATA: u64 = 0x8000;
 
-struct WriteOnlyData {
+struct CpuOnlyBacking {
     memory: AlignedHeapMemory,
     read_bitmap: [u8; 2],
     write_bitmap: [u8; 2],
-    unexpected_reads: AtomicUsize,
+    guest_memory_faults: AtomicUsize,
 }
 
 // SAFETY: the aligned allocation and both bitmaps remain valid and stable for
 // the backing's lifetime. All mapped pages are committed. The immutable bitmap
-// denies direct reads of DATA, while permitting write-qualified accesses.
+// denies GuestMemory reads and writes independently of the CPU mapping.
 // UNSAFETY: Exposes stable mapping pointers for this transport regression.
 #[expect(unsafe_code)]
-unsafe impl GuestMemoryAccess for WriteOnlyData {
+unsafe impl GuestMemoryAccess for CpuOnlyBacking {
     fn mapping(&self) -> Option<NonNull<u8>> {
         self.memory.mapping()
     }
@@ -64,16 +64,51 @@ unsafe impl GuestMemoryAccess for WriteOnlyData {
 
     fn page_fault(
         &self,
-        address: u64,
+        _address: u64,
         _len: usize,
-        write: bool,
+        _write: bool,
         bitmap_failure: bool,
     ) -> PageFaultAction {
-        assert!(bitmap_failure && !write && (DATA..DATA + 4096).contains(&address));
-        self.unexpected_reads.fetch_add(1, Ordering::SeqCst);
+        assert!(bitmap_failure);
+        self.guest_memory_faults.fetch_add(1, Ordering::SeqCst);
         PageFaultAction::Fail(PageFaultError::other(std::io::Error::other(
-            "destination reads are forbidden",
+            "GuestMemory transport is forbidden",
         )))
+    }
+}
+
+struct CpuMapping<'a> {
+    partition: &'a EmuPartition,
+    _backing: Arc<CpuOnlyBacking>,
+}
+
+impl<'a> CpuMapping<'a> {
+    fn new(partition: &'a EmuPartition, backing: Arc<CpuOnlyBacking>) -> Self {
+        // SAFETY: this guard retains the shared allocation until synchronous
+        // unmap has drained all CPU leases.
+        // UNSAFETY: Installs the guard-owned backing in the CPU partition view.
+        #[expect(unsafe_code)]
+        unsafe {
+            partition
+                .map_range(
+                    backing.memory.mapping().unwrap().as_ptr(),
+                    SIZE,
+                    0,
+                    true,
+                    true,
+                )
+                .unwrap();
+        }
+        Self {
+            partition,
+            _backing: backing,
+        }
+    }
+}
+
+impl Drop for CpuMapping<'_> {
+    fn drop(&mut self) {
+        self.partition.unmap_range(0, SIZE as u64).unwrap();
     }
 }
 
@@ -103,13 +138,31 @@ impl CpuIo for NoDevices {
         panic!("no port I/O expected");
     }
     fn fatal_error(&self, error: Box<dyn std::error::Error + Send + Sync>) -> VpHaltReason {
-        self.0.lock().push(error.to_string());
+        let mut message = error.to_string();
+        let mut source = error.source();
+        while let Some(error) = source {
+            message.push_str(": ");
+            message.push_str(&error.to_string());
+            source = error.source();
+        }
+        self.0.lock().push(message);
         VpHaltReason::PowerOff
     }
 }
 
 #[async_test]
-async fn real_backend_narrow_stores_and_atomics_do_not_preload_destinations(driver: DefaultDriver) {
+async fn real_backend_stores_and_atomics_use_direct_mappings_not_guest_memory(
+    driver: DefaultDriver,
+) {
+    run_transport_fixture(&driver, true).await;
+}
+
+#[async_test]
+async fn guest_memory_without_partition_mapping_does_not_back_cpu_ram(driver: DefaultDriver) {
+    run_transport_fixture(&driver, false).await;
+}
+
+async fn run_transport_fixture(driver: &DefaultDriver, mapped: bool) {
     let program = [
         0xc6, 0x47, 0x01, 0x11, // mov byte [rdi+1],11h
         0x66, 0xc7, 0x47, 0x02, 0x33, 0x22, // mov word [rdi+2],2233h
@@ -134,21 +187,22 @@ async fn real_backend_narrow_stores_and_atomics_do_not_preload_destinations(driv
     bytes[0x5010..0x5018].copy_from_slice(&0x00cf93000000ffffu64.to_le_bytes());
     bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
     bytes[DATA as usize..DATA as usize + 16].fill(0xa5);
-    let backing = Arc::new(WriteOnlyData {
+    let backing = Arc::new(CpuOnlyBacking {
         memory: allocation,
-        read_bitmap: [0xff, 0xfe],
-        write_bitmap: [0xff; 2],
-        unexpected_reads: AtomicUsize::new(0),
+        read_bitmap: [0; 2],
+        write_bitmap: [0; 2],
+        guest_memory_faults: AtomicUsize::new(0),
     });
-    let memory = GuestMemory::new("write-only-cpu-data", backing.clone());
+    let memory = GuestMemory::new("no-guest-memory-cpu-transport", backing.clone());
     assert!(memory.read_plain::<u8>(DATA).is_err());
+    assert!(memory.write_plain(DATA, &0u8).is_err());
     let layout = MemoryLayout::new(SIZE as u64, &[] as &[MemoryRange], &[], &[], None).unwrap();
     let topology = TopologyBuilder::new_x86()
         .x2apic(X2ApicState::Unsupported)
         .build(1)
         .unwrap();
-    let keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
-    let time = keeper.builder().build(&driver).await.unwrap();
+    let keeper = VmTimeKeeper::new(driver, VmTime::from_100ns(0));
+    let time = keeper.builder().build(driver).await.unwrap();
     let proto = EmuHypervisor
         .new_legacy_fixture(ProtoPartitionConfig {
             processor_topology: &topology,
@@ -158,7 +212,7 @@ async fn real_backend_narrow_stores_and_atomics_do_not_preload_destinations(driv
             nested_virt: false,
         })
         .unwrap();
-    let (_partition, mut binders) = proto
+    let (partition, mut binders) = proto
         .build(PartitionConfig {
             mem_layout: &layout,
             guest_memory: &memory,
@@ -167,6 +221,7 @@ async fn real_backend_narrow_stores_and_atomics_do_not_preload_destinations(driv
             fault_resolver: None,
         })
         .unwrap();
+    let _mapping = mapped.then(|| CpuMapping::new(&partition, backing.clone()));
     let mut vp = binders[0].bind().unwrap();
     let mut state = State {
         gpr: [0; 16],
@@ -202,12 +257,27 @@ async fn real_backend_narrow_stores_and_atomics_do_not_preload_destinations(driv
         Err(VpHaltReason::PowerOff)
     ));
     assert_eq!(devices.0.lock().len(), 1);
+    assert_eq!(backing.guest_memory_faults.load(Ordering::SeqCst), 2);
+    if !mapped {
+        assert!(
+            devices.0.lock()[0].contains("unmapped"),
+            "{:?}",
+            devices.0.lock()
+        );
+        assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), initial);
+        assert_eq!(vp.completed_batch_progress().retired, 0);
+        assert!(
+            backing.memory[DATA as usize..DATA as usize + 16]
+                .iter()
+                .all(|byte| byte.load(Ordering::SeqCst) == 0xa5)
+        );
+        return;
+    }
     assert!(
         devices.0.lock()[0].contains("checkpoint"),
         "{:?}",
         devices.0.lock()
     );
-    assert_eq!(backing.unexpected_reads.load(Ordering::SeqCst), 1);
     let mut expected = [0xa5; 16];
     expected[1..8].copy_from_slice(&[0x78, 0x38, 0x22, 0x77, 0x66, 0x55, 0x44]);
     let actual: Vec<_> = backing.memory[DATA as usize..DATA as usize + 16]

@@ -7,7 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-perf = ["strudel/perf"]
+perf = ["strudel/perf", "dep:sparse_mmap"]
 test-support = ["guestmem/bitmap"]
 
 [[test]]
@@ -31,6 +31,9 @@ hvdef.workspace = true
 inspect.workspace = true
 vmcore.workspace = true
 vm_topology.workspace = true
+trycopy.workspace = true
+parking_lot.workspace = true
+sparse_mmap = { workspace = true, optional = true }
 
 [dev-dependencies]
 strudel = { workspace = true, features = ["test-support"] }
@@ -43,7 +46,6 @@ serde_json = { workspace = true, features = ["std"] }
 sha2.workspace = true
 test_with_tracing.workspace = true
 pal_async.workspace = true
-parking_lot.workspace = true
 state_unit.workspace = true
 vm_resource.workspace = true
 vmotherboard.workspace = true
@@ -56,6 +58,7 @@ chipset_device_resources.workspace = true
 chipset_resources.workspace = true
 missing_dev.workspace = true
 local_clock = { workspace = true, features = ["inspect"] }
+sparse_mmap.workspace = true
 
 [build-dependencies]
 build_rs_guest_arch.workspace = true

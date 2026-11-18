@@ -3,6 +3,8 @@
 
 //! Bounded unchanged-loader witness for the content-pinned Linux entry.
 
+#![recursion_limit = "256"]
+
 // xtask-fmt allow-target-arch cpu-intrinsic -- Uses the native x86 WB provider.
 #[cfg(all(guest_arch = "x86_64", target_arch = "x86_64"))]
 mod native {
@@ -1586,6 +1588,8 @@ mod native {
                     "fetch_misses":d.fetch_misses,
                     "execution_lookups":d.execution_lookups,
                     "execution_hits":d.execution_hits,"execution_misses":d.execution_misses,
+                    "chain_lookups":d.chain_lookups,"chain_hits":d.chain_hits,
+                    "chain_links":d.chain_links,
                 })
             };
             let preparation = vp.code_preparation_diagnostics();
@@ -1815,6 +1819,10 @@ mod native {
             decode.execution_hits > 0,
             "VA execution-cache path was not exercised"
         );
+        ensure!(
+            decode.chain_hits > 0,
+            "intra-page successor path was not exercised"
+        );
         let preparation = vp.code_preparation_diagnostics();
         println!(
             "{}",
@@ -1822,6 +1830,7 @@ mod native {
                 "retired": progress.retired, "delivered": progress.delivered,
                 "no_refetch_hits":no_refetch_hits,
                 "execution_cache_hits":decode.execution_hits,
+                "chain_hits":decode.chain_hits,
                 "code_pages_prepared":preparation.prepared,
                 "code_pages_unavailable":preparation.unavailable,
                 "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "75065de9df5d00",

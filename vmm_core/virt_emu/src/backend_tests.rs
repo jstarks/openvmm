@@ -378,8 +378,10 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         if bypass {
             assert_eq!(decode.fetch_hits, 0);
             assert_eq!(decode.execution_hits, 0);
+            assert_eq!(decode.chain_hits, 0);
         } else {
             assert!(decode.execution_hits > 0);
+            assert_eq!(decode.chain_hits > 0, boundaries);
             assert!(vp.code_preparation_diagnostics().prepared > 0);
         }
         println!(

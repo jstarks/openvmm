@@ -1021,6 +1021,8 @@ mod native {
         ensure!(probe_seconds > 0, "probe deadline must be positive");
         let mut shell_command = None;
         let mut profile_enabled = false;
+        #[cfg(feature = "perf")]
+        let mut perf_control = None;
         while let Some(flag) = args.next() {
             if flag == "--shell-command" {
                 ensure!(probe_apic, "shell command requires the APIC/chipset probe");
@@ -1036,6 +1038,17 @@ mod native {
                 ensure!(cfg!(feature = "perf"), "profiling requires --features perf");
                 ensure!(!profile_enabled, "duplicate profiling flag");
                 profile_enabled = true;
+            } else if flag == "--perf-control" {
+                #[cfg(not(feature = "perf"))]
+                bail!("counter control requires --features perf");
+                #[cfg(feature = "perf")]
+                {
+                    ensure!(perf_control.is_none(), "duplicate counter control");
+                    perf_control = Some(strudel::perf::CounterControl::open(
+                        args.next().context("missing perf control FIFO")?,
+                        args.next().context("missing perf acknowledgement FIFO")?,
+                    )?);
+                }
             } else {
                 bail!("unexpected witness argument: {flag:?}");
             }
@@ -1506,6 +1519,14 @@ mod native {
         };
         let stop = StopVpSource::new();
         let initial_jiffies = memory.read_plain::<u64>(0x2609980)?;
+        #[cfg(feature = "perf")]
+        let counters_gated = perf_control.is_some();
+        #[cfg(not(feature = "perf"))]
+        let counters_gated = false;
+        #[cfg(feature = "perf")]
+        if let Some(control) = &mut perf_control {
+            control.set(true)?;
+        }
         let started = Instant::now();
         let run = Box::pin(vp.run_vp(stop.checker(), &devices));
         let diagnostic = async {
@@ -1535,6 +1556,10 @@ mod native {
             }
         }
         let seconds = started.elapsed().as_secs_f64();
+        #[cfg(feature = "perf")]
+        if let Some(control) = &mut perf_control {
+            control.set(false)?;
+        }
         if probe {
             units.stop().await;
         }
@@ -1593,6 +1618,7 @@ mod native {
                 })
             };
             let preparation = vp.code_preparation_diagnostics();
+            let translations = vp.translation_diagnostics()?;
             let apic=vp.apic_diagnostics().map(|snapshot| {
                 let apic=snapshot.registers;
                 serde_json::json!({
@@ -1606,6 +1632,10 @@ mod native {
                     "decode":decode_json(decode),"decode_at_first_interrupt":first_decode.map(decode_json),
                     "code_pages_prepared":preparation.prepared,
                     "code_pages_unavailable":preparation.unavailable,
+                    "translations":{
+                        "hits":translations.hits,"misses":translations.misses,
+                        "invalidations":translations.invalidations,"fallbacks":translations.fallbacks,
+                    },
                     "layout":{
                         "event_phase":size_of::<x86_system::execute::Phase>(),
                         "decode_decision":size_of::<x86_system::execute::decode::DecodeOutcome>(),
@@ -1672,6 +1702,7 @@ mod native {
                     "stop_debug":format!("{failure:?}"),
                     "transport_error":matches!(failure.downcast_ref::<Error>(),Some(Error::Memory(_))),
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
+                    "counters_gated":counters_gated,
                     "execution_profile":execution_profile,
                     "clock_slowdown":clock_slowdown.get(),
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
@@ -1810,6 +1841,11 @@ mod native {
             })
             .collect();
         let decode = vp.decode_diagnostics()?.0;
+        let translations = vp.translation_diagnostics()?;
+        ensure!(
+            translations.hits > 0,
+            "host-bound TLB path was not exercised"
+        );
         let no_refetch_hits = decode.fetch_hits.wrapping_add(decode.execution_hits);
         ensure!(
             no_refetch_hits > 0,
@@ -1831,6 +1867,10 @@ mod native {
                 "no_refetch_hits":no_refetch_hits,
                 "execution_cache_hits":decode.execution_hits,
                 "chain_hits":decode.chain_hits,
+                "translations":{
+                    "hits":translations.hits,"misses":translations.misses,
+                    "invalidations":translations.invalidations,"fallbacks":translations.fallbacks,
+                },
                 "code_pages_prepared":preparation.prepared,
                 "code_pages_unavailable":preparation.unavailable,
                 "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "75065de9df5d00",

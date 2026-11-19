@@ -290,6 +290,16 @@ impl EmuProcessor<'_> {
         Ok((core.decode_diagnostics(), self.state.first_apic_decode))
     }
 
+    /// Reports host payload reuse separately from guest translation state.
+    pub fn translation_diagnostics(
+        &self,
+    ) -> Result<x86_system::memory::physical::TranslationDiagnostics, Error> {
+        let CpuLifecycle::Ready(core) = &self.state.cpu else {
+            return Err(Error::Uninitialized);
+        };
+        Ok(core.translation_diagnostics())
+    }
+
     /// Reports cold registration separately from guest execution progress.
     pub fn code_preparation_diagnostics(&self) -> CodePreparationDiagnostics {
         self.state.code_preparation

@@ -306,6 +306,7 @@ fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
         fail: std::sync::atomic::AtomicBool,
     }
     impl PhysicalRam for FailOnce {
+        x86_system::untranslated_ram!();
         type Error = std::io::Error;
         fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
             None
@@ -551,6 +552,7 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
         fail: AtomicBool,
     }
     impl PhysicalRam for TailFault {
+        x86_system::untranslated_ram!();
         type Error = std::io::Error;
         fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
             None

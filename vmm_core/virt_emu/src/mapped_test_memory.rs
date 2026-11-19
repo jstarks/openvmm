@@ -114,6 +114,7 @@ impl TestRam {
 }
 
 impl PhysicalRam for TestRam {
+    x86_system::untranslated_ram!();
     type Error = RamError;
 
     fn code_token(

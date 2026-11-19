@@ -18,13 +18,32 @@ use guestmem::{WriteTracker, WriteTrackerError};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::atomic::{Ordering, fence};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 use virt::PartitionMemoryMap;
 use x86_system::arch::integer;
 use x86_system::memory::physical::{
     self as physical, AtomicOperation, AtomicResult, CodeToken, CopyError, CopyErrorKind,
     PhysicalRam,
 };
+mod translation;
+pub use translation::{NativeTranslated, NativeTranslations};
+
+#[derive(Debug, Default)]
+struct BindingDomain {
+    generation: AtomicU64,
+}
+
+impl BindingDomain {
+    fn revoke(&self) {
+        // MAX disables binding reuse permanently; generations never wrap.
+        let _ = self
+            .generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            });
+    }
+}
 
 /// Failure of the physical RAM interface, not an architectural guest exception.
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +141,7 @@ pub struct PartitionMemory {
     tracker: Option<WriteTracker>,
     code_tokens: RwLock<BTreeMap<u64, CodeToken>>,
     pending_code_pages: Mutex<BTreeSet<u64>>,
+    binding_domain: Arc<BindingDomain>,
 }
 
 /// Outcome of preparing the physical code pages requested by previous batches.
@@ -211,6 +231,9 @@ impl PartitionMemory {
         let start = range.start & !4095;
         let end = range.end.checked_add(4095).map_or(u64::MAX, |v| v & !4095);
         let mut mappings = self.mappings.write();
+        let changed = mappings
+            .iter()
+            .any(|mapping| mapping.start < end && start < mapping.end && !mapping.watched);
         for boundary in [start, end] {
             let index = mappings.partition_point(|mapping| mapping.end <= boundary);
             if let Some(mapping) = mappings.get(index).copied()
@@ -233,6 +256,9 @@ impl PartitionMemory {
         for mapping in mappings.iter_mut() {
             if mapping.start < end && start < mapping.end {
                 mapping.watched = true;
+            }
+            if changed {
+                self.binding_domain.revoke();
             }
         }
         // Only boundaries of changed watch permissions need survive.
@@ -257,6 +283,7 @@ impl PartitionMemory {
             tracker: Some(tracker),
             code_tokens: None,
             pending_code_pages: None,
+            binding_domain: None,
         }))
     }
 
@@ -283,6 +310,7 @@ impl PartitionMemory {
             tracker: self.tracker.as_ref(),
             code_tokens: self.code_tokens.read(),
             pending_code_pages: &self.pending_code_pages,
+            binding_domain: &self.binding_domain,
         }
     }
 
@@ -353,6 +381,7 @@ impl PartitionMemoryMap for PartitionMemory {
         self.code_tokens
             .write()
             .retain(|page, _| !(*page < end && addr < page.saturating_add(4096)));
+        self.binding_domain.revoke();
         Ok(())
     }
 
@@ -369,10 +398,14 @@ impl PartitionMemoryMap for PartitionMemory {
         }) {
             return Err(MapError::PartialUnmap.into());
         }
+        let previous_len = mappings.len();
         mappings.retain(|mapping| !(addr <= mapping.start && mapping.end <= end));
         self.code_tokens
             .write()
             .retain(|page, _| !(*page < end && addr < page.saturating_add(4096)));
+        if mappings.len() != previous_len {
+            self.binding_domain.revoke();
+        }
         Ok(())
     }
 
@@ -413,6 +446,7 @@ pub struct NativeAccess<'a> {
     tracker: Option<&'a WriteTracker>,
     code_tokens: RwLockReadGuard<'a, BTreeMap<u64, CodeToken>>,
     pending_code_pages: &'a Mutex<BTreeSet<u64>>,
+    binding_domain: &'a Arc<BindingDomain>,
 }
 
 impl NativeAccess<'_> {
@@ -423,14 +457,16 @@ impl NativeAccess<'_> {
             tracker: self.tracker,
             code_tokens: Some(&self.code_tokens),
             pending_code_pages: Some(self.pending_code_pages),
+            binding_domain: Some(self.binding_domain),
         }
     }
 }
 
 /// Native RAM view borrowing a live mapping lease.
 ///
-/// No host pointer escapes this view. Callers classify RAM versus MMIO
-/// independently of transport failures.
+/// Host pointers are usable only under this lease. Opaque persistent TLB
+/// payloads must validate their backing domain/revocations before reuse.
+/// Callers classify RAM versus MMIO independently of transport failures.
 /// A scalar spanning adjacent mappings requires contiguous host backing;
 /// discontiguous ranges must use the prefix-reporting bulk interface.
 ///
@@ -448,6 +484,7 @@ pub struct NativeRam<'a> {
     tracker: Option<&'a WriteTracker>,
     code_tokens: Option<&'a BTreeMap<u64, CodeToken>>,
     pending_code_pages: Option<&'a Mutex<BTreeSet<u64>>>,
+    binding_domain: Option<&'a Arc<BindingDomain>>,
 }
 
 impl NativeRam<'_> {
@@ -497,15 +534,7 @@ impl NativeRam<'_> {
     fn copy_width(&self, address: u64, remaining: usize, write: bool) -> Result<usize, RamError> {
         let mapping = self.mapping(address, write)?;
         let remaining = remaining.min((mapping.end - address) as usize);
-        Ok(if remaining >= 8 && address.is_multiple_of(8) {
-            8
-        } else if remaining >= 4 && address.is_multiple_of(4) {
-            4
-        } else if remaining >= 2 && address.is_multiple_of(2) {
-            2
-        } else {
-            1
-        })
+        Ok(scalar_width(address, remaining))
     }
 
     fn copy_bytes(
@@ -577,6 +606,15 @@ impl NativeRam<'_> {
 
 impl PhysicalRam for NativeRam<'_> {
     type Error = RamError;
+    type Translations = NativeTranslations;
+    type Translated<'a>
+        = NativeTranslated<'a>
+    where
+        Self: 'a;
+
+    fn translated<'a>(&'a self, cache: &'a mut NativeTranslations) -> NativeTranslated<'a> {
+        NativeTranslated::new(self, cache)
+    }
 
     fn code_token(&self, address: u64, length: u8) -> Option<&CodeToken> {
         self.tracker?;
@@ -605,7 +643,7 @@ impl PhysicalRam for NativeRam<'_> {
         let (pointer, _) = self.pointer(address, N, false)?;
         // SAFETY: the lease reserves the complete range. Byte arrays have no
         // validity or alignment restriction; trycopy uses one exact-width load.
-        Ok(unsafe { trycopy::try_read_volatile(pointer.cast::<[u8; N]>()) }?)
+        unsafe { self.read_pointer(pointer) }
     }
 
     fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), RamError> {
@@ -613,9 +651,7 @@ impl PhysicalRam for NativeRam<'_> {
         let (pointer, watched) = self.pointer(address, N, true)?;
         // SAFETY: the lease reserves writable shared backing for the complete
         // scalar. One exact-width store performs no destination read.
-        let result = unsafe { trycopy::try_write_volatile(pointer.cast(), &value) };
-        self.notify_write(address, N, watched)?;
-        Ok(result?)
+        unsafe { self.write_pointer(address, value, pointer, watched) }
     }
 
     fn read_bytes(&self, address: u64, destination: &mut [u8]) -> Result<(), CopyError<RamError>> {
@@ -664,6 +700,61 @@ impl PhysicalRam for NativeRam<'_> {
         width: u8,
         operation: AtomicOperation,
     ) -> Result<AtomicResult, CopyError<RamError>> {
+        self.atomic_pointer(address, width, operation, None)
+    }
+
+    fn barrier(&self) {
+        NativeRam::barrier(self);
+    }
+}
+
+fn scalar_width(address: u64, remaining: usize) -> usize {
+    if remaining >= 8 && address.is_multiple_of(8) {
+        8
+    } else if remaining >= 4 && address.is_multiple_of(4) {
+        4
+    } else if remaining >= 2 && address.is_multiple_of(2) {
+        2
+    } else {
+        1
+    }
+}
+
+impl NativeRam<'_> {
+    /// # Safety
+    /// `pointer` must name N shared-WB bytes reserved by this live mapping lease.
+    /// Inaccessible host pages may fault through trycopy.
+    unsafe fn read_pointer<const N: usize>(&self, pointer: *mut u8) -> Result<[u8; N], RamError> {
+        const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
+        // SAFETY: the caller qualified this pointer under the current mapping lease.
+        Ok(unsafe { trycopy::try_read_volatile(pointer.cast::<[u8; N]>()) }?)
+    }
+
+    /// # Safety
+    /// `pointer` must name N logically writable shared-WB bytes for `address`
+    /// reserved by this live lease. Inaccessible host pages may fault.
+    /// `watched` must include the current mapping's write-watch qualification.
+    unsafe fn write_pointer<const N: usize>(
+        &self,
+        address: u64,
+        value: [u8; N],
+        pointer: *mut u8,
+        watched: bool,
+    ) -> Result<(), RamError> {
+        const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
+        // SAFETY: the caller qualified writable shared backing under this lease.
+        let result = unsafe { trycopy::try_write_volatile(pointer.cast(), &value) };
+        self.notify_write(address, N, watched)?;
+        Ok(result?)
+    }
+
+    fn atomic_pointer(
+        &self,
+        address: u64,
+        width: u8,
+        operation: AtomicOperation,
+        qualified: Option<(*mut u8, bool)>,
+    ) -> Result<AtomicResult, CopyError<RamError>> {
         let invalid = || CopyError {
             completed: 0,
             kind: CopyErrorKind::InvalidAccess,
@@ -675,9 +766,12 @@ impl PhysicalRam for NativeRam<'_> {
             completed: 0,
             kind: CopyErrorKind::Memory(error),
         };
-        let (pointer, watched) = self
-            .pointer(address, usize::from(width), true)
-            .map_err(failure)?;
+        let (pointer, watched) = match qualified {
+            Some(pointer) => pointer,
+            None => self
+                .pointer(address, usize::from(width), true)
+                .map_err(failure)?,
+        };
         if let AtomicOperation::CompareExchange {
             expected,
             replacement,
@@ -768,10 +862,6 @@ impl PhysicalRam for NativeRam<'_> {
                 trycopy::AtomicError::Memory(error) => failure(error.into()),
                 _ => invalid(),
             })
-    }
-
-    fn barrier(&self) {
-        NativeRam::barrier(self);
     }
 }
 

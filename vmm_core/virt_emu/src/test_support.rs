@@ -60,6 +60,7 @@ impl std::ops::DerefMut for EventFixture {
 struct VectorRam<'a>(Mutex<&'a mut Vec<u8>>);
 
 impl PhysicalRam for VectorRam<'_> {
+    x86_system::untranslated_ram!();
     type Error = io::Error;
 
     fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {

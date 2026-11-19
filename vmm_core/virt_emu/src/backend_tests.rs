@@ -2236,6 +2236,9 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
     assert!(!old_observation.is_valid());
     assert_eq!(*old_observation.value(), 0x1111u64.to_le_bytes());
     bytes[0x16000..0x16008].copy_from_slice(&0x2222u64.to_le_bytes());
+    // Host rebinding must not invent a guest TLB flush for this still-cached VA.
+    bytes[0x4000 + 0x16 * 8..0x4008 + 0x16 * 8].copy_from_slice(&0x17007u64.to_le_bytes());
+    bytes[0x17000..0x17008].copy_from_slice(&0x3333u64.to_le_bytes());
     let replacement =
         MappedTestMemory::observed(partition.clone(), &bytes, partition.write_tracker());
     vp.set_execution_checkpoint(Some(CODE + program.len() as u64))

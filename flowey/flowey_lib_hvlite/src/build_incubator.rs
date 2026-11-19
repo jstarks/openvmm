@@ -8,11 +8,29 @@ use crate::run_cargo_build::BuildProfile;
 use flowey::node::prelude::*;
 
 #[derive(Serialize, Deserialize)]
-pub struct IncubatorOutput {
-    #[serde(rename = "incubator")]
-    pub bin: PathBuf,
-    #[serde(rename = "incubator.dbg")]
-    pub dbg: Option<PathBuf>,
+#[serde(untagged)]
+pub enum IncubatorOutput {
+    LinuxBin {
+        #[serde(rename = "incubator")]
+        bin: PathBuf,
+        #[serde(rename = "incubator.dbg")]
+        dbg: Option<PathBuf>,
+    },
+    WindowsBin {
+        #[serde(rename = "incubator.exe")]
+        exe: PathBuf,
+        #[serde(rename = "incubator.pdb")]
+        pdb: Option<PathBuf>,
+    },
+}
+
+impl IncubatorOutput {
+    pub fn executable(self) -> PathBuf {
+        match self {
+            Self::LinuxBin { bin, .. } => bin,
+            Self::WindowsBin { exe, .. } => exe,
+        }
+    }
 }
 
 impl Artifact for IncubatorOutput {}
@@ -60,7 +78,10 @@ impl SimpleFlowNode for Node {
             move |rt| {
                 let output = match rt.read(output) {
                     crate::run_cargo_build::CargoBuildOutput::ElfBin { bin, dbg } => {
-                        IncubatorOutput { bin, dbg }
+                        IncubatorOutput::LinuxBin { bin, dbg }
+                    }
+                    crate::run_cargo_build::CargoBuildOutput::WindowsBin { exe, pdb } => {
+                        IncubatorOutput::WindowsBin { exe, pdb }
                     }
                     _ => unreachable!(),
                 };

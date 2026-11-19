@@ -6,14 +6,14 @@ Petri, keeping builds, caches, and logs on the host.
 ## Launcher and boot selection
 
 `[incubator]` selects the launcher and VM resources; `[boot]` selects the guest
-environment and defaults to `linux-direct`. OpenVMM requires x64 Linux with
-KVM. QEMU TCG can run ARM64 guests on x64 or ARM64 Linux without KVM.
+environment and defaults to `linux-direct`. Native OpenVMM uses KVM on Linux
+or WHP on Windows. QEMU TCG can run ARM64 guests on x64 or ARM64 Linux without KVM.
 
 | Launcher | Boot environment | Current support |
 |----------|------------------|-----------------|
 | `qemu-tcg` | `linux-direct` | AArch64 guest on x64 or ARM64 Linux |
-| `openvmm` | `linux-direct` | x64 Linux guest on x64 Linux |
-| `openvmm` | `mshv` | x64 mshv root partition on x64 Linux |
+| `openvmm` | `linux-direct` | Matching x64 or ARM64 Linux guest on Linux or Windows |
+| `openvmm` | `mshv` | x64 mshv root partition on x64 Linux or Windows |
 | `qemu-tcg` | `mshv` | Experimental ARM64 mshv root on QEMU SBSA |
 
 Registered VMM tests use [Petri nested tests](vmm.md#nested-tests), not an
@@ -74,6 +74,50 @@ This extension does not register ARM64 MSHV nested VMM tests.
 
 ## OpenVMM commands
 
+### Run an ARM64 Linux environment using WHP from WSL
+
+On Windows ARM64 with WHP already available, build and provision from WSL:
+
+```bash
+. build_support/setup_windows_cross.sh
+cargo xflowey incubator \
+  --profile petri/incubator/profiles/aarch64-openvmm.toml \
+  --target windows-aarch64 -- \
+  --no-pty -- /bin/sh -c 'uname -m; echo hello from WHP'
+```
+
+Follow [Windows cross-compilation setup](../getting_started/cross_compile.md)
+first. Both Incubator and outer OpenVMM run as native Windows executables;
+the guest agent remains a static Linux binary. Linux-direct provisioning
+uses the published ordinary test kernel and initrd, without firmware,
+hypervisor payloads, or EFI host-boot code. This is not an mshv environment:
+ARM64 nested virtualization is unsupported, and `/dev/mshv` is not expected.
+
+The target defaults to native Linux. Select `windows-aarch64` explicitly
+to avoid nested KVM under WSL; `windows-x64` is the equivalent on x64 Windows.
+The target must match the host architecture and, for OpenVMM, the guest
+architecture. QEMU TCG provisioning remains Linux-only.
+
+Flowey converts its host-side paths to Windows paths in the prepared profile
+and command. Keep guest commands, `--guest-current-dir`, and `--guest-env`
+values in Linux guest form. The writable share is still `/share` in the
+guest, including when its host path is on the WSL filesystem. Environment
+variables inherited by the Windows runner follow Windows/WSLENV rules;
+prefer explicit `--guest-env` arguments when launching from WSL.
+`INCUBATOR_ENV` path lists use the runner host's separator (`;` on Windows)
+and are mapped to colon-separated Linux guest paths.
+
+Use `--kernel path/to/Image` for a local ARM64 kernel and `--prepare-only`
+to print a reusable direct `/bin/true` command with `--no-pty`. Replace
+`/bin/true` with your guest program and arguments. Run that command from WSL;
+no rebuilding or provisioning is needed between kernel edits at the same path.
+Linux-direct `--timeout` bounds boot only, not subsequent command execution.
+
+The WSL-to-Windows path currently supports noninteractive commands only.
+WSL presents Windows programs with redirected pipes even when the Linux parent
+has a terminal. Interactive guest PTYs, terminal-mode forwarding, and Ctrl-C
+forwarding across that boundary are deferred; use `--no-pty` for this workflow.
+
 ### Provision an mshv environment
 
 On an x64 Linux host with KVM and nested virtualization enabled:
@@ -84,8 +128,8 @@ cargo xflowey incubator \
   --timeout 600 --no-pty -- /bin/sh -c 'test -c /dev/mshv && uname -a'
 ```
 
-`--profile` is required. Provisioning supports x64 OpenVMM and ARM64 QEMU
-SBSA profiles with `mshv` boot; other launcher, architecture, or boot combinations
+`--profile` is required. Provisioning supports OpenVMM Linux-direct, x64 OpenVMM
+mshv, and ARM64 QEMU SBSA mshv profiles; other launcher, architecture, or boot combinations
 are rejected. Flowey leaves the source file untouched and prepares a copy,
 preserving its VM settings and boot options while replacing `binary`,
 `host-boot`, `firmware`, `firmware-vars` (QEMU), and `boot-artifacts` with resolved paths. These source
@@ -120,10 +164,11 @@ Unchanged binaries are reused across kernel edits. Per-run logs remain in
 `results/incubator-*`; do not use the same directory concurrently.
 
 Use `--prepare-only` without a guest command to prepare everything and print
-a direct Incubator command for `/bin/sh`. Run that printed command for an
-interactive shell without going through Flowey again. Copy the generated
+a direct Incubator command (`/bin/sh` on Linux, `/bin/true` on Windows).
+Linux runners can use it for an interactive shell without going through
+Flowey again. Copy the generated
 profile before customizing it. `--kernel-cmdline` and `--hypervisor-cmdline`
-override the source profile's boot options without rebuilding EFI code.
+override the mshv source profile's boot options without rebuilding EFI code.
 
 `--initrd`, `--firmware`, and `--boot-artifacts` accept explicit local inputs.
 RPMs use Flowey's normal persistent cache; missing RPMs are downloaded as
@@ -289,7 +334,8 @@ authenticate signatures or implement shim's measurements.
 All environments copy the host CA bundle into the temporary initrd and export
 `SSL_CERT_FILE=/incubator-ca-certificates.crt` for guest TLS clients. A nonempty
 host `SSL_CERT_FILE` selects the bundle; otherwise a conventional Linux system
-bundle is required. An invalid or unreadable bundle fails the run. The guest
+bundle or the native Windows root certificate store is used.
+An invalid or unreadable bundle fails the run. The guest
 inherits that trust, including enterprise CAs, without copying private keys or
 disabling verification. Its clock is initialized from the host.
 
@@ -310,5 +356,7 @@ an unresponsive VMM can leave a host process requiring manual termination.
 Direct Incubator invocations preserve the guest exit code. Through xflowey,
 a nonzero guest exit fails the pipeline with Flowey's failure status instead.
 Unexpected VM exit/reset and timeouts fail.
-SIGINT/SIGTERM attempt cleanup; SIGKILL cannot. Temporary boot files are removed
+SIGINT/SIGTERM on Unix and native console Ctrl-C on Windows attempt cleanup;
+WSL-to-Windows Ctrl-C forwarding is not qualified. SIGKILL cannot.
+Temporary boot files are removed
 on normal teardown and handled errors; logs remain on the host.

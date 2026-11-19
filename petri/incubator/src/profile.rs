@@ -273,8 +273,8 @@ impl IncubatorProfile {
             }
             IncubatorBackend::Openvmm(config) => {
                 anyhow::ensure!(
-                    config.arch == Arch::X86_64,
-                    "OpenVMM Incubator currently supports only x86-64 guests"
+                    config.arch != Arch::Aarch64 || !config.nested_virt,
+                    "OpenVMM ARM64 Incubator does not support nested virtualization"
                 );
                 anyhow::ensure!(
                     config.processors > 0,
@@ -337,13 +337,14 @@ mod tests {
     use test_with_tracing::test;
 
     const OPENVMM: &str = include_str!("../profiles/x86_64-openvmm.toml");
+    const OPENVMM_ARM64: &str = include_str!("../profiles/aarch64-openvmm.toml");
     const MSHV: &str = include_str!("../profiles/x86_64-mshv.toml");
     const QEMU: &str = include_str!("../profiles/aarch64-tcg-pcie.toml");
     const QEMU_MSHV: &str = include_str!("../profiles/aarch64-tcg-mshv.toml");
 
     #[test]
     fn launcher_and_boot_are_separate() -> anyhow::Result<()> {
-        for profile in [OPENVMM, MSHV, QEMU, QEMU_MSHV] {
+        for profile in [OPENVMM, OPENVMM_ARM64, MSHV, QEMU, QEMU_MSHV] {
             IncubatorProfile::from_toml(profile)?.validate()?;
         }
         let direct = IncubatorProfile::from_toml(OPENVMM)?;
@@ -385,6 +386,7 @@ mod tests {
             MSHV.replace("nested-virt = true", "nested-virt = false"),
             MSHV.replace("x86-64", "aarch64"),
             OPENVMM.replace("processors = 2", "processors = 0"),
+            OPENVMM_ARM64.replace("nested-virt = false", "nested-virt = true"),
             QEMU_MSHV.replace("sbsa-ref", "virt,virtualization=off"),
             QEMU_MSHV.replace("firmware-vars = \"/path/to/SBSA_FLASH1.fd\"", ""),
             QEMU_MSHV.replace("aarch64", "x86-64"),

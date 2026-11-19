@@ -196,14 +196,9 @@ fn map_path_list(name: &str, value: &str, path_mapper: &HostPathMapper) -> anyho
         return Ok(String::new());
     }
 
-    // The incubator targets a Linux guest, so path lists always use the
-    // guest's ':' separator regardless of the host OS. Do not use
-    // `std::env::split_paths`, which splits on the host separator (';' on
-    // Windows) and would mis-parse these values on Windows hosts.
     let mut mapped = Vec::new();
-    for entry in value.split(':') {
-        let path = Path::new(entry);
-        let guest_path = path_mapper.map_path(path).with_context(|| {
+    for path in std::env::split_paths(value) {
+        let guest_path = path_mapper.map_path(&path).with_context(|| {
             format!(
                 "path-list entry '{}' in environment variable {name} is not in the host share",
                 path.display()
@@ -212,6 +207,7 @@ fn map_path_list(name: &str, value: &str, path_mapper: &HostPathMapper) -> anyho
         mapped.push(guest_path);
     }
 
+    // The guest is Linux even when the host uses Windows path-list syntax.
     Ok(mapped.join(":"))
 }
 
@@ -291,6 +287,7 @@ fn join_guest_path(guest_root: &str, suffix: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use crate::GUEST_SHARE_ROOT;
+    use test_with_tracing::test;
 
     fn host_env(vars: &[(&str, &str)]) -> BTreeMap<String, String> {
         vars.iter()
@@ -337,13 +334,15 @@ mod tests {
     #[test]
     fn applies_incubator_env_policy() {
         let mapper = HostPathMapper::new("/host/test-content", GUEST_SHARE_ROOT).unwrap();
+        let library_paths =
+            std::env::join_paths(["/host/test-content/lib", "/host/test-content/other-lib"])
+                .unwrap()
+                .into_string()
+                .unwrap();
         let host_env = host_env(&[
             ("RUST_LOG", "debug"),
             ("TEST_OUTPUT_PATH", "/host/test-content/out"),
-            (
-                "LD_LIBRARY_PATH",
-                "/host/test-content/lib:/host/test-content/other-lib",
-            ),
+            ("LD_LIBRARY_PATH", &library_paths),
             (
                 "CARGO_BIN_EXE_vmm_tests",
                 "/host/test-content/bin/vmm_tests",
@@ -378,6 +377,15 @@ mod tests {
             guest_env.get("NEXTEST_BIN_EXE_helper").unwrap(),
             &format!("{GUEST_SHARE_ROOT}/bin/helper")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn maps_windows_drive_path_lists_to_linux_guest_paths() {
+        let mapper = HostPathMapper::new(r"C:\work", GUEST_SHARE_ROOT).unwrap();
+        let host_env = host_env(&[("LIBRARIES", r"C:\work\lib;C:\work\other lib")]);
+        let guest_env = guest_env_from_incubator_env("LIBRARIES/lp", &host_env, &mapper).unwrap();
+        assert_eq!(guest_env["LIBRARIES"], "/share/lib:/share/other lib");
     }
 
     #[test]

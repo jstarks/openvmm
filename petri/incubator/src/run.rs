@@ -3,6 +3,7 @@
 
 //! Run a command using Petri's VM lifecycle and Pipette connection.
 
+use crate::profile::Arch;
 use crate::profile::IncubatorBackend;
 use crate::profile::IncubatorBoot;
 use crate::profile::IncubatorProfile;
@@ -64,14 +65,18 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
     let signals = TerminationSignals::new()?;
     anyhow::ensure!(!config.guest_command.is_empty(), "empty guest command");
     config.profile.validate()?;
+    let arch = match config.profile.incubator.arch() {
+        Arch::X86_64 => MachineArch::X86_64,
+        Arch::Aarch64 => MachineArch::Aarch64,
+    };
     if matches!(config.profile.incubator, IncubatorBackend::Openvmm(_)) {
         anyhow::ensure!(
             config.qemu_binary_override.is_none(),
             "--qemu-binary is not valid for the openvmm launcher"
         );
         anyhow::ensure!(
-            cfg!(target_os = "linux") && MachineArch::host() == MachineArch::X86_64,
-            "OpenVMM Incubator requires an x86-64 Linux host"
+            cfg!(any(windows, target_os = "linux")) && MachineArch::host() == arch,
+            "OpenVMM Incubator requires a matching native Windows or Linux host"
         );
     }
     fs_err::create_dir_all(&config.output_dir)?;
@@ -109,7 +114,7 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
             let artifacts = PetriVmArtifacts {
                 backend: petri::openvmm::OpenVmmPetriBackend::from_binary(profile.binary.clone()),
                 firmware,
-                arch: MachineArch::X86_64,
+                arch,
                 agent_image: None,
                 openhcl_agent_image: None,
                 pipette_binary: None,
@@ -301,6 +306,8 @@ struct TerminationSignals {
     signal: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(unix)]
     registrations: Vec<signal_hook::SigId>,
+    #[cfg(windows)]
+    signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TerminationSignals {
@@ -310,6 +317,11 @@ impl TerminationSignals {
             let signal = self.signal.load(std::sync::atomic::Ordering::Relaxed);
             anyhow::ensure!(signal == 0, "incubator interrupted by signal {signal}");
         }
+        #[cfg(windows)]
+        anyhow::ensure!(
+            !self.signal.load(std::sync::atomic::Ordering::Relaxed),
+            "incubator interrupted"
+        );
         Ok(())
     }
 
@@ -329,19 +341,26 @@ impl TerminationSignals {
             }
             Ok(guard)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let target = signal.clone();
+            ctrlc::set_handler(move || target.store(true, std::sync::atomic::Ordering::Relaxed))?;
+            Ok(Self { signal })
+        }
+        #[cfg(not(any(unix, windows)))]
         Ok(Self {})
     }
 
     async fn cancelled<T>(&self, driver: &pal_async::DefaultDriver) -> anyhow::Result<T> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         loop {
             self.check()?;
             pal_async::timer::PolledTimer::new(driver)
                 .sleep(Duration::from_millis(100))
                 .await;
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = driver;
             std::future::pending().await

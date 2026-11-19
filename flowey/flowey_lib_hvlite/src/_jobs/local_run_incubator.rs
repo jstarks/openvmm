@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Prepare a standalone mshv Incubator using reusable build/acquisition nodes.
+//! Prepare a standalone Incubator using reusable build/acquisition nodes.
 
 use crate::common::CommonArch;
 use crate::common::CommonProfile;
@@ -11,6 +11,7 @@ use sha2::Digest as _;
 
 flowey_request! {
     pub struct Params {
+        pub target: CommonTriple,
         pub profile: CommonProfile,
         pub source_profile: String,
         pub working_dir: PathBuf,
@@ -49,6 +50,7 @@ impl SimpleFlowNode for Node {
 
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let Params {
+            target,
             profile,
             source_profile,
             working_dir,
@@ -67,11 +69,16 @@ impl SimpleFlowNode for Node {
         } = request;
         let source = parse_source_profile(&source_profile)?;
         let qemu_tcg = source["incubator"]["type"].as_str() == Some("qemu-tcg");
-        let arch = if qemu_tcg {
-            CommonArch::Aarch64
-        } else {
-            CommonArch::X86_64
+        let mshv = source["boot"]["type"].as_str() == Some("mshv");
+        let arch = match source["incubator"]["arch"].as_str() {
+            Some("aarch64") => CommonArch::Aarch64,
+            Some("x86-64") => CommonArch::X86_64,
+            _ => unreachable!("source profile architecture was validated"),
         };
+        let windows = matches!(
+            target.as_triple().operating_system,
+            target_lexicon::OperatingSystem::Windows
+        );
         let host_arch: CommonArch = ctx.arch().try_into()?;
         ctx.config(crate::resolve_mshv_boot_artifacts::Config {
             local_path: boot_artifacts.map(|path| ConfigVar(ReadVar::from_static(path))),
@@ -79,7 +86,7 @@ impl SimpleFlowNode for Node {
         let openvmm = (!qemu_tcg).then(|| {
             ctx.reqv(|openvmm| crate::build_openvmm::Request {
                 params: crate::build_openvmm::OpenvmmBuildParams {
-                    target: CommonTriple::X86_64_LINUX_GNU,
+                    target: target.clone(),
                     profile,
                     features: Default::default(),
                 },
@@ -96,10 +103,7 @@ impl SimpleFlowNode for Node {
             })
         });
         let incubator = ctx.reqv(|incubator| crate::build_incubator::Request {
-            target: match host_arch {
-                CommonArch::X86_64 => CommonTriple::X86_64_LINUX_GNU,
-                CommonArch::Aarch64 => CommonTriple::AARCH64_LINUX_GNU,
-            },
+            target,
             profile: if profile.to_release() {
                 crate::run_cargo_build::BuildProfile::Release
             } else {
@@ -115,26 +119,33 @@ impl SimpleFlowNode for Node {
             profile,
             pipette,
         });
-        let host_boot = ctx.reqv(|host_boot| crate::build_mshv_host_boot::Request {
-            arch,
-            profile,
-            host_boot,
+        let host_boot = mshv.then(|| {
+            ctx.reqv(|host_boot| crate::build_mshv_host_boot::Request {
+                arch,
+                profile,
+                host_boot,
+            })
         });
-        let artifacts =
-            ctx.reqv(|artifacts| crate::resolve_mshv_boot_artifacts::Request { arch, artifacts });
+        let artifacts = mshv.then(|| {
+            ctx.reqv(|artifacts| crate::resolve_mshv_boot_artifacts::Request { arch, artifacts })
+        });
         let kernel = kernel.map(ReadVar::from_static).unwrap_or_else(|| {
             ctx.reqv(|kernel| {
                 crate::resolve_openvmm_test_linux_kernel::Request::Get(
-                    match arch {
-                        CommonArch::X86_64 => {
+                    match (arch, mshv) {
+                        (CommonArch::X86_64, true) => {
                             crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::BzImage
                         }
-                        CommonArch::Aarch64 => {
+                        _ => {
                             crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel
                         }
                     },
                     arch,
-                    crate::resolve_openvmm_test_linux_kernel::LinuxTestKernelVersion::MshvTest,
+                    if mshv {
+                        crate::resolve_openvmm_test_linux_kernel::LinuxTestKernelVersion::MshvTest
+                    } else {
+                        crate::resolve_openvmm_test_linux_kernel::DEFAULT_LINUX_TEST_KERNEL_VERSION
+                    },
                     kernel,
                 )
             })
@@ -148,14 +159,20 @@ impl SimpleFlowNode for Node {
                 directory,
             })
         });
-        let firmware = match (firmware, sbsa.clone()) {
-            (Some(path), _) => ReadVar::from_static(path),
-            (None, Some(sbsa)) => sbsa.map(ctx, |dir| dir.join("SBSA_FLASH0.fd")),
-            (None, None) => ctx.reqv(|msvm_fd| crate::download_uefi_mu_msvm::Request::GetMsvmFd {
-                arch,
-                flavor: None,
-                msvm_fd,
-            }),
+        let firmware = if !mshv {
+            None
+        } else {
+            Some(match (firmware, sbsa.clone()) {
+                (Some(path), _) => ReadVar::from_static(path),
+                (None, Some(sbsa)) => sbsa.map(ctx, |dir| dir.join("SBSA_FLASH0.fd")),
+                (None, None) => {
+                    ctx.reqv(|msvm_fd| crate::download_uefi_mu_msvm::Request::GetMsvmFd {
+                        arch,
+                        flavor: None,
+                        msvm_fd,
+                    })
+                }
+            })
         };
         let firmware_vars = firmware_vars
             .map(ReadVar::from_static)
@@ -174,56 +191,75 @@ impl SimpleFlowNode for Node {
             let firmware_vars = firmware_vars.claim(ctx);
             done.claim(ctx);
             move |rt| {
-                let runner = rt.read(incubator).bin;
+                let runner = rt.read(incubator).executable();
                 let launcher = if let Some(qemu) = qemu {
                     rt.read(qemu)
                 } else {
-                    let crate::build_openvmm::OpenvmmOutput::LinuxBin { bin, .. } =
-                        rt.read(openvmm.context("missing OpenVMM launcher")?)
-                    else {
-                        unreachable!()
-                    };
-                    bin
+                    match rt.read(openvmm.context("missing OpenVMM launcher")?) {
+                        crate::build_openvmm::OpenvmmOutput::LinuxBin { bin, .. } => bin,
+                        crate::build_openvmm::OpenvmmOutput::WindowsBin { exe, .. } => exe,
+                    }
                 };
                 let crate::build_pipette::PipetteOutput::LinuxBin { bin: pipette, .. } =
                     rt.read(pipette)
                 else {
                     unreachable!()
                 };
-                let host_boot = rt.read(host_boot).efi;
-                let artifacts = rt.read(artifacts).directory;
+                let host_boot = rt.read(host_boot).map(|output| output.efi);
+                let artifacts = rt.read(artifacts).map(|output| output.directory);
                 let kernel = rt.read(kernel);
                 let firmware = rt.read(firmware);
+                let firmware_vars = rt.read(firmware_vars);
                 let initrd = rt.read(initrd);
                 fs_err::create_dir_all(&dir)?;
-                let runtime = stage_runtime(
-                    &dir.join("runtime"),
-                    &[
-                        ("launcher", &launcher),
-                        ("incubator", &runner),
-                        ("pipette", &pipette),
-                        ("mshv_host_boot.efi", &host_boot),
-                    ],
-                )?;
-                let launcher = runtime.join("launcher");
-                let runner = runtime.join("incubator");
-                let host_boot = runtime.join("mshv_host_boot.efi");
+                let launcher_name = if windows { "launcher.exe" } else { "launcher" };
+                let runner_name = if windows {
+                    "incubator.exe"
+                } else {
+                    "incubator"
+                };
+                let mut files = vec![
+                    (launcher_name, launcher.as_path()),
+                    (runner_name, runner.as_path()),
+                    ("pipette", pipette.as_path()),
+                ];
+                if let Some(host_boot) = &host_boot {
+                    files.push(("mshv_host_boot.efi", host_boot.as_path()));
+                }
+                let runtime = stage_runtime(&dir.join("runtime"), &files)?;
+                let launcher = runtime.join(launcher_name);
+                let runner = runtime.join(runner_name);
+                let host_boot = host_boot.map(|_| runtime.join("mshv_host_boot.efi"));
                 let pipette_path = runtime.join("pipette");
                 let relative_pipette = pipette_path.strip_prefix(&share)?;
                 let guest_pipette = format!("/share/{}", path_str(relative_pipette)?);
-
-                let mut config = resolve_profile(
-                    &source_profile,
-                    &launcher,
-                    &host_boot,
-                    &firmware,
-                    &artifacts,
-                    kernel_cmdline.as_deref(),
-                    hypervisor_cmdline.as_deref(),
-                )?;
+                let windows_via_wsl = windows && flowey_lib_common::_util::running_in_wsl(rt);
+                let convert_path = |path: &Path| {
+                    if windows_via_wsl {
+                        flowey_lib_common::_util::wslpath::linux_to_win(rt, path)
+                    } else {
+                        Ok(path.to_path_buf())
+                    }
+                };
+                let launcher = convert_path(&launcher)?;
+                let mut config = if mshv {
+                    resolve_profile(
+                        &source_profile,
+                        &launcher,
+                        &convert_path(&host_boot.context("missing host boot application")?)?,
+                        &convert_path(&firmware.context("missing mshv firmware")?)?,
+                        &convert_path(&artifacts.context("missing mshv payloads")?)?,
+                        kernel_cmdline.as_deref(),
+                        hypervisor_cmdline.as_deref(),
+                    )?
+                } else {
+                    let mut config = parse_source_profile(&source_profile)?;
+                    config["incubator"]["binary"] = toml_edit::value(path_str(&launcher)?);
+                    config
+                };
                 if let Some(firmware_vars) = firmware_vars {
                     config["boot"]["firmware-vars"] =
-                        toml_edit::value(path_str(&rt.read(firmware_vars))?);
+                        toml_edit::value(path_str(&convert_path(&firmware_vars)?)?);
                 }
                 let profile_path = dir.join("profile.toml");
                 let profile_file = tempfile::NamedTempFile::new_in(&dir)?;
@@ -231,23 +267,28 @@ impl SimpleFlowNode for Node {
                 profile_file.persist(&profile_path)?;
                 let args = vec![
                     "--profile".into(),
-                    path_str(&profile_path)?.into(),
+                    path_str(&convert_path(&profile_path)?)?.into(),
                     "--kernel".into(),
-                    path_str(&kernel)?.into(),
+                    path_str(&convert_path(&kernel)?)?.into(),
                     "--initrd".into(),
-                    path_str(&initrd)?.into(),
+                    path_str(&convert_path(&initrd)?)?.into(),
                     "--share".into(),
-                    path_str(&share)?.into(),
+                    path_str(&convert_path(&share)?)?.into(),
                     "--guest-pipette".into(),
                     guest_pipette,
                     "--output-dir".into(),
-                    path_str(&dir.join("results"))?.into(),
+                    path_str(&convert_path(&dir.join("results"))?)?.into(),
                 ];
                 log::info!("Prepared profile: {}", profile_path.display());
                 if prepare_only {
+                    let default_command: &[&str] = if windows {
+                        &["--no-pty", "--", "/bin/true"]
+                    } else {
+                        &["--", "/bin/sh"]
+                    };
                     let command = std::iter::once(path_str(&runner)?)
                         .chain(args.iter().map(String::as_str))
-                        .chain(["--", "/bin/sh"])
+                        .chain(default_command.iter().copied())
                         .map(shell_word)
                         .collect::<Vec<_>>()
                         .join(" ");
@@ -277,14 +318,30 @@ pub fn parse_source_profile(contents: &str) -> anyhow::Result<toml_edit::Documen
                 incubator.get("type").and_then(|v| v.as_str()),
                 incubator.get("arch").and_then(|v| v.as_str())
             ),
-            (Some("openvmm"), Some("x86-64")) | (Some("qemu-tcg"), Some("aarch64"))
-        ) && boot.get("type").and_then(|v| v.as_str()) == Some("mshv"),
-        "Incubator provisioning supports mshv boot with x64 OpenVMM or ARM64 QEMU TCG"
+            (Some("openvmm"), Some("x86-64" | "aarch64")) | (Some("qemu-tcg"), Some("aarch64"))
+        ),
+        "Incubator provisioning supports OpenVMM or ARM64 QEMU TCG"
+    );
+    anyhow::ensure!(
+        match boot.get("type").and_then(|v| v.as_str()) {
+            Some("linux-direct") =>
+                incubator.get("type").and_then(|v| v.as_str()) == Some("openvmm"),
+            Some("mshv") =>
+                incubator.get("type").and_then(|v| v.as_str()) == Some("qemu-tcg")
+                    || incubator.get("arch").and_then(|v| v.as_str()) == Some("x86-64"),
+            _ => false,
+        },
+        "Incubator provisioning supports OpenVMM Linux-direct, x64 OpenVMM mshv, or ARM64 QEMU mshv"
     );
     if incubator.get("type").and_then(|v| v.as_str()) == Some("qemu-tcg") {
         anyhow::ensure!(
             incubator.get("machine").and_then(|v| v.as_str()) == Some("sbsa-ref"),
             "ARM64 Incubator provisioning requires the sbsa-ref machine"
+        );
+    } else if incubator.get("arch").and_then(|v| v.as_str()) == Some("aarch64") {
+        anyhow::ensure!(
+            incubator.get("nested-virt").and_then(|v| v.as_bool()) != Some(true),
+            "OpenVMM ARM64 Incubator does not support nested virtualization"
         );
     }
     Ok(config)
@@ -382,6 +439,25 @@ mod tests {
         include_str!("../../../../petri/incubator/profiles/x86_64-mshv.toml");
     const ARM64_PROFILE: &str =
         include_str!("../../../../petri/incubator/profiles/aarch64-tcg-mshv.toml");
+    const ARM64_DIRECT_PROFILE: &str =
+        include_str!("../../../../petri/incubator/profiles/aarch64-openvmm.toml");
+
+    #[test]
+    fn arm64_linux_direct_needs_no_mshv_artifacts_or_nested_virtualization() -> anyhow::Result<()> {
+        let config = parse_source_profile(ARM64_DIRECT_PROFILE)?;
+        assert_eq!(config["boot"]["type"].as_str(), Some("linux-direct"));
+        assert!(config["boot"].get("boot-artifacts").is_none());
+        assert!(
+            parse_source_profile(
+                &ARM64_DIRECT_PROFILE.replace("nested-virt = false", "nested-virt = true")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_source_profile(&ARM64_DIRECT_PROFILE.replace("linux-direct", "mshv")).is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn arm64_profile_preserves_platform_and_boot_options() -> anyhow::Result<()> {
@@ -423,7 +499,7 @@ mod tests {
         for source in [
             SOURCE_PROFILE.replace("type = \"openvmm\"", "type = \"qemu-tcg\""),
             SOURCE_PROFILE.replace("arch = \"x86-64\"", "arch = \"aarch64\""),
-            SOURCE_PROFILE.replace("type = \"mshv\"", "type = \"linux-direct\""),
+            SOURCE_PROFILE.replace("type = \"mshv\"", "type = \"unknown\""),
             "[incubator]\ntype = 'openvmm'\narch = 'x86-64'\n".into(),
         ] {
             assert!(parse_source_profile(&source).is_err());

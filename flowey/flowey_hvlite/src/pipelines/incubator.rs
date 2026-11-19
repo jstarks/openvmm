@@ -1,22 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Local standalone mshv provisioning, independent of VMM test discovery.
+//! Local standalone Incubator provisioning, independent of VMM test discovery.
 
 use anyhow::Context as _;
 use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
+use flowey_lib_hvlite::common::CommonArch;
 use flowey_lib_hvlite::common::CommonProfile;
+use flowey_lib_hvlite::common::CommonTriple;
 use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct IncubatorCli {
-    /// Source mshv Incubator profile (x64 OpenVMM or ARM64 QEMU TCG).
+    /// Source OpenVMM Linux-direct/mshv or ARM64 QEMU mshv profile.
     #[arg(long)]
     profile: PathBuf,
 
-    /// Override the pinned mshv root kernel, not the child VM's kernel.
+    /// Native runner target. Windows targets require WSL; defaults to Linux.
+    #[arg(long, value_enum)]
+    target: Option<IncubatorTargetCli>,
+
+    /// Override the pinned guest kernel (the root kernel for mshv boot).
     #[arg(long)]
     kernel: Option<PathBuf>,
 
@@ -73,6 +79,25 @@ pub struct IncubatorCli {
     incubator_args: Vec<String>,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum IncubatorTargetCli {
+    LinuxX64,
+    LinuxAarch64,
+    WindowsX64,
+    WindowsAarch64,
+}
+
+impl IncubatorTargetCli {
+    fn triple(self) -> CommonTriple {
+        match self {
+            Self::LinuxX64 => CommonTriple::X86_64_LINUX_GNU,
+            Self::LinuxAarch64 => CommonTriple::AARCH64_LINUX_GNU,
+            Self::WindowsX64 => CommonTriple::X86_64_WINDOWS_MSVC,
+            Self::WindowsAarch64 => CommonTriple::AARCH64_WINDOWS_MSVC,
+        }
+    }
+}
+
 impl IntoPipeline for IncubatorCli {
     fn into_pipeline(self, backend_hint: PipelineBackendHint) -> anyhow::Result<Pipeline> {
         let working_dir = std::env::current_dir().context("getting Incubator working directory")?;
@@ -80,11 +105,52 @@ impl IntoPipeline for IncubatorCli {
         let source =
             flowey_lib_hvlite::_jobs::local_run_incubator::parse_source_profile(&source_profile)?;
         let qemu_tcg = source["incubator"]["type"].as_str() == Some("qemu-tcg");
+        let mshv = source["boot"]["type"].as_str() == Some("mshv");
         anyhow::ensure!(
             matches!(backend_hint, PipelineBackendHint::Local)
-                && matches!(FlowPlatform::host(backend_hint), FlowPlatform::Linux(_))
-                && (qemu_tcg || matches!(FlowArch::host(backend_hint), FlowArch::X86_64)),
-            "incubator provisioning requires a local Linux host; OpenVMM requires x64 with KVM"
+                && matches!(FlowPlatform::host(backend_hint), FlowPlatform::Linux(_)),
+            "incubator provisioning requires a local Linux or WSL host"
+        );
+        let host_arch: CommonArch = FlowArch::host(backend_hint).try_into()?;
+        let target = self
+            .target
+            .unwrap_or(match host_arch {
+                CommonArch::X86_64 => IncubatorTargetCli::LinuxX64,
+                CommonArch::Aarch64 => IncubatorTargetCli::LinuxAarch64,
+            })
+            .triple();
+        let windows = matches!(
+            target.as_triple().operating_system,
+            target_lexicon::OperatingSystem::Windows
+        );
+        anyhow::ensure!(
+            !windows || flowey_cli::running_in_wsl(),
+            "Windows Incubator targets require provisioning from WSL"
+        );
+        anyhow::ensure!(
+            !windows || !qemu_tcg,
+            "QEMU TCG Incubator provisioning requires a Linux target"
+        );
+        anyhow::ensure!(
+            target.common_arch()? == host_arch,
+            "the Incubator target must match the native host architecture"
+        );
+        let guest_arch = match source["incubator"]["arch"].as_str() {
+            Some("x86-64") => CommonArch::X86_64,
+            Some("aarch64") => CommonArch::Aarch64,
+            _ => unreachable!("source profile architecture was validated"),
+        };
+        anyhow::ensure!(
+            qemu_tcg || target.common_arch()? == guest_arch,
+            "the OpenVMM target must match the profile's guest architecture"
+        );
+        anyhow::ensure!(
+            mshv || (self.firmware.is_none()
+                && self.firmware_vars.is_none()
+                && self.boot_artifacts.is_none()
+                && self.kernel_cmdline.is_none()
+                && self.hypervisor_cmdline.is_none()),
+            "firmware, boot-artifact and boot command-line overrides require mshv boot"
         );
         anyhow::ensure!(
             if qemu_tcg {
@@ -134,7 +200,7 @@ impl IntoPipeline for IncubatorCli {
             .new_job(
                 FlowPlatform::host(backend_hint),
                 FlowArch::host(backend_hint),
-                "provision and run standalone mshv Incubator",
+                "provision and run standalone Incubator",
             )
             .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request::Init)
             .dep_on(
@@ -157,6 +223,7 @@ impl IntoPipeline for IncubatorCli {
             })
             .dep_on(
                 |ctx| flowey_lib_hvlite::_jobs::local_run_incubator::Params {
+                    target,
                     profile: CommonProfile::from_release(self.release),
                     source_profile,
                     working_dir,
@@ -218,6 +285,40 @@ mod tests {
         assert!(cli.incubator.prepare_only);
         assert!(cli.incubator.kernel.is_none());
         assert!(cli.incubator.incubator_args.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn windows_target_is_separate_from_guest_arguments() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "incubator",
+            "--profile",
+            "source.toml",
+            "--target",
+            "windows-aarch64",
+            "--",
+            "--guest-env",
+            "MESSAGE=hello world",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$MESSAGE\"",
+        ])?;
+        assert!(matches!(
+            cli.incubator.target,
+            Some(IncubatorTargetCli::WindowsAarch64)
+        ));
+        assert_eq!(
+            cli.incubator.incubator_args,
+            [
+                "--guest-env",
+                "MESSAGE=hello world",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf '%s' \"$MESSAGE\"",
+            ]
+        );
         Ok(())
     }
 

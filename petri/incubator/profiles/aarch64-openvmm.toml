@@ -1,0 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[incubator]
+type = "openvmm"
+arch = "aarch64"
+binary = "/path/to/native/openvmm"
+memory = "4G"
+processors = 2
+nested-virt = false
+
+[boot]
+type = "linux-direct"

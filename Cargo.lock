@@ -4060,6 +4060,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "ctrlc",
  "fs-err",
  "futures-concurrency",
  "pal_async",

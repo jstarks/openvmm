@@ -45,6 +45,18 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
 
+    fn execution_json(d: x86_system::execute::block::ExecutionDiagnostics) -> serde_json::Value {
+        serde_json::json!({
+            "single_entries":d.single_entries,"single_retired":d.single_retired,
+            "resumes":d.resumes,"block_entries":d.block_entries,
+            "block_retired":d.block_retired,"completed_lengths":d.completed_lengths,
+            "complete_exits":d.complete_exits,"budget_exits":d.budget_exits,
+            "revocation_exits":d.revocation_exits,"observer_exits":d.observer_exits,
+            "suspended_exits":d.suspended_exits,"transition_exits":d.transition_exits,
+            "stopped_exits":d.stopped_exits,
+        })
+    }
+
     struct DeviceBacking {
         mapping: Arc<sparse_mmap::SparseMapping>,
         tracker: WriteTracker,
@@ -1615,9 +1627,19 @@ mod native {
                     "execution_hits":d.execution_hits,"execution_misses":d.execution_misses,
                     "chain_lookups":d.chain_lookups,"chain_hits":d.chain_hits,
                     "chain_links":d.chain_links,
+                    "block_lookups":d.block_lookups,"block_hits":d.block_hits,
+                    "block_builds":d.block_builds,
                 })
             };
             let preparation = vp.code_preparation_diagnostics();
+            let execution = vp.execution_diagnostics()?;
+            ensure!(
+                execution
+                    .single_retired
+                    .wrapping_add(execution.block_retired)
+                    == progress.retired,
+                "execution diagnostics disagree with retired instruction progress"
+            );
             let translations = vp.translation_diagnostics()?;
             let apic=vp.apic_diagnostics().map(|snapshot| {
                 let apic=snapshot.registers;
@@ -1630,6 +1652,7 @@ mod native {
                     "delivered":snapshot.delivered,"first_interrupt_retired":snapshot.first_interrupt_retired,
                     "first_interrupt_time_100ns":snapshot.first_interrupt_time_100ns,
                     "decode":decode_json(decode),"decode_at_first_interrupt":first_decode.map(decode_json),
+                    "execution":execution_json(execution),
                     "code_pages_prepared":preparation.prepared,
                     "code_pages_unavailable":preparation.unavailable,
                     "translations":{
@@ -1841,6 +1864,7 @@ mod native {
             })
             .collect();
         let decode = vp.decode_diagnostics()?.0;
+        let execution = vp.execution_diagnostics()?;
         let translations = vp.translation_diagnostics()?;
         ensure!(
             translations.hits > 0,
@@ -1867,6 +1891,7 @@ mod native {
                 "no_refetch_hits":no_refetch_hits,
                 "execution_cache_hits":decode.execution_hits,
                 "chain_hits":decode.chain_hits,
+                "execution":execution_json(execution),
                 "translations":{
                     "hits":translations.hits,"misses":translations.misses,
                     "invalidations":translations.invalidations,"fallbacks":translations.fallbacks,

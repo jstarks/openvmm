@@ -45,7 +45,7 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
 
-    fn execution_json(d: x86_system::execute::block::ExecutionDiagnostics) -> serde_json::Value {
+    fn execution_json(d: x86_system::execute::compiled::ExecutionDiagnostics) -> serde_json::Value {
         serde_json::json!({
             "single_entries":d.single_entries,"single_retired":d.single_retired,
             "resumes":d.resumes,"block_entries":d.block_entries,

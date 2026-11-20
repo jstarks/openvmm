@@ -293,7 +293,7 @@ impl EmuProcessor<'_> {
     /// Returns aggregate IR entry lengths, retirements and precise exit reasons.
     pub fn execution_diagnostics(
         &self,
-    ) -> Result<x86_system::execute::block::ExecutionDiagnostics, Error> {
+    ) -> Result<x86_system::execute::compiled::ExecutionDiagnostics, Error> {
         let CpuLifecycle::Ready(core) = &self.state.cpu else {
             return Err(Error::Uninitialized);
         };

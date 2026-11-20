@@ -51,7 +51,8 @@ mod native {
             "resumes":d.resumes,"block_entries":d.block_entries,
             "block_retired":d.block_retired,"completed_lengths":d.completed_lengths,
             "complete_exits":d.complete_exits,"budget_exits":d.budget_exits,
-            "revocation_exits":d.revocation_exits,"observer_exits":d.observer_exits,
+            "revocation_exits":d.revocation_exits,"code_write_exits":d.code_write_exits,
+            "host_stop_exits":d.host_stop_exits,
             "suspended_exits":d.suspended_exits,"transition_exits":d.transition_exits,
             "stopped_exits":d.stopped_exits,
         })

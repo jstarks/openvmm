@@ -737,6 +737,7 @@ impl Processor for EmuProcessor<'_> {
                 .filter(|apic| apic.enabled() && apic.lvt[0] & 0x10000 == 0)
                 .map(|apic| apic.timer.deadline());
             let offer = self.state.apic_offer;
+            core.set_entry_stop(checkpoint);
             #[cfg(test)]
             let boundary_in_batch = self.state.boundary_in_batch;
             let result = {
@@ -756,6 +757,7 @@ impl Processor for EmuProcessor<'_> {
                         })
                     },
                     |core| {
+                        // Ingress and timer deadlines are recognized between bounded entries.
                         #[cfg(test)]
                         if !boundary_in_batch {
                             return true;

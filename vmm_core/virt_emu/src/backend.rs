@@ -1121,7 +1121,8 @@ fn with_system(mut regs: vp::Registers, system: SystemState) -> vp::Registers {
     regs.gs = segment_register(system.gs);
     regs.tr = segment_register(system.tr);
     regs.ldtr = segment_register(system.ldtr);
-    regs.efer |= u64::from(system.efer_sce);
+    regs.efer =
+        x86_system::arch::svm::read_efer(regs.efer | u64::from(system.efer_sce), system.svm);
     regs.cr0 |= system.cr0_extra;
     regs.cr4 |= system.cr4_extra;
     regs

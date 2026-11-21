@@ -56,6 +56,8 @@ mod native {
             "suspended_exits":d.suspended_exits,"transition_exits":d.transition_exits,
             "stopped_exits":d.stopped_exits,
             "svm_page_faults":d.svm_page_faults,"svm_fault_samples":d.svm_fault_samples,
+            "svm_ud_exits":d.svm_ud_exits,"svm_invlpg_exits":d.svm_invlpg_exits,
+            "svm_exits":d.svm_exits,"svm_exit_samples":d.svm_exit_samples,
         })
     }
 

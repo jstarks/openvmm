@@ -1183,7 +1183,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
         program.extend([0x41, 0x0f, 0x20, 0xd0, 0xb9]);
         program.extend((if supported_msr { 0x8bu32 } else { 0x10 }).to_le_bytes());
         let msr_rip = CODE + program.len() as u64;
-        program.extend([0x0f, 0x32, 0xf4]);
+        program.extend([0x0f, if supported_msr { 0x32 } else { 0x30 }, 0xf4]);
         bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
         bytes[data as usize..data as usize + 8]
             .copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());

@@ -203,6 +203,7 @@ struct VpState {
     progress: CompletedBatchProgress,
     code_preparation: CodePreparationDiagnostics,
     checkpoint: Option<u64>,
+    checkpoint_guest: bool,
     io_active: bool,
     fault: Option<Error>,
     #[cfg(feature = "perf")]
@@ -348,6 +349,14 @@ impl EmuProcessor<'_> {
             return Err(Error::Profile("noncanonical execution checkpoint"));
         }
         self.state.checkpoint = address;
+        self.state.checkpoint_guest = false;
+        Ok(())
+    }
+
+    /// Stops at a guest instruction boundary without also stopping the SVM host.
+    pub fn set_guest_execution_checkpoint(&mut self, address: Option<u64>) -> Result<(), Error> {
+        self.set_execution_checkpoint(address)?;
+        self.state.checkpoint_guest = true;
         Ok(())
     }
 
@@ -505,6 +514,7 @@ impl ProtoPartition for EmuProtoPartition {
                 #[cfg(feature = "perf")]
                 profile: None,
                 checkpoint: None,
+                checkpoint_guest: false,
                 io_active: false,
                 fault: None,
             },
@@ -723,6 +733,7 @@ impl Processor for EmuProcessor<'_> {
                 (apic.base & 0x800 != 0 && !apic.x2apic()).then_some(apic.base & !0xfff)
             });
             let checkpoint = self.state.checkpoint;
+            let checkpoint_guest = self.state.checkpoint_guest;
             if let Some(error) = self.state.fault.take() {
                 return Err(dev.fatal_error(Box::new(error)));
             }
@@ -734,7 +745,10 @@ impl Processor for EmuProcessor<'_> {
             }
             self.control.yield_requested.maybe_yield().await;
             stop.check()?;
-            if core.at_instruction_boundary() && checkpoint == Some(core.cpu().rip) {
+            if core.at_instruction_boundary()
+                && checkpoint == Some(core.cpu().rip)
+                && (!checkpoint_guest || core.guest_mode())
+            {
                 return Err(dev.fatal_error(Box::new(Error::Checkpoint {
                     rip: core.cpu().rip,
                 })));
@@ -747,7 +761,11 @@ impl Processor for EmuProcessor<'_> {
                 .filter(|apic| apic.enabled() && apic.lvt[0] & 0x10000 == 0)
                 .map(|apic| apic.timer.deadline());
             let offer = self.state.apic_offer;
-            core.set_entry_stop(checkpoint);
+            if checkpoint_guest {
+                core.set_guest_entry_stop(checkpoint);
+            } else {
+                core.set_entry_stop(checkpoint);
+            }
             #[cfg(test)]
             let boundary_in_batch = self.state.boundary_in_batch;
             let result = {
@@ -776,7 +794,10 @@ impl Processor for EmuProcessor<'_> {
                             // Arm the timer timeout before registering the halt wait.
                             return true;
                         }
-                        if core.at_instruction_boundary() && checkpoint == Some(core.cpu().rip) {
+                        if core.at_instruction_boundary()
+                            && checkpoint == Some(core.cpu().rip)
+                            && (!checkpoint_guest || core.guest_mode())
+                        {
                             return true;
                         }
                         if self.control.unsupported.load(Ordering::Acquire)

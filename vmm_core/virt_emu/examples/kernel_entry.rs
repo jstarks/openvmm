@@ -58,6 +58,7 @@ mod native {
             "svm_page_faults":d.svm_page_faults,"svm_fault_samples":d.svm_fault_samples,
             "svm_ud_exits":d.svm_ud_exits,"svm_invlpg_exits":d.svm_invlpg_exits,
             "svm_exits":d.svm_exits,"svm_exit_samples":d.svm_exit_samples,
+            "svm_breakpoint":d.svm_breakpoint,
         })
     }
 
@@ -1002,6 +1003,33 @@ mod native {
         Ok(trace)
     }
 
+    fn virtual_words(
+        memory: &GuestMemory,
+        root: u64,
+        linear: u64,
+        count: u64,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let trace = walk_trace(memory, root, linear)?;
+        let mut words = Vec::new();
+        if let Some(leaf) = trace.last() {
+            if let (Some(word), Some(shift)) = (leaf["word"].as_u64(), leaf["shift"].as_u64()) {
+                if word & 1 != 0
+                    && (shift == 12 || ((shift == 21 || shift == 30) && word & 0x80 != 0))
+                {
+                    let mask = (1u64 << shift) - 1;
+                    let physical = (word & 0x0000_ffff_ffff_f000 & !mask) | (linear & mask);
+                    let bytes = (0x1000 - (linear & 0xfff)).min(count * 8);
+                    for offset in (0..bytes.saturating_sub(7)).step_by(8) {
+                        words.push(serde_json::json!({
+                            "address":linear+offset, "value":memory.read_plain::<u64>(physical+offset)?,
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(words)
+    }
+
     async fn witness(driver: DefaultDriver) -> anyhow::Result<()> {
         let mut args = std::env::args_os().skip(1);
         let kernel_path = args.next().context("missing vmlinux")?;
@@ -1059,12 +1087,26 @@ mod native {
         ensure!(probe_seconds > 0, "probe deadline must be positive");
         let mut shell_command = None;
         let mut stop_after_command = false;
+        let mut guest_checkpoint = None;
         let mut svm_enabled = false;
         let mut profile_enabled = false;
         #[cfg(feature = "perf")]
         let mut perf_control = None;
         while let Some(flag) = args.next() {
-            if flag == "--stop-after-command" {
+            if flag == "--guest-checkpoint" {
+                ensure!(guest_checkpoint.is_none(), "duplicate guest checkpoint");
+                let value = args
+                    .next()
+                    .context("missing guest checkpoint")?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 guest checkpoint"))?;
+                guest_checkpoint = Some(u64::from_str_radix(
+                    value
+                        .strip_prefix("0x")
+                        .context("guest checkpoint needs 0x prefix")?,
+                    16,
+                )?);
+            } else if flag == "--stop-after-command" {
                 ensure!(!stop_after_command, "duplicate command-stop flag");
                 stop_after_command = true;
             } else if flag == "--svm" {
@@ -1101,6 +1143,10 @@ mod native {
             }
         }
         let command_configured = shell_command.is_some();
+        ensure!(
+            guest_checkpoint.is_none() || (probe && svm_enabled),
+            "guest checkpoint requires an SVM probe"
+        );
         ensure!(
             !stop_after_command || (probe_apic && command_configured),
             "command-stop requires the APIC probe and a shell command"
@@ -1402,7 +1448,11 @@ mod native {
         if profile_enabled {
             vp.enable_execution_profile()?;
         }
-        vp.set_execution_checkpoint(Some(if probe { probe_target } else { CHECKPOINT }))?;
+        if let Some(target) = guest_checkpoint {
+            vp.set_guest_execution_checkpoint(Some(target))?;
+        } else {
+            vp.set_execution_checkpoint(Some(if probe { probe_target } else { CHECKPOINT }))?;
+        }
         {
             let mut state = vp.access_state(Vtl::Vtl0);
             state.set_mtrrs(&initial.mtrrs)?;
@@ -1730,25 +1780,46 @@ mod native {
                 })
             });
             let current_stack_walk = walk_trace(&memory, registers.cr3, registers.rsp)?;
-            let mut current_stack_words = Vec::new();
-            if let Some(leaf) = current_stack_walk.last() {
-                if let (Some(word), Some(shift)) = (leaf["word"].as_u64(), leaf["shift"].as_u64()) {
-                    if word & 1 != 0
-                        && (shift == 12 || ((shift == 21 || shift == 30) && word & 0x80 != 0))
-                    {
-                        let offset_mask = (1u64 << shift) - 1;
-                        let physical = (word & 0x0000_ffff_ffff_f000 & !offset_mask)
-                            | (registers.rsp & offset_mask);
-                        let bytes = (0x1000 - (registers.rsp & 0xfff)).min(1024);
-                        for offset in (0..bytes.saturating_sub(7)).step_by(8) {
-                            current_stack_words.push(serde_json::json!({
-                                "address":registers.rsp+offset,
-                                "value":memory.read_plain::<u64>(physical+offset)?,
-                            }));
-                        }
-                    }
-                }
-            }
+            let current_stack_words = virtual_words(&memory, registers.cr3, registers.rsp, 128)?;
+            let current_code_words = virtual_words(&memory, registers.cr3, registers.rip & !7, 4)?;
+            let callback_args = if guest_checkpoint.is_some() {
+                virtual_words(&memory, registers.cr3, registers.rdx, 4)?
+            } else {
+                Vec::new()
+            };
+            let callback_regs = if let Some(address) = callback_args
+                .first()
+                .and_then(|word| word["value"].as_u64())
+            {
+                virtual_words(&memory, registers.cr3, address, 21)?
+            } else {
+                Vec::new()
+            };
+            let checkpoint_rdi_words = if guest_checkpoint.is_some() {
+                virtual_words(&memory, registers.cr3, registers.rdi, 21)?
+            } else {
+                Vec::new()
+            };
+            let breakpoint_gate = if guest_checkpoint.is_some() {
+                virtual_words(&memory, registers.cr3, registers.idtr.base + 3 * 16, 2)?
+            } else {
+                Vec::new()
+            };
+            // v6.18.33's soft-exception skip return, with its pinned vcpu_svm offsets.
+            let kvm_soft_rip = if probe_target == 0xffff_ffff_812e_42d6
+                && guest_checkpoint.is_none()
+            {
+                let rip = virtual_words(&memory, registers.cr3, registers.rbx + 0x1b0, 4)?;
+                let exception = virtual_words(&memory, registers.cr3, registers.rbx + 0x868, 4)?;
+                let pointer = virtual_words(&memory, registers.cr3, registers.rbx + 0x1740, 1)?;
+                serde_json::json!({
+                    "rip":rip,"exception":exception,"vmcb_pointer":pointer,
+                    "vcpu_address":registers.rbx,
+                    "vcpu_rip_mapped":!rip.is_empty(),"vmcb_pointer_mapped":!pointer.is_empty(),
+                })
+            } else {
+                serde_json::Value::Null
+            };
             let mut stack_words = Vec::new();
             for address in (0x2603c00..0x2603f48).step_by(8) {
                 let value = memory.read_plain::<u64>(address)?;
@@ -1795,6 +1866,11 @@ mod native {
                     "stack_words":stack_words,
                     "current_stack_walk":current_stack_walk,
                     "current_stack_words":current_stack_words,
+                    "current_code_words":current_code_words,
+                    "guest_checkpoint":guest_checkpoint,"callback_args":callback_args,"callback_regs":callback_regs,
+                    "checkpoint_rdi_words":checkpoint_rdi_words,
+                    "breakpoint_gate":breakpoint_gate,
+                    "kvm_soft_rip":kvm_soft_rip,
                     "serial_bytes":serial_bytes,
                     "serial_output":serial_output,
                     "serial_input":serial_input,

@@ -1033,11 +1033,16 @@ mod native {
         };
         ensure!(probe_seconds > 0, "probe deadline must be positive");
         let mut shell_command = None;
+        let mut svm_enabled = false;
         let mut profile_enabled = false;
         #[cfg(feature = "perf")]
         let mut perf_control = None;
         while let Some(flag) = args.next() {
-            if flag == "--shell-command" {
+            if flag == "--svm" {
+                ensure!(probe_apic, "SVM requires the APIC/chipset probe");
+                ensure!(!svm_enabled, "duplicate SVM flag");
+                svm_enabled = true;
+            } else if flag == "--shell-command" {
                 ensure!(probe_apic, "shell command requires the APIC/chipset probe");
                 ensure!(shell_command.is_none(), "duplicate shell command");
                 shell_command = Some(
@@ -1087,7 +1092,7 @@ mod native {
             hv_config: None,
             vmtime: &time,
             isolation: ProtoPartitionIsolation::None,
-            nested_virt: false,
+            nested_virt: svm_enabled,
         };
         let proto = if probe_apic {
             hypervisor.new_partition(config)?
@@ -1728,7 +1733,7 @@ mod native {
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
                     "counters_gated":counters_gated,
                     "execution_profile":execution_profile,
-                    "clock_slowdown":clock_slowdown.get(),
+                    "clock_slowdown":clock_slowdown.get(),"svm_enabled":svm_enabled,
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
                     "kernel_image_bytes":encoding,
                     "instruction_walk":walk_trace(&memory,registers.cr3,registers.rip)?,

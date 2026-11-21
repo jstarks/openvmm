@@ -169,6 +169,7 @@ pub struct EmuProtoPartition {
     caps: Arc<PartitionCapabilities>,
     clock: VmTimeSource,
     architectural_apic: bool,
+    svm_available: bool,
     apic_id: u32,
     writes: WriteWatch,
 }
@@ -389,11 +390,11 @@ impl EmuHypervisor {
     ) -> Result<EmuProtoPartition, Error> {
         if config.processor_topology.vps().count() != 1
             || config.hv_config.is_some()
-            || config.nested_virt
+            || (config.nested_virt && !architectural_apic)
             || !matches!(config.isolation, ProtoPartitionIsolation::None)
         {
             return Err(Error::Profile(
-                "one VP, no isolation/HV1/nested virtualization",
+                "one VP, no isolation/HV1; basic SVM requires the architectural APIC profile",
             ));
         }
         let apic_id = config.processor_topology.max_apic_id();
@@ -409,7 +410,8 @@ impl EmuHypervisor {
         let caps = PartitionCapabilities::from_cpuid(
             config.processor_topology,
             &mut |function, subleaf| {
-                let mut values = x86_system::arch::profile::cpuid(function, subleaf);
+                let mut values =
+                    x86_system::arch::svm::cpuid(config.nested_virt, function, subleaf);
                 if architectural_apic && function == 1 {
                     values[1] = (values[1] & 0x00ff_ffff) | (apic_id << 24);
                     values[2] |= 1 << 21;
@@ -422,6 +424,7 @@ impl EmuHypervisor {
             caps: Arc::new(caps),
             clock: config.vmtime.clone(),
             architectural_apic,
+            svm_available: config.nested_virt,
             apic_id,
             writes: WriteWatch::default(),
         })
@@ -488,7 +491,14 @@ impl ProtoPartition for EmuProtoPartition {
                 first_apic_retired: None,
                 first_apic_time: None,
                 first_apic_decode: None,
-                cpu: CpuLifecycle::Importing(Box::new(SystemState::empty())),
+                cpu: CpuLifecycle::Importing(Box::new(SystemState {
+                    svm: if self.svm_available {
+                        x86_system::arch::svm::BASIC
+                    } else {
+                        x86_system::arch::svm::RESET
+                    },
+                    ..SystemState::empty()
+                })),
                 started: false,
                 progress: CompletedBatchProgress::default(),
                 code_preparation: CodePreparationDiagnostics::default(),

@@ -156,7 +156,7 @@ pub(super) fn poll(
     }
     // APIC register accesses materialize the counter themselves. With IF clear,
     // defer timer-only work until it can affect entry, observation, or a wait.
-    if core.cpu().flags & 0x200 == 0 && !core.halted() && !control.apic_work_pending() {
+    if !core.physical_interrupts_enabled() && !core.halted() && !control.apic_work_pending() {
         return Ok(());
     }
     let now = ticks(clock.now())?;
@@ -170,7 +170,7 @@ pub(super) fn poll(
     }
     control.drain_apic(apic)?;
     control.publish_apic(apic);
-    if core.pending().is_none() && core.cpu().flags & 0x200 != 0 && !core.shadow() {
+    if core.pending().is_none() && core.physical_interrupts_enabled() {
         if apic.interrupts.irr.words.iter().any(|&word| word != 0) {
             if let Some(vector) = apic.candidate() {
                 match core.inject(vector) {
@@ -181,7 +181,7 @@ pub(super) fn poll(
         }
     }
     clock.cancel_timeout();
-    if apic.enabled() && apic.lvt[0] & 0x10000 == 0 && core.cpu().flags & 0x200 != 0 {
+    if apic.enabled() && apic.lvt[0] & 0x10000 == 0 && core.physical_interrupts_enabled() {
         match apic.timer.deadline() {
             Deadline::Stopped => {}
             Deadline::At(value) => {

@@ -791,7 +791,7 @@ impl Processor for EmuProcessor<'_> {
                         if offer.is_some() {
                             return true;
                         }
-                        if core.cpu().flags & 0x200 == 0 || core.shadow() {
+                        if !core.physical_interrupts_enabled() {
                             return false;
                         }
                         candidate.is_some()

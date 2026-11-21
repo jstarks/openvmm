@@ -55,6 +55,7 @@ mod native {
             "host_stop_exits":d.host_stop_exits,
             "suspended_exits":d.suspended_exits,"transition_exits":d.transition_exits,
             "stopped_exits":d.stopped_exits,
+            "svm_page_faults":d.svm_page_faults,"svm_fault_samples":d.svm_fault_samples,
         })
     }
 
@@ -131,6 +132,10 @@ mod native {
     #[error("bounded kernel probe reached its {0}-second deadline")]
     struct ProbeDeadline(u32);
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("serial command returned to the shell prompt")]
+    struct CommandReturned;
+
     #[derive(Default)]
     struct ConsoleState {
         output: Vec<u8>,
@@ -139,6 +144,8 @@ mod native {
         reader: Option<std::task::Waker>,
         command_sent: bool,
         consumed: usize,
+        command_returned: bool,
+        return_waiter: Option<std::task::Waker>,
     }
 
     impl ConsoleState {
@@ -199,8 +206,21 @@ mod native {
             } else {
                 None
             };
+            let returned = if state.command_sent
+                && state.consumed != 0
+                && state.input.is_empty()
+                && state.output.ends_with(b"~ # ")
+            {
+                state.command_returned = true;
+                state.return_waiter.take()
+            } else {
+                None
+            };
             drop(state);
             if let Some(wake) = wake {
+                wake.wake();
+            }
+            if let Some(wake) = returned {
                 wake.wake();
             }
             Poll::Ready(Ok(data.len()))
@@ -408,6 +428,8 @@ mod native {
             assert_eq!(received, b"echo one\n");
             assert_eq!(state.lock().consumed, received.len());
             assert!(state.lock().command_sent);
+            assert!(!state.lock().command_returned);
+            state.lock().return_waiter = Some(waker.clone());
             assert_eq!(state.lock().output, b"boot\n~ # ");
             assert!(matches!(
                 Pin::new(&mut console).poll_write(&mut cx, b"~ # "),
@@ -418,7 +440,8 @@ mod native {
                     .poll_read(&mut cx, &mut data)
                     .is_pending()
             );
-            assert_eq!(count.0.load(Ordering::SeqCst), 1);
+            assert_eq!(count.0.load(Ordering::SeqCst), 2);
+            assert!(state.lock().command_returned);
         }
 
         #[test]
@@ -1033,12 +1056,16 @@ mod native {
         };
         ensure!(probe_seconds > 0, "probe deadline must be positive");
         let mut shell_command = None;
+        let mut stop_after_command = false;
         let mut svm_enabled = false;
         let mut profile_enabled = false;
         #[cfg(feature = "perf")]
         let mut perf_control = None;
         while let Some(flag) = args.next() {
-            if flag == "--svm" {
+            if flag == "--stop-after-command" {
+                ensure!(!stop_after_command, "duplicate command-stop flag");
+                stop_after_command = true;
+            } else if flag == "--svm" {
                 ensure!(probe_apic, "SVM requires the APIC/chipset probe");
                 ensure!(!svm_enabled, "duplicate SVM flag");
                 svm_enabled = true;
@@ -1072,6 +1099,10 @@ mod native {
             }
         }
         let command_configured = shell_command.is_some();
+        ensure!(
+            !stop_after_command || (probe_apic && command_configured),
+            "command-stop requires the APIC probe and a shell command"
+        );
         ensure!(args.next().is_none(), "unexpected witness arguments");
         let topology = TopologyBuilder::new_x86()
             .x2apic(if probe_apic {
@@ -1557,7 +1588,26 @@ mod native {
                     .await;
                 devices.events.fail(Box::new(ProbeDeadline(probe_seconds)));
             };
-            select(Box::pin(devices.failed()), Box::pin(deadline)).await;
+            let command_end = async {
+                if !stop_after_command {
+                    std::future::pending::<()>().await;
+                }
+                futures::future::poll_fn(|cx| {
+                    let mut state = console.lock();
+                    if state.command_returned {
+                        Poll::Ready(())
+                    } else {
+                        state.return_waiter = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+                devices.events.fail(Box::new(CommandReturned));
+            };
+            let terminal = async {
+                select(Box::pin(deadline), Box::pin(command_end)).await;
+            };
+            select(Box::pin(devices.failed()), Box::pin(terminal)).await;
         };
         match select(run, Box::pin(diagnostic)).await {
             Either::Left((Err(VpHaltReason::PowerOff), _)) => {}
@@ -1602,7 +1652,8 @@ mod native {
                     )
                 ) || failure.is::<UnconfiguredPort>()
                     || failure.is::<UnsupportedIrq>()
-                    || failure.is::<ProbeDeadline>(),
+                    || failure.is::<ProbeDeadline>()
+                    || failure.is::<CommandReturned>(),
                 "unexpected probe transport/device failure: {failure}"
             );
             let registers = vp.access_state(Vtl::Vtl0).registers()?;
@@ -1729,6 +1780,7 @@ mod native {
                 serde_json::json!({
                     "probe":true,"acceptance":false,"stop":failure.to_string(),"target":probe_target,
                     "stop_debug":format!("{failure:?}"),
+                    "stop_after_command":stop_after_command,
                     "transport_error":matches!(failure.downcast_ref::<Error>(),Some(Error::Memory(_))),
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
                     "counters_gated":counters_gated,

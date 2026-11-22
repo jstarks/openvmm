@@ -3080,7 +3080,7 @@ async fn run_control_inner(
                 None => openvmm_helpers::hypervisor::choose_hypervisor()?,
             },
             cfg: vm_config,
-            saved_state,
+            saved_state: saved_state.map(openvmm_defs::worker::RestoreState::Saved),
             shared_memory,
             rpc: rpc_recv,
             notify: notify_send,

@@ -14,7 +14,7 @@ pub use publish::write_snapshot;
 pub use restore::read_snapshot;
 
 /// Current manifest format version. Bump when making incompatible changes.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// Manifest describing a VM snapshot.
 #[derive(Clone, Protobuf)]

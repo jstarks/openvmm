@@ -33,7 +33,7 @@ impl Worker {
         let params = VmWorkerParameters {
             hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
             cfg,
-            saved_state,
+            saved_state: saved_state.map(openvmm_defs::worker::RestoreState::Saved),
             shared_memory,
             rpc: rpc_recv,
             notify: notify_send,

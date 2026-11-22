@@ -18,7 +18,18 @@ use vm_resource::kind::PciDeviceHandleKind;
 use vm_resource::kind::VmbusDeviceHandleKind;
 
 #[derive(MeshPayload)]
+pub struct ServicingResources {
+    pub construction: ProtobufMessage,
+    pub ram: crate::worker::SharedMemoryFd,
+    pub kernel: File,
+    pub initrd: Option<File>,
+}
+
+#[derive(MeshPayload)]
 pub enum VmRpc {
+    SetRamDirtyTracking(FailableRpc<bool, (u64, u64)>),
+    CollectRamDirty(FailableRpc<(), Vec<u64>>),
+    ServicingResources(FailableRpc<(), ServicingResources>),
     Save(FailableRpc<(), ProtobufMessage>),
     Resume(Rpc<(), bool>),
     Pause(Rpc<(), bool>),
@@ -72,6 +83,9 @@ impl From<anyhow::Error> for PulseSaveRestoreError {
 impl fmt::Debug for VmRpc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
+            VmRpc::SetRamDirtyTracking(_) => "SetRamDirtyTracking",
+            VmRpc::CollectRamDirty(_) => "CollectRamDirty",
+            VmRpc::ServicingResources(_) => "ServicingResources",
             VmRpc::Reset(_) => "Reset",
             VmRpc::Save(_) => "Save",
             VmRpc::Resume(_) => "Resume",

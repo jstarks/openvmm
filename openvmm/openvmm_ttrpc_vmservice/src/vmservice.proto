@@ -41,6 +41,16 @@ service VM {
     // so a snapshot can be restored only once.
     rpc RestoreVM(RestoreVMRequest) returns (RestoreVMResponse);
 
+    // Offer a running direct-boot VM to a local replacement. The rendezvous
+    // socket must be in a directory accessible only to the management user.
+    // Success means the source VM no longer owns the resources.
+    rpc OfferServicingVM(OfferServicingVMRequest) returns (OfferServicingVMResponse);
+    // Connect to an offer and resume the VM after the source releases ownership.
+    rpc AcceptServicingVM(AcceptServicingVMRequest) returns (google.protobuf.Empty);
+    // Prototype: receive a live VM into independent RAM over loopback TCP.
+    rpc ReceiveMigrationVM(ReceiveMigrationVMRequest) returns (google.protobuf.Empty);
+    rpc MigrateVM(MigrateVMRequest) returns (MigrateVMResponse);
+
     // ShutdownVM requests a cooperative guest power-off.
     // Success does not mean the guest has halted. Use WaitVM to observe a halt
     // and TeardownVM to release resources.
@@ -922,6 +932,45 @@ message CreateVMRequest {
 
 message SaveVMRequest {
     string destination_dir = 1;
+}
+
+message OfferServicingVMRequest {
+    string socket_path = 1;
+}
+
+message OfferServicingVMResponse {
+    // Upper bound from requesting source pause to acknowledgement of
+    // destination resume. Excludes preparation and source teardown.
+    uint64 pause_to_resume_us = 1;
+}
+
+message AcceptServicingVMRequest {
+    string socket_path = 1;
+    VMConfig config = 2;
+}
+
+message MigrationEndpoint {
+    // Loopback TCP port, chosen by the caller.
+    uint32 port = 1;
+    // One-time 32-byte pairing key supplied privately to both management endpoints.
+    bytes pairing_key = 2;
+}
+
+message MigrateVMRequest {
+    MigrationEndpoint endpoint = 1;
+}
+
+message MigrateVMResponse {
+    uint64 initial_bytes = 1;
+    uint64 dirty_bytes = 2;
+    uint64 final_bytes = 3;
+}
+
+message ReceiveMigrationVMRequest {
+    MigrationEndpoint endpoint = 1;
+    VMConfig config = 2;
+    // Leave the accepted VM paused (for inspection before first destination execution).
+    bool start_paused = 3;
 }
 
 message SaveVMResponse {

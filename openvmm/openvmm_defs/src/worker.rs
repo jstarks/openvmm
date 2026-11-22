@@ -25,6 +25,16 @@ cfg_select! {
 
 pub const VM_WORKER: WorkerId<VmWorkerParameters> = WorkerId::new("VmWorker");
 
+#[derive(MeshPayload)]
+pub enum RestoreState {
+    Saved(ProtobufMessage),
+    Incoming {
+        construction: ProtobufMessage,
+        prepared: mesh::OneshotSender<()>,
+        final_state: mesh::OneshotReceiver<ProtobufMessage>,
+    },
+}
+
 /// Launch parameters for the VM worker.
 #[derive(MeshPayload)]
 pub struct VmWorkerParameters {
@@ -33,7 +43,7 @@ pub struct VmWorkerParameters {
     /// The initial configuration.
     pub cfg: Config,
     /// The saved state.
-    pub saved_state: Option<ProtobufMessage>,
+    pub saved_state: Option<RestoreState>,
     /// File-backed guest RAM handle. When set, guest memory uses this
     /// fd/handle instead of allocating anonymous memory.
     pub shared_memory: Option<SharedMemoryFd>,

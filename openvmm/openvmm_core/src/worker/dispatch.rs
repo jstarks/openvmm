@@ -288,6 +288,21 @@ pub struct SavedState {
     resolved_gic_msi: Option<ResolvedGicMsi>,
 }
 
+#[derive(Protobuf)]
+#[mesh(package = "openvmm")]
+struct ConstructionState {
+    #[mesh(1)]
+    resolved_gic_msi: Option<ResolvedGicMsi>,
+}
+
+enum LoadState {
+    Saved(SavedState),
+    Incoming(
+        mesh::OneshotSender<()>,
+        mesh::OneshotReceiver<ProtobufMessage>,
+    ),
+}
+
 async fn open_simple_disk(
     resolver: &ResourceResolver,
     disk_type: Resource<DiskHandleKind>,
@@ -337,14 +352,23 @@ impl Worker for VmWorker {
         let (device_thread, device_driver) = new_device_thread();
 
         let mut manifest = Manifest::from_config(parameters.cfg);
-        let saved_state: Option<SavedState> = parameters
-            .saved_state
-            .map(|m| m.parse())
-            .transpose()
-            .context("failed to decode saved state")?;
-        manifest.resolved_gic_msi = saved_state
-            .as_ref()
-            .and_then(|s| s.resolved_gic_msi.clone());
+        let saved_state = match parameters.saved_state {
+            Some(openvmm_defs::worker::RestoreState::Saved(m)) => {
+                let state: SavedState = m.parse().context("failed to decode saved state")?;
+                manifest.resolved_gic_msi = state.resolved_gic_msi.clone();
+                Some(LoadState::Saved(state))
+            }
+            Some(openvmm_defs::worker::RestoreState::Incoming {
+                construction,
+                prepared,
+                final_state,
+            }) => {
+                manifest.resolved_gic_msi =
+                    construction.parse::<ConstructionState>()?.resolved_gic_msi;
+                Some(LoadState::Incoming(prepared, final_state))
+            }
+            None => None,
+        };
 
         let hypervisor = block_on(ResourceResolver::new().resolve(parameters.hypervisor, ()))
             .context("failed to resolve hypervisor backend")?;
@@ -393,7 +417,7 @@ impl Worker for VmWorker {
             shared_memory,
         ))?;
         pal_async::local::block_on(async {
-            let mut vm = vm.load(Some(saved_state), notify).await?;
+            let mut vm = vm.load(Some(LoadState::Saved(saved_state)), notify).await?;
 
             LOADED_VM.store(&vm);
 
@@ -1535,6 +1559,13 @@ impl InitializedVm {
             .guest_memory()
             .await
             .context("failed to get guest memory")?;
+        let gm = if let [ram] = mem_layout.ram() {
+            gm.with_write_watch(Arc::new(guestmem::WriteWatch::new(
+                ram.range.start()..ram.range.end(),
+            )))
+        } else {
+            gm
+        };
         let mut cpuid = Vec::new();
 
         // Add in Hyper-V VMM CPUID leaves.
@@ -1611,7 +1642,7 @@ impl InitializedVm {
     //         outside the VM-PHU/live migration blackout window.
     async fn load(
         self,
-        saved_state: Option<SavedState>,
+        saved_state: Option<LoadState>,
         client_notify_send: mesh::Sender<HaltReason>,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
@@ -3248,7 +3279,22 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
-            this.restore(saved_state)
+            let state = match saved_state {
+                LoadState::Saved(state) => state,
+                LoadState::Incoming(prepared, final_state) => {
+                    prepared.send(());
+                    let state: SavedState = final_state
+                        .await
+                        .context("source abandoned prepared VM")?
+                        .parse()?;
+                    anyhow::ensure!(
+                        state.resolved_gic_msi == this.construction_state().resolved_gic_msi,
+                        "construction state changed during transfer"
+                    );
+                    state
+                }
+            };
+            this.restore(state)
                 .await
                 .context("loadedvm restore failed")?;
         } else {
@@ -3878,6 +3924,34 @@ impl LoadedVm {
                     }
                     VmRpc::Resume(rpc) => rpc.handle(async |()| self.resume().await).await,
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
+                    VmRpc::SetRamDirtyTracking(rpc) => rpc.handle_failable_sync(|enable| {
+                        let range = self.migration_ram()?;
+                        anyhow::ensure!(self.inner.pcie_hotplug_devices.is_empty() && self.inner.dynamic_vpci_devices.is_empty(), "migration of dynamic devices is unsupported");
+                        let watch = self.inner.gm.write_watch().context("missing RAM write watch")?;
+                        self.inner.partition.memory_mapper(Vtl::Vtl0).set_dirty_tracking(range.start(), range.len(), enable)?;
+                        if enable { watch.start(); } else { watch.stop(); }
+                        anyhow::Ok((range.start(), range.len()))
+                    }),
+                    VmRpc::CollectRamDirty(rpc) => rpc.handle_failable_sync(|()| {
+                        let range = self.migration_ram()?;
+                        let mut bits = vec![0; (range.len() / 4096).div_ceil(64).try_into()?];
+                        self.inner.partition.memory_mapper(Vtl::Vtl0).collect_dirty(range.start(), range.len(), &mut bits)?;
+                        self.inner.gm.write_watch().context("missing RAM write watch")?.collect(&mut bits);
+                        anyhow::Ok(bits)
+                    }),
+                    VmRpc::ServicingResources(rpc) => rpc.handle_failable_sync(|()| {
+                        anyhow::ensure!(self.inner.pcie_hotplug_devices.is_empty() && self.inner.dynamic_vpci_devices.is_empty(), "servicing dynamic devices is unsupported");
+                        let LoadMode::Linux { kernel, initrd, .. } = &self.inner.load_mode else {
+                            anyhow::bail!("servicing requires direct boot")
+                        };
+                        let ram = self.inner.memory_manager.shared_memory_backing()
+                            .context("servicing requires one shareable RAM backing")?
+                            .into_mappable().inner_arc().try_clone()?;
+                        anyhow::Ok(openvmm_defs::rpc::ServicingResources {
+                            construction: ProtobufMessage::new(self.construction_state()),
+                            ram, kernel: kernel.try_clone()?, initrd: initrd.as_ref().map(File::try_clone).transpose()?,
+                        })
+                    }),
                     VmRpc::Save(rpc) => {
                         rpc.handle_failable(async |()| self.save().await.map(ProtobufMessage::new))
                             .await
@@ -4373,16 +4447,29 @@ impl LoadedVm {
         }
     }
 
+    fn migration_ram(&self) -> anyhow::Result<MemoryRange> {
+        let [ram] = self.inner.mem_layout.ram() else {
+            anyhow::bail!("prototype migration requires one contiguous RAM range")
+        };
+        Ok(ram.range)
+    }
+
+    fn construction_state(&self) -> ConstructionState {
+        ConstructionState {
+            resolved_gic_msi: cfg_select! {
+                guest_arch = "aarch64" => ResolvedGicMsi::capture(self.inner.processor_topology.gic_msi()),
+                _ => None,
+            },
+        }
+    }
+
     /// Saves the VM's processor, partition, and device state.
     ///
     /// TODO: virtio & vmbus unsupported.
     async fn save(&mut self) -> anyhow::Result<SavedState> {
         Ok(SavedState {
             units: self.state_units.save().await?,
-            resolved_gic_msi: cfg_select! {
-                guest_arch = "aarch64" => ResolvedGicMsi::capture(self.inner.processor_topology.gic_msi()),
-                _ => None,
-            },
+            resolved_gic_msi: self.construction_state().resolved_gic_msi,
         })
     }
 

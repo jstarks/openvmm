@@ -15,7 +15,9 @@
 mod fd_passing;
 #[cfg(windows)]
 mod handle_passing;
+mod migration;
 mod resource_passing;
+mod servicing;
 
 cfg_select! {
     unix => {
@@ -587,6 +589,7 @@ impl VmService {
 }
 
 struct Vm {
+    servicing_profile: Option<servicing::TransferProfile>,
     worker_rpc: mesh::Sender<VmRpc>,
     shutdown_rpc: Option<mesh::Sender<ShutdownRpc>>,
     acpi_power_button_rpc: Option<mesh::Sender<PowerButtonRpc>>,
@@ -768,6 +771,19 @@ struct PreparedRestore {
     snapshot_id: Guid,
 }
 
+enum RestoreSource {
+    Migrated(
+        openvmm_defs::worker::SharedMemoryFd,
+        mesh::payload::message::ProtobufMessage,
+    ),
+    Snapshot(RestoreParameters),
+    Servicing(
+        openvmm_defs::rpc::ServicingResources,
+        mesh::OneshotSender<()>,
+        mesh::OneshotReceiver<mesh::payload::message::ProtobufMessage>,
+    ),
+}
+
 /// Validates the snapshot against the VM configuration and opens its memory.
 /// The manifest and saved state were read and checked up front by
 /// `restore_vm`.
@@ -875,8 +891,29 @@ enum HandleAction {
 
 impl VmService {
     async fn handle(&mut self, ctx: mesh::CancelContext, request: vmservice::Vm) -> HandleAction {
-        tracing::debug!(?request, "request");
+        // Migration requests contain one-time pairing keys.
+        if !matches!(
+            request,
+            vmservice::Vm::ReceiveMigrationVm(..) | vmservice::Vm::MigrateVm(..)
+        ) {
+            tracing::debug!(?request, "request");
+        }
         match request {
+            vmservice::Vm::MigrateVm(request, response) => {
+                response.send(map_grpc(self.migrate(ctx, request).await));
+            }
+            vmservice::Vm::ReceiveMigrationVm(request, response) => {
+                response.send(map_grpc(self.receive_migration(ctx, request).await));
+            }
+            vmservice::Vm::OfferServicingVm(request, response) => {
+                response.send(map_grpc(
+                    self.offer_servicing(ctx, Path::new(&request.socket_path))
+                        .await,
+                ));
+            }
+            vmservice::Vm::AcceptServicingVm(request, response) => {
+                response.send(map_grpc(self.accept_servicing(ctx, request).await));
+            }
             vmservice::Vm::CreateVm(request, response) => {
                 response.send(map_grpc(self.create_vm(request).await))
             }
@@ -1090,11 +1127,11 @@ impl VmService {
         let snapshot_id = self
             .create_vm_inner(
                 config,
-                Some(RestoreParameters {
+                Some(RestoreSource::Snapshot(RestoreParameters {
                     source_dir,
                     manifest,
                     state_bytes,
-                }),
+                })),
             )
             .await?
             .context("restore did not produce a snapshot ID")?;
@@ -1108,13 +1145,22 @@ impl VmService {
     async fn create_vm_inner(
         &mut self,
         mut req_config: vmservice::VmConfig,
-        restore: Option<RestoreParameters>,
+        restore: Option<RestoreSource>,
     ) -> anyhow::Result<Option<Guid>> {
         if self.vm.is_some() {
             bail!("VM already created");
         }
 
         validate_platform_config(&req_config)?;
+        let servicing_profile = servicing::profile(&req_config);
+        let (snapshot, mut handoff, migrated) = match restore {
+            Some(RestoreSource::Snapshot(s)) => (Some(s), None, None),
+            Some(RestoreSource::Servicing(resources, prepared, state)) => {
+                (None, Some((resources, prepared, state)), None)
+            }
+            Some(RestoreSource::Migrated(ram, state)) => (None, None, Some((ram, state))),
+            None => (None, None, None),
+        };
 
         let vmgs = build_vmgs(req_config.vmgs.take()).await?;
         let iommufds = IommufdContexts::new(std::mem::take(&mut req_config.iommufds))?;
@@ -1184,11 +1230,16 @@ impl VmService {
                 if isolation.is_some() {
                     bail!("VM-service SNP isolation currently supports only IGVM boot");
                 }
-                let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
-                let initrd = if boot.initrd_path.is_empty() {
-                    None
+                let (kernel, initrd) = if let Some((resources, ..)) = &mut handoff {
+                    (resources.kernel.try_clone()?, resources.initrd.take())
                 } else {
-                    Some(File::open(boot.initrd_path).context("failed to open initrd")?)
+                    let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
+                    let initrd = if boot.initrd_path.is_empty() {
+                        None
+                    } else {
+                        Some(File::open(boot.initrd_path).context("failed to open initrd")?)
+                    };
+                    (kernel, initrd)
                 };
                 (
                     LoadMode::Linux {
@@ -1349,7 +1400,7 @@ impl VmService {
             .and_then(|config| config.backing_file_path.as_deref())
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
-        if restore.is_some() && memory_backing_file.is_some() {
+        if (snapshot.is_some() || handoff.is_some()) && memory_backing_file.is_some() {
             return Err(anyhow!(Code::InvalidArgument)
                 .context("memory backing file cannot be specified when restoring a snapshot"));
         }
@@ -1584,14 +1635,34 @@ impl VmService {
             .context("spawning vm process failed")?;
 
         let (shared_memory, saved_state, active_memory_backing_file, snapshot_id) =
-            if let Some(restore) = &restore {
+            if let Some(restore) = &snapshot {
                 let prepared =
                     prepare_snapshot_restore(restore, config_mem_size, config_proc_count)?;
                 (
                     Some(prepared.shared_memory),
-                    Some(prepared.saved_state),
+                    Some(openvmm_defs::worker::RestoreState::Saved(
+                        prepared.saved_state,
+                    )),
                     Some(restore.source_dir.join("memory.bin")),
                     Some(prepared.snapshot_id),
+                )
+            } else if let Some((ram, state)) = migrated {
+                (
+                    Some(ram),
+                    Some(openvmm_defs::worker::RestoreState::Saved(state)),
+                    memory_backing_file,
+                    None,
+                )
+            } else if let Some((resources, prepared, final_state)) = handoff {
+                (
+                    Some(resources.ram),
+                    Some(openvmm_defs::worker::RestoreState::Incoming {
+                        construction: resources.construction,
+                        prepared,
+                        final_state,
+                    }),
+                    None,
+                    None,
                 )
             } else {
                 let shared_memory = memory_backing_file
@@ -1657,6 +1728,7 @@ impl VmService {
         self.vm_controller_events = Some(event_recv);
         self.controller_task = Some(controller_task);
         self.vm = Some(Arc::new(Vm {
+            servicing_profile,
             shutdown_rpc,
             acpi_power_button_rpc,
             scsi_rpc,
@@ -3486,6 +3558,7 @@ mod tests {
         VmService {
             driver,
             vm: Some(Arc::new(Vm {
+                servicing_profile: None,
                 worker_rpc,
                 shutdown_rpc,
                 acpi_power_button_rpc: None,

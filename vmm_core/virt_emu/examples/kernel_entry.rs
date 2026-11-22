@@ -45,6 +45,37 @@ mod native {
 
     const RAM: u64 = 512 * 1024 * 1024;
 
+    fn jit_json(
+        vp: &virt_emu::backend::EmuProcessor<'_>,
+        enabled: bool,
+        retired: u64,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        if !enabled {
+            return Ok(None);
+        }
+        #[cfg(all(feature = "native-jit", target_os = "linux"))]
+        {
+            let d = vp.native_diagnostics()?;
+            ensure!(
+                d.retired <= retired,
+                "native retirements exceed VP progress"
+            );
+            let blockers: BTreeMap<_,_> = d.blockers.iter().map(|(name, count)| (*name, serde_json::json!({
+                "entries":count.entries, "offered":count.instructions, "retired_before_resume":count.retired
+            }))).collect();
+            Ok(Some(
+                serde_json::json!({"native_entries":d.entries, "native_retired":d.retired,"compilations":d.compilations,
+                "interpreted_retired":retired - d.retired, "fallback_entries":d.fallbacks,
+                "fallback_offered":d.fallback_instructions, "blockers":blockers}),
+            ))
+        }
+        #[cfg(not(all(feature = "native-jit", target_os = "linux")))]
+        {
+            let _ = (vp, retired);
+            bail!("native execution requires Linux x86-64 and --features native-jit")
+        }
+    }
+
     fn execution_json(d: x86_system::execute::compiled::ExecutionDiagnostics) -> serde_json::Value {
         serde_json::json!({
             "single_entries":d.single_entries,"single_retired":d.single_retired,
@@ -1040,11 +1071,7 @@ mod native {
             .next()
             .context("missing pre-reset mapping projection")?;
         let option = args.next();
-        let native_jit = option.as_deref() == Some(std::ffi::OsStr::new("--native-jit"));
-        ensure!(
-            !native_jit || cfg!(all(feature = "native-jit", target_os = "linux")),
-            "native checkpoint requires Linux x86-64 and --features native-jit"
-        );
+        let mut native_jit = option.as_deref() == Some(std::ffi::OsStr::new("--native-jit"));
         let slow_time = option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic-slow"));
         let probe_apic =
             slow_time || option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic"));
@@ -1102,7 +1129,10 @@ mod native {
         #[cfg(feature = "perf")]
         let mut perf_control = None;
         while let Some(flag) = args.next() {
-            if flag == "--svm-exit-checkpoint" {
+            if flag == "--native-jit" {
+                ensure!(probe && !native_jit, "unexpected or duplicate --native-jit");
+                native_jit = true;
+            } else if flag == "--svm-exit-checkpoint" {
                 ensure!(
                     svm_exit_checkpoint.is_none(),
                     "duplicate SVM exit checkpoint"
@@ -1177,6 +1207,10 @@ mod native {
             }
         }
         let command_configured = shell_command.is_some();
+        ensure!(
+            !native_jit || cfg!(all(feature = "native-jit", target_os = "linux")),
+            "native execution requires Linux x86-64 and --features native-jit"
+        );
         ensure!(
             svm_exit_checkpoint.is_none() || (probe && svm_enabled && guest_checkpoint.is_none()),
             "SVM exit checkpoint requires an SVM probe without a guest RIP checkpoint"
@@ -1923,6 +1957,7 @@ mod native {
                     "stop_after_command":stop_after_command,
                     "transport_error":matches!(failure.downcast_ref::<Error>(),Some(Error::Memory(_))),
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
+                    "jit":jit_json(&vp,native_jit,progress.retired)?,
                     "counters_gated":counters_gated,
                     "execution_profile":execution_profile,
                     "clock_slowdown":clock_slowdown.get(),"svm_enabled":svm_enabled,"nrips":svm_enabled && !no_nrips,
@@ -2090,30 +2125,18 @@ mod native {
             "intra-page successor path was not exercised"
         );
         let preparation = vp.code_preparation_diagnostics();
-        #[cfg(all(feature = "native-jit", target_os = "linux"))]
-        let jit = if native_jit {
-            let d = vp.native_diagnostics()?;
+        let jit = jit_json(&vp, native_jit, progress.retired)?;
+        if native_jit {
             ensure!(
                 progress.retired == 967_067,
                 "mixed execution changed checkpoint retirement count"
             );
+            #[cfg(all(feature = "native-jit", target_os = "linux"))]
             ensure!(
-                d.retired > 0 && d.retired <= progress.retired,
-                "no valid native checkpoint retirements"
+                vp.native_diagnostics()?.retired > 0,
+                "no native checkpoint retirements"
             );
-            let blockers: BTreeMap<_,_> = d.blockers.iter().map(|(name, count)| (*name, serde_json::json!({
-                "entries":count.entries, "offered":count.instructions, "retired_before_resume":count.retired
-            }))).collect();
-            Some(
-                serde_json::json!({"native_entries":d.entries, "native_retired":d.retired,
-                "interpreted_retired":progress.retired - d.retired, "fallback_entries":d.fallbacks,
-                "fallback_offered":d.fallback_instructions, "blockers":blockers}),
-            )
-        } else {
-            None
-        };
-        #[cfg(not(all(feature = "native-jit", target_os = "linux")))]
-        let jit: Option<serde_json::Value> = None;
+        }
         println!(
             "{}",
             serde_json::json!({

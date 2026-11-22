@@ -26,6 +26,7 @@ pub(super) enum ResolvedGicMsi {
 
 #[cfg(guest_arch = "aarch64")]
 impl ResolvedGicMsi {
+    pub(super) const OWNER: &'static str = "platform/gic-msi";
     pub(super) fn capture(
         controller: vm_topology::processor::aarch64::GicMsiController,
     ) -> Option<Self> {

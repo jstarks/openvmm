@@ -126,6 +126,9 @@ impl VirtioDevice for VirtioRtcDevice {
     fn supports_save_restore(&self) -> bool {
         true
     }
+    fn transfer_binding(&self) -> virtio::device::TransferBinding {
+        virtio::device::TransferBinding::Reconstruct
+    }
 }
 
 #[derive(InspectMut)]

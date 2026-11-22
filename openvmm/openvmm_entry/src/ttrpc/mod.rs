@@ -1527,10 +1527,25 @@ impl VmService {
                 scsi_rpc = Some(send);
             }
 
+            let mut slots = if let Some((resources, ..)) = &mut handoff {
+                anyhow::ensure!(
+                    resources.mmio.len() == devices_config.virtio_mmio.len(),
+                    "servicing MMIO slot count mismatch"
+                );
+                Some(std::mem::take(&mut resources.mmio).into_iter())
+            } else {
+                None
+            };
             for device in devices_config.virtio_mmio {
+                let live = slots.as_mut().and_then(Iterator::next);
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
-                    build_virtio_device(device, &registry).await?,
+                    match live {
+                        Some(openvmm_defs::rpc::ServicingSlot::Bound(resource)) => resource,
+                        Some(openvmm_defs::rpc::ServicingSlot::Reconstruct) | None => {
+                            build_virtio_device(device, &registry).await?
+                        }
+                    },
                 ));
             }
             for nic in devices_config.nic_config {
@@ -1630,6 +1645,12 @@ impl VmService {
             vmbus.vsock_path = Some(hvsocket_config.path);
         }
 
+        if let Some((resources, ..)) = &handoff {
+            anyhow::ensure!(
+                resources.mmio.is_empty(),
+                "unused servicing device bindings"
+            );
+        }
         let (send, recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
 
@@ -1655,7 +1676,7 @@ impl VmService {
             } else if let Some((ram, state)) = migrated {
                 (
                     Some(ram),
-                    Some(openvmm_defs::worker::RestoreState::Saved(state)),
+                    Some(openvmm_defs::worker::RestoreState::Migrated(state)),
                     memory_backing_file,
                     None,
                 )
@@ -3105,6 +3126,39 @@ async fn build_nvme_controller(
         requests: None,
     }
     .into_resource())
+}
+
+/// Project management resource bindings into a portable comparison. Device
+/// eligibility and guest-visible backend properties belong to the resolved
+/// device, not this adapter. Never authorize a destructive disk open.
+fn portable_function_binding(function: &mut vmservice::VirtioDevice) -> Option<()> {
+    use vmservice::virtio_device::Kind;
+    match function.kind.as_mut()? {
+        Kind::Blk(blk) => {
+            let vmservice::disk_backend::Kind::File(file) = blk.backend.as_mut()?.kind.as_mut()?
+            else {
+                return None;
+            };
+            if !blk.read_only || file.create_size_bytes.is_some() {
+                return None;
+            }
+            // Storage orchestration guarantees identical read-only data; a
+            // path and cache policy locate it, neither identifies the guest disk.
+            file.path.clear();
+            file.direct = false;
+        }
+        Kind::Rng(_) | Kind::Rtc(_) => (),
+        Kind::Net(net) if net.backend.is_none() => (),
+        // These management descriptors contain endpoints, paths or service
+        // bindings without a portable binding projection yet.
+        Kind::Net(_)
+        | Kind::Console(_)
+        | Kind::Vsock(_)
+        | Kind::VhostUser(_)
+        | Kind::Fs(_)
+        | Kind::Pmem(_) => return None,
+    }
+    Some(())
 }
 
 /// Builds a transport-independent virtio device function from the proto

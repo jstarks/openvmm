@@ -28,6 +28,7 @@ pub const VM_WORKER: WorkerId<VmWorkerParameters> = WorkerId::new("VmWorker");
 #[derive(MeshPayload)]
 pub enum RestoreState {
     Saved(ProtobufMessage),
+    Migrated(ProtobufMessage),
     Incoming {
         construction: ProtobufMessage,
         prepared: mesh::OneshotSender<()>,

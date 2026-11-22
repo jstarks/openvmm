@@ -10,6 +10,7 @@ rust-version.workspace = true
 vm_resource.workspace = true
 
 inspect.workspace = true
+mesh.workspace = true
 inspect_counters.workspace = true
 net_backend.workspace = true
 net_backend_resources.workspace = true
@@ -31,7 +32,6 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-mesh.workspace = true
 pal_event.workspace = true
 parking_lot.workspace = true
 test_with_tracing.workspace = true

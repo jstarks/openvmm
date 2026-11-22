@@ -63,6 +63,46 @@ pub struct VirtioBlkDevice {
     read_only: bool,
     supports_discard: bool,
     config: VirtioBlkConfig,
+    configured_id: Option<[u8; VIRTIO_BLK_ID_BYTES]>,
+    options: VirtioBlkOptions,
+}
+
+#[derive(mesh::payload::Protobuf)]
+#[mesh(package = "virtio.block")]
+struct DiskPresentation {
+    #[mesh(1)]
+    id: [u8; VIRTIO_BLK_ID_BYTES],
+    #[mesh(2)]
+    capacity: u64,
+    #[mesh(3)]
+    logical_size: u32,
+    #[mesh(4)]
+    physical_exp: u8,
+    #[mesh(5)]
+    discard: bool,
+    #[mesh(6)]
+    discard_alignment: u32,
+    #[mesh(7)]
+    read_only: bool,
+}
+
+fn guest_id(
+    disk: &Disk,
+    configured: Option<[u8; VIRTIO_BLK_ID_BYTES]>,
+) -> [u8; VIRTIO_BLK_ID_BYTES] {
+    if let Some(id) = configured {
+        return id;
+    }
+    if let Some(id) = disk.disk_id() {
+        let mut bytes = [0; VIRTIO_BLK_ID_BYTES];
+        for (pair, byte) in bytes.chunks_exact_mut(2).zip(id) {
+            let hex = b"0123456789abcdef";
+            pair.copy_from_slice(&[hex[(byte >> 4) as usize], hex[(byte & 15) as usize]]);
+        }
+        bytes
+    } else {
+        *b"openvmm-virtio-blk\0\0"
+    }
 }
 
 impl InspectMut for VirtioBlkDevice {
@@ -361,6 +401,8 @@ impl VirtioBlkDevice {
             read_only,
             supports_discard,
             config,
+            configured_id: serial,
+            options,
         })
     }
 }
@@ -381,6 +423,76 @@ fn parse_serial(serial: String) -> anyhow::Result<[u8; VIRTIO_BLK_ID_BYTES]> {
 }
 
 impl VirtioDevice for VirtioBlkDevice {
+    fn construction_config(
+        &mut self,
+        source: Option<&mesh::payload::message::ProtobufAny>,
+    ) -> anyhow::Result<Option<mesh::payload::message::ProtobufAny>> {
+        let local = DiskPresentation {
+            id: guest_id(&self.workers[0].worker.task().disk, self.configured_id),
+            capacity: self.config.capacity,
+            logical_size: self.config.blk_size,
+            physical_exp: self.config.topology.physical_block_exp,
+            discard: self.supports_discard,
+            discard_alignment: self.config.discard_sector_alignment,
+            read_only: self.read_only,
+        };
+        let effective = match source {
+            None => local,
+            Some(blob) => {
+                let saved: DiskPresentation = blob.parse()?;
+                anyhow::ensure!(
+                    saved.capacity == local.capacity && saved.logical_size == local.logical_size,
+                    "incompatible disk capacity or logical sector size"
+                );
+                anyhow::ensure!(
+                    saved.read_only == local.read_only
+                        && (!saved.discard
+                            || (local.discard
+                                && saved.discard_alignment == local.discard_alignment)),
+                    "incompatible disk capabilities"
+                );
+                anyhow::ensure!(
+                    self.configured_id.is_none_or(|id| id == saved.id),
+                    "configured disk serial conflicts with source"
+                );
+                // Physical geometry is an advisory topology hint; logical
+                // addressing and I/O validation continue to use the backend.
+                anyhow::ensure!(
+                    saved.physical_exp < 32
+                        && (saved.logical_size as u64) << saved.physical_exp <= u32::MAX as u64,
+                    "invalid physical sector geometry"
+                );
+                self.config.topology.physical_block_exp = saved.physical_exp;
+                self.config.discard_sector_alignment = saved.discard_alignment;
+                self.supports_discard = saved.discard;
+                saved
+            }
+        };
+        for w in &mut self.workers {
+            w.worker.task_mut().serial = Some(effective.id);
+        }
+        Ok(Some(mesh::payload::message::ProtobufAny::new(effective)))
+    }
+
+    fn transfer_binding(&self) -> virtio::device::TransferBinding {
+        if !self.read_only {
+            return virtio::device::TransferBinding::Unsupported;
+        }
+        let disk = self.workers[0].worker.task().disk.clone();
+        let options = self.options;
+        let read_only = self.read_only;
+        virtio::device::TransferBinding::Export(Box::new(move || {
+            Ok(vm_resource::Resource::new(
+                virtio_resources::blk::VirtioBlkHandle {
+                    disk: disk.servicing_resource()?,
+                    read_only,
+                    options,
+                    serial: None,
+                },
+            ))
+        }))
+    }
+
     fn traits(&self) -> DeviceTraits {
         let mut features = VIRTIO_BLK_F_SEG_MAX
             | VIRTIO_BLK_F_BLK_SIZE
@@ -595,17 +707,7 @@ async fn process_request_inner(
             Ok((0, IoStat::Flush, false))
         }
         VIRTIO_BLK_T_GET_ID => {
-            let id = if let Some(serial) = serial {
-                serial
-            } else if let Some(disk_id) = disk.disk_id() {
-                let mut id_str = [0u8; VIRTIO_BLK_ID_BYTES];
-                let hex: String = disk_id.iter().map(|b| format!("{:02x}", b)).collect();
-                let copy_len = hex.len().min(VIRTIO_BLK_ID_BYTES);
-                id_str[..copy_len].copy_from_slice(&hex.as_bytes()[..copy_len]);
-                id_str
-            } else {
-                *b"openvmm-virtio-blk\0\0"
-            };
+            let id = guest_id(disk, serial);
             work.write(mem, &id).map_err(|_| VIRTIO_BLK_S_IOERR)?;
             Ok((VIRTIO_BLK_ID_BYTES as u32, IoStat::None, false))
         }
@@ -798,9 +900,13 @@ async fn do_io(
     let buffers = RequestBuffers::new(effective_mem, range, is_read);
 
     if is_read {
-        disk.read_vectored(&buffers, start_disk_sector)
-            .await
-            .map_err(|_| VIRTIO_BLK_S_IOERR)?;
+        let result = disk.read_vectored(&buffers, start_disk_sector).await;
+        if !bounced {
+            for region in &regions {
+                mem.record_external_write(region.addr, region.len as usize);
+            }
+        }
+        result.map_err(|_| VIRTIO_BLK_S_IOERR)?;
     } else {
         disk.write_vectored(&buffers, start_disk_sector, false)
             .await

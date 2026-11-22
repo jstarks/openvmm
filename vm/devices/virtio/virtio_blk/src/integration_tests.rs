@@ -1067,6 +1067,34 @@ async fn flush_succeeds(driver: DefaultDriver) {
     assert_eq!(used_len, 1); // status byte only
 }
 
+#[async_test]
+async fn restored_identity_is_used_by_the_queue(driver: DefaultDriver) {
+    let make = |sector, id| {
+        TestHarness::new(
+            &driver,
+            HookDisk::new(64 * 1024, sector)
+                .with_disk_id(id)
+                .into_disk(),
+            true,
+        )
+    };
+    let mut source = make(512, *b"backing-disk-id!");
+    let mut different = make(4096, *b"another-disk-id!");
+    let mut compatible = make(512, *b"another-disk-id!");
+    let saved = virtio::device::FunctionPresentation::bind(&mut source.device, None).unwrap();
+    let err = virtio::device::FunctionPresentation::bind(&mut different.device, Some(&saved))
+        .unwrap_err();
+    assert!(err.to_string().contains("logical sector size"));
+    virtio::device::FunctionPresentation::bind(&mut compatible.device, Some(&saved)).unwrap();
+    compatible.enable().await;
+    let gpa = compatible.post_get_id_request(0);
+    let (_, len) = compatible.wait_for_used().await;
+    assert_eq!(len, VIRTIO_BLK_ID_BYTES as u32 + 1);
+    let mut id = [0; VIRTIO_BLK_ID_BYTES];
+    compatible.mem.read_at(gpa, &mut id).unwrap();
+    assert_eq!(&id, b"6261636b696e672d6469");
+}
+
 /// GET_ID request should return a device identifier string.
 #[async_test]
 async fn get_id_returns_identifier(driver: DefaultDriver) {

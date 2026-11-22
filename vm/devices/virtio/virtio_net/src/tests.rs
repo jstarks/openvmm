@@ -2527,6 +2527,38 @@ async fn link_speed_boundaries(driver: DefaultDriver) {
     );
 }
 
+#[async_test]
+async fn replay_endpoint_presentation(driver: DefaultDriver) {
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let build = |speed, offloads| {
+        Device::builder()
+            .build(
+                &driver_source,
+                Box::new(MockEndpointWithTxOffloads {
+                    offloads,
+                    link_speed: speed * BITS_PER_MEGABIT,
+                }),
+                MacAddress::new([2, 0, 0, 0, 0, 1]),
+            )
+            .unwrap()
+    };
+    let mut source = build(1000, TxOffloadSupport::default());
+    let saved = virtio::device::FunctionPresentation::bind(&mut source, None).unwrap();
+    let mut target = build(100, TxOffloadSupport::default());
+    assert_eq!(target.read_registers_u32(12).await, 100);
+    virtio::device::FunctionPresentation::bind(&mut target, Some(&saved)).unwrap();
+    assert_eq!(target.read_registers_u32(12).await, 1000);
+    let mut other = build(
+        100,
+        TxOffloadSupport {
+            tcp: true,
+            udp: true,
+            ..Default::default()
+        },
+    );
+    assert!(virtio::device::FunctionPresentation::bind(&mut other, Some(&saved)).is_err());
+}
+
 // Mock endpoint that reports specific transmit offload support.
 struct MockEndpointWithTxOffloads {
     offloads: TxOffloadSupport,

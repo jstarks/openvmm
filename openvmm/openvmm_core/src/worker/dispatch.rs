@@ -191,8 +191,11 @@ pub fn new_device_thread() -> (JoinHandle<()>, DefaultDriver) {
     DefaultPool::spawn_on_thread("basic_device_thread")
 }
 
+#[cfg(guest_arch = "aarch64")]
 mod resolved_config;
+#[cfg(guest_arch = "aarch64")]
 use resolved_config::ResolvedGicMsi;
+use vmcore::save_restore::ConstructionState;
 
 impl Manifest {
     fn from_config(config: Config) -> Self {
@@ -209,7 +212,7 @@ impl Manifest {
             hypervisor: config.hypervisor,
             numa: config.numa,
             processor_topology: config.processor_topology,
-            resolved_gic_msi: None,
+            construction: None,
             chipset: config.chipset,
             #[cfg(windows)]
             kernel_vmnics: config.kernel_vmnics,
@@ -242,7 +245,7 @@ impl Manifest {
 /// updates.
 #[derive(MeshPayload)]
 pub struct Manifest {
-    resolved_gic_msi: Option<ResolvedGicMsi>,
+    construction: Option<ConstructionState>,
     load_mode: LoadMode,
     floppy_disks: Vec<FloppyDiskConfig>,
     ide_disks: Vec<IdeDeviceConfig>,
@@ -285,18 +288,12 @@ pub struct SavedState {
     #[mesh(1)]
     pub units: Vec<SavedStateUnit>,
     #[mesh(2)]
-    resolved_gic_msi: Option<ResolvedGicMsi>,
-}
-
-#[derive(Protobuf)]
-#[mesh(package = "openvmm")]
-struct ConstructionState {
-    #[mesh(1)]
-    resolved_gic_msi: Option<ResolvedGicMsi>,
+    construction: ConstructionState,
 }
 
 enum LoadState {
     Saved(SavedState),
+    Migrated(SavedState),
     Incoming(
         mesh::OneshotSender<()>,
         mesh::OneshotReceiver<ProtobufMessage>,
@@ -352,19 +349,29 @@ impl Worker for VmWorker {
         let (device_thread, device_driver) = new_device_thread();
 
         let mut manifest = Manifest::from_config(parameters.cfg);
+        let live = matches!(
+            parameters.saved_state,
+            Some(openvmm_defs::worker::RestoreState::Migrated(_))
+        );
         let saved_state = match parameters.saved_state {
-            Some(openvmm_defs::worker::RestoreState::Saved(m)) => {
+            Some(
+                openvmm_defs::worker::RestoreState::Saved(m)
+                | openvmm_defs::worker::RestoreState::Migrated(m),
+            ) => {
                 let state: SavedState = m.parse().context("failed to decode saved state")?;
-                manifest.resolved_gic_msi = state.resolved_gic_msi.clone();
-                Some(LoadState::Saved(state))
+                manifest.construction = Some(state.construction.clone());
+                Some(if live {
+                    LoadState::Migrated(state)
+                } else {
+                    LoadState::Saved(state)
+                })
             }
             Some(openvmm_defs::worker::RestoreState::Incoming {
                 construction,
                 prepared,
                 final_state,
             }) => {
-                manifest.resolved_gic_msi =
-                    construction.parse::<ConstructionState>()?.resolved_gic_msi;
+                manifest.construction = Some(construction.parse()?);
                 Some(LoadState::Incoming(prepared, final_state))
             }
             None => None,
@@ -920,6 +927,8 @@ struct DynamicVpciDeviceEntry {
 /// Most of the VM state for [`LoadedVm`], excluding things that are necessary
 /// for state machine transitions.
 struct LoadedVmInner {
+    mmio_bindings: Vec<(String, virtio::device::TransferBinding)>,
+    construction: ConstructionState,
     driver_source: VmTaskDriverSource,
     resolver: ResourceResolver,
     partition_unit: PartitionUnit,
@@ -1232,7 +1241,7 @@ impl InitializedVm {
                         &cfg.processor_topology,
                         &platform_info,
                         smmu_count,
-                        cfg.resolved_gic_msi.as_ref(),
+                        cfg.construction.as_ref().and_then(|s| s.get(ResolvedGicMsi::OWNER)).map(|r| r.parse()).transpose()?.as_ref(),
                     )?;
                     (result.processor_topology, result.spi_layout)
                 };
@@ -3077,6 +3086,15 @@ impl InitializedVm {
         // allocation indexed by the order of VirtioBus::Mmio devices.
         let mut pci_device_number = 10;
         let mut virtio_mmio_index = 0;
+        let mut construction = ConstructionState::default();
+        #[cfg(guest_arch = "aarch64")]
+        if let Some(msi) = ResolvedGicMsi::capture(processor_topology.gic_msi()) {
+            construction.record(
+                ResolvedGicMsi::OWNER.into(),
+                mesh::payload::message::ProtobufAny::new(msi),
+            )?;
+        }
+        let mut mmio_bindings = Vec::new();
 
         // Avoid an ISA interrupt to avoid conflicts and to avoid needing to
         // configure the line as level-triggered in the MADT (necessary for
@@ -3092,7 +3110,7 @@ impl InitializedVm {
         };
         for (bus, device) in cfg.virtio_devices.into_iter() {
             let id = device.id().to_string();
-            let device = resolver
+            let mut device = resolver
                 .resolve(
                     device,
                     VirtioResolveInput {
@@ -3105,6 +3123,19 @@ impl InitializedVm {
                     let mmio_start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
                     virtio_mmio_index += 1;
                     let id = format!("{id}-{mmio_start}");
+                    let source = cfg.construction.as_ref().and_then(|c| c.get(&id));
+                    let presentation =
+                        virtio::device::FunctionPresentation::bind(&mut *device.0, source)
+                            .with_context(|| {
+                                format!("applying construction configuration for {id}")
+                            })?;
+                    construction.record(id.clone(), presentation)?;
+                    let binding = if device.0.supports_save_restore() {
+                        device.0.transfer_binding()
+                    } else {
+                        virtio::device::TransferBinding::Unsupported
+                    };
+                    mmio_bindings.push((id.clone(), binding));
                     let gm = gm.clone();
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
                         VirtioMmioDevice::new(
@@ -3227,6 +3258,8 @@ impl InitializedVm {
                 resolver,
                 partition_unit,
                 partition,
+                construction,
+                mmio_bindings,
                 chipset_devices: devices,
                 _vmtime: vmtime,
                 memory_manager,
@@ -3279,18 +3312,21 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
+            if !matches!(saved_state, LoadState::Saved(_)) {
+                this.check_live_devices()?;
+            }
+            if let Some(expected) = &cfg.construction {
+                expected.check(&this.inner.construction)?;
+            }
             let state = match saved_state {
-                LoadState::Saved(state) => state,
+                LoadState::Saved(state) | LoadState::Migrated(state) => state,
                 LoadState::Incoming(prepared, final_state) => {
                     prepared.send(());
                     let state: SavedState = final_state
                         .await
                         .context("source abandoned prepared VM")?
                         .parse()?;
-                    anyhow::ensure!(
-                        state.resolved_gic_msi == this.construction_state().resolved_gic_msi,
-                        "construction state changed during transfer"
-                    );
+                    state.construction.check(&this.inner.construction)?;
                     state
                 }
             };
@@ -3925,8 +3961,8 @@ impl LoadedVm {
                     VmRpc::Resume(rpc) => rpc.handle(async |()| self.resume().await).await,
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
                     VmRpc::SetRamDirtyTracking(rpc) => rpc.handle_failable_sync(|enable| {
+                        self.check_live_devices()?;
                         let range = self.migration_ram()?;
-                        anyhow::ensure!(self.inner.pcie_hotplug_devices.is_empty() && self.inner.dynamic_vpci_devices.is_empty(), "migration of dynamic devices is unsupported");
                         let watch = self.inner.gm.write_watch().context("missing RAM write watch")?;
                         self.inner.partition.memory_mapper(Vtl::Vtl0).set_dirty_tracking(range.start(), range.len(), enable)?;
                         if enable { watch.start(); } else { watch.stop(); }
@@ -3940,7 +3976,7 @@ impl LoadedVm {
                         anyhow::Ok(bits)
                     }),
                     VmRpc::ServicingResources(rpc) => rpc.handle_failable_sync(|()| {
-                        anyhow::ensure!(self.inner.pcie_hotplug_devices.is_empty() && self.inner.dynamic_vpci_devices.is_empty(), "servicing dynamic devices is unsupported");
+                        self.check_live_devices()?;
                         let LoadMode::Linux { kernel, initrd, .. } = &self.inner.load_mode else {
                             anyhow::bail!("servicing requires direct boot")
                         };
@@ -3948,7 +3984,15 @@ impl LoadedVm {
                             .context("servicing requires one shareable RAM backing")?
                             .into_mappable().inner_arc().try_clone()?;
                         anyhow::Ok(openvmm_defs::rpc::ServicingResources {
-                            construction: ProtobufMessage::new(self.construction_state()),
+                            mmio: self.inner.mmio_bindings.iter().map(|(id, binding)| {
+                                use openvmm_defs::rpc::ServicingSlot;
+                                Ok(match binding {
+                                    virtio::device::TransferBinding::Unsupported => anyhow::bail!("unsupported device {id}"),
+                                    virtio::device::TransferBinding::Reconstruct => ServicingSlot::Reconstruct,
+                                    virtio::device::TransferBinding::Export(export) => ServicingSlot::Bound(export().with_context(|| format!("exporting {id}"))?),
+                                })
+                            }).collect::<anyhow::Result<_>>()?,
+                            construction: ProtobufMessage::new(self.inner.construction.clone()),
                             ram, kernel: kernel.try_clone()?, initrd: initrd.as_ref().map(File::try_clone).transpose()?,
                         })
                     }),
@@ -4447,20 +4491,26 @@ impl LoadedVm {
         }
     }
 
+    fn check_live_devices(&self) -> anyhow::Result<()> {
+        for (id, binding) in &self.inner.mmio_bindings {
+            anyhow::ensure!(
+                !matches!(binding, virtio::device::TransferBinding::Unsupported),
+                "device {id} does not support live transfer"
+            );
+        }
+        anyhow::ensure!(
+            self.inner.pcie_hotplug_devices.is_empty()
+                && self.inner.dynamic_vpci_devices.is_empty(),
+            "live transfer of dynamic devices is unsupported"
+        );
+        Ok(())
+    }
+
     fn migration_ram(&self) -> anyhow::Result<MemoryRange> {
         let [ram] = self.inner.mem_layout.ram() else {
             anyhow::bail!("prototype migration requires one contiguous RAM range")
         };
         Ok(ram.range)
-    }
-
-    fn construction_state(&self) -> ConstructionState {
-        ConstructionState {
-            resolved_gic_msi: cfg_select! {
-                guest_arch = "aarch64" => ResolvedGicMsi::capture(self.inner.processor_topology.gic_msi()),
-                _ => None,
-            },
-        }
     }
 
     /// Saves the VM's processor, partition, and device state.
@@ -4469,7 +4519,7 @@ impl LoadedVm {
     async fn save(&mut self) -> anyhow::Result<SavedState> {
         Ok(SavedState {
             units: self.state_units.save().await?,
-            resolved_gic_msi: self.construction_state().resolved_gic_msi,
+            construction: self.inner.construction.clone(),
         })
     }
 
@@ -4503,7 +4553,7 @@ impl LoadedVm {
         }
 
         let manifest = Manifest {
-            resolved_gic_msi: saved_state.resolved_gic_msi.clone(),
+            construction: Some(saved_state.construction.clone()),
             load_mode: self.inner.load_mode,
             floppy_disks: vec![],            // TODO
             ide_disks: vec![],               // TODO

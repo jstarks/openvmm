@@ -34,21 +34,13 @@ pub(super) fn profile(config: &vmservice::VmConfig) -> Option<TransferProfile> {
     let Some(vmservice::vm_config::BootConfig::DirectBoot(boot)) = &config.boot_config else {
         return None;
     };
-    // Only admit the fixture whose devices can be reconstructed without
-    // side effects on RAM before commit. New device classes opt in explicitly.
-    let mmio = config
+    // Compare the management-owned topology and portable attachment settings.
+    // The VM worker checks each resolved function's live-transfer contract.
+    let mut mmio = config
         .devices_config
         .as_ref()
         .map(|d| d.virtio_mmio.clone())
         .unwrap_or_default();
-    if !mmio.iter().all(|d| {
-        matches!(
-            d.kind,
-            Some(vmservice::virtio_device::Kind::Rtc(_) | vmservice::virtio_device::Kind::Rng(_))
-        )
-    }) {
-        return None;
-    }
     let supported = vmservice::VmConfig {
         devices_config: config
             .devices_config
@@ -66,6 +58,9 @@ pub(super) fn profile(config: &vmservice::VmConfig) -> Option<TransferProfile> {
     };
     if &supported != config {
         return None;
+    }
+    for function in &mut mmio {
+        portable_function_binding(function)?;
     }
     let mut memory = supported.memory_config?;
     memory.backing_file_path = None;

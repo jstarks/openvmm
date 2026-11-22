@@ -18,7 +18,16 @@ use vm_resource::kind::PciDeviceHandleKind;
 use vm_resource::kind::VmbusDeviceHandleKind;
 
 #[derive(MeshPayload)]
+pub enum ServicingSlot {
+    /// The source explicitly authorizes reconstruction of this slot.
+    Reconstruct,
+    /// Use the source binding; never fall back to opening a destination path.
+    Bound(Resource<vm_resource::kind::VirtioDeviceHandle>),
+}
+
+#[derive(MeshPayload)]
 pub struct ServicingResources {
+    pub mmio: Vec<ServicingSlot>,
     pub construction: ProtobufMessage,
     pub ram: crate::worker::SharedMemoryFd,
     pub kernel: File,

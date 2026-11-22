@@ -256,7 +256,32 @@ enum QueuePairState {
     Active,
 }
 
+#[derive(mesh::payload::Protobuf)]
+#[mesh(package = "virtio.net")]
+struct LinkPresentation {
+    #[mesh(1)]
+    speed_mbps: u32,
+}
+
 impl VirtioDevice for Device {
+    fn construction_config(
+        &mut self,
+        source: Option<&mesh::payload::message::ProtobufAny>,
+    ) -> anyhow::Result<Option<mesh::payload::message::ProtobufAny>> {
+        if let Some(source) = source {
+            let saved: LinkPresentation = source.parse()?;
+            anyhow::ensure!(
+                saved.speed_mbps <= i32::MAX as u32 || saved.speed_mbps == u32::MAX,
+                "invalid saved link speed"
+            );
+            self.registers.speed = saved.speed_mbps;
+        }
+        Ok(Some(mesh::payload::message::ProtobufAny::new(
+            LinkPresentation {
+                speed_mbps: self.registers.speed,
+            },
+        )))
+    }
     fn traits(&self) -> DeviceTraits {
         let offloads = &self.adapter.tx_offload_support;
 

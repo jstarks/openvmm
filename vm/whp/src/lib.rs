@@ -592,6 +592,43 @@ impl Partition {
         unsafe { check_hresult(api::WHvUnmapGpaRange(self.handle, addr, size)) }
     }
 
+    /// Collect dirty bits for a tracked GPA mapping. Bit zero describes the
+    /// first 4 KiB page. Passing `None` clears the range without collecting it.
+    pub fn query_dirty_bitmap(
+        &self,
+        addr: u64,
+        size: u64,
+        bitmap: Option<&mut [u64]>,
+    ) -> Result<()> {
+        let invalid =
+            || WHvError(NonZeroI32::new(windows_sys::Win32::Foundation::E_INVALIDARG).unwrap());
+        if size == 0 || (addr | size) & 4095 != 0 || addr.checked_add(size).is_none() {
+            return Err(invalid());
+        }
+        let (ptr, bytes) = match bitmap {
+            Some(words) => {
+                let count = (size / 4096).div_ceil(64);
+                if words.len() as u64 != count {
+                    return Err(invalid());
+                }
+                (
+                    words.as_mut_ptr(),
+                    (count * 8).try_into().map_err(|_| invalid())?,
+                )
+            }
+            None => (null_mut(), 0),
+        };
+        unsafe {
+            check_hresult(api::WHvQueryGpaRangeDirtyBitmap(
+                self.handle,
+                addr,
+                size,
+                ptr,
+                bytes,
+            ))
+        }
+    }
+
     pub fn populate_ranges(
         &self,
         ranges: &[abi::WHV_MEMORY_RANGE_ENTRY],

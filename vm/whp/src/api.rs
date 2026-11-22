@@ -111,6 +111,14 @@ unsafe extern "system" {
 
 // These APIs were added after the first release and so may not be present.
 pal::delayload!("WinHvPlatform.dll" {
+    pub fn WHvQueryGpaRangeDirtyBitmap(
+        partition: WHV_PARTITION_HANDLE,
+        addr: u64,
+        size: u64,
+        bitmap: *mut u64,
+        bitmap_bytes: u32,
+    ) -> HRESULT;
+
     pub fn WHvResetPartition(partition: WHV_PARTITION_HANDLE) -> HRESULT;
 
     pub fn WHvRegisterPartitionDoorbellEvent(

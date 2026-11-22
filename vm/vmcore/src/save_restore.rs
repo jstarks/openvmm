@@ -186,6 +186,59 @@ pub trait AsyncProtobufSaveRestore: Send {
 #[mesh(transparent)]
 pub struct SavedStateBlob(ProtobufAny);
 
+/// Immutable guest-visible choices, keyed by stable component identity.
+/// Unlike execution state these records must be available before constructing
+/// a replacement. Unlike resource handles they can cross a machine boundary.
+#[derive(Default, Clone, Protobuf)]
+#[mesh(package = "vmcore")]
+pub struct ConstructionState {
+    #[mesh(1)]
+    components: std::collections::BTreeMap<String, ProtobufAny>,
+}
+
+impl ConstructionState {
+    /// Record an owner's canonical, typed presentation once.
+    pub fn record(&mut self, owner: String, value: ProtobufAny) -> anyhow::Result<()> {
+        use std::collections::btree_map::Entry;
+        match self.components.entry(owner) {
+            Entry::Vacant(slot) => {
+                slot.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(slot) => {
+                anyhow::bail!("duplicate construction configuration for {}", slot.key())
+            }
+        }
+    }
+
+    /// Only the owner interprets this record.
+    pub fn get(&self, owner: &str) -> Option<&ProtobufAny> {
+        self.components.get(owner)
+    }
+
+    /// Check that construction consumed and reproduced the entire catalog.
+    /// Owners must provide deterministic encodings of immutable facts.
+    pub fn check(&self, effective: &Self) -> anyhow::Result<()> {
+        for (owner, record) in &self.components {
+            let other = effective
+                .get(owner)
+                .ok_or_else(|| anyhow::anyhow!("missing destination component {owner}"))?;
+            anyhow::ensure!(
+                payload::encode(record.clone()) == payload::encode(other.clone()),
+                "construction configuration mismatch for {owner}"
+            );
+        }
+        if let Some(extra) = effective
+            .components
+            .keys()
+            .find(|key| !self.components.contains_key(*key))
+        {
+            anyhow::bail!("unexpected destination component {extra}");
+        }
+        Ok(())
+    }
+}
+
 /// Trait implemented by "root" saved state blobs, which are ones that either
 /// form the root of a saved state tree, or at points in the tree where the type
 /// is not known at compile time.
@@ -340,6 +393,35 @@ mod tests {
     }
 
     struct Device(u32);
+
+    #[test]
+    fn construction_checks_owner_and_preserves_first_registration() {
+        let mut source = ConstructionState::default();
+        source
+            .record("slot0".into(), ProtobufAny::new(State { value: 1 }))
+            .unwrap();
+        let mut dest = source.clone();
+        assert!(
+            dest.record("slot0".into(), ProtobufAny::new(State { value: 2 }))
+                .is_err()
+        );
+        source.check(&dest).unwrap();
+        dest.record("slot1".into(), ProtobufAny::new(State { value: 1 }))
+            .unwrap();
+        assert!(
+            source
+                .check(&dest)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected destination component slot1")
+        );
+        assert!(
+            dest.check(&source)
+                .unwrap_err()
+                .to_string()
+                .contains("missing destination component slot1")
+        );
+    }
 
     impl SaveRestore for Device {
         type SavedState = State;

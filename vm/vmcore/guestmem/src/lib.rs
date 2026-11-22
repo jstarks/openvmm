@@ -1541,6 +1541,15 @@ impl GuestMemory {
         self.watch.as_ref().map(|(watch, _)| &**watch)
     }
 
+    /// Report a completed external write through this view (including a
+    /// potentially partial failed write). The caller must own completion
+    /// through this notification and drain such writes before final collection.
+    pub fn record_external_write(&self, gpa: u64, len: usize) {
+        if let Some((watch, base)) = &self.watch {
+            watch.record(base.saturating_add(gpa), len);
+        }
+    }
+
     /// Creates a smaller view into guest memory, constraining accesses within the new boundaries. For smaller ranges,
     /// some memory implementations (e.g. HDV) may choose to lock the pages into memory for faster access. Locking
     /// random guest memory may cause issues, so only opt in to this behavior when the range can be considered "owned"
@@ -1728,9 +1737,7 @@ impl GuestMemory {
         #[cfg(not(feature = "bitmap"))]
         let result = op();
         if access_type == AccessType::Write {
-            if let Some((watch, base)) = &self.watch {
-                watch.record(base.saturating_add(gpa), len);
-            }
+            self.record_external_write(gpa, len);
         }
         result
     }

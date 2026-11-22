@@ -6,7 +6,7 @@
 
 mod readwriteat;
 
-use self::readwriteat::ReadWriteAt;
+pub use self::readwriteat::ReadWriteAt;
 use blocking::unblock;
 use disk_backend::DiskError;
 use disk_backend::DiskIo;
@@ -74,6 +74,10 @@ impl std::os::windows::io::AsHandle for FileDisk {
 }
 
 impl FileDisk {
+    /// Duplicate the underlying open file without resolving its path again.
+    pub fn duplicate_file(&self) -> std::io::Result<fs::File> {
+        self.file.try_clone()
+    }
     pub fn open(file: fs::File, read_only: bool) -> Result<Self, std::io::Error> {
         let metadata = Metadata {
             disk_size: file.metadata()?.len(),
@@ -166,6 +170,23 @@ impl FileDisk {
 }
 
 impl DiskIo for FileDisk {
+    fn servicing_resource(&self) -> std::io::Result<vm_resource::Resource<DiskHandleKind>> {
+        // FileDiskHandle is the raw-file resolver. A wrapper that supplies
+        // custom metadata (e.g. a fixed VHD hiding its footer) must export
+        // its own typed resource, not silently widen the visible disk.
+        if self.metadata.disk_size != self.file.metadata()?.len()
+            || self.metadata.sector_size != 512
+            || self.metadata.physical_sector_size != 4096
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "custom file disk requires its owner's servicing resource",
+            ));
+        }
+        Ok(vm_resource::Resource::new(FileDiskHandle(
+            self.duplicate_file()?,
+        )))
+    }
     fn disk_type(&self) -> &str {
         "file"
     }

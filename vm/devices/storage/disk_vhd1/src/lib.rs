@@ -17,7 +17,6 @@ use inspect::Inspect;
 use scsi_buffers::RequestBuffers;
 use std::fs::File;
 use std::io;
-use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
 use thiserror::Error;
@@ -139,15 +138,16 @@ impl Vhd1Disk {
     }
 
     /// Opens a fixed VHD.
-    pub fn open_fixed(mut file: File, read_only: bool) -> Result<Self, OpenError> {
+    pub fn open_fixed(file: File, read_only: bool) -> Result<Self, OpenError> {
         let meta = file.metadata()?;
         let len = meta.len();
         if len < VhdFooter::LEN || len % VhdFooter::ALIGNMENT != 0 {
             return Err(OpenError::InvalidFileSize(len));
         }
-        file.seek(io::SeekFrom::End(-512))?;
         let mut footer: VhdFooter = FromZeros::new_zeroed();
-        file.read_exact(footer.as_mut_bytes())?;
+        // A servicing source may still be doing I/O on a duplicated handle
+        // sharing the Windows file pointer. Never split seek and footer read.
+        disk_file::ReadWriteAt::read_exact_at(&file, footer.as_mut_bytes(), len - VhdFooter::LEN)?;
         let metadata = Metadata::from_footer(footer, len)?;
 
         // Just wrap FileDisk for handling actual IO.
@@ -174,6 +174,11 @@ impl Vhd1Disk {
 }
 
 impl DiskIo for Vhd1Disk {
+    fn servicing_resource(&self) -> io::Result<vm_resource::Resource<DiskHandleKind>> {
+        Ok(vm_resource::Resource::new(FixedVhd1DiskHandle(
+            self.file.duplicate_file()?,
+        )))
+    }
     fn disk_type(&self) -> &str {
         "vhd1"
     }

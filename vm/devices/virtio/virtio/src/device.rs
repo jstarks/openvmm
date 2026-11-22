@@ -11,15 +11,108 @@ use crate::queue::QueueState;
 use crate::spec::VirtioDeviceFeatures;
 use guestmem::MappedMemoryRegion;
 use inspect::InspectMut;
+use mesh::payload::message::ProtobufAny;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+/// Non-destructive exporter captured at construction, invoked only for local
+/// handoff. Live resources never enter portable construction configuration.
+pub type ServicingBinding = Box<
+    dyn Fn() -> anyhow::Result<vm_resource::Resource<vm_resource::kind::VirtioDeviceHandle>>
+        + Send
+        + Sync,
+>;
+
+/// How to prepare another instance while the source remains authoritative.
+pub enum TransferBinding {
+    Unsupported,
+    Reconstruct,
+    Export(ServicingBinding),
+}
+
+/// The transport-visible presentation is checked even when the model has no
+/// private record. An unnegotiated feature is still observable by a driver
+/// after reset, so comparing only negotiated features is insufficient.
+#[derive(mesh::payload::Protobuf)]
+#[mesh(package = "virtio.transport")]
+pub struct FunctionPresentation {
+    #[mesh(1)]
+    device_id: u32,
+    #[mesh(2)]
+    features: Vec<u32>,
+    #[mesh(3)]
+    queue_sizes: Vec<u16>,
+    #[mesh(4)]
+    config_length: u32,
+    #[mesh(5)]
+    device: Option<ProtobufAny>,
+    #[mesh(6)]
+    shared_memory_size: u64,
+    #[mesh(7)]
+    shared_memory_id: u8,
+}
+
+impl FunctionPresentation {
+    pub fn bind(
+        device: &mut dyn DynVirtioDevice,
+        source: Option<&ProtobufAny>,
+    ) -> anyhow::Result<ProtobufAny> {
+        let saved = source.map(ProtobufAny::parse::<Self>).transpose()?;
+        let private = device.construction_config(saved.as_ref().and_then(|s| s.device.as_ref()))?;
+        let traits = device.traits();
+        let effective = Self {
+            device_id: traits.device_id.0.into(),
+            features: (0..2).map(|i| traits.device_features.bank(i)).collect(),
+            queue_sizes: (0..traits.max_queues)
+                .map(|i| device.queue_size(i))
+                .collect(),
+            config_length: traits.device_register_length,
+            shared_memory_id: traits.shared_memory.id,
+            shared_memory_size: traits.shared_memory.size,
+            device: private,
+        };
+        if let Some(saved) = saved {
+            anyhow::ensure!(
+                saved.device_id == effective.device_id
+                    && saved.features == effective.features
+                    && saved.queue_sizes == effective.queue_sizes
+                    && saved.config_length == effective.config_length
+                    && saved.shared_memory_size == effective.shared_memory_size
+                    && saved.shared_memory_id == effective.shared_memory_id,
+                "incompatible virtio function presentation"
+            );
+        }
+        Ok(ProtobufAny::new(effective))
+    }
+}
 
 /// Per-queue virtio device trait. Ergonomic async fn — not object-safe.
 ///
 /// Devices implement this trait. The blanket impl converts any
 /// `VirtioDevice` into a `DynVirtioDevice` for use behind `Box<dyn>`.
 pub trait VirtioDevice: InspectMut + Send {
+    /// Called once after resource resolution and before transport construction.
+    /// Apply the source-selected configuration, if supplied, and return the
+    /// immutable effective configuration. Queue progress belongs in stop_queue,
+    /// not here. Devices without host-derived settings need no record.
+    fn construction_config(
+        &mut self,
+        source: Option<&ProtobufAny>,
+    ) -> anyhow::Result<Option<ProtobufAny>> {
+        anyhow::ensure!(
+            source.is_none(),
+            "unexpected device construction configuration"
+        );
+        Ok(None)
+    }
+
+    /// In addition to snapshot support, preparation must not mutate guest RAM
+    /// and all device writes must participate in dirty tracking by quiescence.
+    fn transfer_binding(&self) -> TransferBinding {
+        TransferBinding::Unsupported
+    }
+
     /// Device identity and capabilities.
     fn traits(&self) -> DeviceTraits;
 
@@ -123,6 +216,13 @@ pub trait VirtioDevice: InspectMut + Send {
 ///
 /// The device task, backend server, and resolver hold `Box<dyn DynVirtioDevice>`.
 pub trait DynVirtioDevice: InspectMut + Send {
+    /// See [`VirtioDevice::construction_config`].
+    fn construction_config(
+        &mut self,
+        source: Option<&ProtobufAny>,
+    ) -> anyhow::Result<Option<ProtobufAny>>;
+    /// See [`VirtioDevice::transfer_binding`].
+    fn transfer_binding(&self) -> TransferBinding;
     /// Device identity and capabilities.
     fn traits(&self) -> DeviceTraits;
 
@@ -169,6 +269,15 @@ pub trait DynVirtioDevice: InspectMut + Send {
 }
 
 impl<T: VirtioDevice> DynVirtioDevice for T {
+    fn construction_config(
+        &mut self,
+        source: Option<&ProtobufAny>,
+    ) -> anyhow::Result<Option<ProtobufAny>> {
+        VirtioDevice::construction_config(self, source)
+    }
+    fn transfer_binding(&self) -> TransferBinding {
+        VirtioDevice::transfer_binding(self)
+    }
     fn traits(&self) -> DeviceTraits {
         VirtioDevice::traits(self)
     }

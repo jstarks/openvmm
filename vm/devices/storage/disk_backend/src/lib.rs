@@ -159,6 +159,17 @@ pub enum MediumErrorDetails {
 /// to do so. Note that this says nothing about how large the disk is, so it is
 /// not a substitute for the range check above.
 pub trait DiskIo: 'static + Send + Sync + Inspect {
+    /// Duplicate the open backing for a local process replacement. Do not
+    /// reopen a pathname or release the source's ownership. A backend with
+    /// additional non-reconstructible state must leave this unsupported.
+    fn servicing_resource(
+        &self,
+    ) -> std::io::Result<vm_resource::Resource<vm_resource::kind::DiskHandleKind>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "disk does not support live resource export",
+        ))
+    }
     /// Returns the disk type name as a string.
     ///
     /// This is used for diagnostic purposes.
@@ -290,6 +301,12 @@ pub trait DiskIo: 'static + Send + Sync + Inspect {
 pub struct Disk(#[inspect(flatten)] Arc<DiskInner>);
 
 impl Disk {
+    /// Export a resource that resolves to the same live storage.
+    pub fn servicing_resource(
+        &self,
+    ) -> std::io::Result<vm_resource::Resource<vm_resource::kind::DiskHandleKind>> {
+        self.0.disk.servicing_resource()
+    }
     fn inspect_extra(&self, resp: &mut inspect::Response<'_>) {
         resp.field("disk_type", self.0.disk.disk_type())
             .field("sector_count", self.0.disk.sector_count())
@@ -570,6 +587,9 @@ const ASYNC_DISK_STACK_SIZE: usize = 1256;
 type IoFuture<'a> = StackFuture<'a, Result<(), DiskError>, { ASYNC_DISK_STACK_SIZE }>;
 
 trait DynDisk: Send + Sync + Inspect {
+    fn servicing_resource(
+        &self,
+    ) -> std::io::Result<vm_resource::Resource<vm_resource::kind::DiskHandleKind>>;
     fn disk_type(&self) -> &str;
     fn sector_count(&self) -> u64;
 
@@ -596,6 +616,11 @@ trait DynDisk: Send + Sync + Inspect {
 }
 
 impl<T: DiskIo> DynDisk for T {
+    fn servicing_resource(
+        &self,
+    ) -> std::io::Result<vm_resource::Resource<vm_resource::kind::DiskHandleKind>> {
+        DiskIo::servicing_resource(self)
+    }
     fn disk_type(&self) -> &str {
         self.disk_type()
     }

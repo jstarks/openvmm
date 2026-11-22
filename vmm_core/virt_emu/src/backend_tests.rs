@@ -858,6 +858,67 @@ async fn build_profile(
 }
 
 #[async_test]
+async fn lowering_cr8_delivers_masked_self_ipi_before_the_following_instruction(
+    driver: DefaultDriver,
+) {
+    let (mut bytes, owned) = fixture();
+    bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
+    let handler = 0x12000usize;
+    let gate = 0x0001_8e00_0008_2000u64;
+    bytes[0xae00..0xae08].copy_from_slice(&gate.to_le_bytes());
+    bytes[0xae08..0xae10].fill(0);
+    // Read the interrupted RIP from the hardware frame into r10.
+    bytes[handler..handler + 4].copy_from_slice(&[0x4c, 0x8b, 0x14, 0x24]);
+    let mut code = Vec::new();
+    store_apic(&mut code, 0xf0, 0x1ff);
+    store_apic(&mut code, 0x300, 0x400e0);
+    code.extend_from_slice(&[0x31, 0xc0, 0x44, 0x0f, 0x22, 0xc0]); // xor eax,eax; mov cr8,rax
+    let next = CODE + code.len() as u64;
+    code.extend_from_slice(&[0x49, 0xff, 0xc3, 0xf4]); // inc r11; hlt
+    bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+    let (_, mut binder, _memory, _keeper) =
+        build_profile(&driver, &bytes, VmTime::from_100ns(0), true).await;
+    let mut vp = binder.bind().unwrap();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        77,
+    );
+    initial.rdi = DEVICE;
+    initial.rflags |= 0x200;
+    initial.cr8 = 14;
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(handler as u64 + 4))
+        .unwrap();
+    let stop = StopVpSource::new();
+    let mut devices = Devices::new();
+    devices.apic = true;
+    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut timeout = pal_async::timer::PolledTimer::new(&driver);
+    match futures::future::select(
+        run.as_mut(),
+        Box::pin(timeout.sleep(std::time::Duration::from_secs(2))),
+    )
+    .await
+    {
+        futures::future::Either::Left((result, _)) => {
+            assert!(matches!(result, Err(VpHaltReason::PowerOff)))
+        }
+        futures::future::Either::Right(_) => {
+            panic!("CR8 failed to unmask the pending LAPIC interrupt")
+        }
+    }
+    drop(run);
+    let current = vp.access_state(Vtl::Vtl0).registers().unwrap();
+    assert_eq!(
+        (current.r10, current.r11, current.cr8),
+        (next, initial.r11, 0)
+    );
+    assert_eq!(vp.apic_diagnostics().unwrap().delivered, [(0xe0, 1)]);
+}
+
+#[async_test]
 async fn owned_lapic_timer_interrupts_an_if_enabled_batch_without_executor_wakeup(
     driver: DefaultDriver,
 ) {

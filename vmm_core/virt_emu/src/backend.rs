@@ -192,8 +192,7 @@ struct VpState {
     decode_cache_enabled: bool,
     #[cfg(test)]
     boundary_in_batch: bool,
-    lapic: Option<LocalApic>,
-    apic_offer: Option<u8>,
+    apic_id: Option<u32>,
     apic_delivered: [u64; 256],
     first_apic_retired: Option<u64>,
     first_apic_time: Option<u64>,
@@ -328,7 +327,11 @@ impl EmuProcessor<'_> {
     }
     /// Captures the owned controller and delivery counters without changing them.
     pub fn apic_diagnostics(&self) -> Option<ApicDiagnostics> {
-        self.state.lapic.map(|registers| ApicDiagnostics {
+        let registers = match &self.state.cpu {
+            CpuLifecycle::Ready(core) => *core.lapic()?,
+            CpuLifecycle::Importing(_) => LocalApic::new(self.state.apic_id?, true, 0),
+        };
+        Some(ApicDiagnostics {
             registers,
             delivered: self
                 .state
@@ -526,12 +529,7 @@ impl ProtoPartition for EmuProtoPartition {
                 decode_cache_enabled: true,
                 #[cfg(test)]
                 boundary_in_batch: true,
-                lapic: if self.architectural_apic {
-                    Some(LocalApic::new(self.apic_id, true, 0))
-                } else {
-                    None
-                },
-                apic_offer: None,
+                apic_id: self.architectural_apic.then_some(self.apic_id),
                 apic_delivered: [0; 256],
                 first_apic_retired: None,
                 first_apic_time: None,
@@ -762,9 +760,6 @@ impl Processor for EmuProcessor<'_> {
             if let Err(error) = apic::poll(self.state, &self.control, self.clock) {
                 return Err(dev.fatal_error(Box::new(error)));
             }
-            let local_window = self.state.lapic.as_ref().and_then(|apic| {
-                (apic.base & 0x800 != 0 && !apic.x2apic()).then_some(apic.base & !0xfff)
-            });
             let checkpoint = self.state.checkpoint;
             let checkpoint_guest = self.state.checkpoint_guest;
             if let Some(error) = self.state.fault.take() {
@@ -791,14 +786,13 @@ impl Processor for EmuProcessor<'_> {
                     rip: core.cpu().rip,
                 })));
             }
-            let candidate = self.state.lapic.as_ref().and_then(|apic| apic.candidate());
-            let deadline = self
-                .state
-                .lapic
-                .as_ref()
+            let local_window = core.lapic().and_then(|apic| {
+                (apic.base & 0x800 != 0 && !apic.x2apic()).then_some(apic.base & !0xfff)
+            });
+            let deadline = core
+                .lapic()
                 .filter(|apic| apic.enabled() && apic.lvt[0] & 0x10000 == 0)
                 .map(|apic| apic.timer.deadline());
-            let offer = self.state.apic_offer;
             if checkpoint_guest {
                 core.set_guest_entry_stop(checkpoint);
             } else {
@@ -844,24 +838,19 @@ impl Processor for EmuProcessor<'_> {
                         {
                             return true;
                         }
-                        if core.pending().is_some() {
-                            return false;
-                        }
-                        if offer.is_some() {
+                        if core.last_lapic_delivery().is_some() {
                             return true;
                         }
-                        if !core.physical_interrupts_enabled() {
+                        if core.pending().is_some() || !core.physical_interrupts_enabled() {
                             return false;
                         }
-                        candidate.is_some()
-                            || match deadline {
-                                Some(x86_system::arch::apic::timer::Deadline::At(value)) => {
-                                    self.clock.now().as_100ns()
-                                        >= apic::deadline_time(value).as_100ns()
-                                }
-                                Some(x86_system::arch::apic::timer::Deadline::BeyondClock) => true,
-                                _ => false,
+                        match deadline {
+                            Some(x86_system::arch::apic::timer::Deadline::At(value)) => {
+                                self.clock.now().as_100ns() >= apic::deadline_time(value).as_100ns()
                             }
+                            Some(x86_system::arch::apic::timer::Deadline::BeyondClock) => true,
+                            _ => false,
+                        }
                     },
                 )
             };
@@ -913,31 +902,27 @@ impl Processor for EmuProcessor<'_> {
                 self.control.yield_requested.request_yield();
                 batch_work = 0;
             }
-            match apic::acknowledge(&mut self.state.lapic, &mut self.state.apic_offer, core) {
-                Ok(Some(vector)) => {
-                    let slot = &mut self.state.apic_delivered[usize::from(vector)];
-                    let Some(count) = slot.checked_add(1) else {
-                        return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
-                    };
-                    *slot = count;
-                    self.state.first_apic_retired.get_or_insert(retired);
-                    if self.state.first_apic_time.is_none() {
-                        self.state.first_apic_time = Some(self.clock.now().as_100ns());
-                        self.state.first_apic_decode = Some(core.decode_diagnostics());
-                    }
+            if let Some(vector) = core.last_lapic_delivery() {
+                let slot = &mut self.state.apic_delivered[usize::from(vector)];
+                let Some(count) = slot.checked_add(1) else {
+                    return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+                };
+                *slot = count;
+                self.state.first_apic_retired.get_or_insert(retired);
+                if self.state.first_apic_time.is_none() {
+                    self.state.first_apic_time = Some(self.clock.now().as_100ns());
+                    self.state.first_apic_decode = Some(core.decode_diagnostics());
                 }
-                Ok(None) => {}
-                Err(error) => return Err(dev.fatal_error(Box::new(error))),
             }
             match batch.stop {
                 BatchStop::ControlIo { sequence, access } => {
-                    let Some(lapic) = self.state.lapic.as_mut() else {
+                    let Some(mut lapic) = core.lapic_access() else {
                         return Err(
                             dev.fatal_error(Box::new(Error::Profile("missing owned LAPIC")))
                         );
                     };
                     let reply = match apic::ticks(self.clock.now())
-                        .and_then(|now| apic::control(lapic, access, now, &self.control, dev))
+                        .and_then(|now| apic::control(&mut lapic, access, now, &self.control, dev))
                     {
                         Ok(reply) => reply,
                         Err(error) => return Err(dev.fatal_error(Box::new(error))),
@@ -990,7 +975,7 @@ impl Processor for EmuProcessor<'_> {
                     if let Some(base) = local_window
                         .filter(|&base| request.address >= base && request.address - base < 4096)
                     {
-                        let Some(lapic) = self.state.lapic.as_mut() else {
+                        let Some(mut lapic) = core.lapic_access() else {
                             return Err(dev.fatal_error(Box::new(Error::Profile(
                                 "missing local APIC window owner",
                             ))));
@@ -1002,20 +987,16 @@ impl Processor for EmuProcessor<'_> {
                         let offset = (request.address - base) as u16;
                         let reply = match request.access {
                             WordAccess::Read => match lapic.mmio_read(offset, request.size, now) {
-                                Ok((next, value)) => {
-                                    *lapic = next;
-                                    IoReply::Read(u64::from(value))
-                                }
+                                Ok(value) => IoReply::Read(u64::from(value)),
                                 Err(error) => {
                                     return Err(dev.fatal_error(Box::new(Error::Apic(error))));
                                 }
                             },
                             WordAccess::Write(value) => {
                                 match lapic.mmio_write(offset, request.size, value as u32, now) {
-                                    Ok((next, effects)) => {
-                                        *lapic = next;
+                                    Ok(effects) => {
                                         if let Err(error) =
-                                            apic::effect(lapic, &self.control, effects, dev)
+                                            apic::effect(&mut lapic, &self.control, effects, dev)
                                         {
                                             return Err(dev.fatal_error(Box::new(error)));
                                         }
@@ -1240,12 +1221,13 @@ impl AccessVpState for EmuStateAccess<'_> {
         self.core().map(|_| ())
     }
     fn registers(&mut self) -> Result<vp::Registers, Error> {
-        let state = self.core()?.state();
+        let core = self.core()?;
+        let state = core.state();
         let mut registers = with_system(
             long_mode_registers(state.registers, state.config, state.tables, state.cr2),
             state.system,
         );
-        if let Some(apic) = &self.state.lapic {
+        if let Some(apic) = core.lapic() {
             registers.cr8 = u64::from(apic.tpr >> 4);
         }
         Ok(registers)
@@ -1285,7 +1267,7 @@ impl AccessVpState for EmuStateAccess<'_> {
         };
         let mut normalized = *regs;
         normalized.cr0 |= 0x10;
-        if self.state.lapic.is_some() {
+        if self.state.apic_id.is_some() {
             if regs.cr8 > 15 {
                 return Err(Error::Profile("initial CR8"));
             }
@@ -1315,11 +1297,14 @@ impl AccessVpState for EmuStateAccess<'_> {
         core.set_test_options(strudel::TestOptions {
             cache: self.state.decode_cache_enabled,
         });
-        if let Some(apic) = &mut self.state.lapic {
-            if !core.configure_apic(apic.id) {
+        if let Some(id) = self.state.apic_id {
+            if !core.configure_apic(id) {
                 return Err(Error::Profile("initial APIC metadata"));
             }
-            *apic = apic.write_cr8(regs.cr8).map_err(Error::Apic)?;
+            core.lapic_access()
+                .expect("just configured")
+                .set_cr8(regs.cr8)
+                .map_err(Error::Apic)?;
         }
         self.state.cpu = CpuLifecycle::Ready(Box::new(core));
         Ok(())

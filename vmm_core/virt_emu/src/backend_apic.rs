@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 use super::*;
+use strudel::LapicAccess;
 use x86_system::arch::apic::{
-    Rejection,
     registers::{Effect, Error as ApicError},
     route::{FixedIpi, Interface},
     timer::{Deadline, Error as TimerError},
@@ -91,7 +91,7 @@ impl Control {
         self.incoming_banks.load(Ordering::Acquire) != 0
     }
 
-    fn drain_apic(&self, apic: &mut LocalApic) -> Result<(), Error> {
+    fn drain_apic(&self, apic: &mut LapicAccess<'_>) -> Result<(), Error> {
         // Clear before draining: concurrent publication must leave a notification.
         let banks = self.incoming_banks.swap(0, Ordering::AcqRel);
         for (bank, slot) in self.incoming.iter().enumerate() {
@@ -103,7 +103,8 @@ impl Control {
             while pending != 0 {
                 let bit = pending.trailing_zeros();
                 let vector = (bank * 32 + bit as usize) as u8;
-                *apic = receive(*apic, vector, packet & (1u64 << (bit + 32)) != 0)?;
+                apic.receive(vector, packet & (1u64 << (bit + 32)) != 0)
+                    .map_err(Error::ApicIngress)?;
                 pending &= pending - 1;
             }
         }
@@ -111,22 +112,14 @@ impl Control {
     }
 }
 
-fn receive(apic: LocalApic, vector: u8, level: bool) -> Result<LocalApic, Error> {
-    match apic.receive(vector, level) {
-        Ok(next) => Ok(next),
-        // An occupied IRR slot already represents this vector; do not make a FIFO.
-        Err(Rejection::Retry) => Ok(apic),
-        Err(other) => Err(Error::ApicIngress(other)),
-    }
-}
-
 pub(super) fn effect(
-    apic: &mut LocalApic,
+    apic: &mut LapicAccess<'_>,
     control: &Control,
     effect: Effect,
     dev: &impl CpuIo,
 ) -> Result<(), Error> {
-    control.publish_apic(apic);
+    let registers = apic.registers();
+    control.publish_apic(registers);
     match effect {
         Effect::None => {}
         Effect::Eoi(eoi) => {
@@ -135,8 +128,14 @@ pub(super) fn effect(
             }
         }
         Effect::Ipi(packet) => {
-            if packet.targets(apic.id, apic.id, apic.ldr, apic.enabled()) {
-                *apic = receive(*apic, packet.vector, false)?;
+            if packet.targets(
+                registers.id,
+                registers.id,
+                registers.ldr,
+                registers.enabled(),
+            ) {
+                apic.receive(packet.vector, false)
+                    .map_err(Error::ApicIngress)?;
             }
         }
     }
@@ -148,10 +147,10 @@ pub(super) fn poll(
     control: &Control,
     clock: &mut VmTimeAccess,
 ) -> Result<(), Error> {
-    let (Some(apic), CpuLifecycle::Ready(core)) = (&mut state.lapic, &mut state.cpu) else {
+    let CpuLifecycle::Ready(core) = &mut state.cpu else {
         return Ok(());
     };
-    if state.apic_offer.is_some() || !core.at_interrupt_boundary() {
+    if core.lapic_offer().is_some() || !core.at_interrupt_boundary() {
         return Ok(());
     }
     // APIC register accesses materialize the counter themselves. With IF clear,
@@ -159,29 +158,24 @@ pub(super) fn poll(
     if !core.physical_interrupts_enabled() && !core.halted() && !control.apic_work_pending() {
         return Ok(());
     }
+    let enabled = core.physical_interrupts_enabled();
+    let Some(mut apic) = core.lapic_access() else {
+        return Ok(());
+    };
     let now = ticks(clock.now())?;
-    if now < apic.timer.last {
+    if now < apic.registers().timer.last {
         return Err(Error::Apic(ApicError::Timer(TimerError::BackwardsTime)));
     }
     // Counter reads/writes materialize time themselves. Between deadlines,
     // no timer effect is observable and the absolute deadline is unchanged.
-    if matches!(apic.timer.deadline(),Deadline::At(deadline) if now>=deadline) {
-        *apic = apic.advance(now).map_err(Error::Apic)?;
+    if matches!(apic.registers().timer.deadline(),Deadline::At(deadline) if now>=deadline) {
+        apic.advance(now).map_err(Error::Apic)?;
     }
-    control.drain_apic(apic)?;
+    control.drain_apic(&mut apic)?;
+    let apic = apic.registers();
     control.publish_apic(apic);
-    if core.pending().is_none() && core.physical_interrupts_enabled() {
-        if apic.interrupts.irr.words.iter().any(|&word| word != 0) {
-            if let Some(vector) = apic.candidate() {
-                match core.inject(vector) {
-                    Injection::Queued => state.apic_offer = Some(vector),
-                    other => return Err(Error::Injection(other)),
-                }
-            }
-        }
-    }
     clock.cancel_timeout();
-    if apic.enabled() && apic.lvt[0] & 0x10000 == 0 && core.physical_interrupts_enabled() {
+    if apic.enabled() && apic.lvt[0] & 0x10000 == 0 && enabled {
         match apic.timer.deadline() {
             Deadline::Stopped => {}
             Deadline::At(value) => {
@@ -193,54 +187,22 @@ pub(super) fn poll(
     Ok(())
 }
 
-pub(super) fn acknowledge(
-    apic: &mut Option<LocalApic>,
-    offer: &mut Option<u8>,
-    core: &Machine,
-) -> Result<Option<u8>, Error> {
-    if let Some(vector) = *offer {
-        // The core clears pending only after completing this external event's frame.
-        // Exceptions retain it, so exception delivery cannot acknowledge this offer.
-        if core.pending().is_none() {
-            let current = apic.as_mut().ok_or(Error::Completion)?;
-            *current = current.accept(vector, true).map_err(Error::ApicIngress)?;
-            *offer = None;
-            return Ok(Some(vector));
-        }
-    }
-    Ok(None)
-}
-
 pub(super) fn control(
-    apic: &mut LocalApic,
+    apic: &mut LapicAccess<'_>,
     access: ControlAccess,
     now: u64,
     ingress: &Control,
     dev: &impl CpuIo,
 ) -> Result<ControlReply, Error> {
-    *apic = apic.advance(now).map_err(Error::Apic)?;
     let operation = match access {
-        ControlAccess::ReadMsr(0x1b) => return Ok(ControlReply::Value(apic.base)),
         ControlAccess::ReadMsr(number) => match apic.msr_read(number, now) {
-            Ok((next, value)) => {
-                *apic = next;
-                return Ok(ControlReply::Value(value));
-            }
+            Ok(value) => return Ok(ControlReply::Value(value)),
             Err(error) => Err(error),
         },
-        ControlAccess::WriteMsr {
-            number: 0x1b,
-            value,
-        } => apic.write_base(value).map(|next| (next, Effect::None)),
         ControlAccess::WriteMsr { number, value } => apic.msr_write(number, value, now),
-        ControlAccess::ReadPriority(_) => return Ok(ControlReply::Value(u64::from(apic.tpr >> 4))),
-        ControlAccess::WritePriority(value) => {
-            apic.write_cr8(value).map(|next| (next, Effect::None))
-        }
     };
     match operation {
-        Ok((next, effects)) => {
-            *apic = next;
+        Ok(effects) => {
             effect(apic, ingress, effects, dev)?;
             Ok(ControlReply::Written)
         }
@@ -279,7 +241,9 @@ mod tests {
                 let bank = vector / 32;
                 let mask = 1u32 << (vector % 32);
                 loop {
-                    control.drain_apic(&mut apic).unwrap();
+                    control
+                        .drain_apic(&mut LapicAccess::new(&mut apic))
+                        .unwrap();
                     if apic.interrupts.irr.words[bank] & mask != 0 {
                         break;
                     }
@@ -295,7 +259,9 @@ mod tests {
             }
             producer.join().unwrap();
         });
-        control.drain_apic(&mut apic).unwrap();
+        control
+            .drain_apic(&mut LapicAccess::new(&mut apic))
+            .unwrap();
         assert!(!control.apic_work_pending());
         assert!(
             control

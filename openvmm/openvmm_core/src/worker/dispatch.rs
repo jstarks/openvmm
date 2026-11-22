@@ -191,6 +191,9 @@ pub fn new_device_thread() -> (JoinHandle<()>, DefaultDriver) {
     DefaultPool::spawn_on_thread("basic_device_thread")
 }
 
+mod resolved_config;
+use resolved_config::ResolvedGicMsi;
+
 impl Manifest {
     fn from_config(config: Config) -> Self {
         Self {
@@ -206,6 +209,7 @@ impl Manifest {
             hypervisor: config.hypervisor,
             numa: config.numa,
             processor_topology: config.processor_topology,
+            resolved_gic_msi: None,
             chipset: config.chipset,
             #[cfg(windows)]
             kernel_vmnics: config.kernel_vmnics,
@@ -238,6 +242,7 @@ impl Manifest {
 /// updates.
 #[derive(MeshPayload)]
 pub struct Manifest {
+    resolved_gic_msi: Option<ResolvedGicMsi>,
     load_mode: LoadMode,
     floppy_disks: Vec<FloppyDiskConfig>,
     ide_disks: Vec<IdeDeviceConfig>,
@@ -279,6 +284,8 @@ pub struct Manifest {
 pub struct SavedState {
     #[mesh(1)]
     pub units: Vec<SavedStateUnit>,
+    #[mesh(2)]
+    resolved_gic_msi: Option<ResolvedGicMsi>,
 }
 
 async fn open_simple_disk(
@@ -329,7 +336,15 @@ impl Worker for VmWorker {
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
         let (device_thread, device_driver) = new_device_thread();
 
-        let manifest = Manifest::from_config(parameters.cfg);
+        let mut manifest = Manifest::from_config(parameters.cfg);
+        let saved_state: Option<SavedState> = parameters
+            .saved_state
+            .map(|m| m.parse())
+            .transpose()
+            .context("failed to decode saved state")?;
+        manifest.resolved_gic_msi = saved_state
+            .as_ref()
+            .and_then(|s| s.resolved_gic_msi.clone());
 
         let hypervisor = block_on(ResourceResolver::new().resolve(parameters.hypervisor, ()))
             .context("failed to resolve hypervisor backend")?;
@@ -344,11 +359,6 @@ impl Worker for VmWorker {
             manifest,
             shared_memory,
         ))?;
-        let saved_state = parameters
-            .saved_state
-            .map(|m| m.parse())
-            .transpose()
-            .context("failed to decode saved state")?;
 
         let vm = block_with_io(|_| vm.load(saved_state, parameters.notify))?;
 
@@ -569,6 +579,7 @@ fn build_aarch64_topology(
     config: &ProcessorTopologyConfig,
     platform_info: &virt::PlatformInfo,
     smmu_count: usize,
+    saved: Option<&ResolvedGicMsi>,
 ) -> anyhow::Result<Aarch64TopologyResult> {
     use openvmm_defs::config::GicMsiConfig;
     use vm_topology::processor::aarch64::Aarch64PlatformConfig;
@@ -578,12 +589,15 @@ fn build_aarch64_topology(
 
     const DEFAULT_GIC_V2M_SPI_COUNT: u32 = 64;
 
-    let arch = match &config.arch {
+    let mut arch = match &config.arch {
         None => Default::default(),
         Some(ArchTopologyConfig::Aarch64(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
 
+    if let Some(saved) = saved {
+        saved.apply(&mut arch.gic_msi)?;
+    }
     let pmu_gsiv = match arch.pmu_gsiv {
         PmuGsivConfig::Disabled => None,
         PmuGsivConfig::Gsiv(gsiv) => Some(gsiv),
@@ -693,6 +707,12 @@ fn build_aarch64_topology(
         })
     };
 
+    if let Some(saved) = saved {
+        anyhow::ensure!(
+            ResolvedGicMsi::capture(gic_msi).as_ref() == Some(saved),
+            "destination GIC MSI layout {gic_msi:?} differs from saved {saved:?}"
+        );
+    }
     let platform = Aarch64PlatformConfig {
         gic_distributor_base,
         gic_version,
@@ -1188,6 +1208,7 @@ impl InitializedVm {
                         &cfg.processor_topology,
                         &platform_info,
                         smmu_count,
+                        cfg.resolved_gic_msi.as_ref(),
                     )?;
                     (result.processor_topology, result.spi_layout)
                 };
@@ -4358,6 +4379,10 @@ impl LoadedVm {
     async fn save(&mut self) -> anyhow::Result<SavedState> {
         Ok(SavedState {
             units: self.state_units.save().await?,
+            resolved_gic_msi: cfg_select! {
+                guest_arch = "aarch64" => ResolvedGicMsi::capture(self.inner.processor_topology.gic_msi()),
+                _ => None,
+            },
         })
     }
 
@@ -4391,6 +4416,7 @@ impl LoadedVm {
         }
 
         let manifest = Manifest {
+            resolved_gic_msi: saved_state.resolved_gic_msi.clone(),
             load_mode: self.inner.load_mode,
             floppy_disks: vec![],            // TODO
             ide_disks: vec![],               // TODO

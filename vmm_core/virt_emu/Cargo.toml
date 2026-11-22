@@ -7,6 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
+native-jit = ["strudel/native-jit"]
 perf = ["strudel/perf", "dep:sparse_mmap"]
 test-support = ["guestmem/bitmap"]
 

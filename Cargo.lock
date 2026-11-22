@@ -8822,6 +8822,7 @@ dependencies = [
 name = "strudel-core"
 version = "0.1.0"
 dependencies = [
+ "strudel-native",
  "vstd",
 ]
 
@@ -8831,6 +8832,14 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "strudel-core",
+]
+
+[[package]]
+name = "strudel-native"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "memmap2",
 ]
 
 [[package]]

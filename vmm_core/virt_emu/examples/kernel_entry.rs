@@ -1040,6 +1040,11 @@ mod native {
             .next()
             .context("missing pre-reset mapping projection")?;
         let option = args.next();
+        let native_jit = option.as_deref() == Some(std::ffi::OsStr::new("--native-jit"));
+        ensure!(
+            !native_jit || cfg!(all(feature = "native-jit", target_os = "linux")),
+            "native checkpoint requires Linux x86-64 and --features native-jit"
+        );
         let slow_time = option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic-slow"));
         let probe_apic =
             slow_time || option.as_deref() == Some(std::ffi::OsStr::new("--probe-apic"));
@@ -1050,10 +1055,10 @@ mod native {
             None => false,
             Some(argument) => {
                 ensure!(
-                    argument == "--probe" || probe_apic || pm_stalls || loader_inputs,
+                    argument == "--probe" || probe_apic || pm_stalls || loader_inputs || native_jit,
                     "unknown witness option"
                 );
-                !loader_inputs
+                !loader_inputs && !native_jit
             }
         };
         let probe_target = if probe {
@@ -1497,6 +1502,10 @@ mod native {
             state.set_registers(&initial.registers)?;
             state.set_pat(&initial.pat)?;
             state.commit()?;
+        }
+        #[cfg(all(feature = "native-jit", target_os = "linux"))]
+        if native_jit {
+            vp.enable_native_jit()?;
         }
         let mut devices = WitnessIo {
             with_ioapic: probe_apic,
@@ -2081,10 +2090,35 @@ mod native {
             "intra-page successor path was not exercised"
         );
         let preparation = vp.code_preparation_diagnostics();
+        #[cfg(all(feature = "native-jit", target_os = "linux"))]
+        let jit = if native_jit {
+            let d = vp.native_diagnostics()?;
+            ensure!(
+                progress.retired == 967_067,
+                "mixed execution changed checkpoint retirement count"
+            );
+            ensure!(
+                d.retired > 0 && d.retired <= progress.retired,
+                "no valid native checkpoint retirements"
+            );
+            let blockers: BTreeMap<_,_> = d.blockers.iter().map(|(name, count)| (*name, serde_json::json!({
+                "entries":count.entries, "offered":count.instructions, "retired_before_resume":count.retired
+            }))).collect();
+            Some(
+                serde_json::json!({"native_entries":d.entries, "native_retired":d.retired,
+                "interpreted_retired":progress.retired - d.retired, "fallback_entries":d.fallbacks,
+                "fallback_offered":d.fallback_instructions, "blockers":blockers}),
+            )
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "native-jit", target_os = "linux")))]
+        let jit: Option<serde_json::Value> = None;
         println!(
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
+                "jit": jit,
                 "no_refetch_hits":no_refetch_hits,
                 "execution_cache_hits":decode.execution_hits,
                 "chain_hits":decode.chain_hits,

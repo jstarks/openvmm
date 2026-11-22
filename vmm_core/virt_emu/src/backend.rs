@@ -292,6 +292,25 @@ impl EmuProcessor<'_> {
         Ok((core.decode_diagnostics(), self.state.first_apic_decode))
     }
 
+    /// Enables mixed native/interpreted execution after importing the VP state.
+    #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
+    pub fn enable_native_jit(&mut self) -> Result<(), Error> {
+        let CpuLifecycle::Ready(core) = &mut self.state.cpu else {
+            return Err(Error::Uninitialized);
+        };
+        core.set_native_jit(true);
+        Ok(())
+    }
+
+    /// Returns native retirements and the first reason each fallback entry was declined.
+    #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
+    pub fn native_diagnostics(&self) -> Result<x86_system::execute::native::Diagnostics, Error> {
+        let CpuLifecycle::Ready(core) = &self.state.cpu else {
+            return Err(Error::Uninitialized);
+        };
+        Ok(core.native_diagnostics())
+    }
+
     /// Returns aggregate IR entry lengths, retirements and precise exit reasons.
     pub fn execution_diagnostics(
         &self,

@@ -42,28 +42,23 @@ fn guest_store_starts_a_new_dirty_epoch() {
     ))
     .unwrap();
     let p = cfg.create().unwrap();
+    let flags =
+        abi::WHvMapGpaRangeFlagRead | abi::WHvMapGpaRangeFlagWrite | abi::WHvMapGpaRangeFlagExecute;
+    let ptr = pages.0.as_mut_ptr();
     // UNSAFETY: mapping owned test RAM into the WHP partition.
     #[expect(unsafe_code)]
     // SAFETY: the aligned allocation remains live until after the partition
     // drops, including on unwinding, and is not accessed while the VP runs.
-    unsafe {
-        p.map_range(
-            None,
-            pages.0.as_mut_ptr(),
-            8192,
-            0,
-            abi::WHvMapGpaRangeFlagRead
-                | abi::WHvMapGpaRangeFlagWrite
-                | abi::WHvMapGpaRangeFlagExecute
-                | abi::WHvMapGpaRangeFlagTrackDirtyPages,
-        )
-        .unwrap();
-    }
+    let map = |flags| unsafe { p.map_range(None, ptr, 8192, 0, flags).unwrap() };
+    map(flags);
     p.create_vp(0).create().unwrap();
     let vp = p.vp(0);
     vp.set_register(Register64::GicrBaseGpa, 0x8100000).unwrap();
     vp.set_register(Register64::Pc, 0).unwrap();
     vp.set_register(Register64::Cpsr, 0x3c5).unwrap();
+    vp.runner().run().unwrap();
+    vp.set_register(Register64::Pc, 0).unwrap();
+    map(flags | abi::WHvMapGpaRangeFlagTrackDirtyPages);
     p.query_dirty_bitmap(0, 8192, None).unwrap();
     vp.runner().run().unwrap();
     assert_eq!(&pages.0[4096..4104], &4096u64.to_le_bytes());
@@ -72,4 +67,5 @@ fn guest_store_starts_a_new_dirty_epoch() {
     assert_eq!(bits, [2]);
     p.query_dirty_bitmap(0, 8192, Some(&mut bits)).unwrap();
     assert_eq!(bits, [0]);
+    map(flags);
 }

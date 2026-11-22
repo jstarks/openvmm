@@ -57,16 +57,11 @@ mod native {
         {
             let d = vp.native_diagnostics()?;
             ensure!(
-                d.retired <= retired,
-                "native retirements exceed VP progress"
+                d.retired == retired,
+                "strict native retirements differ from VP progress"
             );
-            let blockers: BTreeMap<_,_> = d.blockers.iter().map(|(name, count)| (*name, serde_json::json!({
-                "entries":count.entries, "offered":count.instructions, "retired_before_resume":count.retired
-            }))).collect();
             Ok(Some(
-                serde_json::json!({"native_entries":d.entries, "native_retired":d.retired,"compilations":d.compilations,
-                "interpreted_retired":retired - d.retired, "fallback_entries":d.fallbacks,
-                "fallback_offered":d.fallback_instructions, "blockers":blockers}),
+                serde_json::json!({"native_entries":d.entries, "native_retired":d.retired}),
             ))
         }
         #[cfg(not(all(feature = "native-jit", target_os = "linux")))]
@@ -1520,6 +1515,10 @@ mod native {
         let mut binder = binders.pop().context("missing VP binder")?;
         ensure!(binders.is_empty(), "unexpected additional VP");
         let mut vp = binder.bind()?;
+        #[cfg(all(feature = "native-jit", target_os = "linux"))]
+        if native_jit {
+            vp.enable_native_jit()?;
+        }
         #[cfg(feature = "perf")]
         if profile_enabled {
             vp.enable_execution_profile()?;
@@ -1536,10 +1535,6 @@ mod native {
             state.set_registers(&initial.registers)?;
             state.set_pat(&initial.pat)?;
             state.commit()?;
-        }
-        #[cfg(all(feature = "native-jit", target_os = "linux"))]
-        if native_jit {
-            vp.enable_native_jit()?;
         }
         let mut devices = WitnessIo {
             with_ioapic: probe_apic,
@@ -1771,6 +1766,12 @@ mod native {
             .take()
             .context("missing frontier diagnostic")?;
         let stopped_rip = vp.access_state(Vtl::Vtl0).registers()?.rip;
+        if matches!(
+            failure.downcast_ref::<Error>(),
+            Some(Error::NativeCompilation { .. })
+        ) {
+            return Err(anyhow::Error::from_boxed(failure));
+        }
         if probe {
             ensure!(
                 matches!(
@@ -2129,7 +2130,7 @@ mod native {
         if native_jit {
             ensure!(
                 progress.retired == 967_067,
-                "mixed execution changed checkpoint retirement count"
+                "native execution changed checkpoint retirement count"
             );
             #[cfg(all(feature = "native-jit", target_os = "linux"))]
             ensure!(

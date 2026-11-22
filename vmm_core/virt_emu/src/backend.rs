@@ -79,6 +79,14 @@ pub enum Error {
     /// Decoder input was stale or no longer outstanding.
     #[error("decoder completion did not match the outstanding request")]
     DecodeCompletion,
+    /// The selected executor cannot compile this entry; no guest exception was injected.
+    #[error("native compilation at {rip:#x}: {reason}")]
+    NativeCompilation {
+        /// Unexecuted guest instruction.
+        rip: u64,
+        /// Unsupported operation or compilation failure.
+        reason: &'static str,
+    },
     /// Completed-batch telemetry cannot wrap.
     #[error("completed-batch progress counter exhausted")]
     ProgressExhausted,
@@ -188,6 +196,7 @@ enum CpuLifecycle {
 }
 
 struct VpState {
+    backend: strudel::Backend,
     #[cfg(test)]
     decode_cache_enabled: bool,
     #[cfg(test)]
@@ -292,17 +301,17 @@ impl EmuProcessor<'_> {
         Ok((core.decode_diagnostics(), self.state.first_apic_decode))
     }
 
-    /// Enables mixed native/interpreted execution after importing the VP state.
+    /// Select the strict native executor before the CPU is constructed.
     #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
     pub fn enable_native_jit(&mut self) -> Result<(), Error> {
-        let CpuLifecycle::Ready(core) = &mut self.state.cpu else {
-            return Err(Error::Uninitialized);
-        };
-        core.set_native_jit(true);
+        if !matches!(self.state.cpu, CpuLifecycle::Importing(_)) || self.state.started {
+            return Err(Error::AlreadyInitialized);
+        }
+        self.state.backend = strudel::Backend::Native;
         Ok(())
     }
 
-    /// Returns native retirements and the first reason each fallback entry was declined.
+    /// Returns retirements performed by the selected native executor.
     #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
     pub fn native_diagnostics(&self) -> Result<x86_system::execute::native::Diagnostics, Error> {
         let CpuLifecycle::Ready(core) = &self.state.cpu else {
@@ -544,6 +553,7 @@ impl ProtoPartition for EmuProtoPartition {
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
             state: VpState {
+                backend: strudel::Backend::Interpreter,
                 #[cfg(test)]
                 decode_cache_enabled: true,
                 #[cfg(test)]
@@ -877,6 +887,12 @@ impl Processor for EmuProcessor<'_> {
                 Ok(batch) => batch,
                 Err(RunError::DecodeCompletion(_)) => {
                     return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));
+                }
+                Err(RunError::NativeCompilation(reason)) => {
+                    return Err(dev.fatal_error(Box::new(Error::NativeCompilation {
+                        rip: core.cpu().rip,
+                        reason,
+                    })));
                 }
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Memory(error)))),
             };
@@ -1304,13 +1320,16 @@ impl AccessVpState for EmuStateAccess<'_> {
         {
             return Err(Error::Profile("initial long-mode register image"));
         }
-        let mut core = Machine::new(CpuState {
-            registers: cpu,
-            config,
-            cr2: regs.cr2,
-            tables,
-            system,
-        })?;
+        let mut core = Machine::new_with_backend(
+            CpuState {
+                registers: cpu,
+                config,
+                cr2: regs.cr2,
+                tables,
+                system,
+            },
+            self.state.backend,
+        )?;
         core.set_svm_exit_stop(self.state.svm_exit_checkpoint);
         #[cfg(test)]
         core.set_test_options(strudel::TestOptions {

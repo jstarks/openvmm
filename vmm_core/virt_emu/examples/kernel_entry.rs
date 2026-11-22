@@ -1091,6 +1091,7 @@ mod native {
         let mut guest_checkpoint = None;
         let mut svm_exit_checkpoint = None;
         let mut svm_enabled = false;
+        let mut no_nrips = false;
         let mut profile_enabled = false;
         #[cfg(feature = "perf")]
         let mut perf_control = None;
@@ -1134,10 +1135,11 @@ mod native {
             } else if flag == "--stop-after-command" {
                 ensure!(!stop_after_command, "duplicate command-stop flag");
                 stop_after_command = true;
-            } else if flag == "--svm" {
+            } else if flag == "--svm-no-nrips" || flag == "--svm" {
                 ensure!(probe_apic, "SVM requires the APIC/chipset probe");
                 ensure!(!svm_enabled, "duplicate SVM flag");
                 svm_enabled = true;
+                no_nrips = flag == "--svm-no-nrips";
             } else if flag == "--shell-command" {
                 ensure!(probe_apic, "shell command requires the APIC/chipset probe");
                 ensure!(shell_command.is_none(), "duplicate shell command");
@@ -1203,7 +1205,11 @@ mod native {
             nested_virt: svm_enabled,
         };
         let proto = if probe_apic {
-            hypervisor.new_partition(config)?
+            if no_nrips {
+                hypervisor.new_no_nrips_fixture(config)?
+            } else {
+                hypervisor.new_partition(config)?
+            }
         } else {
             hypervisor.new_legacy_fixture(config)?
         };
@@ -1908,7 +1914,7 @@ mod native {
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
                     "counters_gated":counters_gated,
                     "execution_profile":execution_profile,
-                    "clock_slowdown":clock_slowdown.get(),"svm_enabled":svm_enabled,
+                    "clock_slowdown":clock_slowdown.get(),"svm_enabled":svm_enabled,"nrips":svm_enabled && !no_nrips,
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
                     "kernel_image_bytes":encoding,
                     "instruction_walk":walk_trace(&memory,registers.cr3,registers.rip)?,

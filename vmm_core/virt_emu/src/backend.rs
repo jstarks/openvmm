@@ -169,7 +169,7 @@ pub struct EmuProtoPartition {
     caps: Arc<PartitionCapabilities>,
     clock: VmTimeSource,
     architectural_apic: bool,
-    svm_available: bool,
+    svm: x86_system::arch::svm::State,
     apic_id: u32,
     writes: WriteWatch,
 }
@@ -396,7 +396,7 @@ impl Hypervisor for EmuHypervisor {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, true)
+        self.partition(config, true, true)
     }
 }
 
@@ -406,13 +406,22 @@ impl EmuHypervisor {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, false)
+        self.partition(config, false, false)
+    }
+
+    /// Diagnostic SVM profile using software instruction-length discovery.
+    pub fn new_no_nrips_fixture(
+        &mut self,
+        config: ProtoPartitionConfig<'_>,
+    ) -> Result<EmuProtoPartition, Error> {
+        self.partition(config, true, false)
     }
 
     fn partition(
         &mut self,
         config: ProtoPartitionConfig<'_>,
         architectural_apic: bool,
+        nrips: bool,
     ) -> Result<EmuProtoPartition, Error> {
         if config.processor_topology.vps().count() != 1
             || config.hv_config.is_some()
@@ -433,11 +442,18 @@ impl EmuHypervisor {
                 "initial APIC profile requires an 8-bit boot ID and x2APIC-capable legacy mode",
             ));
         }
+        let svm = if config.nested_virt {
+            x86_system::arch::svm::State {
+                nrips,
+                ..x86_system::arch::svm::BASIC
+            }
+        } else {
+            x86_system::arch::svm::RESET
+        };
         let caps = PartitionCapabilities::from_cpuid(
             config.processor_topology,
             &mut |function, subleaf| {
-                let mut values =
-                    x86_system::arch::svm::cpuid(config.nested_virt, function, subleaf);
+                let mut values = x86_system::arch::svm::cpuid(svm, function, subleaf);
                 if architectural_apic && function == 1 {
                     values[1] = (values[1] & 0x00ff_ffff) | (apic_id << 24);
                     values[2] |= 1 << 21;
@@ -450,7 +466,7 @@ impl EmuHypervisor {
             caps: Arc::new(caps),
             clock: config.vmtime.clone(),
             architectural_apic,
-            svm_available: config.nested_virt,
+            svm,
             apic_id,
             writes: WriteWatch::default(),
         })
@@ -518,11 +534,7 @@ impl ProtoPartition for EmuProtoPartition {
                 first_apic_time: None,
                 first_apic_decode: None,
                 cpu: CpuLifecycle::Importing(Box::new(SystemState {
-                    svm: if self.svm_available {
-                        x86_system::arch::svm::BASIC
-                    } else {
-                        x86_system::arch::svm::RESET
-                    },
+                    svm: self.svm,
                     ..SystemState::empty()
                 })),
                 started: false,

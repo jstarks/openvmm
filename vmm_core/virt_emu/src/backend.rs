@@ -396,7 +396,7 @@ impl Hypervisor for EmuHypervisor {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, true, true)
+        self.partition(config, true, true, true)
     }
 }
 
@@ -406,15 +406,16 @@ impl EmuHypervisor {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, false, false)
+        self.partition(config, false, false, false)
     }
 
-    /// Diagnostic SVM profile using software instruction-length discovery.
-    pub fn new_no_nrips_fixture(
+    /// Diagnostic SVM profile without nested paging, optionally also without NRIPS.
+    pub fn new_shadow_fixture(
         &mut self,
         config: ProtoPartitionConfig<'_>,
+        nrips: bool,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, true, false)
+        self.partition(config, true, nrips, false)
     }
 
     fn partition(
@@ -422,6 +423,7 @@ impl EmuHypervisor {
         config: ProtoPartitionConfig<'_>,
         architectural_apic: bool,
         nrips: bool,
+        npt: bool,
     ) -> Result<EmuProtoPartition, Error> {
         if config.processor_topology.vps().count() != 1
             || config.hv_config.is_some()
@@ -445,6 +447,7 @@ impl EmuHypervisor {
         let svm = if config.nested_virt {
             x86_system::arch::svm::State {
                 nrips,
+                npt,
                 ..x86_system::arch::svm::BASIC
             }
         } else {

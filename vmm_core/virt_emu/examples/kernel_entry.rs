@@ -1092,6 +1092,7 @@ mod native {
         let mut svm_exit_checkpoint = None;
         let mut svm_enabled = false;
         let mut no_nrips = false;
+        let mut shadow_paging = false;
         let mut profile_enabled = false;
         #[cfg(feature = "perf")]
         let mut perf_control = None;
@@ -1135,11 +1136,12 @@ mod native {
             } else if flag == "--stop-after-command" {
                 ensure!(!stop_after_command, "duplicate command-stop flag");
                 stop_after_command = true;
-            } else if flag == "--svm-no-nrips" || flag == "--svm" {
+            } else if flag == "--svm-no-nrips" || flag == "--svm-shadow" || flag == "--svm" {
                 ensure!(probe_apic, "SVM requires the APIC/chipset probe");
                 ensure!(!svm_enabled, "duplicate SVM flag");
                 svm_enabled = true;
                 no_nrips = flag == "--svm-no-nrips";
+                shadow_paging = flag != "--svm";
             } else if flag == "--shell-command" {
                 ensure!(probe_apic, "shell command requires the APIC/chipset probe");
                 ensure!(shell_command.is_none(), "duplicate shell command");
@@ -1205,8 +1207,8 @@ mod native {
             nested_virt: svm_enabled,
         };
         let proto = if probe_apic {
-            if no_nrips {
-                hypervisor.new_no_nrips_fixture(config)?
+            if shadow_paging {
+                hypervisor.new_shadow_fixture(config, !no_nrips)?
             } else {
                 hypervisor.new_partition(config)?
             }
@@ -1915,6 +1917,7 @@ mod native {
                     "counters_gated":counters_gated,
                     "execution_profile":execution_profile,
                     "clock_slowdown":clock_slowdown.get(),"svm_enabled":svm_enabled,"nrips":svm_enabled && !no_nrips,
+                    "npt":svm_enabled && !shadow_paging,
                     "rip":registers.rip,"cr2":registers.cr2,"registers":format!("{registers:?}"),
                     "kernel_image_bytes":encoding,
                     "instruction_walk":walk_trace(&memory,registers.cr3,registers.rip)?,

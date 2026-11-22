@@ -20,6 +20,8 @@ use virt::PageVisibility;
 #[derive(Debug, Inspect)]
 pub(super) struct MappedRange {
     range: MemoryRange,
+    #[inspect(skip)]
+    direct_va: Option<usize>,
     writable: bool,
     exec: bool,
 }
@@ -74,6 +76,9 @@ impl SimpleMemoryMap for whp::Partition {
 
 /// Trait for different partition memory mapper implementations.
 pub(crate) trait MemoryMapper: Inspect + Send + Sync {
+    fn direct_mappings(&self) -> bool {
+        false
+    }
     /// Map a range into the partition.
     ///
     /// # Safety
@@ -210,6 +215,9 @@ impl WhpMemoryMapper {
 }
 
 impl MemoryMapper for WhpMemoryMapper {
+    fn direct_mappings(&self) -> bool {
+        self.overlays.is_none()
+    }
     unsafe fn map_range(
         &self,
         partition: &dyn SimpleMemoryMap,
@@ -396,8 +404,11 @@ impl VtlPartition {
                 .map_range(&self.whp, process, data, size, addr, writable, exec)?;
         }
 
+        ranges.retain(|r| !range.contains(&r.range));
         ranges.push(MappedRange {
             range,
+            direct_va: (process.is_none() && self.mapper.direct_mappings())
+                .then(|| data.expose_provenance()),
             writable,
             exec,
         });
@@ -463,6 +474,42 @@ impl virt::PartitionMemoryMapper for WhpPartition {
 }
 
 impl virt::PartitionMemoryMap for WhpPartitionAndVtl {
+    fn set_dirty_tracking(&self, addr: u64, size: u64, enable: bool) -> anyhow::Result<()> {
+        let vtlp = self.vtlp();
+        let ranges = vtlp.ranges.write();
+        let mapping = ranges
+            .iter()
+            .find(|r| r.range.start() == addr && r.range.len() == size)
+            .context("dirty tracking requires one complete mapping")?;
+        let va = mapping
+            .direct_va
+            .context("dirty tracking requires a direct local GPA mapping")?;
+        anyhow::ensure!(mapping.writable, "RAM is not writable");
+        let mut flags = whp::abi::WHvMapGpaRangeFlagRead | whp::abi::WHvMapGpaRangeFlagWrite;
+        if mapping.exec {
+            flags |= whp::abi::WHvMapGpaRangeFlagExecute;
+        }
+        if enable {
+            flags |= whp::abi::WHvMapGpaRangeFlagTrackDirtyPages;
+        }
+        // SAFETY: direct_va belongs to the existing local mapping. Holding
+        // ranges prevents its owner from unmapping or replacing the range.
+        unsafe {
+            vtlp.whp.map_range(
+                None,
+                std::ptr::with_exposed_provenance_mut(va),
+                size.try_into()?,
+                addr,
+                flags,
+            )
+        }?;
+        Ok(())
+    }
+
+    fn collect_dirty(&self, addr: u64, size: u64, bits: &mut [u64]) -> anyhow::Result<()> {
+        Ok(self.vtlp().whp.query_dirty_bitmap(addr, size, Some(bits))?)
+    }
+
     fn unmap_range(&self, addr: u64, size: u64) -> anyhow::Result<()> {
         self.vtlp().unmap_range(addr, size)
     }

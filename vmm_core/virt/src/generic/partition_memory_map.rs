@@ -6,6 +6,17 @@
 
 /// Trait for mapping process memory into a partition.
 pub trait PartitionMemoryMap: Send + Sync {
+    /// Switch an existing RAM mapping into or out of guest CPU dirty logging.
+    /// Does not cover stores performed by userspace or by assigned devices.
+    fn set_dirty_tracking(&self, _addr: u64, _size: u64, _enable: bool) -> anyhow::Result<()> {
+        anyhow::bail!("this partition does not support on-demand dirty tracking")
+    }
+
+    /// Collect and clear one bit per 4 KiB guest page in a tracked RAM range.
+    fn collect_dirty(&self, _addr: u64, _size: u64, _bits: &mut [u64]) -> anyhow::Result<()> {
+        anyhow::bail!("this partition does not support dirty page collection")
+    }
+
     /// Unmaps any ranges in the given guest physical address range.
     ///
     /// The specified range may overlap zero, one, or many ranges mapped with

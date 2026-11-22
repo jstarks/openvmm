@@ -8,6 +8,8 @@
 #![expect(missing_docs)]
 
 pub mod ranges;
+mod write_watch;
+pub use write_watch::WriteWatch;
 
 use guestmem_core::ranges::PagedRange;
 use inspect::Inspect;
@@ -1119,6 +1121,7 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
 #[inspect(skip)]
 pub struct GuestMemory {
     inner: Arc<GuestMemoryInner>,
+    watch: Option<(Arc<WriteWatch>, u64)>,
 }
 
 struct GuestMemoryInner<T: ?Sized = dyn DynGuestMemoryAccess> {
@@ -1334,6 +1337,7 @@ impl GuestMemory {
         let supports_kernel_lock = imp.supports_kernel_lock();
         let supports_user_lock = imp.supports_user_lock();
         Self {
+            watch: None,
             inner: Arc::new(GuestMemoryInner {
                 imp,
                 debug_name,
@@ -1437,6 +1441,7 @@ impl GuestMemory {
         };
 
         Ok(Self {
+            watch: None,
             inner: Arc::new(inner),
         })
     }
@@ -1468,7 +1473,10 @@ impl GuestMemory {
         let inner = unsafe {
             Arc::<GuestMemoryInner<AlignedHeapMemory>>::from_raw(Arc::into_raw(self.inner).cast())
         };
-        let inner = Arc::try_unwrap(inner).map_err(|inner| Self { inner })?;
+        let inner = Arc::try_unwrap(inner).map_err(|inner| Self {
+            inner,
+            watch: self.watch,
+        })?;
         Ok(inner.imp)
     }
 
@@ -1522,6 +1530,17 @@ impl GuestMemory {
         f().map_err(|err| self.wrap_err(gpa_len, op, err))
     }
 
+    /// Attach before distributing this view to emulated devices. Clones and
+    /// subranges inherit the watch; independently obtained memory does not.
+    pub fn with_write_watch(mut self, watch: Arc<WriteWatch>) -> Self {
+        self.watch = Some((watch, 0));
+        self
+    }
+
+    pub fn write_watch(&self) -> Option<&WriteWatch> {
+        self.watch.as_ref().map(|(watch, _)| &**watch)
+    }
+
     /// Creates a smaller view into guest memory, constraining accesses within the new boundaries. For smaller ranges,
     /// some memory implementations (e.g. HDV) may choose to lock the pages into memory for faster access. Locking
     /// random guest memory may cause issues, so only opt in to this behavior when the range can be considered "owned"
@@ -1532,7 +1551,7 @@ impl GuestMemory {
         len: u64,
         allow_preemptive_locking: bool,
     ) -> Result<GuestMemory, GuestMemoryError> {
-        self.with_op(Some((offset, len)), GuestMemoryOperation::Subrange, || {
+        let mut view = self.with_op(Some((offset, len)), GuestMemoryOperation::Subrange, || {
             if let Some(guest_memory) =
                 self.inner
                     .imp
@@ -1542,7 +1561,11 @@ impl GuestMemory {
             } else {
                 create_memory_subrange(self.inner.clone(), offset, len, allow_preemptive_locking)
             }
-        })
+        })?;
+        if let Some((watch, base)) = &self.watch {
+            view.watch = Some((watch.clone(), base.saturating_add(offset)));
+        }
+        Ok(view)
     }
 
     /// Returns a subrange where pages from the subrange can be locked.
@@ -1701,9 +1724,15 @@ impl GuestMemory {
         // critical section. This will allow callers to flush concurrent
         // accesses after bitmap updates.
         #[cfg(feature = "bitmap")]
-        return rcu().run(op);
+        let result = rcu().run(op);
         #[cfg(not(feature = "bitmap"))]
-        op()
+        let result = op();
+        if access_type == AccessType::Write {
+            if let Some((watch, base)) = &self.watch {
+                watch.record(base.saturating_add(gpa), len);
+            }
+        }
+        result
     }
 
     /// # Safety

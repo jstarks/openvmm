@@ -59,6 +59,7 @@ mod native {
             "svm_ud_exits":d.svm_ud_exits,"svm_invlpg_exits":d.svm_invlpg_exits,
             "svm_exits":d.svm_exits,"svm_exit_samples":d.svm_exit_samples,
             "svm_breakpoint":d.svm_breakpoint,
+            "svm_vmcb":d.svm_vmcb,
         })
     }
 
@@ -1088,12 +1089,36 @@ mod native {
         let mut shell_command = None;
         let mut stop_after_command = false;
         let mut guest_checkpoint = None;
+        let mut svm_exit_checkpoint = None;
         let mut svm_enabled = false;
         let mut profile_enabled = false;
         #[cfg(feature = "perf")]
         let mut perf_control = None;
         while let Some(flag) = args.next() {
-            if flag == "--guest-checkpoint" {
+            if flag == "--svm-exit-checkpoint" {
+                ensure!(
+                    svm_exit_checkpoint.is_none(),
+                    "duplicate SVM exit checkpoint"
+                );
+                let code = args
+                    .next()
+                    .context("missing SVM exit code")?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 SVM exit code"))?;
+                let vector = args
+                    .next()
+                    .context("missing vectored event")?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 vectored event"))?;
+                svm_exit_checkpoint = Some((
+                    u64::from_str_radix(
+                        code.strip_prefix("0x")
+                            .context("SVM exit code needs 0x prefix")?,
+                        16,
+                    )?,
+                    vector.parse::<u8>()?,
+                ));
+            } else if flag == "--guest-checkpoint" {
                 ensure!(guest_checkpoint.is_none(), "duplicate guest checkpoint");
                 let value = args
                     .next()
@@ -1143,6 +1168,10 @@ mod native {
             }
         }
         let command_configured = shell_command.is_some();
+        ensure!(
+            svm_exit_checkpoint.is_none() || (probe && svm_enabled && guest_checkpoint.is_none()),
+            "SVM exit checkpoint requires an SVM probe without a guest RIP checkpoint"
+        );
         ensure!(
             guest_checkpoint.is_none() || (probe && svm_enabled),
             "guest checkpoint requires an SVM probe"
@@ -1453,6 +1482,7 @@ mod native {
         } else {
             vp.set_execution_checkpoint(Some(if probe { probe_target } else { CHECKPOINT }))?;
         }
+        vp.set_svm_exit_checkpoint(svm_exit_checkpoint);
         {
             let mut state = vp.access_state(Vtl::Vtl0);
             state.set_mtrrs(&initial.mtrrs)?;
@@ -1780,6 +1810,25 @@ mod native {
                 })
             });
             let current_stack_walk = walk_trace(&memory, registers.cr3, registers.rsp)?;
+            let svm_exit_checkpoint_reached = vp.svm_exit_checkpoint_reached()?;
+            let base = vp.execution_diagnostics()?.svm_vmcb;
+            let svm_vmcb_control = if svm_exit_checkpoint_reached
+                || (svm_enabled
+                    && base != 0
+                    && matches!(
+                        failure.downcast_ref::<Error>(),
+                        Some(Error::Checkpoint { .. })
+                    )) {
+                let mut words = Vec::new();
+                for offset in (0..0x100).step_by(8) {
+                    words.push(serde_json::json!({
+                        "offset":offset,"value":memory.read_plain::<u64>(base+offset)?,
+                    }));
+                }
+                words
+            } else {
+                Vec::new()
+            };
             let current_stack_words = virtual_words(&memory, registers.cr3, registers.rsp, 128)?;
             let current_code_words = virtual_words(&memory, registers.cr3, registers.rip & !7, 4)?;
             let callback_args = if guest_checkpoint.is_some() {
@@ -1807,6 +1856,7 @@ mod native {
             };
             // v6.18.33's soft-exception skip return, with its pinned vcpu_svm offsets.
             let kvm_soft_rip = if probe_target == 0xffff_ffff_812e_42d6
+                && stopped_rip == probe_target
                 && guest_checkpoint.is_none()
             {
                 let rip = virtual_words(&memory, registers.cr3, registers.rbx + 0x1b0, 4)?;
@@ -1871,6 +1921,8 @@ mod native {
                     "checkpoint_rdi_words":checkpoint_rdi_words,
                     "breakpoint_gate":breakpoint_gate,
                     "kvm_soft_rip":kvm_soft_rip,
+                    "svm_exit_checkpoint":svm_exit_checkpoint,"svm_vmcb_control":svm_vmcb_control,
+                    "svm_exit_checkpoint_reached":svm_exit_checkpoint_reached,
                     "serial_bytes":serial_bytes,
                     "serial_output":serial_output,
                     "serial_input":serial_input,

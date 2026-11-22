@@ -204,6 +204,7 @@ struct VpState {
     code_preparation: CodePreparationDiagnostics,
     checkpoint: Option<u64>,
     checkpoint_guest: bool,
+    svm_exit_checkpoint: Option<(u64, u8)>,
     io_active: bool,
     fault: Option<Error>,
     #[cfg(feature = "perf")]
@@ -358,6 +359,22 @@ impl EmuProcessor<'_> {
         self.set_execution_checkpoint(address)?;
         self.state.checkpoint_guest = true;
         Ok(())
+    }
+
+    /// Pause after VMEXIT for an exit code and in-flight event vector, before host execution.
+    pub fn set_svm_exit_checkpoint(&mut self, selector: Option<(u64, u8)>) {
+        self.state.svm_exit_checkpoint = selector;
+        if let CpuLifecycle::Ready(core) = &mut self.state.cpu {
+            core.set_svm_exit_stop(selector);
+        }
+    }
+
+    /// Whether the requested exit checkpoint, rather than an instruction stop, was reached.
+    pub fn svm_exit_checkpoint_reached(&self) -> Result<bool, Error> {
+        let CpuLifecycle::Ready(core) = &self.state.cpu else {
+            return Err(Error::Uninitialized);
+        };
+        Ok(core.svm_exit_stopped())
     }
 
     /// Transport failures can leave additional, unreported partial progress.
@@ -515,6 +532,7 @@ impl ProtoPartition for EmuProtoPartition {
                 profile: None,
                 checkpoint: None,
                 checkpoint_guest: false,
+                svm_exit_checkpoint: None,
                 io_active: false,
                 fault: None,
             },
@@ -740,6 +758,11 @@ impl Processor for EmuProcessor<'_> {
             let CpuLifecycle::Ready(core) = &mut self.state.cpu else {
                 return Err(dev.fatal_error(Box::new(Error::Uninitialized)));
             };
+            if core.svm_exit_stopped() {
+                return Err(dev.fatal_error(Box::new(Error::Checkpoint {
+                    rip: core.cpu().rip,
+                })));
+            }
             if let Err(error) = self.control.flush(core) {
                 return Err(dev.fatal_error(Box::new(error)));
             }
@@ -1272,6 +1295,7 @@ impl AccessVpState for EmuStateAccess<'_> {
             tables,
             system,
         })?;
+        core.set_svm_exit_stop(self.state.svm_exit_checkpoint);
         #[cfg(test)]
         core.set_test_options(strudel::TestOptions {
             cache: self.state.decode_cache_enabled,

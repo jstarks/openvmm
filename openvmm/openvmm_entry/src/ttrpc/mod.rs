@@ -1527,6 +1527,12 @@ impl VmService {
                 scsi_rpc = Some(send);
             }
 
+            for device in devices_config.virtio_mmio {
+                config.virtio_devices.push((
+                    VirtioBus::Mmio,
+                    build_virtio_device(device, &registry).await?,
+                ));
+            }
             for nic in devices_config.nic_config {
                 let is_consomme = matches!(
                     &nic.backend,

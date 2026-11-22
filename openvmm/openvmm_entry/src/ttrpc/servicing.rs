@@ -25,6 +25,7 @@ pub(super) struct TransferProfile {
     processors: Option<vmservice::ProcessorConfig>,
     cmdline: String,
     initrd: bool,
+    mmio: Vec<vmservice::VirtioDevice>,
 }
 
 type Request = FailableRpc<TransferProfile, Offer>;
@@ -35,7 +36,27 @@ pub(super) fn profile(config: &vmservice::VmConfig) -> Option<TransferProfile> {
     };
     // Only admit the fixture whose devices can be reconstructed without
     // side effects on RAM before commit. New device classes opt in explicitly.
+    let mmio = config
+        .devices_config
+        .as_ref()
+        .map(|d| d.virtio_mmio.clone())
+        .unwrap_or_default();
+    if !mmio.iter().all(|d| {
+        matches!(
+            d.kind,
+            Some(vmservice::virtio_device::Kind::Rtc(_) | vmservice::virtio_device::Kind::Rng(_))
+        )
+    }) {
+        return None;
+    }
     let supported = vmservice::VmConfig {
+        devices_config: config
+            .devices_config
+            .as_ref()
+            .map(|_| vmservice::DevicesConfig {
+                virtio_mmio: mmio.clone(),
+                ..Default::default()
+            }),
         boot_config: config.boot_config.clone(),
         memory_config: config.memory_config.clone(),
         processor_config: config.processor_config.clone(),
@@ -54,6 +75,7 @@ pub(super) fn profile(config: &vmservice::VmConfig) -> Option<TransferProfile> {
         processors: supported.processor_config,
         cmdline: boot.kernel_cmdline.clone(),
         initrd: !boot.initrd_path.is_empty(),
+        mmio,
     })
 }
 

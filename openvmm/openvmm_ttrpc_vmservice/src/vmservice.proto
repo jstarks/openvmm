@@ -275,6 +275,8 @@ message DevicesConfig {
     // Single-port console devices, enumerated by the guest as hvc0, hvc1, and
     // so on in list order.
     repeated VirtioConsoleConfig virtio_consoles = 6;
+    // Explicit virtio-MMIO slots in guest-visible order.
+    repeated VirtioDevice virtio_mmio = 7;
 }
 
 // An endpoint PCIe device function. Attached behind a port in the topology

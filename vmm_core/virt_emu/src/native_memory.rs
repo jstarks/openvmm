@@ -677,6 +677,19 @@ impl PhysicalRam for NativeRam<'_> {
         None
     }
 
+    fn read_code_prefix(&self, address: u64, destination: &mut [u8]) -> Option<(CodeToken, usize)> {
+        let length = destination.len().min(4096 - (address & 4095) as usize);
+        if length == 0 {
+            return None;
+        }
+        let token = self.code_token(address, 1)?.clone();
+        let (source, _) = self.pointer(address, length, false).ok()?;
+        // SAFETY: the lease pins the range; try_copy handles inaccessible
+        // backing. Admission rechecks the page observation after the copy.
+        unsafe { trycopy::try_copy(source, destination.as_mut_ptr(), length) }.ok()?;
+        Some((token, length))
+    }
+
     fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
         let (pointer, _) = self.pointer(address, N, false)?;

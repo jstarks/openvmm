@@ -303,6 +303,7 @@ impl EmuProcessor<'_> {
     }
 
     /// Select the strict native executor before the CPU is constructed.
+    // xtask-fmt allow-target-arch dependency - the native backend emits host x86-64 code.
     #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
     pub fn enable_native_jit(&mut self) -> Result<(), Error> {
         if !matches!(self.state.cpu, CpuLifecycle::Importing(_)) || self.state.started {
@@ -313,6 +314,7 @@ impl EmuProcessor<'_> {
     }
 
     /// Native instrumentation counters, not total guest progress after uncounted execution.
+    // xtask-fmt allow-target-arch dependency - these counters belong to the host JIT.
     #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
     pub fn native_diagnostics(&self) -> Result<x86_system::execute::native::Diagnostics, Error> {
         let CpuLifecycle::Ready(core) = &self.state.cpu else {

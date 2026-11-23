@@ -1875,8 +1875,7 @@ mod native {
                     "execution_hits":d.execution_hits,"execution_misses":d.execution_misses,
                     "chain_lookups":d.chain_lookups,"chain_hits":d.chain_hits,
                     "chain_links":d.chain_links,
-                    "block_lookups":d.block_lookups,"block_hits":d.block_hits,
-                    "block_builds":d.block_builds,
+                    "block_hits":d.block_hits,"forward_admissions":d.forward_admissions,
                 })
             };
             let preparation = vp.code_preparation_diagnostics();

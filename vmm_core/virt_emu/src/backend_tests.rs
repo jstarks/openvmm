@@ -2401,6 +2401,58 @@ async fn indexed_ram_reuses_stack_and_data_translations(driver: DefaultDriver) {
     );
 }
 
+#[cfg(all(feature = "tlb-stats", target_os = "linux"))]
+#[async_test]
+async fn rep_movsq_uses_direct_ram_across_page_changes(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    let src = 0x15f00;
+    let dst = 0x17f00;
+    let count = 128;
+    bytes[CODE as usize..CODE as usize + 3].copy_from_slice(&[0xf3, 0x48, 0xa5]);
+    for i in 0..(8 * count) {
+        bytes[src + i] = (i ^ (i >> 6)) as u8;
+    }
+    bytes[dst - 1..dst + 8 * count + 1].fill(0xcd);
+    let mut cpu = owned.core.cpu;
+    cpu.flags = 2;
+    cpu.gpr[1] = count as u64;
+    cpu.gpr[6] = src as u64;
+    cpu.gpr[7] = dst as u64;
+    let initial = long_mode_registers(cpu, super::shared_mmu_tests::config(), owned.tables, 0);
+    let (_partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    binder.set_observed_for_test(false);
+    let mut vp = binder.bind().unwrap();
+    vp.enable_native_jit().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + 3)).unwrap();
+    let stop = StopVpSource::new();
+    let devices = Devices::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let regs = vp.access_state(Vtl::Vtl0).registers().unwrap();
+    assert_eq!(
+        (regs.rip, regs.rcx, regs.rsi, regs.rdi),
+        (
+            CODE + 3,
+            0,
+            (src + 8 * count) as u64,
+            (dst + 8 * count) as u64
+        )
+    );
+    let mut copy = vec![0; 8 * count + 2];
+    memory.read_at((dst - 1) as u64, &mut copy).unwrap();
+    assert_eq!((copy[0], copy[8 * count + 1]), (0xcd, 0xcd));
+    assert_eq!(&copy[1..1 + 8 * count], &bytes[src..src + 8 * count]);
+    let d = vp.native_diagnostics().unwrap();
+    assert_eq!(d.retired, 1);
+    assert!(
+        d.scalar_polls.iter().all(|&n| (2..16).contains(&n)),
+        "{d:?}"
+    );
+}
+
 #[async_test]
 async fn host_checkpoint_stops_after_complete_rep_and_can_resume_without_guest_changes(
     driver: DefaultDriver,

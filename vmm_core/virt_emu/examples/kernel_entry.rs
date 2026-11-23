@@ -58,7 +58,8 @@ mod native {
             let d = vp.native_diagnostics()?;
             ensure!(
                 d.retired == retired,
-                "strict native retirements differ from VP progress"
+                "strict native retirements ({}) differ from VP progress ({retired})",
+                d.retired
             );
             Ok(Some(
                 serde_json::json!({"native_entries":d.entries, "native_retired":d.retired}),

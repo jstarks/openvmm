@@ -61,9 +61,16 @@ mod native {
                 "strict native retirements ({}) differ from VP progress ({retired})",
                 d.retired
             );
-            Ok(Some(
-                serde_json::json!({"native_entries":d.entries, "native_retired":d.retired}),
-            ))
+            let summary =
+                serde_json::json!({"native_entries":d.entries, "native_retired":d.retired});
+            #[cfg(feature = "tlb-stats")]
+            let summary = {
+                let mut result = summary;
+                result["tlb"] = serde_json::json!({"fills":d.tlb_fills, "conflicts":d.tlb_conflicts,
+                    "load_polls":d.scalar_polls[0], "store_polls":d.scalar_polls[1]});
+                result
+            };
+            Ok(Some(summary))
         }
         #[cfg(not(all(feature = "native-jit", target_os = "linux")))]
         {

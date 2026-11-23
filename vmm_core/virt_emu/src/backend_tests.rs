@@ -2357,6 +2357,50 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
     );
 }
 
+#[cfg(all(feature = "tlb-stats", target_os = "linux"))]
+#[async_test]
+async fn indexed_ram_reuses_stack_and_data_translations(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    // push rax; mov rbx,[rdi]; pop rax; dec ecx; jnz start
+    let code = [0x50, 0x48, 0x8b, 0x1f, 0x58, 0xff, 0xc9, 0x75, 0xf7];
+    bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+    bytes[0x16000..0x16008].copy_from_slice(&VALUE.to_le_bytes());
+    let mut cpu = owned.core.cpu;
+    cpu.gpr[0] = 0x1234;
+    cpu.gpr[1] = 256;
+    cpu.gpr[4] = 0x18000;
+    cpu.gpr[7] = 0x16000;
+    let initial = long_mode_registers(cpu, super::shared_mmu_tests::config(), owned.tables, 0);
+    let (_partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    binder.set_observed_for_test(false);
+    let mut vp = binder.bind().unwrap();
+    vp.enable_native_jit().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + code.len() as u64))
+        .unwrap();
+    let devices = Devices::new();
+    let stop = StopVpSource::new();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    let regs = vp.access_state(Vtl::Vtl0).registers().unwrap();
+    assert_eq!(
+        (regs.rip, regs.rax, regs.rbx, regs.rsp),
+        (CODE + 9, 0x1234, VALUE, 0x18000)
+    );
+    assert_eq!(memory.read_plain::<u64>(0x17ff8).unwrap(), 0x1234);
+    let d = vp.native_diagnostics().unwrap();
+    assert_eq!(d.retired, 5 * 256);
+    assert_eq!(d.tlb_conflicts, 0);
+    // Allow cold singletons and watch registration. A one-entry cache, or a
+    // per-block snapshot, would still miss on each alternating page.
+    assert!(
+        d.tlb_fills >= 2 && d.scalar_polls.iter().sum::<u64>() < 32,
+        "{d:?}"
+    );
+}
+
 #[async_test]
 async fn host_checkpoint_stops_after_complete_rep_and_can_resume_without_guest_changes(
     driver: DefaultDriver,

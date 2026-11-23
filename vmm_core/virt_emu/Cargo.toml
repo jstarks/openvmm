@@ -9,6 +9,7 @@ rust-version.workspace = true
 [features]
 native-jit = ["strudel/native-jit"]
 direct-ram = ["native-jit", "strudel/direct-ram"]
+tlb-stats = ["direct-ram", "strudel/tlb-stats"]
 perf = ["strudel/perf", "dep:sparse_mmap"]
 test-support = ["guestmem/bitmap"]
 

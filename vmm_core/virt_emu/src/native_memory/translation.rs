@@ -7,7 +7,12 @@ use x86_system::memory::physical::{
     TranslationSlot,
 };
 
-const DATA_SLOT: usize = 1;
+const DATA_SLOTS: usize = if cfg!(feature = "direct-ram") { 256 } else { 1 };
+const SLOTS: usize = 5 + DATA_SLOTS;
+
+fn data_index(page: u64) -> usize {
+    5 + (page as usize & (DATA_SLOTS - 1))
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Slot {
@@ -18,12 +23,23 @@ struct Slot {
 
 /// Opaque persistent host payloads for fetch/data and four walker slots.
 /// Cached pointers are unusable until a live lease validates their domain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NativeTranslations {
     domain: Option<Arc<BindingDomain>>,
     generation: u64,
-    slots: [Option<Slot>; 6],
+    slots: [Option<Slot>; SLOTS],
     diagnostics: TranslationDiagnostics,
+}
+
+impl Default for NativeTranslations {
+    fn default() -> Self {
+        Self {
+            domain: None,
+            generation: 0,
+            slots: [None; SLOTS],
+            diagnostics: Default::default(),
+        }
+    }
 }
 
 impl TranslationCache for NativeTranslations {
@@ -56,7 +72,7 @@ impl<'a> NativeTranslated<'a> {
             if cache.domain.is_some() {
                 cache.diagnostics.invalidations = cache.diagnostics.invalidations.wrapping_add(1);
             }
-            cache.slots = [None; 6];
+            cache.slots.fill(None);
             cache.domain = current.map(|(domain, _)| Arc::clone(domain));
             cache.generation = current.map_or(0, |(_, generation)| generation);
         }
@@ -119,8 +135,8 @@ impl<'a> NativeTranslated<'a> {
         }
         let index = match translation.slot {
             TranslationSlot::Fetch => 0,
-            TranslationSlot::Data => DATA_SLOT,
-            TranslationSlot::Table(level) if level < 4 => usize::from(level) + 2,
+            TranslationSlot::Data => data_index(translation.physical_page),
+            TranslationSlot::Table(level) if level < 4 => usize::from(level) + 1,
             TranslationSlot::Table(_) => return None,
         };
         let hit = self.cache.slots[index].is_some_and(|slot| slot.translation == *translation);
@@ -155,7 +171,7 @@ impl TranslatedRam for NativeTranslated<'_> {
         if !self.ram.direct_pages || !self.enabled {
             return None;
         }
-        let slot = self.cache.slots[DATA_SLOT]?;
+        let slot = self.cache.slots[data_index(physical_page)]?;
         if slot.translation.physical_page != physical_page {
             return None;
         }
@@ -326,6 +342,57 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.diagnostics.misses, 3);
+    }
+
+    #[cfg(feature = "direct-ram")]
+    #[test]
+    fn data_bindings_coexist_until_index_collision_or_domain_revocation() {
+        let memory = memory(None, 0, 8192);
+        let mut cache = NativeTranslations::default();
+        // SAFETY: the reservation outlives both mappings. This untracked
+        // fixture permits two physical names for the second host page.
+        unsafe {
+            for page in [1, DATA_SLOTS] {
+                memory
+                    .partition
+                    .map_range(
+                        memory.backing.as_ptr().add(4096).cast(),
+                        4096,
+                        page as u64 * 4096,
+                        true,
+                        true,
+                    )
+                    .unwrap();
+            }
+        }
+        {
+            let access = memory.partition.access();
+            let ram = access.ram_for_execution();
+            let mut view = ram.translated(&mut cache);
+            for page in [0, 1, DATA_SLOTS as u64] {
+                view.read_value(
+                    &Translation {
+                        physical_page: page,
+                        ..key()
+                    },
+                    page * 4096,
+                    1,
+                )
+                .unwrap();
+                assert!(view.direct_page(page).is_some());
+                if page == 1 {
+                    assert!(view.direct_page(0).is_some());
+                }
+            }
+            assert!(view.direct_page(1).is_some());
+            assert!(view.direct_page(0).is_none());
+        }
+        memory.partition.unmap_range(4096, 4096).unwrap();
+        let access = memory.partition.access();
+        let ram = access.ram_for_execution();
+        let view = ram.translated(&mut cache);
+        assert!(view.direct_page(1).is_none());
+        assert!(view.direct_page(DATA_SLOTS as u64).is_none());
     }
 
     #[test]

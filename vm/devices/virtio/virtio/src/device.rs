@@ -28,7 +28,12 @@ pub type ServicingBinding = Box<
 pub enum TransferBinding {
     Unsupported,
     Reconstruct,
-    Export(ServicingBinding),
+    Export {
+        export: ServicingBinding,
+        /// If present, a live transfer must bind the same external object
+        /// before acquiring write ownership. Not a guest-visible identifier.
+        shared_writer: Option<Vec<u8>>,
+    },
 }
 
 /// The transport-visible presentation is checked even when the model has no

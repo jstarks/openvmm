@@ -289,6 +289,8 @@ pub struct SavedState {
     pub units: Vec<SavedStateUnit>,
     #[mesh(2)]
     construction: ConstructionState,
+    #[mesh(3)]
+    shared_writers: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 enum LoadState {
@@ -958,9 +960,7 @@ struct LoadedVmInner {
     chipset_cfg: BaseChipsetManifest,
     chipset_capabilities: VmChipsetCapabilities,
     dt_uarts: Vec<UartId>,
-    #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     virtio_mmio_region: MemoryRange,
-    #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     virtio_mmio_irq: u32,
     /// Resolved chipset MMIO ranges.
     chipset_mmio: ChipsetMmioRanges,
@@ -3312,7 +3312,8 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
-            if !matches!(saved_state, LoadState::Saved(_)) {
+            let live = !matches!(saved_state, LoadState::Saved(_));
+            if live {
                 this.check_live_devices()?;
             }
             if let Some(expected) = &cfg.construction {
@@ -3330,6 +3331,12 @@ impl InitializedVm {
                     state
                 }
             };
+            if live {
+                anyhow::ensure!(
+                    state.shared_writers == this.shared_writers(),
+                    "writable backing identity mismatch"
+                );
+            }
             this.restore(state)
                 .await
                 .context("loadedvm restore failed")?;
@@ -3561,6 +3568,11 @@ impl LoadedVmInner {
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {
                     Some(|rsdp_gpa: u64| {
                         acpi_builder.build_acpi_tables(rsdp_gpa, |dsdt| {
+                            add_virtio_mmio_to_dsdt(
+                                dsdt,
+                                self.virtio_mmio_region,
+                                self.virtio_mmio_irq + *vmm_core::emuplat::gic::SPI_RANGE.start(),
+                            );
                             add_devices_to_dsdt_arm64(
                                 dsdt,
                                 &self.chipset_capabilities,
@@ -3989,7 +4001,7 @@ impl LoadedVm {
                                 Ok(match binding {
                                     virtio::device::TransferBinding::Unsupported => anyhow::bail!("unsupported device {id}"),
                                     virtio::device::TransferBinding::Reconstruct => ServicingSlot::Reconstruct,
-                                    virtio::device::TransferBinding::Export(export) => ServicingSlot::Bound(export().with_context(|| format!("exporting {id}"))?),
+                                    virtio::device::TransferBinding::Export { export, .. } => ServicingSlot::Bound(export().with_context(|| format!("exporting {id}"))?),
                                 })
                             }).collect::<anyhow::Result<_>>()?,
                             construction: ProtobufMessage::new(self.inner.construction.clone()),
@@ -4513,6 +4525,20 @@ impl LoadedVm {
         Ok(ram.range)
     }
 
+    fn shared_writers(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+        self.inner
+            .mmio_bindings
+            .iter()
+            .filter_map(|(slot, binding)| match binding {
+                virtio::device::TransferBinding::Export {
+                    shared_writer: Some(id),
+                    ..
+                } => Some((slot.clone(), id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Saves the VM's processor, partition, and device state.
     ///
     /// TODO: virtio & vmbus unsupported.
@@ -4520,6 +4546,7 @@ impl LoadedVm {
         Ok(SavedState {
             units: self.state_units.save().await?,
             construction: self.inner.construction.clone(),
+            shared_writers: self.shared_writers(),
         })
     }
 
@@ -4667,21 +4694,7 @@ fn add_devices_to_dsdt_x64(
         }
     }
 
-    // Virtio-mmio devices are allocated as a contiguous region by the memory
-    // layout resolver. Each 4 KiB slot is a separate device.
-    for i in 0..virtio_mmio_region.page_count_4k() {
-        let slot_base = virtio_mmio_region.start() + i * HV_PAGE_SIZE;
-        let mut device = dsdt::Device::new(format!("\\_SB.VI{i:02}").as_bytes());
-        device.add_object(&dsdt::NamedString::new(b"_HID", b"LNRO0005"));
-        device.add_object(&dsdt::NamedInteger::new(b"_UID", i));
-        let mut crs = dsdt::CurrentResourceSettings::new();
-        crs.add_resource(&dsdt::QwordMemory::new(slot_base, HV_PAGE_SIZE));
-        let mut intr = dsdt::Interrupt::new(virtio_mmio_irq);
-        intr.is_edge_triggered = false;
-        crs.add_resource(&intr);
-        device.add_object(&crs);
-        dsdt.add_object(&device);
-    }
+    add_virtio_mmio_to_dsdt(dsdt, virtio_mmio_region, virtio_mmio_irq);
 
     // The chipset MMIO module or PCI bus describes the chipset low/high
     // MMIO regions to the guest. Either range may be empty (e.g. when
@@ -4700,6 +4713,24 @@ fn add_devices_to_dsdt_x64(
         );
     }
     dsdt.add_rtc();
+}
+
+fn add_virtio_mmio_to_dsdt(dsdt: &mut dsdt::Dsdt, region: MemoryRange, gsi: u32) {
+    for i in 0..region.page_count_4k() {
+        let mut device = dsdt::Device::new(format!("\\_SB.VI{i:02}").as_bytes());
+        device.add_object(&dsdt::NamedString::new(b"_HID", b"LNRO0005"));
+        device.add_object(&dsdt::NamedInteger::new(b"_UID", i));
+        let mut crs = dsdt::CurrentResourceSettings::new();
+        crs.add_resource(&dsdt::QwordMemory::new(
+            region.start() + i * HV_PAGE_SIZE,
+            HV_PAGE_SIZE,
+        ));
+        let mut intr = dsdt::Interrupt::new(gsi);
+        intr.is_shared = region.page_count_4k() > 1;
+        crs.add_resource(&intr);
+        device.add_object(&crs);
+        dsdt.add_object(&device);
+    }
 }
 
 #[cfg(guest_arch = "aarch64")]

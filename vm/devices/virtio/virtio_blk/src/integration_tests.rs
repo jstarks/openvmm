@@ -297,7 +297,7 @@ impl TestHarness {
     }
 
     /// Build a flush request descriptor chain.
-    fn post_flush_request(&mut self, head_desc: u16) {
+    fn post_flush_request(&mut self, head_desc: u16) -> u64 {
         let header_gpa = self.alloc_data(REQ_HEADER_SIZE);
         let status_gpa = self.alloc_data(1);
 
@@ -341,6 +341,7 @@ impl TestHarness {
             &mut self.avail_idx,
         );
         self.queue_event.signal();
+        status_gpa
     }
 
     /// Build a get-id request descriptor chain.
@@ -831,15 +832,45 @@ async fn teardown_releases_disk_backend(driver: DefaultDriver) {
 
 #[async_test]
 async fn stop_drains_one_accepted_write_exactly_once(driver: DefaultDriver) {
+    check_drain(&driver, false).await
+}
+
+#[async_test]
+async fn stop_drains_one_accepted_flush_exactly_once(driver: DefaultDriver) {
+    check_drain(&driver, true).await
+}
+
+async fn check_drain(driver: &DefaultDriver, flush: bool) {
     let (_device_thread, device_driver) = DefaultPool::spawn_on_thread("virtio-blk-drain");
     let write_calls = Arc::new(AtomicUsize::new(0));
     let (write_started, write_started_recv) = std::sync::mpsc::channel();
     let (release_write, release_write_recv) = async_channel::bounded(1);
-    let disk = HookDisk::new(64 * 1024, 512)
+    let shared = ram_disk(64 * 1024, false);
+    let committed = Arc::new(AtomicBool::new(false));
+    let target_disk = HookDisk::wrap(shared.clone())
+        .with_sync_hook({
+            let committed = committed.clone();
+            move |_| {
+                assert!(
+                    committed.load(Ordering::SeqCst),
+                    "destination issued pre-commit I/O"
+                );
+                Ok(())
+            }
+        })
+        .into_disk();
+    let mut target = TestHarness::new(driver, target_disk, false);
+    let disk = HookDisk::wrap(shared)
         .with_async_hook({
             let write_calls = write_calls.clone();
+            let committed = committed.clone();
             move |op| {
-                let hold = matches!(op, DiskOperation::Write { .. })
+                assert!(
+                    !committed.load(Ordering::SeqCst),
+                    "source issued post-commit I/O"
+                );
+                let hold = (matches!(op, DiskOperation::Write { .. }) && !flush
+                    || op == DiskOperation::SyncCache && flush)
                     && write_calls.fetch_add(1, Ordering::SeqCst) == 0;
                 if hold {
                     write_started.send(()).unwrap();
@@ -854,9 +885,13 @@ async fn stop_drains_one_accepted_write_exactly_once(driver: DefaultDriver) {
             }
         })
         .into_disk();
-    let mut harness = TestHarness::with_device_driver(&driver, &device_driver, disk, false, None);
+    let mut harness = TestHarness::with_device_driver(driver, &device_driver, disk, false, None);
     harness.enable().await;
-    let status_gpa = harness.post_write_request(0, 0, &[0xa5; 512]);
+    let status_gpa = if flush {
+        harness.post_flush_request(0)
+    } else {
+        harness.post_write_request(0, 0, &[0xa5; 512])
+    };
     write_started_recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
@@ -869,7 +904,7 @@ async fn stop_drains_one_accepted_write_exactly_once(driver: DefaultDriver) {
         );
         release_write.send(()).await.unwrap();
         with_timeout(
-            &driver,
+            driver,
             Duration::from_secs(5),
             "stop failed to drain accepted I/O",
             stop,
@@ -881,6 +916,22 @@ async fn stop_drains_one_accepted_write_exactly_once(driver: DefaultDriver) {
     assert_eq!(harness.read_status(status_gpa), VIRTIO_BLK_S_OK);
     assert_eq!(write_calls.load(Ordering::SeqCst), 1);
     assert_eq!(read_used_idx(&harness.mem, USED_ADDR), 1);
+    let cursor = stopped.unwrap();
+    assert_eq!((cursor.avail_index, cursor.used_index), (1, 1));
+    committed.store(true, Ordering::SeqCst);
+    let resources = harness.resources();
+    target
+        .device
+        .start_queue(0, resources, &VirtioDeviceFeatures::new(), Some(cursor))
+        .await
+        .unwrap();
+    let data = harness.post_read_request(3, 0, 512);
+    assert_eq!(harness.wait_for_used().await, (3, 513));
+    let mut actual = [0; 512];
+    harness.mem.read_at(data, &mut actual).unwrap();
+    assert_eq!(actual, [if flush { 0 } else { 0xa5 }; 512]);
+    target.device.stop_queue(0).await.unwrap();
+    assert_eq!(read_used_idx(&harness.mem, USED_ADDR), 2);
 }
 
 #[async_test]

@@ -1537,6 +1537,18 @@ impl VmService {
                 None
             };
             for device in devices_config.virtio_mmio {
+                if snapshot.is_some()
+                    && let Some(vmservice::virtio_device::Kind::Blk(blk)) = &device.kind
+                    && let Some(vmservice::disk_backend::Kind::File(file)) = blk
+                        .backend
+                        .as_ref()
+                        .and_then(|backend| backend.kind.as_ref())
+                {
+                    anyhow::ensure!(
+                        file.create_size_bytes.is_none(),
+                        "snapshot restore cannot create or truncate a block backing"
+                    );
+                }
                 let live = slots.as_mut().and_then(Iterator::next);
                 config.virtio_devices.push((
                     VirtioBus::Mmio,
@@ -3139,11 +3151,18 @@ fn portable_function_binding(function: &mut vmservice::VirtioDevice) -> Option<(
             else {
                 return None;
             };
-            if !blk.read_only || file.create_size_bytes.is_some() {
+            if file.create_size_bytes.is_some() {
                 return None;
             }
-            // Storage orchestration guarantees identical read-only data; a
-            // path and cache policy locate it, neither identifies the guest disk.
+            // Only raw files have a verified side-effect-free writable attach
+            // in this prototype. Container parsers may replay a journal on open.
+            if !blk.read_only
+                && Path::new(&file.path).extension().and_then(|e| e.to_str()) != Some("raw")
+            {
+                return None;
+            }
+            // For writable disks, the backend must also identify the same
+            // shared object. A path is not an ownership or identity token.
             file.path.clear();
             file.direct = false;
         }

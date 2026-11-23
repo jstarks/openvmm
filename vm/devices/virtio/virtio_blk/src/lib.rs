@@ -65,6 +65,7 @@ pub struct VirtioBlkDevice {
     config: VirtioBlkConfig,
     configured_id: Option<[u8; VIRTIO_BLK_ID_BYTES]>,
     options: VirtioBlkOptions,
+    writer_id: Option<[u8; 24]>,
 }
 
 #[derive(mesh::payload::Protobuf)]
@@ -318,6 +319,17 @@ impl VirtioBlkDevice {
             "virtio-blk I/O depth must be nonzero"
         );
         let serial = serial.map(parse_serial).transpose()?;
+        let writer_id = if read_only {
+            None
+        } else {
+            match disk.shared_writer_id() {
+                Ok(id) => id,
+                Err(error) => {
+                    tracelimit::warn_ratelimited!(%error, "disk backing identity unavailable; writable transfer disabled");
+                    None
+                }
+            }
+        };
         let sector_count = disk.sector_count();
         let sector_size = disk.sector_size();
         let physical_sector_size = disk.physical_sector_size();
@@ -402,6 +414,7 @@ impl VirtioBlkDevice {
             supports_discard,
             config,
             configured_id: serial,
+            writer_id,
             options,
         })
     }
@@ -475,22 +488,25 @@ impl VirtioDevice for VirtioBlkDevice {
     }
 
     fn transfer_binding(&self) -> virtio::device::TransferBinding {
-        if !self.read_only {
+        if !self.read_only && self.writer_id.is_none() {
             return virtio::device::TransferBinding::Unsupported;
         }
         let disk = self.workers[0].worker.task().disk.clone();
         let options = self.options;
         let read_only = self.read_only;
-        virtio::device::TransferBinding::Export(Box::new(move || {
-            Ok(vm_resource::Resource::new(
-                virtio_resources::blk::VirtioBlkHandle {
-                    disk: disk.servicing_resource()?,
-                    read_only,
-                    options,
-                    serial: None,
-                },
-            ))
-        }))
+        virtio::device::TransferBinding::Export {
+            shared_writer: self.writer_id.map(|id| id.to_vec()),
+            export: Box::new(move || {
+                Ok(vm_resource::Resource::new(
+                    virtio_resources::blk::VirtioBlkHandle {
+                        disk: disk.servicing_resource()?,
+                        read_only,
+                        options,
+                        serial: None,
+                    },
+                ))
+            }),
+        }
     }
 
     fn traits(&self) -> DeviceTraits {

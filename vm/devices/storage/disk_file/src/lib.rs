@@ -170,6 +170,14 @@ impl FileDisk {
 }
 
 impl DiskIo for FileDisk {
+    #[cfg(windows)]
+    fn shared_writer_id(&self) -> std::io::Result<Option<[u8; 24]>> {
+        let file = pal::windows::fs::relative::file_identity(&self.file)?;
+        let mut id = [0; 24];
+        id[..8].copy_from_slice(&file.volume_serial_number.to_le_bytes());
+        id[8..].copy_from_slice(&file.file_id);
+        Ok(Some(id))
+    }
     fn servicing_resource(&self) -> std::io::Result<vm_resource::Resource<DiskHandleKind>> {
         // FileDiskHandle is the raw-file resolver. A wrapper that supplies
         // custom metadata (e.g. a fixed VHD hiding its footer) must export

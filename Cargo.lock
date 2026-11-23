@@ -1643,6 +1643,7 @@ dependencies = [
  "disk_backend_resources",
  "guestmem",
  "inspect",
+ "pal",
  "pal_async",
  "scsi_buffers",
  "storage_tests",

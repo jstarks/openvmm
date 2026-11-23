@@ -17,6 +17,9 @@ inspect = { workspace = true, features = ["filepath"] }
 blocking.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+pal.workspace = true
+
 [dev-dependencies]
 pal_async.workspace = true
 storage_tests.workspace = true

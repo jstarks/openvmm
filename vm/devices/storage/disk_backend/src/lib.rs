@@ -159,6 +159,12 @@ pub enum MediumErrorDetails {
 /// to do so. Note that this says nothing about how large the disk is, so it is
 /// not a substitute for the range check above.
 pub trait DiskIo: 'static + Send + Sync + Inspect {
+    /// For same-host transfers, identify the actual shared writable backing,
+    /// not a copyable on-disk guest identifier. Opt in only when opening a
+    /// second stopped attachment has no write side effects.
+    fn shared_writer_id(&self) -> std::io::Result<Option<[u8; 24]>> {
+        Ok(None)
+    }
     /// Duplicate the open backing for a local process replacement. Do not
     /// reopen a pathname or release the source's ownership. A backend with
     /// additional non-reconstructible state must leave this unsupported.
@@ -301,6 +307,10 @@ pub trait DiskIo: 'static + Send + Sync + Inspect {
 pub struct Disk(#[inspect(flatten)] Arc<DiskInner>);
 
 impl Disk {
+    /// See [`DiskIo::shared_writer_id`].
+    pub fn shared_writer_id(&self) -> std::io::Result<Option<[u8; 24]>> {
+        self.0.disk.shared_writer_id()
+    }
     /// Export a resource that resolves to the same live storage.
     pub fn servicing_resource(
         &self,
@@ -587,6 +597,7 @@ const ASYNC_DISK_STACK_SIZE: usize = 1256;
 type IoFuture<'a> = StackFuture<'a, Result<(), DiskError>, { ASYNC_DISK_STACK_SIZE }>;
 
 trait DynDisk: Send + Sync + Inspect {
+    fn shared_writer_id(&self) -> std::io::Result<Option<[u8; 24]>>;
     fn servicing_resource(
         &self,
     ) -> std::io::Result<vm_resource::Resource<vm_resource::kind::DiskHandleKind>>;
@@ -616,6 +627,9 @@ trait DynDisk: Send + Sync + Inspect {
 }
 
 impl<T: DiskIo> DynDisk for T {
+    fn shared_writer_id(&self) -> std::io::Result<Option<[u8; 24]>> {
+        DiskIo::shared_writer_id(self)
+    }
     fn servicing_resource(
         &self,
     ) -> std::io::Result<vm_resource::Resource<vm_resource::kind::DiskHandleKind>> {

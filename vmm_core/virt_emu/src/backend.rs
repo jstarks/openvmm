@@ -207,7 +207,7 @@ struct VpState {
     first_apic_decode: Option<DecodeDiagnostics>,
     cpu: CpuLifecycle,
     started: bool,
-    progress: CompletedBatchProgress,
+    progress: Option<CompletedBatchProgress>,
     code_preparation: CodePreparationDiagnostics,
     checkpoint: Option<u64>,
     checkpoint_guest: bool,
@@ -276,7 +276,7 @@ pub struct ApicDiagnostics {
 }
 
 impl EmuProcessor<'_> {
-    /// Enables bounded guest-PC sampling before execution, without changing guest state.
+    /// Enables bounded guest-PC sampling for `run_vp_counted`, without changing guest state.
     #[cfg(feature = "perf")]
     pub fn enable_execution_profile(&mut self) -> Result<(), Error> {
         if self.state.started {
@@ -312,7 +312,7 @@ impl EmuProcessor<'_> {
         Ok(())
     }
 
-    /// Returns retirements performed by the selected native executor.
+    /// Native instrumentation counters, not total guest progress after uncounted execution.
     #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
     pub fn native_diagnostics(&self) -> Result<x86_system::execute::native::Diagnostics, Error> {
         let CpuLifecycle::Ready(core) = &self.state.cpu else {
@@ -321,7 +321,8 @@ impl EmuProcessor<'_> {
         Ok(core.native_diagnostics())
     }
 
-    /// Returns aggregate IR entry lengths, retirements and precise exit reasons.
+    /// IR instrumentation counters. Uncounted fast entries do not contribute
+    /// to the normal entry/retirement totals.
     pub fn execution_diagnostics(
         &self,
     ) -> Result<x86_system::execute::compiled::ExecutionDiagnostics, Error> {
@@ -409,8 +410,9 @@ impl EmuProcessor<'_> {
         Ok(core.svm_exit_stopped())
     }
 
-    /// Transport failures can leave additional, unreported partial progress.
-    pub fn completed_batch_progress(&self) -> CompletedBatchProgress {
+    /// Exact totals are unavailable once the VP has run uncounted. Transport
+    /// failures can leave additional, unreported partial progress.
+    pub fn completed_batch_progress(&self) -> Option<CompletedBatchProgress> {
         self.state.progress
     }
 }
@@ -578,7 +580,7 @@ impl ProtoPartition for EmuProtoPartition {
                     ..SystemState::empty()
                 })),
                 started: false,
-                progress: CompletedBatchProgress::default(),
+                progress: Some(CompletedBatchProgress::default()),
                 code_preparation: CodePreparationDiagnostics::default(),
                 #[cfg(feature = "perf")]
                 profile: None,
@@ -771,24 +773,17 @@ impl inspect::InspectMut for EmuProcessor<'_> {
     }
 }
 
-impl Processor for EmuProcessor<'_> {
-    type StateAccess<'a>
-        = EmuStateAccess<'a>
-    where
-        Self: 'a;
-
-    fn set_debug_state(
+impl EmuProcessor<'_> {
+    /// Run the same VP loop with exact retirement and event accounting.
+    pub async fn run_vp_counted(
         &mut self,
-        vtl: Vtl,
-        state: Option<&virt::x86::DebugState>,
-    ) -> Result<(), Error> {
-        if vtl != Vtl::Vtl0 || state.is_some() {
-            return Err(Error::Profile("debug state/VTL"));
-        }
-        Ok(())
+        stop: StopVp<'_>,
+        dev: &impl CpuIo,
+    ) -> Result<Infallible, VpHaltReason> {
+        self.run_vp_inner::<true>(stop, dev).await
     }
 
-    async fn run_vp(
+    async fn run_vp_inner<const COUNTED: bool>(
         &mut self,
         stop: StopVp<'_>,
         dev: &impl CpuIo,
@@ -797,6 +792,18 @@ impl Processor for EmuProcessor<'_> {
         let mut stop = stop;
         if self.state.io_active {
             return Err(dev.fatal_error(Box::new(Error::CancelledIo)));
+        }
+        if COUNTED && self.state.progress.is_none() {
+            return Err(dev.fatal_error(Box::new(Error::Profile("incomplete counted VP history"))));
+        }
+        if !COUNTED {
+            #[cfg(feature = "perf")]
+            if self.state.profile.is_some() {
+                return Err(dev.fatal_error(Box::new(Error::Profile(
+                    "guest-PC profiling requires counted execution",
+                ))));
+            }
+            self.state.progress = None;
         }
         self.state.started = true;
         #[cfg(test)]
@@ -863,31 +870,40 @@ impl Processor for EmuProcessor<'_> {
                                 .any(|range| range.start() <= base && end <= range.end())
                         })
                 };
-                #[cfg(not(test))]
-                let result = core.run_fast_with_ram_pages(&ram, is_mmio, is_ram_page);
-                #[cfg(test)]
-                let result = if self.state.observed {
-                    core.run(
-                        &ram,
-                        strudel::RunBudget {
-                            memory_effects: 64,
-                            steps: 64,
-                        },
-                        is_mmio,
-                        |boundary| {
-                            !self.state.boundary_in_batch
-                                || boundary.last_lapic_delivery().is_some()
-                                || (boundary.at_instruction_boundary()
-                                    && checkpoint == Some(boundary.cpu().rip)
-                                    && (!checkpoint_guest || boundary.guest_mode()))
-                        },
-                    )
+                let counted =
+                    |batch: strudel::Batch| (batch.stop, Some((batch.retired, batch.delivered)));
+                if !COUNTED {
+                    core.run_fast_uncounted_with_ram_pages(&ram, is_mmio, is_ram_page)
+                        .map(|stop| (stop, None))
                 } else {
+                    #[cfg(test)]
+                    if self.state.observed {
+                        core.run(
+                            &ram,
+                            strudel::RunBudget {
+                                memory_effects: 64,
+                                steps: 64,
+                            },
+                            is_mmio,
+                            |boundary| {
+                                !self.state.boundary_in_batch
+                                    || boundary.last_lapic_delivery().is_some()
+                                    || (boundary.at_instruction_boundary()
+                                        && checkpoint == Some(boundary.cpu().rip)
+                                        && (!checkpoint_guest || boundary.guest_mode()))
+                            },
+                        )
+                        .map(counted)
+                    } else {
+                        core.run_fast_with_ram_pages(&ram, is_mmio, is_ram_page)
+                            .map(counted)
+                    }
+                    #[cfg(not(test))]
                     core.run_fast_with_ram_pages(&ram, is_mmio, is_ram_page)
-                };
-                result
+                        .map(counted)
+                }
             };
-            let batch = match result {
+            let (batch_stop, counts) = match result {
                 Ok(batch) => batch,
                 Err(RunError::DecodeCompletion(_)) => {
                     return Err(dev.fatal_error(Box::new(Error::DecodeCompletion)));
@@ -900,17 +916,20 @@ impl Processor for EmuProcessor<'_> {
                 }
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Memory(error)))),
             };
-            let Some(retired) = self.state.progress.retired.checked_add(batch.retired) else {
-                return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
-            };
-            let Some(delivered) = self.state.progress.delivered.checked_add(batch.delivered) else {
-                return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
-            };
-            self.state.progress = CompletedBatchProgress {
-                core_returns: self.state.progress.core_returns.wrapping_add(1),
-                retired,
-                delivered,
-            };
+            if let Some((retired, delivered)) = counts {
+                let progress = self.state.progress.as_mut().expect("counted VP history");
+                let Some(retired) = progress.retired.checked_add(retired) else {
+                    return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+                };
+                let Some(delivered) = progress.delivered.checked_add(delivered) else {
+                    return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
+                };
+                *progress = CompletedBatchProgress {
+                    core_returns: progress.core_returns.wrapping_add(1),
+                    retired,
+                    delivered,
+                };
+            }
             let preparation = match self.ram.prepare_code_pages(&self.writes) {
                 Ok(preparation) => preparation,
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Ram(error)))),
@@ -936,11 +955,14 @@ impl Processor for EmuProcessor<'_> {
                 unavailable,
             };
             #[cfg(feature = "perf")]
-            if let Some(profile) = &mut self.state.profile {
-                profile.record(retired, delivered, || core.cpu().rip);
+            if COUNTED
+                && let (Some(profile), Some(progress)) =
+                    (&mut self.state.profile, self.state.progress)
+            {
+                profile.record(progress.retired, progress.delivered, || core.cpu().rip);
             }
             #[cfg(test)]
-            if self.state.observed {
+            if COUNTED && self.state.observed {
                 observed_batches += 1;
                 if observed_batches == 64 {
                     self.control.yield_requested.request_yield();
@@ -953,13 +975,13 @@ impl Processor for EmuProcessor<'_> {
                     return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
                 };
                 *slot = count;
-                self.state.first_apic_retired.get_or_insert(retired);
                 if self.state.first_apic_time.is_none() {
+                    self.state.first_apic_retired = self.state.progress.map(|p| p.retired);
                     self.state.first_apic_time = Some(self.clock.now().as_100ns());
                     self.state.first_apic_decode = Some(core.decode_diagnostics());
                 }
             }
-            match batch.stop {
+            match batch_stop {
                 BatchStop::ControlIo { sequence, access } => {
                     let Some(mut lapic) = core.lapic_access() else {
                         return Err(
@@ -1102,7 +1124,7 @@ impl Processor for EmuProcessor<'_> {
                 BatchStop::Budget | BatchStop::Yield => {}
                 BatchStop::Waiting => {
                     #[cfg(test)]
-                    if self.state.observed {
+                    if COUNTED && self.state.observed {
                         stop.until_stop(std::future::poll_fn(|cx| {
                             self.control.remote.poll_wake(cx)
                         }))
@@ -1120,6 +1142,32 @@ impl Processor for EmuProcessor<'_> {
                 }
             }
         }
+    }
+}
+
+impl Processor for EmuProcessor<'_> {
+    type StateAccess<'a>
+        = EmuStateAccess<'a>
+    where
+        Self: 'a;
+
+    fn set_debug_state(
+        &mut self,
+        vtl: Vtl,
+        state: Option<&virt::x86::DebugState>,
+    ) -> Result<(), Error> {
+        if vtl != Vtl::Vtl0 || state.is_some() {
+            return Err(Error::Profile("debug state/VTL"));
+        }
+        Ok(())
+    }
+
+    async fn run_vp(
+        &mut self,
+        stop: StopVp<'_>,
+        dev: &impl CpuIo,
+    ) -> Result<Infallible, VpHaltReason> {
+        self.run_vp_inner::<false>(stop, dev).await
     }
 
     fn flush_async_requests(&mut self) {

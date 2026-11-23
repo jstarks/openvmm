@@ -154,15 +154,17 @@ impl CpuIo for NoDevices {
 async fn real_backend_stores_and_atomics_use_direct_mappings_not_guest_memory(
     driver: DefaultDriver,
 ) {
-    run_transport_fixture(&driver, true).await;
+    run_transport_fixture(&driver, true, true).await;
+    run_transport_fixture(&driver, true, false).await;
 }
 
 #[async_test]
 async fn guest_memory_without_partition_mapping_does_not_back_cpu_ram(driver: DefaultDriver) {
-    run_transport_fixture(&driver, false).await;
+    run_transport_fixture(&driver, false, true).await;
+    run_transport_fixture(&driver, false, false).await;
 }
 
-async fn run_transport_fixture(driver: &DefaultDriver, mapped: bool) {
+async fn run_transport_fixture(driver: &DefaultDriver, mapped: bool, counted: bool) {
     let program = [
         0xc6, 0x47, 0x01, 0x11, // mov byte [rdi+1],11h
         0x66, 0xc7, 0x47, 0x02, 0x33, 0x22, // mov word [rdi+2],2233h
@@ -252,10 +254,12 @@ async fn run_transport_fixture(driver: &DefaultDriver, mapped: bool) {
         .unwrap();
     let devices = NoDevices::default();
     let stop = StopVpSource::new();
-    assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
-        Err(VpHaltReason::PowerOff)
-    ));
+    let result = if counted {
+        vp.run_vp_counted(stop.checker(), &devices).await
+    } else {
+        vp.run_vp(stop.checker(), &devices).await
+    };
+    assert!(matches!(result, Err(VpHaltReason::PowerOff)));
     assert_eq!(devices.0.lock().len(), 1);
     assert_eq!(backing.guest_memory_faults.load(Ordering::SeqCst), 2);
     if !mapped {
@@ -265,7 +269,10 @@ async fn run_transport_fixture(driver: &DefaultDriver, mapped: bool) {
             devices.0.lock()
         );
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), initial);
-        assert_eq!(vp.completed_batch_progress().retired, 0);
+        assert_eq!(
+            vp.completed_batch_progress().map(|p| p.retired),
+            counted.then_some(0)
+        );
         assert!(
             backing.memory[DATA as usize..DATA as usize + 16]
                 .iter()
@@ -295,5 +302,8 @@ async fn run_transport_fixture(driver: &DefaultDriver, mapped: bool) {
         vp.access_state(Vtl::Vtl0).registers().unwrap(),
         expected_registers
     );
-    assert_eq!(vp.completed_batch_progress().retired, 9);
+    assert_eq!(
+        vp.completed_batch_progress().map(|p| p.retired),
+        counted.then_some(9)
+    );
 }

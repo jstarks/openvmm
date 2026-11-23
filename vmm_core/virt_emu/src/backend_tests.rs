@@ -246,7 +246,7 @@ async fn cpu_stores_and_atomics_invalidate_physical_watches_through_virtual_alia
             let devices = Devices::new();
             let stop = StopVpSource::new();
             assert!(matches!(
-                vp.run_vp(stop.checker(), &devices).await,
+                vp.run_vp_counted(stop.checker(), &devices).await,
                 Err(VpHaltReason::PowerOff)
             ));
             let mut expected = initial;
@@ -254,7 +254,7 @@ async fn cpu_stores_and_atomics_invalidate_physical_watches_through_virtual_alia
             expected.rflags = flags;
             expected.rip = CODE + program.len() as u64;
             assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-            assert_eq!(vp.completed_batch_progress().retired, 1);
+            assert_eq!(vp.completed_batch_progress().unwrap().retired, 1);
             assert!(!token.is_valid());
             assert_eq!(*token.value(), 7u64.to_le_bytes());
             assert!(neighbor.is_valid());
@@ -304,14 +304,14 @@ async fn self_modifying_code_invalidates_receipts_without_restarting_the_store(
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let mut expected = initial;
     expected.rax = 42;
     expected.rip = CODE + program.len() as u64;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-    assert_eq!(vp.completed_batch_progress().retired, 3);
+    assert_eq!(vp.completed_batch_progress().unwrap().retired, 3);
     assert!(!token.is_valid());
     assert_eq!(token.value()[3], 0xf4);
     assert!(next.is_valid());
@@ -362,7 +362,7 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         let stop = StopVpSource::new();
         let start = std::time::Instant::now();
         assert!(matches!(
-            vp.run_vp(stop.checker(), &devices).await,
+            vp.run_vp_counted(stop.checker(), &devices).await,
             Err(VpHaltReason::PowerOff)
         ));
         let seconds = start.elapsed().as_secs_f64();
@@ -373,7 +373,7 @@ async fn real_vp_decode_receipts_match_uncached_execution_and_measure_hot_loop(
         expected.rip = CODE + code.len() as u64;
         expected.rflags = (initial.rflags & !0x108d5) | 0x44;
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-        assert_eq!(vp.completed_batch_progress().retired, retired);
+        assert_eq!(vp.completed_batch_progress().unwrap().retired, retired);
         let decode = vp.decode_diagnostics().unwrap().0;
         if bypass {
             assert_eq!(decode.fetch_hits, 0);
@@ -415,7 +415,7 @@ async fn warmed_no_refetch_execution_observes_external_code_replacement(driver: 
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let mut expected = initial;
@@ -433,7 +433,7 @@ async fn warmed_no_refetch_execution_observes_external_code_replacement(driver: 
     memory.write_at(end, &jump).unwrap();
     vp.set_execution_checkpoint(Some(CODE)).unwrap();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap().rip, CODE);
@@ -441,13 +441,13 @@ async fn warmed_no_refetch_execution_observes_external_code_replacement(driver: 
     memory.write_at(CODE + 8, &[2]).unwrap();
     vp.set_execution_checkpoint(Some(end)).unwrap();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     expected.rax = u64::from(iterations) * 3;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
     assert_eq!(
-        vp.completed_batch_progress().retired,
+        vp.completed_batch_progress().unwrap().retired,
         2 * (u64::from(iterations) * 3 + 1) + 1
     );
     let after = vp.decode_diagnostics().unwrap().0;
@@ -483,7 +483,7 @@ async fn unlocked_gs_byte_cmpxchg_preserves_the_percpu_base_and_rex_byte_source(
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let mut expected = initial;
@@ -492,7 +492,7 @@ async fn unlocked_gs_byte_cmpxchg_preserves_the_percpu_base_and_rex_byte_source(
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
     assert_eq!(memory.read_plain::<u8>(0x16008).unwrap(), 0x22);
     assert_eq!(memory.read_plain::<u8>(8).unwrap(), bytes[8]);
-    assert_eq!(vp.completed_batch_progress().retired, 1);
+    assert_eq!(vp.completed_batch_progress().unwrap().retired, 1);
 }
 
 #[async_test]
@@ -520,7 +520,7 @@ async fn three_byte_memory_mov_uses_the_general_two_page_operand_path(driver: De
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let mut expected = initial;
@@ -532,7 +532,7 @@ async fn three_byte_memory_mov_uses_the_general_two_page_operand_path(driver: De
     assert_eq!(memory.read_plain::<u64>(source as u64).unwrap(), VALUE);
     assert_eq!(devices.reads.load(Ordering::SeqCst), 0);
     assert_eq!(devices.writes.load(Ordering::SeqCst), 0);
-    assert_eq!(vp.completed_batch_progress().retired, 2);
+    assert_eq!(vp.completed_batch_progress().unwrap().retired, 2);
 }
 
 #[async_test]
@@ -612,7 +612,7 @@ async fn rdtsc_and_existing_pm_timer_use_the_same_stopped_clock(driver: DefaultD
         vp.set_execution_checkpoint(Some(target)).unwrap();
         let stop = StopVpSource::new();
         assert!(matches!(
-            vp.run_vp(stop.checker(), &devices).await,
+            vp.run_vp_counted(stop.checker(), &devices).await,
             Err(VpHaltReason::PowerOff)
         ));
         let ticks = now.wrapping_mul(100);
@@ -626,7 +626,7 @@ async fn rdtsc_and_existing_pm_timer_use_the_same_stopped_clock(driver: DefaultD
         expected.rflags &= !0x10000;
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
         assert_eq!(devices.reads.load(Ordering::SeqCst), 1);
-        assert_eq!(vp.completed_batch_progress().retired, 7);
+        assert_eq!(vp.completed_batch_progress().unwrap().retired, 7);
         assert_eq!(devices.faults.lock().len(), 1);
         assert!(devices.faults.lock()[0].contains("checkpoint"));
     }
@@ -674,7 +674,7 @@ async fn scalar_port_io_uses_exact_width_and_retains_completed_output_across_sto
             let mut devices = Devices::new();
             devices.port_io = true;
             let stop = StopVpSource::new();
-            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
             park(run.as_mut());
             assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
             assert_eq!(devices.writes_done.load(Ordering::SeqCst), 0);
@@ -684,11 +684,11 @@ async fn scalar_port_io_uses_exact_width_and_retains_completed_output_across_sto
             assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
             drop(run);
             assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), initial);
-            assert_eq!(vp.completed_batch_progress().retired, 0);
+            assert_eq!(vp.completed_batch_progress().unwrap().retired, 0);
             let mut before = vec![0; bytes.len()];
             memory.read_at(0, &mut before).unwrap();
             let stop = StopVpSource::new();
-            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
             assert!(matches!(
                 ready_after_yields(run.as_mut()),
                 Err(VpHaltReason::PowerOff)
@@ -706,8 +706,8 @@ async fn scalar_port_io_uses_exact_width_and_retains_completed_output_across_sto
             assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
             assert_eq!(
                 (
-                    vp.completed_batch_progress().retired,
-                    vp.completed_batch_progress().delivered
+                    vp.completed_batch_progress().unwrap().retired,
+                    vp.completed_batch_progress().unwrap().delivered
                 ),
                 (2, 0)
             );
@@ -896,7 +896,7 @@ async fn lowering_cr8_delivers_masked_self_ipi_before_the_following_instruction(
     let stop = StopVpSource::new();
     let mut devices = Devices::new();
     devices.apic = true;
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     let mut timeout = pal_async::timer::PolledTimer::new(&driver);
     match futures::future::select(
         run.as_mut(),
@@ -979,7 +979,7 @@ async fn owned_lapic_timer_interrupts_running_guest_independently(_driver: Defau
             VpIndex::new(0),
             futures::future::select(
                 Box::pin(timeout.sleep(std::time::Duration::from_secs(5))),
-                Box::pin(vp.run_vp(stop.checker(), &devices)),
+                Box::pin(vp.run_vp_counted(stop.checker(), &devices)),
             ),
         );
         assert!(matches!(
@@ -996,7 +996,7 @@ async fn owned_lapic_timer_interrupts_running_guest_independently(_driver: Defau
     assert_eq!(apic.delivered, [(224, 1)]);
     assert_eq!(
         apic.first_interrupt_retired.unwrap() + 1,
-        vp.completed_batch_progress().retired
+        vp.completed_batch_progress().unwrap().retired
     );
     assert!(devices.mmio.lock().is_empty());
 }
@@ -1072,7 +1072,7 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
             VpIndex::new(0),
             futures::future::select(
                 Box::pin(timeout.sleep(std::time::Duration::from_secs(5))),
-                Box::pin(vp.run_vp(stop.checker(), &devices)),
+                Box::pin(vp.run_vp_counted(stop.checker(), &devices)),
             ),
         ) {
             futures::future::Either::Right((result, _)) => result,
@@ -1088,7 +1088,7 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
         (current.rip, current.r10, current.rbx, current.cr8),
         (after_timer, 1, 5, 0)
     );
-    assert_eq!(vp.completed_batch_progress().delivered, 1);
+    assert_eq!(vp.completed_batch_progress().unwrap().delivered, 1);
     assert!(
         devices.eois.lock().is_empty(),
         "edge timer EOI must not be broadcast"
@@ -1120,11 +1120,11 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     }
     devices.ioapic = Some(ioapic);
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap().r10, 3);
-    assert_eq!(vp.completed_batch_progress().delivered, 3);
+    assert_eq!(vp.completed_batch_progress().unwrap().delivered, 3);
     assert_eq!(&*devices.eois.lock(), &[64, 64]);
     assert_eq!(
         vp.apic_diagnostics().unwrap().delivered,
@@ -1132,7 +1132,7 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     );
     vp.set_execution_checkpoint(Some(after_rearm)).unwrap();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     keeper.start().await;
@@ -1141,7 +1141,7 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
         .await;
     vp.set_execution_checkpoint(Some(after_irr)).unwrap();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let current = vp.access_state(Vtl::Vtl0).registers().unwrap();
@@ -1150,10 +1150,10 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
         "IRR read must observe the expired timer with IF clear"
     );
     assert_eq!(current.rflags & 0x200, 0);
-    assert_eq!(vp.completed_batch_progress().delivered, 3);
+    assert_eq!(vp.completed_batch_progress().unwrap().delivered, 3);
     vp.set_execution_checkpoint(Some(after_unmask)).unwrap();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     keeper.stop().await;
@@ -1191,7 +1191,7 @@ async fn descriptor_entry_updates_real_vp_state_and_preserves_store_neighbors(
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -1210,7 +1210,7 @@ async fn descriptor_entry_updates_real_vp_state_and_preserves_store_neighbors(
         0x001f334455667788
     );
     assert_eq!(memory.read_plain::<u64>(0x18010).unwrap(), 0x9000);
-    let progress = vp.completed_batch_progress();
+    let progress = vp.completed_batch_progress().unwrap();
     assert_eq!((progress.retired, progress.delivered), (10, 0));
     assert!(devices.faults.lock().is_empty());
 }
@@ -1243,7 +1243,7 @@ async fn loaded_nondefault_ss_iret_restores_the_actual_frame_and_segment_state(
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -1255,7 +1255,7 @@ async fn loaded_nondefault_ss_iret_restores_the_actual_frame_and_segment_state(
     expected.rsp = 0x18040;
     expected.rflags &= !0x10000;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-    let progress = vp.completed_batch_progress();
+    let progress = vp.completed_batch_progress().unwrap();
     assert_eq!((progress.retired, progress.delivered), (4, 0));
     assert!(devices.faults.lock().is_empty());
 }
@@ -1297,7 +1297,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
         let devices = Devices::new();
         let stop = StopVpSource::new();
         if supported_msr {
-            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
             park(run.as_mut());
             stop.stop();
             assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -1305,7 +1305,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
             assert!(devices.faults.lock().is_empty());
         } else {
             assert!(matches!(
-                vp.run_vp(stop.checker(), &devices).await,
+                vp.run_vp_counted(stop.checker(), &devices).await,
                 Err(VpHaltReason::PowerOff)
             ));
             assert_eq!(devices.faults.lock().len(), 1);
@@ -1336,7 +1336,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
             memory.read_plain::<u64>(data + 0x40).unwrap(),
             0xffff_ffff_ffff_ff00
         );
-        let progress = vp.completed_batch_progress();
+        let progress = vp.completed_batch_progress().unwrap();
         assert_eq!(
             (progress.retired, progress.delivered),
             (if supported_msr { 13 } else { 11 }, 0)
@@ -1368,7 +1368,7 @@ async fn locked_compare_exchange_uses_actual_vp_state_and_atomic_ram(driver: Def
         let devices = Devices::new();
         let stop = StopVpSource::new();
         assert!(matches!(
-            vp.run_vp(stop.checker(), &devices).await,
+            vp.run_vp_counted(stop.checker(), &devices).await,
             Err(VpHaltReason::PowerOff)
         ));
         assert_eq!(devices.faults.lock().len(), 1);
@@ -1384,7 +1384,7 @@ async fn locked_compare_exchange_uses_actual_vp_state_and_atomic_ram(driver: Def
             memory.read_plain::<u64>(0x16000).unwrap(),
             if matched { 0x22 } else { 0x33 }
         );
-        let progress = vp.completed_batch_progress();
+        let progress = vp.completed_batch_progress().unwrap();
         assert_eq!((progress.retired, progress.delivered), (1, 0));
     }
 }
@@ -1412,7 +1412,7 @@ async fn locked_integer_modify_preserves_neighbor_bits_and_carry_through_the_rea
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     assert_eq!(devices.faults.lock().len(), 1);
@@ -1425,7 +1425,7 @@ async fn locked_integer_modify_preserves_neighbor_bits_and_carry_through_the_rea
         memory.read_plain::<u64>(0x16000).unwrap(),
         0xaabb_ccdd_0000_0000
     );
-    let progress = vp.completed_batch_progress();
+    let progress = vp.completed_batch_progress().unwrap();
     assert_eq!((progress.retired, progress.delivered), (1, 0));
 }
 
@@ -1453,7 +1453,7 @@ async fn locked_bit_strings_use_signed_word_addresses_through_the_real_vp(driver
             let devices = Devices::new();
             let stop = StopVpSource::new();
             assert!(matches!(
-                vp.run_vp(stop.checker(), &devices).await,
+                vp.run_vp_counted(stop.checker(), &devices).await,
                 Err(VpHaltReason::PowerOff)
             ));
             assert_eq!(devices.faults.lock().len(), 1);
@@ -1476,7 +1476,7 @@ async fn locked_bit_strings_use_signed_word_addresses_through_the_real_vp(driver
                 };
                 assert_eq!(memory.read_plain::<u64>(address).unwrap(), expected);
             }
-            let progress = vp.completed_batch_progress();
+            let progress = vp.completed_batch_progress().unwrap();
             assert_eq!((progress.retired, progress.delivered), (1, 0));
         }
     }
@@ -1514,7 +1514,7 @@ async fn narrow_cross_beat_memmove_and_scan_aliases_preserve_real_vp_state_and_n
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     assert_eq!(devices.faults.lock().len(), 1);
@@ -1531,7 +1531,7 @@ async fn narrow_cross_beat_memmove_and_scan_aliases_preserve_real_vp_state_and_n
     let mut expected = [0xa5; 16];
     expected[5..9].copy_from_slice(&[5, 6, 7, 8]);
     assert_eq!(actual, expected);
-    let progress = vp.completed_batch_progress();
+    let progress = vp.completed_batch_progress().unwrap();
     assert_eq!((progress.retired, progress.delivered), (4, 0));
 }
 
@@ -1567,7 +1567,7 @@ async fn unavailable_prediction_command_faults_and_guest_fixup_preserves_state(
             let devices = Devices::new();
             let stop = StopVpSource::new();
             assert!(matches!(
-                vp.run_vp(stop.checker(), &devices).await,
+                vp.run_vp_counted(stop.checker(), &devices).await,
                 Err(VpHaltReason::PowerOff)
             ));
             assert_eq!(devices.faults.lock().len(), 1);
@@ -1579,7 +1579,7 @@ async fn unavailable_prediction_command_faults_and_guest_fixup_preserves_state(
             let frame = (initial.rsp & !15) - 48;
             assert_eq!(memory.read_plain::<u64>(frame).unwrap(), 0);
             assert_eq!(memory.read_plain::<u64>(frame + 8).unwrap(), CODE + 2);
-            let progress = vp.completed_batch_progress();
+            let progress = vp.completed_batch_progress().unwrap();
             assert_eq!((progress.retired, progress.delivered), (3, 1));
         }
     }
@@ -1615,7 +1615,7 @@ async fn selector_reads_use_loaded_images_and_exact_store_width(driver: DefaultD
         let devices = Devices::new();
         let stop = StopVpSource::new();
         assert!(matches!(
-            vp.run_vp(stop.checker(), &devices).await,
+            vp.run_vp_counted(stop.checker(), &devices).await,
             Err(VpHaltReason::PowerOff)
         ));
         assert_eq!(devices.faults.lock().len(), 1);
@@ -1632,7 +1632,7 @@ async fn selector_reads_use_loaded_images_and_exact_store_width(driver: DefaultD
         let mut expected = [0xa5; 16];
         expected[7..9].copy_from_slice(&initial.ds.selector.to_le_bytes());
         assert_eq!(actual, expected);
-        let progress = vp.completed_batch_progress();
+        let progress = vp.completed_batch_progress().unwrap();
         assert_eq!((progress.retired, progress.delivered), (4, 0));
     }
 }
@@ -1666,13 +1666,13 @@ async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: D
         let stop = StopVpSource::new();
         if iret {
             assert!(matches!(
-                vp.run_vp(stop.checker(), &devices).await,
+                vp.run_vp_counted(stop.checker(), &devices).await,
                 Err(VpHaltReason::PowerOff)
             ));
             assert_eq!(devices.faults.lock().len(), 1);
             assert!(devices.faults.lock()[0].contains("ReturnImage"));
         } else {
-            let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+            let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
             park(run.as_mut());
             stop.stop();
             assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -1693,7 +1693,7 @@ async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: D
             initial.rflags & !0x30000
         );
         assert_eq!(memory.read_plain::<u64>(0x18008).unwrap(), 0);
-        let progress = vp.completed_batch_progress();
+        let progress = vp.completed_batch_progress().unwrap();
         assert_eq!(
             (progress.retired, progress.delivered),
             (if iret { 10 } else { 11 }, 0)
@@ -1721,7 +1721,7 @@ async fn entry_forms_retire_through_real_vp_and_preserve_the_call_push(driver: D
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -1735,7 +1735,7 @@ async fn entry_forms_retire_through_real_vp_and_preserve_the_call_push(driver: D
     expected.gs.base = 0;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
     assert_eq!(memory.read_plain::<u64>(0x18000).unwrap(), CODE + 11);
-    let progress = vp.completed_batch_progress();
+    let progress = vp.completed_batch_progress().unwrap();
     assert_eq!((progress.retired, progress.delivered), (5, 0));
     assert!(devices.faults.lock().is_empty());
 }
@@ -1813,7 +1813,7 @@ async fn loader_system_import_orders_roundtrip_and_lock_after_run(driver: Defaul
 
         let devices = Devices::new();
         let stop = StopVpSource::new();
-        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
         park(run.as_mut());
         stop.stop();
         assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -1892,7 +1892,7 @@ async fn real_backend_guest_recovery_delayed_mmio_hlt_and_irq(driver: DefaultDri
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
     assert_eq!(devices.reads.load(Ordering::SeqCst), 0);
@@ -1978,7 +1978,7 @@ async fn decoded_mmio_preserves_exact_device_width_and_naturally_aligned_offsets
         devices.release();
         let stop = StopVpSource::new();
         assert!(matches!(
-            vp.run_vp(stop.checker(), &devices).await,
+            vp.run_vp_counted(stop.checker(), &devices).await,
             Err(VpHaltReason::PowerOff)
         ));
         assert_eq!(
@@ -2007,7 +2007,7 @@ async fn decoded_mmio_preserves_exact_device_width_and_naturally_aligned_offsets
             value
         };
         assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-        assert_eq!(vp.completed_batch_progress().retired, 2);
+        assert_eq!(vp.completed_batch_progress().unwrap().retired, 2);
         assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
         assert_eq!(devices.reads.load(Ordering::SeqCst), 1);
         let mut original = [0; 8];
@@ -2031,7 +2031,7 @@ async fn backend_stop_during_device_completion_resumes_without_reissue(driver: D
     vp.access_state(Vtl::Vtl0).set_registers(&regs).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     park(run.as_mut());
@@ -2042,7 +2042,7 @@ async fn backend_stop_during_device_completion_resumes_without_reissue(driver: D
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), regs);
 
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -2091,7 +2091,7 @@ async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
         vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
         let devices = Devices::new();
         let stop = StopVpSource::new();
-        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
         park(run.as_mut());
         assert_eq!(devices.writes.load(Ordering::SeqCst), 1);
         assert_eq!(devices.reads.load(Ordering::SeqCst), 0);
@@ -2104,7 +2104,7 @@ async fn decoded_backend_scalar_widths_recovery_mmio_and_irq_match_full_oracle(
         assert_eq!(suspended.r12, 0x1122334455667756);
         assert_eq!(suspended.r13, 0x99aabbccddee789a);
         let stop = StopVpSource::new();
-        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
         park(run.as_mut());
         partition.inject_selected(64).unwrap();
         park(run.as_mut());
@@ -2191,7 +2191,7 @@ async fn mapping_families_reload_cr3_and_fetch_high_va_through_the_real_vp(drive
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -2205,7 +2205,7 @@ async fn mapping_families_reload_cr3_and_fetch_high_va_through_the_real_vp(drive
     expected.rflags = 0x87;
     expected.cr3 = 0x5000;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-    let progress = vp.completed_batch_progress();
+    let progress = vp.completed_batch_progress().unwrap();
     assert_eq!((progress.retired, progress.delivered), (12, 0));
     assert!(devices.faults.lock().is_empty());
     for (address, bits) in [
@@ -2255,7 +2255,7 @@ async fn bootstrap_control_and_null_segments_use_the_actual_vp_image(driver: Def
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -2275,7 +2275,7 @@ async fn bootstrap_control_and_null_segments_use_the_actual_vp_image(driver: Def
     expected.fs = Default::default();
     expected.gs = Default::default();
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-    assert_eq!(vp.completed_batch_progress().retired, 16);
+    assert_eq!(vp.completed_batch_progress().unwrap().retired, 16);
     assert!(devices.faults.lock().is_empty());
     for address in [0x1000, 0x2000, 0x3000, 0x4080] {
         let word = u64::from_le_bytes(bytes[address..address + 8].try_into().unwrap()) | 0x20;
@@ -2310,14 +2310,14 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let mut expected = initial;
     expected.rax = 0x1111;
     expected.rip = CODE + 3;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-    assert_eq!(vp.completed_batch_progress().retired, 1);
+    assert_eq!(vp.completed_batch_progress().unwrap().retired, 1);
     assert_eq!(
         &*devices.faults.lock(),
         &[format!("host execution checkpoint at {:#x}", CODE + 3)]
@@ -2339,13 +2339,13 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
         .unwrap();
     devices.faults.lock().clear();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     expected.rbx = 0x2222;
     expected.rip = CODE + program.len() as u64;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-    assert_eq!(vp.completed_batch_progress().retired, 2);
+    assert_eq!(vp.completed_batch_progress().unwrap().retired, 2);
     assert_eq!(old_memory.read_plain::<u64>(0x16000).unwrap(), 0x1111);
     assert_eq!(replacement.read_plain::<u64>(0x16000).unwrap(), 0x2222);
     assert_eq!(
@@ -2381,7 +2381,7 @@ async fn indexed_ram_reuses_stack_and_data_translations(driver: DefaultDriver) {
     let devices = Devices::new();
     let stop = StopVpSource::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let regs = vp.access_state(Vtl::Vtl0).registers().unwrap();
@@ -2428,7 +2428,7 @@ async fn rep_movsq_uses_direct_ram_across_page_changes(driver: DefaultDriver) {
     let stop = StopVpSource::new();
     let devices = Devices::new();
     assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
+        vp.run_vp_counted(stop.checker(), &devices).await,
         Err(VpHaltReason::PowerOff)
     ));
     let regs = vp.access_state(Vtl::Vtl0).registers().unwrap();
@@ -2483,7 +2483,7 @@ async fn host_checkpoint_stops_after_complete_rep_and_can_resume_without_guest_c
     assert!(vp.set_execution_checkpoint(Some(0x8000_0000_0000)).is_err());
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     assert!(matches!(
         ready_after_yields(run.as_mut()),
         Err(VpHaltReason::PowerOff)
@@ -2499,7 +2499,7 @@ async fn host_checkpoint_stops_after_complete_rep_and_can_resume_without_guest_c
     expected.rip = checkpoint;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
     assert_eq!(
-        vp.completed_batch_progress().retired,
+        vp.completed_batch_progress().unwrap().retired,
         2,
         "REP is one retired instruction, not three"
     );
@@ -2512,7 +2512,7 @@ async fn host_checkpoint_stops_after_complete_rep_and_can_resume_without_guest_c
     vp.set_execution_checkpoint(None).unwrap();
     devices.faults.lock().clear();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -2520,7 +2520,7 @@ async fn host_checkpoint_stops_after_complete_rep_and_can_resume_without_guest_c
     expected.rax = 1;
     expected.rip = CODE + program.len() as u64;
     assert_eq!(vp.access_state(Vtl::Vtl0).registers().unwrap(), expected);
-    assert_eq!(vp.completed_batch_progress().retired, 4);
+    assert_eq!(vp.completed_batch_progress().unwrap().retired, 4);
     let mut after = vec![0; bytes.len()];
     memory.read_at(0, &mut after).unwrap();
     assert_eq!(
@@ -2548,10 +2548,10 @@ async fn backend_cancelled_device_future_is_explicitly_fatal_not_replayed(driver
         .unwrap();
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     drop(run);
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     let wake = waker(Arc::new(Wakes::default()));
     assert!(matches!(
         run.as_mut().poll(&mut Context::from_waker(&wake)),
@@ -2590,7 +2590,7 @@ async fn backend_state_profile_and_requested_yield_preserve_cpu(driver: DefaultD
     partition.request_yield(VpIndex::new(0));
     let devices = Devices::new();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     let wake = waker(Arc::new(Wakes::default()));
     assert!(
         run.as_mut()
@@ -2620,7 +2620,7 @@ async fn backend_state_profile_and_requested_yield_preserve_cpu(driver: DefaultD
         ))
         .unwrap();
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     assert!(
         run.as_mut()
             .poll(&mut Context::from_waker(&wake))
@@ -2638,7 +2638,7 @@ async fn backend_state_profile_and_requested_yield_preserve_cpu(driver: DefaultD
     assert_eq!(partial.rdx, 0xc0000101);
 
     let stop = StopVpSource::new();
-    let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
+    let mut run = Box::pin(vp.run_vp_counted(stop.checker(), &devices));
     park(run.as_mut());
     stop.stop();
     assert!(matches!(ready(run.as_mut()), Err(VpHaltReason::Stop(_))));
@@ -2734,6 +2734,7 @@ async fn check_block_on_vp_kick(driver: &DefaultDriver, guest: KickedGuest) {
                 "{result:?}: {:?}",
                 devices.faults.lock()
             );
+            assert!(vp.completed_batch_progress().is_none());
             let mut access = vp.access_state(Vtl::Vtl0);
             finished
                 .send((access.registers().unwrap(), access.activity().unwrap()))

@@ -1130,12 +1130,16 @@ mod native {
         let mut no_nrips = false;
         let mut shadow_paging = false;
         let mut profile_enabled = false;
+        let mut uncounted = false;
         #[cfg(feature = "perf")]
         let mut perf_control = None;
         while let Some(flag) = args.next() {
             if flag == "--native-jit" {
                 ensure!(probe && !native_jit, "unexpected or duplicate --native-jit");
                 native_jit = true;
+            } else if flag == "--uncounted" {
+                ensure!(!uncounted, "duplicate --uncounted");
+                uncounted = true;
             } else if flag == "--svm-exit-checkpoint" {
                 ensure!(
                     svm_exit_checkpoint.is_none(),
@@ -1211,6 +1215,15 @@ mod native {
             }
         }
         let command_configured = shell_command.is_some();
+        ensure!(
+            !uncounted
+                || (native_jit
+                    && !profile_enabled
+                    && !command_configured
+                    && !svm_enabled
+                    && !loader_inputs),
+            "--uncounted requires a strict native host RIP checkpoint without guest profiling"
+        );
         ensure!(
             !native_jit || cfg!(all(feature = "native-jit", target_os = "linux")),
             "native execution requires Linux x86-64 and --features native-jit"
@@ -1714,7 +1727,11 @@ mod native {
             control.set(true)?;
         }
         let started = Instant::now();
-        let run = Box::pin(vp.run_vp(stop.checker(), &devices));
+        let run = Box::pin(if uncounted {
+            Either::Left(vp.run_vp(stop.checker(), &devices))
+        } else {
+            Either::Right(vp.run_vp_counted(stop.checker(), &devices))
+        });
         let diagnostic = async {
             let deadline = async {
                 if !probe {
@@ -1807,7 +1824,31 @@ mod native {
                 "unexpected probe transport/device failure: {failure}"
             );
             let registers = vp.access_state(Vtl::Vtl0).registers()?;
-            let progress = vp.completed_batch_progress();
+            if uncounted {
+                ensure!(
+                    matches!(failure.downcast_ref::<Error>(), Some(Error::Checkpoint { rip }) if *rip == probe_target)
+                        && registers.rip == probe_target,
+                    "uncounted probe missed checkpoint {probe_target:#x}: {failure}"
+                );
+                ensure!(
+                    vp.completed_batch_progress().is_none(),
+                    "unexpected uncounted VP totals"
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "mode":"strict_native_uncounted","probe":true,"acceptance":false,
+                        "stop":failure.to_string(),"stop_debug":format!("{failure:?}"),
+                        "target":probe_target,"rip":registers.rip,"registers":format!("{registers:?}"),
+                        "transport_error":false,"retired":null,"delivered":null,
+                        "seconds":seconds,"counters_gated":counters_gated,"clock_slowdown":clock_slowdown.get(),
+                    })
+                );
+                return Ok(());
+            }
+            let progress = vp
+                .completed_batch_progress()
+                .context("missing probe counts")?;
             #[cfg(feature = "perf")]
             let execution_profile = vp.take_execution_profile().map(|profile| {
                 serde_json::json!({
@@ -2018,10 +2059,14 @@ mod native {
             "did not reach the host checkpoint: stopped at {stopped_rip:#x}: {failure}"
         );
         let progress = vp.completed_batch_progress();
-        ensure!(
-            progress.retired > 960613 && progress.retired < 2_000_000 && progress.delivered == 2,
-            "wrong progress: {progress:?}"
-        );
+        if let Some(progress) = progress {
+            ensure!(
+                progress.retired > 960613
+                    && progress.retired < 2_000_000
+                    && progress.delivered == 2,
+                "wrong progress: {progress:?}"
+            );
+        }
         let mut expected = initial.registers;
         expected.cr0 = 0x80050033;
         expected.cr4 = 0xb0;
@@ -2112,6 +2157,20 @@ mod native {
             bytes == [0x75, 0x06, 0x5d, 0xe9, 0xdf, 0x5d, 0],
             "wrong checkpoint bytes"
         );
+        if uncounted {
+            ensure!(progress.is_none(), "unexpected uncounted VP totals");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "mode":"strict_native_uncounted","retired":null,"delivered":null,
+                    "entry":ENTRY,"checkpoint":actual.rip,"stop_kind":"host_checkpoint",
+                    "complete_register_image_checked":true,"whole_ram_checked":true,
+                    "seconds":seconds,"counters_gated":counters_gated,
+                })
+            );
+            return Ok(());
+        }
+        let progress = progress.context("missing checkpoint counts")?;
         let functions = [0, 1, 0x8000_0000, 0x8000_0001, 0x8000_0008];
         let cpuid: Vec<_> = functions
             .into_iter()
@@ -2163,6 +2222,7 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
+                "counters_gated":counters_gated,
                 "core_returns": progress.core_returns,
                 "jit": jit,
                 "no_refetch_hits":no_refetch_hits,

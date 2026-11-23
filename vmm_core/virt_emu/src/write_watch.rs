@@ -23,10 +23,6 @@ impl CodeValidity for Watch {
     fn is_valid(&self) -> bool {
         self.validity.is_valid()
     }
-
-    fn revocation_flag(&self) -> Option<&std::sync::atomic::AtomicBool> {
-        self.validity.revocation_flag()
-    }
 }
 
 #[derive(Default)]

@@ -88,14 +88,14 @@ impl<'a> NativeTranslated<'a> {
         let end = start.checked_add(4096)?;
         let first = *self.ram.mapping(start, false).ok()?;
         let data = first.data.wrapping_add((start - first.start) as usize);
-        let (mut current, mut writable, mut watched) = (first.end, first.writable, first.watched);
+        let (mut current, mut writable) = (first.end, first.writable);
         while current < end {
             let next = self.ram.mapping(current, false).ok()?;
             if next.data != data.wrapping_add((current - start) as usize) {
                 return None;
             }
-            writable &= next.writable;
-            watched |= next.watched;
+            // A single write binding must describe every destination on the page.
+            writable &= next.writable && next.watched == first.watched;
             current = next.end;
         }
         Some(Mapping {
@@ -103,7 +103,6 @@ impl<'a> NativeTranslated<'a> {
             end,
             data,
             writable,
-            watched,
             ..first
         })
     }
@@ -220,13 +219,13 @@ impl TranslatedRam for NativeTranslated<'_> {
         translation: &Translation,
         address: u64,
         bytes: &[u8],
-    ) -> Result<(), CopyError<RamError>> {
+    ) -> Result<WriteOutcome, CopyError<RamError>> {
         if bytes.is_empty() {
-            return Ok(());
+            return Ok(WriteOutcome::Ordinary);
         }
         let Some((pointer, watched)) = self.pointer(translation, address, bytes.len(), true) else {
             self.fallback();
-            return self.ram.write_bytes(address, bytes);
+            return self.ram.write_bytes_observed(address, bytes);
         };
         let mut completed = 0;
         while completed < bytes.len() {
@@ -258,7 +257,11 @@ impl TranslatedRam for NativeTranslated<'_> {
             })?;
             completed += width;
         }
-        Ok(())
+        Ok(if watched {
+            WriteOutcome::Watched
+        } else {
+            WriteOutcome::Ordinary
+        })
     }
 
     #[inline]
@@ -563,6 +566,61 @@ mod tests {
     }
 
     #[test]
+    fn split_store_reports_only_the_watched_destination_chunks() {
+        let observer = Arc::new(Observer::default());
+        let memory = memory(Some(WriteTracker::new(observer.clone())), 0, 8192);
+        memory.partition.unmap_range(0, 4096).unwrap();
+        // SAFETY: Memory owns both halves of this reservation throughout.
+        unsafe {
+            memory
+                .partition
+                .map_range(memory.backing.as_ptr().cast(), 2048, 0, true, true)
+        }
+        .unwrap();
+        memory.partition.with_code_watch(0..2048, |_| ()).unwrap();
+        let mut cache = NativeTranslations::default();
+        {
+            let access = memory.partition.access();
+            let ram = access.ram();
+            let error = ram
+                .translated(&mut cache)
+                .write_bytes(&key(), 2044, &[1; 8])
+                .unwrap_err();
+            assert_eq!(error.completed, 4);
+            assert!(matches!(
+                error.kind,
+                CopyErrorKind::Memory(RamError::Unmapped(2048))
+            ));
+            assert_eq!(ram.read::<4>(2044).unwrap(), [1; 4]);
+        }
+        // The newly mapped half is ordinary despite sharing the watched half's physical page.
+        // SAFETY: the second half remains reserved by Memory.
+        unsafe {
+            memory.partition.map_range(
+                memory.backing.as_ptr().add(2048).cast(),
+                2048,
+                2048,
+                true,
+                true,
+            )
+        }
+        .unwrap();
+        let access = memory.partition.access();
+        let ram = access.ram();
+        let mut view = ram.translated(&mut cache);
+        assert_eq!(
+            view.write_bytes(&key(), 2044, &[2; 8]).unwrap(),
+            WriteOutcome::Watched
+        );
+        assert_eq!(
+            view.write_bytes(&key(), 2048, &[3; 4]).unwrap(),
+            WriteOutcome::Ordinary
+        );
+        assert_eq!(ram.read::<8>(2044).unwrap(), [2, 2, 2, 2, 3, 3, 3, 3]);
+        assert_eq!(&*observer.0.lock(), &[2044..2048, 2044..2048]);
+    }
+
+    #[test]
     fn watch_activation_revokes_store_qualification_but_writes_do_not() {
         let observer = Arc::new(Observer::default());
         let memory = memory(Some(WriteTracker::new(observer.clone())), 0, 8192);
@@ -571,7 +629,10 @@ mod tests {
             let access = memory.partition.access();
             let ram = access.ram_for_execution();
             let mut view = ram.translated(&mut cache);
-            view.write_bytes(&key(), 0, &1u64.to_le_bytes()).unwrap();
+            assert_eq!(
+                view.write_bytes(&key(), 0, &1u64.to_le_bytes()).unwrap(),
+                WriteOutcome::Ordinary
+            );
             assert!(view.direct_page(0).unwrap().writable());
         }
         assert!(observer.0.lock().is_empty());
@@ -583,8 +644,11 @@ mod tests {
             if address == 8 {
                 assert!(view.direct_page(0).is_none());
             }
-            view.write_bytes(&key(), address, &2u64.to_le_bytes())
-                .unwrap();
+            assert_eq!(
+                view.write_bytes(&key(), address, &2u64.to_le_bytes())
+                    .unwrap(),
+                WriteOutcome::Watched
+            );
             assert!(!view.direct_page(0).unwrap().writable());
         }
         assert_eq!(&*observer.0.lock(), &[8..16, 16..24]);

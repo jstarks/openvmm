@@ -25,7 +25,7 @@ use virt::PartitionMemoryMap;
 use x86_system::arch::integer;
 use x86_system::memory::physical::{
     self as physical, AtomicOperation, AtomicResult, CodeToken, CopyError, CopyErrorKind,
-    PhysicalRam,
+    PhysicalRam, WriteOutcome,
 };
 mod translation;
 pub use translation::{NativeTranslated, NativeTranslations};
@@ -571,18 +571,12 @@ impl NativeRam<'_> {
         Ok(())
     }
 
-    fn copy_width(&self, address: u64, remaining: usize, write: bool) -> Result<usize, RamError> {
-        let mapping = self.mapping(address, write)?;
-        let remaining = remaining.min((mapping.end - address) as usize);
-        Ok(scalar_width(address, remaining))
-    }
-
     fn copy_bytes(
         &self,
         address: u64,
         length: usize,
         write: bool,
-        mut copy: impl FnMut(u64, usize, usize) -> Result<(), RamError>,
+        mut copy: impl FnMut(u64, usize, usize, &Mapping) -> Result<(), RamError>,
     ) -> Result<(), CopyError<RamError>> {
         if length != 0 && address.checked_add((length - 1) as u64).is_none() {
             return Err(CopyError {
@@ -596,13 +590,13 @@ impl NativeRam<'_> {
         // known prefix; never retry a committed store or a faulting chunk.
         while completed < length {
             let current = address + completed as u64;
-            let width = self
-                .copy_width(current, length - completed, write)
-                .map_err(|error| CopyError {
-                    completed,
-                    kind: CopyErrorKind::Memory(error),
-                })?;
-            copy(current, completed, width).map_err(|error| CopyError {
+            let mapping = self.mapping(current, write).map_err(|error| CopyError {
+                completed,
+                kind: CopyErrorKind::Memory(error),
+            })?;
+            let remaining = (length - completed).min((mapping.end - current) as usize);
+            let width = scalar_width(current, remaining);
+            copy(current, completed, width, mapping).map_err(|error| CopyError {
                 completed,
                 kind: CopyErrorKind::Memory(error),
             })?;
@@ -704,7 +698,7 @@ impl PhysicalRam for NativeRam<'_> {
             address,
             destination.len(),
             false,
-            |current, offset, width| {
+            |current, offset, width, _| {
                 macro_rules! read {
                     ($n:literal) => {
                         self.read::<$n>(current)
@@ -722,21 +716,45 @@ impl PhysicalRam for NativeRam<'_> {
     }
 
     fn write_bytes(&self, address: u64, source: &[u8]) -> Result<(), CopyError<RamError>> {
-        self.copy_bytes(address, source.len(), true, |current, offset, width| {
-            macro_rules! write {
-                ($n:literal) => {{
-                    let mut value = [0; $n];
-                    value.copy_from_slice(&source[offset..offset + $n]);
-                    self.write(current, value)
-                }};
-            }
-            match width {
-                8 => write!(8),
-                4 => write!(4),
-                2 => write!(2),
-                _ => write!(1),
-            }
-        })
+        self.write_bytes_observed(address, source).map(|_| ())
+    }
+
+    fn write_bytes_observed(
+        &self,
+        address: u64,
+        source: &[u8],
+    ) -> Result<WriteOutcome, CopyError<RamError>> {
+        let mut outcome = WriteOutcome::Ordinary;
+        self.copy_bytes(
+            address,
+            source.len(),
+            true,
+            |current, offset, width, mapping| {
+                let pointer = mapping
+                    .data
+                    .wrapping_add((current - mapping.start) as usize);
+                macro_rules! write {
+                    ($n:literal) => {{
+                        let value = source[offset..offset + $n].try_into().unwrap();
+                        // SAFETY: copy_bytes qualified this entire chunk in one writable mapping.
+                        unsafe {
+                            self.write_pointer::<$n>(current, value, pointer, mapping.watched)
+                        }
+                    }};
+                }
+                match width {
+                    8 => write!(8),
+                    4 => write!(4),
+                    2 => write!(2),
+                    _ => write!(1),
+                }?;
+                if mapping.watched {
+                    outcome = WriteOutcome::Watched;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(outcome)
     }
 
     fn atomic(

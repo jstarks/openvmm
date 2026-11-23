@@ -3,8 +3,11 @@
 
 use super::*;
 use x86_system::memory::physical::{
-    TranslatedRam, Translation, TranslationCache, TranslationDiagnostics, TranslationSlot,
+    DirectPage, TranslatedRam, Translation, TranslationCache, TranslationDiagnostics,
+    TranslationSlot,
 };
+
+const DATA_SLOT: usize = 1;
 
 #[derive(Debug, Clone, Copy)]
 struct Slot {
@@ -116,7 +119,7 @@ impl<'a> NativeTranslated<'a> {
         }
         let index = match translation.slot {
             TranslationSlot::Fetch => 0,
-            TranslationSlot::Data => 1,
+            TranslationSlot::Data => DATA_SLOT,
             TranslationSlot::Table(level) if level < 4 => usize::from(level) + 2,
             TranslationSlot::Table(_) => return None,
         };
@@ -146,6 +149,22 @@ impl<'a> NativeTranslated<'a> {
 
 impl TranslatedRam for NativeTranslated<'_> {
     type Error = RamError;
+
+    #[inline]
+    fn direct_page(&self, physical_page: u64) -> Option<DirectPage<'_, Self>> {
+        if !self.ram.direct_pages || !self.enabled {
+            return None;
+        }
+        let slot = self.cache.slots[DATA_SLOT]?;
+        if slot.translation.physical_page != physical_page {
+            return None;
+        }
+        let mapping = slot.mapping?;
+        // SAFETY: bind qualified a complete, contiguous page. This view
+        // validated its domain/generation under a lease excluding remapping
+        // and new watches. The VM worker opts into unguarded native accesses.
+        Some(unsafe { DirectPage::new(mapping.data, mapping.writable && !mapping.watched) })
+    }
 
     #[inline]
     fn read_value(
@@ -271,6 +290,75 @@ mod tests {
         Translation {
             slot: TranslationSlot::Data,
             physical_page: 0,
+        }
+    }
+
+    #[test]
+    fn direct_page_only_peeks_at_the_current_data_slot_and_lease() {
+        let first = memory(None, 0, 8192);
+        let second = memory(None, 0, 8192);
+        let mut cache = NativeTranslations::default();
+        {
+            let access = first.partition.access();
+            let ram = access.ram_for_execution();
+            let mut view = ram.translated(&mut cache);
+            for slot in [TranslationSlot::Fetch, TranslationSlot::Table(1)] {
+                view.read_value(&Translation { slot, ..key() }, 0, 1)
+                    .unwrap();
+                assert!(view.direct_page(0).is_none());
+            }
+            view.read_value(&key(), 0, 1).unwrap();
+            assert!(view.direct_page(1).is_none());
+            let page = view.direct_page(0).unwrap();
+            assert!(page.writable());
+            assert_eq!(page.as_ptr(), first.backing.as_ptr().cast());
+        }
+        // The same slot is still cached but a fault-recovering caller has
+        // not opted into direct loads or stores.
+        let access = first.partition.access();
+        assert!(access.ram().translated(&mut cache).direct_page(0).is_none());
+        let access = second.partition.access();
+        assert!(
+            access
+                .ram_for_execution()
+                .translated(&mut cache)
+                .direct_page(0)
+                .is_none()
+        );
+        assert_eq!(cache.diagnostics.misses, 3);
+    }
+
+    #[test]
+    fn split_page_requires_contiguous_host_bytes_and_combines_permissions() {
+        for (offset, readable) in [(2048, true), (4096, false)] {
+            let memory = memory(None, 0, 8192);
+            memory.partition.unmap_range(0, 4096).unwrap();
+            // SAFETY: both nonoverlapping host spans belong to `memory`.
+            unsafe {
+                memory
+                    .partition
+                    .map_range(memory.backing.as_ptr().cast(), 2048, 0, true, true)
+                    .unwrap();
+                memory
+                    .partition
+                    .map_range(
+                        memory.backing.as_ptr().add(offset).cast(),
+                        2048,
+                        2048,
+                        false,
+                        true,
+                    )
+                    .unwrap();
+            }
+            let access = memory.partition.access();
+            let ram = access.ram_for_execution();
+            let mut cache = NativeTranslations::default();
+            let mut view = ram.translated(&mut cache);
+            view.read_value(&key(), 0, 1).unwrap();
+            assert_eq!(
+                view.direct_page(0).map(|page| page.writable()),
+                readable.then_some(false)
+            );
         }
     }
 
@@ -414,19 +502,23 @@ mod tests {
         let mut cache = NativeTranslations::default();
         {
             let access = memory.partition.access();
-            let ram = access.ram();
-            ram.translated(&mut cache)
-                .write_bytes(&key(), 0, &1u64.to_le_bytes())
-                .unwrap();
+            let ram = access.ram_for_execution();
+            let mut view = ram.translated(&mut cache);
+            view.write_bytes(&key(), 0, &1u64.to_le_bytes()).unwrap();
+            assert!(view.direct_page(0).unwrap().writable());
         }
         assert!(observer.0.lock().is_empty());
         memory.partition.with_code_watch(0..4096, |_| ()).unwrap();
         for address in [8, 16] {
             let access = memory.partition.access();
-            let ram = access.ram();
-            ram.translated(&mut cache)
-                .write_bytes(&key(), address, &2u64.to_le_bytes())
+            let ram = access.ram_for_execution();
+            let mut view = ram.translated(&mut cache);
+            if address == 8 {
+                assert!(view.direct_page(0).is_none());
+            }
+            view.write_bytes(&key(), address, &2u64.to_le_bytes())
                 .unwrap();
+            assert!(!view.direct_page(0).unwrap().writable());
         }
         assert_eq!(&*observer.0.lock(), &[8..16, 16..24]);
         assert_eq!(
@@ -545,9 +637,10 @@ mod tests {
         .unwrap();
         let mut cache = NativeTranslations::default();
         let access = memory.partition.access();
-        let ram = access.ram();
+        let ram = access.ram_for_execution();
         let mut view = ram.translated(&mut cache);
         assert_eq!(view.read_value(&key(), 0, 8).unwrap(), 11);
+        assert!(view.direct_page(0).is_none());
         assert_eq!(view.read_value(&key(), 0, 1).unwrap(), 11);
         assert!(matches!(
             view.read_value(&key(), 8, 1),

@@ -834,6 +834,9 @@ impl Processor for EmuProcessor<'_> {
                     rip: core.cpu().rip,
                 })));
             }
+            // This profile does not support LAPIC base relocation. Keep its
+            // page off the direct path even while xAPIC MMIO is disabled.
+            let apic_page = core.lapic().map(|apic| apic.base & !0xfff);
             let local_window = core.lapic().and_then(|apic| {
                 (apic.base & 0x800 != 0 && !apic.x2apic()).then_some(apic.base & !0xfff)
             });
@@ -844,7 +847,7 @@ impl Processor for EmuProcessor<'_> {
             }
             let result = {
                 let access = self.ram.access();
-                let ram = access.ram();
+                let ram = access.ram_for_execution();
                 let is_mmio = |address: u64, width: u8| {
                     (0..u64::from(width)).all(|offset| {
                         !self.ram_ranges.iter().any(|range| {
@@ -852,8 +855,16 @@ impl Processor for EmuProcessor<'_> {
                         })
                     })
                 };
+                let is_ram_page = |base: u64| {
+                    Some(base) != apic_page
+                        && base.checked_add(4096).is_some_and(|end| {
+                            self.ram_ranges
+                                .iter()
+                                .any(|range| range.start() <= base && end <= range.end())
+                        })
+                };
                 #[cfg(not(test))]
-                let result = core.run_fast(&ram, is_mmio);
+                let result = core.run_fast_with_ram_pages(&ram, is_mmio, is_ram_page);
                 #[cfg(test)]
                 let result = if self.state.observed {
                     core.run(
@@ -872,7 +883,7 @@ impl Processor for EmuProcessor<'_> {
                         },
                     )
                 } else {
-                    core.run_fast(&ram, is_mmio)
+                    core.run_fast_with_ram_pages(&ram, is_mmio, is_ram_page)
                 };
                 result
             };

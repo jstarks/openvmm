@@ -10,8 +10,9 @@
 //! Optional code watches revoke old batches before capture. Only writes touching
 //! marked physical spans notify the tracker; untouched RAM remains ungated.
 
-// UNSAFETY: partition-owned reservations are accessed only under a mapping lease
-// through fault-recoverable trycopy primitives, without creating Rust references.
+// UNSAFETY: partition-owned reservations are accessed only under a mapping lease,
+// without creating Rust references. The VM worker can opt into unguarded JIT
+// scalars; other accesses use fault-recoverable trycopy primitives.
 #![allow(unsafe_code)]
 
 use guestmem::{WriteTracker, WriteTrackerError};
@@ -120,7 +121,7 @@ struct Mapping {
 // SAFETY: map_range's caller keeps the reservation alive and permits shared
 // native access until unmap returns. No Rust references to its bytes are made.
 unsafe impl Send for Mapping {}
-// SAFETY: shared access uses trycopy's concurrent native-memory primitives.
+// SAFETY: concurrent accesses use native memory operations, not Rust references.
 unsafe impl Sync for Mapping {}
 
 /// Partition mapping metadata, not an owner of the underlying allocation.
@@ -304,6 +305,7 @@ impl PartitionMemory {
             pending_code_pages: None,
             vp_control: None,
             binding_domain: None,
+            direct_pages: false,
         }))
     }
 
@@ -484,6 +486,16 @@ impl NativeAccess<'_> {
             pending_code_pages: Some(self.pending_code_pages),
             vp_control: self.vp_control,
             binding_domain: Some(self.binding_domain),
+            direct_pages: false,
+        }
+    }
+
+    /// Uses the VM worker's populated-backing policy: a broken host RAM
+    /// mapping may fault the worker instead of returning a `RamError`.
+    pub(crate) fn ram_for_execution(&self) -> NativeRam<'_> {
+        NativeRam {
+            direct_pages: true,
+            ..self.ram()
         }
     }
 }
@@ -512,6 +524,7 @@ pub struct NativeRam<'a> {
     pending_code_pages: Option<&'a Mutex<BTreeSet<u64>>>,
     vp_control: Option<&'a strudel::VpControl>,
     binding_domain: Option<&'a Arc<BindingDomain>>,
+    direct_pages: bool,
 }
 
 impl NativeRam<'_> {

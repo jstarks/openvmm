@@ -11,18 +11,23 @@ use crate::native_memory::RamError;
 use guestmem::{WriteObserver, WriteTracker};
 use parking_lot::Mutex;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use x86_system::memory::physical::{CodeToken, CodeValidity, CopyError};
+use x86_system::memory::physical::{CodeToken, CodeValidity, CopyError, EntryAttention, PageWatch};
 
 struct Watch {
     range: Range<u64>,
-    valid: AtomicBool,
+    validity: PageWatch,
 }
 
 impl CodeValidity for Watch {
     fn is_valid(&self) -> bool {
-        self.valid.load(Ordering::Acquire)
+        self.validity.is_valid()
+    }
+    fn supports_chaining(&self) -> bool {
+        self.range.start.is_multiple_of(4096) && self.range.end - self.range.start == 4096
+    }
+    fn arm_chain(&self, attention: &EntryAttention) -> bool {
+        self.supports_chaining() && self.validity.arm_chain(attention)
     }
 }
 
@@ -36,9 +41,9 @@ impl WriteObserver for Watches {
                 return false;
             };
             if watch.range.start < range.end && range.start < watch.range.end {
-                watch.valid.store(false, Ordering::Release);
+                watch.validity.revoke();
             }
-            watch.valid.load(Ordering::Relaxed)
+            watch.is_valid()
         });
     }
 }
@@ -104,7 +109,7 @@ impl<T> Watched<T> {
     /// This does not authorize guest instruction execution. The observation
     /// assumes all external writers obey the observed backing configuration.
     pub fn is_valid(&self) -> bool {
-        self.watch.valid.load(Ordering::Acquire)
+        self.watch.is_valid()
     }
 }
 
@@ -136,7 +141,7 @@ impl WriteWatch {
     fn register_watch(&self, range: Range<u64>) -> Arc<Watch> {
         let watch = Arc::new(Watch {
             range,
-            valid: AtomicBool::new(true),
+            validity: PageWatch::default(),
         });
         let mut watches = self.watches.0.lock();
         watches.retain(|entry| entry.strong_count() != 0);

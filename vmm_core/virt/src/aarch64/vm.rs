@@ -12,4 +12,5 @@ state_trait!(
     Aarch64VpInfo,
     VmSavedState,
     "virt.aarch64",
+    extension super::BackendExecutionState;
 );

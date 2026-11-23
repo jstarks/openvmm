@@ -433,6 +433,18 @@ mod aarch64 {
     impl AccessVpState for WhpVpStateAccess<'_, '_> {
         type Error = Error;
 
+        fn save_extension(
+            &mut self,
+        ) -> anyhow::Result<Option<virt::aarch64::BackendExecutionState>> {
+            crate::arm_execution::save_vp(self.run.vp.whp(self.vtl))
+        }
+        fn restore_extension(
+            &mut self,
+            state: Option<&virt::aarch64::BackendExecutionState>,
+        ) -> anyhow::Result<()> {
+            crate::arm_execution::restore_vp(self.run.vp.whp(self.vtl), state)
+        }
+
         fn caps(&self) -> &virt::PartitionCapabilities {
             &self.run.vp.partition.caps
         }

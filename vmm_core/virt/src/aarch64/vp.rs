@@ -422,6 +422,7 @@ state_trait! {
     Aarch64VpInfo,
     VpSavedState,
     "virt.aarch64",
+    extension super::BackendExecutionState;
     (1, "registers", registers, set_registers, Registers),
     (2, "system_registers", system_registers, set_system_registers, SystemRegisters),
 }

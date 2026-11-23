@@ -9,6 +9,8 @@
 #![expect(unsafe_code)]
 #![expect(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
+#[cfg(guest_arch = "aarch64")]
+mod arm_execution;
 pub mod device;
 mod hypercalls;
 mod memory;

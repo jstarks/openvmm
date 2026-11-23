@@ -35,11 +35,15 @@ pub trait HvRegisterState<T, const COUNT: usize>: Default {
 }
 
 #[derive(Debug, Error)]
-#[error("state access error, phase {phase}")]
-pub struct StateError<T: 'static + Debug + std::error::Error> {
-    pub(crate) phase: &'static str,
-    #[source]
-    pub(crate) err: T,
+pub enum StateError<T: 'static + Debug + std::error::Error> {
+    #[error("state access error, phase {phase}")]
+    Access {
+        phase: &'static str,
+        #[source]
+        err: T,
+    },
+    #[error("backend execution state: {0:#}")]
+    Backend(#[source] anyhow::Error),
 }
 
 mod macros {
@@ -60,6 +64,7 @@ mod macros {
     /// set individual pieces of state.
     macro_rules! state_trait {
         ($doc:tt, $trait:ident, $caps:ty, $vp:ty, $save_state:ident, $package:expr,
+            $(extension $ext:ty;)?
             $(($field_num:literal, $id:expr, $get:ident, $set:ident, $ty:ty $(,)?)),* $(,)?
         ) => {
             #[doc = $doc]
@@ -74,6 +79,15 @@ mod macros {
                 fn commit(&mut self) -> Result<(), Self::Error>;
 
                 $(
+                /// Backend state not represented by the common register API.
+                fn save_extension(&mut self) -> anyhow::Result<Option<$ext>> { Ok(None) }
+                fn restore_extension(&mut self, extension: Option<&$ext>) -> anyhow::Result<()> {
+                    anyhow::ensure!(extension.is_none(), "unsupported backend execution state");
+                    Ok(())
+                }
+                )?
+
+                $(
                 /// Gets the specified state.
                 fn $get(&mut self) -> Result<$ty, Self::Error>;
                 /// Sets the specified state.
@@ -86,10 +100,12 @@ mod macros {
                     let mut save_state = $save_state::default();
                     $(
                         if <$ty as $crate::state::StateElement<$caps, $vp>>::is_present(self.caps()) {
-                            save_state.$get = Some(self.$get().map_err(|err| $crate::state::StateError{phase: concat!("save ", stringify!($id)), err})?);
+                            save_state.$get = Some(self.$get().map_err(|err| $crate::state::StateError::Access{phase: concat!("save ", stringify!($id)), err})?);
                         }
                     )*
 
+                    $(let ext: Option<$ext> = self.save_extension().map_err($crate::state::StateError::Backend)?;
+                    save_state.extension = ext;)?
                     Ok(save_state)
                 }
 
@@ -100,7 +116,7 @@ mod macros {
                         if let Some(value) = state.$get.as_ref() {
                             // TODO: assert good or not?
                             assert!(<$ty as $crate::state::StateElement<$caps, $vp>>::is_present(self.caps()));
-                            self.$set(value).map_err(|err| $crate::state::StateError{phase: concat!("restore ", stringify!($id)), err})?;
+                            self.$set(value).map_err(|err| $crate::state::StateError::Access{phase: concat!("restore ", stringify!($id)), err})?;
                             if cfg!(debug_assertions) {
                                 if <$ty as $crate::state::StateElement<$caps, $vp>>::can_compare(self.caps()) {
                                     assert_eq!(&self.$get().expect($id), value, "restore state mismatch (actual/expected)");
@@ -109,14 +125,16 @@ mod macros {
                         }
                     )*
 
-                    self.commit().map_err(|err| $crate::state::StateError{phase: "commit restore", err})
+                    $(let ext: Option<&$ext> = state.extension.as_ref();
+                    self.restore_extension(ext).map_err($crate::state::StateError::Backend)?;)?
+                    self.commit().map_err(|err| $crate::state::StateError::Access{phase: "commit restore", err})
                 }
 
                 /// Resets all the state elements to their initial state (after machine reset).
                 fn reset_all(&mut self, vp_info: &$vp) -> Result<(), $crate::state::StateError<Self::Error>> {
                     $(
                         if <$ty as $crate::state::StateElement<$caps, $vp>>::is_present(self.caps()) {
-                            self.$set(&<$ty as $crate::state::StateElement<$caps, $vp>>::at_reset(self.caps(), vp_info)).map_err(|err| $crate::state::StateError{phase: concat!("reset ", stringify!($id)), err})?;
+                            self.$set(&<$ty as $crate::state::StateElement<$caps, $vp>>::at_reset(self.caps(), vp_info)).map_err(|err| $crate::state::StateError::Access{phase: concat!("reset ", stringify!($id)), err})?;
                         }
                     )*
 
@@ -153,6 +171,7 @@ mod macros {
             #[derive(Debug, Default, PartialEq, Eq, mesh_protobuf::Protobuf, vmcore::save_restore::SavedStateRoot)]
             #[mesh(package = $package)]
             pub struct $save_state {
+                $(#[mesh(64)] extension: Option<$ext>,)?
                 $(
                     #[mesh($field_num)]
                     $get: Option<$ty>,

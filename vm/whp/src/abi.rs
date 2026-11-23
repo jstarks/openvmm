@@ -1009,6 +1009,13 @@ pub struct WHV_TRIGGER_HANDLE(isize);
 #[derive(Debug, Copy, Clone)]
 pub struct WHV_VIRTUAL_PROCESSOR_STATE_TYPE(u32);
 
+#[cfg(target_arch = "aarch64")]
+pub const WHvVirtualProcessorStateTypeArmLocalInterrupt: WHV_VIRTUAL_PROCESSOR_STATE_TYPE =
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE(0x80000000);
+#[cfg(target_arch = "aarch64")]
+pub const WHvVirtualProcessorStateTypeArmGlobalInterrupt: WHV_VIRTUAL_PROCESSOR_STATE_TYPE =
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE(0xc0000006);
+
 pub const WHvVirtualProcessorStateTypeSynicMessagePage: WHV_VIRTUAL_PROCESSOR_STATE_TYPE =
     WHV_VIRTUAL_PROCESSOR_STATE_TYPE(0x00000000);
 pub const WHvVirtualProcessorStateTypeSynicEventFlagPage: WHV_VIRTUAL_PROCESSOR_STATE_TYPE =

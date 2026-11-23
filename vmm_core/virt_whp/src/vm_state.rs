@@ -102,6 +102,21 @@ mod aarch64 {
     impl AccessVmState for PartitionStateAccess<'_> {
         type Error = Error;
 
+        fn save_extension(
+            &mut self,
+        ) -> anyhow::Result<Option<virt::aarch64::BackendExecutionState>> {
+            crate::arm_execution::save_vm(self.inner.vtlp(self.vtl).whp.vp(hvdef::HV_ANY_VP))
+        }
+        fn restore_extension(
+            &mut self,
+            state: Option<&virt::aarch64::BackendExecutionState>,
+        ) -> anyhow::Result<()> {
+            crate::arm_execution::restore_vm(
+                self.inner.vtlp(self.vtl).whp.vp(hvdef::HV_ANY_VP),
+                state,
+            )
+        }
+
         fn caps(&self) -> &virt::PartitionCapabilities {
             &self.inner.caps
         }

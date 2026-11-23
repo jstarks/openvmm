@@ -44,3 +44,22 @@ pub struct Aarch64PartitionCapabilities {
 
 #[derive(Error, Debug)]
 pub enum Aarch64PartitionCapabilitiesError {}
+
+/// Versioned native execution state, separate from guest construction facts.
+#[derive(PartialEq, Eq, mesh_protobuf::Protobuf)]
+#[mesh(package = "virt.aarch64")]
+pub struct BackendExecutionState {
+    #[mesh(1)]
+    pub format: String,
+    #[mesh(2)]
+    pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for BackendExecutionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendExecutionState")
+            .field("format", &self.format)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
+}

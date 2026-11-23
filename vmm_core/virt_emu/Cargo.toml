@@ -37,6 +37,7 @@ parking_lot.workspace = true
 sparse_mmap = { workspace = true, optional = true }
 
 [dev-dependencies]
+mesh.workspace = true
 strudel = { workspace = true, features = ["test-support"] }
 x86_decode.workspace = true
 x86_system = { workspace = true, features = ["reference"] }

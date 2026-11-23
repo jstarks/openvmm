@@ -15,7 +15,7 @@
 #![allow(unsafe_code)]
 
 use guestmem::{WriteTracker, WriteTrackerError};
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -137,6 +137,8 @@ unsafe impl Sync for Mapping {}
 /// pointers cannot identify those aliases.
 #[derive(Debug, Default)]
 pub struct PartitionMemory {
+    admission: Mutex<()>,
+    vp_control: Option<strudel::VpControl>,
     mappings: RwLock<Vec<Mapping>>,
     tracker: Option<WriteTracker>,
     code_tokens: RwLock<BTreeMap<u64, CodeToken>>,
@@ -154,6 +156,23 @@ pub(crate) struct CodePreparation {
 }
 
 impl PartitionMemory {
+    pub(crate) fn for_vp(tracker: WriteTracker, vp_control: strudel::VpControl) -> Self {
+        Self {
+            vp_control: Some(vp_control),
+            ..Self::with_write_tracker(tracker)
+        }
+    }
+
+    fn change_mappings(&self) -> RwLockWriteGuard<'_, Vec<Mapping>> {
+        // Don't let the VP consume the kick and reenter before we queue for
+        // the exclusive lease. The gate is never held during guest execution.
+        let _gate = self.admission.lock();
+        if let Some(control) = &self.vp_control {
+            control.request_attention();
+        }
+        self.mappings.write()
+    }
+
     /// Creates an empty partition mapping table.
     pub fn new() -> Self {
         Self::default()
@@ -230,7 +249,7 @@ impl PartitionMemory {
         let tracker = self.tracker.as_ref().ok_or(RamError::Untracked)?;
         let start = range.start & !4095;
         let end = range.end.checked_add(4095).map_or(u64::MAX, |v| v & !4095);
-        let mut mappings = self.mappings.write();
+        let mut mappings = self.change_mappings();
         let changed = mappings
             .iter()
             .any(|mapping| mapping.start < end && start < mapping.end && !mapping.watched);
@@ -283,6 +302,7 @@ impl PartitionMemory {
             tracker: Some(tracker),
             code_tokens: None,
             pending_code_pages: None,
+            vp_control: None,
             binding_domain: None,
         }))
     }
@@ -304,12 +324,16 @@ impl PartitionMemory {
     pub fn access(&self) -> NativeAccess<'_> {
         // Default construction must initialize recovery too.
         trycopy::initialize_try_copy();
-        let mappings = self.mappings.read();
+        let mappings = {
+            let _gate = self.admission.lock();
+            self.mappings.read()
+        };
         NativeAccess {
             mappings,
             tracker: self.tracker.as_ref(),
             code_tokens: self.code_tokens.read(),
             pending_code_pages: &self.pending_code_pages,
+            vp_control: self.vp_control.as_ref(),
             binding_domain: &self.binding_domain,
         }
     }
@@ -351,7 +375,7 @@ impl PartitionMemoryMap for PartitionMemory {
                 .with_offset(end)
                 .map_err(|_| MapError::InvalidObserverRange)?;
         }
-        let mut mappings = self.mappings.write();
+        let mut mappings = self.change_mappings();
         let index = mappings.partition_point(|mapping| mapping.start < addr);
         if index != 0 && mappings[index - 1].end > addr
             || index < mappings.len() && mappings[index].start < end
@@ -387,7 +411,7 @@ impl PartitionMemoryMap for PartitionMemory {
 
     fn unmap_range(&self, addr: u64, size: u64) -> anyhow::Result<()> {
         let end = addr.checked_add(size).ok_or(MapError::InvalidRange)?;
-        let mut mappings = self.mappings.write();
+        let mut mappings = self.change_mappings();
         if size == 0 {
             return Ok(());
         }
@@ -446,6 +470,7 @@ pub struct NativeAccess<'a> {
     tracker: Option<&'a WriteTracker>,
     code_tokens: RwLockReadGuard<'a, BTreeMap<u64, CodeToken>>,
     pending_code_pages: &'a Mutex<BTreeSet<u64>>,
+    vp_control: Option<&'a strudel::VpControl>,
     binding_domain: &'a Arc<BindingDomain>,
 }
 
@@ -457,6 +482,7 @@ impl NativeAccess<'_> {
             tracker: self.tracker,
             code_tokens: Some(&self.code_tokens),
             pending_code_pages: Some(self.pending_code_pages),
+            vp_control: self.vp_control,
             binding_domain: Some(self.binding_domain),
         }
     }
@@ -484,6 +510,7 @@ pub struct NativeRam<'a> {
     tracker: Option<&'a WriteTracker>,
     code_tokens: Option<&'a BTreeMap<u64, CodeToken>>,
     pending_code_pages: Option<&'a Mutex<BTreeSet<u64>>>,
+    vp_control: Option<&'a strudel::VpControl>,
     binding_domain: Option<&'a Arc<BindingDomain>>,
 }
 
@@ -634,7 +661,12 @@ impl PhysicalRam for NativeRam<'_> {
             return Some(token);
         }
         self.pointer(address, usize::from(length), false).ok()?;
-        self.pending_code_pages?.lock().insert(page);
+        if self.pending_code_pages?.lock().insert(page)
+            && let Some(control) = self.vp_control
+            && self.pointer(page, 4096, false).is_ok()
+        {
+            control.request_attention();
+        }
         None
     }
 

@@ -12,7 +12,7 @@ use guestmem::{WriteObserver, WriteTracker};
 use parking_lot::Mutex;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
-use x86_system::memory::physical::{CodeToken, CodeValidity, CopyError, EntryAttention, PageWatch};
+use x86_system::memory::physical::{CodeToken, CodeValidity, CopyError, PageWatch};
 
 struct Watch {
     range: Range<u64>,
@@ -23,11 +23,9 @@ impl CodeValidity for Watch {
     fn is_valid(&self) -> bool {
         self.validity.is_valid()
     }
-    fn supports_chaining(&self) -> bool {
-        self.range.start.is_multiple_of(4096) && self.range.end - self.range.start == 4096
-    }
-    fn arm_chain(&self, attention: &EntryAttention) -> bool {
-        self.supports_chaining() && self.validity.arm_chain(attention)
+
+    fn revocation_flag(&self) -> Option<&std::sync::atomic::AtomicBool> {
+        self.validity.revocation_flag()
     }
 }
 

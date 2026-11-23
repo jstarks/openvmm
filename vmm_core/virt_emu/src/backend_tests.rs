@@ -854,7 +854,9 @@ async fn build_profile(
     assert_eq!(binders.len(), 1);
     let partition = Arc::new(partition);
     let memory = MappedTestMemory::observed(partition.clone(), bytes, tracker);
-    (partition, binders.pop().unwrap(), memory, keeper)
+    let mut binder = binders.pop().unwrap();
+    binder.set_observed_for_test(true);
+    (partition, binder, memory, keeper)
 }
 
 #[async_test]
@@ -919,9 +921,8 @@ async fn lowering_cr8_delivers_masked_self_ipi_before_the_following_instruction(
 }
 
 #[async_test]
-async fn owned_lapic_timer_interrupts_an_if_enabled_batch_without_executor_wakeup(
-    driver: DefaultDriver,
-) {
+async fn owned_lapic_timer_interrupts_running_guest_independently(_driver: DefaultDriver) {
+    let (_thread, driver) = pal_async::DefaultPool::spawn_on_thread("emu-timer");
     let (mut bytes, owned) = fixture();
     bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
     let target = 0x12000u64;
@@ -937,12 +938,13 @@ async fn owned_lapic_timer_interrupts_an_if_enabled_batch_without_executor_wakeu
     store_apic(&mut code, 0x3e0, 11);
     store_apic(&mut code, 0x320, 0xe0);
     store_apic(&mut code, 0x380, 100_000);
-    code.push(0xb9);
-    code.extend_from_slice(&100_000u32.to_le_bytes());
-    code.extend_from_slice(&[0x48, 0xff, 0xc9, 0x75, 0xfb]);
+    // Publish entry into a RAM-only loop. No APIC register access or HLT
+    // can materialize time; only the independently driven deadline can.
+    code.extend_from_slice(&[0xc6, 0x06, 1, 0x48, 0xff, 0xc1, 0xeb, 0xfb]);
     bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
-    let (_, mut binder, _memory, mut keeper) =
+    let (partition, mut binder, memory, mut keeper) =
         build_profile(&driver, &bytes, VmTime::from_100ns(0), true).await;
+    binder.set_observed_for_test(false);
     let mut vp = binder.bind().unwrap();
     let mut initial = long_mode_registers(
         owned.core.cpu,
@@ -951,36 +953,59 @@ async fn owned_lapic_timer_interrupts_an_if_enabled_batch_without_executor_wakeu
         77,
     );
     initial.rdi = DEVICE;
+    initial.rsi = 0x16000;
+    initial.rcx = 0;
     initial.r10 = 0;
     initial.rflags |= 0x200;
     vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
-    vp.set_execution_checkpoint(Some(CODE + code.len() as u64))
-        .unwrap();
+    vp.set_execution_checkpoint(Some(target + 3)).unwrap();
     let mut devices = Devices::new();
     devices.apic = true;
     let stop = StopVpSource::new();
-    keeper.start().await;
-    assert!(matches!(
-        vp.run_vp(stop.checker(), &devices).await,
-        Err(VpHaltReason::PowerOff)
-    ));
+    std::thread::scope(|scope| {
+        let memory = memory.guest_memory();
+        let keeper = &mut keeper;
+        scope.spawn(move || {
+            let start = std::time::Instant::now();
+            while memory.read_plain::<u8>(0x16000).unwrap() != 1 {
+                assert!(start.elapsed() < std::time::Duration::from_secs(2));
+                std::thread::yield_now();
+            }
+            pal_async::local::block_on(keeper.start());
+        });
+        let mut timeout = pal_async::timer::PolledTimer::new(&driver);
+        let outcome = vmm_core::partition_unit::block_on_vp(
+            partition,
+            VpIndex::new(0),
+            futures::future::select(
+                Box::pin(timeout.sleep(std::time::Duration::from_secs(5))),
+                Box::pin(vp.run_vp(stop.checker(), &devices)),
+            ),
+        );
+        assert!(matches!(
+            outcome,
+            futures::future::Either::Right((Err(VpHaltReason::PowerOff), _))
+        ));
+    });
     keeper.stop().await;
     let current = vp.access_state(Vtl::Vtl0).registers().unwrap();
-    assert_eq!(
-        (current.rip, current.rcx, current.r10),
-        (CODE + code.len() as u64, 0, 1)
-    );
-    assert_eq!(current.rflags & 0x200, 0x200);
+    assert_eq!((current.rip, current.r10), (target + 3, 1));
+    let saved_rip = memory.read_plain::<u64>(current.rsp).unwrap();
+    assert!([CODE + code.len() as u64 - 5, CODE + code.len() as u64 - 2].contains(&saved_rip));
     let apic = vp.apic_diagnostics().unwrap();
     assert_eq!(apic.delivered, [(224, 1)]);
-    assert!(apic.first_interrupt_retired.unwrap() < vp.completed_batch_progress().retired - 100);
+    assert_eq!(
+        apic.first_interrupt_retired.unwrap() + 1,
+        vp.completed_batch_progress().retired
+    );
     assert!(devices.mmio.lock().is_empty());
 }
 
 #[async_test]
 async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real_eoi(
-    driver: DefaultDriver,
+    _driver: DefaultDriver,
 ) {
+    let (_thread, driver) = pal_async::DefaultPool::spawn_on_thread("emu-hlt-timer");
     let (mut bytes, owned) = fixture();
     bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
     let target = 0x12000u64;
@@ -1015,6 +1040,7 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
     let (partition, mut binder, _memory, mut keeper) =
         build_profile(&driver, &bytes, VmTime::from_100ns(0), true).await;
+    binder.set_observed_for_test(false);
     let mut vp = binder.bind().unwrap();
     let mut registers = long_mode_registers(
         owned.core.cpu,
@@ -1030,24 +1056,31 @@ async fn owned_lapic_programmed_timer_wakes_real_hlt_and_level_msi_requires_real
     let mut devices = Devices::new();
     devices.apic = true;
     let stop = StopVpSource::new();
-    let result = {
-        let mut run = Box::pin(vp.run_vp(stop.checker(), &devices));
-        park(run.as_mut());
-        // Guest time stays stopped until the VP has actually reached HLT.
-        keeper.start().await;
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // No wall-clock race between timer programming and HLT.
+            let start = std::time::Instant::now();
+            while !partition.is_waiting_for_test() {
+                assert!(start.elapsed() < std::time::Duration::from_secs(2));
+                std::thread::yield_now();
+            }
+            pal_async::local::block_on(keeper.start());
+        });
         let mut timeout = pal_async::timer::PolledTimer::new(&driver);
-        let result = futures::future::select(
-            run,
-            Box::pin(timeout.sleep(std::time::Duration::from_secs(2))),
-        )
-        .await;
-        match result {
-            futures::future::Either::Left((result, _)) => result,
-            futures::future::Either::Right(_) => {
+        match vmm_core::partition_unit::block_on_vp(
+            partition.clone(),
+            VpIndex::new(0),
+            futures::future::select(
+                Box::pin(timeout.sleep(std::time::Duration::from_secs(5))),
+                Box::pin(vp.run_vp(stop.checker(), &devices)),
+            ),
+        ) {
+            futures::future::Either::Right((result, _)) => result,
+            futures::future::Either::Left(_) => {
                 panic!("owned LAPIC timer did not wake the halted VP")
             }
         }
-    };
+    });
     assert!(matches!(result, Err(VpHaltReason::PowerOff)));
     keeper.stop().await;
     let current = vp.access_state(Vtl::Vtl0).registers().unwrap();
@@ -2519,4 +2552,180 @@ async fn backend_state_profile_and_requested_yield_preserve_cpu(driver: DefaultD
         CODE + code.len() as u64 + 1
     );
     assert!(devices.faults.lock().is_empty());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KickedGuest {
+    Running,
+    Halted,
+    Rep,
+    Interrupt,
+}
+
+async fn check_block_on_vp_kick(driver: &DefaultDriver, guest: KickedGuest) {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const DEST: u64 = 0x30000;
+    const COUNT: u64 = 0x1c0000;
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    let (mut bytes, owned) = fixture();
+    bytes.resize(0x200000, 0);
+    let mut interrupt = Vec::new();
+    store_apic(&mut interrupt, 0xf0, 0x1ff);
+    interrupt.extend_from_slice(&[0xf4, 0x88, 0x06, 0xf4]); // hlt; mov [rsi],al; hlt
+    let program: &[u8] = match guest {
+        KickedGuest::Running => &[0x88, 0x07, 0x48, 0xff, 0xc0, 0xeb, 0xfb],
+        KickedGuest::Halted => &[0xf4],
+        KickedGuest::Rep => &[0xf3, 0xaa, 0xf4],
+        KickedGuest::Interrupt => &interrupt,
+    };
+    bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(program);
+    let apic = guest == KickedGuest::Interrupt;
+    if apic {
+        bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
+    }
+    let (partition, mut binder, backing, _keeper) =
+        build_profile(driver, &bytes, VmTime::from_100ns(0), apic).await;
+    binder.set_observed_for_test(false);
+    let memory = backing.guest_memory();
+    let mut initial = long_mode_registers(
+        owned.core.cpu,
+        super::shared_mmu_tests::config(),
+        owned.tables,
+        0,
+    );
+    initial.rdi = if apic { DEVICE } else { DEST };
+    initial.rsi = DEST;
+    initial.rcx = COUNT;
+    initial.rflags = if apic { 0x202 } else { 2 };
+    initial.rax = 0x55;
+    let (kick, kicked) = mesh::oneshot::<()>();
+    let (finished, done) = mpsc::channel();
+    let requested = Arc::new(AtomicBool::new(false));
+    let worker = std::thread::spawn({
+        let partition = partition.clone();
+        let requested = requested.clone();
+        move || {
+            let _backing = backing;
+            let mut vp = binder.bind().unwrap();
+            #[cfg(all(feature = "native-jit", target_os = "linux"))]
+            vp.enable_native_jit().unwrap();
+            vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+            let stop = StopVpSource::new();
+            let devices = Devices::new();
+            let result = vmm_core::partition_unit::block_on_vp(partition, VpIndex::new(0), async {
+                let mut run = std::pin::pin!(vp.run_vp(stop.checker(), &devices));
+                futures::future::join(
+                    async {
+                        kicked.await.unwrap();
+                        stop.stop();
+                    },
+                    std::future::poll_fn(|cx| {
+                        let result = run.as_mut().poll(cx);
+                        assert!(
+                            result.is_ready() || requested.load(Ordering::Acquire),
+                            "VP returned Pending without an executor wake"
+                        );
+                        result
+                    }),
+                )
+                .await
+                .1
+            });
+            assert!(
+                matches!(result, Err(VpHaltReason::Stop(_))),
+                "{result:?}: {:?}",
+                devices.faults.lock()
+            );
+            let mut access = vp.access_state(Vtl::Vtl0);
+            finished
+                .send((access.registers().unwrap(), access.activity().unwrap()))
+                .unwrap();
+        }
+    });
+    let start = Instant::now();
+    while match guest {
+        KickedGuest::Running => memory.read_plain::<u8>(DEST).unwrap() != 0x55,
+        KickedGuest::Halted | KickedGuest::Interrupt => !partition.is_waiting_for_test(),
+        KickedGuest::Rep => memory.read_plain::<u8>(DEST + 64).unwrap() != 0x55,
+    } {
+        assert!(
+            !worker.is_finished() && start.elapsed() < TIMEOUT,
+            "{guest:?} never reached its in-flight witness"
+        );
+        std::thread::yield_now();
+    }
+    if apic {
+        partition.request_msi(
+            Vtl::Vtl0,
+            virt::irqcon::MsiRequest {
+                address: 0xfee0_0000,
+                data: 64,
+            },
+        );
+        while memory.read_plain::<u8>(DEST).unwrap() != 0x55 || !partition.is_waiting_for_test() {
+            assert!(
+                !worker.is_finished() && start.elapsed() < TIMEOUT,
+                "MSI did not resume HLT"
+            );
+            std::thread::yield_now();
+        }
+    }
+    if guest != KickedGuest::Rep {
+        // An exclusive capture must finish even when the VP has an infinite
+        // instruction stream (or is asleep). No executor wake has been sent.
+        let (captured, check) = mpsc::channel();
+        let map = partition.clone();
+        std::thread::spawn(move || {
+            captured
+                .send(*map.capture_code::<1>(CODE).unwrap().value())
+                .unwrap()
+        });
+        assert_eq!(check.recv_timeout(TIMEOUT).unwrap(), [program[0]]);
+    }
+    requested.store(true, Ordering::Release);
+    kick.send(());
+    let (regs, activity) = done
+        .recv_timeout(TIMEOUT)
+        .expect("block_on_vp wake did not stop guest");
+    worker.join().unwrap();
+    match guest {
+        KickedGuest::Running => {
+            assert!(matches!(regs.rip, rip if rip == CODE + 2 || rip == CODE + 5));
+            assert_eq!(activity.mp_state, virt::vp::MpState::Running);
+        }
+        KickedGuest::Halted | KickedGuest::Interrupt => {
+            assert_eq!(regs.rip, CODE + program.len() as u64);
+            assert_eq!(activity.mp_state, virt::vp::MpState::Halted);
+            assert_eq!(regs.r10, initial.r10 + u64::from(apic));
+        }
+        KickedGuest::Rep => {
+            assert_eq!(regs.rip, CODE);
+            assert!((1..COUNT).contains(&regs.rcx));
+            assert_eq!(regs.rdi, DEST + COUNT - regs.rcx);
+            assert_eq!(memory.read_plain::<u8>(regs.rdi - 1).unwrap(), 0x55);
+            assert_eq!(memory.read_plain::<u8>(regs.rdi).unwrap(), 0);
+        }
+    }
+}
+
+#[async_test]
+async fn block_on_vp_kicks_running_guest(driver: DefaultDriver) {
+    check_block_on_vp_kick(&driver, KickedGuest::Running).await;
+}
+
+#[async_test]
+async fn block_on_vp_kicks_blocking_hlt_without_resuming_guest(driver: DefaultDriver) {
+    check_block_on_vp_kick(&driver, KickedGuest::Halted).await;
+}
+
+#[async_test]
+async fn block_on_vp_kicks_long_rep_at_an_element_boundary(driver: DefaultDriver) {
+    check_block_on_vp_kick(&driver, KickedGuest::Rep).await;
+}
+
+#[async_test]
+async fn block_on_vp_hlt_receives_external_msi_without_yield(driver: DefaultDriver) {
+    check_block_on_vp_kick(&driver, KickedGuest::Interrupt).await;
 }

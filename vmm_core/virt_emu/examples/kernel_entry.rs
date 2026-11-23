@@ -74,11 +74,12 @@ mod native {
 
     fn execution_json(d: x86_system::execute::compiled::ExecutionDiagnostics) -> serde_json::Value {
         serde_json::json!({
+            "fast_dispatch_starts":d.fast_dispatch_starts,
             "single_entries":d.single_entries,"single_retired":d.single_retired,
             "resumes":d.resumes,"block_entries":d.block_entries,
             "block_retired":d.block_retired,"completed_lengths":d.completed_lengths,
             "complete_exits":d.complete_exits,"budget_exits":d.budget_exits,
-            "revocation_exits":d.revocation_exits,"code_write_exits":d.code_write_exits,
+            "attention_exits":d.attention_exits,"code_write_exits":d.code_write_exits,
             "host_stop_exits":d.host_stop_exits,
             "suspended_exits":d.suspended_exits,"transition_exits":d.transition_exits,
             "stopped_exits":d.stopped_exits,
@@ -1266,6 +1267,7 @@ mod native {
             vtl0_alias_map: None,
             fault_resolver: None,
         })?;
+        let partition = Arc::new(partition);
         // SAFETY: backing outlives both the partition and its VP binders.
         // UNSAFETY: Installs the owned harness backing just as membacking would.
         #[expect(unsafe_code)]
@@ -1578,7 +1580,6 @@ mod native {
                 )
                 .await?;
             if probe_apic {
-                let partition = Arc::new(partition);
                 output
                     .chipset_builder
                     .arc_mutex_device("ioapic")
@@ -1587,7 +1588,7 @@ mod native {
                         chipset::ioapic::IoApicDevice::new(
                             24,
                             Box::new(IoApicRoutes {
-                                partition,
+                                partition: partition.clone(),
                                 routes: Mutex::new([None; 24]),
                                 events: devices.events.clone(),
                             }),
@@ -1738,11 +1739,18 @@ mod native {
             };
             select(Box::pin(devices.failed()), Box::pin(terminal)).await;
         };
-        match select(run, Box::pin(diagnostic)).await {
-            Either::Left((Err(VpHaltReason::PowerOff), _)) => {}
-            Either::Left((other, _)) => bail!("unexpected VP outcome: {other:?}"),
-            Either::Right(_) if probe => {}
-            Either::Right(_) => {
+        // Register diagnostic wakeups before entering the blocking VP. The
+        // VM-time/device driver runs independently and the VP waker kicks a
+        // running instruction stream or a halted VP out to this select.
+        match vmm_core::partition_unit::block_on_vp(
+            partition,
+            VpIndex::new(0),
+            select(Box::pin(diagnostic), run),
+        ) {
+            Either::Right((Err(VpHaltReason::PowerOff), _)) => {}
+            Either::Right((other, _)) => bail!("unexpected VP outcome: {other:?}"),
+            Either::Left(_) if probe => {}
+            Either::Left(_) => {
                 let failure = devices
                     .events
                     .error
@@ -1959,6 +1967,7 @@ mod native {
                     "stop_after_command":stop_after_command,
                     "transport_error":matches!(failure.downcast_ref::<Error>(),Some(Error::Memory(_))),
                     "retired":progress.retired,"delivered":progress.delivered,"seconds":seconds,
+                    "core_returns":progress.core_returns,
                     "jit":jit_json(&vp,native_jit,progress.retired)?,
                     "counters_gated":counters_gated,
                     "execution_profile":execution_profile,
@@ -2110,6 +2119,10 @@ mod native {
         let execution = vp.execution_diagnostics()?;
         let translations = vp.translation_diagnostics()?;
         ensure!(
+            execution.fast_dispatch_starts != 0 && execution.budget_exits == 0,
+            "frozen checkpoint must exercise unbudgeted VP dispatch"
+        );
+        ensure!(
             translations.hits > 0,
             "host-bound TLB path was not exercised"
         );
@@ -2143,6 +2156,7 @@ mod native {
             "{}",
             serde_json::json!({
                 "retired": progress.retired, "delivered": progress.delivered,
+                "core_returns": progress.core_returns,
                 "jit": jit,
                 "no_refetch_hits":no_refetch_hits,
                 "execution_cache_hits":decode.execution_hits,
@@ -2176,7 +2190,10 @@ mod native {
     }
 
     pub fn run() -> anyhow::Result<()> {
-        DefaultPool::run_with(witness)
+        let (thread, driver) = DefaultPool::spawn_on_thread("kernel-entry-devices");
+        let result = futures::executor::block_on(witness(driver));
+        thread.join().expect("device executor panicked");
+        result
     }
 }
 

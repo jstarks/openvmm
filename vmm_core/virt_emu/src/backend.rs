@@ -7,20 +7,23 @@
 //! and subsequent register writes are rejected. Stop is deferred until an
 //! already-started device operation completes. Cancelling its run future poisons
 //! that VP rather than reissuing a possibly side-effecting operation.
+//!
+//! Run on a dedicated VP thread through `block_on_vp`: a poll can execute
+//! indefinitely or block in guest HLT until another thread posts work. VM
+//! time and devices need a driver independent of that thread. HLT releases
+//! the mapping lease, and a host yield does not unhalt the guest.
 
 use crate::native_memory::{PartitionMemory, RamError};
 use crate::write_watch::{CaptureError, CodeCaptureError, Watched, WriteWatch};
 use crate::{state_from_registers, update_registers};
-use futures::task::AtomicWaker;
 use hvdef::Vtl;
 use memory_range::MemoryRange;
 use std::convert::Infallible;
-use std::future::poll_fn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
-use std::task::Poll;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Wake, Waker};
 pub use strudel::DecodeDiagnostics;
-use strudel::{CpuState, Machine, RunBudget, Stop as BatchStop};
+use strudel::{CpuState, Machine, Stop as BatchStop, VpControl};
 use virt::io::CpuIo;
 use virt::vp::{self, AccessVpState};
 use virt::x86::{SegmentRegister, TableRegister};
@@ -64,9 +67,6 @@ pub enum Error {
     /// Exception vectors cannot enter the selected IRQ port.
     #[error("invalid selected interrupt vector")]
     InterruptVector,
-    /// The private interrupt input protocol was inconsistent.
-    #[error("invalid interrupt ingress state")]
-    InterruptIngress,
     /// An unsupported controller request was latched for the VP.
     #[error("unsupported interrupt message or an invalid VP target was requested")]
     UnsupportedInterrupt,
@@ -120,51 +120,47 @@ pub enum Error {
 }
 
 struct Control {
+    #[cfg(test)]
+    waiting: AtomicBool,
     has_apic: bool,
     routing: AtomicU64,
-    incoming: [AtomicU64; 8],
-    incoming_banks: AtomicU8,
-    pending: AtomicU16,
     unsupported: AtomicBool,
-    waker: AtomicWaker,
+    remote: VpControl,
     yield_requested: NeedsYield,
 }
 
 impl Control {
     fn new(has_apic: bool) -> Self {
         Self {
+            #[cfg(test)]
+            waiting: AtomicBool::new(false),
             has_apic,
             routing: AtomicU64::new(0),
-            incoming: std::array::from_fn(|_| AtomicU64::new(0)),
-            incoming_banks: AtomicU8::new(0),
-            pending: AtomicU16::new(0),
             unsupported: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
+            remote: VpControl::default(),
             yield_requested: NeedsYield::new(),
         }
     }
 
-    fn flush(&self, core: &mut Machine) -> Result<(), Error> {
-        if self.unsupported.load(Ordering::Acquire) {
-            return Err(Error::UnsupportedInterrupt);
-        }
-        if core.pending().is_some() {
-            return Ok(());
-        }
-        let current = self.pending.load(Ordering::Acquire);
-        if current == 0 {
-            return Ok(());
-        }
-        let vector = u8::try_from(current - 1).map_err(|_| Error::InterruptIngress)?;
-        match core.inject(vector) {
-            Injection::Queued => {
-                self.pending
-                    .compare_exchange(current, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| Error::InterruptIngress)?;
-                Ok(())
-            }
-            other => Err(Error::Injection(other)),
-        }
+    fn unsupported(&self) {
+        self.unsupported.store(true, Ordering::Release);
+        self.remote.request_attention();
+    }
+}
+
+struct TimerWake {
+    fired: AtomicBool,
+    remote: VpControl,
+}
+
+impl Wake for TimerWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.fired.store(true, Ordering::Release);
+        self.remote.request_attention();
     }
 }
 
@@ -196,11 +192,14 @@ enum CpuLifecycle {
 }
 
 struct VpState {
+    timer: Arc<TimerWake>,
     backend: strudel::Backend,
     #[cfg(test)]
     decode_cache_enabled: bool,
     #[cfg(test)]
     boundary_in_batch: bool,
+    #[cfg(test)]
+    observed: bool,
     apic_id: Option<u32>,
     apic_delivered: [u64; 256],
     first_apic_retired: Option<u64>,
@@ -244,6 +243,8 @@ pub struct EmuProcessor<'a> {
 /// Progress from successfully returned core batches, not transport-error totals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompletedBatchProgress {
+    /// Successful returns from the core to the platform (not guest entries).
+    pub core_returns: u64,
     /// Instructions retired in completed batches.
     pub retired: u64,
     /// Events delivered in completed batches.
@@ -543,7 +544,10 @@ impl ProtoPartition for EmuProtoPartition {
             return Err(Error::Profile("no RAM"));
         }
         let control = Arc::new(Control::new(self.architectural_apic));
-        let ram = Arc::new(PartitionMemory::with_write_tracker(self.writes.tracker()));
+        let ram = Arc::new(PartitionMemory::for_vp(
+            self.writes.tracker(),
+            control.remote.clone(),
+        ));
         let partition = EmuPartition {
             caps: self.caps.clone(),
             control: control.clone(),
@@ -553,11 +557,17 @@ impl ProtoPartition for EmuProtoPartition {
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
             state: VpState {
+                timer: Arc::new(TimerWake {
+                    fired: false.into(),
+                    remote: control.remote.clone(),
+                }),
                 backend: strudel::Backend::Interpreter,
                 #[cfg(test)]
                 decode_cache_enabled: true,
                 #[cfg(test)]
                 boundary_in_batch: true,
+                #[cfg(test)]
+                observed: false,
                 apic_id: self.architectural_apic.then_some(self.apic_id),
                 apic_delivered: [0; 256],
                 first_apic_retired: None,
@@ -590,6 +600,11 @@ impl ProtoPartition for EmuProtoPartition {
 
 impl EmuPartition {
     #[cfg(test)]
+    pub(crate) fn is_waiting_for_test(&self) -> bool {
+        self.control.waiting.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn write_tracker(&self) -> guestmem::WriteTracker {
         self.writes.tracker()
     }
@@ -599,8 +614,8 @@ impl EmuPartition {
     /// Every external writer must use this prototype's observed memory backing.
     /// The result is a backing observation, not guest execute authorization;
     /// instruction fetch permissions and current translation remain separate.
-    /// This may wait for bounded CPU batches. Do not call from inside such a
-    /// batch or while holding the external write-registration gate.
+    /// This kicks a running VP and waits for its memory lease. Do not call
+    /// from inside that lease or while holding the external write-registration gate.
     pub fn capture_code<const N: usize>(
         &self,
         address: u64,
@@ -627,20 +642,12 @@ impl EmuPartition {
                 "selected-vector ingress bypasses the owned LAPIC",
             ));
         }
-        if vector < 32 {
-            return Err(Error::InterruptVector);
+        match self.control.remote.post_selected(vector) {
+            Injection::Queued => Ok(()),
+            Injection::Busy => Err(Error::InterruptBusy),
+            Injection::InvalidVector => Err(Error::InterruptVector),
+            other => Err(Error::Injection(other)),
         }
-        self.control
-            .pending
-            .compare_exchange(
-                0,
-                u16::from(vector) + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| Error::InterruptBusy)?;
-        self.control.waker.wake();
-        Ok(())
     }
 }
 
@@ -677,8 +684,7 @@ impl Partition for EmuPartition {
         if vtl == Vtl::Vtl0 {
             self.control.request_apic_msi(request);
         } else {
-            self.control.unsupported.store(true, Ordering::Release);
-            self.control.waker.wake();
+            self.control.unsupported();
         }
     }
     fn caps(&self) -> &PartitionCapabilities {
@@ -688,8 +694,9 @@ impl Partition for EmuPartition {
         if vp_index.index() != 0 {
             self.control.unsupported.store(true, Ordering::Release);
         }
-        self.control.yield_requested.request_yield();
-        self.control.waker.wake();
+        if self.control.yield_requested.request_yield() {
+            self.control.remote.request_yield();
+        }
     }
 }
 
@@ -746,6 +753,13 @@ impl BindProcessor for EmuProcessorBinder {
     }
 }
 
+#[cfg(test)]
+impl EmuProcessorBinder {
+    pub(crate) fn set_observed_for_test(&mut self, observed: bool) {
+        self.state.observed = observed;
+    }
+}
+
 impl inspect::InspectMut for EmuProcessor<'_> {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         req.respond()
@@ -776,18 +790,21 @@ impl Processor for EmuProcessor<'_> {
 
     async fn run_vp(
         &mut self,
-        mut stop: StopVp<'_>,
+        stop: StopVp<'_>,
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
+        #[cfg(test)]
+        let mut stop = stop;
         if self.state.io_active {
             return Err(dev.fatal_error(Box::new(Error::CancelledIo)));
         }
         self.state.started = true;
-        let mut batch_work = 0u8;
+        #[cfg(test)]
+        let mut observed_batches = 0u8;
         loop {
             stop.check()?;
-            if let Err(error) = apic::poll(self.state, &self.control, self.clock) {
-                return Err(dev.fatal_error(Box::new(error)));
+            if self.control.unsupported.load(Ordering::Acquire) {
+                return Err(dev.fatal_error(Box::new(Error::UnsupportedInterrupt)));
             }
             let checkpoint = self.state.checkpoint;
             let checkpoint_guest = self.state.checkpoint_guest;
@@ -802,7 +819,9 @@ impl Processor for EmuProcessor<'_> {
                     rip: core.cpu().rip,
                 })));
             }
-            if let Err(error) = self.control.flush(core) {
+            if self.state.timer.fired.swap(false, Ordering::AcqRel)
+                && let Err(error) = apic::expire_timer(core, self.clock, &self.state.timer)
+            {
                 return Err(dev.fatal_error(Box::new(error)));
             }
             self.control.yield_requested.maybe_yield().await;
@@ -818,70 +837,44 @@ impl Processor for EmuProcessor<'_> {
             let local_window = core.lapic().and_then(|apic| {
                 (apic.base & 0x800 != 0 && !apic.x2apic()).then_some(apic.base & !0xfff)
             });
-            let deadline = core
-                .lapic()
-                .filter(|apic| apic.enabled() && apic.lvt[0] & 0x10000 == 0)
-                .map(|apic| apic.timer.deadline());
             if checkpoint_guest {
                 core.set_guest_entry_stop(checkpoint);
             } else {
                 core.set_entry_stop(checkpoint);
             }
-            #[cfg(test)]
-            let boundary_in_batch = self.state.boundary_in_batch;
             let result = {
                 let access = self.ram.access();
                 let ram = access.ram();
-                core.run(
-                    &ram,
-                    RunBudget {
-                        memory_effects: 64,
-                        steps: 64,
-                    },
-                    |address, width| {
-                        (0..u64::from(width)).all(|offset| {
-                            !self.ram_ranges.iter().any(|range| {
-                                address + offset >= range.start() && address + offset < range.end()
-                            })
+                let is_mmio = |address: u64, width: u8| {
+                    (0..u64::from(width)).all(|offset| {
+                        !self.ram_ranges.iter().any(|range| {
+                            address + offset >= range.start() && address + offset < range.end()
                         })
-                    },
-                    |core| {
-                        // Ingress and timer deadlines are recognized between bounded entries.
-                        #[cfg(test)]
-                        if !boundary_in_batch {
-                            return true;
-                        }
-                        if core.halted() {
-                            // Arm the timer timeout before registering the halt wait.
-                            return true;
-                        }
-                        if core.at_instruction_boundary()
-                            && checkpoint == Some(core.cpu().rip)
-                            && (!checkpoint_guest || core.guest_mode())
-                        {
-                            return true;
-                        }
-                        if self.control.unsupported.load(Ordering::Acquire)
-                            || self.control.apic_work_pending()
-                            || self.control.pending.load(Ordering::Acquire) != 0
-                        {
-                            return true;
-                        }
-                        if core.last_lapic_delivery().is_some() {
-                            return true;
-                        }
-                        if core.pending().is_some() || !core.physical_interrupts_enabled() {
-                            return false;
-                        }
-                        match deadline {
-                            Some(x86_system::arch::apic::timer::Deadline::At(value)) => {
-                                self.clock.now().as_100ns() >= apic::deadline_time(value).as_100ns()
-                            }
-                            Some(x86_system::arch::apic::timer::Deadline::BeyondClock) => true,
-                            _ => false,
-                        }
-                    },
-                )
+                    })
+                };
+                #[cfg(not(test))]
+                let result = core.run_fast(&ram, is_mmio);
+                #[cfg(test)]
+                let result = if self.state.observed {
+                    core.run(
+                        &ram,
+                        strudel::RunBudget {
+                            memory_effects: 64,
+                            steps: 64,
+                        },
+                        is_mmio,
+                        |boundary| {
+                            !self.state.boundary_in_batch
+                                || boundary.last_lapic_delivery().is_some()
+                                || (boundary.at_instruction_boundary()
+                                    && checkpoint == Some(boundary.cpu().rip)
+                                    && (!checkpoint_guest || boundary.guest_mode()))
+                        },
+                    )
+                } else {
+                    core.run_fast(&ram, is_mmio)
+                };
+                result
             };
             let batch = match result {
                 Ok(batch) => batch,
@@ -902,7 +895,11 @@ impl Processor for EmuProcessor<'_> {
             let Some(delivered) = self.state.progress.delivered.checked_add(batch.delivered) else {
                 return Err(dev.fatal_error(Box::new(Error::ProgressExhausted)));
             };
-            self.state.progress = CompletedBatchProgress { retired, delivered };
+            self.state.progress = CompletedBatchProgress {
+                core_returns: self.state.progress.core_returns.wrapping_add(1),
+                retired,
+                delivered,
+            };
             let preparation = match self.ram.prepare_code_pages(&self.writes) {
                 Ok(preparation) => preparation,
                 Err(error) => return Err(dev.fatal_error(Box::new(Error::Ram(error)))),
@@ -931,11 +928,13 @@ impl Processor for EmuProcessor<'_> {
             if let Some(profile) = &mut self.state.profile {
                 profile.record(retired, delivered, || core.cpu().rip);
             }
-            // Frequent controller/checkpoint returns are not executor-yield requests.
-            batch_work += 1;
-            if batch_work == 64 {
-                self.control.yield_requested.request_yield();
-                batch_work = 0;
+            #[cfg(test)]
+            if self.state.observed {
+                observed_batches += 1;
+                if observed_batches == 64 {
+                    self.control.yield_requested.request_yield();
+                    observed_batches = 0;
+                }
             }
             if let Some(vector) = core.last_lapic_delivery() {
                 let slot = &mut self.state.apic_delivered[usize::from(vector)];
@@ -962,6 +961,14 @@ impl Processor for EmuProcessor<'_> {
                         Ok(reply) => reply,
                         Err(error) => return Err(dev.fatal_error(Box::new(error))),
                     };
+                    if let Err(error) = apic::arm_timer(
+                        lapic.timer_deadline(),
+                        self.clock,
+                        &self.state.timer,
+                        false,
+                    ) {
+                        return Err(dev.fatal_error(Box::new(error)));
+                    }
                     if !core.complete_control(sequence, reply) {
                         return Err(dev.fatal_error(Box::new(Error::Completion)));
                     }
@@ -1043,6 +1050,14 @@ impl Processor for EmuProcessor<'_> {
                                 }
                             }
                         };
+                        if let Err(error) = apic::arm_timer(
+                            lapic.timer_deadline(),
+                            self.clock,
+                            &self.state.timer,
+                            false,
+                        ) {
+                            return Err(dev.fatal_error(Box::new(error)));
+                        }
                         self.ram.barrier();
                         if !core.complete_io(request.sequence, reply) {
                             return Err(dev.fatal_error(Box::new(Error::Completion)));
@@ -1075,20 +1090,19 @@ impl Processor for EmuProcessor<'_> {
                 }
                 BatchStop::Budget | BatchStop::Yield => {}
                 BatchStop::Waiting => {
-                    let can_accept = core.pending().is_none();
-                    stop.until_stop(poll_fn(|cx| {
-                        self.control.waker.register(cx.waker());
-                        if self.control.unsupported.load(Ordering::Acquire)
-                            || (can_accept && self.control.pending.load(Ordering::Acquire) != 0)
-                            || self.control.apic_work_pending()
-                            || self.clock.poll_timeout(cx).is_ready()
-                        {
-                            Poll::Ready(())
-                        } else {
-                            Poll::Pending
-                        }
-                    }))
-                    .await?;
+                    #[cfg(test)]
+                    if self.state.observed {
+                        stop.until_stop(std::future::poll_fn(|cx| {
+                            self.control.remote.poll_wake(cx)
+                        }))
+                        .await?;
+                        continue;
+                    }
+                    #[cfg(test)]
+                    self.control.waiting.store(true, Ordering::Release);
+                    self.control.remote.wait_for_wake();
+                    #[cfg(test)]
+                    self.control.waiting.store(false, Ordering::Release);
                 }
                 BatchStop::Stopped(reason) => {
                     return Err(dev.fatal_error(Box::new(Error::Cpu(reason))));
@@ -1099,8 +1113,8 @@ impl Processor for EmuProcessor<'_> {
 
     fn flush_async_requests(&mut self) {
         if let CpuLifecycle::Ready(core) = &mut self.state.cpu {
-            if let Err(error) = self.control.flush(core) {
-                self.state.fault = Some(error);
+            if let Err(error) = core.flush_vp_control() {
+                self.state.fault = Some(Error::ApicIngress(error));
             }
         }
     }
@@ -1108,6 +1122,7 @@ impl Processor for EmuProcessor<'_> {
     fn access_state(&mut self, vtl: Vtl) -> EmuStateAccess<'_> {
         EmuStateAccess {
             state: self.state,
+            control: &self.control,
             caps: &self.caps,
             vtl,
         }
@@ -1125,6 +1140,7 @@ impl Processor for EmuProcessor<'_> {
 /// Snapshot access and initialization-only register import.
 pub struct EmuStateAccess<'a> {
     state: &'a mut VpState,
+    control: &'a Control,
     caps: &'a PartitionCapabilities,
     vtl: Vtl,
 }
@@ -1331,6 +1347,7 @@ impl AccessVpState for EmuStateAccess<'_> {
             self.state.backend,
         )?;
         core.set_svm_exit_stop(self.state.svm_exit_checkpoint);
+        core.set_vp_control(self.control.remote.clone());
         #[cfg(test)]
         core.set_test_options(strudel::TestOptions {
             cache: self.state.decode_cache_enabled,
@@ -1339,10 +1356,9 @@ impl AccessVpState for EmuStateAccess<'_> {
             if !core.configure_apic(id) {
                 return Err(Error::Profile("initial APIC metadata"));
             }
-            core.lapic_access()
-                .expect("just configured")
-                .set_cr8(regs.cr8)
-                .map_err(Error::Apic)?;
+            let mut lapic = core.lapic_access().expect("just configured");
+            lapic.set_cr8(regs.cr8).map_err(Error::Apic)?;
+            self.control.publish_apic(lapic.registers());
         }
         self.state.cpu = CpuLifecycle::Ready(Box::new(core));
         Ok(())

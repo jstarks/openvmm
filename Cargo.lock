@@ -10491,6 +10491,7 @@ dependencies = [
  "loader",
  "local_clock",
  "memory_range",
+ "mesh",
  "missing_dev",
  "pal_async",
  "parking_lot",

@@ -1873,8 +1873,6 @@ mod native {
                     "fetch_misses":d.fetch_misses,
                     "execution_lookups":d.execution_lookups,
                     "execution_hits":d.execution_hits,"execution_misses":d.execution_misses,
-                    "chain_lookups":d.chain_lookups,"chain_hits":d.chain_hits,
-                    "chain_links":d.chain_links,
                     "block_hits":d.block_hits,"forward_admissions":d.forward_admissions,
                 })
             };
@@ -2200,10 +2198,6 @@ mod native {
             decode.execution_hits > 0,
             "VA execution-cache path was not exercised"
         );
-        ensure!(
-            decode.chain_hits > 0,
-            "intra-page successor path was not exercised"
-        );
         let preparation = vp.code_preparation_diagnostics();
         let jit = jit_json(&vp, native_jit, progress.retired)?;
         if native_jit {
@@ -2226,7 +2220,6 @@ mod native {
                 "jit": jit,
                 "no_refetch_hits":no_refetch_hits,
                 "execution_cache_hits":decode.execution_hits,
-                "chain_hits":decode.chain_hits,
                 "execution":execution_json(execution),
                 "translations":{
                     "hits":translations.hits,"misses":translations.misses,

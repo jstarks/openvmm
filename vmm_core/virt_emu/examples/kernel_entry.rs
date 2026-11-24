@@ -1813,7 +1813,7 @@ mod native {
                         Error::Cpu { .. }
                             | Error::Checkpoint { .. }
                             | Error::Apic(_)
-                            | Error::ApicAccess { .. }
+                            | Error::LocalDevice { .. }
                             | Error::ApicIngress(_)
                             | Error::UnsupportedInterrupt
                             | Error::Memory(_)

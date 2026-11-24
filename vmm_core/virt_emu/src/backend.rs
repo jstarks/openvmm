@@ -20,7 +20,7 @@ use hvdef::Vtl;
 use memory_range::MemoryRange;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Wake, Waker};
 pub use strudel::DecodeDiagnostics;
 use strudel::{CpuState, Machine, Stop as BatchStop, VpControl};
@@ -40,11 +40,11 @@ use x86_system::mmu::translate::RunError;
 use x86_system::mmu::translate::io::IoReply;
 use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
 
-#[path = "backend_apic.rs"]
-mod apic;
 #[cfg(feature = "perf")]
 #[path = "backend_perf.rs"]
 pub mod perf;
+#[path = "backend_timer.rs"]
+mod timer;
 
 /// Unsupported profile, invalid lifecycle operation, or execution failure.
 #[derive(Debug, thiserror::Error)]
@@ -123,15 +123,13 @@ pub enum Error {
     /// The owned controller rejected an unimplemented device profile.
     #[error("Strudel local APIC stopped: {0:?}")]
     Apic(x86_system::arch::apic::registers::Error),
-    /// An architectural local APIC access stopped the Strudel backend.
-    #[error("Strudel local APIC at guest RIP {rip:#x}: {access}: {reason:?}")]
-    ApicAccess {
+    /// Failure in an owned VP-local device.
+    #[error("Strudel VP-local device at guest RIP {rip:#x}: {reason:#x?}")]
+    LocalDevice {
         /// RIP of the unretired instruction.
         rip: u64,
-        /// Register interface, direction, and operands.
-        access: String,
-        /// Rejection from Strudel's register model.
-        reason: x86_system::arch::apic::registers::Error,
+        /// Access and rejection from Strudel.
+        reason: strudel::LocalError,
     },
     /// A controller message could not enter its architectural image.
     #[error("owned APIC ingress rejected: {0:?}")]
@@ -140,11 +138,10 @@ pub enum Error {
 
 struct Control {
     irq_routes: virt::irqcon::IrqRoutes,
-    lint_routes: AtomicU64,
     #[cfg(test)]
     waiting: AtomicBool,
     has_apic: bool,
-    routing: AtomicU64,
+    routing: Arc<strudel::LocalRouting>,
     unsupported: AtomicBool,
     remote: VpControl,
     yield_requested: NeedsYield,
@@ -154,11 +151,10 @@ impl Control {
     fn new(has_apic: bool) -> Self {
         Self {
             irq_routes: Default::default(),
-            lint_routes: AtomicU64::new(0x0001_0000_0001_0000),
             #[cfg(test)]
             waiting: AtomicBool::new(false),
             has_apic,
-            routing: AtomicU64::new(0),
+            routing: Default::default(),
             unsupported: AtomicBool::new(false),
             remote: VpControl::default(),
             yield_requested: NeedsYield::new(),
@@ -168,6 +164,26 @@ impl Control {
     fn unsupported(&self) {
         self.unsupported.store(true, Ordering::Release);
         self.remote.request_attention();
+    }
+
+    fn request_apic_msi(&self, request: virt::irqcon::MsiRequest) {
+        let (address, data) = request.as_x86();
+        if !self.has_apic
+            || request.address >> 20 != 0xfee
+            || data.delivery_mode() > 1
+            || self
+                .routing
+                .post_msi(
+                    &self.remote,
+                    address.virt_destination().into(),
+                    address.destination_mode_logical(),
+                    data.vector(),
+                    data.trigger_mode_level(),
+                )
+                .is_err()
+        {
+            self.unsupported();
+        }
     }
 }
 
@@ -218,6 +234,7 @@ enum CpuLifecycle {
 
 struct VpState {
     timer: Arc<TimerWake>,
+    clock_source: VmTimeSource,
     backend: strudel::Backend,
     #[cfg(test)]
     decode_cache_enabled: bool,
@@ -614,6 +631,7 @@ impl ProtoPartition for EmuProtoPartition {
         let binder = EmuProcessorBinder {
             clock: self.clock.access("emu-tsc"),
             state: VpState {
+                clock_source: self.clock.clone(),
                 timer: Arc::new(TimerWake {
                     fired: false.into(),
                     remote: control.remote.clone(),
@@ -756,15 +774,13 @@ impl virt::X86Partition for EmuPartition {
             self.control.unsupported();
             return;
         }
-        let lvt = (self.control.lint_routes.load(Ordering::Acquire) >> (32 * lint)) as u32;
-        if lvt & (1 << 16) != 0 {
-            return;
-        }
-        // This profile implements edge-triggered fixed-vector LINT only.
-        if lvt & 0x8700 != 0 || (lvt as u8) < 32 {
+        if self
+            .control
+            .routing
+            .pulse_lint(&self.control.remote, lint)
+            .is_err()
+        {
             self.control.unsupported();
-        } else {
-            self.control.remote.post_interrupt(lvt as u8, false);
         }
     }
 }
@@ -919,10 +935,14 @@ impl EmuProcessor<'_> {
                     rip: core.cpu().rip,
                 })));
             }
-            if self.state.timer.fired.swap(false, Ordering::AcqRel)
-                && let Err(error) = apic::expire_timer(core, self.clock, &self.state.timer)
-            {
-                return Err(dev.fatal_error(Box::new(error)));
+            if self.state.timer.fired.swap(false, Ordering::AcqRel) {
+                core.expire_timers().map_err(|reason| {
+                    dev.fatal_error(Box::new(Error::LocalDevice {
+                        rip: core.cpu().rip,
+                        reason,
+                    }))
+                })?;
+                timer::arm(core.next_timer(), self.clock, &self.state.timer, true);
             }
             self.control.yield_requested.maybe_yield().await;
             stop.check()?;
@@ -934,12 +954,6 @@ impl EmuProcessor<'_> {
                     rip: core.cpu().rip,
                 })));
             }
-            // This profile does not support LAPIC base relocation. Keep its
-            // page off the direct path even while xAPIC MMIO is disabled.
-            let apic_page = core.lapic().map(|apic| apic.base & !0xfff);
-            let local_window = core.lapic().and_then(|apic| {
-                (apic.base & 0x800 != 0 && !apic.x2apic()).then_some(apic.base & !0xfff)
-            });
             if checkpoint_guest {
                 core.set_guest_entry_stop(checkpoint);
             } else {
@@ -956,12 +970,11 @@ impl EmuProcessor<'_> {
                     })
                 };
                 let is_ram_page = |base: u64| {
-                    Some(base) != apic_page
-                        && base.checked_add(4096).is_some_and(|end| {
-                            self.ram_ranges
-                                .iter()
-                                .any(|range| range.start() <= base && end <= range.end())
-                        })
+                    base.checked_add(4096).is_some_and(|end| {
+                        self.ram_ranges
+                            .iter()
+                            .any(|range| range.start() <= base && end <= range.end())
+                    })
                 };
                 let counted =
                     |batch: strudel::Batch| (batch.stop, Some((batch.retired, batch.delivered)));
@@ -1078,36 +1091,18 @@ impl EmuProcessor<'_> {
                 }
             }
             match batch_stop {
-                BatchStop::ControlIo { sequence, access } => {
-                    let Some(mut lapic) = core.lapic_access() else {
-                        return Err(
-                            dev.fatal_error(Box::new(Error::Profile("missing owned LAPIC")))
-                        );
-                    };
-                    let reply = match apic::ticks(self.clock.now())
-                        .and_then(|now| apic::control(&mut lapic, access, now, &self.control, dev))
-                    {
-                        Ok(reply) => reply,
-                        Err(Error::Apic(reason)) => {
-                            return Err(dev.fatal_error(Box::new(Error::ApicAccess {
-                                rip: core.cpu().rip,
-                                access: format!("MSR {access:#x?}"),
-                                reason,
-                            })));
-                        }
-                        Err(error) => return Err(dev.fatal_error(Box::new(error))),
-                    };
-                    if let Err(error) = apic::arm_timer(
-                        lapic.timer_deadline(),
-                        self.clock,
-                        &self.state.timer,
-                        false,
-                    ) {
-                        return Err(dev.fatal_error(Box::new(error)));
-                    }
-                    if !core.complete_control(sequence, reply) {
-                        return Err(dev.fatal_error(Box::new(Error::Completion)));
-                    }
+                BatchStop::TimerChanged(next) => {
+                    timer::arm(next, self.clock, &self.state.timer, false)
+                }
+                BatchStop::Eoi(vector) => {
+                    dev.handle_eoi(vector.into());
+                    timer::arm(core.next_timer(), self.clock, &self.state.timer, false);
+                }
+                BatchStop::LocalError(reason) => {
+                    return Err(dev.fatal_error(Box::new(Error::LocalDevice {
+                        rip: core.cpu().rip,
+                        reason,
+                    })));
                 }
                 BatchStop::Timestamp { sequence } => {
                     let ticks = self
@@ -1150,71 +1145,6 @@ impl EmuProcessor<'_> {
                     self.state.io_active = true;
                     self.ram.barrier();
                     let size = usize::from(request.size);
-                    if let Some(base) = local_window
-                        .filter(|&base| request.address >= base && request.address - base < 4096)
-                    {
-                        let Some(mut lapic) = core.lapic_access() else {
-                            return Err(dev.fatal_error(Box::new(Error::Profile(
-                                "missing local APIC window owner",
-                            ))));
-                        };
-                        let now = match apic::ticks(self.clock.now()) {
-                            Ok(now) => now,
-                            Err(error) => return Err(dev.fatal_error(Box::new(error))),
-                        };
-                        let offset = (request.address - base) as u16;
-                        let reply = match request.access {
-                            WordAccess::Read => match lapic.mmio_read(offset, request.size, now) {
-                                Ok(value) => IoReply::Read(u64::from(value)),
-                                Err(error) => {
-                                    return Err(dev.fatal_error(Box::new(Error::ApicAccess {
-                                        rip: core.cpu().rip,
-                                        access: format!(
-                                            "MMIO read {:#x} ({} bytes)",
-                                            request.address, request.size
-                                        ),
-                                        reason: error,
-                                    })));
-                                }
-                            },
-                            WordAccess::Write(value) => {
-                                match lapic.mmio_write(offset, request.size, value as u32, now) {
-                                    Ok(effects) => {
-                                        if let Err(error) =
-                                            apic::effect(&mut lapic, &self.control, effects, dev)
-                                        {
-                                            return Err(dev.fatal_error(Box::new(error)));
-                                        }
-                                        IoReply::Written
-                                    }
-                                    Err(error) => {
-                                        return Err(dev.fatal_error(Box::new(Error::ApicAccess {
-                                            rip: core.cpu().rip,
-                                            access: format!(
-                                                "MMIO write {:#x} = {value:#x} ({} bytes)",
-                                                request.address, request.size
-                                            ),
-                                            reason: error,
-                                        })));
-                                    }
-                                }
-                            }
-                        };
-                        if let Err(error) = apic::arm_timer(
-                            lapic.timer_deadline(),
-                            self.clock,
-                            &self.state.timer,
-                            false,
-                        ) {
-                            return Err(dev.fatal_error(Box::new(error)));
-                        }
-                        self.ram.barrier();
-                        if !core.complete_io(request.sequence, reply) {
-                            return Err(dev.fatal_error(Box::new(Error::Completion)));
-                        }
-                        self.state.io_active = false;
-                        continue;
-                    }
                     let reply = match request.access {
                         WordAccess::Read => {
                             let mut bytes = [0; 8];
@@ -1557,13 +1487,14 @@ impl AccessVpState for EmuStateAccess<'_> {
         core.set_test_options(strudel::TestOptions {
             cache: self.state.decode_cache_enabled,
         });
+        let clock = self.state.clock_source.access("strudel-vp-clock");
+        core.set_vm_clock(move || clock.now().as_100ns());
         if let Some(id) = self.state.apic_id {
             if !core.configure_apic(id) {
                 return Err(Error::Profile("initial APIC metadata"));
             }
-            let mut lapic = core.lapic_access().expect("just configured");
-            lapic.set_cr8(regs.cr8).map_err(Error::Apic)?;
-            self.control.publish_apic(lapic.registers());
+            core.set_cr8(regs.cr8).map_err(Error::Apic)?;
+            core.set_local_routing(self.control.routing.clone());
         }
         self.state.cpu = CpuLifecycle::Ready(Box::new(core));
         Ok(())

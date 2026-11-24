@@ -142,6 +142,9 @@ mesh_worker::register_workers! {
 
 // Hypervisor backend resolvers.
 vm_resource::register_static_resolvers! {
+    #[cfg(all(target_os = "linux", guest_arch = "x86_64", guest_is_native, feature = "strudel"))]
+    hypervisor_resolvers::strudel::StrudelResolver,
+
     #[cfg(all(target_os = "linux", feature = "virt_mshv", guest_is_native))]
     hypervisor_resolvers::mshv::MshvResolver,
 

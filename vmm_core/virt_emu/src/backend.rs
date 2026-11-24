@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Restricted single-VP long-mode backend, not a Linux-capable machine backend.
+//! Restricted single-VP long-mode backend for Linux direct boot.
 //!
 //! Initial register import and owned APIC/MSI are supported; reset, migration, other VTLs
 //! and subsequent register writes are rejected. Stop is deferred until an
@@ -120,6 +120,8 @@ pub enum Error {
 }
 
 struct Control {
+    irq_routes: virt::irqcon::IrqRoutes,
+    lint_routes: AtomicU64,
     #[cfg(test)]
     waiting: AtomicBool,
     has_apic: bool,
@@ -132,6 +134,8 @@ struct Control {
 impl Control {
     fn new(has_apic: bool) -> Self {
         Self {
+            irq_routes: Default::default(),
+            lint_routes: AtomicU64::new(0x0001_0000_0001_0000),
             #[cfg(test)]
             waiting: AtomicBool::new(false),
             has_apic,
@@ -170,6 +174,7 @@ pub struct EmuHypervisor;
 
 /// Validated profile awaiting existing backing.
 pub struct EmuProtoPartition {
+    backend: strudel::Backend,
     caps: Arc<PartitionCapabilities>,
     clock: VmTimeSource,
     architectural_apic: bool,
@@ -179,6 +184,7 @@ pub struct EmuProtoPartition {
 }
 
 /// Partition control and bounded external event ingress.
+#[derive(Clone)]
 pub struct EmuPartition {
     caps: Arc<PartitionCapabilities>,
     control: Arc<Control>,
@@ -436,6 +442,32 @@ impl Hypervisor for EmuHypervisor {
     }
 }
 
+/// The strict native executor used by full OpenVMM on Linux/x86-64.
+#[cfg(all(feature = "native-jit", target_os = "linux"))]
+pub struct NativeHypervisor;
+
+#[cfg(all(feature = "native-jit", target_os = "linux"))]
+impl Hypervisor for NativeHypervisor {
+    type ProtoPartition<'a> = EmuProtoPartition;
+    type Partition = EmuPartition;
+    type Error = Error;
+
+    fn platform_info(&self) -> PlatformInfo {
+        PlatformInfo::default()
+    }
+    fn recognizes_nested_virt(&self) -> bool {
+        true
+    }
+    fn new_partition(
+        &mut self,
+        config: ProtoPartitionConfig<'_>,
+    ) -> Result<EmuProtoPartition, Error> {
+        let mut proto = EmuHypervisor.new_partition(config)?;
+        proto.backend = strudel::Backend::Native;
+        Ok(proto)
+    }
+}
+
 impl EmuHypervisor {
     /// Constructs the frozen pre-APIC regression fixture, not a production option.
     pub fn new_legacy_fixture<'a>(
@@ -489,7 +521,7 @@ impl EmuHypervisor {
         } else {
             x86_system::arch::svm::RESET
         };
-        let caps = PartitionCapabilities::from_cpuid(
+        let mut caps = PartitionCapabilities::from_cpuid(
             config.processor_topology,
             &mut |function, subleaf| {
                 let mut values = x86_system::arch::svm::cpuid(svm, function, subleaf);
@@ -501,7 +533,9 @@ impl EmuHypervisor {
                 values
             },
         )?;
+        caps.nested_virt = config.nested_virt;
         Ok(EmuProtoPartition {
+            backend: strudel::Backend::Interpreter,
             caps: Arc::new(caps),
             clock: config.vmtime.clone(),
             architectural_apic,
@@ -565,7 +599,7 @@ impl ProtoPartition for EmuProtoPartition {
                     fired: false.into(),
                     remote: control.remote.clone(),
                 }),
-                backend: strudel::Backend::Interpreter,
+                backend: self.backend,
                 #[cfg(test)]
                 decode_cache_enabled: true,
                 #[cfg(test)]
@@ -677,6 +711,44 @@ impl virt::Hv1 for EmuPartition {
     }
 }
 
+impl virt::PartitionMemoryMapper for EmuPartition {
+    fn memory_mapper(&self, vtl: Vtl) -> Arc<dyn PartitionMemoryMap> {
+        assert_eq!(vtl, Vtl::Vtl0);
+        Arc::new(self.clone())
+    }
+}
+
+impl virt::irqcon::IoApicRouting for Control {
+    fn set_irq_route(&self, irq: u8, request: Option<virt::irqcon::MsiRequest>) {
+        self.irq_routes.set_irq_route(irq, request);
+    }
+    fn assert_irq(&self, irq: u8) {
+        self.irq_routes
+            .assert_irq(irq, |request| self.request_apic_msi(request));
+    }
+}
+
+impl virt::X86Partition for EmuPartition {
+    fn ioapic_routing(&self) -> Arc<dyn virt::irqcon::IoApicRouting> {
+        self.control.clone()
+    }
+    fn pulse_lint(&self, vp: VpIndex, vtl: Vtl, lint: u8) {
+        if vp != VpIndex::BSP || vtl != Vtl::Vtl0 || lint > 1 {
+            self.control.unsupported();
+            return;
+        }
+        let lvt = (self.control.lint_routes.load(Ordering::Acquire) >> (32 * lint)) as u32;
+        if lvt & (1 << 16) != 0 {
+            return;
+        }
+        // This profile implements edge-triggered fixed-vector LINT only.
+        if lvt & 0x8700 != 0 || (lvt as u8) < 32 {
+            self.control.unsupported();
+        } else {
+            self.control.remote.post_interrupt(lvt as u8, false);
+        }
+    }
+}
 impl Partition for EmuPartition {
     fn initial_vp_state_source(&self) -> InitialVpStateSource {
         InitialVpStateSource::Registers
@@ -1322,6 +1394,29 @@ macro_rules! unsupported_state {
         fn $get(&mut self) -> Result<$ty, Error> { Err(Error::Profile(stringify!($get))) }
         fn $set(&mut self, _value: &$ty) -> Result<(), Error> { Err(Error::Profile(stringify!($set))) }
     )*};
+}
+
+impl virt::PartitionAccessState for EmuPartition {
+    type StateAccess<'a> = &'a Self;
+    fn access_state(&self, vtl: Vtl) -> Self::StateAccess<'_> {
+        assert_eq!(vtl, Vtl::Vtl0);
+        self
+    }
+}
+
+impl virt::vm::AccessVmState for &EmuPartition {
+    type Error = Error;
+    fn caps(&self) -> &PartitionCapabilities {
+        &self.caps
+    }
+    fn commit(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    unsupported_state! {
+        (hypercall, set_hypercall, virt::vm::HypercallMsrs),
+        (reference_tsc_page, set_reference_tsc_page, virt::vm::ReferenceTscPage),
+        (reftime, set_reftime, virt::vm::ReferenceTime),
+    }
 }
 
 impl AccessVpState for EmuStateAccess<'_> {

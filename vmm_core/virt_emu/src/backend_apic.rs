@@ -24,6 +24,11 @@ pub(super) fn ticks(time: vmcore::vmtime::VmTime) -> Result<u64, Error> {
 
 impl Control {
     pub(super) fn publish_apic(&self, apic: &LocalApic) {
+        let mask = if apic.enabled() { 0 } else { 1 << 16 };
+        self.lint_routes.store(
+            u64::from(apic.lvt[3] | mask) | (u64::from(apic.lvt[4] | mask) << 32),
+            Ordering::Release,
+        );
         self.routing.store(
             u64::from(apic.id) | (u64::from(apic.ldr) << 32) | (u64::from(apic.enabled()) << 40),
             Ordering::Release,

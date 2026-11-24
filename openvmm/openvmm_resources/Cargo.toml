@@ -18,6 +18,7 @@ virt_mshv = ["dep:virt_mshv"]
 
 # Enable building with KVM support.
 virt_kvm = ["dep:virt_kvm"]
+strudel = ["dep:virt_emu"]
 
 # Enable building with WHP support.
 virt_whp = ["openvmm_core/virt_whp", "dep:virt_whp"]
@@ -123,6 +124,7 @@ net_tap = { workspace = true, optional = true }
 vhost_user_frontend.workspace = true
 disk_blockdevice.workspace = true
 virt_kvm = { workspace = true, optional = true }
+virt_emu = { workspace = true, optional = true, features = ["direct-ram"] }
 virt_mshv = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]

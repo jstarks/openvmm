@@ -76,6 +76,18 @@ describes the source definitions.
   `x86_64` guests only), `hvf` (macOS). When omitted, OpenVMM
   auto-detects the best available backend.
 
+  On Linux x86-64, builds with the experimental `strudel` Cargo feature also
+  accept `--hypervisor strudel`. This is a software CPU backend and is never
+  auto-selected. Its supported boot profile is one VP, Linux direct boot,
+  x2APIC supported (not forced on), no VMBus or Hyper-V enlightenments, and
+  no isolation. For example:
+
+  ```sh
+  openvmm --hypervisor strudel -p 1 -m 512M --x2apic supported --no-vmbus \
+    --kernel vmlinux --initrd initrd --com1 console \
+    --cmdline 'console=ttyS0 nokaslr rdinit=/init'
+  ```
+
   WHP accepts the following parameters (x86_64 guests only):
   * `user_mode_apic` — use the user-mode APIC emulator instead of WHP's
     in-hypervisor APIC

@@ -4,8 +4,8 @@
 //! Initial owned-core integration with OpenVMM register and memory types.
 //!
 //! The host-x86 `backend` implements a restricted long-mode VP lifecycle with
-//! shared paging, events and device continuation. It is not a selectable
-//! Linux-capable machine backend. The backend uses Strudel's self-contained machine.
+//! shared paging, events and device continuation. Full OpenVMM can select
+//! the native Strudel executor with `--hypervisor strudel` for Linux direct boot.
 
 #![deny(unsafe_code)]
 #![cfg(guest_arch = "x86_64")]

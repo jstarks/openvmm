@@ -10,4 +10,5 @@
 pub mod hvf;
 pub mod kvm;
 pub mod mshv;
+pub mod strudel;
 pub mod whp;

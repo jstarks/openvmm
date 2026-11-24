@@ -86,6 +86,14 @@ impl ResourceId<HypervisorKind> for WhpHandle {
 #[derive(MeshPayload)]
 pub struct HvfHandle;
 
+/// Explicit software execution on the restricted Strudel x86-64 backend.
+#[derive(MeshPayload)]
+pub struct StrudelHandle;
+
+impl ResourceId<HypervisorKind> for StrudelHandle {
+    const ID: &'static str = "strudel";
+}
+
 impl ResourceId<HypervisorKind> for HvfHandle {
     const ID: &'static str = "hvf";
 }

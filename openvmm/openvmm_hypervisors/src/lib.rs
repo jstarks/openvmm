@@ -14,10 +14,14 @@
 pub mod hvf;
 pub mod kvm;
 pub mod mshv;
+pub mod strudel;
 pub mod whp;
 
 // Register probes for auto-detection (checked in this order).
 hypervisor_resources::register_hypervisor_probes! {
+    #[cfg(all(target_os = "linux", guest_arch = "x86_64", guest_is_native, feature = "strudel"))]
+    strudel::StrudelProbe,
+
     #[cfg(all(target_os = "linux", feature = "virt_mshv", guest_is_native))]
     mshv::MshvProbe,
 

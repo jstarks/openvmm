@@ -432,6 +432,7 @@ impl MshvProtoPartition<'_> {
         let hv1 = self.config.hv_config.is_some();
         Ok(X86PartitionCapabilities {
             vendor,
+            mtrrs: true,
             hv1,
             hv1_reference_tsc_page: hv1_reference_tsc_page_supported(
                 hv1,

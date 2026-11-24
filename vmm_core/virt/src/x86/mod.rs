@@ -86,6 +86,8 @@ pub struct X86PartitionCapabilities {
     pub vtom: Option<u64>,
     /// The physical address width of the CPU, as reported by CPUID.
     pub physical_address_width: u8,
+    /// Guest MTRRs are available for the loader to describe variable RAM ranges.
+    pub mtrrs: bool,
     /// The page-table bit that marks private memory for SNP, if supported.
     pub snp_c_bit: Option<u8>,
 
@@ -140,6 +142,7 @@ impl X86PartitionCapabilities {
             tsc_deadline: false,
             vtom: None,
             physical_address_width: max_physical_address_size_from_cpuid(&mut *f),
+            mtrrs: false,
             snp_c_bit: snp_c_bit_from_cpuid(&mut *f),
             can_freeze_time: false,
             xsaves_state_bv_broken: false,
@@ -159,6 +162,7 @@ impl X86PartitionCapabilities {
         if max_function >= CpuidFunction::VersionAndFeatures.0 {
             let result = f(CpuidFunction::VersionAndFeatures.0, 0);
             this.reset_rdx = result[0].into();
+            this.mtrrs = result[3] & (1 << 12) != 0;
             let features = result[2] as u64 | ((result[3] as u64) << 32);
             this.x2apic = features & (1 << 21) != 0;
             this.tsc_deadline = features & (1 << 24) != 0;

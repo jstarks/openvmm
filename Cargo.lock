@@ -6633,6 +6633,7 @@ dependencies = [
  "tpm_device",
  "uidevices",
  "vhost_user_frontend",
+ "virt_emu",
  "virt_hvf",
  "virt_kvm",
  "virt_mshv",

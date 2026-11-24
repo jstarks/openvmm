@@ -3634,7 +3634,7 @@ impl LoadedVmInner {
         // Don't setup variable MTRRs if VTL2 is present. It's expected that
         // VTL2 will setup MTRRs for VTL0 if needed.
         #[cfg(guest_arch = "x86_64")]
-        if self.hypervisor_cfg.with_vtl2.is_none() {
+        if self.hypervisor_cfg.with_vtl2.is_none() && self.partition.caps().mtrrs {
             regs.extend(loader::common::compute_variable_mtrrs(
                 &self.mem_layout,
                 self.partition.caps().physical_address_width,

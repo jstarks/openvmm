@@ -31,6 +31,7 @@ tpm = [
 ]
 virt_hvf = ["openvmm_resources/virt_hvf", "openvmm_hypervisors/virt_hvf"]
 virt_kvm = ["openvmm_resources/virt_kvm", "openvmm_hypervisors/virt_kvm"]
+strudel = ["openvmm_resources/strudel", "openvmm_hypervisors/strudel"]
 virt_mshv = ["openvmm_resources/virt_mshv", "openvmm_hypervisors/virt_mshv"]
 virt_whp = ["openvmm_resources/virt_whp", "openvmm_hypervisors/virt_whp"]
 

@@ -468,6 +468,7 @@ state_unit = { path = "vmm_core/state_unit" }
 virt = { path = "vmm_core/virt" }
 virt_hvf = { path = "vmm_core/virt_hvf" }
 virt_kvm = { path = "vmm_core/virt_kvm" }
+virt_emu = { path = "vmm_core/virt_emu" }
 x86_system = { package = "strudel-core", path = "../strudel-consolidation/crates/strudel-core" }
 x86_decode = { package = "strudel-decode", path = "../strudel-consolidation/crates/strudel-decode" }
 strudel = { path = "../strudel-consolidation/crates/strudel" }

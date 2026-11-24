@@ -12,6 +12,7 @@ virt_mshv = ["dep:virt_mshv"]
 
 # Enable building with KVM support.
 virt_kvm = []
+strudel = []
 
 # Enable building with WHP support.
 virt_whp = ["dep:virt_whp"]

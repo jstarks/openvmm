@@ -175,7 +175,7 @@ fn mapping(operations: u64, mut control: impl FnMut(bool) -> Result<()>) -> Resu
     }
     ensure!(memory.prepare_code_pages(&watches)?.prepared == 64);
     let lease = memory.access();
-    let ram = lease.ram_for_execution();
+    let ram = lease.ram();
     let mut sum = 0u64;
     let mut direct = 0;
     control(true)?;

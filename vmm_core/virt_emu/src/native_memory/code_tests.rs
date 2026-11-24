@@ -65,16 +65,7 @@ fn normal_leases_share_a_domain_even_when_watches_are_added_or_renewed() {
     request(&memory, 4096);
     prepare(&memory);
     assert!(first.is_valid());
-    assert!(
-        original.same_domain(
-            memory
-                .partition
-                .access()
-                .ram_for_execution()
-                .code_domain()
-                .unwrap()
-        )
-    );
+    assert!(original.same_domain(memory.partition.access().ram().code_domain().unwrap()));
 }
 
 #[test]
@@ -90,7 +81,6 @@ fn cold_query_and_page_registration_do_not_read_backing() {
     {
         let access = memory.partition.access();
         let ram = access.ram();
-        assert!(ram.read::<1>(0).is_err());
         assert!(ram.code_token(0, 1).is_none());
         assert!(ram.code_token(4095, 1).is_none());
         assert_eq!(
@@ -112,7 +102,6 @@ fn cold_query_and_page_registration_do_not_read_backing() {
     for _ in 0..32 {
         assert!(std::ptr::eq(first, ram.code_token(8, 15).unwrap()));
     }
-    assert!(ram.read::<1>(0).is_err());
     assert!(memory.partition.pending_code_pages.lock().is_empty());
 }
 
@@ -196,11 +185,12 @@ fn discontiguous_host_spans_and_unrepresentable_page_ends_stay_fresh() {
         assert!(partition.pending_code_pages.lock().is_empty());
         assert!(ram.code_token(0, 1).is_none());
     }
+    assert!(partition.pending_code_pages.lock().is_empty());
     assert_eq!(
         partition.prepare_code_pages(&watches).unwrap(),
         CodePreparation {
             prepared: 0,
-            unavailable: 1,
+            unavailable: 0
         }
     );
     partition.unmap_range(0, 4096).unwrap();

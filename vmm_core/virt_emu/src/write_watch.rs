@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
-use x86_system::memory::physical::{CodeValidity, CopyError, PageWatch};
+use x86_system::memory::physical::{CodeValidity, PageWatch};
 
 struct Watch {
     range: Range<u64>,
@@ -105,7 +105,7 @@ pub enum CodeCaptureError {
     Mapping(#[from] RamError),
     /// The code range or captured backing is unavailable.
     #[error("capturing physical code")]
-    Capture(#[from] CaptureError<CopyError<RamError>>),
+    Capture(#[from] CaptureError<RamError>),
 }
 
 /// Captured value and its write-validity token.

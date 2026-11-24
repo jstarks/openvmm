@@ -938,7 +938,7 @@ impl EmuProcessor<'_> {
             }
             let result = {
                 let access = self.ram.access();
-                let ram = access.ram_for_execution();
+                let ram = access.ram();
                 let is_mmio = |address: u64, width: u8| {
                     (0..u64::from(width)).all(|offset| {
                         !self.ram_ranges.iter().any(|range| {
@@ -995,7 +995,7 @@ impl EmuProcessor<'_> {
                     return Err(dev.fatal_error(Box::new(Error::NativeCompilation {
                         rip: core.cpu().rip,
                         instruction: core
-                            .describe_instruction(&self.ram.access().ram_for_execution())
+                            .describe_instruction(&self.ram.access().ram())
                             .unwrap_or_else(|| "instruction bytes unavailable".into()),
                         reason,
                     })));
@@ -1165,7 +1165,7 @@ impl EmuProcessor<'_> {
                     return Err(dev.fatal_error(Box::new(Error::Cpu {
                         rip: core.cpu().rip,
                         instruction: core
-                            .describe_instruction(&self.ram.access().ram_for_execution())
+                            .describe_instruction(&self.ram.access().ram())
                             .unwrap_or_else(|| "instruction bytes unavailable".into()),
                         reason,
                     })));

@@ -1,12 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::mapped_test_memory::TestRam;
+use crate::mapped_test_memory::MappedTestMemory;
+use crate::native_memory::PartitionMemory;
 use guestmem::GuestMemory;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use test_with_tracing::test;
-use x86_system::memory::physical::{self as physical, PhysicalRam};
+use x86_system::memory::physical::PhysicalRam;
 use x86_system::mmu::translate::{Progress, Request, RunError, Translator};
 use x86_system::mmu::{Access, Config, MmuResult, ReferenceMmu, Report};
 
@@ -35,13 +36,13 @@ pub(super) fn bytes() -> Vec<u8> {
     ram
 }
 
-pub(super) fn fixture(data: &[u8]) -> (GuestMemory, TestRam) {
-    let ram = TestRam::new(data);
+pub(super) fn fixture(data: &[u8]) -> (GuestMemory, MappedTestMemory<PartitionMemory>) {
+    let ram = MappedTestMemory::fixture(data);
     let memory = ram.guest_memory();
     (memory, ram)
 }
 
-fn finish(mmu: &mut Translator, ram: &TestRam) -> Report {
+fn finish(mmu: &mut Translator, ram: &impl PhysicalRam) -> Report {
     for _ in 0..128 {
         if let Progress::Complete(report) = mmu.run(ram, 1).unwrap() {
             return report;
@@ -51,7 +52,9 @@ fn finish(mmu: &mut Translator, ram: &TestRam) -> Report {
 }
 
 fn compare(mut data: Vec<u8>, c: Config, va: u64, access: Access, user: bool) {
-    let (memory, ram) = fixture(&data);
+    let (memory, image) = fixture(&data);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut owned = ReferenceMmu::new(c, 0x77);
     let expected = owned.access(&mut data, 0, va, access, user);
     let mut shared = Translator::new(c, 0x77);
@@ -77,7 +80,9 @@ fn shared_atomic_operations_observe_dma_at_the_locked_operation() {
     use x86_system::arch::{integer::Operation, operand::Width};
     for arithmetic in [false, true] {
         let data = bytes();
-        let (memory, ram) = fixture(&data);
+        let (memory, image) = fixture(&data);
+        let lease = image.access();
+        let ram = lease.ram();
         let mut mmu = Translator::new(config(), 0x77);
         let accepted = if arithmetic {
             mmu.begin_locked_modify(0, Operation::Inc, 0, 1, Width::Byte)
@@ -134,7 +139,9 @@ fn shared_huge_leaf_geometry_word_cache_and_pde_replacement() {
     data[0x200000] = 0x71;
     data[0x20f123] = 0x72;
     data[0x3fffff] = 0x73;
-    let (memory, ram) = fixture(&data);
+    let (memory, image) = fixture(&data);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut owned = ReferenceMmu::new(config(), 77);
     let mut shared = Translator::new(config(), 77);
     for va in [0x200000, 0x20f123, 0x3fffff] {
@@ -267,7 +274,9 @@ fn shared_mmu_revalidates_replaced_and_revoked_ptes() {
         (Access::Read, 0x5007, 0x6006, MmuResult::PageFault(0)),
         (Access::Write(0xcc), 0x5027, 0x5025, MmuResult::PageFault(3)),
     ] {
-        let (memory, ram) = fixture(&bytes());
+        let (memory, image) = fixture(&bytes());
+        let lease = image.access();
+        let ram = lease.ram();
         let mut mmu = Translator::new(config(), 0x77);
         assert!(mmu.begin(0, access, false));
         let mut reached = false;
@@ -301,55 +310,9 @@ fn shared_mmu_revalidates_replaced_and_revoked_ptes() {
 
 #[test]
 fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
-    struct FailOnce {
-        ram: TestRam,
-        fail: std::sync::atomic::AtomicBool,
-    }
-    impl PhysicalRam for FailOnce {
-        type Error = std::io::Error;
-        fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
-            None
-        }
-        fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], Self::Error> {
-            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                return Err(std::io::Error::other("scheduled backing failure"));
-            }
-            self.ram.read(address).map_err(std::io::Error::other)
-        }
-        fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), Self::Error> {
-            self.ram
-                .write(address, value)
-                .map_err(std::io::Error::other)
-        }
-        fn read_bytes(
-            &self,
-            address: u64,
-            destination: &mut [u8],
-        ) -> Result<(), physical::CopyError<Self::Error>> {
-            physical::read_bytes(self, address, destination)
-        }
-        fn write_bytes(
-            &self,
-            address: u64,
-            source: &[u8],
-        ) -> Result<(), physical::CopyError<Self::Error>> {
-            physical::write_bytes(self, address, source)
-        }
-        fn atomic(
-            &self,
-            address: u64,
-            width: u8,
-            operation: physical::AtomicOperation,
-        ) -> Result<physical::AtomicResult, physical::CopyError<Self::Error>> {
-            self.ram
-                .atomic(address, width, operation)
-                .map_err(super::test_support::map_copy_error)
-        }
-        fn barrier(&self) {
-            self.ram.barrier();
-        }
-    }
-    let (memory, ram) = fixture(&bytes());
+    let (memory, image) = fixture(&bytes());
+    let lease = image.access();
+    let ram = lease.ram();
     let mut mmu = Translator::new(config(), 0x77);
     assert!(mmu.begin(0, Access::Read, false));
     let request = mmu.request();
@@ -359,11 +322,12 @@ fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
     assert!(!mmu.invalidate(0));
     assert!(!mmu.exchanged());
     assert_eq!(mmu.request(), request);
-    let fail = FailOnce {
-        ram: ram.clone(),
-        fail: true.into(),
-    };
-    assert!(matches!(mmu.run(&fail, 1), Err(RunError::Memory { .. })));
+    image.with_hole(0x1000..0x1008, |access| {
+        assert!(matches!(
+            mmu.run(&access.ram(), 1),
+            Err(RunError::Memory { .. })
+        ))
+    });
     assert_eq!(mmu.request(), request);
     assert_eq!(mmu.cr2(), 0x77);
     assert_eq!(memory.read_plain::<u64>(0x1000).unwrap(), 0x2007);
@@ -372,7 +336,9 @@ fn shared_mmu_retains_pending_effect_on_yield_and_memory_error() {
 
 #[test]
 fn shared_mmu_parallel_cpu_contexts_and_direct_dma_preserve_neighbors() {
-    let (memory, ram) = fixture(&bytes());
+    let (memory, image) = fixture(&bytes());
+    let lease = image.access();
+    let ram = lease.ram();
     memory.write_plain(0x5000, &0u64).unwrap();
     let start = Arc::new(Barrier::new(3));
     thread::scope(|scope| {
@@ -408,7 +374,9 @@ fn shared_mmu_parallel_cpu_contexts_and_direct_dma_preserve_neighbors() {
 
 #[test]
 fn shared_mmu_tlbs_are_per_cpu_stale_until_explicit_invalidation() {
-    let (memory, ram) = fixture(&bytes());
+    let (memory, image) = fixture(&bytes());
+    let lease = image.access();
+    let ram = lease.ram();
     let mut first = Translator::new(config(), 0);
     let mut second = Translator::new(config(), 0);
     assert!(first.begin(0, Access::Read, false));
@@ -439,7 +407,9 @@ fn shared_mmu_self_pte_alias_and_backing_error_order() {
     let mut data = bytes();
     data[0x4000..0x4008].copy_from_slice(&0x4007u64.to_le_bytes());
     compare(data, config(), 0, Access::Write(1), false);
-    let (memory, ram) = fixture(&bytes()[..0x5000]);
+    let (memory, image) = fixture(&bytes()[..0x5000]);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut mmu = Translator::new(config(), 0x77);
     assert!(mmu.begin(0, Access::Write(0xcc), false));
     assert!(matches!(mmu.run(&ram, 32), Err(RunError::Copy { .. })));
@@ -455,7 +425,7 @@ fn shared_mmu_self_pte_alias_and_backing_error_order() {
     ));
 }
 
-fn finish_word(mmu: &mut Translator, ram: &TestRam) -> x86_system::mmu::word::WordReport {
+fn finish_word(mmu: &mut Translator, ram: &impl PhysicalRam) -> x86_system::mmu::word::WordReport {
     for _ in 0..128 {
         match mmu.run(ram, 1).unwrap() {
             Progress::CompleteWord(report) => return report,
@@ -475,7 +445,9 @@ fn shared_qwords_match_owned_ram_at_every_supported_offset() {
             for (i, byte) in expected[0x5000..0x6000].iter_mut().enumerate() {
                 *byte = i as u8;
             }
-            let (memory, ram) = fixture(&expected);
+            let (memory, image) = fixture(&expected);
+            let lease = image.access();
+            let ram = lease.ram();
             let mut owned = ReferenceMmu::new(config(), 0x77);
             let report = owned.access_word(&mut expected, 0, offset, access, false);
             let mut shared = Translator::new(config(), 0x77);
@@ -489,7 +461,9 @@ fn shared_qwords_match_owned_ram_at_every_supported_offset() {
     }
     for va in [4089, 4095, u64::MAX, u64::MAX - 7, 0x8000_0000_0000] {
         let mut data = bytes();
-        let (_, ram) = fixture(&data);
+        let (_, image) = fixture(&data);
+        let lease = image.access();
+        let ram = lease.ram();
         let mut owned = ReferenceMmu::new(config(), 0x77);
         let mut shared = Translator::new(config(), 0x77);
         assert!(shared.begin_word(va, WordAccess::Read, false));
@@ -503,7 +477,9 @@ fn shared_qwords_match_owned_ram_at_every_supported_offset() {
 #[test]
 fn shared_aligned_qword_stores_are_native_and_do_not_tear() {
     use x86_system::mmu::word::WordAccess;
-    let (memory, ram) = fixture(&bytes());
+    let (memory, image) = fixture(&bytes());
+    let lease = image.access();
+    let ram = lease.ram();
     memory.write_plain(0x5000, &0u64).unwrap();
     let values = [0x5555aaaa5555aaaa, 0xaaaa5555aaaa5555];
     let start = Arc::new(Barrier::new(3));
@@ -544,55 +520,10 @@ fn shared_aligned_qword_stores_are_native_and_do_not_tear() {
 
 #[test]
 fn split_qword_yield_and_error_never_replay_committed_head() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use x86_system::mmu::word::{WordAccess, WordResult};
-    struct TailFault {
-        ram: TestRam,
-        fail: AtomicBool,
-    }
-    impl PhysicalRam for TailFault {
-        type Error = std::io::Error;
-        fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
-            None
-        }
-        fn read<const N: usize>(&self, a: u64) -> Result<[u8; N], Self::Error> {
-            self.ram.read(a).map_err(std::io::Error::other)
-        }
-        fn write<const N: usize>(&self, a: u64, v: [u8; N]) -> Result<(), Self::Error> {
-            if a == 0x5008 && self.fail.swap(false, Ordering::SeqCst) {
-                return Err(std::io::Error::other("scheduled tail failure"));
-            }
-            self.ram.write(a, v).map_err(std::io::Error::other)
-        }
-        fn read_bytes(
-            &self,
-            address: u64,
-            destination: &mut [u8],
-        ) -> Result<(), physical::CopyError<Self::Error>> {
-            physical::read_bytes(self, address, destination)
-        }
-        fn write_bytes(
-            &self,
-            address: u64,
-            source: &[u8],
-        ) -> Result<(), physical::CopyError<Self::Error>> {
-            physical::write_bytes(self, address, source)
-        }
-        fn atomic(
-            &self,
-            a: u64,
-            width: u8,
-            operation: physical::AtomicOperation,
-        ) -> Result<physical::AtomicResult, physical::CopyError<Self::Error>> {
-            self.ram
-                .atomic(a, width, operation)
-                .map_err(super::test_support::map_copy_error)
-        }
-        fn barrier(&self) {
-            self.ram.barrier();
-        }
-    }
-    let (memory, ram) = fixture(&bytes());
+    let (memory, image) = fixture(&bytes());
+    let lease = image.access();
+    let ram = lease.ram();
     let value = 0x1122334455667788;
     let mut mmu = Translator::new(config(), 0);
     assert!(mmu.begin_word(1, WordAccess::Write(value), false));
@@ -612,11 +543,11 @@ fn split_qword_yield_and_error_never_replay_committed_head() {
         assert_eq!(mmu.run(&ram, 1).unwrap(), Progress::Yield);
     }
     assert!(reached);
-    let fault = TailFault {
-        ram: ram.clone(),
-        fail: true.into(),
-    };
-    assert!(matches!(mmu.run(&fault, 1), Err(RunError::Copy {source,..}) if source.completed==7));
+    image.with_hole(0x5008..0x5009, |access| {
+        assert!(
+            matches!(mmu.run(&access.ram(),1),Err(RunError::Copy{source,..}) if source.completed==7)
+        )
+    });
     assert!(matches!(
         mmu.request(),
         Request::WriteBytes {
@@ -646,7 +577,9 @@ fn qword_aliases_and_revocation_keep_dirty_order_precise() {
     for offset in 0..8 {
         let mut data = bytes();
         data[0x4000..0x4008].copy_from_slice(&0x4007u64.to_le_bytes());
-        let (memory, ram) = fixture(&data);
+        let (memory, image) = fixture(&data);
+        let lease = image.access();
+        let ram = lease.ram();
         let mut owned = ReferenceMmu::new(config(), 0);
         let access = WordAccess::Write(0x1122334455667788);
         let expected = owned.access_word(&mut data, 0, offset, access, false);
@@ -657,7 +590,9 @@ fn qword_aliases_and_revocation_keep_dirty_order_precise() {
         memory.read_at(0, &mut actual).unwrap();
         assert_eq!(actual, data);
     }
-    let (memory, ram) = fixture(&bytes());
+    let (memory, image) = fixture(&bytes());
+    let lease = image.access();
+    let ram = lease.ram();
     let mut mmu = Translator::new(config(), 0);
     assert!(mmu.begin_word(1, WordAccess::Write(u64::MAX), false));
     let mut reached = false;

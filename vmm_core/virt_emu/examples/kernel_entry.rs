@@ -1905,7 +1905,7 @@ mod native {
                         "decode_decision":size_of::<x86_system::execute::decode::DecodeOutcome>(),
                         "request":size_of::<x86_system::mmu::translate::Request>(),
                         "reply":size_of::<x86_system::mmu::translate::Reply>(),
-                        "effect_result":size_of::<Result<x86_system::mmu::translate::Reply,x86_system::mmu::translate::RunError<virt_emu::native_memory::RamError>>>(),
+                        "effect_result":size_of::<Result<x86_system::mmu::translate::Reply,x86_system::mmu::translate::RunError<x86_system::ram_ranges::RangeError>>>(),
                     },
                     "jiffies_initial":initial_jiffies,"jiffies_final":final_jiffies,
                     "jiffies_delta":final_jiffies.wrapping_sub(initial_jiffies),

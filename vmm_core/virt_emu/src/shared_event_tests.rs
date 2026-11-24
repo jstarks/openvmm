@@ -2,13 +2,12 @@
 // Licensed under the MIT License.
 
 use super::test_support::{EventFixture, RunDecoded, long64_system, run_fixture};
-use crate::mapped_test_memory::TestRam;
+use crate::mapped_test_memory::MappedTestMemory;
+use crate::native_memory::PartitionMemory;
 use guestmem::GuestMemory;
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use test_with_tracing::test;
 use x86_system::execute::{Batch, BatchStop, Machine};
-use x86_system::memory::physical::{self as physical, PhysicalRam};
+use x86_system::memory::physical::PhysicalRam;
 use x86_system::mmu::translate::{Request, RunError};
 use x86_system::reference::{ReferenceCpu, ReferenceMachine, ReferenceMmu};
 use x86_system::{CpuState, EventDiagnostic, Injection, State, Tables};
@@ -95,8 +94,8 @@ pub(super) fn fixture() -> (Vec<u8>, EventFixture) {
     )
 }
 
-pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, TestRam) {
-    let ram = TestRam::new(bytes);
+pub(super) fn backing(bytes: &[u8]) -> (GuestMemory, MappedTestMemory<PartitionMemory>) {
+    let ram = MappedTestMemory::fixture(bytes);
     let memory = ram.guest_memory();
     (memory, ram)
 }
@@ -112,7 +111,7 @@ fn shared(owned: &EventFixture) -> Machine {
     .unwrap()
 }
 
-fn decoded_one(cpu: &mut Machine, ram: &TestRam) -> Batch {
+fn decoded_one(cpu: &mut Machine, ram: &impl PhysicalRam) -> Batch {
     let before = cpu.cpu();
     for _ in 0..4096 {
         let batch = cpu.run(ram, 1, 1).unwrap();
@@ -136,7 +135,9 @@ fn decoded_page_edge_retires_without_touching_the_missing_next_page() {
     put(&mut bytes, pte(0x11000), 0x11000);
     owned.core.cpu.rip = start as u64;
     owned.core.cpu.flags |= RF;
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     let batch = decoded_one(&mut cpu, &ram);
     assert_eq!(
@@ -165,7 +166,9 @@ fn decoded_faults_frame_ud_and_gp_without_fetching_past_the_page() {
         gate(&mut bytes, vector, IRQ, 0x8e);
         owned.core.cpu.rip = start as u64;
         let initial = owned.core.cpu;
-        let (memory, ram) = backing(&bytes);
+        let (memory, image) = backing(&bytes);
+        let lease = image.access();
+        let ram = lease.ram();
         let mut cpu = shared(&owned);
         let stack = initial.gpr[4] & !15;
         let mut stores = Vec::new();
@@ -235,7 +238,9 @@ fn truncated_decode_fetch_fault_wins_before_opcode_classification() {
     gate(&mut bytes, 14, IRQ, 0x8e);
     owned.core.cpu.rip = 0x10fff;
     let initial = owned.core.cpu;
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     let batch = decoded_one(&mut cpu, &ram);
     assert_eq!((batch.retired, batch.delivered), (0, 1));
@@ -256,7 +261,9 @@ fn decoded_scalar_and_legacy_keep_retained_bytes_after_direct_dma_changes_code()
         bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(code);
         owned.core.cpu.gpr[7] = 0x8000;
         put(&mut bytes, 0x8000, 0xabcdef0123456789);
-        let (memory, ram) = backing(&bytes);
+        let (memory, image) = backing(&bytes);
+        let lease = image.access();
+        let ram = lease.ram();
         let mut cpu = shared(&owned);
         loop {
             let batch = cpu.run(&ram, 1024, 1).unwrap();
@@ -296,7 +303,9 @@ fn decoded_fetch_fault_discards_prefix_and_rejects_reply_after_guest_repair() {
     owned.core.cpu.gpr[1] = 0x16007;
     owned.core.cpu.gpr[6] = pte(0x16000);
     owned.core.cpu.gpr[7] = 0x16000;
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     let stale = loop {
         let batch = cpu.run(&ram, 1024, 1).unwrap();
@@ -357,7 +366,9 @@ fn decoded_instruction_keeps_sti_shadow_until_retirement_then_delivers_irq() {
     bytes[CODE as usize..CODE as usize + 7]
         .copy_from_slice(&[0xfb, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xf4]);
     owned.core.cpu.flags &= !IF;
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     assert_eq!(decoded_one(&mut cpu, &ram).retired, 1);
     assert!(cpu.shadow());
@@ -414,7 +425,7 @@ fn compare_one(
     owned: &mut EventFixture,
     cpu: &mut Machine,
     memory: &GuestMemory,
-    ram: &TestRam,
+    ram: &impl PhysicalRam,
 ) -> Batch {
     let expected = run_fixture(owned, bytes, 1);
     let actual = one(cpu, ram);
@@ -434,7 +445,7 @@ fn compare_one(
     memory.read_at(0, &mut actual_bytes).unwrap();
     assert_eq!(
         actual_bytes, *bytes,
-        "complete vector/native RAM comparison"
+        "complete RAM comparison across run budgets"
     );
     actual
 }
@@ -443,7 +454,9 @@ fn compare_one(
 fn shared_guest_repairs_fault_retries_and_wakes_from_hlt() {
     let (mut bytes, mut owned) = fixture();
     let initial = owned.core.cpu;
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     let (mut retired, mut delivered) = (0, 0);
     for _ in 0..6 {
@@ -491,7 +504,9 @@ fn shared_event_entry_matches_owned_full_ram_matrix() {
                         2 => owned.core.cpu.gpr[7] = 0x8000_0000_0000,
                         _ => put(&mut bytes, pte(CODE), CODE | 7 | (1 << 63)),
                     }
-                    let (memory, ram) = backing(&bytes);
+                    let (memory, image) = backing(&bytes);
+                    let lease = image.access();
+                    let ram = lease.ram();
                     let mut cpu = shared(&owned);
                     if kind == 0 {
                         assert_eq!(cpu.inject(64), Injection::Queued);
@@ -514,7 +529,9 @@ fn shared_event_partial_frames_preserve_cpu_pending_and_prefix() {
         put(&mut bytes, pte(0x17000), 0x17000);
         assert_eq!(owned.inject(64), Injection::Queued);
         let initial = owned.core.cpu;
-        let (memory, ram) = backing(&bytes);
+        let (memory, image) = backing(&bytes);
+        let lease = image.access();
+        let ram = lease.ram();
         let mut cpu = shared(&owned);
         assert_eq!(cpu.inject(64), Injection::Queued);
         let batch = compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
@@ -529,68 +546,18 @@ fn shared_event_partial_frames_preserve_cpu_pending_and_prefix() {
     }
 }
 
-struct FailOnce {
-    ram: TestRam,
-    address: u64,
-    fail: AtomicBool,
-}
-
-impl PhysicalRam for FailOnce {
-    type Error = io::Error;
-    fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
-        None
-    }
-    fn read<const N: usize>(&self, address: u64) -> io::Result<[u8; N]> {
-        self.ram.read(address).map_err(io::Error::other)
-    }
-    fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> io::Result<()> {
-        if address == self.address && self.fail.swap(false, Ordering::SeqCst) {
-            return Err(io::Error::other("scheduled frame transport error"));
-        }
-        self.ram.write(address, value).map_err(io::Error::other)
-    }
-    fn read_bytes(
-        &self,
-        address: u64,
-        destination: &mut [u8],
-    ) -> Result<(), physical::CopyError<Self::Error>> {
-        physical::read_bytes(self, address, destination)
-    }
-    fn write_bytes(
-        &self,
-        address: u64,
-        source: &[u8],
-    ) -> Result<(), physical::CopyError<Self::Error>> {
-        physical::write_bytes(self, address, source)
-    }
-    fn atomic(
-        &self,
-        address: u64,
-        width: u8,
-        operation: physical::AtomicOperation,
-    ) -> Result<physical::AtomicResult, physical::CopyError<Self::Error>> {
-        self.ram
-            .atomic(address, width, operation)
-            .map_err(super::test_support::map_copy_error)
-    }
-    fn barrier(&self) {
-        self.ram.barrier();
-    }
-}
-
 #[test]
 fn shared_frame_host_error_and_dma_never_replay_committed_prefix() {
     let (bytes, owned) = fixture();
     let initial = owned.core.cpu;
-    let (memory, ram) = backing(&bytes);
-    let ram = FailOnce {
-        ram,
-        address: 0x17ff0,
-        fail: AtomicBool::new(true),
-    };
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     assert_eq!(cpu.inject(64), Injection::Queued);
-    let error = cpu.run(&ram, 256, 1).unwrap_err();
+    let error = image.with_hole(0x17ff0..0x17ff8, |access| {
+        cpu.run(&access.ram(), 256, 1).unwrap_err()
+    });
     assert!(matches!(
         error,
         RunError::Copy {
@@ -643,7 +610,9 @@ fn shared_iret_rejects_bad_images_without_early_cpu_commit() {
             _ => put(&mut bytes, pte(0x18000), 0x18000),
         }
         let initial = owned.core.cpu;
-        let (memory, ram) = backing(&bytes);
+        let (memory, image) = backing(&bytes);
+        let lease = image.access();
+        let ram = lease.ram();
         let mut cpu = shared(&owned);
         let batch = compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
         if kind == 0 {
@@ -664,7 +633,9 @@ fn shared_sti_shadow_rf_and_first_handler_boundaries_match_oracle() {
     let (mut bytes, mut owned) = fixture();
     owned.core.cpu.flags &= !IF;
     bytes[CODE as usize..CODE as usize + 5].copy_from_slice(&[0xfb, 0xfb, 0xfa, 0xf4, 0xf4]);
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     assert_eq!(cpu.inject(31), Injection::InvalidVector);
     assert_eq!(owned.inject(64), Injection::Queued);
@@ -682,7 +653,9 @@ fn shared_sti_shadow_rf_and_first_handler_boundaries_match_oracle() {
     );
 
     let (mut bytes, mut owned) = fixture();
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     for _ in 0..5 {
         compare_one(&mut bytes, &mut owned, &mut cpu, &memory, &ram);
@@ -706,7 +679,9 @@ fn shared_sti_shadow_rf_and_first_handler_boundaries_match_oracle() {
     bytes[CODE as usize..CODE as usize + 4].copy_from_slice(&[0xfb, 0x48, 0x8b, 0x07]);
     gate(&mut bytes, 14, HANDLER, 0x8f);
     assert_eq!(owned.inject(64), Injection::Queued);
-    let (memory, ram) = backing(&bytes);
+    let (memory, image) = backing(&bytes);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut cpu = shared(&owned);
     assert_eq!(cpu.inject(64), Injection::Queued);
     for _ in 0..2 {

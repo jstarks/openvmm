@@ -41,12 +41,14 @@ fn program(code: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn shared_cpu_native_and_vector_transports_agree_on_registers_and_full_ram() {
+fn budgeted_and_uninterrupted_runs_agree_on_registers_and_full_ram() {
     for rex in 0x48..=0x4f {
         for opcode in [0x01, 0x11, 0x8b, 0x89] {
             for modrm in 0..=255 {
                 let mut expected = program(&[rex, opcode, modrm]);
-                let (memory, ram) = fixture(&expected);
+                let (memory, image) = fixture(&expected);
+                let lease = image.access();
+                let ram = lease.ram();
                 let initial = state();
                 let mut owned = EventFixture {
                     system: long64_system(),
@@ -96,7 +98,9 @@ fn shared_cpu_native_and_vector_transports_agree_on_registers_and_full_ram() {
 fn shared_cpu_incremental_execution_matches_explicit_load_add_store_state() {
     let code = [0x48, 0x8b, 0x07, 0x48, 0x01, 0xc8, 0x48, 0x89, 0x07];
     let data = program(&code);
-    let (memory, ram) = fixture(&data);
+    let (memory, image) = fixture(&data);
+    let lease = image.access();
+    let ram = lease.ram();
     let mut initial = state();
     initial.gpr[7] = 0x1000;
     initial.gpr[1] = 1;
@@ -125,7 +129,9 @@ fn two_instruction_streams_and_direct_dma_share_existing_backing() {
     let code = [0x48, 0x8b, 0x07, 0x48, 0x01, 0xc8, 0x48, 0x89, 0x07].repeat(LOOPS);
     let data = program(&code);
     let code_len = code.len();
-    let (memory, ram) = fixture(&data);
+    let (memory, image) = fixture(&data);
+    let lease = image.access();
+    let ram = lease.ram();
     memory.write_plain(0x6000, &0u64).unwrap();
     memory.write_plain(0x6008, &100u64).unwrap();
     let start = Arc::new(Barrier::new(3));

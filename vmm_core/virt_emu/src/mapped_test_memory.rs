@@ -1,12 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::native_memory::{PartitionMemory, RamError};
+use crate::native_memory::PartitionMemory;
 use guestmem::{AlignedHeapMemory, GuestMemory, GuestMemoryAccess, WriteTracker};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use virt::PartitionMemoryMap;
-use x86_system::memory::physical::{AtomicOperation, AtomicResult, CopyError, PhysicalRam};
 
 struct ObservedAllocation {
     allocation: Arc<AlignedHeapMemory>,
@@ -96,64 +95,41 @@ impl<M: PartitionMemoryMap> Drop for MappedTestMemory<M> {
     }
 }
 
-/// Test-only convenience adapter; production leases once per synchronous batch.
-#[derive(Clone)]
-pub(crate) struct TestRam(Arc<MappedTestMemory<PartitionMemory>>);
-
-impl TestRam {
-    pub fn new(bytes: &[u8]) -> Self {
-        Self(Arc::new(MappedTestMemory::new(
-            Arc::new(PartitionMemory::new()),
-            bytes,
-        )))
+impl MappedTestMemory<PartitionMemory> {
+    pub fn fixture(bytes: &[u8]) -> Self {
+        Self::new(Arc::new(PartitionMemory::new()), bytes)
     }
-
-    pub fn guest_memory(&self) -> GuestMemory {
-        self.0.guest_memory()
+    pub fn access(&self) -> crate::native_memory::NativeAccess<'_> {
+        self.map.access()
     }
-}
-
-impl PhysicalRam for TestRam {
-    type Error = RamError;
-
-    fn code_token(
+    /// Retry tests can omit part of the same backing for exactly one run,
+    /// without a mock provider or making a host page inaccessible.
+    pub fn with_hole<T>(
         &self,
-        _address: u64,
-        _length: u8,
-    ) -> Option<&x86_system::memory::physical::CodeToken> {
-        None
-    }
-
-    fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], Self::Error> {
-        self.0.map.access().ram().read(address)
-    }
-
-    fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), Self::Error> {
-        self.0.map.access().ram().write(address, value)
-    }
-
-    fn read_bytes(
-        &self,
-        address: u64,
-        destination: &mut [u8],
-    ) -> Result<(), CopyError<Self::Error>> {
-        self.0.map.access().ram().read_bytes(address, destination)
-    }
-
-    fn write_bytes(&self, address: u64, source: &[u8]) -> Result<(), CopyError<Self::Error>> {
-        self.0.map.access().ram().write_bytes(address, source)
-    }
-
-    fn atomic(
-        &self,
-        address: u64,
-        width: u8,
-        operation: AtomicOperation,
-    ) -> Result<AtomicResult, CopyError<Self::Error>> {
-        self.0.map.access().ram().atomic(address, width, operation)
-    }
-
-    fn barrier(&self) {
-        self.0.map.access().ram().barrier();
+        hole: std::ops::Range<u64>,
+        run: impl FnOnce(&crate::native_memory::NativeAccess<'_>) -> T,
+    ) -> T {
+        assert!(hole.start < hole.end && hole.end <= self.size);
+        let (ptr, _) = self.memory.full_mapping().unwrap();
+        let partial = PartitionMemory::new();
+        for range in [0..hole.start, hole.end..self.size] {
+            if !range.is_empty() {
+                // SAFETY: the fixture owns this populated extent throughout
+                // the callback and until the temporary mapping table drops.
+                // UNSAFETY: installs a subrange of the fixture-owned backing.
+                #[expect(unsafe_code)]
+                unsafe {
+                    partial.map_range(
+                        ptr.add(range.start as usize).cast(),
+                        (range.end - range.start) as usize,
+                        range.start,
+                        true,
+                        true,
+                    )
+                }
+                .unwrap();
+            }
+        }
+        run(&partial.access())
     }
 }

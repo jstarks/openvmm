@@ -80,8 +80,10 @@ pub enum Error {
     #[error("decoder completion did not match the outstanding request")]
     DecodeCompletion,
     /// The selected executor cannot compile this entry; no guest exception was injected.
-    #[error("native compilation at {rip:#x}: {reason}")]
+    #[error("native compilation at guest RIP {rip:#x}: {instruction}: {reason}")]
     NativeCompilation {
+        /// Best available guest instruction text.
+        instruction: String,
         /// Unexecuted guest instruction.
         rip: u64,
         /// Unsupported operation or compilation failure.
@@ -100,8 +102,15 @@ pub enum Error {
     #[error("run future was cancelled during a device operation; replay is unsafe")]
     CancelledIo,
     /// The core explicitly stopped outside its execution profile.
-    #[error("emulated CPU stopped: {0:?}")]
-    Cpu(EventDiagnostic),
+    #[error("emulated CPU stopped at guest RIP {rip:#x}: {instruction}: {reason:?}")]
+    Cpu {
+        /// Architectural instruction pointer at the stop.
+        rip: u64,
+        /// Guest instruction and encoding, or an explicit unavailable marker.
+        instruction: String,
+        /// Original stop reason.
+        reason: EventDiagnostic,
+    },
     /// A physical operation failed without inventing a guest exception.
     #[error("physical memory operation failed")]
     Memory(#[from] RunError<RamError>),
@@ -985,6 +994,9 @@ impl EmuProcessor<'_> {
                 Err(RunError::NativeCompilation(reason)) => {
                     return Err(dev.fatal_error(Box::new(Error::NativeCompilation {
                         rip: core.cpu().rip,
+                        instruction: core
+                            .describe_instruction(&self.ram.access().ram_for_execution())
+                            .unwrap_or_else(|| "instruction bytes unavailable".into()),
                         reason,
                     })));
                 }
@@ -1212,7 +1224,13 @@ impl EmuProcessor<'_> {
                     self.control.waiting.store(false, Ordering::Release);
                 }
                 BatchStop::Stopped(reason) => {
-                    return Err(dev.fatal_error(Box::new(Error::Cpu(reason))));
+                    return Err(dev.fatal_error(Box::new(Error::Cpu {
+                        rip: core.cpu().rip,
+                        instruction: core
+                            .describe_instruction(&self.ram.access().ram_for_execution())
+                            .unwrap_or_else(|| "instruction bytes unavailable".into()),
+                        reason,
+                    })));
                 }
             }
         }

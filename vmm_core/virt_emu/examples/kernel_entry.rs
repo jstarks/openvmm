@@ -1810,7 +1810,7 @@ mod native {
                 matches!(
                     failure.downcast_ref::<Error>(),
                     Some(
-                        Error::Cpu(_)
+                        Error::Cpu { .. }
                             | Error::Checkpoint { .. }
                             | Error::Apic(_)
                             | Error::ApicIngress(_)

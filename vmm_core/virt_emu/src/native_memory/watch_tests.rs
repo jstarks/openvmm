@@ -90,6 +90,37 @@ fn operations(width: u8) -> Vec<AtomicOperation> {
 }
 
 #[test]
+fn pte_compare_only_attempts_aligned_unwatched_ram() {
+    use x86_system::memory::physical::TranslatedRam;
+
+    let memory = fixture(12288, 8192);
+    memory
+        .partition
+        .with_code_watch(4096..4104, |_| ())
+        .unwrap();
+    let access = memory.partition.access();
+    let ram = access.ram();
+    let mut cache = NativeTranslations::default();
+    let mut view = ram.translated(&mut cache);
+    for address in [1, 4096, 12288] {
+        assert!(view.compare_unwatched_pte(address, 0, 7).is_none());
+    }
+    assert_eq!(memory.backing.read_plain::<[u8; 8]>(1).unwrap(), [0; 8]);
+    assert_eq!(memory.backing.read_plain::<u64>(4096).unwrap(), 0);
+    assert_eq!(
+        view.compare_unwatched_pte(0, 0, 7).unwrap().unwrap(),
+        AtomicResult::Value(0)
+    );
+    assert_eq!(
+        view.compare_unwatched_pte(0, 0, 9).unwrap().unwrap(),
+        AtomicResult::Value(7)
+    );
+    assert_eq!(memory.backing.read_plain::<u64>(0).unwrap(), 7);
+    assert!(view.compare_unwatched_pte(8192, 0, 7).unwrap().is_err());
+    assert!(memory.observer.0.lock().is_empty());
+}
+
+#[test]
 fn unwatched_stores_and_atomics_do_not_enter_the_tracker() {
     let memory = fixture(12288, 12288);
     memory

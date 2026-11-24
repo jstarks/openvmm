@@ -166,6 +166,30 @@ impl TranslatedRam for NativeTranslated<'_> {
     type Error = RamError;
 
     #[inline]
+    fn compare_unwatched_pte(
+        &mut self,
+        address: u64,
+        expected: u64,
+        replacement: u64,
+    ) -> Option<Result<AtomicResult, CopyError<RamError>>> {
+        if !address.is_multiple_of(8) {
+            return None;
+        }
+        let qualified @ (_, false) = self.ram.pointer(address, 8, true).ok()? else {
+            return None;
+        };
+        Some(self.ram.atomic_pointer(
+            address,
+            8,
+            AtomicOperation::CompareExchange {
+                expected,
+                replacement,
+            },
+            Some(qualified),
+        ))
+    }
+
+    #[inline]
     fn direct_page(&self, physical_page: u64) -> Option<DirectPage<'_, Self>> {
         if !self.ram.direct_pages || !self.enabled {
             return None;

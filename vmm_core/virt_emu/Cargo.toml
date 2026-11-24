@@ -36,6 +36,7 @@ vmcore.workspace = true
 vm_topology.workspace = true
 trycopy.workspace = true
 parking_lot.workspace = true
+smallvec.workspace = true
 sparse_mmap = { workspace = true, optional = true }
 
 [dev-dependencies]

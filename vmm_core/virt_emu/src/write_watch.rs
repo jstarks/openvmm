@@ -10,6 +10,7 @@
 use crate::native_memory::RamError;
 use guestmem::{WriteObserver, WriteTracker};
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -28,7 +29,7 @@ impl CodeValidity for Watch {
 
 #[derive(Default)]
 struct WatchIndex {
-    pages: BTreeMap<u64, Weak<PageWatch>>,
+    pages: BTreeMap<u64, SmallVec<[Weak<PageWatch>; 1]>>,
     ranges: Vec<Weak<Watch>>,
 }
 
@@ -44,8 +45,8 @@ impl WriteObserver for Watches {
         let mut index = self.0.lock();
         index
             .pages
-            .extract_if(pages, |_, weak| {
-                if let Some(watch) = weak.upgrade() {
+            .extract_if(pages, |_, watches| {
+                for watch in watches.iter().filter_map(Weak::upgrade) {
                     watch.revoke();
                 }
                 true
@@ -149,12 +150,12 @@ impl WriteWatch {
         page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
         self.tracker.synchronize(|| {
             let mut index = self.watches.0.lock();
-            let entry = index.pages.entry(page / 4096).or_default();
-            let watch = entry.upgrade().unwrap_or_else(|| {
-                let watch = Arc::new(PageWatch::default());
-                *entry = Arc::downgrade(&watch);
-                watch
-            });
+            // The address identifies which watches to revoke, not the
+            // observation: an old token can outlive an unmap and remap.
+            let watches = index.pages.entry(page / 4096).or_default();
+            watches.retain(|weak| weak.strong_count() != 0);
+            let watch = Arc::new(PageWatch::default());
+            watches.push(Arc::downgrade(&watch));
             drop(index);
             publish(CodeToken::from_page(watch));
         });
@@ -225,7 +226,7 @@ mod tests {
             let first = ram.code_token(0, 1).unwrap();
             for _ in 0..64 {
                 assert!(first.same_observation(ram.code_token(64, 15).unwrap()));
-                assert_eq!(watches.watches.0.lock().pages[&0].strong_count(), 1);
+                assert_eq!(watches.watches.0.lock().pages[&0][0].strong_count(), 1);
             }
         }
         mappings.unmap_range(0, 4096).unwrap();
@@ -240,6 +241,7 @@ mod tests {
                 .capture_page(page, |token| tokens.push(token))
                 .unwrap();
         }
+        assert!(!tokens[1].same_observation(&tokens[3]));
         let span = watches
             .capture(4095..4097, || Ok::<_, std::io::Error>(()))
             .unwrap();

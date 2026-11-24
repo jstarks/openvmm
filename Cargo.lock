@@ -10512,6 +10512,7 @@ dependencies = [
  "serial_16550_resources",
  "serial_core",
  "sha2 0.11.0",
+ "smallvec",
  "sparse_mmap",
  "state_unit",
  "strudel",

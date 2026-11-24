@@ -10,6 +10,7 @@
 use crate::native_memory::RamError;
 use guestmem::{WriteObserver, WriteTracker};
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 use x86_system::memory::physical::{CodeToken, CodeValidity, CopyError, PageWatch};
@@ -26,11 +27,31 @@ impl CodeValidity for Watch {
 }
 
 #[derive(Default)]
-struct Watches(Mutex<Vec<Weak<Watch>>>);
+struct WatchIndex {
+    pages: BTreeMap<u64, Weak<PageWatch>>,
+    ranges: Vec<Weak<Watch>>,
+}
+
+#[derive(Default)]
+struct Watches(Mutex<WatchIndex>);
 
 impl WriteObserver for Watches {
     fn notify_write(&self, range: Range<u64>) {
-        self.0.lock().retain(|weak| {
+        if range.is_empty() {
+            return;
+        }
+        let pages = range.start / 4096..=(range.end - 1) / 4096;
+        let mut index = self.0.lock();
+        index
+            .pages
+            .extract_if(pages, |_, weak| {
+                if let Some(watch) = weak.upgrade() {
+                    watch.revoke();
+                }
+                true
+            })
+            .for_each(drop);
+        index.ranges.retain(|weak| {
             let Some(watch) = weak.upgrade() else {
                 return false;
             };
@@ -125,9 +146,17 @@ impl WriteWatch {
         if !page.is_multiple_of(4096) {
             return Err(RamError::InvalidWatchRange);
         }
-        let end = page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
+        page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
         self.tracker.synchronize(|| {
-            publish(CodeToken::new(self.register_watch(page..end)));
+            let mut index = self.watches.0.lock();
+            let entry = index.pages.entry(page / 4096).or_default();
+            let watch = entry.upgrade().unwrap_or_else(|| {
+                let watch = Arc::new(PageWatch::default());
+                *entry = Arc::downgrade(&watch);
+                watch
+            });
+            drop(index);
+            publish(CodeToken::new(watch));
         });
         Ok(())
     }
@@ -137,7 +166,8 @@ impl WriteWatch {
             range,
             validity: PageWatch::default(),
         });
-        let mut watches = self.watches.0.lock();
+        let mut index = self.watches.0.lock();
+        let watches = &mut index.ranges;
         watches.retain(|entry| entry.strong_count() != 0);
         watches.push(Arc::downgrade(&watch));
         watch
@@ -195,10 +225,33 @@ mod tests {
             let first = ram.code_token(0, 1).unwrap();
             for _ in 0..64 {
                 assert!(first.same_observation(ram.code_token(64, 15).unwrap()));
-                assert_eq!(watches.watches.0.lock()[0].strong_count(), 1);
+                assert_eq!(watches.watches.0.lock().pages[&0].strong_count(), 1);
             }
         }
         mappings.unmap_range(0, 4096).unwrap();
+    }
+
+    #[test]
+    fn a_cross_page_write_revokes_only_overlapping_pages_and_ranges() {
+        let watches = WriteWatch::default();
+        let mut tokens = Vec::new();
+        for page in [0, 4096, 8192, 4096] {
+            watches
+                .capture_page(page, |token| tokens.push(token))
+                .unwrap();
+        }
+        let span = watches
+            .capture(4095..4097, || Ok::<_, std::io::Error>(()))
+            .unwrap();
+        watches.tracker().notify_write(4095, 2).unwrap();
+        assert_eq!(
+            tokens.iter().map(CodeToken::is_valid).collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        assert!(!span.is_valid());
+        watches
+            .capture_page(4096, |token| assert!(token.is_valid()))
+            .unwrap();
     }
 
     #[test]
@@ -256,7 +309,7 @@ mod tests {
             Err::<(), _>(std::io::Error::other("capture failed"))
         });
         assert!(matches!(failure, Err(CaptureError::Read(_))));
-        assert!(watches.watches.0.lock().is_empty());
+        assert!(watches.watches.0.lock().ranges.is_empty());
     }
 
     #[test]

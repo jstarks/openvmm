@@ -142,9 +142,33 @@ pub struct PartitionMemory {
     vp_control: Option<strudel::VpControl>,
     mappings: RwLock<Vec<Mapping>>,
     tracker: Option<WriteTracker>,
-    code_tokens: RwLock<BTreeMap<u64, CodeToken>>,
+    code: RwLock<CodeObservations>,
     pending_code_pages: Mutex<BTreeSet<u64>>,
     binding_domain: Arc<BindingDomain>,
+}
+
+#[derive(Debug, Default)]
+struct CodeObservations {
+    domain: strudel::CodeDomain,
+    tokens: BTreeMap<u64, CodeToken>,
+}
+
+impl CodeObservations {
+    fn remove_range(&mut self, range: Range<u64>) {
+        let mut removed_live = false;
+        self.tokens.retain(|&page, token| {
+            let overlaps = page < range.end && range.start < page.saturating_add(4096);
+            if overlaps && token.is_valid() {
+                removed_live = true;
+            }
+            !overlaps
+        });
+        // Mapping changes need not revoke the underlying write watch. Cached
+        // observations must not authorize its old span under the new mapping.
+        if removed_live {
+            self.domain = strudel::CodeDomain::default();
+        }
+    }
 }
 
 /// Outcome of preparing the physical code pages requested by previous batches.
@@ -211,15 +235,16 @@ impl PartitionMemory {
                     Err(error) => return Err(error),
                 }
                 if self
-                    .code_tokens
+                    .code
                     .read()
+                    .tokens
                     .get(&page)
                     .is_some_and(CodeToken::is_valid)
                 {
                     return Ok(true);
                 }
                 watches.capture_page(page, |token| {
-                    self.code_tokens.write().insert(page, token);
+                    self.code.write().tokens.insert(page, token);
                 })?;
                 Ok(true)
             })??;
@@ -301,7 +326,7 @@ impl PartitionMemory {
         Ok(f(NativeRam {
             mappings: &mappings,
             tracker: Some(tracker),
-            code_tokens: None,
+            code: None,
             pending_code_pages: None,
             vp_control: None,
             binding_domain: None,
@@ -333,7 +358,7 @@ impl PartitionMemory {
         NativeAccess {
             mappings,
             tracker: self.tracker.as_ref(),
-            code_tokens: self.code_tokens.read(),
+            code: self.code.read(),
             pending_code_pages: &self.pending_code_pages,
             vp_control: self.vp_control.as_ref(),
             binding_domain: &self.binding_domain,
@@ -404,9 +429,7 @@ impl PartitionMemoryMap for PartitionMemory {
                 original_end: end,
             },
         );
-        self.code_tokens
-            .write()
-            .retain(|page, _| !(*page < end && addr < page.saturating_add(4096)));
+        self.code.write().remove_range(addr..end);
         self.binding_domain.revoke();
         Ok(())
     }
@@ -426,9 +449,7 @@ impl PartitionMemoryMap for PartitionMemory {
         }
         let previous_len = mappings.len();
         mappings.retain(|mapping| !(addr <= mapping.start && mapping.end <= end));
-        self.code_tokens
-            .write()
-            .retain(|page, _| !(*page < end && addr < page.saturating_add(4096)));
+        self.code.write().remove_range(addr..end);
         if mappings.len() != previous_len {
             self.binding_domain.revoke();
         }
@@ -470,7 +491,7 @@ pub enum AdUpdate {
 pub struct NativeAccess<'a> {
     mappings: RwLockReadGuard<'a, Vec<Mapping>>,
     tracker: Option<&'a WriteTracker>,
-    code_tokens: RwLockReadGuard<'a, BTreeMap<u64, CodeToken>>,
+    code: RwLockReadGuard<'a, CodeObservations>,
     pending_code_pages: &'a Mutex<BTreeSet<u64>>,
     vp_control: Option<&'a strudel::VpControl>,
     binding_domain: &'a Arc<BindingDomain>,
@@ -482,7 +503,7 @@ impl NativeAccess<'_> {
         NativeRam {
             mappings: &self.mappings,
             tracker: self.tracker,
-            code_tokens: Some(&self.code_tokens),
+            code: Some(&self.code),
             pending_code_pages: Some(self.pending_code_pages),
             vp_control: self.vp_control,
             binding_domain: Some(self.binding_domain),
@@ -520,7 +541,7 @@ impl NativeAccess<'_> {
 pub struct NativeRam<'a> {
     mappings: &'a [Mapping],
     tracker: Option<&'a WriteTracker>,
-    code_tokens: Option<&'a BTreeMap<u64, CodeToken>>,
+    code: Option<&'a CodeObservations>,
     pending_code_pages: Option<&'a Mutex<BTreeSet<u64>>>,
     vp_control: Option<&'a strudel::VpControl>,
     binding_domain: Option<&'a Arc<BindingDomain>>,
@@ -650,6 +671,10 @@ impl PhysicalRam for NativeRam<'_> {
         NativeTranslated::new(self, cache)
     }
 
+    fn code_domain(&self) -> Option<&strudel::CodeDomain> {
+        Some(&self.code?.domain)
+    }
+
     fn code_token(&self, address: u64, length: u8) -> Option<&CodeToken> {
         self.tracker?;
         if !(1..=15).contains(&length) {
@@ -660,7 +685,7 @@ impl PhysicalRam for NativeRam<'_> {
         if address.checked_add(u64::from(length))? > page_end {
             return None;
         }
-        let tokens = self.code_tokens?;
+        let tokens = &self.code?.tokens;
         // Publication qualifies the entire page; mapping changes remove its
         // identity under the exclusive mapping lease. This lease therefore
         // needs no second mapping lookup for a current identity.

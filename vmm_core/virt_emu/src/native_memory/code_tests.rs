@@ -47,6 +47,43 @@ fn token(memory: &Memory, address: u64) -> CodeToken {
     access.ram().code_token(address, 1).unwrap().clone()
 }
 
+fn domain(partition: &PartitionMemory) -> strudel::CodeDomain {
+    partition.access().ram().code_domain().unwrap().clone()
+}
+
+#[test]
+fn normal_leases_share_a_domain_even_when_watches_are_added_or_renewed() {
+    let memory = fixture(true);
+    let original = domain(&memory.partition);
+    request(&memory, 0);
+    prepare(&memory);
+    assert!(original.same_domain(&domain(&memory.partition)));
+    let first = token(&memory, 0);
+    request(&memory, 4096);
+    prepare(&memory);
+    memory.watches.tracker().notify_write(4096, 1).unwrap();
+    request(&memory, 4096);
+    prepare(&memory);
+    assert!(first.is_valid());
+    assert!(
+        original.same_domain(
+            memory
+                .partition
+                .access()
+                .ram_for_execution()
+                .code_domain()
+                .unwrap()
+        )
+    );
+}
+
+#[test]
+fn partitions_sharing_a_tracker_have_distinct_code_domains() {
+    let memory = fixture(true);
+    let other = PartitionMemory::with_write_tracker(memory.watches.tracker());
+    assert!(!domain(&memory.partition).same_domain(&domain(&other)));
+}
+
 #[test]
 fn cold_query_and_page_registration_do_not_read_backing() {
     let memory = fixture(false);
@@ -184,8 +221,11 @@ fn unmap_discards_identity_and_pending_disappearance_is_unavailable() {
     request(&memory, 0);
     prepare(&memory);
     let old = token(&memory, 0);
+    let old_domain = domain(&memory.partition);
     request(&memory, 4096);
     memory.partition.unmap_range(0, 8192).unwrap();
+    assert!(old.is_valid());
+    assert!(!old_domain.same_domain(&domain(&memory.partition)));
     assert_eq!(
         prepare(&memory),
         CodePreparation {
@@ -217,7 +257,7 @@ fn untracked_queries_and_mismatched_preparation_publish_nothing() {
         memory.partition.prepare_code_pages(&WriteWatch::default()),
         Err(RamError::TrackerMismatch)
     ));
-    assert!(memory.partition.code_tokens.read().is_empty());
+    assert!(memory.partition.code.read().tokens.is_empty());
     assert_eq!(prepare(&memory).prepared, 1);
     let translated =
         PartitionMemory::with_write_tracker(memory.watches.tracker().with_offset(1).unwrap());

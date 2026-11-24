@@ -8,10 +8,12 @@ use x86_system::memory::physical::{
 };
 
 const DATA_SLOTS: usize = if cfg!(feature = "direct-ram") { 256 } else { 1 };
-const SLOTS: usize = 5 + DATA_SLOTS;
+const TABLE_SETS: usize = if cfg!(feature = "direct-ram") { 16 } else { 1 };
+const DATA_START: usize = 1 + 4 * TABLE_SETS;
+const SLOTS: usize = DATA_START + DATA_SLOTS;
 
 fn data_index(page: u64) -> usize {
-    5 + (page as usize & (DATA_SLOTS - 1))
+    DATA_START + (page as usize & (DATA_SLOTS - 1))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -21,7 +23,7 @@ struct Slot {
     mapping: Option<Mapping>,
 }
 
-/// Opaque persistent host payloads for fetch/data and four walker slots.
+/// Opaque persistent host bindings for fetch, data and page-table accesses.
 /// Cached pointers are unusable until a live lease validates their domain.
 #[derive(Debug)]
 pub struct NativeTranslations {
@@ -135,7 +137,9 @@ impl<'a> NativeTranslated<'a> {
         let index = match translation.slot {
             TranslationSlot::Fetch => 0,
             TranslationSlot::Data => data_index(translation.physical_page),
-            TranslationSlot::Table(level) if level < 4 => usize::from(level) + 1,
+            TranslationSlot::Table(level) if level < 4 => {
+                1 + usize::from(level) + 4 * (translation.physical_page as usize & (TABLE_SETS - 1))
+            }
             TranslationSlot::Table(_) => return None,
         };
         let hit = self.cache.slots[index].is_some_and(|slot| slot.translation == *translation);

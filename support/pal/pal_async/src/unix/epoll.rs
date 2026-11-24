@@ -187,6 +187,7 @@ impl IoBackend for EpollBackend {
 
         let mut to_delete: Vec<_> = Vec::new();
         let mut wakers = WakerList::default();
+        let mut try_pwait2 = true;
 
         // Set up thread-local state for on-thread io-uring access.
         // The io-uring may not be initialized yet (it's lazy), so we
@@ -241,19 +242,12 @@ impl IoBackend for EpollBackend {
                             unsafe { uring_thread_state.set_ring(uring) }.flush();
                         }
 
-                        let timeout = deadline
-                            .map(|deadline| {
-                                let now = Instant::now();
-                                (deadline.max(now) - now)
-                                    .as_millis()
-                                    .try_into()
-                                    .unwrap_or(i32::MAX)
-                            })
-                            .unwrap_or(-1);
-
                         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
-                        let n = while_eintr(|| self.epfd.wait(&mut events, timeout))
-                            .expect("epoll_wait failed unexpectedly");
+                        let n = while_eintr(|| {
+                            let timeout = deadline.map(|d| d.saturating_sub(Instant::now()));
+                            self.epfd.wait(&mut events, timeout, &mut try_pwait2)
+                        })
+                        .expect("epoll wait failed unexpectedly");
 
                         // Block unnecessary wakeups.
                         let _ = self.state.lock().state.wake();
@@ -328,8 +322,36 @@ impl EpollFd {
         Ok(())
     }
 
-    fn wait(&self, events: &mut [libc::epoll_event], timeout: i32) -> Result<usize, Errno> {
+    fn wait(
+        &self,
+        events: &mut [libc::epoll_event],
+        timeout: Option<std::time::Duration>,
+        try_pwait2: &mut bool,
+    ) -> Result<usize, Errno> {
         let maxevents = events.len() as i32;
+        if *try_pwait2
+            && let Some(d) = timeout.filter(|d| !d.subsec_nanos().is_multiple_of(1_000_000))
+        {
+            let ts = io_uring::types::Timespec::from(d);
+            // SAFETY: ts has the kernel timespec layout, events has maxevents
+            // writable entries, and no signal mask is installed.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_epoll_pwait2,
+                    self.0.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    maxevents,
+                    &ts,
+                    std::ptr::null::<libc::sigset_t>(),
+                    0usize,
+                )
+            };
+            match (result as isize).syscall_result() {
+                Err(Errno(libc::ENOSYS)) => *try_pwait2 = false,
+                result => return result.map(|n| n as usize),
+            }
+        }
+        let timeout = timeout.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX));
         // SAFETY: maxevents is set appropriately to write to the events slice.
         let n = unsafe {
             libc::epoll_wait(self.0.as_raw_fd(), events.as_mut_ptr(), maxevents, timeout)

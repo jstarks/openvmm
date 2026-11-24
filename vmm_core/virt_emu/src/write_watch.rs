@@ -156,7 +156,7 @@ impl WriteWatch {
                 watch
             });
             drop(index);
-            publish(CodeToken::new(watch));
+            publish(CodeToken::from_page(watch));
         });
         Ok(())
     }

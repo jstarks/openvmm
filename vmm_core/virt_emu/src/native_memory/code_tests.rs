@@ -240,7 +240,7 @@ fn unmap_discards_identity_and_pending_disappearance_is_unavailable() {
             .map_range(memory.backing.as_ptr().cast(), 8192, 0, true, true)
     }
     .unwrap();
-    assert!(!memory.partition.mappings.read()[0].watched);
+    assert!(memory.partition.code.read().tokens.is_empty());
     request(&memory, 0);
     prepare(&memory);
     assert!(!token(&memory, 0).same_observation(&old));

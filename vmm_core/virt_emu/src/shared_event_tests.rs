@@ -536,7 +536,6 @@ struct FailOnce {
 }
 
 impl PhysicalRam for FailOnce {
-    x86_system::untranslated_ram!();
     type Error = io::Error;
     fn code_token(&self, _address: u64, _length: u8) -> Option<&physical::CodeToken> {
         None

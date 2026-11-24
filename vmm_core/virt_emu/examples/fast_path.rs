@@ -66,9 +66,10 @@ mod native {
             serde_json::json!({
                 "case":case,"operations":result.operations,"seconds":result.seconds,
                 "ns_per_operation":result.seconds * 1e9 / result.operations as f64,
-                "warm":true,"setup_included":false,
-                "scope":if case=="decode" {"cached decoder lookup"} else {"TLB hit plus native qword transport"},
-                "physical_effects_per_operation":if case=="decode" {0} else {1},
+                    "warm":case!="mapping","setup_included":false,
+                    "scope":match case.as_str() {"mapping"=>"two RAM ranges: table read, direct query, scalar write and read", "decode"=>"cached decoder lookup", _=>"TLB hit plus native qword transport"},
+                    "direct_pages":result.direct_pages,
+                    "physical_effects_per_operation":match case.as_str() {"decode"=>0,"mapping"=>3,_=>1},
             })
         );
         Ok(())

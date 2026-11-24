@@ -7,8 +7,8 @@
 //! returned. Each synchronous CPU batch holds one shared mapping lease, never
 //! across an await. Concurrent CPU batches and external DMA share the backing;
 //! mapping changes wait for all leases, not for individual memory operations.
-//! Optional code watches revoke old batches before capture. Only writes touching
-//! marked physical spans notify the tracker; untouched RAM remains ungated.
+//! Registration drains old leases before capture. Strudel manages CPU write
+//! observations; the backing tracker reports external writes.
 
 // UNSAFETY: partition-owned reservations are accessed only under a mapping lease,
 // without creating Rust references. The VM worker can opt into unguarded JIT
@@ -17,34 +17,15 @@
 
 use guestmem::{WriteTracker, WriteTrackerError};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::{Ordering, fence};
 use virt::PartitionMemoryMap;
 use x86_system::arch::integer;
 use x86_system::memory::physical::{
     self as physical, AtomicOperation, AtomicResult, CodeToken, CopyError, CopyErrorKind,
     PhysicalRam, WriteOutcome,
 };
-mod translation;
-pub use translation::{NativeTranslated, NativeTranslations};
-
-#[derive(Debug, Default)]
-struct BindingDomain {
-    generation: AtomicU64,
-}
-
-impl BindingDomain {
-    fn revoke(&self) {
-        // MAX disables binding reuse permanently; generations never wrap.
-        let _ = self
-            .generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            });
-    }
-}
 
 /// Failure of the physical RAM interface, not an architectural guest exception.
 #[derive(Debug, thiserror::Error)]
@@ -107,22 +88,7 @@ pub enum MapError {
     NonExecutable,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Mapping {
-    start: u64,
-    end: u64,
-    data: *mut u8,
-    writable: bool,
-    watched: bool,
-    original_start: u64,
-    original_end: u64,
-}
-
-// SAFETY: map_range's caller keeps the reservation alive and permits shared
-// native access until unmap returns. No Rust references to its bytes are made.
-unsafe impl Send for Mapping {}
-// SAFETY: concurrent accesses use native memory operations, not Rust references.
-unsafe impl Sync for Mapping {}
+use x86_system::ram_ranges::RamRange as Mapping;
 
 /// Partition mapping metadata, not an owner of the underlying allocation.
 ///
@@ -144,28 +110,19 @@ pub struct PartitionMemory {
     tracker: Option<WriteTracker>,
     code: RwLock<CodeObservations>,
     pending_code_pages: Mutex<BTreeSet<u64>>,
-    binding_domain: Arc<BindingDomain>,
 }
 
 #[derive(Debug, Default)]
 struct CodeObservations {
     domain: strudel::CodeDomain,
-    tokens: BTreeMap<u64, CodeToken>,
+    tokens: physical::CpuCodePages,
 }
 
 impl CodeObservations {
     fn remove_range(&mut self, range: Range<u64>) {
-        let mut removed_live = false;
-        self.tokens.retain(|&page, token| {
-            let overlaps = page < range.end && range.start < page.saturating_add(4096);
-            if overlaps && token.is_valid() {
-                removed_live = true;
-            }
-            !overlaps
-        });
         // Mapping changes need not revoke the underlying write watch. Cached
         // observations must not authorize its old span under the new mapping.
-        if removed_live {
+        if self.tokens.remove_range(range) {
             self.domain = strudel::CodeDomain::default();
         }
     }
@@ -227,32 +184,29 @@ impl PartitionMemory {
         let pending = std::mem::take(&mut *self.pending_code_pages.lock());
         let mut result = CodePreparation::default();
         for page in pending {
-            let end = page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
-            let available = self.with_code_watch(page..end, |ram| {
-                match ram.pointer(page, 4096, false) {
-                    Ok(_) => {}
-                    Err(RamError::Unmapped(_) | RamError::SplitAccess(_)) => return Ok(false),
-                    Err(error) => return Err(error),
+            page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
+            let mappings = self.change_mappings();
+            let ram = NativeRam {
+                mappings: &mappings,
+                tracker: Some(tracker),
+                code: None,
+                pending_code_pages: None,
+                vp_control: None,
+            };
+            match ram.pointer(page, 4096, false) {
+                Ok(_) => {}
+                Err(RamError::Unmapped(_) | RamError::SplitAccess(_)) => {
+                    result.unavailable += 1;
+                    continue;
                 }
-                if self
-                    .code
-                    .read()
-                    .tokens
-                    .get(&page)
-                    .is_some_and(CodeToken::is_valid)
-                {
-                    return Ok(true);
-                }
-                watches.capture_page(page, |token| {
-                    self.code.write().tokens.insert(page, token);
-                })?;
-                Ok(true)
-            })??;
-            if available {
-                result.prepared += 1;
-            } else {
-                result.unavailable += 1;
+                Err(error) => return Err(error),
             }
+            if self.code.read().tokens.token(page).is_none() {
+                watches.capture_page(page, |watch| {
+                    self.code.write().tokens.install(page, watch);
+                })?;
+            }
+            result.prepared += 1;
         }
         Ok(result)
     }
@@ -260,78 +214,40 @@ impl PartitionMemory {
     /// Revokes old CPU batches, marks physical pages, and captures code.
     ///
     /// Lock order is mapping lease, external tracker, then observer state.
-    /// The callback may acquire `WriteTracker::synchronize` to read/register
-    /// immutable code, but must not write, reenter this table, or await. It
-    /// runs with the exclusive mapping lease, after all old CPU writes and
-    /// their notifications have finished. Marks persist until unmap.
-    pub(crate) fn with_code_watch<T>(
+    /// The tracker excludes DMA during capture. The exclusive mapping lease
+    /// excludes CPU writes through publication into Strudel's watch registry.
+    pub(crate) fn capture_code<const N: usize>(
         &self,
-        range: Range<u64>,
-        f: impl FnOnce(NativeRam<'_>) -> T,
-    ) -> Result<T, RamError> {
-        if range.start >= range.end {
-            return Err(RamError::InvalidWatchRange);
-        }
+        watches: &crate::write_watch::WriteWatch,
+        address: u64,
+    ) -> Result<crate::write_watch::Watched<[u8; N]>, crate::write_watch::CodeCaptureError> {
+        let end = address
+            .checked_add(N as u64)
+            .filter(|&end| end > address)
+            .ok_or(RamError::InvalidWatchRange)?;
         let tracker = self.tracker.as_ref().ok_or(RamError::Untracked)?;
-        let start = range.start & !4095;
-        let end = range.end.checked_add(4095).map_or(u64::MAX, |v| v & !4095);
-        let mut mappings = self.change_mappings();
-        let changed = mappings
-            .iter()
-            .any(|mapping| mapping.start < end && start < mapping.end && !mapping.watched);
-        for boundary in [start, end] {
-            let index = mappings.partition_point(|mapping| mapping.end <= boundary);
-            if let Some(mapping) = mappings.get(index).copied()
-                && mapping.start < boundary
-                && boundary < mapping.end
-            {
-                mappings[index].end = boundary;
-                mappings.insert(
-                    index + 1,
-                    Mapping {
-                        start: boundary,
-                        data: mapping
-                            .data
-                            .wrapping_add((boundary - mapping.start) as usize),
-                        ..mapping
-                    },
-                );
-            }
+        if !tracker.same_domain(&watches.tracker()) {
+            return Err(RamError::TrackerMismatch.into());
         }
-        for mapping in mappings.iter_mut() {
-            if mapping.start < end && start < mapping.end {
-                mapping.watched = true;
-            }
-            if changed {
-                self.binding_domain.revoke();
-            }
-        }
-        // Only boundaries of changed watch permissions need survive.
-        let mut index = 1;
-        while index < mappings.len() {
-            let previous = &mappings[index - 1];
-            let next = &mappings[index];
-            if previous.end == next.start
-                && previous.original_start == next.original_start
-                && previous.original_end == next.original_end
-                && previous.watched == next.watched
-            {
-                mappings[index - 1].end = next.end;
-                mappings.remove(index);
-            } else {
-                index += 1;
-            }
-        }
+        let mappings = self.change_mappings();
         trycopy::initialize_try_copy();
-        Ok(f(NativeRam {
+        let ram = NativeRam {
             mappings: &mappings,
             tracker: Some(tracker),
             code: None,
             pending_code_pages: None,
             vp_control: None,
-            binding_domain: None,
-            direct_pages: false,
-        }))
+        };
+        let captured = watches.capture(address..end, || {
+            let mut bytes = [0; N];
+            ram.read_bytes(address, &mut bytes)?;
+            Ok(bytes)
+        })?;
+        self.code
+            .write()
+            .tokens
+            .observe_range(address..end, captured.validity());
+        Ok(captured)
     }
 
     /// Leases the mappings for one synchronous CPU batch.
@@ -361,7 +277,6 @@ impl PartitionMemory {
             code: self.code.read(),
             pending_code_pages: &self.pending_code_pages,
             vp_control: self.vp_control.as_ref(),
-            binding_domain: &self.binding_domain,
         }
     }
 
@@ -424,13 +339,9 @@ impl PartitionMemoryMap for PartitionMemory {
                 end,
                 data,
                 writable,
-                watched: false,
-                original_start: addr,
-                original_end: end,
             },
         );
         self.code.write().remove_range(addr..end);
-        self.binding_domain.revoke();
         Ok(())
     }
 
@@ -441,18 +352,12 @@ impl PartitionMemoryMap for PartitionMemory {
             return Ok(());
         }
         if mappings.iter().any(|mapping| {
-            mapping.start < end
-                && addr < mapping.end
-                && (mapping.original_start < addr || end < mapping.original_end)
+            mapping.start < end && addr < mapping.end && (mapping.start < addr || end < mapping.end)
         }) {
             return Err(MapError::PartialUnmap.into());
         }
-        let previous_len = mappings.len();
         mappings.retain(|mapping| !(addr <= mapping.start && mapping.end <= end));
         self.code.write().remove_range(addr..end);
-        if mappings.len() != previous_len {
-            self.binding_domain.revoke();
-        }
         Ok(())
     }
 
@@ -483,9 +388,8 @@ pub enum AdUpdate {
 
 /// Read-side mapping lease for a synchronous CPU batch.
 ///
-/// This guard is not Send. Drop it before awaiting, even on a local executor,
-/// and before changing this partition's mappings. Borrow its native RAM view
-/// with `ram()` for the duration of synchronous execution.
+/// This guard is not Send. Drop it before awaiting or changing mappings.
+/// `ram()` uses checked host accesses; the VP worker lends the ranges directly.
 #[derive(Debug)]
 #[must_use]
 pub struct NativeAccess<'a> {
@@ -494,37 +398,54 @@ pub struct NativeAccess<'a> {
     code: RwLockReadGuard<'a, CodeObservations>,
     pending_code_pages: &'a Mutex<BTreeSet<u64>>,
     vp_control: Option<&'a strudel::VpControl>,
-    binding_domain: &'a Arc<BindingDomain>,
 }
 
 impl NativeAccess<'_> {
     /// Borrows a concurrent-capable view without acquiring another lock.
-    pub fn ram(&self) -> NativeRam<'_> {
+    fn backing(&self) -> NativeRam<'_> {
         NativeRam {
             mappings: &self.mappings,
             tracker: self.tracker,
             code: Some(&self.code),
             pending_code_pages: Some(self.pending_code_pages),
             vp_control: self.vp_control,
-            binding_domain: Some(self.binding_domain),
-            direct_pages: false,
         }
+    }
+
+    /// CPU view: writes participate in the same code observations as DMA.
+    pub fn ram(&self) -> physical::CpuRam<'_, NativeRam<'_>> {
+        physical::CpuRam::new(self.backing(), &self.code.tokens)
     }
 
     /// Uses the VM worker's populated-backing policy: a broken host RAM
     /// mapping may fault the worker instead of returning a `RamError`.
-    pub(crate) fn ram_for_execution(&self) -> NativeRam<'_> {
-        NativeRam {
-            direct_pages: true,
-            ..self.ram()
+    pub(crate) fn ram_for_execution(
+        &self,
+    ) -> impl PhysicalRam<Error = x86_system::ram_ranges::RangeError> + '_ {
+        // SAFETY: the read lease pins the populated coherent WB reservations
+        // used for VP execution. map_range validates ordering, aliasing and
+        // alignment. New watches and mapping changes require the write lease.
+        unsafe {
+            x86_system::ram_ranges::borrow_ram(
+                &self.mappings,
+                &self.code.domain,
+                &self.code.tokens,
+                |page| {
+                    if self.tracker.is_some()
+                        && self.pending_code_pages.lock().insert(page)
+                        && let Some(control) = self.vp_control
+                    {
+                        control.request_attention();
+                    }
+                },
+            )
         }
     }
 }
 
 /// Native RAM view borrowing a live mapping lease.
 ///
-/// Host pointers are usable only under this lease. Opaque persistent TLB
-/// payloads must validate their backing domain/revocations before reuse.
+/// Host pointers are usable only under this lease.
 /// Callers classify RAM versus MMIO independently of transport failures.
 /// A scalar spanning adjacent mappings requires contiguous host backing;
 /// discontiguous ranges must use the prefix-reporting bulk interface.
@@ -544,52 +465,43 @@ pub struct NativeRam<'a> {
     code: Option<&'a CodeObservations>,
     pending_code_pages: Option<&'a Mutex<BTreeSet<u64>>>,
     vp_control: Option<&'a strudel::VpControl>,
-    binding_domain: Option<&'a Arc<BindingDomain>>,
-    direct_pages: bool,
 }
 
 impl NativeRam<'_> {
+    #[inline]
     fn mapping(&self, address: u64, write: bool) -> Result<&Mapping, RamError> {
-        let index = self
-            .mappings
-            .partition_point(|mapping| mapping.start <= address);
-        let mapping = index
-            .checked_sub(1)
-            .and_then(|index| self.mappings.get(index))
-            .filter(|mapping| address < mapping.end)
-            .ok_or(RamError::Unmapped(address))?;
+        let mapping = match self.mappings {
+            [one] => Some(one),
+            [low, high] => Some(if address < low.end { low } else { high }),
+            ranges => ranges
+                .partition_point(|m| m.start <= address)
+                .checked_sub(1)
+                .map(|i| &ranges[i]),
+        }
+        .filter(|m| m.start <= address && address < m.end)
+        .ok_or(RamError::Unmapped(address))?;
         if write && !mapping.writable {
             return Err(RamError::ReadOnly(address));
         }
         Ok(mapping)
     }
 
-    fn pointer(&self, address: u64, size: usize, write: bool) -> Result<(*mut u8, bool), RamError> {
+    #[inline]
+    fn pointer(&self, address: u64, size: usize, write: bool) -> Result<*mut u8, RamError> {
         let end = address
             .checked_add(size as u64)
             .ok_or(RamError::AddressOverflow)?;
         let first = self.mapping(address, write)?;
         let pointer = first.data.wrapping_add((address - first.start) as usize);
         let mut current = first.end;
-        let mut watched = first.watched;
         while current < end {
             let next = self.mapping(current, write)?;
             if next.data != pointer.wrapping_add((current - address) as usize) {
                 return Err(RamError::SplitAccess(current));
             }
-            watched |= next.watched;
             current = next.end;
         }
-        Ok((pointer, watched))
-    }
-
-    fn notify_write(&self, address: u64, size: usize, watched: bool) -> Result<(), RamError> {
-        if watched {
-            self.tracker
-                .ok_or(RamError::Untracked)?
-                .notify_write(address, size)?;
-        }
-        Ok(())
+        Ok(pointer)
     }
 
     fn copy_bytes(
@@ -625,12 +537,14 @@ impl NativeRam<'_> {
         }
         Ok(())
     }
+}
 
-    /// Marks A and optionally D only if the PTE still equals the observation.
+/// Marks A and optionally D only if the PTE still equals the observation.
+pub trait MarkAd: PhysicalRam<Error = RamError> {
     ///
     /// A replacement/removal is not retried blindly: the walker must revalidate
     /// its address/permission decision against the changed entry.
-    pub fn try_mark_ad(
+    fn try_mark_ad(
         &self,
         address: u64,
         observed: u64,
@@ -652,7 +566,9 @@ impl NativeRam<'_> {
             AtomicResult::Flags(_) => unreachable!("compare-exchange returns an operand"),
         }
     }
-
+}
+impl<R: PhysicalRam<Error = RamError>> MarkAd for R {}
+impl NativeRam<'_> {
     /// Orders RAM, not translation invalidation or device-I/O completion.
     pub fn barrier(&self) {
         fence(Ordering::SeqCst);
@@ -661,15 +577,6 @@ impl NativeRam<'_> {
 
 impl PhysicalRam for NativeRam<'_> {
     type Error = RamError;
-    type Translations = NativeTranslations;
-    type Translated<'a>
-        = NativeTranslated<'a>
-    where
-        Self: 'a;
-
-    fn translated<'a>(&'a self, cache: &'a mut NativeTranslations) -> NativeTranslated<'a> {
-        NativeTranslated::new(self, cache)
-    }
 
     fn code_domain(&self) -> Option<&strudel::CodeDomain> {
         Some(&self.code?.domain)
@@ -689,7 +596,7 @@ impl PhysicalRam for NativeRam<'_> {
         // Publication qualifies the entire page; mapping changes remove its
         // identity under the exclusive mapping lease. This lease therefore
         // needs no second mapping lookup for a current identity.
-        if let Some(token) = tokens.get(&page).filter(|token| token.is_valid()) {
+        if let Some(token) = tokens.token(page) {
             return Some(token);
         }
         self.pointer(address, usize::from(length), false).ok()?;
@@ -708,7 +615,7 @@ impl PhysicalRam for NativeRam<'_> {
             return None;
         }
         let token = self.code_token(address, 1)?.clone();
-        let (source, _) = self.pointer(address, length, false).ok()?;
+        let source = self.pointer(address, length, false).ok()?;
         // SAFETY: the lease pins the range; try_copy handles inaccessible
         // backing. Admission rechecks the page observation after the copy.
         unsafe { trycopy::try_copy(source, destination.as_mut_ptr(), length) }.ok()?;
@@ -717,7 +624,7 @@ impl PhysicalRam for NativeRam<'_> {
 
     fn read<const N: usize>(&self, address: u64) -> Result<[u8; N], RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
-        let (pointer, _) = self.pointer(address, N, false)?;
+        let pointer = self.pointer(address, N, false)?;
         // SAFETY: the lease reserves the complete range. Byte arrays have no
         // validity or alignment restriction; trycopy uses one exact-width load.
         unsafe { self.read_pointer(pointer) }
@@ -725,10 +632,10 @@ impl PhysicalRam for NativeRam<'_> {
 
     fn write<const N: usize>(&self, address: u64, value: [u8; N]) -> Result<(), RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
-        let (pointer, watched) = self.pointer(address, N, true)?;
+        let pointer = self.pointer(address, N, true)?;
         // SAFETY: the lease reserves writable shared backing for the complete
         // scalar. One exact-width store performs no destination read.
-        unsafe { self.write_pointer(address, value, pointer, watched) }
+        unsafe { self.write_pointer(value, pointer) }
     }
 
     fn read_bytes(&self, address: u64, destination: &mut [u8]) -> Result<(), CopyError<RamError>> {
@@ -762,7 +669,6 @@ impl PhysicalRam for NativeRam<'_> {
         address: u64,
         source: &[u8],
     ) -> Result<WriteOutcome, CopyError<RamError>> {
-        let mut outcome = WriteOutcome::Ordinary;
         self.copy_bytes(
             address,
             source.len(),
@@ -775,9 +681,7 @@ impl PhysicalRam for NativeRam<'_> {
                     ($n:literal) => {{
                         let value = source[offset..offset + $n].try_into().unwrap();
                         // SAFETY: copy_bytes qualified this entire chunk in one writable mapping.
-                        unsafe {
-                            self.write_pointer::<$n>(current, value, pointer, mapping.watched)
-                        }
+                        unsafe { self.write_pointer::<$n>(value, pointer) }
                     }};
                 }
                 match width {
@@ -786,13 +690,10 @@ impl PhysicalRam for NativeRam<'_> {
                     2 => write!(2),
                     _ => write!(1),
                 }?;
-                if mapping.watched {
-                    outcome = WriteOutcome::Watched;
-                }
                 Ok(())
             },
         )?;
-        Ok(outcome)
+        Ok(WriteOutcome::Ordinary)
     }
 
     fn atomic(
@@ -834,18 +735,14 @@ impl NativeRam<'_> {
     /// # Safety
     /// `pointer` must name N logically writable shared-WB bytes for `address`
     /// reserved by this live lease. Inaccessible host pages may fault.
-    /// `watched` must include the current mapping's write-watch qualification.
     unsafe fn write_pointer<const N: usize>(
         &self,
-        address: u64,
         value: [u8; N],
         pointer: *mut u8,
-        watched: bool,
     ) -> Result<(), RamError> {
         const { assert!(matches!(N, 1 | 2 | 4 | 8)) };
         // SAFETY: the caller qualified writable shared backing under this lease.
         let result = unsafe { trycopy::try_write_volatile(pointer.cast(), &value) };
-        self.notify_write(address, N, watched)?;
         Ok(result?)
     }
 
@@ -854,7 +751,7 @@ impl NativeRam<'_> {
         address: u64,
         width: u8,
         operation: AtomicOperation,
-        qualified: Option<(*mut u8, bool)>,
+        qualified: Option<*mut u8>,
     ) -> Result<AtomicResult, CopyError<RamError>> {
         let invalid = || CopyError {
             completed: 0,
@@ -867,7 +764,7 @@ impl NativeRam<'_> {
             completed: 0,
             kind: CopyErrorKind::Memory(error),
         };
-        let (pointer, watched) = match qualified {
+        let pointer = match qualified {
             Some(pointer) => pointer,
             None => self
                 .pointer(address, usize::from(width), true)
@@ -905,8 +802,6 @@ impl NativeRam<'_> {
                 _ => return Err(invalid()),
             }
             .map_err(|error| failure(error.into()));
-            self.notify_write(address, usize::from(width), watched)
-                .map_err(failure)?;
             return result;
         }
         use trycopy::AtomicOperation as Native;
@@ -952,8 +847,6 @@ impl NativeRam<'_> {
         // SAFETY: the validated operand is naturally aligned and completely
         // reserved and writable for this lease. There is no preliminary read.
         let result = unsafe { trycopy::try_atomic(pointer, width, operation, source, flags) };
-        self.notify_write(address, usize::from(width), watched)
-            .map_err(failure)?;
         result
             .map(|result| match result {
                 trycopy::AtomicResult::Value(value) => AtomicResult::Value(value),
@@ -1006,7 +899,7 @@ mod tests {
         TestMemory { partition, backing }
     }
 
-    fn read(ram: &NativeRam<'_>, address: u64, width: u8) -> u64 {
+    fn read(ram: &impl PhysicalRam, address: u64, width: u8) -> u64 {
         match width {
             1 => u64::from(u8::from_le_bytes(ram.read(address).unwrap())),
             2 => u64::from(u16::from_le_bytes(ram.read(address).unwrap())),
@@ -1016,7 +909,7 @@ mod tests {
         }
     }
 
-    fn write(ram: &NativeRam<'_>, address: u64, width: u8, value: u64) {
+    fn write(ram: &impl PhysicalRam, address: u64, width: u8, value: u64) {
         match width {
             1 => ram.write(address, (value as u8).to_le_bytes()),
             2 => ram.write(address, (value as u16).to_le_bytes()),

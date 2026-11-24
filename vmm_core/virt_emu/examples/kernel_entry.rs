@@ -1886,7 +1886,6 @@ mod native {
                     == progress.retired,
                 "execution diagnostics disagree with retired instruction progress"
             );
-            let translations = vp.translation_diagnostics()?;
             let apic=vp.apic_diagnostics().map(|snapshot| {
                 let apic=snapshot.registers;
                 serde_json::json!({
@@ -1901,10 +1900,6 @@ mod native {
                     "execution":execution_json(execution),
                     "code_pages_prepared":preparation.prepared,
                     "code_pages_unavailable":preparation.unavailable,
-                    "translations":{
-                        "hits":translations.hits,"misses":translations.misses,
-                        "invalidations":translations.invalidations,"fallbacks":translations.fallbacks,
-                    },
                     "layout":{
                         "event_phase":size_of::<x86_system::execute::Phase>(),
                         "decode_decision":size_of::<x86_system::execute::decode::DecodeOutcome>(),
@@ -2181,14 +2176,9 @@ mod native {
             .collect();
         let decode = vp.decode_diagnostics()?.0;
         let execution = vp.execution_diagnostics()?;
-        let translations = vp.translation_diagnostics()?;
         ensure!(
             execution.fast_dispatch_starts != 0 && execution.budget_exits == 0,
             "frozen checkpoint must exercise unbudgeted VP dispatch"
-        );
-        ensure!(
-            translations.hits > 0,
-            "host-bound TLB path was not exercised"
         );
         let no_refetch_hits = decode.fetch_hits.wrapping_add(decode.execution_hits);
         ensure!(
@@ -2222,10 +2212,6 @@ mod native {
                 "no_refetch_hits":no_refetch_hits,
                 "execution_cache_hits":decode.execution_hits,
                 "execution":execution_json(execution),
-                "translations":{
-                    "hits":translations.hits,"misses":translations.misses,
-                    "invalidations":translations.invalidations,"fallbacks":translations.fallbacks,
-                },
                 "code_pages_prepared":preparation.prepared,
                 "code_pages_unavailable":preparation.unavailable,
                 "entry": ENTRY, "checkpoint": actual.rip, "checkpoint_hex": "75065de9df5d00",

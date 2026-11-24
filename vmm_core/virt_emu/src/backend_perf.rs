@@ -94,6 +94,8 @@ pub struct FastPathResult {
     pub operations: u64,
     /// Elapsed seconds in the measured interval.
     pub seconds: f64,
+    /// Direct bindings returned, including first access to each physical page.
+    pub direct_pages: Option<u64>,
 }
 
 fn completed_hit(progress: Progress) -> Result<()> {
@@ -129,7 +131,11 @@ pub fn fast_path(
         return Ok(FastPathResult {
             operations,
             seconds,
+            direct_pages: None,
         });
+    }
+    if case == "mapping" {
+        return mapping(operations, control);
     }
     match case {
         "fetch" => tlb::<0>(operations, control),
@@ -137,6 +143,65 @@ pub fn fast_path(
         "write" => tlb::<2>(operations, control),
         _ => bail!("unknown fast path: {case}"),
     }
+}
+
+/// Two contiguous 1 MiB RAM ranges. Alternate a page-table access, an
+/// operand store, and a direct binding query over a fixed page permutation.
+fn mapping(operations: u64, mut control: impl FnMut(bool) -> Result<()>) -> Result<FastPathResult> {
+    use strudel::PhysicalRam;
+    let backing = sparse_mmap::SparseMapping::new(2 << 20)?;
+    backing.alloc(0, 2 << 20)?;
+    let watches = WriteWatch::default();
+    let memory = PartitionMemory::with_write_tracker(watches.tracker());
+    for start in [0, 1 << 20] {
+        // SAFETY: the reservation outlives memory and each disjoint range.
+        #[expect(unsafe_code)]
+        unsafe {
+            memory.map_range(
+                backing.as_ptr().add(start).cast(),
+                1 << 20,
+                start as u64,
+                true,
+                true,
+            )?;
+        }
+    }
+    {
+        let lease = memory.access();
+        let ram = lease.ram();
+        for page in (0..256).step_by(4) {
+            ensure!(ram.code_token(page * 4096, 1).is_none());
+        }
+    }
+    ensure!(memory.prepare_code_pages(&watches)?.prepared == 64);
+    let lease = memory.access();
+    let ram = lease.ram_for_execution();
+    let mut sum = 0u64;
+    let mut direct = 0;
+    control(true)?;
+    let start = Instant::now();
+    for i in 0..operations {
+        let page = 256 + ((i * 73) & 255);
+        let addr = page * 4096;
+        sum = sum.wrapping_add(u64::from_le_bytes(ram.read((page - 256) * 4096)?));
+        if black_box(ram.direct_page(black_box(page))).is_some() {
+            direct += 1;
+        }
+        ram.write_bytes(addr, &i.to_le_bytes())?;
+        sum = sum.wrapping_add(u64::from_le_bytes(ram.read(addr)?));
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    control(false)?;
+    ensure!(
+        sum == (u128::from(operations) * u128::from(operations - 1) / 2) as u64,
+        "RAM checksum"
+    );
+    ensure!(direct == operations, "ordinary RAM direct binding missed");
+    Ok(FastPathResult {
+        operations,
+        seconds,
+        direct_pages: Some(direct),
+    })
 }
 
 fn tlb<const KIND: u8>(
@@ -198,6 +263,7 @@ fn tlb<const KIND: u8>(
     Ok(FastPathResult {
         operations,
         seconds,
+        direct_pages: None,
     })
 }
 

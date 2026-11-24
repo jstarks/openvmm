@@ -14,7 +14,7 @@
 //! the mapping lease, and a host yield does not unhalt the guest.
 
 use crate::native_memory::{PartitionMemory, RamError};
-use crate::write_watch::{CaptureError, CodeCaptureError, Watched, WriteWatch};
+use crate::write_watch::{CodeCaptureError, Watched, WriteWatch};
 use crate::{state_from_registers, update_registers};
 use hvdef::Vtl;
 use memory_range::MemoryRange;
@@ -35,7 +35,6 @@ use virt::{
 use vmcore::vmtime::{VmTimeAccess, VmTimeSource};
 use x86_system::arch::apic::registers::LocalApic;
 use x86_system::arch::system::{self, SegmentState, SystemState};
-use x86_system::memory::physical::PhysicalRam;
 use x86_system::mmu::translate::RunError;
 use x86_system::mmu::translate::io::IoReply;
 use x86_system::{Config, EventDiagnostic, Injection, State, Tables, WordAccess};
@@ -113,7 +112,7 @@ pub enum Error {
     },
     /// A physical operation failed without inventing a guest exception.
     #[error("physical memory operation failed")]
-    Memory(#[from] RunError<RamError>),
+    Memory(#[from] RunError<x86_system::ram_ranges::RangeError>),
     /// Declared RAM could not be adapted.
     #[error("invalid native RAM backing")]
     Ram(#[from] RamError),
@@ -374,16 +373,6 @@ impl EmuProcessor<'_> {
             return Err(Error::Uninitialized);
         };
         Ok(core.execution_diagnostics())
-    }
-
-    /// Reports host payload reuse separately from guest translation state.
-    pub fn translation_diagnostics(
-        &self,
-    ) -> Result<x86_system::memory::physical::TranslationDiagnostics, Error> {
-        let CpuLifecycle::Ready(core) = &self.state.cpu else {
-            return Err(Error::Uninitialized);
-        };
-        Ok(core.translation_diagnostics())
     }
 
     /// Reports cold registration separately from guest execution progress.
@@ -695,19 +684,7 @@ impl EmuPartition {
         &self,
         address: u64,
     ) -> Result<Watched<[u8; N]>, CodeCaptureError> {
-        let end = address
-            .checked_add(N as u64)
-            .filter(|&end| address < end)
-            .ok_or(CaptureError::InvalidRange)?;
-        self.ram
-            .with_code_watch(address..end, |ram| {
-                self.writes.capture(address..end, || {
-                    let mut bytes = [0; N];
-                    ram.read_bytes(address, &mut bytes)?;
-                    Ok(bytes)
-                })
-            })?
-            .map_err(CodeCaptureError::Capture)
+        self.ram.capture_code(&self.writes, address)
     }
 
     /// Offers an already-selected vector, not an APIC/PIC arbitration interface.

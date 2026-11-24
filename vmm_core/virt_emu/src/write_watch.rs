@@ -14,11 +14,11 @@ use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
-use x86_system::memory::physical::{CodeToken, CodeValidity, CopyError, PageWatch};
+use x86_system::memory::physical::{CodeValidity, CopyError, PageWatch};
 
 struct Watch {
     range: Range<u64>,
-    validity: PageWatch,
+    validity: Arc<PageWatch>,
 }
 
 impl CodeValidity for Watch {
@@ -115,6 +115,9 @@ pub struct Watched<T> {
 }
 
 impl<T> Watched<T> {
+    pub(crate) fn validity(&self) -> &Arc<PageWatch> {
+        &self.watch.validity
+    }
     /// The original captured value, including after invalidation.
     pub fn value(&self) -> &T {
         &self.value
@@ -142,7 +145,7 @@ impl WriteWatch {
     pub(crate) fn capture_page(
         &self,
         page: u64,
-        publish: impl FnOnce(CodeToken),
+        publish: impl FnOnce(Arc<PageWatch>),
     ) -> Result<(), RamError> {
         if !page.is_multiple_of(4096) {
             return Err(RamError::InvalidWatchRange);
@@ -153,11 +156,11 @@ impl WriteWatch {
             // The address identifies which watches to revoke, not the
             // observation: an old token can outlive an unmap and remap.
             let watches = index.pages.entry(page / 4096).or_default();
-            watches.retain(|weak| weak.strong_count() != 0);
+            watches.retain(|weak| weak.upgrade().is_some_and(|watch| watch.is_valid()));
             let watch = Arc::new(PageWatch::default());
             watches.push(Arc::downgrade(&watch));
             drop(index);
-            publish(CodeToken::from_page(watch));
+            publish(watch);
         });
         Ok(())
     }
@@ -165,7 +168,7 @@ impl WriteWatch {
     fn register_watch(&self, range: Range<u64>) -> Arc<Watch> {
         let watch = Arc::new(Watch {
             range,
-            validity: PageWatch::default(),
+            validity: Arc::new(PageWatch::default()),
         });
         let mut index = self.watches.0.lock();
         let watches = &mut index.ranges;
@@ -200,6 +203,7 @@ mod tests {
     use super::*;
     use crate::mapped_test_memory::MappedTestMemory;
     use crate::native_memory::PartitionMemory;
+    use strudel::CodeToken;
     use test_with_tracing::test;
     use virt::PartitionMemoryMap;
     use x86_system::WordAccess;
@@ -238,7 +242,7 @@ mod tests {
         let mut tokens = Vec::new();
         for page in [0, 4096, 8192, 4096] {
             watches
-                .capture_page(page, |token| tokens.push(token))
+                .capture_page(page, |watch| tokens.push(CodeToken::from_page(watch)))
                 .unwrap();
         }
         assert!(!tokens[1].same_observation(&tokens[3]));
@@ -347,12 +351,7 @@ mod tests {
             suspended,
             "stop after translation but before the physical write"
         );
-        let token = mappings
-            .with_code_watch(0x5000..0x5008, |ram| {
-                watches.capture(0x5000..0x5008, || ram.read::<8>(0x5000))
-            })
-            .unwrap()
-            .unwrap();
+        let token = mappings.capture_code::<8>(&watches, 0x5000).unwrap();
         assert_eq!(*token.value(), 0xa1u64.to_le_bytes());
         {
             let access = mappings.access();

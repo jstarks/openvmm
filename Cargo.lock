@@ -8839,7 +8839,7 @@ name = "strudel-native"
 version = "0.1.0"
 dependencies = [
  "iced-x86",
- "memmap2",
+ "libc",
 ]
 
 [[package]]

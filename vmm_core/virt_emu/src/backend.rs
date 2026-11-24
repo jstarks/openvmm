@@ -121,8 +121,18 @@ pub enum Error {
     #[error("partition capabilities")]
     Capabilities(#[from] virt::PartitionCapabilitiesError),
     /// The owned controller rejected an unimplemented device profile.
-    #[error("owned APIC stopped: {0:?}")]
+    #[error("Strudel local APIC stopped: {0:?}")]
     Apic(x86_system::arch::apic::registers::Error),
+    /// An architectural local APIC access stopped the Strudel backend.
+    #[error("Strudel local APIC at guest RIP {rip:#x}: {access}: {reason:?}")]
+    ApicAccess {
+        /// RIP of the unretired instruction.
+        rip: u64,
+        /// Register interface, direction, and operands.
+        access: String,
+        /// Rejection from Strudel's register model.
+        reason: x86_system::arch::apic::registers::Error,
+    },
     /// A controller message could not enter its architectural image.
     #[error("owned APIC ingress rejected: {0:?}")]
     ApicIngress(x86_system::arch::apic::Rejection),
@@ -1078,6 +1088,13 @@ impl EmuProcessor<'_> {
                         .and_then(|now| apic::control(&mut lapic, access, now, &self.control, dev))
                     {
                         Ok(reply) => reply,
+                        Err(Error::Apic(reason)) => {
+                            return Err(dev.fatal_error(Box::new(Error::ApicAccess {
+                                rip: core.cpu().rip,
+                                access: format!("MSR {access:#x?}"),
+                                reason,
+                            })));
+                        }
                         Err(error) => return Err(dev.fatal_error(Box::new(error))),
                     };
                     if let Err(error) = apic::arm_timer(
@@ -1150,7 +1167,14 @@ impl EmuProcessor<'_> {
                             WordAccess::Read => match lapic.mmio_read(offset, request.size, now) {
                                 Ok(value) => IoReply::Read(u64::from(value)),
                                 Err(error) => {
-                                    return Err(dev.fatal_error(Box::new(Error::Apic(error))));
+                                    return Err(dev.fatal_error(Box::new(Error::ApicAccess {
+                                        rip: core.cpu().rip,
+                                        access: format!(
+                                            "MMIO read {:#x} ({} bytes)",
+                                            request.address, request.size
+                                        ),
+                                        reason: error,
+                                    })));
                                 }
                             },
                             WordAccess::Write(value) => {
@@ -1164,7 +1188,14 @@ impl EmuProcessor<'_> {
                                         IoReply::Written
                                     }
                                     Err(error) => {
-                                        return Err(dev.fatal_error(Box::new(Error::Apic(error))));
+                                        return Err(dev.fatal_error(Box::new(Error::ApicAccess {
+                                            rip: core.cpu().rip,
+                                            access: format!(
+                                                "MMIO write {:#x} = {value:#x} ({} bytes)",
+                                                request.address, request.size
+                                            ),
+                                            reason: error,
+                                        })));
                                     }
                                 }
                             }

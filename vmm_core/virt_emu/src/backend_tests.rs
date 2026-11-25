@@ -2357,6 +2357,44 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
 
 #[cfg(all(feature = "direct-ram", target_os = "linux"))]
 #[async_test]
+async fn watch_between_uncounted_runs_revokes_a_warm_writable_binding(driver: DefaultDriver) {
+    let (mut bytes, owned) = fixture();
+    // Warm a writable page, stop, then write it again after installing a watch.
+    let code = [
+        0x48, 0x89, 0x07, 0x48, 0xff, 0xc0, 0xff, 0xc9, 0x75, 0xf6, 0x48, 0x89, 0x07,
+    ];
+    bytes[CODE as usize..CODE as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = owned.core.cpu;
+    cpu.gpr[0] = 0;
+    cpu.gpr[1] = 32;
+    cpu.gpr[7] = 0x16000;
+    let initial = long_mode_registers(cpu, super::shared_mmu_tests::config(), owned.tables, 0);
+    let (partition, mut binder, memory, _keeper) = build(&driver, &bytes).await;
+    binder.set_observed_for_test(false);
+    let mut vp = binder.bind().unwrap();
+    vp.enable_native_jit().unwrap();
+    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+    let stop = StopVpSource::new();
+    let devices = Devices::new();
+    vp.set_execution_checkpoint(Some(CODE + 10)).unwrap();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    assert_eq!(memory.read_plain::<u64>(0x16000).unwrap(), 31);
+    let target = partition.capture_code::<8>(0x16000).unwrap();
+    vp.set_execution_checkpoint(Some(CODE + code.len() as u64))
+        .unwrap();
+    assert!(matches!(
+        vp.run_vp(stop.checker(), &devices).await,
+        Err(VpHaltReason::PowerOff)
+    ));
+    assert!(!target.is_valid());
+    assert_eq!(memory.read_plain::<u64>(0x16000).unwrap(), 32);
+}
+
+#[cfg(all(feature = "direct-ram", target_os = "linux"))]
+#[async_test]
 async fn watched_store_redispatches_even_when_executing_page_is_unchanged(driver: DefaultDriver) {
     let (mut bytes, owned) = fixture();
     // mov [rdi],rax; inc rax; dec ecx; jnz start

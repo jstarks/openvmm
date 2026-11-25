@@ -107,12 +107,14 @@ pub struct PartitionMemory {
 
 #[derive(Debug, Default)]
 struct CodeObservations {
+    binding_epoch: strudel::BindingEpoch,
     domain: strudel::CodeDomain,
     tokens: physical::CpuCodePages,
 }
 
 impl CodeObservations {
     fn remove_range(&mut self, range: Range<u64>) {
+        self.binding_epoch = Default::default();
         // Mapping changes need not revoke the underlying write watch. Cached
         // observations must not authorize its old span under the new mapping.
         if self.tokens.remove_range(range) {
@@ -189,7 +191,9 @@ impl PartitionMemory {
             }
             if self.code.read().tokens.token(page).is_none() {
                 watches.capture_page(page, |watch| {
-                    self.code.write().tokens.install(page, watch);
+                    let mut code = self.code.write();
+                    code.binding_epoch = Default::default();
+                    code.tokens.install(page, watch);
                 })?;
             }
             result.prepared += 1;
@@ -234,10 +238,9 @@ impl PartitionMemory {
             }
             Ok::<_, RamError>(bytes)
         })?;
-        self.code
-            .write()
-            .tokens
-            .observe_range(address..end, captured.validity());
+        let mut code = self.code.write();
+        code.binding_epoch = Default::default();
+        code.tokens.observe_range(address..end, captured.validity());
         Ok(captured)
     }
 
@@ -379,6 +382,9 @@ pub struct NativeAccess<'a> {
 }
 
 impl NativeAccess<'_> {
+    pub(crate) fn binding_epoch(&self) -> &strudel::BindingEpoch {
+        &self.code.binding_epoch
+    }
     /// Borrows Strudel's CPU RAM view for the lifetime of this lease.
     pub fn ram(&self) -> impl PhysicalRam<Error = RangeError> + '_ {
         // SAFETY: the read lease pins the populated coherent WB reservations

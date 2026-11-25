@@ -27,6 +27,35 @@ fn fixture(start: u64, size: usize, committed: usize) -> Memory {
 }
 
 #[test]
+fn binding_epoch_tracks_backing_and_watches_not_ram_contents() {
+    let m = fixture(0, 8192, 8192);
+    let epoch = || m.partition.access().binding_epoch().clone();
+    let original = epoch();
+    m.partition.access().ram().write(0, [1]).unwrap();
+    assert!(original.same_generation(&epoch()));
+    m.partition.unmap_range(0, 8192).unwrap();
+    let unmapped = epoch();
+    assert!(!original.same_generation(&unmapped));
+    // SAFETY: this remaps the same still-live reservation with narrower permissions.
+    unsafe {
+        m.partition
+            .map_range(m.backing.as_ptr().cast(), 8192, 0, false, true)
+    }
+    .unwrap();
+    let remapped = epoch();
+    assert!(!unmapped.same_generation(&remapped));
+    let _capture = m.partition.capture_code::<4>(&m.watches, 0).unwrap();
+    let captured = epoch();
+    assert!(!remapped.same_generation(&captured));
+    assert!(m.partition.access().ram().code_token(4096, 1).is_none());
+    assert_eq!(
+        m.partition.prepare_code_pages(&m.watches).unwrap().prepared,
+        1
+    );
+    assert!(!captured.same_generation(&epoch()));
+}
+
+#[test]
 fn cpu_watch_downgrades_vtlb_fill_not_backing_permissions() {
     for start in [0, 1 << 40] {
         let m = fixture(start, 8192, 8192);

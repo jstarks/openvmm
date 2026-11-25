@@ -956,7 +956,14 @@ impl EmuProcessor<'_> {
                 let counted =
                     |batch: strudel::Batch| (batch.stop, Some((batch.retired, batch.delivered)));
                 if !COUNTED {
-                    core.run_fast_uncounted_with_ram_pages(&ram, is_mmio, is_ram_page)
+                    // SAFETY: this read lease pins mappings and code watches.
+                    // Writers rotate the epoch under the exclusive lease. The
+                    // partition's RAM classification is immutable for its lifetime.
+                    #[allow(unsafe_code)]
+                    let lease = unsafe {
+                        strudel::BindingLease::new(&ram, access.binding_epoch(), &is_ram_page)
+                    };
+                    core.run_fast_uncounted_with_binding_lease(&lease, is_mmio)
                         .map(|stop| (stop, None))
                 } else {
                     #[cfg(test)]

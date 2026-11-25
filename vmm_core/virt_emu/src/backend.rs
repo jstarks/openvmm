@@ -344,10 +344,7 @@ impl EmuProcessor<'_> {
     }
 
     /// Select the strict native executor before the CPU is constructed.
-    #[cfg(all(
-        feature = "native-jit",
-        any(target_os = "linux", all(windows, not(guest_is_native)))
-    ))]
+    #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
     pub fn enable_native_jit(&mut self) -> Result<(), Error> {
         if !matches!(self.state.cpu, CpuLifecycle::Importing(_)) || self.state.started {
             return Err(Error::AlreadyInitialized);
@@ -357,10 +354,7 @@ impl EmuProcessor<'_> {
     }
 
     /// Native instrumentation counters, not total guest progress after uncounted execution.
-    #[cfg(all(
-        feature = "native-jit",
-        any(target_os = "linux", all(windows, not(guest_is_native)))
-    ))]
+    #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
     pub fn native_diagnostics(&self) -> Result<x86_system::execute::native::Diagnostics, Error> {
         let CpuLifecycle::Ready(core) = &self.state.cpu else {
             return Err(Error::Uninitialized);
@@ -472,16 +466,10 @@ impl Hypervisor for EmuHypervisor {
 }
 
 /// The strict native executor used by full OpenVMM on supported hosts.
-#[cfg(all(
-    feature = "native-jit",
-    any(target_os = "linux", all(windows, not(guest_is_native)))
-))]
+#[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
 pub struct NativeHypervisor;
 
-#[cfg(all(
-    feature = "native-jit",
-    any(target_os = "linux", all(windows, not(guest_is_native)))
-))]
+#[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
 impl Hypervisor for NativeHypervisor {
     type ProtoPartition<'a> = EmuProtoPartition;
     type Partition = EmuPartition;

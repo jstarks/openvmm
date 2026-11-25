@@ -19,7 +19,7 @@ pub mod whp;
 
 // Register probes for auto-detection (checked in this order).
 hypervisor_resources::register_hypervisor_probes! {
-    #[cfg(all(any(target_os = "linux", all(windows, not(guest_is_native))), guest_arch = "x86_64", feature = "strudel"))]
+    #[cfg(all(any(target_os = "linux", windows), guest_arch = "x86_64", feature = "strudel"))]
     strudel::StrudelProbe,
 
     #[cfg(all(target_os = "linux", feature = "virt_mshv", guest_is_native))]

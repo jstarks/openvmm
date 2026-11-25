@@ -64,8 +64,6 @@ members = [
   # opentmk
   "opentmk",
   "opentmk/opentmk_executor",
-  # Owned-core integration bring-up.
-  "vmm_core/virt_emu",
   # support crates consumed by closed-source only
   "support/debug_output_tracing",
   # TDISP

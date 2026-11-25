@@ -42,3 +42,6 @@ vmbus_proxy.workspace = true
 
 [lints]
 workspace = true
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true

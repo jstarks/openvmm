@@ -27,6 +27,10 @@ virt_whp = ["openvmm_core/virt_whp", "dep:virt_whp"]
 virt_hvf = ["dep:virt_hvf"]
 
 [dependencies]
+virt_emu = { workspace = true, optional = true, features = ["direct-ram"] }
+serial_16550.workspace = true
+serial_debugcon.workspace = true
+serial_pl011.workspace = true
 hypervisor_resources.workspace = true
 mesh_worker.workspace = true
 vm_resource.workspace = true
@@ -109,13 +113,6 @@ vnc_worker.workspace = true
 # on all platforms, to ensure consist sqlite behavior.
 rusqlite = { workspace = true, features = ["bundled"] }
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-serial_16550.workspace = true
-serial_debugcon.workspace = true
-
-[target.'cfg(target_arch = "aarch64")'.dependencies]
-serial_pl011.workspace = true
-
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 virt_hvf = { workspace = true, optional = true }
 
@@ -124,7 +121,6 @@ net_tap = { workspace = true, optional = true }
 vhost_user_frontend.workspace = true
 disk_blockdevice.workspace = true
 virt_kvm = { workspace = true, optional = true }
-virt_emu = { workspace = true, optional = true, features = ["direct-ram"] }
 virt_mshv = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]

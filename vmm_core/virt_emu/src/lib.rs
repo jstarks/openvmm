@@ -13,44 +13,34 @@
 use virt::vp::Registers;
 use x86_system::State;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Depends on host x86 WB ordering.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(guest_is_native, windows, target_os = "linux"))]
 pub mod native_memory;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Native partition coherence foundation.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(guest_is_native, windows, target_os = "linux"))]
 pub mod write_watch;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Uses the native x86 WB RAM transport.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(guest_is_native, windows, target_os = "linux"))]
 pub mod backend;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Exercises the native WB RAM provider.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(guest_is_native, windows, target_os = "linux")))]
 mod shared_mmu_tests;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Exercises the native WB RAM provider.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(guest_is_native, windows, target_os = "linux")))]
 mod shared_cpu_tests;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Exercises the native WB RAM provider.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(guest_is_native, windows, target_os = "linux")))]
 mod shared_event_tests;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Exercises the native WB RAM provider.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(guest_is_native, windows, target_os = "linux")))]
 mod shared_io_tests;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Exercises the native x86 backend.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(guest_is_native, windows, target_os = "linux")))]
 mod backend_tests;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Native transport comparison drivers.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(guest_is_native, windows, target_os = "linux")))]
 mod test_support;
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Native partition-mapping fixtures.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(guest_is_native, windows, target_os = "linux")))]
 mod mapped_test_memory;
 
 fn state_from_registers(registers: &Registers) -> State {

@@ -51,7 +51,7 @@ pub struct Config {
     pub vga_firmware: Option<RomFileLocation>,
     pub vtl2_gfx: bool,
     pub virtio_devices: Vec<(VirtioBus, Resource<VirtioDeviceHandle>)>,
-    #[cfg(windows)]
+    #[cfg(all(windows, guest_is_native))]
     pub vpci_resources: Vec<virt_whp::device::DeviceHandle>,
     pub vmgs: Option<VmgsResource>,
     // TODO: move FirmwareEvent somewhere not GED-specific.

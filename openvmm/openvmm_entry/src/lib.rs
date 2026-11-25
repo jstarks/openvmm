@@ -1221,7 +1221,12 @@ async fn vm_config_from_command_line(
             .collect::<anyhow::Result<Vec<_>>>()?
     };
 
-    #[cfg(windows)]
+    #[cfg(all(windows, not(guest_is_native)))]
+    anyhow::ensure!(
+        opt.device.is_empty(),
+        "physical device assignment requires a native guest architecture"
+    );
+    #[cfg(all(windows, guest_is_native))]
     let vpci_resources: Vec<_> = opt
         .device
         .iter()
@@ -2245,7 +2250,7 @@ async fn vm_config_from_command_line(
         isa_dma_controller,
         chipset_capabilities: capabilities,
         layout: layout_config,
-        #[cfg(windows)]
+        #[cfg(all(windows, guest_is_native))]
         vpci_resources,
         vmgs,
         firmware_event_send: None,

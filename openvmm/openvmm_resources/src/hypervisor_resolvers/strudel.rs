@@ -3,9 +3,8 @@
 
 //! Strudel native-JIT backend resolver.
 #![cfg(all(
-    target_os = "linux",
+    any(target_os = "linux", all(windows, not(guest_is_native))),
     guest_arch = "x86_64",
-    guest_is_native,
     feature = "strudel"
 ))]
 

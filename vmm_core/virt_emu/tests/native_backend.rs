@@ -3,8 +3,10 @@
 
 //! Real-VP direct mappings are independent of GuestMemory access permissions.
 
-// xtask-fmt allow-target-arch cpu-intrinsic -- Exercises the host x86 RAM provider.
-#![cfg(all(guest_arch = "x86_64", target_arch = "x86_64"))]
+#![cfg(all(
+    guest_arch = "x86_64",
+    any(guest_is_native, windows, target_os = "linux")
+))]
 
 use guestmem::{
     AlignedHeapMemory, BitmapInfo, GuestMemory, GuestMemoryAccess, PageFaultAction, PageFaultError,

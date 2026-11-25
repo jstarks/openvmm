@@ -602,7 +602,7 @@ fn shared_iret_rejects_bad_images_without_early_cpu_commit() {
             0 => {}
             1 => put(&mut bytes, stack + 8, 16),
             2 => put(&mut bytes, stack + 32, 8),
-            3 => put(&mut bytes, stack + 16, 0),
+            3 => put(&mut bytes, stack + 16, 1 << 8),
             4 => put(&mut bytes, stack, 0x8000_0000_0000),
             5 => put(&mut bytes, stack + 24, 0x8000_0000_0000),
             6 => put(&mut bytes, 0x9008, 0),

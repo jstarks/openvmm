@@ -155,7 +155,10 @@ fn mapping(operations: u64, mut control: impl FnMut(bool) -> Result<()>) -> Resu
     let memory = PartitionMemory::with_write_tracker(watches.tracker());
     for start in [0, 1 << 20] {
         // SAFETY: the reservation outlives memory and each disjoint range.
-        #[expect(unsafe_code)]
+        #[expect(
+            unsafe_code,
+            reason = "the mapping API requires a pinned backing pointer"
+        )]
         unsafe {
             memory.map_range(
                 backing.as_ptr().add(start).cast(),

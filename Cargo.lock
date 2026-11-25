@@ -6361,6 +6361,7 @@ name = "openvmm_defs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "build_rs_guest_arch",
  "floppy_resources",
  "framebuffer",
  "get_resources",
@@ -8852,6 +8853,7 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "libc",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]

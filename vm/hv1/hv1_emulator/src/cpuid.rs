@@ -6,13 +6,18 @@
 
 #![cfg(guest_arch = "x86_64")]
 
+#[cfg(guest_is_native)]
 use hvdef::HvEnlightenmentInformation;
 use hvdef::HvFeatures;
+#[cfg(guest_is_native)]
 use hvdef::HvHardwareFeatures;
+#[cfg(guest_is_native)]
 use hvdef::HvIsolationConfiguration;
 use hvdef::HvPartitionPrivilege;
+#[cfg(guest_is_native)]
 use std::arch::x86_64::CpuidResult;
 use virt::CpuidLeaf;
+#[cfg(guest_is_native)]
 use x86defs::cpuid::CpuidFunction;
 
 /// The partition privileges that this emulator supports.
@@ -29,6 +34,7 @@ pub const SUPPORTED_FEATURES: HvFeatures = HvFeatures::new()
     .with_privileges(SUPPORTED_PRIVILEGES)
     .with_direct_synthetic_timers(true);
 
+#[cfg(guest_is_native)]
 const fn split_u128(x: u128) -> CpuidResult {
     let bytes: [u32; 4] = zerocopy::transmute!(x);
     CpuidResult {
@@ -41,6 +47,7 @@ const fn split_u128(x: u128) -> CpuidResult {
 
 /// Converts the given features and enlightenment information into a set of
 /// synthetic cpuid leaves.
+#[cfg(guest_is_native)]
 pub fn make_hv_cpuid_leaves(
     features: HvFeatures,
     enlightenments: HvEnlightenmentInformation,
@@ -78,6 +85,7 @@ pub fn make_hv_cpuid_leaves(
 
 /// Converts the given features and enlightenment information into a set of
 /// synthetic cpuid leaves for isolated VMs.
+#[cfg(guest_is_native)]
 pub fn make_isolated_hv_cpuid_leaves(
     hardware_features: HvHardwareFeatures,
     isolation_config: HvIsolationConfiguration,

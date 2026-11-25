@@ -1237,7 +1237,7 @@ impl VmService {
             vmbus: (!req_config.disable_vmbus).then(VmbusConfig::default),
             vtl2_vmbus: None,
             vmbus_devices: vec![],
-            #[cfg(windows)]
+            #[cfg(all(windows, guest_is_native))]
             vpci_resources: vec![],
             vmgs,
             firmware_event_send: None,

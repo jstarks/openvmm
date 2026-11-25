@@ -344,8 +344,10 @@ impl EmuProcessor<'_> {
     }
 
     /// Select the strict native executor before the CPU is constructed.
-    // xtask-fmt allow-target-arch dependency - the native backend emits host x86-64 code.
-    #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_os = "linux", all(windows, not(guest_is_native)))
+    ))]
     pub fn enable_native_jit(&mut self) -> Result<(), Error> {
         if !matches!(self.state.cpu, CpuLifecycle::Importing(_)) || self.state.started {
             return Err(Error::AlreadyInitialized);
@@ -355,8 +357,10 @@ impl EmuProcessor<'_> {
     }
 
     /// Native instrumentation counters, not total guest progress after uncounted execution.
-    // xtask-fmt allow-target-arch dependency - these counters belong to the host JIT.
-    #[cfg(all(feature = "native-jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "native-jit",
+        any(target_os = "linux", all(windows, not(guest_is_native)))
+    ))]
     pub fn native_diagnostics(&self) -> Result<x86_system::execute::native::Diagnostics, Error> {
         let CpuLifecycle::Ready(core) = &self.state.cpu else {
             return Err(Error::Uninitialized);
@@ -467,11 +471,17 @@ impl Hypervisor for EmuHypervisor {
     }
 }
 
-/// The strict native executor used by full OpenVMM on Linux/x86-64.
-#[cfg(all(feature = "native-jit", target_os = "linux"))]
+/// The strict native executor used by full OpenVMM on supported hosts.
+#[cfg(all(
+    feature = "native-jit",
+    any(target_os = "linux", all(windows, not(guest_is_native)))
+))]
 pub struct NativeHypervisor;
 
-#[cfg(all(feature = "native-jit", target_os = "linux"))]
+#[cfg(all(
+    feature = "native-jit",
+    any(target_os = "linux", all(windows, not(guest_is_native)))
+))]
 impl Hypervisor for NativeHypervisor {
     type ProtoPartition<'a> = EmuProtoPartition;
     type Partition = EmuPartition;
@@ -487,6 +497,11 @@ impl Hypervisor for NativeHypervisor {
         &mut self,
         config: ProtoPartitionConfig<'_>,
     ) -> Result<EmuProtoPartition, Error> {
+        if !x86_system::ram_ranges::host_supported() {
+            return Err(Error::Profile(
+                "native RAM requires RCpc/LSE on ARM64 and LSE2 on Linux ARM64",
+            ));
+        }
         let mut proto = EmuHypervisor.new_partition(config)?;
         proto.backend = strudel::Backend::Native;
         Ok(proto)

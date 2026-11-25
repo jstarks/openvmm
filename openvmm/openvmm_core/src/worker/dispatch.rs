@@ -174,7 +174,7 @@ use vmotherboard::options::BaseChipsetDevices;
 use vmotherboard::options::BaseChipsetFoundation;
 use vmotherboard::options::BaseChipsetManifest;
 use vmotherboard::options::VmChipsetCapabilities;
-#[cfg(all(windows, feature = "virt_whp"))]
+#[cfg(all(windows, guest_is_native, feature = "virt_whp"))]
 use vpci::bus::VpciBus;
 use watchdog_core::platform::BaseWatchdogPlatform;
 use watchdog_core::platform::WatchdogCallback;
@@ -216,7 +216,7 @@ impl Manifest {
             virtio_devices: config.virtio_devices,
             vmbus: config.vmbus,
             vtl2_vmbus: config.vtl2_vmbus,
-            #[cfg(all(windows, feature = "virt_whp"))]
+            #[cfg(all(windows, guest_is_native, feature = "virt_whp"))]
             vpci_resources: config.vpci_resources,
             vmgs: config.vmgs,
             firmware_event_send: config.firmware_event_send,
@@ -260,7 +260,7 @@ pub struct Manifest {
     virtio_devices: Vec<(VirtioBus, Resource<VirtioDeviceHandle>)>,
     vmbus: Option<VmbusConfig>,
     vtl2_vmbus: Option<VmbusConfig>,
-    #[cfg(all(windows, feature = "virt_whp"))]
+    #[cfg(all(windows, guest_is_native, feature = "virt_whp"))]
     vpci_resources: Vec<virt_whp::device::DeviceHandle>,
     vmgs: Option<VmgsResource>,
     firmware_event_send: Option<mesh::Sender<get_resources::ged::FirmwareEvent>>,
@@ -504,7 +504,10 @@ fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86Top
         Some(ArchTopologyConfig::X86(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
-    let mut builder = TopologyBuilder::from_host_topology()?;
+    let mut builder = cfg_select! {
+        guest_is_native => TopologyBuilder::from_host_topology()?,
+        _ => TopologyBuilder::new_x86(),
+    };
     builder.apic_id_offset(arch.apic_id_offset);
     if let Some(smt) = config.enable_smt {
         builder.smt_enabled(smt);
@@ -1160,7 +1163,7 @@ impl InitializedVm {
 
         let hv_config = if cfg.hypervisor.with_hv {
             let allow_device_assignment = cfg_select! {
-                all(windows, feature = "virt_whp") => !cfg.vpci_resources.is_empty(),
+                all(windows, guest_is_native, feature = "virt_whp") => !cfg.vpci_resources.is_empty(),
                 _ => false,
             };
 
@@ -1475,7 +1478,7 @@ impl InitializedVm {
             memory_builder = memory_builder.add_backing(backing);
         }
 
-        #[cfg(all(windows, feature = "virt_whp"))]
+        #[cfg(all(windows, guest_is_native, feature = "virt_whp"))]
         if !cfg.vpci_resources.is_empty() {
             memory_builder = memory_builder.pin_mappings(true);
         }
@@ -2850,7 +2853,7 @@ impl InitializedVm {
             vtl2_vmbus_server = vtl2_vmbus;
         }
 
-        #[cfg(all(windows, feature = "virt_whp"))]
+        #[cfg(all(windows, guest_is_native, feature = "virt_whp"))]
         fn make_ids(
             name: &str,
             instance_id: Option<guid::Guid>,
@@ -2950,7 +2953,7 @@ impl InitializedVm {
                     .await?;
                 }
 
-                #[cfg(all(windows, feature = "virt_whp"))]
+                #[cfg(all(windows, guest_is_native, feature = "virt_whp"))]
                 for resource in cfg.vpci_resources {
                     let vmbus = vmbus_server
                         .as_ref()
@@ -4422,7 +4425,7 @@ impl LoadedVm {
             vga_firmware: None,     // TODO
             vtl2_gfx: false,        // TODO
             virtio_devices: vec![], // TODO
-            #[cfg(all(windows, feature = "virt_whp"))]
+            #[cfg(all(windows, guest_is_native, feature = "virt_whp"))]
             vpci_resources: vec![], // TODO
             vmgs: None,             // TODO
             firmware_event_send: self.inner.firmware_event_send,

@@ -792,7 +792,7 @@ impl Partition for EmuPartition {
 }
 
 // UNSAFETY: Forwards the caller's mapping lifetime contract to the owned map.
-#[expect(unsafe_code, reason = "the read lease pins the certified RAM bindings")]
+#[expect(unsafe_code)]
 impl PartitionMemoryMap for EmuPartition {
     unsafe fn map_range(
         &self,
@@ -962,7 +962,10 @@ impl EmuProcessor<'_> {
                     // SAFETY: this read lease pins mappings and code watches.
                     // Writers rotate the epoch under the exclusive lease. The
                     // partition's RAM classification is immutable for its lifetime.
-                    #[allow(unsafe_code)]
+                    #[expect(
+                        unsafe_code,
+                        reason = "the read lease pins the certified RAM bindings"
+                    )]
                     let lease = unsafe {
                         strudel::BindingLease::new(&ram, access.binding_epoch(), &is_ram_page)
                     };

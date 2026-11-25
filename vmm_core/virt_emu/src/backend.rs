@@ -792,7 +792,7 @@ impl Partition for EmuPartition {
 }
 
 // UNSAFETY: Forwards the caller's mapping lifetime contract to the owned map.
-#[expect(unsafe_code)]
+#[expect(unsafe_code, reason = "the read lease pins the certified RAM bindings")]
 impl PartitionMemoryMap for EmuPartition {
     unsafe fn map_range(
         &self,

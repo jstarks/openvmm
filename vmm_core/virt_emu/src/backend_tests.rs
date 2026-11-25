@@ -2355,7 +2355,7 @@ async fn partition_unmap_and_remap_changes_ram_between_complete_cpu_batches(driv
     );
 }
 
-#[cfg(all(feature = "direct-ram", target_os = "linux"))]
+#[cfg(all(feature = "direct-ram", any(target_os = "linux", windows)))]
 #[async_test]
 async fn watch_between_uncounted_runs_revokes_a_warm_writable_binding(driver: DefaultDriver) {
     let (mut bytes, owned) = fixture();

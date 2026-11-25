@@ -1273,7 +1273,9 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
         program.extend([0x0f, 0x95, 0x04, 0x25]);
         program.extend(((data + 0x40) as u32).to_le_bytes());
         program.extend([0x41, 0x0f, 0x20, 0xd0, 0xb9]);
-        program.extend((if supported_msr { 0x8bu32 } else { 0x10 }).to_le_bytes());
+        // Read the microcode signature, or request unsupported nonzero DEBUGCTL bits.
+        let msr: u32 = if supported_msr { 0x8b } else { 0x1d9 };
+        program.extend(msr.to_le_bytes());
         let msr_rip = CODE + program.len() as u64;
         program.extend([0x0f, if supported_msr { 0x32 } else { 0x30 }, 0xf4]);
         bytes[CODE as usize..CODE as usize + program.len()].copy_from_slice(&program);
@@ -1312,7 +1314,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
         let mut expected = initial;
         expected.rax = 0;
         expected.rbx = 0xcccc_dddd;
-        expected.rcx = if supported_msr { 0x8b } else { 0x10 };
+        expected.rcx = u64::from(msr);
         expected.rdx = if supported_msr { 0 } else { initial.rdx };
         expected.rsi = data + 24;
         expected.rdi = data + 32;

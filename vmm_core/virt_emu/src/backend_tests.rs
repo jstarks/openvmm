@@ -1273,8 +1273,8 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
         program.extend([0x0f, 0x95, 0x04, 0x25]);
         program.extend(((data + 0x40) as u32).to_le_bytes());
         program.extend([0x41, 0x0f, 0x20, 0xd0, 0xb9]);
-        // Read the microcode signature, or request unsupported nonzero DEBUGCTL bits.
-        let msr: u32 = if supported_msr { 0x8b } else { 0x1d9 };
+        // Read the microcode signature, or try changing NB_CFG from the fixed profile.
+        let msr: u32 = if supported_msr { 0x8b } else { 0xc001_001f };
         program.extend(msr.to_le_bytes());
         let msr_rip = CODE + program.len() as u64;
         program.extend([0x0f, if supported_msr { 0x32 } else { 0x30 }, 0xf4]);
@@ -1305,7 +1305,7 @@ async fn bootdata_string_and_conditional_families_use_actual_vp_state(driver: De
             assert!(devices.faults.lock().is_empty());
         } else {
             assert!(matches!(
-                vp.run_vp_counted(stop.checker(), &devices).await,
+                ready_after_yields(Box::pin(vp.run_vp_counted(stop.checker(), &devices)).as_mut()),
                 Err(VpHaltReason::PowerOff)
             ));
             assert_eq!(devices.faults.lock().len(), 1);

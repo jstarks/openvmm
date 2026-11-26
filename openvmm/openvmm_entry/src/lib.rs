@@ -1460,8 +1460,9 @@ async fn vm_config_from_command_line(
             default_boot_always_attempt,
         } = uefi_options;
 
-        if opt.no_hv && cfg!(guest_arch = "x86_64") {
-            anyhow::bail!("--no-hv is not supported on x86_64");
+        if opt.no_hv && cfg!(guest_arch = "x86_64") && opt.hypervisor.as_deref() != Some("strudel")
+        {
+            anyhow::bail!("--no-hv on x86_64 requires --hypervisor strudel");
         }
 
         with_hv = !opt.no_hv;

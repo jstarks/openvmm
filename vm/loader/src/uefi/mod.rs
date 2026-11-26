@@ -354,18 +354,14 @@ pub mod x86_64 {
 
     /// Load a UEFI image with the provided config type.
     ///
-    /// On x86_64 the firmware always runs under Hyper-V, so `hv_enabled` must
-    /// be `true`.
+    /// `hv_enabled` describes the exposed Hyper-V enlightenments. An
+    /// unenlightened software backend still uses the ordinary SEC handoff.
     pub fn load(
         importer: &mut dyn ImageLoad<X86Register>,
         image: &[u8],
         config: ConfigType,
-        hv_enabled: bool,
+        _hv_enabled: bool,
     ) -> Result<LoadInfo, Error> {
-        if !hv_enabled {
-            return Err(Error::HvRequired);
-        }
-
         if image.len() != IMAGE_SIZE as usize {
             return Err(Error::InvalidImageSize);
         }

@@ -28,6 +28,7 @@ virt.workspace = true
 x86_system.workspace = true
 strudel.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 hvdef.workspace = true

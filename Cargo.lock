@@ -10522,6 +10522,7 @@ dependencies = [
  "strudel-decode",
  "test_with_tracing",
  "thiserror 2.0.16",
+ "tracing",
  "trycopy",
  "virt",
  "vm_loader",

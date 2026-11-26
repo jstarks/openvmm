@@ -642,6 +642,9 @@ mod tests {
                                 integer::evaluate(operation, 0x5a, source, operand_width, flags);
                             (outcome.value, AtomicResult::Flags(outcome.flags))
                         }
+                        AtomicOperation::CompareExchange16 { .. } => {
+                            unreachable!("pair operations are outside the scalar atomic matrix")
+                        }
                     };
                     assert_eq!(
                         ram.atomic(address, width, operation).unwrap(),
@@ -655,6 +658,43 @@ mod tests {
                     assert_eq!(after, before, "{width}/{address}/{operation:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn pair_compare_exchange_preserves_or_replaces_the_whole_operand() {
+        for matches in [false, true] {
+            let memory = fixture();
+            let initial = [1u64, 2];
+            let replacement = [3u64, 4];
+            let mut bytes = [0; 16];
+            bytes[..8].copy_from_slice(&initial[0].to_le_bytes());
+            bytes[8..].copy_from_slice(&initial[1].to_le_bytes());
+            memory.write_at(0, &bytes).unwrap();
+            let access = memory.partition.access();
+            let ram = access.ram();
+            assert_eq!(
+                ram.atomic(
+                    0,
+                    16,
+                    AtomicOperation::CompareExchange16 {
+                        expected: if matches { initial } else { [9, 2] },
+                        replacement,
+                    }
+                )
+                .unwrap(),
+                AtomicResult::Pair(initial),
+            );
+            let expected = if matches { replacement } else { initial };
+            memory.read_at(0, &mut bytes).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                expected[0]
+            );
+            assert_eq!(
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+                expected[1]
+            );
         }
     }
 

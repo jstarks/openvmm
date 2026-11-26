@@ -98,7 +98,7 @@ use x86_system::ram_ranges::RamRange as Mapping;
 #[derive(Debug, Default)]
 pub struct PartitionMemory {
     admission: Mutex<()>,
-    vp_control: Option<strudel::VpControl>,
+    vp_controls: Vec<strudel::VpControl>,
     mappings: RwLock<Vec<Mapping>>,
     tracker: Option<WriteTracker>,
     code: RwLock<CodeObservations>,
@@ -133,9 +133,9 @@ pub(crate) struct CodePreparation {
 }
 
 impl PartitionMemory {
-    pub(crate) fn for_vp(tracker: WriteTracker, vp_control: strudel::VpControl) -> Self {
+    pub(crate) fn for_vps(tracker: WriteTracker, vp_controls: Vec<strudel::VpControl>) -> Self {
         Self {
-            vp_control: Some(vp_control),
+            vp_controls,
             ..Self::with_write_tracker(tracker)
         }
     }
@@ -144,7 +144,7 @@ impl PartitionMemory {
         // Don't let the VP consume the kick and reenter before we queue for
         // the exclusive lease. The gate is never held during guest execution.
         let _gate = self.admission.lock();
-        if let Some(control) = &self.vp_control {
+        for control in &self.vp_controls {
             control.request_attention();
         }
         self.mappings.write()
@@ -178,9 +178,12 @@ impl PartitionMemory {
         }
         let pending = std::mem::take(&mut *self.pending_code_pages.lock());
         let mut result = CodePreparation::default();
+        if pending.is_empty() {
+            return Ok(result);
+        }
+        let mappings = self.change_mappings();
         for page in pending {
             page.checked_add(4096).ok_or(RamError::AddressOverflow)?;
-            let mappings = self.change_mappings();
             match Mapping::span(&mappings, page, 4096, false) {
                 Ok(_) => {}
                 Err(RangeError::Unmapped(_) | RangeError::Split(_)) => {
@@ -259,6 +262,10 @@ impl PartitionMemory {
     /// // Mapping changes or asynchronous work may now proceed.
     /// ```
     pub fn access(&self) -> NativeAccess<'_> {
+        self.access_for(None)
+    }
+
+    pub(crate) fn access_for(&self, vp: Option<usize>) -> NativeAccess<'_> {
         let mappings = {
             let _gate = self.admission.lock();
             self.mappings.read()
@@ -268,7 +275,7 @@ impl PartitionMemory {
             tracker: self.tracker.as_ref(),
             code: self.code.read(),
             pending_code_pages: &self.pending_code_pages,
-            vp_control: self.vp_control.as_ref(),
+            vp_control: vp.and_then(|i| self.vp_controls.get(i)),
         }
     }
 
@@ -1085,6 +1092,44 @@ mod tests {
             ram.read::<8>(u64::MAX - 3),
             Err(RangeError::Overflow)
         ));
+    }
+
+    #[test]
+    fn mapping_writer_kicks_and_drains_every_vp_lease() {
+        use std::sync::mpsc;
+        use std::task::{Context, Poll, Waker};
+        use std::time::{Duration, Instant};
+
+        let watches = crate::write_watch::WriteWatch::default();
+        let controls = [strudel::VpControl::default(), strudel::VpControl::default()];
+        let partition = PartitionMemory::for_vps(watches.tracker(), controls.to_vec());
+        let first = partition.access_for(Some(0));
+        let second = partition.access_for(Some(1));
+        let (send, done) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let _writer = partition.change_mappings();
+                send.send(()).unwrap();
+            });
+            let mut cx = Context::from_waker(Waker::noop());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for control in &controls {
+                while control.poll_wake(&mut cx) == Poll::Pending && Instant::now() < deadline {
+                    thread::yield_now();
+                }
+            }
+            let kicked = controls
+                .iter()
+                .all(|control| control.poll_wake(&mut cx).is_ready());
+            let admission_closed = partition.admission.try_lock().is_none();
+            drop(first);
+            let while_second_held = done.try_recv();
+            drop(second);
+            assert!(kicked);
+            assert!(admission_closed);
+            assert!(matches!(while_second_held, Err(mpsc::TryRecvError::Empty)));
+            done.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
     }
 
     #[test]

@@ -137,32 +137,56 @@ pub enum Error {
 
 struct Control {
     irq_routes: virt::irqcon::IrqRoutes,
+    has_apic: bool,
+    unsupported: AtomicBool,
+    vps: Box<[VpEndpoint]>,
+    ipis: Arc<strudel::IpiRouter>,
+}
+
+struct VpEndpoint {
     #[cfg(test)]
     waiting: AtomicBool,
-    has_apic: bool,
     routing: Arc<strudel::LocalRouting>,
-    unsupported: AtomicBool,
     remote: VpControl,
     yield_requested: NeedsYield,
 }
 
 impl Control {
-    fn new(has_apic: bool) -> Self {
+    fn new(has_apic: bool, ids: &[u32]) -> Self {
+        let vps: Box<[_]> = ids
+            .iter()
+            .map(|_| VpEndpoint {
+                #[cfg(test)]
+                waiting: AtomicBool::new(false),
+                routing: Default::default(),
+                remote: Default::default(),
+                yield_requested: NeedsYield::new(),
+            })
+            .collect();
+        let ipis = Arc::new(strudel::IpiRouter::new(
+            ids.iter()
+                .copied()
+                .zip(vps.iter())
+                .map(|(id, vp)| (id, vp.routing.clone(), vp.remote.clone())),
+        ));
         Self {
             irq_routes: Default::default(),
-            #[cfg(test)]
-            waiting: AtomicBool::new(false),
             has_apic,
-            routing: Default::default(),
             unsupported: AtomicBool::new(false),
-            remote: VpControl::default(),
-            yield_requested: NeedsYield::new(),
+            vps,
+            ipis,
         }
+    }
+
+    fn vp(&self, index: VpIndex) -> Option<&VpEndpoint> {
+        self.vps.get(index.index() as usize)
     }
 
     fn unsupported(&self) {
         self.unsupported.store(true, Ordering::Release);
-        self.remote.request_attention();
+        for vp in &self.vps {
+            vp.remote.request_attention();
+        }
     }
 
     fn request_apic_msi(&self, request: virt::irqcon::MsiRequest) {
@@ -170,18 +194,26 @@ impl Control {
         if !self.has_apic
             || request.address >> 20 != 0xfee
             || data.delivery_mode() > 1
-            || self
+            || (data.delivery_mode() == 1 && self.vps.len() != 1)
+        {
+            self.unsupported();
+            return;
+        }
+        for vp in &self.vps {
+            if vp
                 .routing
                 .post_msi(
-                    &self.remote,
+                    &vp.remote,
                     address.virt_destination().into(),
                     address.destination_mode_logical(),
                     data.vector(),
                     data.trigger_mode_level(),
                 )
                 .is_err()
-        {
-            self.unsupported();
+            {
+                self.unsupported();
+                return;
+            }
         }
     }
 }
@@ -214,7 +246,7 @@ pub struct EmuProtoPartition {
     clock: VmTimeSource,
     architectural_apic: bool,
     svm: x86_system::arch::svm::State,
-    apic_id: u32,
+    apic_ids: Box<[u32]>,
     writes: WriteWatch,
 }
 
@@ -233,10 +265,13 @@ enum CpuLifecycle {
 }
 
 struct VpState {
+    index: VpIndex,
     timer: Arc<TimerWake>,
     clock_source: VmTimeSource,
     backend: strudel::Backend,
     chaining: bool,
+    #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
+    block_store: Option<Arc<strudel::SharedBlockStore>>,
     #[cfg(test)]
     decode_cache_enabled: bool,
     #[cfg(test)]
@@ -536,9 +571,14 @@ impl EmuHypervisor {
                 "one VP, no isolation/HV1; basic SVM requires the architectural APIC profile",
             ));
         }
-        let apic_id = config.processor_topology.max_apic_id();
+        let apic_ids: Box<[_]> = config
+            .processor_topology
+            .vps_arch()
+            .map(|vp| vp.apic_id)
+            .collect();
+        let apic_id = apic_ids[0];
         if architectural_apic
-            && (apic_id > 255
+            && (apic_ids.iter().any(|&id| id > 255)
                 || config.processor_topology.apic_mode()
                     != vm_topology::processor::x86::ApicMode::X2ApicSupported)
         {
@@ -575,7 +615,7 @@ impl EmuHypervisor {
             clock: config.vmtime.clone(),
             architectural_apic,
             svm,
-            apic_id,
+            apic_ids,
             writes: WriteWatch::default(),
         })
     }
@@ -616,10 +656,10 @@ impl ProtoPartition for EmuProtoPartition {
         if ram_ranges.is_empty() {
             return Err(Error::Profile("no RAM"));
         }
-        let control = Arc::new(Control::new(self.architectural_apic));
-        let ram = Arc::new(PartitionMemory::for_vp(
+        let control = Arc::new(Control::new(self.architectural_apic, &self.apic_ids));
+        let ram = Arc::new(PartitionMemory::for_vps(
             self.writes.tracker(),
-            control.remote.clone(),
+            control.vps.iter().map(|vp| vp.remote.clone()).collect(),
         ));
         let partition = EmuPartition {
             caps: self.caps.clone(),
@@ -627,56 +667,73 @@ impl ProtoPartition for EmuProtoPartition {
             ram: ram.clone(),
             writes: self.writes.clone(),
         };
-        let binder = EmuProcessorBinder {
-            clock: self.clock.access("emu-tsc"),
-            state: VpState {
-                clock_source: self.clock.clone(),
-                timer: Arc::new(TimerWake {
-                    fired: false.into(),
-                    remote: control.remote.clone(),
-                }),
-                backend: self.backend,
-                chaining: self.chaining,
-                #[cfg(test)]
-                decode_cache_enabled: true,
-                #[cfg(test)]
-                boundary_in_batch: true,
-                #[cfg(test)]
-                observed: false,
-                apic_id: self.architectural_apic.then_some(self.apic_id),
-                apic_delivered: [0; 256],
-                first_apic_retired: None,
-                first_apic_time: None,
-                first_apic_decode: None,
-                cpu: CpuLifecycle::Importing(Box::new(SystemState {
-                    svm: self.svm,
-                    ..SystemState::empty()
-                })),
-                started: false,
-                progress: Some(CompletedBatchProgress::default()),
-                code_preparation: CodePreparationDiagnostics::default(),
-                #[cfg(feature = "perf")]
-                profile: None,
-                checkpoint: None,
-                checkpoint_guest: false,
-                svm_exit_checkpoint: None,
-                io_active: false,
-                fault: None,
-            },
-            ram,
-            writes: self.writes,
-            ram_ranges: ram_ranges.into(),
-            caps: self.caps,
-            control,
-        };
-        Ok((partition, vec![binder]))
+        let ranges: Arc<[MemoryRange]> = ram_ranges.into();
+        #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
+        let block_store = self.chaining.then(|| {
+            Arc::new(if self.svm.available {
+                strudel::SharedBlockStore::new_nested(true)
+            } else {
+                strudel::SharedBlockStore::new(true)
+            })
+        });
+        let binders = self
+            .apic_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, apic_id)| EmuProcessorBinder {
+                clock: self.clock.access("emu-tsc"),
+                state: VpState {
+                    index: VpIndex::new(index as u32),
+                    clock_source: self.clock.clone(),
+                    timer: Arc::new(TimerWake {
+                        fired: false.into(),
+                        remote: control.vps[index].remote.clone(),
+                    }),
+                    backend: self.backend,
+                    chaining: self.chaining,
+                    #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
+                    block_store: block_store.clone(),
+                    #[cfg(test)]
+                    decode_cache_enabled: true,
+                    #[cfg(test)]
+                    boundary_in_batch: true,
+                    #[cfg(test)]
+                    observed: false,
+                    apic_id: self.architectural_apic.then_some(apic_id),
+                    apic_delivered: [0; 256],
+                    first_apic_retired: None,
+                    first_apic_time: None,
+                    first_apic_decode: None,
+                    cpu: CpuLifecycle::Importing(Box::new(SystemState {
+                        svm: self.svm,
+                        ..SystemState::empty()
+                    })),
+                    started: false,
+                    progress: Some(CompletedBatchProgress::default()),
+                    code_preparation: CodePreparationDiagnostics::default(),
+                    #[cfg(feature = "perf")]
+                    profile: None,
+                    checkpoint: None,
+                    checkpoint_guest: false,
+                    svm_exit_checkpoint: None,
+                    io_active: false,
+                    fault: None,
+                },
+                ram: ram.clone(),
+                writes: self.writes.clone(),
+                ram_ranges: ranges.clone(),
+                caps: self.caps.clone(),
+                control: control.clone(),
+            })
+            .collect();
+        Ok((partition, binders))
     }
 }
 
 impl EmuPartition {
     #[cfg(test)]
     pub(crate) fn is_waiting_for_test(&self) -> bool {
-        self.control.waiting.load(Ordering::Acquire)
+        self.control.vps[0].waiting.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -705,7 +762,7 @@ impl EmuPartition {
                 "selected-vector ingress bypasses the owned LAPIC",
             ));
         }
-        match self.control.remote.post_selected(vector) {
+        match self.control.vps[0].remote.post_selected(vector) {
             Injection::Queued => Ok(()),
             Injection::Busy => Err(Error::InterruptBusy),
             Injection::InvalidVector => Err(Error::InterruptVector),
@@ -758,16 +815,15 @@ impl virt::X86Partition for EmuPartition {
         self.control.clone()
     }
     fn pulse_lint(&self, vp: VpIndex, vtl: Vtl, lint: u8) {
-        if vp != VpIndex::BSP || vtl != Vtl::Vtl0 || lint > 1 {
+        let Some(endpoint) = self.control.vp(vp) else {
+            self.control.unsupported();
+            return;
+        };
+        if vtl != Vtl::Vtl0 || lint > 1 {
             self.control.unsupported();
             return;
         }
-        if self
-            .control
-            .routing
-            .pulse_lint(&self.control.remote, lint)
-            .is_err()
-        {
+        if endpoint.routing.pulse_lint(&endpoint.remote, lint).is_err() {
             self.control.unsupported();
         }
     }
@@ -790,11 +846,12 @@ impl Partition for EmuPartition {
         &self.caps
     }
     fn request_yield(&self, vp_index: VpIndex) {
-        if vp_index.index() != 0 {
-            self.control.unsupported.store(true, Ordering::Release);
-        }
-        if self.control.yield_requested.request_yield() {
-            self.control.remote.request_yield();
+        let Some(endpoint) = self.control.vp(vp_index) else {
+            self.control.unsupported();
+            return;
+        };
+        if endpoint.yield_requested.request_yield() {
+            endpoint.remote.request_yield();
         }
     }
 }
@@ -885,6 +942,8 @@ impl EmuProcessor<'_> {
         stop: StopVp<'_>,
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
+        let vp = self.state.index;
+        let endpoint = self.control.vp(vp).expect("bound VP index");
         #[cfg(test)]
         let mut stop = stop;
         if self.state.io_active {
@@ -937,7 +996,7 @@ impl EmuProcessor<'_> {
                 })?;
                 timer::arm(core.next_timer(), self.clock, &self.state.timer, true);
             }
-            self.control.yield_requested.maybe_yield().await;
+            endpoint.yield_requested.maybe_yield().await;
             stop.check()?;
             if core.at_instruction_boundary()
                 && checkpoint == Some(core.cpu().rip)
@@ -953,7 +1012,7 @@ impl EmuProcessor<'_> {
                 core.set_entry_stop(checkpoint);
             }
             let result = {
-                let access = self.ram.access();
+                let access = self.ram.access_for(Some(vp.index() as usize));
                 let ram = access.ram();
                 let is_mmio = |address: u64, width: u8| {
                     (0..u64::from(width)).all(|offset| {
@@ -1077,7 +1136,7 @@ impl EmuProcessor<'_> {
             if COUNTED && self.state.observed {
                 observed_batches += 1;
                 if observed_batches == 64 {
-                    self.control.yield_requested.request_yield();
+                    endpoint.yield_requested.request_yield();
                     observed_batches = 0;
                 }
             }
@@ -1124,17 +1183,12 @@ impl EmuProcessor<'_> {
                     let reply = match request.access {
                         WordAccess::Read => {
                             let mut bytes = [0; 8];
-                            dev.read_io(VpIndex::new(0), request.port, &mut bytes[..size])
-                                .await;
+                            dev.read_io(vp, request.port, &mut bytes[..size]).await;
                             IoReply::Read(u64::from_le_bytes(bytes))
                         }
                         WordAccess::Write(value) => {
-                            dev.write_io(
-                                VpIndex::new(0),
-                                request.port,
-                                &value.to_le_bytes()[..size],
-                            )
-                            .await;
+                            dev.write_io(vp, request.port, &value.to_le_bytes()[..size])
+                                .await;
                             IoReply::Written
                         }
                     };
@@ -1151,17 +1205,12 @@ impl EmuProcessor<'_> {
                     let reply = match request.access {
                         WordAccess::Read => {
                             let mut bytes = [0; 8];
-                            dev.read_mmio(VpIndex::new(0), request.address, &mut bytes[..size])
-                                .await;
+                            dev.read_mmio(vp, request.address, &mut bytes[..size]).await;
                             IoReply::Read(u64::from_le_bytes(bytes))
                         }
                         WordAccess::Write(value) => {
-                            dev.write_mmio(
-                                VpIndex::new(0),
-                                request.address,
-                                &value.to_le_bytes()[..size],
-                            )
-                            .await;
+                            dev.write_mmio(vp, request.address, &value.to_le_bytes()[..size])
+                                .await;
                             IoReply::Written
                         }
                     };
@@ -1175,17 +1224,15 @@ impl EmuProcessor<'_> {
                 BatchStop::Waiting => {
                     #[cfg(test)]
                     if COUNTED && self.state.observed {
-                        stop.until_stop(std::future::poll_fn(|cx| {
-                            self.control.remote.poll_wake(cx)
-                        }))
-                        .await?;
+                        stop.until_stop(std::future::poll_fn(|cx| endpoint.remote.poll_wake(cx)))
+                            .await?;
                         continue;
                     }
                     #[cfg(test)]
-                    self.control.waiting.store(true, Ordering::Release);
-                    self.control.remote.wait_for_wake();
+                    endpoint.waiting.store(true, Ordering::Release);
+                    endpoint.remote.wait_for_wake();
                     #[cfg(test)]
-                    self.control.waiting.store(false, Ordering::Release);
+                    endpoint.waiting.store(false, Ordering::Release);
                 }
                 BatchStop::Stopped(reason) => {
                     return Err(dev.fatal_error(Box::new(Error::Cpu {
@@ -1483,8 +1530,8 @@ impl AccessVpState for EmuStateAccess<'_> {
         };
         let mut core = {
             #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
-            if self.state.chaining {
-                Machine::new_native_chained(image)
+            if let Some(store) = &self.state.block_store {
+                Machine::new_with_shared_blocks(image, store.clone())
             } else {
                 Machine::new_with_backend(image, self.state.backend)
             }
@@ -1492,7 +1539,8 @@ impl AccessVpState for EmuStateAccess<'_> {
             Machine::new_with_backend(image, self.state.backend)
         }?;
         core.set_svm_exit_stop(self.state.svm_exit_checkpoint);
-        core.set_vp_control(self.control.remote.clone());
+        let endpoint = self.control.vp(self.state.index).expect("bound VP index");
+        core.set_vp_control(endpoint.remote.clone());
         #[cfg(test)]
         core.set_test_options(strudel::TestOptions {
             cache: self.state.decode_cache_enabled,
@@ -1500,11 +1548,12 @@ impl AccessVpState for EmuStateAccess<'_> {
         let clock = self.state.clock_source.access("strudel-vp-clock");
         core.set_vm_clock(move || clock.now().as_100ns());
         if let Some(id) = self.state.apic_id {
-            if !core.configure_apic(id) {
+            if !core.configure_apic_with_role(id, self.state.index.is_bsp()) {
                 return Err(Error::Profile("initial APIC metadata"));
             }
             core.set_cr8(regs.cr8).map_err(Error::Apic)?;
-            core.set_local_routing(self.control.routing.clone());
+            core.set_local_routing(endpoint.routing.clone());
+            core.set_ipi_router(self.control.ipis.clone());
         }
         self.state.cpu = CpuLifecycle::Ready(Box::new(core));
         Ok(())

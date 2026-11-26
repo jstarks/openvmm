@@ -29,6 +29,7 @@ x86_system.workspace = true
 strudel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+pci_core.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 hvdef.workspace = true

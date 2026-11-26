@@ -2825,13 +2825,11 @@ async fn check_block_on_vp_kick(driver: &DefaultDriver, guest: KickedGuest) {
         std::thread::yield_now();
     }
     if apic {
-        partition.request_msi(
-            Vtl::Vtl0,
-            virt::irqcon::MsiRequest {
-                address: 0xfee0_0000,
-                data: 64,
-            },
-        );
+        assert!(partition.as_signal_msi(Vtl::Vtl1).is_none());
+        partition
+            .as_signal_msi(Vtl::Vtl0)
+            .unwrap()
+            .signal_msi(Some(0x100), 0xfee0_0000, 64);
         while memory.read_plain::<u8>(DEST).unwrap() != 0x55 || !partition.is_waiting_for_test() {
             assert!(
                 !worker.is_finished() && start.elapsed() < TIMEOUT,

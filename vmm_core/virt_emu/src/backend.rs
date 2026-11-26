@@ -186,6 +186,12 @@ impl Control {
     }
 }
 
+impl pci_core::msi::SignalMsi for Control {
+    fn signal_msi(&self, _devid: Option<u32>, address: u64, data: u32) {
+        self.request_apic_msi(virt::irqcon::MsiRequest { address, data });
+    }
+}
+
 struct TimerWake {
     fired: AtomicBool,
     remote: VpControl,
@@ -780,6 +786,10 @@ impl Partition for EmuPartition {
         } else {
             self.control.unsupported();
         }
+    }
+    fn as_signal_msi(&self, vtl: Vtl) -> Option<Arc<dyn pci_core::msi::SignalMsi>> {
+        (vtl == Vtl::Vtl0 && self.control.has_apic)
+            .then(|| self.control.clone() as Arc<dyn pci_core::msi::SignalMsi>)
     }
     fn caps(&self) -> &PartitionCapabilities {
         &self.caps

@@ -10509,6 +10509,7 @@ dependencies = [
  "missing_dev",
  "pal_async",
  "parking_lot",
+ "pci_core",
  "serde_json",
  "serial_16550",
  "serial_16550_resources",

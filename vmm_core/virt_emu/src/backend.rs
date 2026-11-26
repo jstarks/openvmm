@@ -209,6 +209,7 @@ pub struct EmuHypervisor;
 /// Validated profile awaiting existing backing.
 pub struct EmuProtoPartition {
     backend: strudel::Backend,
+    chaining: bool,
     caps: Arc<PartitionCapabilities>,
     clock: VmTimeSource,
     architectural_apic: bool,
@@ -235,6 +236,7 @@ struct VpState {
     timer: Arc<TimerWake>,
     clock_source: VmTimeSource,
     backend: strudel::Backend,
+    chaining: bool,
     #[cfg(test)]
     decode_cache_enabled: bool,
     #[cfg(test)]
@@ -408,6 +410,9 @@ impl EmuProcessor<'_> {
     }
     /// Configure an out-of-band instruction-boundary stop without changing guest state.
     pub fn set_execution_checkpoint(&mut self, address: Option<u64>) -> Result<(), Error> {
+        if self.state.chaining && address.is_some() {
+            return Err(Error::Profile("execution checkpoint requires chaining off"));
+        }
         if address
             .is_some_and(|address| (0x8000_0000_0000..0xffff_8000_0000_0000).contains(&address))
         {
@@ -492,6 +497,7 @@ impl Hypervisor for NativeHypervisor {
         }
         let mut proto = EmuHypervisor.new_partition(config)?;
         proto.backend = strudel::Backend::Native;
+        proto.chaining = true;
         Ok(proto)
     }
 }
@@ -564,6 +570,7 @@ impl EmuHypervisor {
         caps.nested_virt = config.nested_virt;
         Ok(EmuProtoPartition {
             backend: strudel::Backend::Interpreter,
+            chaining: false,
             caps: Arc::new(caps),
             clock: config.vmtime.clone(),
             architectural_apic,
@@ -629,6 +636,7 @@ impl ProtoPartition for EmuProtoPartition {
                     remote: control.remote.clone(),
                 }),
                 backend: self.backend,
+                chaining: self.chaining,
                 #[cfg(test)]
                 decode_cache_enabled: true,
                 #[cfg(test)]
@@ -881,6 +889,11 @@ impl EmuProcessor<'_> {
         let mut stop = stop;
         if self.state.io_active {
             return Err(dev.fatal_error(Box::new(Error::CancelledIo)));
+        }
+        if COUNTED && self.state.chaining {
+            return Err(dev.fatal_error(Box::new(Error::Profile(
+                "counted execution requires chaining off",
+            ))));
         }
         if COUNTED && self.state.progress.is_none() {
             return Err(dev.fatal_error(Box::new(Error::Profile("incomplete counted VP history"))));
@@ -1461,16 +1474,23 @@ impl AccessVpState for EmuStateAccess<'_> {
         {
             return Err(Error::Profile("initial long-mode register image"));
         }
-        let mut core = Machine::new_with_backend(
-            CpuState {
-                registers: cpu,
-                config,
-                cr2: regs.cr2,
-                tables,
-                system,
-            },
-            self.state.backend,
-        )?;
+        let image = CpuState {
+            registers: cpu,
+            config,
+            cr2: regs.cr2,
+            tables,
+            system,
+        };
+        let mut core = {
+            #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
+            if self.state.chaining {
+                Machine::new_native_chained(image)
+            } else {
+                Machine::new_with_backend(image, self.state.backend)
+            }
+            #[cfg(not(all(feature = "native-jit", any(target_os = "linux", windows))))]
+            Machine::new_with_backend(image, self.state.backend)
+        }?;
         core.set_svm_exit_stop(self.state.svm_exit_checkpoint);
         core.set_vp_control(self.control.remote.clone());
         #[cfg(test)]

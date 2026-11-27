@@ -532,7 +532,12 @@ impl Hypervisor for NativeHypervisor {
                 "native RAM requires RCpc/LSE on ARM64 and LSE2 on Linux ARM64",
             ));
         }
-        let mut proto = EmuHypervisor.new_partition(config)?;
+        let max_vps = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            4
+        } else {
+            1
+        };
+        let mut proto = EmuHypervisor.partition(config, true, true, true, max_vps)?;
         proto.backend = strudel::Backend::Native;
         proto.chaining = true;
         Ok(proto)
@@ -587,7 +592,7 @@ impl EmuHypervisor {
             || !matches!(config.isolation, ProtoPartitionIsolation::None)
         {
             return Err(Error::Profile(
-                "one VP, no isolation/HV1; basic SVM requires the architectural APIC profile",
+                "unsupported VP count or isolation/HV1; basic SVM requires the architectural APIC profile",
             ));
         }
         let apic_ids: Box<[_]> = config
@@ -967,7 +972,6 @@ impl EmuProcessor<'_> {
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
         let vp = self.state.index;
-        let endpoint = self.control.vp(vp).expect("bound VP index");
         #[cfg(test)]
         let mut stop = stop;
         if self.state.io_active {
@@ -990,7 +994,16 @@ impl EmuProcessor<'_> {
             }
             self.state.progress = None;
         }
+        if !vp.is_bsp() {
+            if let CpuLifecycle::Importing(system) = &self.state.cpu {
+                let image = CpuState::ap_reset(**system);
+                if let Err(error) = self.access_state(Vtl::Vtl0).initialize(image, 0, true) {
+                    return Err(dev.fatal_error(Box::new(error)));
+                }
+            }
+        }
         self.state.started = true;
+        let endpoint = self.control.vp(vp).expect("bound VP index");
         #[cfg(test)]
         let mut observed_batches = 0u8;
         loop {
@@ -1332,6 +1345,46 @@ pub struct EmuStateAccess<'a> {
 }
 
 impl EmuStateAccess<'_> {
+    fn initialize(
+        &mut self,
+        image: CpuState,
+        cr8: u64,
+        wait_for_startup: bool,
+    ) -> Result<(), Error> {
+        let mut core = {
+            #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
+            if let Some(store) = &self.state.block_store {
+                Machine::new_with_shared_blocks(image, store.clone())
+            } else {
+                Machine::new_with_backend(image, self.state.backend)
+            }
+            #[cfg(not(all(feature = "native-jit", any(target_os = "linux", windows))))]
+            Machine::new_with_backend(image, self.state.backend)
+        }?;
+        core.set_svm_exit_stop(self.state.svm_exit_checkpoint);
+        let endpoint = self.control.vp(self.state.index).expect("bound VP index");
+        core.set_vp_control(endpoint.remote.clone());
+        #[cfg(test)]
+        core.set_test_options(strudel::TestOptions {
+            cache: self.state.decode_cache_enabled,
+        });
+        let clock = self.state.clock_source.access("strudel-vp-clock");
+        core.set_vm_clock(move || clock.now().as_100ns());
+        if let Some(id) = self.state.apic_id {
+            if !core.configure_apic_with_role(id, self.state.index.is_bsp()) {
+                return Err(Error::Profile("initial APIC metadata"));
+            }
+            core.set_cr8(cr8).map_err(Error::Apic)?;
+            core.set_local_routing(endpoint.routing.clone());
+            core.set_ipi_router(self.control.ipis.clone());
+        }
+        if wait_for_startup {
+            core.wait_for_startup();
+        }
+        self.state.cpu = CpuLifecycle::Ready(Box::new(core));
+        Ok(())
+    }
+
     fn core(&self) -> Result<&Machine, Error> {
         if self.vtl != Vtl::Vtl0 {
             return Err(Error::Profile("VTL"));
@@ -1398,10 +1451,18 @@ fn with_system(mut regs: vp::Registers, system: SystemState) -> vp::Registers {
     regs.gs = segment_register(system.gs);
     regs.tr = segment_register(system.tr);
     regs.ldtr = segment_register(system.ldtr);
-    regs.efer =
-        x86_system::arch::svm::read_efer(regs.efer | u64::from(system.efer_sce), system.svm);
-    regs.cr0 |= system.cr0_extra;
-    regs.cr4 |= system.cr4_extra;
+    regs.efer = x86_system::arch::svm::read_efer(
+        (regs.efer & !0x500)
+            | (u64::from(system.mode.long_enable) << 8)
+            | (u64::from(system.mode.long_active) << 10)
+            | u64::from(system.efer_sce),
+        system.svm,
+    );
+    regs.cr0 = (regs.cr0 & !0x8000_0001)
+        | system.cr0_extra
+        | u64::from(system.mode.protected)
+        | (u64::from(system.mode.paging) << 31);
+    regs.cr4 = (regs.cr4 & !0x20) | system.cr4_extra | (u64::from(system.mode.pae) << 5);
     regs
 }
 
@@ -1552,35 +1613,7 @@ impl AccessVpState for EmuStateAccess<'_> {
             tables,
             system,
         };
-        let mut core = {
-            #[cfg(all(feature = "native-jit", any(target_os = "linux", windows)))]
-            if let Some(store) = &self.state.block_store {
-                Machine::new_with_shared_blocks(image, store.clone())
-            } else {
-                Machine::new_with_backend(image, self.state.backend)
-            }
-            #[cfg(not(all(feature = "native-jit", any(target_os = "linux", windows))))]
-            Machine::new_with_backend(image, self.state.backend)
-        }?;
-        core.set_svm_exit_stop(self.state.svm_exit_checkpoint);
-        let endpoint = self.control.vp(self.state.index).expect("bound VP index");
-        core.set_vp_control(endpoint.remote.clone());
-        #[cfg(test)]
-        core.set_test_options(strudel::TestOptions {
-            cache: self.state.decode_cache_enabled,
-        });
-        let clock = self.state.clock_source.access("strudel-vp-clock");
-        core.set_vm_clock(move || clock.now().as_100ns());
-        if let Some(id) = self.state.apic_id {
-            if !core.configure_apic_with_role(id, self.state.index.is_bsp()) {
-                return Err(Error::Profile("initial APIC metadata"));
-            }
-            core.set_cr8(regs.cr8).map_err(Error::Apic)?;
-            core.set_local_routing(endpoint.routing.clone());
-            core.set_ipi_router(self.control.ipis.clone());
-        }
-        self.state.cpu = CpuLifecycle::Ready(Box::new(core));
-        Ok(())
+        self.initialize(image, regs.cr8, false)
     }
     fn pat(&mut self) -> Result<vp::Pat, Error> {
         Ok(vp::Pat {
@@ -1616,7 +1649,9 @@ impl AccessVpState for EmuStateAccess<'_> {
     fn activity(&mut self) -> Result<vp::Activity, Error> {
         let core = self.core()?;
         Ok(vp::Activity {
-            mp_state: if core.halted() {
+            mp_state: if core.waiting_for_startup() {
+                vp::MpState::WaitForSipi
+            } else if core.halted() {
                 vp::MpState::Halted
             } else {
                 vp::MpState::Running

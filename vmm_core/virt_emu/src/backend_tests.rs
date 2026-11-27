@@ -805,13 +805,31 @@ async fn build_profile(
     MappedTestMemory<EmuPartition>,
     VmTimeKeeper,
 ) {
+    let (partition, mut binders, memory, keeper) = build_vps(driver, bytes, now, apic, 1).await;
+    let mut binder = binders.pop().unwrap();
+    binder.set_observed_for_test(true);
+    (partition, binder, memory, keeper)
+}
+
+async fn build_vps(
+    driver: &DefaultDriver,
+    bytes: &[u8],
+    now: VmTime,
+    apic: bool,
+    count: u32,
+) -> (
+    Arc<EmuPartition>,
+    Vec<EmuProcessorBinder>,
+    MappedTestMemory<EmuPartition>,
+    VmTimeKeeper,
+) {
     let topology = TopologyBuilder::new_x86()
         .x2apic(if apic {
             X2ApicState::Supported
         } else {
             X2ApicState::Unsupported
         })
-        .build(1)
+        .build(count)
         .unwrap();
     let memory_layout = MemoryLayout::new(
         bytes.len() as u64,
@@ -832,7 +850,25 @@ async fn build_profile(
         isolation: ProtoPartitionIsolation::None,
         nested_virt: false,
     };
-    let proto = if apic {
+    let proto = if count != 1 {
+        #[cfg(all(feature = "direct-ram", target_os = "linux", target_arch = "x86_64"))]
+        {
+            assert!(apic);
+            assert!(
+                hv.new_partition(ProtoPartitionConfig {
+                    processor_topology: &topology,
+                    hv_config: None,
+                    vmtime: &time,
+                    isolation: ProtoPartitionIsolation::None,
+                    nested_virt: false,
+                })
+                .is_err()
+            );
+            hv.new_long_mode_smp_fixture(config)
+        }
+        #[cfg(not(all(feature = "direct-ram", target_os = "linux", target_arch = "x86_64")))]
+        panic!("long-mode SMP fixture requires Linux x64 direct RAM");
+    } else if apic {
         hv.new_partition(config)
     } else {
         hv.new_legacy_fixture(config)
@@ -840,7 +876,7 @@ async fn build_profile(
     .unwrap();
     assert_eq!(proto.max_physical_address_size(), 48);
     let tracker = proto.memory_write_tracker().unwrap();
-    let (partition, mut binders) = proto
+    let (partition, binders) = proto
         .build(PartitionConfig {
             mem_layout: &memory_layout,
             guest_memory: &memory,
@@ -849,12 +885,169 @@ async fn build_profile(
             fault_resolver: None,
         })
         .unwrap();
-    assert_eq!(binders.len(), 1);
+    assert_eq!(binders.len(), count as usize);
     let partition = Arc::new(partition);
     let memory = MappedTestMemory::observed(partition.clone(), bytes, tracker);
-    let mut binder = binders.pop().unwrap();
-    binder.set_observed_for_test(true);
-    (partition, binder, memory, keeper)
+    (partition, binders, memory, keeper)
+}
+
+#[cfg(all(feature = "direct-ram", target_os = "linux", target_arch = "x86_64"))]
+#[async_test]
+async fn native_smp_shootdown_wakes_each_peer_after_a_shared_watch(driver: DefaultDriver) {
+    use std::time::{Duration, Instant};
+
+    const AP: u64 = 0x11000;
+    const IRQ: u64 = 0x12000;
+    const GATE: u64 = 0x17000;
+    const MARKERS: u64 = 0x17100;
+    const DATA: u64 = 0x1a000;
+    const REPLACEMENT: u64 = 0x1b000;
+    const PTE: u64 = 0x4000 + DATA / 4096 * 8;
+    const BEFORE: u32 = 0x1111_2222;
+    const AFTER: u32 = 0x3333_4444;
+
+    for count in [2, 4] {
+        let (mut bytes, owned) = fixture();
+        bytes[0x4100..0x4108].copy_from_slice(&0xfee0_0007u64.to_le_bytes());
+        bytes[PTE as usize..PTE as usize + 8].copy_from_slice(&(DATA | 7).to_le_bytes());
+        bytes[DATA as usize..DATA as usize + 4].copy_from_slice(&BEFORE.to_le_bytes());
+        bytes[REPLACEMENT as usize..REPLACEMENT as usize + 4].copy_from_slice(&AFTER.to_le_bytes());
+        let gate = 0x0001_8e00_0008_2000u64;
+        bytes[0xa400..0xa408].copy_from_slice(&gate.to_le_bytes()); // vector 64
+        bytes[0xa408..0xa410].fill(0);
+
+        let mut sender = Vec::new();
+        store_apic(&mut sender, 0xf0, 0x1ff);
+        // Wait for the host to observe every peer halted, then edit the PTE.
+        sender.extend([0x83, 0x3a, 2, 0x75, 0xfb]); // cmp dword [rdx],2; jne
+        sender.extend([0x48, 0xc7, 0x06]); // mov qword [rsi],imm32
+        sender.extend(((REPLACEMENT | 7) as u32).to_le_bytes());
+        store_apic(&mut sender, 0x300, 0xc0040); // fixed 64, all excluding self
+        sender.push(0xf4);
+        bytes[CODE as usize..CODE as usize + sender.len()].copy_from_slice(&sender);
+
+        let mut peer = Vec::new();
+        store_apic(&mut peer, 0xf0, 0x1ff);
+        peer.extend([0x8b, 0x06, 0x89, 0x03]); // read old mapping; record [rbx]
+        peer.extend([0x83, 0x3a, 0, 0x74, 0xfb]); // wait during host watch capture
+        peer.extend([0xf4, 0xc7, 0x43, 8, 1, 0, 0, 0, 0xf4]); // HLT; record IRET; HLT
+        bytes[AP as usize..AP as usize + peer.len()].copy_from_slice(&peer);
+
+        let mut handler = vec![0x0f, 0x01, 0x3e, 0x8b, 0x06, 0x89, 0x43, 4]; // INVLPG; read new mapping
+        store_apic(&mut handler, 0xb0, 0); // EOI
+        handler.extend([0x48, 0xcf]); // IRETQ
+        bytes[IRQ as usize..IRQ as usize + handler.len()].copy_from_slice(&handler);
+
+        let (partition, binders, memory, _keeper) =
+            build_vps(&driver, &bytes, VmTime::from_100ns(0), true, count).await;
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            let mut kicks = Vec::new();
+            for (index, mut binder) in binders.into_iter().enumerate() {
+                let partition = partition.clone();
+                let (kick, kicked) = mesh::oneshot::<()>();
+                kicks.push(kick);
+                let mut initial = long_mode_registers(
+                    owned.core.cpu,
+                    super::shared_mmu_tests::config(),
+                    owned.tables,
+                    0,
+                );
+                initial.rip = if index == 0 { CODE } else { AP };
+                initial.rdi = DEVICE;
+                initial.rsi = if index == 0 { PTE } else { DATA };
+                initial.rdx = GATE;
+                initial.rbx = MARKERS + 16 * index as u64;
+                initial.rsp = 0x19000 - 0x100 * index as u64;
+                initial.rflags = 0x202;
+                workers.push(scope.spawn(move || {
+                    let mut vp = binder.bind().unwrap();
+                    vp.access_state(Vtl::Vtl0).set_registers(&initial).unwrap();
+                    let mut devices = Devices::new();
+                    devices.apic = true;
+                    let stop = StopVpSource::new();
+                    let result = vmm_core::partition_unit::block_on_vp(
+                        partition,
+                        VpIndex::new(index as u32),
+                        async {
+                            futures::future::join(
+                                async {
+                                    let _ = kicked.await;
+                                    stop.stop();
+                                },
+                                vp.run_vp(stop.checker(), &devices),
+                            )
+                            .await
+                            .1
+                        },
+                    );
+                    assert!(
+                        matches!(result, Err(VpHaltReason::Stop(_))),
+                        "VP {index}: {result:?}: {:?}",
+                        devices.faults.lock()
+                    );
+                    // Edge-triggered EOI stays local; it is not an IOAPIC EOI.
+                    assert!(devices.eois.lock().is_empty());
+                    let apic = vp.apic_diagnostics().unwrap();
+                    assert!(!apic.registers.interrupts.isr.contains(64));
+                    assert_eq!(
+                        apic.delivered.as_slice(),
+                        if index == 0 { &[][..] } else { &[(64, 1)] }
+                    );
+                }));
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let wait = |stage, ready: &dyn Fn() -> bool| {
+                while !ready() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{count} VPs: timed out at {stage}"
+                    );
+                    std::thread::yield_now();
+                }
+            };
+            let marker = |vp: u32, offset| {
+                memory
+                    .read_plain::<u32>(MARKERS + 16 * u64::from(vp) + offset)
+                    .unwrap()
+            };
+            wait("initial reads", &|| {
+                (1..count).all(|vp| marker(vp, 0) == BEFORE)
+            });
+            let watched = partition.capture_code::<1>(AP).unwrap();
+            assert_eq!(*watched.value(), [peer[0]]);
+            let result_watches: Vec<_> = (1..count)
+                .map(|vp| {
+                    let watch = partition
+                        .capture_code::<4>(MARKERS + 16 * u64::from(vp) + 4)
+                        .unwrap();
+                    assert_eq!(*watch.value(), [0; 4]);
+                    watch
+                })
+                .collect();
+            memory.write_plain(GATE, &1u32).unwrap();
+            wait("peers halted before IPI", &|| {
+                (1..count).all(|vp| partition.is_vp_waiting_for_test(VpIndex::new(vp)))
+            });
+            memory.write_plain(GATE, &2u32).unwrap();
+            wait("shootdown and IRET", &|| {
+                (1..count).all(|vp| marker(vp, 4) == AFTER && marker(vp, 8) == 1)
+            });
+            wait("peers halted after IRET", &|| {
+                (1..count).all(|vp| partition.is_vp_waiting_for_test(VpIndex::new(vp)))
+            });
+            assert_eq!(memory.read_plain::<u64>(PTE).unwrap() & !0xfff, REPLACEMENT);
+            assert!(watched.is_valid());
+            assert!(result_watches.iter().all(|watch| !watch.is_valid()));
+            for kick in kicks {
+                kick.send(());
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+    }
 }
 
 #[async_test]

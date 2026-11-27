@@ -427,7 +427,9 @@ impl EmuProcessor<'_> {
     pub fn apic_diagnostics(&self) -> Option<ApicDiagnostics> {
         let registers = match &self.state.cpu {
             CpuLifecycle::Ready(core) => *core.lapic()?,
-            CpuLifecycle::Importing(_) => LocalApic::new(self.state.apic_id?, true, 0),
+            CpuLifecycle::Importing(_) => {
+                LocalApic::new(self.state.apic_id?, self.state.index.is_bsp(), 0)
+            }
         };
         Some(ApicDiagnostics {
             registers,
@@ -501,7 +503,7 @@ impl Hypervisor for EmuHypervisor {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, true, true, true)
+        self.partition(config, true, true, true, 1)
     }
 }
 
@@ -543,7 +545,7 @@ impl EmuHypervisor {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, false, false, false)
+        self.partition(config, false, false, false, 1)
     }
 
     /// Diagnostic SVM profile without nested paging, optionally also without NRIPS.
@@ -552,7 +554,23 @@ impl EmuHypervisor {
         config: ProtoPartitionConfig<'_>,
         nrips: bool,
     ) -> Result<EmuProtoPartition, Error> {
-        self.partition(config, true, nrips, false)
+        self.partition(config, true, nrips, false, 1)
+    }
+
+    #[cfg(all(
+        test,
+        feature = "direct-ram",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(crate) fn new_long_mode_smp_fixture(
+        &mut self,
+        config: ProtoPartitionConfig<'_>,
+    ) -> Result<EmuProtoPartition, Error> {
+        let mut proto = self.partition(config, true, false, false, 4)?;
+        proto.backend = strudel::Backend::Native;
+        proto.chaining = true;
+        Ok(proto)
     }
 
     fn partition(
@@ -561,8 +579,9 @@ impl EmuHypervisor {
         architectural_apic: bool,
         nrips: bool,
         npt: bool,
+        max_vps: usize,
     ) -> Result<EmuProtoPartition, Error> {
-        if config.processor_topology.vps().count() != 1
+        if !(1..=max_vps).contains(&config.processor_topology.vps().len())
             || config.hv_config.is_some()
             || (config.nested_virt && !architectural_apic)
             || !matches!(config.isolation, ProtoPartitionIsolation::None)
@@ -733,7 +752,12 @@ impl ProtoPartition for EmuProtoPartition {
 impl EmuPartition {
     #[cfg(test)]
     pub(crate) fn is_waiting_for_test(&self) -> bool {
-        self.control.vps[0].waiting.load(Ordering::Acquire)
+        self.is_vp_waiting_for_test(VpIndex::BSP)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_vp_waiting_for_test(&self, vp: VpIndex) -> bool {
+        self.control.vp(vp).unwrap().waiting.load(Ordering::Acquire)
     }
 
     #[cfg(test)]

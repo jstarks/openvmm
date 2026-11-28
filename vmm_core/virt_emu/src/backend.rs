@@ -218,6 +218,12 @@ impl Control {
     }
 }
 
+impl pci_core::msi::SignalMsi for Control {
+    fn signal_msi(&self, _devid: Option<u32>, address: u64, data: u32) {
+        self.request_apic_msi(virt::irqcon::MsiRequest { address, data });
+    }
+}
+
 struct TimerWake {
     fired: AtomicBool,
     remote: VpControl,
@@ -628,6 +634,9 @@ impl EmuHypervisor {
                     values[2] |= 1 << 21;
                     values[3] |= 1 << 9;
                 }
+                if architectural_apic && function == 0x8000_0001 {
+                    values[3] |= 1 << 9;
+                }
                 values
             },
         )?;
@@ -871,6 +880,10 @@ impl Partition for EmuPartition {
             self.control.unsupported();
         }
     }
+    fn as_signal_msi(&self, vtl: Vtl) -> Option<Arc<dyn pci_core::msi::SignalMsi>> {
+        (vtl == Vtl::Vtl0 && self.control.has_apic)
+            .then(|| self.control.clone() as Arc<dyn pci_core::msi::SignalMsi>)
+    }
     fn caps(&self) -> &PartitionCapabilities {
         &self.caps
     }
@@ -1068,13 +1081,13 @@ impl EmuProcessor<'_> {
                 let counted =
                     |batch: strudel::Batch| (batch.stop, Some((batch.retired, batch.delivered)));
                 if !COUNTED {
-                    // SAFETY: this read lease pins mappings and code watches.
-                    // Writers rotate the epoch under the exclusive lease. The
-                    // partition's RAM classification is immutable for its lifetime.
                     #[expect(
                         unsafe_code,
                         reason = "the read lease pins the certified RAM bindings"
                     )]
+                    // SAFETY: this read lease pins mappings and code watches.
+                    // Writers rotate the epoch under the exclusive lease. The
+                    // partition's RAM classification is immutable for its lifetime.
                     let lease = unsafe {
                         strudel::BindingLease::new(&ram, access.binding_epoch(), &is_ram_page)
                     };
@@ -1224,6 +1237,16 @@ impl EmuProcessor<'_> {
                             IoReply::Read(u64::from_le_bytes(bytes))
                         }
                         WordAccess::Write(value) => {
+                            if (request.port == 0xcf9 && value & 4 != 0)
+                                || (request.port == 0x64 && value == 0xfe)
+                            {
+                                tracing::warn!(
+                                    port = request.port,
+                                    value,
+                                    state = ?core.state(),
+                                    "guest requested hardware reset"
+                                );
+                            }
                             dev.write_io(vp, request.port, &value.to_le_bytes()[..size])
                                 .await;
                             IoReply::Written
@@ -1272,6 +1295,7 @@ impl EmuProcessor<'_> {
                     endpoint.waiting.store(false, Ordering::Release);
                 }
                 BatchStop::Stopped(reason) => {
+                    tracing::warn!(state = ?core.state(), ?reason, "emulated CPU stopped");
                     return Err(dev.fatal_error(Box::new(Error::Cpu {
                         rip: core.cpu().rip,
                         instruction: core
@@ -1452,10 +1476,11 @@ fn with_system(mut regs: vp::Registers, system: SystemState) -> vp::Registers {
     regs.tr = segment_register(system.tr);
     regs.ldtr = segment_register(system.ldtr);
     regs.efer = x86_system::arch::svm::read_efer(
-        (regs.efer & !0x500)
+        (regs.efer & !(0x500 | (1 << 14)))
             | (u64::from(system.mode.long_enable) << 8)
             | (u64::from(system.mode.long_active) << 10)
-            | u64::from(system.efer_sce),
+            | u64::from(system.efer_sce)
+            | (u64::from(system.efer_ffxsr) << 14),
         system.svm,
     );
     regs.cr0 = (regs.cr0 & !0x8000_0001)
@@ -1582,8 +1607,9 @@ impl AccessVpState for EmuStateAccess<'_> {
             tr: segment_state(regs.tr),
             ldtr: segment_state(regs.ldtr),
             efer_sce: regs.efer & 1 != 0,
-            cr0_extra: regs.cr0 & 0x40022,
-            cr4_extra: regs.cr4 & 0x90,
+            efer_ffxsr: regs.efer & 0x4000 != 0,
+            cr0_extra: regs.cr0 & x86_system::arch::privilege::CR0_EXTRA_MASK,
+            cr4_extra: regs.cr4 & x86_system::arch::privilege::CR4_EXTRA_MASK,
             ..self.system()?
         };
         let mut normalized = *regs;
@@ -1594,8 +1620,9 @@ impl AccessVpState for EmuStateAccess<'_> {
             }
             normalized.cr8 = 0;
         }
+        let expected = with_system(long_mode_registers(cpu, config, tables, regs.cr2), system);
         if !system.is_supported()
-            || normalized != with_system(long_mode_registers(cpu, config, tables, regs.cr2), system)
+            || normalized != expected
             || config.root >= 1u64 << 48
             || !config.root.is_multiple_of(4096)
             || cpu.flags & !0x0021_0ed7 != 0
@@ -1604,6 +1631,12 @@ impl AccessVpState for EmuStateAccess<'_> {
             || tables.gdt_limit < 23
             || !tables.idt_base.is_multiple_of(16)
         {
+            tracing::warn!(
+                registers = ?normalized,
+                expected = ?expected,
+                system_supported = system.is_supported(),
+                "unsupported initial long-mode register image"
+            );
             return Err(Error::Profile("initial long-mode register image"));
         }
         let image = CpuState {
@@ -1638,6 +1671,10 @@ impl AccessVpState for EmuStateAccess<'_> {
     }
     fn set_mtrrs(&mut self, value: &vp::Mtrrs) -> Result<(), Error> {
         if !system::mtrrs_supported(value.msr_mtrr_def_type, &value.fixed, &value.variable) {
+            tracing::warn!(
+                ?value,
+                "initial MTRR image is outside the supported CPU profile"
+            );
             return Err(Error::Profile("initial MTRR image"));
         }
         let mut system = self.system()?;

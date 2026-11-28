@@ -1874,9 +1874,9 @@ async fn cpu_check_far_return_cpuid_and_flag_stack_use_actual_vp_state(driver: D
         }
         let mut expected = initial;
         expected.rax = 0x00a00f11;
-        expected.rbx = 0x10000;
-        expected.rcx = 0;
-        expected.rdx = 0x0780a179;
+        expected.rbx = 0x10800;
+        expected.rcx = 0x2000;
+        expected.rdx = 0x078bf9ff;
         expected.cs.selector = 16;
         expected.rip = CODE + if iret { 24 } else { 25 };
         expected.rflags &= !0x10000;
@@ -3018,13 +3018,11 @@ async fn check_block_on_vp_kick(driver: &DefaultDriver, guest: KickedGuest) {
         std::thread::yield_now();
     }
     if apic {
-        partition.request_msi(
-            Vtl::Vtl0,
-            virt::irqcon::MsiRequest {
-                address: 0xfee0_0000,
-                data: 64,
-            },
-        );
+        assert!(partition.as_signal_msi(Vtl::Vtl1).is_none());
+        partition
+            .as_signal_msi(Vtl::Vtl0)
+            .unwrap()
+            .signal_msi(Some(0x100), 0xfee0_0000, 64);
         while memory.read_plain::<u8>(DEST).unwrap() != 0x55 || !partition.is_waiting_for_test() {
             assert!(
                 !worker.is_finished() && start.elapsed() < TIMEOUT,
